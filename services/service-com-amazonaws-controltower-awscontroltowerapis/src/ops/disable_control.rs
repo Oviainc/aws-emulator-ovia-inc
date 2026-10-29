@@ -350,24 +350,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // A MANDATORY control is one AWS Control Tower applies to every target it governs
         // itself rather than one a caller enabled, so it is not a caller's to turn off
-        // either: what removes it is the target ceasing to be governed. Read off the
-        // catalog entry this enablement's control resolves to — the same property
-        // `EnableControl` refuses a mandatory `controlIdentifier` by — so a request naming
-        // one is refused rather than tearing down a control the service applied.
-        if let Some(mandatory) = crate::state::resolve_control(&enabled.control_identifier)
-            .filter(|control| !control.enablable)
+        // either: what removes it is the target ceasing to be governed. Asked of the catalog
+        // entry this enablement's control resolves to — the same question `EnableControl`
+        // refuses a mandatory `controlIdentifier` by — so a request naming one is refused
+        // rather than tearing down a control the service applied.
+        if let Some(message) =
+            crate::state::mandatory_control_message(&enabled.control_identifier, "disabled")
         {
-            return Err(DisableControlErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "control {} is a mandatory control, which AWS Control Tower applies \
-                         itself; only strongly recommended and elective controls may be \
-                         disabled, with the exception of the Region deny control",
-                        mandatory.name
-                    ),
-                },
-            )
-            .into());
+            return Err(
+                DisableControlErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
         }
         if enabled.status == crate::state::EnablementStatus::UnderChange {
             let in_flight = enabled.last_operation_identifier.clone();

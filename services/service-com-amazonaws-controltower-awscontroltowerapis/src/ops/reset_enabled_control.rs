@@ -185,6 +185,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A MANDATORY control is one AWS Control Tower applies to every target it governs
+        // itself rather than one a caller enabled, so it is not a caller's to re-deploy
+        // either: what deploys and withdraws it is the target coming under this service's
+        // governance and ceasing to be governed. Asked of the catalog entry this
+        // enablement's control resolves to — the same question `EnableControl` and
+        // `DisableControl` refuse a mandatory control by — before anything about the
+        // control's implementation, because whether the enablement is the caller's at all
+        // is settled before which mechanism puts it into effect.
+        if let Some(message) =
+            crate::state::mandatory_control_message(&control.control_identifier, "reset")
+        {
+            return Err(ResetEnabledControlErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
         // The documented restriction on this operation: a reset "does not work for
         // controls implemented with SCPs". Which mechanism puts a control into effect is a
         // published property of the CONTROL — the same catalog `EnableControl` resolves a

@@ -3317,6 +3317,28 @@ pub fn is_mandatory_control(control_identifier: &str) -> bool {
     resolve_control(control_identifier).is_some_and(|control| !control.enablable)
 }
 
+/// Why the control `control_identifier` names is not a caller's to act on, or `None` when it
+/// names a control that is.
+///
+/// A MANDATORY control is the SERVICE's enablement, not a caller's resource
+/// ([`is_mandatory_control`]), so no call a caller makes against one — enabling it,
+/// disabling it, changing its configuration or re-deploying it — is accepted. This is the
+/// one place that refusal's wording is built, so each of those calls refuses the same
+/// control in the same words, differing only in `action`: the past participle of what the
+/// call would have done ("enabled", "disabled", "updated", "reset"), as the sentence reads
+/// it back. The exception named is the Region deny control, which
+/// `EnableControlInput$controlIdentifier` documents as permitted and which this catalog
+/// publishes as enablable.
+pub fn mandatory_control_message(control_identifier: &str, action: &str) -> Option<String> {
+    let mandatory = resolve_control(control_identifier).filter(|control| !control.enablable)?;
+    Some(format!(
+        "control {} is a mandatory control, which AWS Control Tower applies itself; only \
+         strongly recommended and elective controls may be {action}, with the exception of \
+         the Region deny control",
+        mandatory.name
+    ))
+}
+
 /// The catalog entry a `controlIdentifier` names, or `None` when the identifier is not a
 /// control ARN or the catalog holds no control it names.
 ///

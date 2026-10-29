@@ -39,13 +39,13 @@ use crate::enabled_control_lifecycle::{catalog_arn, control, entries, ou};
 use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
 
 /// The `BaselineArn` of a catalog baseline, in the region these tests sign for.
-fn baseline(id: &str) -> String {
+pub(crate) fn baseline(id: &str) -> String {
     format!("arn:aws:controltower:us-west-2::baseline/{id}")
 }
 
 /// The one catalog baseline whose enablement brings a target under AWS Control Tower's
 /// governance, read off the catalog rather than named here.
-fn governance_baseline() -> &'static CatalogBaseline {
+pub(crate) fn governance_baseline() -> &'static CatalogBaseline {
     let mut governing = BASELINE_CATALOG
         .iter()
         .filter(|baseline| baseline.establishes_governance);
@@ -62,7 +62,7 @@ fn governance_baseline() -> &'static CatalogBaseline {
 
 /// The MANDATORY catalog controls: the entries no caller may enable, which are the ones
 /// AWS Control Tower applies to a governed target itself.
-fn mandatory() -> Vec<&'static CatalogControl> {
+pub(crate) fn mandatory() -> Vec<&'static CatalogControl> {
     let mandatory: Vec<&'static CatalogControl> = CONTROL_CATALOG
         .iter()
         .filter(|control| !control.enablable)
@@ -90,7 +90,7 @@ fn enablable(index: usize) -> &'static CatalogControl {
 
 /// POST `/enable-baseline` for a baseline/version pair on `target`, asserting it succeeded,
 /// and hand back the `EnabledBaseline` ARN it minted.
-async fn enable_baseline(
+pub(crate) async fn enable_baseline(
     router: &MultiServiceRouter,
     baseline_identifier: &str,
     version: &str,
@@ -116,7 +116,7 @@ async fn enable_baseline(
 }
 
 /// POST `/list-enabled-controls` with `body`, asserting the listing answered.
-async fn list(router: &MultiServiceRouter, body: serde_json::Value) -> Answer {
+pub(crate) async fn list(router: &MultiServiceRouter, body: serde_json::Value) -> Answer {
     let answer = call(router, "/list-enabled-controls", body.clone()).await;
     assert_eq!(
         answer.status, 200,
@@ -145,7 +145,7 @@ fn listed_controls(listed: &Answer) -> Vec<String> {
 
 /// The enablement ARN a listing reports for `control_identifier`, or the empty string when
 /// the listing holds no entry for it.
-fn listed_arn_of(listed: &Answer, control_identifier: &str) -> String {
+pub(crate) fn listed_arn_of(listed: &Answer, control_identifier: &str) -> String {
     entries(listed.get("enabledControls"))
         .iter()
         .find(|entry| {

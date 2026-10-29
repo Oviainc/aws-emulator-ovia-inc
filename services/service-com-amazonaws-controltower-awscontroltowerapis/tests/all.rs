@@ -101,6 +101,8 @@ mod list_filter_narrowing;
 mod list_pagination;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
+#[path = "all/mandatory_control_is_the_services.rs"]
+mod mandatory_control_is_the_services;
 #[path = "all/one_enabled_control_per_target.rs"]
 mod one_enabled_control_per_target;
 #[path = "all/reserved_tag_keys.rs"]

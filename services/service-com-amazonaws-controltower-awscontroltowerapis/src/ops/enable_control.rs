@@ -230,19 +230,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Only part of the catalog may be enabled by a caller: the mandatory controls AWS
         // Control Tower applies to every governed account itself are named by a
-        // `controlIdentifier` but are not a caller's to enable.
-        if !control.enablable {
-            return Err(EnableControlErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "control {} is a mandatory control, which AWS Control Tower applies \
-                         itself; only strongly recommended and elective controls may be \
-                         enabled, with the exception of the Region deny control",
-                        control.name
-                    ),
-                },
-            )
-            .into());
+        // `controlIdentifier` but are not a caller's to enable. The refusal is built where
+        // every call that acts on such a control builds it, so all of them refuse the same
+        // control in the same words.
+        if let Some(message) =
+            crate::state::mandatory_control_message(&input.control_identifier, "enabled")
+        {
+            return Err(
+                EnableControlErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
         }
 
         if let Some(message) =

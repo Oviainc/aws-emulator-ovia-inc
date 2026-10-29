@@ -230,6 +230,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         if let Some(message) =
+            crate::state::mandatory_control_message(&control.control_identifier, "updated")
+        {
+            // A MANDATORY control is one AWS Control Tower applies to every target it
+            // governs itself rather than one a caller enabled, so its configuration is not
+            // a caller's to change either — the same question `EnableControl`,
+            // `DisableControl` and `ResetEnabledControl` refuse a mandatory control by,
+            // asked before this request's `parameters` are weighed against the control,
+            // because whether the enablement is the caller's at all is settled before what
+            // a caller may configure on it.
+            return Err(
+                UpdateEnabledControlErrorModeled::ValidationException(ValidationException {
+                    message,
+                })
+                .into(),
+            );
+        }
+
+        if let Some(message) =
             crate::state::unacceptable_control_parameters_message(catalogued, &requested)
         {
             return Err(UpdateEnabledControlErrorModeled::ValidationException(
