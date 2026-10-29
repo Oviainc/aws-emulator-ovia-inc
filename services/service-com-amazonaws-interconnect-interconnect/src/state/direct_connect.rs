@@ -155,15 +155,23 @@ const ATTACH_POINTS_UNRESOLVABLE_MESSAGE: &str =
     "the attach points of this account could not be resolved, so the requested attach point \
      could not be validated";
 
-/// The two refusals an attach-point resolution can call for, in the error channel of
-/// the operation that asked for it.
+/// The refusals an attach-point judgement can call for, in the error channel of the
+/// operation that asked for it.
 ///
-/// Every operation of this service carries its own modelled error enum, so the rule
-/// deciding WHICH refusal a verdict calls for and what it says lives once, in
-/// [`judge_attach_point`], and an operation that resolves an attach point supplies only
-/// this: which variant of its own channel each refusal travels in. A handler therefore
-/// cannot classify or word one of these refusals differently from its neighbour.
+/// Every operation of this service carries its own modelled error enum, so the rules
+/// deciding WHICH refusal a verdict calls for and what it says live once — in
+/// [`judge_attach_point`] for the gateway resource and in
+/// [`crate::state::judge_attach_point_in_store`] for the member's own constraints and the
+/// ARN's resource — and an operation that resolves an attach point supplies only this:
+/// which variant of its own channel each refusal travels in. A handler therefore cannot
+/// classify or word one of these refusals differently from its neighbour.
 pub trait AttachPointRefusal: Sized {
+    /// The value the union carries is not one the member it arrived in may hold, so the
+    /// request itself is at fault and nothing is resolved for it: the modelled
+    /// `InterconnectValidationException` (HTTP 400), the same class a malformed ARN gets
+    /// from every other operation addressed by one.
+    fn invalid_attach_point(message: String) -> Self;
+
     /// The account's attach points were read and the identifier is not one of them: the
     /// modelled `ResourceNotFoundException` (HTTP 404).
     fn not_an_attach_point(message: String) -> Self;
@@ -178,7 +186,11 @@ pub trait AttachPointRefusal: Sized {
 ///
 /// The ONE rule both writers of a connection's attach point (the create that allocates
 /// the first one and the acceptance that associates one) are held to, so what a
-/// Connection may be attached to does not depend on how it came to exist:
+/// Connection may be attached to does not depend on how it came to exist. The value the
+/// union carries is held to its member's OWN modelled constraints FIRST
+/// ([`crate::state::attach_point_violation`]), so a value that is not an identifier of
+/// its kind is invalid input and nothing is resolved for it — the account's gateways are
+/// not walked for it at all. Then the identifier is resolved:
 ///
 /// * [`AttachPointResolution::Valid`] — the identifier names an attach point of the
 ///   account, and the request continues;
@@ -190,10 +202,11 @@ pub trait AttachPointRefusal: Sized {
 ///   read, which is the server refusal carrying the sentence above, a DIFFERENT answer
 ///   because nothing is known about the identifier either way.
 ///
-/// Only `AttachPoint$directConnectGateway` is resolved here: that member "identifies an
+/// Only `AttachPoint$directConnectGateway` is RESOLVED here: that member "identifies an
 /// DirectConnect Gateway attach point by DirectConnectGatewayID", a resource of the
 /// service that OWNS those gateways, while `AttachPoint$arn` names a Connection of the
-/// account, which this service's own store resolves under its own lock.
+/// account, which this service's own store resolves under its own lock
+/// ([`crate::state::judge_attach_point_in_store`]).
 /// `environment` is the catalog record the request resolved, and `environment_id` the
 /// identifier it resolved it by — taken separately, the way
 /// [`crate::state::bandwidth_availability_violation`] takes them, so the refusal names
@@ -205,6 +218,9 @@ pub async fn judge_attach_point<E: AttachPointRefusal>(
     environment: Option<&Environment>,
     environment_id: &str,
 ) -> Result<(), E> {
+    if let Some(message) = crate::state::attach_point_violation(attach_point) {
+        return Err(E::invalid_attach_point(message));
+    }
     let AttachPoint::directConnectGateway(gateway) = attach_point else {
         return Ok(());
     };

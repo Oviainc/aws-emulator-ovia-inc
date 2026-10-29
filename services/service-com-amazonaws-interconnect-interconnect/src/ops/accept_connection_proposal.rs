@@ -110,9 +110,17 @@ impl From<AcceptConnectionProposalErrorModeled> for AcceptConnectionProposalErro
 }
 
 /// Which variant of this operation's error channel each attach-point refusal travels
-/// in. WHICH refusal a resolution verdict calls for, and how it is worded, is
+/// in. WHICH refusal a verdict calls for, and how it is worded, is
+/// `crate::state::judge_attach_point_in_store`'s and
 /// `crate::state::direct_connect::judge_attach_point`'s to say.
 impl crate::state::direct_connect::AttachPointRefusal for AcceptConnectionProposalError {
+    fn invalid_attach_point(message: String) -> Self {
+        AcceptConnectionProposalErrorModeled::InterconnectValidationException(
+            InterconnectValidationException { message },
+        )
+        .into()
+    }
+
     fn not_an_attach_point(message: String) -> Self {
         AcceptConnectionProposalErrorModeled::ResourceNotFoundException(
             ResourceNotFoundException {
@@ -265,20 +273,23 @@ fn judge_against_store(
         );
     }
 
-    // `AttachPoint$arn` "identifies an attach point by full ARN", and the pattern
-    // that member carries is an Interconnect CONNECTION ARN: the attach point is a
-    // connection of the account, judged by the one rule both writers of a
-    // connection's attach point apply to that member
-    // (`crate::state::judge_attach_point_arn`) — the ARN resolved in full, so one
-    // whose Region or account is not the stored one names no resource this account
-    // holds, inside the scope the request addressed, so a connection created through
-    // another Region's endpoint is one this endpoint holds nothing for, and with the
-    // connectivity behind it still there, so a connection whose teardown has already
-    // been called is no longer an attach point. An ARN that resolves to nothing has
-    // no attach point behind it, so there is nothing to make the connection onto. The
-    // same rule the create path applies, so what a Connection may be attached to does
-    // not depend on how it came to exist.
-    crate::state::judge_attach_point_arn::<AcceptConnectionProposalError>(
+    // The attach point the acceptance selected, judged by the one rule both writers of
+    // a connection's attach point apply to it
+    // (`crate::state::judge_attach_point_in_store`): first the value against the union
+    // member's OWN modelled length and pattern, which nothing before the handler holds
+    // it to, so a value that is not an identifier of its kind is refused as invalid
+    // INPUT rather than resolved and then reported as a resource the account does not
+    // hold; then, for `AttachPoint$arn` — which "identifies an attach point by full
+    // ARN", and whose pattern is an Interconnect CONNECTION ARN — the connection it
+    // names, resolved in full, so one whose Region or account is not the stored one
+    // names no resource this account holds, inside the scope the request addressed, so
+    // a connection created through another Region's endpoint is one this endpoint holds
+    // nothing for, and with the connectivity behind it still there, so a connection
+    // whose teardown has already been called is no longer an attach point. An ARN that
+    // resolves to nothing has no attach point behind it, so there is nothing to make
+    // the connection onto. The same rule the create path applies, so what a Connection
+    // may be attached to does not depend on how it came to exist.
+    crate::state::judge_attach_point_in_store::<AcceptConnectionProposalError>(
         store,
         region,
         &input.attach_point,

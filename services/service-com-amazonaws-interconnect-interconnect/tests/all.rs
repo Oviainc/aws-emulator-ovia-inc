@@ -25,6 +25,8 @@ mod attach_point_arn_is_scoped_to_the_request;
 mod attach_point_arn_stops_at_the_delete;
 #[path = "all/attach_point_judgement_is_shared.rs"]
 mod attach_point_judgement_is_shared;
+#[path = "all/attach_point_member_constraints.rs"]
+mod attach_point_member_constraints;
 #[path = "all/attach_points.rs"]
 mod attach_points;
 #[path = "all/attach_points_are_scoped_to_the_environment.rs"]

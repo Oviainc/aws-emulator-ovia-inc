@@ -665,32 +665,143 @@ pub fn environment_offers_attach_points(environment: Option<&Environment>) -> bo
     })
 }
 
-/// Judge the `arn` member of the `attach_point` a request selected for a connection on
-/// `environment_id`, answering `Ok(())` when the connection may be provisioned onto it.
+/// The `@length` the model gives `AttachPoint$arn`, whose pattern is an Interconnect
+/// connection ARN: the shortest such ARN is 59 characters and the longest 150.
+pub const ATTACH_POINT_ARN_LENGTH: (usize, usize) = (59, 150);
+
+/// The `@length` the model gives `AttachPoint$directConnectGateway`: a gateway is
+/// identified by the hyphenated UUID its pattern spells out, which is exactly this many
+/// characters.
+pub const ATTACH_POINT_GATEWAY_LENGTH: usize = 36;
+
+/// The two prefixes `ConnectionId`'s `^(mcc|lmcc)-[a-z0-9]{8}$` pattern allows — the two
+/// [`connection_id_prefix`] mints, one per kind of partner.
+pub const CONNECTION_ID_PREFIXES: [&str; 2] = ["mcc", "lmcc"];
+
+/// How many characters follow a `ConnectionId`'s prefix: the `[a-z0-9]{8}` its pattern
+/// ends with, which is what [`new_connection_id`] allocates.
+pub const CONNECTION_ID_SUFFIX_LENGTH: usize = 8;
+
+/// Whether `id` is spelled the way `ConnectionId`'s `^(mcc|lmcc)-[a-z0-9]{8}$` pattern
+/// spells one: one of the two prefixes, a hyphen, then eight lowercase letters or digits.
+fn is_connection_id_text(id: &str) -> bool {
+    let Some((prefix, suffix)) = id.split_once('-') else {
+        return false;
+    };
+    CONNECTION_ID_PREFIXES.contains(&prefix)
+        && suffix.chars().count() == CONNECTION_ID_SUFFIX_LENGTH
+        && suffix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+/// Whether `arn` is spelled the way `AttachPoint$arn`'s pattern
+/// (`^arn:aws[a-z-]*:interconnect:[^:]+:[0-9]{12}:connection/(mcc|lmcc)-[a-z0-9]{8}$`)
+/// and `@length` spell an Interconnect connection ARN: the six fields
+/// [`parse_connection_arn`] reads, inside the modelled length, carrying a resource field
+/// that is a `ConnectionId`.
 ///
-/// The ONE rule both writers of a connection's attach point apply to that member (the
-/// create that allocates the first attach point and the acceptance that associates one),
-/// so what a Connection may be attached to does not depend on which operation carried it:
-/// the ARN has to name a connection this store holds as an attach point
-/// ([`ComAmazonawsInterconnectInterconnectState::attach_point_connection_in`]), and one
-/// that does not is the not-found refusal
-/// [`direct_connect::AttachPointRefusal::not_an_attach_point`] — the same refusal, worded
-/// the same way, an identifier the account holds nothing for at all gets, so what refuses
-/// the request never reports what the store does hold for that ARN.
+/// The field walk is [`parse_connection_arn`]'s, so what counts as a connection ARN here
+/// is what every other ARN-addressed path of this service resolves; only the two
+/// constraints that walk deliberately leaves open — the overall length and the id's own
+/// spelling — are added on top.
+pub fn is_connection_arn_text(arn: &str) -> bool {
+    let (min, max) = ATTACH_POINT_ARN_LENGTH;
+    // `@length` on a string counts characters, not bytes, so the ARN is measured the
+    // way the model measures it.
+    (min..=max).contains(&arn.chars().count())
+        && parse_connection_arn(arn).is_some_and(|parsed| is_connection_id_text(parsed.id))
+}
+
+/// Whether `identifier` is spelled the way `AttachPoint$directConnectGateway`'s pattern
+/// (`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+/// spells a Direct Connect gateway id: five hex groups of those widths, joined by
+/// hyphens, in either case.
+pub fn is_gateway_identifier_text(identifier: &str) -> bool {
+    /// The widths of the five groups the member's pattern spells out, which together
+    /// with the four hyphens make up [`ATTACH_POINT_GATEWAY_LENGTH`].
+    const GROUP_WIDTHS: [usize; 5] = [8, 4, 4, 4, 12];
+    let mut groups = identifier.split('-');
+    GROUP_WIDTHS.iter().all(|width| {
+        groups.next().is_some_and(|group| {
+            group.chars().count() == *width && group.chars().all(|c| c.is_ascii_hexdigit())
+        })
+    }) && groups.next().is_none()
+}
+
+/// How the service words a `directConnectGateway` that is not a Direct Connect gateway
+/// identifier at all, which is a fault in the request rather than a missing resource —
+/// the gateway counterpart of [`not_a_connection_arn_message`].
+pub fn not_a_gateway_identifier_message(identifier: &str) -> String {
+    format!("{REFUSAL_ENVELOPE}{identifier} is not the ID of a DirectConnect Gateway")
+}
+
+/// Why the value an `AttachPoint` carries is not one the member it arrived in may hold —
+/// or `None` when it is inside that member's own modelled `@length` and `@pattern`.
+///
+/// The union's members are constrained in the model and NOTHING before the handler holds
+/// them to it: the boundary validator holds a top-level member to its target's
+/// constraints but not a member one level down, inside a union — which is why the sibling
+/// union is hand-checked the same way ([`remote_account_violation`]). So every reader of
+/// an `AttachPoint` judges the value here first, and a value outside the member's
+/// constraints is a fault in the REQUEST, reported as invalid input, rather than an
+/// identifier resolved against state and then reported as a resource the account does not
+/// hold: a caller can tell "I sent something that is not an attach-point identifier" from
+/// "this account holds no such attach point".
+///
+/// Each member is worded by the sentence this crate already owns for a value that is not
+/// an identifier of its kind at all ([`not_a_connection_arn_message`] for the ARN,
+/// [`not_a_gateway_identifier_message`] for the gateway), so the same malformed value is
+/// refused the same way whichever operation carried it.
+pub fn attach_point_violation(attach_point: &AttachPoint) -> Option<String> {
+    match attach_point {
+        AttachPoint::Arn(arn) => {
+            (!is_connection_arn_text(arn)).then(|| not_a_connection_arn_message(arn))
+        }
+        AttachPoint::directConnectGateway(identifier) => (!is_gateway_identifier_text(identifier))
+            .then(|| not_a_gateway_identifier_message(identifier)),
+    }
+}
+
+/// Judge the `attach_point` a request selected for a connection on `environment_id`
+/// against this service's own store, answering `Ok(())` when the connection may be
+/// provisioned onto it.
+///
+/// The ONE rule both writers of a connection's attach point apply (the create that
+/// allocates the first attach point and the acceptance that associates one), so what a
+/// Connection may be attached to does not depend on which operation carried it. Two
+/// things are judged, in this order:
+///
+/// * the value the union carries, against the member's OWN modelled constraints
+///   ([`attach_point_violation`]) — a value outside them is invalid input
+///   ([`direct_connect::AttachPointRefusal::invalid_attach_point`]), never an identifier
+///   resolved against state, so neither member reaches a store lookup or a cross-service
+///   walk as something that is not an identifier of its kind;
+/// * then, for the `arn` member only, the resource it names: the ARN has to name a
+///   connection this store holds as an attach point
+///   ([`ComAmazonawsInterconnectInterconnectState::attach_point_connection_in`]), and one
+///   that does not is the not-found refusal
+///   [`direct_connect::AttachPointRefusal::not_an_attach_point`] — the same refusal,
+///   worded the same way, an identifier the account holds nothing for at all gets, so
+///   what refuses the request never reports what the store does hold for that ARN.
 ///
 /// The union's two members are therefore judged through ONE refusal channel: this answers
-/// the `arn` member against the store under the caller's lock, and
-/// [`direct_connect::judge_attach_point`] answers `directConnectGateway` — a resource of
-/// the service that owns those gateways — off that lock, under the same readiness rule.
-/// Each answers `Ok(())` for the member the other owns, and each scopes itself to the
-/// Environment by the same predicate ([`environment_offers_attach_points`]), so neither
-/// member names an attach point valid for an Environment the other would refuse.
-pub fn judge_attach_point_arn<E: direct_connect::AttachPointRefusal>(
+/// both members' constraints and the `arn` member's resource against the store under the
+/// caller's lock, and [`direct_connect::judge_attach_point`] answers the
+/// `directConnectGateway` resource — a resource of the service that owns those gateways —
+/// off that lock, under the same readiness rule. Each answers `Ok(())` for what the other
+/// owns, and each scopes itself to the Environment by the same predicate
+/// ([`environment_offers_attach_points`]), so neither member names an attach point valid
+/// for an Environment the other would refuse.
+pub fn judge_attach_point_in_store<E: direct_connect::AttachPointRefusal>(
     store: &ComAmazonawsInterconnectInterconnectState,
     region: &str,
     attach_point: &AttachPoint,
     environment_id: &str,
 ) -> Result<(), E> {
+    if let Some(message) = attach_point_violation(attach_point) {
+        return Err(E::invalid_attach_point(message));
+    }
     let AttachPoint::Arn(arn) = attach_point else {
         return Ok(());
     };
@@ -818,7 +929,7 @@ pub fn connection_id_prefix(provider: &Provider) -> &'static str {
 /// `^(mcc|lmcc)-[a-z0-9]{8}$` alphabet the member's pattern allows.
 pub fn new_connection_id(prefix: &str) -> String {
     let hex = uuid::Uuid::new_v4().simple().to_string();
-    format!("{prefix}-{}", &hex[..8])
+    format!("{prefix}-{}", &hex[..CONNECTION_ID_SUFFIX_LENGTH])
 }
 
 /// A fresh `ConnectionSharedId`: the hyphenated v4 UUID the member's pattern

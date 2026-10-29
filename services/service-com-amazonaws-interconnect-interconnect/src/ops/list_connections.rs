@@ -152,6 +152,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The `attachPoint` filter carries the same union a create carries, and its
+        // members are constrained in the model while nothing before the handler holds a
+        // member one level down to those constraints: a value that is not an
+        // attach-point identifier of its kind is a fault in the REQUEST, refused as
+        // invalid input by the one rule every reader of an `AttachPoint` applies
+        // (`crate::state::attach_point_violation`), rather than compared against every
+        // stored connection and answered with the empty page it can never match.
+        if let Some(message) = input
+            .attach_point
+            .as_ref()
+            .and_then(crate::state::attach_point_violation)
+        {
+            return Err(ListConnectionsErrorModeled::InterconnectValidationException(
+                InterconnectValidationException { message },
+            )
+            .into());
+        }
+
         // "Only Connection objects matching all filters will be returned": every
         // supplied filter is an exact-match conjunct, and an absent one constrains
         // nothing. Each summary is PROJECTED from the stored connection, so the list
