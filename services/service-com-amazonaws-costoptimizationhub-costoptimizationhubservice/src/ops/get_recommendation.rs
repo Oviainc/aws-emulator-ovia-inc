@@ -3,10 +3,12 @@
 //! @op GetRecommendation
 //!
 //! Looks `recommendationId` up among the recommendations the calling account may
-//! read — the same set `ListRecommendations` pages over, so an account that is
-//! not enrolled, or whose analysis is not due yet, holds no recommendation at
-//! all — and answers with the detail view of that row, or
-//! `ResourceNotFoundException` when this account holds no such id.
+//! read — the rows the accounts this caller's reads reach own, which is the set
+//! `ListRecommendations` pages over, so an id a list reader handed this caller
+//! reads back here, and an account that is not enrolled, or whose analysis is
+//! not due yet, holds no recommendation at all — and answers with the detail
+//! view of that row, or `ResourceNotFoundException` when this caller may read no
+//! such id.
 //!
 //! ## Shape of an operation
 //!
@@ -205,11 +207,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mode = store
                 .effective_preferences(crate::state::caller_account_id())
                 .savings_estimation_mode;
-            // Only a recommendation this account can read is found: an account
-            // that is not enrolled (or whose analysis is not due yet) holds no
-            // recommendations at all, so every id is unknown to it.
+            // Only a recommendation this caller can read is found, over the
+            // same set the list readers select from
+            // (`crate::state::...::readable_recommendations`): the caller's own
+            // account, widened to the organization where the caller is its
+            // management account, with each owning account's enrollment still
+            // judged — so an id the list handed this caller resolves, and an id
+            // of an account that is not enrolled (or whose analysis is not due
+            // yet) is unknown to it.
             let row = store
-                .visible_recommendations(crate::state::caller_account_id())
+                .readable_recommendations(crate::state::caller_account_id())
                 .into_iter()
                 .find(|row| row.recommendation_id == input.recommendation_id);
             (mode, row)

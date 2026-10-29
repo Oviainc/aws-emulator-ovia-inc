@@ -31,6 +31,8 @@ mod preference_refusal_atomicity;
 mod preference_state_consistency;
 #[path = "all/preference_writes.rs"]
 mod preference_writes;
+#[path = "all/recommendation_detail_lookup.rs"]
+mod recommendation_detail_lookup;
 #[path = "all/recommendation_summaries.rs"]
 mod recommendation_summaries;
 #[path = "all/rejection_fidelity.rs"]

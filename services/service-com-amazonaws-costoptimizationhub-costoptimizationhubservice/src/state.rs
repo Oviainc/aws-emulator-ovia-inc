@@ -25,7 +25,7 @@
 //! * `recommendations` + `recommendation_order` — the recommendation catalog
 //!   `ListRecommendations` pages over and `GetRecommendation` looks ids up in,
 //!   narrowed to what the calling account may read by
-//!   [`ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState::visible_recommendations`].
+//!   [`ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState::readable_recommendations`].
 //!   The catalog is part of the store's initial value, so both readers see the
 //!   same rows and neither has to write anything to serve a read.
 
@@ -1082,22 +1082,37 @@ impl ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
         accounts
     }
 
-    /// The recommendations this account can read, in catalog order.
+    /// Every recommendation this caller may read, in catalog order, whichever
+    /// account owns it: the set a read of ONE recommendation resolves its id
+    /// over, because such a read names no account.
+    ///
+    /// A read that names no account addresses the caller's own account, widened
+    /// to the organization where the caller is its management account — the
+    /// caller whose reads past its own account are admitted at all, and so the
+    /// caller whose `filter.accountIds` a list reader serves another account's
+    /// rows to ([`Self::recommendation_view`]). This set is therefore the union
+    /// of what this caller's list reads can select, and an id a list handed it
+    /// reads back.
+    ///
+    /// Enrollment is still judged per owning account
+    /// ([`Self::visible_recommendations_for`]), so an account that never opted
+    /// in, one that opted out, and one that has just opted in hold no readable
+    /// recommendation at all.
+    pub fn readable_recommendations(&self, account_id: &str) -> Vec<StoredRecommendation> {
+        let addressed =
+            self.addressed_accounts(account_id, &[], self.is_management_account(account_id));
+        self.visible_recommendations_for(&addressed)
+    }
+
+    /// The recommendations `accounts` can be read for, in catalog order.
     ///
     /// Cost Optimization Hub reports recommendations for an ENROLLED account
     /// only, and only once the analysis that enrollment starts is due (see
-    /// [`RECOMMENDATION_GENERATION_DELAY`]), so an account that never opted in,
-    /// one that opted out, and one that has just opted in all read the empty set
-    /// rather than someone else's catalog.
-    pub fn visible_recommendations(&self, account_id: &str) -> Vec<StoredRecommendation> {
-        self.visible_recommendations_for(&[account_id.to_string()])
-    }
-
-    /// The recommendations `accounts` can be read for, in catalog order: the
-    /// general form of [`Self::visible_recommendations`], because a read may
+    /// [`RECOMMENDATION_GENERATION_DELAY`]), so an addressed account that never
+    /// opted in, one that opted out, and one whose analysis is not due yet each
+    /// contribute nothing rather than someone else's catalog. A read may
     /// address more than one account (a management account naming members in
-    /// `filter.accountIds`). Enrollment is still judged per account, so an
-    /// addressed account whose analysis is not due contributes nothing.
+    /// `filter.accountIds`), which is why the set is judged per account here.
     pub fn visible_recommendations_for(&self, accounts: &[String]) -> Vec<StoredRecommendation> {
         let readable: Vec<&str> = accounts
             .iter()
