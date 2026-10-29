@@ -1421,7 +1421,18 @@ pub fn notification_set_limit_violation(
 /// A key that is not an epoch names no period, so it is skipped; `None` for a map with
 /// no usable entry at all.
 pub fn planned_limit_in_force(planned: &HashMap<String, Spend>, at: SystemTime) -> Option<Spend> {
-    let now = unix_secs(at);
+    planned_limit_in_force_at_epoch(planned, unix_secs(at))
+}
+
+/// The same derivation as [`planned_limit_in_force`], as of an instant named by the epoch
+/// it is rather than by a host clock value.
+///
+/// Both sides of the comparison are epochs — a planned key is "the start of the month,
+/// `UTC` in epoch seconds" (`Budget$PlannedBudgetLimits`) and so is every `TimePeriod`
+/// bound — so it is made on the epochs themselves, which holds for every instant a stored
+/// budget can name and not only those the platform's clock type can hold
+/// ([`instant_at`]).
+fn planned_limit_in_force_at_epoch(planned: &HashMap<String, Spend>, at: i64) -> Option<Spend> {
     let mut periods: Vec<(i64, &Spend)> = planned
         .iter()
         .filter_map(|(start, limit)| start.trim().parse::<i64>().ok().map(|at| (at, limit)))
@@ -1430,7 +1441,7 @@ pub fn planned_limit_in_force(planned: &HashMap<String, Spend>, at: SystemTime) 
     periods
         .iter()
         .rev()
-        .find(|(start, _)| *start <= now)
+        .find(|(start, _)| *start <= at)
         .or_else(|| periods.first())
         .map(|(_, limit)| (*limit).clone())
 }
@@ -1455,10 +1466,23 @@ pub fn project_budget(stored: &StoredBudget, at: SystemTime) -> Budget {
 /// write path that has just built the budget it is about to store reads back for it,
 /// without first having a [`StoredBudget`] to project.
 pub fn budget_as_read(budget: &Budget, at: SystemTime) -> Budget {
+    budget_as_read_at_epoch(budget, unix_secs(at))
+}
+
+/// The same projection as [`budget_as_read`], as of an instant named by the epoch it is.
+///
+/// The projection depends on the instant ONLY through which planned period has started by
+/// then, which is a comparison between epochs
+/// ([`planned_limit_in_force_at_epoch`]) — so the "as of" instant is carried as the epoch
+/// it is. That is what lets a read project the budget as of a period of its own history
+/// ([`amounts_in_period`]): a `TimePeriod` bound is whatever epoch it was stored with, the
+/// model bounds it nowhere, and an epoch the platform's clock type cannot hold
+/// ([`instant_at`]) is still an instant this projection answers for.
+pub fn budget_as_read_at_epoch(budget: &Budget, at: i64) -> Budget {
     let mut budget = budget.clone();
     if budget.budget_limit.is_none() {
         if let Some(planned) = selection(&budget.planned_budget_limits) {
-            budget.budget_limit = planned_limit_in_force(planned, at);
+            budget.budget_limit = planned_limit_in_force_at_epoch(planned, at);
         }
     }
     budget.calculated_spend = calculated_spend(&budget);
@@ -2073,7 +2097,8 @@ pub fn retained_periods(time_unit: &str, now: SystemTime) -> Vec<TimePeriod> {
 /// or usage" (`BudgetedAndActualAmounts`).
 ///
 /// Both figures are the ones a read of the budget reports AS OF that period
-/// ([`project_budget`]), so a performance history cannot disagree with `DescribeBudget`:
+/// ([`budget_as_read_at_epoch`]), so a performance history cannot disagree with
+/// `DescribeBudget`:
 ///
 /// * `BudgetedAmount` is "the amount of cost or usage that you created the budget for" —
 ///   the limit in force while the period ran, which for a `PlannedBudgetLimits` budget is
@@ -2087,19 +2112,19 @@ pub fn retained_periods(time_unit: &str, now: SystemTime) -> Vec<TimePeriod> {
 /// budget of [`calculated_spend`]): nothing in such a record names a unit of measurement,
 /// and `Spend$Unit` is `@required`.
 pub fn amounts_in_period(stored: &StoredBudget, period: &TimePeriod) -> BudgetedAndActualAmounts {
-    let projected = period
-        .start
-        .as_ref()
-        .and_then(|start| instant_at(start.secs()))
-        .map(|at| project_budget(stored, at));
+    // The period is projected as of the epoch its `Start` names, whatever epoch that is:
+    // the amounts a record reports follow from the budget, not from whether the platform's
+    // clock type can hold that boundary, so every period the budget covers reports the
+    // figures its read reports.
+    //
+    // A period that names no start is unbounded below, so it is projected as of the
+    // earliest epoch there is — which reports the earliest planned entry, the entry a
+    // budget whose planned periods have all still to start reports.
+    let at = period.start.as_ref().map_or(i64::MIN, |start| start.secs());
+    let projected = budget_as_read_at_epoch(&stored.budget, at);
     BudgetedAndActualAmounts {
-        budgeted_amount: projected
-            .as_ref()
-            .and_then(|budget| budget.budget_limit.clone()),
-        actual_amount: projected
-            .as_ref()
-            .and_then(|budget| budget.calculated_spend.as_ref())
-            .map(|spend| spend.actual_spend.clone()),
+        budgeted_amount: projected.budget_limit.clone(),
+        actual_amount: projected.calculated_spend.map(|spend| spend.actual_spend),
         time_period: Some(period.clone()),
     }
 }

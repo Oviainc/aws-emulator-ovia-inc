@@ -47,6 +47,8 @@ mod budget_cost_types_by_type;
 mod budget_creation_limits;
 #[path = "all/budget_end_date_expiry.rs"]
 mod budget_end_date_expiry;
+#[path = "all/budget_history_period_amounts.rs"]
+mod budget_history_period_amounts;
 #[path = "all/budget_lifecycle.rs"]
 mod budget_lifecycle;
 #[path = "all/budget_performance_history.rs"]

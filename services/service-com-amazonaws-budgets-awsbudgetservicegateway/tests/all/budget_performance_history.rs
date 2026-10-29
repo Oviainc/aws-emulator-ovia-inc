@@ -72,7 +72,10 @@ fn timestamp(period: &Value, member: &str) -> i64 {
 }
 
 /// Create one budget and fail the test if the service refuses it.
-async fn create(router: &MultiServiceRouter, case: &str, budget: &Value) {
+///
+/// `pub(crate)` so the sibling suite that asserts what each record REPORTS drives the
+/// same harness rather than copying it.
+pub(crate) async fn create(router: &MultiServiceRouter, case: &str, budget: &Value) {
     let (status, body) = call(
         router,
         "CreateBudget",
@@ -86,17 +89,23 @@ async fn create(router: &MultiServiceRouter, case: &str, budget: &Value) {
 }
 
 /// Ask for one budget's performance history.
-async fn history(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
+///
+/// `pub(crate)` so the sibling suites in this test target share the one helper.
+pub(crate) async fn history(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
     call(router, "DescribeBudgetPerformanceHistory", request).await
 }
 
 /// The request that asks about `name` with no narrowing and no paging.
-fn ask(name: &str) -> Value {
+///
+/// `pub(crate)` so the sibling suites in this test target share the one helper.
+pub(crate) fn ask(name: &str) -> Value {
     json!({"AccountId": caller_account(), "BudgetName": name})
 }
 
 /// The reported records, or an empty list when the response carries none.
-fn records(body: &Value) -> Vec<Value> {
+///
+/// `pub(crate)` so the sibling suites in this test target share the one helper.
+pub(crate) fn records(body: &Value) -> Vec<Value> {
     body["BudgetPerformanceHistory"]["BudgetedAndActualAmountsList"]
         .as_array()
         .cloned()
@@ -104,7 +113,9 @@ fn records(body: &Value) -> Vec<Value> {
 }
 
 /// The `(Start, End)` of one record's period.
-fn bounds(record: &Value) -> (i64, i64) {
+///
+/// `pub(crate)` so the sibling suites in this test target share the one helper.
+pub(crate) fn bounds(record: &Value) -> (i64, i64) {
     let period = &record["TimePeriod"];
     (timestamp(period, "Start"), timestamp(period, "End"))
 }
