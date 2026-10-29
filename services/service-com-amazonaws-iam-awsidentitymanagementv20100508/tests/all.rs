@@ -221,6 +221,8 @@ mod saml_provider_updates;
 mod saml_providers;
 #[path = "all/server_certificate_deletion.rs"]
 mod server_certificate_deletion;
+#[path = "all/server_certificate_listing.rs"]
+mod server_certificate_listing;
 #[path = "all/server_certificate_tag_listing.rs"]
 mod server_certificate_tag_listing;
 #[path = "all/server_certificates.rs"]

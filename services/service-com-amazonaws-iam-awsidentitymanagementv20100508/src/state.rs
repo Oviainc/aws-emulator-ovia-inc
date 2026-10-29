@@ -625,6 +625,17 @@ pub const MARKER_SCOPE_ACCESS_KEYS: &str = "access-keys";
 /// same key order (the certificate id) whichever user it reports on.
 pub const MARKER_SCOPE_SIGNING_CERTIFICATES: &str = "signing-certificates";
 
+/// The marker scope of the account's server certificate collection, which
+/// `ListServerCertificates` pages over. It is its OWN scope, exactly as the user and
+/// role collections are, so a marker issued while paging another collection is not
+/// read as a position among the server certificates. The key it carries is the
+/// [`name_key`] of a certificate name, the key
+/// [`ComAmazonawsIamAwsidentitymanagementv20100508State::server_certificates`] holds a
+/// certificate under, and one scope covers the whole collection because the operation
+/// pages over that same key order whichever path prefix it filters by — the filter
+/// selects within the order rather than changing it.
+pub const MARKER_SCOPE_SERVER_CERTIFICATES: &str = "server-certificates";
+
 /// The marker scope of a policy simulation's evaluation results, which
 /// `SimulatePrincipalPolicy` pages over. Unlike the other scopes this one names a
 /// position in a list the request itself determines (its actions and resources), so

@@ -112,6 +112,9 @@ pub const LIST_POLICIES: &str = "iam:ListPolicies";
 /// `iam:ListInstanceProfiles`.
 pub const LIST_INSTANCE_PROFILES: &str = "iam:ListInstanceProfiles";
 
+/// `iam:ListServerCertificates`.
+pub const LIST_SERVER_CERTIFICATES: &str = "iam:ListServerCertificates";
+
 /// `iam:ListInstanceProfilesForRole`.
 pub const LIST_INSTANCE_PROFILES_FOR_ROLE: &str = "iam:ListInstanceProfilesForRole";
 
