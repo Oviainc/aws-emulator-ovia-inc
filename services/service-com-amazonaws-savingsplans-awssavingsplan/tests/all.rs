@@ -35,6 +35,8 @@ mod queued_plan_wire_rules;
 mod queued_purchase_deletion;
 #[path = "all/return_monthly_allowance.rs"]
 mod return_monthly_allowance;
+#[path = "all/return_window_bound.rs"]
+mod return_window_bound;
 #[path = "all/savings_plans_lifecycle.rs"]
 mod savings_plans_lifecycle;
 #[path = "all/shared_catalog_paging.rs"]

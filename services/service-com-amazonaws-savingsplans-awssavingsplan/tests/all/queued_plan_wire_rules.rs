@@ -22,7 +22,9 @@
 //!   is cancelled through `DeleteQueuedSavingsPlan` instead.
 //!
 //! What a tag key may be is pinned beside this suite, in
-//! [`crate::tag_key_round_trip`].
+//! [`crate::tag_key_round_trip`], and the exact instant the return window turns
+//! over in [`crate::return_window_bound`], which asks the rule as of an instant
+//! it supplies rather than racing the wall clock.
 //!
 //! Everything goes through the same `MultiServiceRouter` the emulator boots,
 //! reusing the harness in [`crate::savings_plans_lifecycle`].
@@ -62,6 +64,21 @@ fn is_wire_instant(value: &str) -> bool {
         _ => character.is_ascii_digit(),
     })
 }
+
+/// How much of the return window a row that buys NEAR its close leaves ahead of
+/// itself, in seconds.
+///
+/// The service decides whether the window is open against the clock at the
+/// instant it SERVES the describe, not the instant a test computed its
+/// `purchaseTime`, so a row that leaves one second of the window is asserting
+/// that this test's own purchase-and-describe round trip takes under a second —
+/// a claim about the machine running it, not about the service, and one a loaded
+/// runner breaks. The margin is wider than any round trip here and still a
+/// rounding error against the seven-day window, so the row stays a row about the
+/// window's close. The exact millisecond the window turns over is pinned without
+/// the wall clock in [`crate::return_window_bound`], which hands the rule the
+/// instant to answer as of.
+const NEAR_WINDOW_CLOSE_SECONDS: i64 = 15 * 60;
 
 /// Now, in whole seconds since the epoch: what a `purchaseTime` carries.
 fn now_seconds() -> i64 {
@@ -281,7 +298,8 @@ async fn every_instant_is_rendered_at_millisecond_precision() {
 /// The rows differ along how far the purchase is from now, which is what decides
 /// whether the window is open: a plan whose term has not begun still has the
 /// whole window ahead of it, and one bought longer ago than the window has none
-/// left. Each bound of the window is a row, plus one past it.
+/// left. Both sides of the window's close are rows — one just inside it (see
+/// [`NEAR_WINDOW_CLOSE_SECONDS`]) and one just past it.
 #[tokio::test]
 async fn returnable_until_reports_the_window_close_while_it_is_open() {
     let emulator = Emulator::new();
@@ -299,7 +317,11 @@ async fn returnable_until_reports_the_window_close_while_it_is_open() {
         ("dated by the service", None, true),
         ("bought a minute ago", Some(-60), true),
         ("bought a day ago", Some(-86_400), true),
-        ("one second inside the window", Some(1 - window_seconds), true),
+        (
+            "just inside the window",
+            Some(NEAR_WINDOW_CLOSE_SECONDS - window_seconds),
+            true,
+        ),
         ("one second past the window", Some(-1 - window_seconds), false),
         ("queued for tomorrow", Some(86_400), true),
         ("queued for a year's time", Some(365 * 86_400), true),
@@ -362,7 +384,11 @@ async fn returnable_until_reports_the_window_close_while_it_is_open() {
 /// `ValidationException`, and the refusal leaves the plan exactly where it was.
 ///
 /// The rows span the states a plan can be in when the return arrives, which is
-/// what the rule generalises over.
+/// what the rule generalises over. A row names the states its clock ADMITS
+/// rather than one: a purchase dated now or earlier is `payment-pending` only
+/// until the activation span the clock owes it elapses, so which of the two a
+/// describe reports is a fact about how fast this test runs, while whether a
+/// return is accepted is the same from both.
 #[tokio::test]
 async fn a_return_is_refused_from_every_state_it_is_not_accepted_from() {
     let emulator = Emulator::new();
@@ -373,44 +399,31 @@ async fn a_return_is_refused_from_every_state_it_is_not_accepted_from() {
     let now = now_seconds();
     let window_seconds = state::RETURN_WINDOW_MILLIS / 1000;
 
-    // (case, purchaseTime offset in seconds, the state the plan is in when the
-    //  return arrives, whether the return is accepted)
-    let cases: [(&str, Option<i64>, &str, bool); 5] = [
+    // (case, purchaseTime offset in seconds, the states the plan may be in when
+    //  the return arrives, whether the return is accepted)
+    type ReturnStateCase = (&'static str, Option<i64>, &'static [&'static str], bool);
+    let started: &[&str] = &[state::STATE_PAYMENT_PENDING, state::STATE_ACTIVE];
+    let cases: [ReturnStateCase; 5] = [
+        ("dated by the service", None, started, true),
         (
-            "dated by the service",
-            None,
-            state::STATE_PAYMENT_PENDING,
+            "just inside the window",
+            Some(NEAR_WINDOW_CLOSE_SECONDS - window_seconds),
+            started,
             true,
         ),
-        (
-            "inside the window",
-            Some(1 - window_seconds),
-            state::STATE_PAYMENT_PENDING,
-            true,
-        ),
-        (
-            "past the window",
-            Some(-1 - window_seconds),
-            state::STATE_PAYMENT_PENDING,
-            false,
-        ),
+        ("past the window", Some(-1 - window_seconds), started, false),
         (
             "past the end of its term",
             Some(-2 * 365 * 86_400),
-            state::STATE_RETIRED,
+            &[state::STATE_RETIRED],
             false,
         ),
         // Not started yet: cancelled through DeleteQueuedSavingsPlan, never
         // returned.
-        (
-            "queued for tomorrow",
-            Some(86_400),
-            state::STATE_QUEUED,
-            false,
-        ),
+        ("queued for tomorrow", Some(86_400), &[state::STATE_QUEUED], false),
     ];
 
-    for (case, offset, state_before, accepted) in cases {
+    for (case, offset, states_before, accepted) in cases {
         let mut request = json!({
             "savingsPlanOfferingId": offering_id,
             "commitment": "0.1",
@@ -420,10 +433,10 @@ async fn a_return_is_refused_from_every_state_it_is_not_accepted_from() {
         }
         let savings_plan_id = emulator.purchase(request).await;
         let observed_before = text(&emulator.plan(&savings_plan_id).await, "state");
-        assert_eq!(
-            observed_before, state_before,
-            "case {case:?}: expected the plan to be {state_before:?} before the return, got \
-             {observed_before:?}"
+        assert!(
+            states_before.contains(&observed_before.as_str()),
+            "case {case:?}: expected the plan to be one of {states_before:?} before the \
+             return, got {observed_before:?}"
         );
 
         let answer = emulator
@@ -456,14 +469,15 @@ async fn a_return_is_refused_from_every_state_it_is_not_accepted_from() {
             );
             let message = text(&answer.body, "message");
             assert!(
-                message.contains(state_before) || message.contains("return window"),
+                message.contains(&observed_before) || message.contains("return window"),
                 "case {case:?}: the refusal must say why, got {message:?}"
             );
-            // A refused return changes nothing: the plan is where it was.
-            assert_eq!(
-                state_after, state_before,
-                "case {case:?}: a refused return must leave the plan {state_before:?}, got \
-                 {state_after:?}"
+            // A refused return changes nothing: the plan is still in a state its
+            // own clock put it in, and in particular it was not returned.
+            assert!(
+                states_before.contains(&state_after.as_str()),
+                "case {case:?}: a refused return must leave the plan one of \
+                 {states_before:?}, got {state_after:?}"
             );
         }
     }
