@@ -15,7 +15,10 @@
 //!
 //! `Method`, `Path`, `QueryParameters` and `Body` are all acted on: the path selects the
 //! Apache Airflow resource, the method what is done to it, the query parameters page a
-//! collection, and the body carries the entity a write creates or changes.
+//! collection, and the body carries the entity a write creates or changes. Both documents
+//! are the JSON objects the model documents them as, so one of any other shape names no
+//! parameter and carries no entity, and is refused ([`object_document`]) rather than
+//! dropped.
 //!
 //! ## How an Apache Airflow answer becomes this operation's answer
 //!
@@ -370,13 +373,23 @@ const SLOTS_IN_USE: i64 = 0;
 /// while a `POST`, `PATCH` or `DELETE` is the change the caller asked Apache Airflow to
 /// make.
 fn serve(environment: &mut EnvironmentRecord, call: &Call<'_>) -> AirflowAnswer {
+    // The query parameters are what this API's request carries on its query string, and a
+    // query string is built from the NAMED values of an object: a document of any other
+    // shape names no parameter at all, so it is refused here — before the path is
+    // addressed, since the query string belongs to the request rather than to the endpoint,
+    // and for every method, since every one of them is called with a URL — rather than read
+    // as if the caller had asked for no parameters.
+    let query = match object_document(call.query, QUERY_PARAMETERS) {
+        Ok(query) => query,
+        Err(refusal) => return refusal,
+    };
     match call.segments.as_slice() {
         ["version"] => match call.method {
             GET => airflow_version(environment),
             _ => method_not_allowed(call),
         },
         ["variables"] => match call.method {
-            GET => list_variables(&environment.airflow, call),
+            GET => list_variables(&environment.airflow, query),
             POST => set_variable(&mut environment.airflow, call),
             _ => method_not_allowed(call),
         },
@@ -392,7 +405,7 @@ fn serve(environment: &mut EnvironmentRecord, call: &Call<'_>) -> AirflowAnswer 
             }
         }
         ["pools"] => match call.method {
-            GET => list_pools(&environment.airflow, call),
+            GET => list_pools(&environment.airflow, query),
             POST => create_pool(&mut environment.airflow, call),
             _ => method_not_allowed(call),
         },
@@ -407,7 +420,7 @@ fn serve(environment: &mut EnvironmentRecord, call: &Call<'_>) -> AirflowAnswer 
             }
         }
         ["dags"] => match call.method {
-            GET => list_dags(call),
+            GET => list_dags(query),
             _ => method_not_allowed(call),
         },
         // Everything under `/dags/{dag_id}` — the DAG itself, its DAG runs, their task
@@ -516,8 +529,8 @@ fn airflow_version(environment: &EnvironmentRecord) -> AirflowAnswer {
 /// docs. The page the call asked for is still resolved, so a call paging the collection
 /// with an unusable `limit` or `offset` is refused here exactly as it is on a collection
 /// that does hold entries.
-fn list_dags(call: &Call<'_>) -> AirflowAnswer {
-    let window = match page_window(call.query) {
+fn list_dags(query: Option<&Document>) -> AirflowAnswer {
+    let window = match page_window(query) {
         Ok(window) => window,
         Err(refusal) => return refusal,
     };
@@ -525,8 +538,8 @@ fn list_dags(call: &Call<'_>) -> AirflowAnswer {
 }
 
 /// `GET /variables`: the environment's variables, in key order.
-fn list_variables(metadata: &AirflowMetadata, call: &Call<'_>) -> AirflowAnswer {
-    let window = match page_window(call.query) {
+fn list_variables(metadata: &AirflowMetadata, query: Option<&Document>) -> AirflowAnswer {
+    let window = match page_window(query) {
         Ok(window) => window,
         Err(refusal) => return refusal,
     };
@@ -591,8 +604,8 @@ fn delete_variable(metadata: &mut AirflowMetadata, key: &str) -> AirflowAnswer {
 }
 
 /// `GET /pools`: the environment's slot pools, in name order.
-fn list_pools(metadata: &AirflowMetadata, call: &Call<'_>) -> AirflowAnswer {
-    let window = match page_window(call.query) {
+fn list_pools(metadata: &AirflowMetadata, query: Option<&Document>) -> AirflowAnswer {
+    let window = match page_window(query) {
         Ok(window) => window,
         Err(refusal) => return refusal,
     };
@@ -771,8 +784,10 @@ fn collection(member: &str, entries: Vec<Document>, window: &PageWindow) -> Airf
     ))
 }
 
-/// The page a collection call asked for: its `limit` and `offset` query parameters, or
-/// [`PAGE_LIMIT`] and the start of the collection when it named none.
+/// The page a collection call asked for: the `limit` and `offset` of the query parameters
+/// it carries ([`object_document`] has already read those parameters as the object they
+/// are, so `query` is that object or nothing at all), or [`PAGE_LIMIT`] and the start of
+/// the collection when it named none.
 ///
 /// A limit past [`PAGE_LIMIT`] is capped to it, and a limit of none at all — an absent
 /// parameter, or one asking for no entry — falls back to that same page size, since a page
@@ -865,14 +880,41 @@ fn requested_pool(body: Option<&Document>) -> Result<AirflowPool, AirflowAnswer>
     })
 }
 
-/// A write's body as the JSON object every one of these endpoints takes.
-fn object_body(body: Option<&Document>) -> Result<&Document, AirflowAnswer> {
-    match body {
-        Some(body @ Document::Object(_)) => Ok(body),
-        _ => Err(AirflowAnswer::bad_request(
-            "the request body must be a JSON object".to_string(),
-        )),
+/// What this operation's query parameters are called in a refusal of a document that
+/// states none.
+const QUERY_PARAMETERS: &str = "query parameters";
+/// What this operation's request body is called in the same refusal.
+const REQUEST_BODY: &str = "request body";
+
+/// A document this API takes as a JSON object, as that object.
+///
+/// Each of this operation's two documents is one the model documents as a JSON object
+/// (`smithy_query(query="doc",shape="InvokeRestApiRequest",member="QueryParameters"|
+/// "Body")`), because an object is what names the values it carries: a document of any
+/// other shape — an array, a string, a number, a boolean — names none of them, so it is
+/// refused rather than read as if the caller had supplied nothing. An absent document, and
+/// the `null` that spells one, state nothing and are `None`; what a caller who states
+/// nothing gets is the endpoint's own business.
+fn object_document<'d>(
+    document: Option<&'d Document>,
+    what: &str,
+) -> Result<Option<&'d Document>, AirflowAnswer> {
+    match document {
+        None | Some(Document::Null) => Ok(None),
+        Some(object @ Document::Object(_)) => Ok(Some(object)),
+        Some(_) => Err(not_an_object(what)),
     }
+}
+
+/// A write's body as the JSON object every one of these endpoints takes, which — unlike
+/// the query parameters — a write has to carry: a body stating nothing states no entity.
+fn object_body(body: Option<&Document>) -> Result<&Document, AirflowAnswer> {
+    object_document(body, REQUEST_BODY)?.ok_or_else(|| not_an_object(REQUEST_BODY))
+}
+
+/// Why a document this API takes as a JSON object could not be read as one.
+fn not_an_object(what: &str) -> AirflowAnswer {
+    AirflowAnswer::bad_request(format!("the {what} must be a JSON object"))
 }
 
 /// A member a body has to carry as a non-empty string.

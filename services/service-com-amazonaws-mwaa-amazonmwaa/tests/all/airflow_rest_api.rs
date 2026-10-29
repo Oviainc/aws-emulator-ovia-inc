@@ -867,6 +867,195 @@ async fn a_collection_is_paged_by_the_query_parameters() {
     }
 }
 
+/// A `QueryParameters` document that is not a JSON object names no parameter at all, so
+/// the call carrying it is refused — with the same Apache Airflow problem document its
+/// sibling `Body` is refused by — instead of being served as if the caller had asked for
+/// nothing.
+///
+/// Rows differ along the shape of the document — array, array of parameter objects, text,
+/// number, boolean — and every one of them is tried against each class of call this API
+/// serves: a paged collection, a read that takes no parameter, a read of one entity, a
+/// write and a delete. The window a document that DOES state parameters asks for is still
+/// served, and so are the two documents that state none.
+#[tokio::test]
+async fn a_query_parameters_document_that_is_not_an_object_is_refused() {
+    let harness = Harness::with_environment("QueryDocument").await;
+
+    // Two variables, so a refused collection read has entries it could have paged and a
+    // refused delete has an entity it could have removed.
+    for key in ["k", "zz"] {
+        let written = harness
+            .invoke(
+                "QueryDocument",
+                call_with_body("POST", "/variables", json!({"key": key, "value": "v"})),
+            )
+            .await;
+        assert_eq!(
+            written.airflow_status(),
+            200,
+            "the fixture write of {key:?} must be served, got {}",
+            written.text()
+        );
+    }
+
+    // Every shape a JSON document takes other than the object this member is documented as
+    // (smithy_query(query="doc",shape="InvokeRestApiRequest",member="QueryParameters"):
+    // "provided as a JSON object").
+    let documents = [
+        ("an array of parameter objects", json!([{"limit": 3}])),
+        ("an empty array", json!([])),
+        ("the text an HTTP query string carries", json!("limit=3&offset=1")),
+        ("a bare number", json!(3)),
+        ("a boolean", json!(true)),
+    ];
+    for (shape, query) in documents {
+        for (kind, request) in [
+            (
+                "a paged collection",
+                call_with_query("GET", "/variables", query.clone()),
+            ),
+            (
+                "another paged collection",
+                call_with_query("GET", "/pools", query.clone()),
+            ),
+            (
+                "the empty DAG inventory",
+                call_with_query("GET", "/dags", query.clone()),
+            ),
+            (
+                "a read that pages nothing",
+                call_with_query("GET", "/version", query.clone()),
+            ),
+            (
+                "a read of one entity",
+                call_with_query("GET", "/variables/k", query.clone()),
+            ),
+            (
+                "a write",
+                json!({
+                    "Method": "POST",
+                    "Path": "/variables",
+                    "Body": {"key": "fresh", "value": "1"},
+                    "QueryParameters": query.clone(),
+                }),
+            ),
+            (
+                "a delete",
+                call_with_query("DELETE", "/variables/zz", query.clone()),
+            ),
+        ] {
+            let case = format!("{shape} on {kind}");
+            let answer = harness.invoke("QueryDocument", request).await;
+            assert_eq!(
+                answer.status, 400,
+                "case {case:?}: a refused Apache Airflow call is the modelled exception's \
+                 own HTTP 400, got {} {}",
+                answer.status,
+                answer.text()
+            );
+            assert_eq!(
+                answer.error_code(),
+                "RestApiClientException",
+                "case {case:?}: expected RestApiClientException, got {}",
+                answer.text()
+            );
+            assert_eq!(
+                answer.airflow_status(),
+                400,
+                "case {case:?}: expected RestApiStatusCode 400, got {}",
+                answer.text()
+            );
+            let document = answer.document();
+            assert_eq!(
+                member(&document, "status"),
+                Some(&json!(400)),
+                "case {case:?}: the problem document must name the same status, got {document}"
+            );
+            assert_eq!(
+                member(&document, "detail").and_then(Value::as_str),
+                Some("the query parameters must be a JSON object"),
+                "case {case:?}: expected the detail of a document that is no object, got \
+                 {document}"
+            );
+        }
+    }
+
+    // No refused call reached an endpoint: the variable a refused delete named is still
+    // there, and the one a refused write named was never created.
+    for (case, path, expected) in [
+        ("the variable a refused delete named", "/variables/zz", 200),
+        ("the variable a refused write named", "/variables/fresh", 404),
+    ] {
+        let answer = harness.invoke("QueryDocument", call("GET", path)).await;
+        assert_eq!(
+            answer.airflow_status(),
+            expected,
+            "case {case:?}: expected RestApiStatusCode {expected}, got {}",
+            answer.text()
+        );
+    }
+
+    // A document that states parameters is served as the window it states, and the two
+    // documents that state none are served as the default window: what is refused is a
+    // document that could carry no parameter, not paging itself.
+    for (case, request, expected_keys) in [
+        (
+            "an object naming a window",
+            call_with_query("GET", "/variables", json!({"limit": 1})),
+            vec!["k"],
+        ),
+        (
+            "an object naming an offset",
+            call_with_query("GET", "/variables", json!({"offset": 1})),
+            vec!["zz"],
+        ),
+        (
+            "an object naming no parameter",
+            call_with_query("GET", "/variables", json!({})),
+            vec!["k", "zz"],
+        ),
+        (
+            "the null that states no parameters",
+            call_with_query("GET", "/variables", Value::Null),
+            vec!["k", "zz"],
+        ),
+        (
+            "no query document at all",
+            call("GET", "/variables"),
+            vec!["k", "zz"],
+        ),
+    ] {
+        let answer = harness.invoke("QueryDocument", request).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: a document that states parameters must be served, got {} {}",
+            answer.status,
+            answer.text()
+        );
+        let document = answer.document();
+        let keys: Vec<String> = document
+            .get("variables")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .get("key")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            keys, expected_keys,
+            "case {case:?}: expected the page {expected_keys:?}, got {keys:?}"
+        );
+    }
+}
+
 /// A read through this API changes nothing a later caller sees: the same read answers the
 /// same document, and nothing a read touches moves.
 #[tokio::test]
