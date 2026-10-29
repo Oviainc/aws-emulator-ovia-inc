@@ -22,7 +22,12 @@
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   generated routing table. Return `Some(op)` to route one yourself. This service
+//!   uses it for the two operations whose `@required` `@httpQuery` member the REST
+//!   router reads as a route discriminator (see `EmulatedService::query_keyed_operation`),
+//!   so a request that leaves that member out still reaches the operation the model binds
+//!   to its method and path and is refused on its own values instead of as an unknown
+//!   operation.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -40,10 +45,20 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_schema::Schema;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Operation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The operation the model's own routing table names for `req`.
+fn modeled_operation<'d>(
+    definition: &'d dyn ErasedServiceDefinition,
+    req: &aws_smithy_runtime_api::http::Request,
+) -> Option<&'d dyn ErasedOperation> {
+    let key = definition.protocol().routing_key(req).ok()?;
+    definition.routing_table().get(key)
+}
 
 /// The `com-amazonaws-kafkaconnect-kafkaconnect` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -52,6 +67,14 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// `UpdateConnector`, built from the SAME shared engine the generated entry threads
+    /// into every operation, so this instance and the rest of the service read one store.
+    /// Held because [`Service::override_operation`] hands back a BORROW of an operation,
+    /// and this is one of the two whose route the REST router keys on a `@required`
+    /// `@httpQuery` member (see [`EmulatedService::query_keyed_operation`]).
+    update_connector: crate::ops::update_connector::UpdateConnector<Eng>,
+    /// `UntagResource`, held from that same shared engine for the other such route.
+    untag_resource: crate::ops::untag_resource::UntagResource<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,8 +83,56 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            update_connector: crate::ops::update_connector::UpdateConnector::new(Arc::clone(
+                &engine,
+            )),
+            untag_resource: crate::ops::untag_resource::UntagResource::new(engine),
         }
+    }
+
+    /// The operation of this service whose own `@http` route `req` ADDRESSES, among the
+    /// ones whose route the REST router keys on a `@required` `@httpQuery` member, or
+    /// `None` when `req` addresses none of them.
+    ///
+    /// The framework's REST router treats such a member as a route DISCRIMINATOR: it
+    /// rejects a candidate route whose `@required` header/query bindings are absent from
+    /// the request, which is how an S3-class model tells several operations apart on ONE
+    /// method + URI template by the shape of the request. This service overloads no route
+    /// — every method + URI template it publishes names exactly one operation — so for a
+    /// request that binds no value for such a member the rule can only misfire: the
+    /// request matches NO route and is answered "unknown operation" (HTTP 501, a status no
+    /// operation here models) instead of reaching the operation the model binds to its
+    /// method and path, whose answer for an absent `@required` member is this service's own
+    /// client-input error (HTTP 400, see [`EmulatedService::override_refusal`]).
+    ///
+    /// The model declares exactly two such members across this service's 19 operations —
+    /// `UpdateConnector$currentVersion` and `UntagResource$tagKeys`
+    /// (`smithy_query(query="operation", operation="UpdateConnector,UntagResource")`) —
+    /// which is why those two operations are the ones held here; every other operation
+    /// binds its `@required` members to the path or the body (or declares none), so its
+    /// route always resolves and it is never reached this way. No method or URI template
+    /// is written out: each candidate is matched through the shared reader
+    /// (`service_common::addresses_modeled_http_route`) against the route its OWN input
+    /// schema's `@http` binding gives it, so this seam cannot drift from the model, and an
+    /// operation can only ever serve the route the model binds to it.
+    fn query_keyed_operation(
+        &self,
+        req: &aws_smithy_runtime_api::http::Request,
+    ) -> Option<&dyn ErasedOperation> {
+        let held: [(&'static Schema, &dyn ErasedOperation); 2] = [
+            (
+                <crate::ops::update_connector::UpdateConnector<Eng> as Operation>::INPUT_SCHEMA,
+                &self.update_connector,
+            ),
+            (
+                <crate::ops::untag_resource::UntagResource<Eng> as Operation>::INPUT_SCHEMA,
+                &self.untag_resource,
+            ),
+        ];
+        held.into_iter()
+            .find(|(schema, _)| service_common::addresses_modeled_http_route(req, schema))
+            .map(|(_, operation)| operation)
     }
 }
 
@@ -91,8 +162,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        //
+        // The model's own routing table is asked FIRST and is left to resolve every
+        // request it can name. What it cannot name is a request that binds no value for
+        // a `@required` `@httpQuery` member of the operation the model binds to its
+        // method and path: the REST router reads such a member as a route
+        // discriminator and matches no route at all, so the request would be answered
+        // "unknown operation" (HTTP 501) although the operation is implemented and
+        // models a client-input error for exactly this mistake. Such a request is
+        // therefore matched against the route each candidate operation's own `@http`
+        // binding gives it (`query_keyed_operation`), and the operation then answers the
+        // request from the request's OWN values: the absent member is refused by the
+        // framework's centralized walk, worded through `override_refusal` below, exactly
+        // as an absent required PATH or BODY member of the same operation already is.
+        if modeled_operation(self.definition(), req).is_some() {
+            return None;
+        }
+        self.query_keyed_operation(req)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

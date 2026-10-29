@@ -23,6 +23,10 @@
 //! * [`shared_path`], the reader for the one case the path half of the claim rule
 //!   cannot settle on its own: two colliding models binding the same URI path space,
 //!   where the ARN in the path names the resource and so the service that owns it;
+//! * [`addresses_modeled_http_route`], the other side of [`addresses_modeled_route`]: which
+//!   operation a request ADDRESSES — the method and URI pattern of one operation's own
+//!   `@http` binding — for a service answering a request the framework's route lookup
+//!   withheld a route from because a `@required` `@httpQuery` member was absent;
 //! * [`chime_family`], the same claim rule for the one family whose shared signing name
 //!   is not even its members' endpoint prefix: the six Amazon Chime services, which are
 //!   told apart by the endpoint the request addresses and then by their own path spaces;
@@ -804,6 +808,95 @@ pub fn uri_path(uri: &str) -> &str {
         .unwrap_or(after_authority)
 }
 
+/// Whether `req` addresses the route ONE modelled operation's `@http` trait binds: that
+/// trait's METHOD, and its URI pattern with the `@httpLabel` placeholders filled.
+///
+/// `input_schema` is that operation's own `Operation::INPUT_SCHEMA`, which carries the
+/// `@http` binding, so the METHOD and the PATTERN are read off the model rather than
+/// copied into a literal per service that cannot be kept in step with it.
+///
+/// This answers the question the framework's own route lookup cannot be asked: which
+/// operation a request ADDRESSES when no route matched it. The REST router rejects a
+/// candidate route whose `@required` header/query bindings are absent from the request
+/// (`route_lookup`, `vendor/smithy-schema-server/src/rest_xml.rs`), which is how an
+/// S3-class model tells several operations apart on ONE method + URI template by the
+/// shape of the request; for a model that binds a method + URI template to exactly one
+/// operation, the same rule only withholds the route of a request that left a required
+/// parameter out, and the service then has nothing to answer it from. A service with such
+/// a route asks this of each candidate operation from its `Service::override_operation`
+/// seam, so the operation the model binds serves the request and refuses the absent member
+/// itself. [`addresses_modeled_route`] is the other half of that pair and stays the
+/// default: it asks the framework whether a route matched at all.
+///
+/// # Services still carrying their own copy
+///
+/// This reader postdates the private copies in `rum`, `artifact` and
+/// `directoryservicedata` (`grep -rln 'fn path_matches' services/*/src/service.rs`), which
+/// are to be MIGRATED onto it; they are left in place only because this change does not
+/// own those services' issues and each is covered by its own suite. Nothing new should
+/// inline the rule again — call this crate.
+pub fn addresses_modeled_http_route(
+    req: &RuntimeApiRequest,
+    input_schema: &aws_smithy_schema::Schema,
+) -> bool {
+    input_schema.http().is_some_and(|binding| {
+        binding.method().eq_ignore_ascii_case(req.method())
+            && path_matches_http_uri(binding.uri(), uri_path(req.uri()))
+    })
+}
+
+/// Whether `path` is the `@http` URI `pattern` with its `@httpLabel` placeholders filled:
+/// the same segments in the same order, a literal segment matching itself, a `{label}`
+/// matching ONE non-empty segment and a greedy `{label+}` taking every segment that is
+/// left (of which there must be at least one).
+///
+/// Only the pattern's PATH is matched. A query literal a pattern pins (`/{Bucket}?acl`)
+/// SELECTS between routes that share a path, and selecting is what the framework's own
+/// lookup does whenever it can; a caller here has already been told that no route matched.
+///
+/// Segments are read the way the framework's matcher reads them — leading and trailing `/`
+/// ignored, nothing else skipped, an empty remainder being no segments at all — so this and
+/// a service's generated routing table cannot disagree about which requests the table
+/// already resolves.
+pub fn path_matches_http_uri(pattern: &str, path: &str) -> bool {
+    let expected = path_segments(pattern.split('?').next().unwrap_or(pattern));
+    let actual = path_segments(path);
+    for (index, segment) in expected.iter().enumerate() {
+        let label = segment.starts_with('{') && segment.ends_with('}');
+        let greedy = label && segment.ends_with("+}");
+        match actual.get(index) {
+            // The pattern has a segment the request does not.
+            None => return false,
+            // A greedy label takes every segment that is left.
+            Some(carried) if greedy => return !carried.is_empty(),
+            Some(carried) if label => {
+                if carried.is_empty() {
+                    return false;
+                }
+            }
+            Some(carried) => {
+                if carried != segment {
+                    return false;
+                }
+            }
+        }
+    }
+    // No greedy label took the remainder, so a longer request path is another route.
+    expected.len() == actual.len()
+}
+
+/// The `/`-separated segments of a URI path, as the framework's route matcher splits them:
+/// leading and trailing `/` ignored, and a path with nothing else in it having NO segments
+/// (so the root path and the empty pattern are the same zero segments).
+fn path_segments(path: &str) -> Vec<&str> {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        Vec::new()
+    } else {
+        trimmed.split('/').collect()
+    }
+}
+
 /// The `index`-th (0-based) `/`-separated segment of a URI path, or `None` when the path
 /// has no such segment.
 ///
@@ -1498,6 +1591,113 @@ mod tests {
             assert_eq!(
                 actual, expected,
                 "case {case:?}: {uri:?} expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// A modelled `@http` URI pattern is matched segment for segment, with each kind of
+    /// placeholder taking what the model says it takes — and a path that differs in any
+    /// segment, or in how many there are, is another route.
+    #[test]
+    fn an_http_uri_pattern_matches_exactly_the_paths_its_labels_admit() {
+        // (case, pattern, path, expected). The patterns are real ones: kafkaconnect's
+        // `/v1/connectors/{connectorArn}` and `/v1/tags/{resourceArn}`, a nested
+        // collection, a bare collection, and a greedy label as S3 binds one
+        // (`/{Bucket}/{Key+}`).
+        let rows: [(&str, &str, &str, bool); 16] = [
+            (
+                "a label filled with one segment",
+                "/v1/connectors/{connectorArn}",
+                "/v1/connectors/arn%3Aaws%3Akafkaconnect%3A%3A%3Aconnector%2Fc%2F1",
+                true,
+            ),
+            (
+                "a trailing slash on the request path",
+                "/v1/connectors/{connectorArn}",
+                "/v1/connectors/c/",
+                true,
+            ),
+            (
+                "the label's segment missing",
+                "/v1/connectors/{connectorArn}",
+                "/v1/connectors",
+                false,
+            ),
+            (
+                "an empty label segment",
+                "/v1/connectors/{connectorArn}",
+                "/v1/connectors//",
+                false,
+            ),
+            (
+                "a segment past the label",
+                "/v1/connectors/{connectorArn}",
+                "/v1/connectors/c/operations",
+                false,
+            ),
+            (
+                "another literal in the same position",
+                "/v1/connectors/{connectorArn}",
+                "/v1/custom-plugins/c",
+                false,
+            ),
+            (
+                "another version prefix",
+                "/v1/connectors/{connectorArn}",
+                "/v2/connectors/c",
+                false,
+            ),
+            (
+                "the tag route's label",
+                "/v1/tags/{resourceArn}",
+                "/v1/tags/arn",
+                true,
+            ),
+            (
+                "a literal after a label",
+                "/v1/connectors/{connectorArn}/operations",
+                "/v1/connectors/c/operations",
+                true,
+            ),
+            (
+                "that literal spelled otherwise",
+                "/v1/connectors/{connectorArn}/operations",
+                "/v1/connectors/c/restart",
+                false,
+            ),
+            (
+                "a collection with no label",
+                "/v1/connectors",
+                "/v1/connectors",
+                true,
+            ),
+            (
+                "a query literal in the pattern, which selects and does not match",
+                "/v1/connectors?list-type=2",
+                "/v1/connectors",
+                true,
+            ),
+            (
+                "a greedy label taking one segment",
+                "/{Bucket}/{Key+}",
+                "/bucket/key",
+                true,
+            ),
+            (
+                "a greedy label taking several",
+                "/{Bucket}/{Key+}",
+                "/bucket/a/b/c",
+                true,
+            ),
+            ("a greedy label taking none", "/{Bucket}/{Key+}", "/bucket", false),
+            ("the root path against the root pattern", "/", "/", true),
+        ];
+
+        for (case, pattern, path, expected) in rows {
+            let actual = path_matches_http_uri(pattern, path);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: {pattern:?} against {path:?} expected {expected}, got {actual}"
             );
         }
     }
