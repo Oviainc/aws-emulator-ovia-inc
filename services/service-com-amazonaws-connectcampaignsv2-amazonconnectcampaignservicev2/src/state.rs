@@ -659,9 +659,109 @@ pub fn integration_identifier_violation(
     }
 }
 
+/// The modelled `AttributeName` rules, from
+/// `smithy_query(query="shape", shape="AttributeName")`: `@length(min: 0, max: 32767)`
+/// with that shape's `@pattern`.
+///
+/// Restated here because `AttributeName` is the KEY shape of a map (`Attributes`), and
+/// a key is the one leaf no generated schema carries the constraints of: the codegen
+/// hangs the VALUE shape's traits off the map member and describes the key nowhere, so
+/// there is no schema to walk instead. Pinned to the model by
+/// `tests/all/attribute_map_keys.rs::the_attribute_key_rules_this_crate_restates_are_the_models`,
+/// which reads these three values out of `smithy-model/` and fails if they drift.
+pub const ATTRIBUTE_NAME_MIN_LEN: i64 = 0;
+/// See [`ATTRIBUTE_NAME_MIN_LEN`].
+pub const ATTRIBUTE_NAME_MAX_LEN: i64 = 32767;
+/// See [`ATTRIBUTE_NAME_MIN_LEN`].
+pub const ATTRIBUTE_NAME_PATTERN: &str = r"^[a-zA-Z0-9\-_]+$";
+
+/// `AttributeName`'s constraints as the trait map the framework's constraint walk reads
+/// them from, built from [`ATTRIBUTE_NAME_MIN_LEN`] and its siblings so the rules
+/// enforced and the rules a refusal states are one statement.
+static ATTRIBUTE_NAME_TRAITS: LazyLock<::aws_smithy_schema::TraitMap> = LazyLock::new(|| {
+    let mut traits = ::aws_smithy_schema::TraitMap::new();
+    traits.insert(Box::new(
+        ::aws_smithy_schema_server::constraints::LengthTrait::new(
+            Some(ATTRIBUTE_NAME_MIN_LEN),
+            Some(ATTRIBUTE_NAME_MAX_LEN),
+        ),
+    ));
+    traits.insert(Box::new(
+        ::aws_smithy_schema_server::constraints::PatternTrait::new(ATTRIBUTE_NAME_PATTERN),
+    ));
+    traits
+});
+
+/// The schema an attribute key is judged against: one string carrying
+/// `AttributeName`'s own constraints, since the map member's generated schema carries
+/// the value shape's and not the key's.
+static ATTRIBUTE_NAME_SCHEMA: LazyLock<::aws_smithy_schema::Schema> = LazyLock::new(|| {
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.connectcampaignsv2#Attributes$key",
+            "com.amazonaws.connectcampaignsv2",
+            "key",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "key",
+        0,
+    )
+    .with_traits(&ATTRIBUTE_NAME_TRAITS)
+});
+
+/// Why `key` is not a value the string shape behind `schema` admits, or `None` when it
+/// is one.
+///
+/// Judged by the framework's own leaf walk, so a key is weighed by the very code the
+/// boundary weighs a constrained string member with, in the same order (`@length`
+/// before `@pattern`); the first requirement it breaks is the one reported, as the
+/// per-key clause of [`map_keys_violation`] carries exactly one.
+fn string_key_violation_kind(
+    schema: &::aws_smithy_schema::Schema,
+    key: &str,
+) -> Option<::smithy_server_runtime::ViolationKind> {
+    use ::aws_smithy_schema::serde::ShapeSerializer as _;
+
+    let mut validator = ::aws_smithy_schema_server::constraints::ValidatingSerializer::new();
+    validator.set_fail_fast(true);
+    // Infallible: the validator accumulates violations instead of failing.
+    let _ = validator.write_string(schema, key);
+    validator
+        .into_violations()
+        .into_iter()
+        .next()
+        .map(|violation| violation.kind)
+}
+
+/// Why the keys of the attribute MAP at `member` are a bad request, or `None` when
+/// every one of them is a key `AttributeName` admits.
+///
+/// The one place a map key whose shape declares a `@length` and a `@pattern` is
+/// enforced, shared by every such map this service accepts — a telephony request's
+/// `attributes` and the `templateParameters` of its SMS, email and WhatsApp siblings,
+/// all four keyed by `AttributeName`. A map key never reaches the boundary walk, so
+/// without this a request could name an attribute the key shape forbids and still be
+/// taken; [`map_keys_violation`] turns what this finds into the refusal, so it reads
+/// exactly like the enum-keyed and tag-keyed refusals beside it.
+pub fn attribute_keys_violation<'k>(
+    member: &str,
+    keys: impl IntoIterator<Item = &'k str>,
+) -> Option<String> {
+    map_keys_violation(member, keys, |key| {
+        string_key_violation_kind(&ATTRIBUTE_NAME_SCHEMA, key)
+    })
+}
+
 /// Why the `ChannelSubtypeParameters` at `member` are a bad request, or `None` when
 /// the parameters of the channel in force satisfy every constraint their shape
-/// declares — the source-number and template ARNs among them.
+/// declares — the source-number and template ARNs among them, and the keys of the
+/// attribute map every channel carries.
+///
+/// A structure's leaves are judged by the framework's own walk, which never validates
+/// a map's KEY, so the key shape of the `Attributes` map behind each channel is weighed
+/// beside them through [`attribute_keys_violation`] — without which a request could
+/// name an attribute `AttributeName` does not admit and still be taken into a
+/// campaign's buffer.
 pub fn channel_subtype_parameters_violation(
     member: &str,
     parameters: &ChannelSubtypeParameters,
@@ -671,22 +771,46 @@ pub fn channel_subtype_parameters_violation(
             &format!("{member}.telephony"),
             telephony,
             &TelephonyChannelSubtypeParameters::SCHEMA,
-        ),
+        )
+        .or_else(|| {
+            attribute_keys_violation(
+                &format!("{member}.telephony.attributes"),
+                telephony.attributes.keys().map(String::as_str),
+            )
+        }),
         ChannelSubtypeParameters::Sms(sms) => structure_refusal(
             &format!("{member}.sms"),
             sms,
             &SmsChannelSubtypeParameters::SCHEMA,
-        ),
+        )
+        .or_else(|| {
+            attribute_keys_violation(
+                &format!("{member}.sms.templateParameters"),
+                sms.template_parameters.keys().map(String::as_str),
+            )
+        }),
         ChannelSubtypeParameters::Email(email) => structure_refusal(
             &format!("{member}.email"),
             email,
             &EmailChannelSubtypeParameters::SCHEMA,
-        ),
+        )
+        .or_else(|| {
+            attribute_keys_violation(
+                &format!("{member}.email.templateParameters"),
+                email.template_parameters.keys().map(String::as_str),
+            )
+        }),
         ChannelSubtypeParameters::whatsApp(whats_app) => structure_refusal(
             &format!("{member}.whatsApp"),
             whats_app,
             &WhatsAppChannelSubtypeParameters::SCHEMA,
-        ),
+        )
+        .or_else(|| {
+            attribute_keys_violation(
+                &format!("{member}.whatsApp.templateParameters"),
+                whats_app.template_parameters.keys().map(String::as_str),
+            )
+        }),
     }
 }
 

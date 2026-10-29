@@ -182,11 +182,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The source-number and template ARNs a request carries sit behind the
+        // The source-number and template ARNs a request carries, and the keys of the
+        // attribute map every channel carries, sit behind the
         // `channelSubtypeParameters` union, which the centralized constraint walk does
-        // not reach, so the shared check holds each of them to the `@length` and
-        // `@pattern` of the shape it targets. A constraint violation is a bad REQUEST,
-        // not a per-request outcome, so the whole batch is refused before any of it is
+        // not reach — and a map key is one it never validates even where it does reach
+        // — so the shared check holds each of them to the `@length` and `@pattern` of
+        // the shape it targets. A constraint violation is a bad REQUEST, not a
+        // per-request outcome, so the whole batch is refused before any of it is
         // taken — the list element is named the way the boundary walk spells one.
         if let Some(message) = input
             .outbound_requests
