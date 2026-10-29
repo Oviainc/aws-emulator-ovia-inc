@@ -82,7 +82,7 @@ use crate::ops::types::{
     BatchCreateBillingAdjustmentRequestEntry, BillingAdjustmentSummary,
     ByolPricingTerm, Charge, ChargeSummary, ConfigurableUpfrontPricingTerm,
     ConfigurableUpfrontPricingTermConfiguration, ConfigurableUpfrontRateCardItem,
-    ConflictException, Constraints, DescribeAgreementOutput, DocumentItem,
+    ConflictException, Constraints, DescribeAgreementOutput, Dimension, DocumentItem,
     EndTimeBehavior, Entitlement, EstimatedCharges, ExpectedCharge, Filter,
     FixedUpfrontPricingTerm, FreeTrialPricingTerm, GetAgreementPaymentRequestOutput,
     GetBillingAdjustmentRequestOutput, GrantItem, InternalServerException, InvoiceBillingPeriod,
@@ -536,9 +536,12 @@ fn quantity(value: i32) -> u128 {
 struct DimensionPrice {
     /// "The dimension key as specified in the accepted term."
     key: String,
-    /// "The requested quantity for this dimension."
+    /// "The requested quantity for this dimension" — the total of every
+    /// occurrence of the key in the configuration ([`requested_quantities`]).
     new_quantity: i32,
-    /// "The existing quantity for this dimension from the source agreement."
+    /// "The existing quantity for this dimension from the source agreement",
+    /// as far as it is not already accounted for by an earlier term of the same
+    /// request ([`term_price`]).
     old_quantity: i32,
     /// `ItemizedCharge$incrementalChargeAmount`, "the total incremental charge
     /// amount for this dimension": the units this request ADDS at the
@@ -574,10 +577,18 @@ struct TermPrice {
 /// other kind is unpriced at quote time whatever is published — a usage-based
 /// charge follows "product usage" and a variable payment is an amount no seller
 /// has requested yet — and so is anything the published rates do not carry.
+///
+/// A dimension key names ONE dimension of the agreement, so a configured prepaid
+/// term is priced per KEY and not per occurrence of it
+/// ([`requested_quantities`]), and the existing quantity a key is measured
+/// against is subtracted from the total asked for exactly once: what this term
+/// measures against is taken OFF `old_quantities`, so a key a later term of the
+/// same request names again is not measured against the same existing units a
+/// second time.
 fn term_price(
     kind: &str,
     configuration: Option<&ConfigurableUpfrontPricingTermConfiguration>,
-    old_quantities: &HashMap<String, i32>,
+    old_quantities: &mut HashMap<String, i32>,
 ) -> TermPrice {
     if !commits_amount(kind) {
         return TermPrice::default();
@@ -590,34 +601,39 @@ fn term_price(
             let Some(configuration) = configuration else {
                 return TermPrice::default();
             };
-            let mut dimensions = Vec::with_capacity(configuration.dimensions.len());
+            // One line item per dimension KEY the acceptor configured, at the
+            // total quantity its occurrences ask for.
+            let requested = requested_quantities(&configuration.dimensions);
+            let mut dimensions = Vec::with_capacity(requested.len());
             // The term's own totals, which stay unknown as soon as ONE of its
             // dimensions is one the rate card does not price: a total missing a
             // line item is not the amount of the charge.
             let mut committed: Option<u128> = Some(0);
             let mut charged: Option<u128> = Some(0);
-            for dimension in &configuration.dimensions {
-                let rate = published_unit_rate(
-                    &dimension.dimension_key,
-                    &configuration.selector_value,
-                )
-                .map(u128::from);
-                let old_quantity = old_quantities
-                    .get(&dimension.dimension_key)
-                    .copied()
-                    .unwrap_or_default();
-                let added =
-                    quantity(dimension.dimension_value).saturating_sub(quantity(old_quantity));
+            for (key, new_quantity) in requested {
+                let rate =
+                    published_unit_rate(&key, &configuration.selector_value).map(u128::from);
+                let old_quantity = old_quantities.get(&key).copied().unwrap_or_default();
+                let new_units = quantity(new_quantity);
+                let old_units = quantity(old_quantity);
+                let added = new_units.saturating_sub(old_units);
+                // The existing units this term measured against are spent: what
+                // is left is what a later term naming the same key is measured
+                // against.
+                old_quantities.insert(
+                    key.clone(),
+                    i32::try_from(old_units.saturating_sub(new_units)).unwrap_or_default(),
+                );
                 let incremental = rate.map(|rate| rate.saturating_mul(added));
-                committed = committed.zip(rate).map(|(total, rate)| {
-                    total.saturating_add(rate.saturating_mul(quantity(dimension.dimension_value)))
-                });
+                committed = committed
+                    .zip(rate)
+                    .map(|(total, rate)| total.saturating_add(rate.saturating_mul(new_units)));
                 charged = charged
                     .zip(incremental)
                     .map(|(total, incremental)| total.saturating_add(incremental));
                 dimensions.push(DimensionPrice {
-                    key: dimension.dimension_key.clone(),
-                    new_quantity: dimension.dimension_value,
+                    key,
+                    new_quantity,
                     old_quantity,
                     incremental,
                 });
@@ -2045,6 +2061,39 @@ pub fn commits_amount(kind: &str) -> bool {
     )
 }
 
+/// The quantity each dimension KEY of one configuration is asked for, summed
+/// over its occurrences, in the order the configuration first names each key.
+///
+/// `DimensionList` carries no uniqueness rule (`smithy_query(query="shape",
+/// shape="DimensionList")`), so one configuration may name a `dimensionKey` more
+/// than once. A dimension key names ONE dimension of the agreement — the
+/// dimension `ItemizedCharge$dimensionKey` reports "the total incremental charge
+/// amount for" — so what that dimension is bought at is the TOTAL of its
+/// occurrences, not one purchase per occurrence. The sum is bounded rather than
+/// left to overflow `i32`: a quantity cannot be larger than the largest the
+/// member can carry.
+fn requested_quantities(dimensions: &[Dimension]) -> Vec<(String, i32)> {
+    let mut totals: Vec<(String, i32)> = Vec::with_capacity(dimensions.len());
+    // Where the total of each key already sits in `totals`, so one occurrence
+    // costs one hash lookup rather than a walk of every key named before it:
+    // the list the caller sends carries as many entries as it likes, so the
+    // work this does grows with it and no faster.
+    let mut placed: HashMap<&str, usize> = HashMap::with_capacity(dimensions.len());
+    for dimension in dimensions {
+        match placed.get(dimension.dimension_key.as_str()) {
+            Some(&index) => {
+                let total = &mut totals[index].1;
+                *total = total.saturating_add(dimension.dimension_value);
+            }
+            None => {
+                placed.insert(dimension.dimension_key.as_str(), totals.len());
+                totals.push((dimension.dimension_key.clone(), dimension.dimension_value));
+            }
+        }
+    }
+    totals
+}
+
 /// The quantity each dimension of `terms` is already bought at, summed over
 /// every accepted configurable-upfront term.
 ///
@@ -2055,15 +2104,12 @@ fn dimension_quantities(terms: &[AcceptedTerm]) -> HashMap<String, i32> {
     for term in terms {
         if let AcceptedTerm::configurableUpfrontPricingTerm(pricing) = term {
             if let Some(configuration) = pricing.configuration.as_ref() {
-                for dimension in &configuration.dimensions {
-                    // The quantities come from the request, and one request may
-                    // name the same dimension twice, so the sum is bounded
-                    // rather than left to overflow `i32`: a quantity cannot be
-                    // larger than the largest the member can carry.
-                    let total = quantities
-                        .entry(dimension.dimension_key.clone())
-                        .or_default();
-                    *total = total.saturating_add(dimension.dimension_value);
+                // A key the configuration names more than once is bought at the
+                // total of its occurrences, which is the one rule the quote
+                // prices by too ([`requested_quantities`]).
+                for (key, quantity) in requested_quantities(&configuration.dimensions) {
+                    let total = quantities.entry(key).or_default();
+                    *total = total.saturating_add(quantity);
                 }
             }
         }
@@ -5389,11 +5435,12 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     /// Every member is computed from the request, the store and the published
     /// rates: one expected charge per requested term that is charged at all
     /// (with the timing its kind implies, and the amount the published rates
-    /// price it at), one itemized charge per dimension the acceptor configured
-    /// (with the quantity it asked for, the quantity the source agreement
-    /// already holds for an amendment, and the incremental amount between them),
-    /// and an agreement value totalling what the requested terms commit. See the
-    /// module docs for where the prices come from and what is left unpriced.
+    /// price it at), one itemized charge per dimension KEY the acceptor
+    /// configured (with the total quantity it asked for, the quantity the source
+    /// agreement already holds for an amendment, and the incremental amount
+    /// between them), and an agreement value totalling what the requested terms
+    /// commit. See the module docs for where the prices come from and what is
+    /// left unpriced.
     pub fn charge_summary(
         &mut self,
         requested_terms: &[RequestedTerm],
@@ -5405,7 +5452,11 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
         let source = source_agreement_id
             .filter(|_| intent != INTENT_NEW)
             .and_then(|id| self.agreements.get(id));
-        let old_quantities = source
+        // The existing quantity of each dimension, which the quote subtracts
+        // from what the request asks for ONCE: every term priced below takes
+        // off what it measured against, so two terms naming one dimension key
+        // are together charged for the units the request adds above the source.
+        let mut remaining_quantities = source
             .map(|source| dimension_quantities(&source.accepted_terms))
             .unwrap_or_default();
         // The kind of each requested term, resolved the ONE way the acceptance
@@ -5436,7 +5487,7 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
             let price = term_price(
                 kind,
                 requested_upfront_configuration(requested),
-                &old_quantities,
+                &mut remaining_quantities,
             );
             if commits_amount(kind) {
                 commits = true;

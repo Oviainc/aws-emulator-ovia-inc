@@ -87,6 +87,8 @@ mod purchase_order_required_members;
 mod purchase_order_updates;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/repeated_dimension_keys.rs"]
+mod repeated_dimension_keys;
 #[path = "all/replacement_source_status.rs"]
 mod replacement_source_status;
 #[path = "all/search_filter_combinations.rs"]
