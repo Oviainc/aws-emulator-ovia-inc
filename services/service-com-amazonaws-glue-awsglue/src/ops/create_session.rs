@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Provisions ONE interactive session per `Id` in the Region the request is served in
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::sessions`]) and answers with the record it
+//! wrote, so every later read of that id reports this session. The id is the client's — "The
+//! ID of the session request" — so a second create under an id this Region already holds is
+//! refused with the modelled `AlreadyExistsException` rather than replacing the session a
+//! statement may be running on.
+//!
+//! A session is NOT ready when the create returns: "the period in which a remote Spark
+//! runtime environment is running" (`Session`) starts with that environment being
+//! provisioned, so the record is written in `PROVISIONING` with `READY` due
+//! [`crate::state::SESSION_SETTLES_AFTER`] out, and whichever later call reads it
+//! materialises the status the clock had already reached.
 //!
 //! ## Shape of an operation
 //!
@@ -197,18 +203,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSession"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(CreateSessionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue session store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "The Glue version determines the versions of Apache Spark and Python that Glue
+        // supports. The GlueVersion must be greater than 2.0": a version that is not names
+        // no runtime this session could run on, so the create is refused before anything is
+        // written rather than storing a session no read could account for.
+        if let Some(defect) = input
+            .glue_version
+            .as_deref()
+            .and_then(crate::state::session_glue_version_defect)
+        {
+            return Err(CreateSessionErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(defect),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // A session is provisioned in the Region its create is served in and is addressed
+        // by `Id` alone thereafter, so the Region and the id together are its whole address.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The id is the CLIENT's, so a create under one this Region already holds would
+        // replace a session its own statements address: refused instead.
+        if store.session(&region, &input.id).is_some() {
+            return Err(CreateSessionErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(crate::state::messages::session_already_exists(&input.id)),
+                },
+            )
+            .into());
+        }
+        // The store is resident memory and this create is reachable by any caller, so the
+        // number of records one process will hold is bounded. Past the ceiling the request
+        // is refused with the operation's own modelled limit error.
+        if !store.can_store_session() {
+            return Err(
+                CreateSessionErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(crate::state::messages::too_many_sessions(
+                            crate::state::MAX_SESSIONS,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let entry = crate::state::SessionEntry::from_create_input(&input, now);
+        // "Returns the session object in the response": the record just written, so the
+        // create's answer and every later read of this id report one session.
+        let session = entry.to_session();
+        store.insert_session(&region, entry);
+        ::tracing::info!(
+            operation = "CreateSession",
+            region = %region,
+            session = %input.id,
+            "created a Glue interactive session"
+        );
+
+        Ok(CreateSessionOutput {
+            session: Some(session),
+        })
     }
 }

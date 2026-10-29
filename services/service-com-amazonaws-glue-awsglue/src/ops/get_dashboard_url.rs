@@ -13,11 +13,12 @@
 //!   `OperationNotSupportedException` BEFORE anything is looked up, so the answer is the
 //!   same whether or not the account holds a job of that name — the refusal is about the
 //!   resource KIND, not about the resource.
-//! * `SESSION` is looked up. This emulator keeps no interactive sessions — `CreateSession`
-//!   is not implemented, so no call can put one into the store — so every `ResourceId`
-//!   addresses a session that does not exist and the read is the modelled
-//!   `EntityNotFoundException` naming it. Handing out a URL for a session nothing created
-//!   would be worse: the URL would address a dashboard of a resource that is not there.
+//! * `SESSION` is looked up in the Region the request is served in
+//!   ([`crate::state::ComAmazonawsGlueAwsglueState::sessions`]): a session this endpoint
+//!   holds is answered with the dashboard URL of THAT session, and an `ResourceId` no
+//!   session of this endpoint has is the modelled `EntityNotFoundException` naming it.
+//!   Handing out a URL for a session nothing created would be worse: the URL would address
+//!   a dashboard of a resource that is not there.
 //!
 //! `RequestOrigin` ("the origin of the request") does not change which kind is served, so
 //! it changes nothing here.
@@ -93,6 +94,20 @@ use super::types::*;
 /// (`JOB | SESSION`, from `smithy_query shape=GlueResourceType`), the interactive session.
 const SESSION_RESOURCE_TYPE: &str = "SESSION";
 
+/// The Spark monitoring dashboard URL of the session `session_id`, served in `region`.
+///
+/// AWS publishes no format for it — the model says only that `Url` is "The URL for the Spark
+/// monitoring dashboard" of the resource the request named — so what is pinned here is what
+/// a caller can act on: an `https` URL on the regional console host that names the session it
+/// was asked for, built from the Region the request was served in and the id it addressed.
+/// Two calls for one session therefore answer one URL, and no two sessions share one.
+fn session_dashboard_url(region: &str, session_id: &str) -> String {
+    format!(
+        "https://{region}.console.aws.amazon.com/gluestudio/home?region={region}\
+         #/session/{session_id}/dashboard"
+    )
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -165,25 +180,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Neither the engine nor the request metadata decides this answer: the resource
-        // kind does, and the one kind that is looked up is looked up in a store that holds
-        // no sessions (see this module's docs).
-        let _ = (ctx, &self.engine);
         match input.resource_type.as_str() {
-            // "Interactive sessions": addressed by their `Id`, of which this emulator
-            // holds none, so the id the request named names no session.
-            SESSION_RESOURCE_TYPE => Err(GetDashboardUrlErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::session_not_found(
-                        &input.resource_id,
-                    )),
-                    from_federation_source: None,
-                },
-            )
-            .into()),
+            // "Interactive sessions": addressed by their `Id` within the Region that
+            // created them, so that pair is what this read resolves.
+            SESSION_RESOURCE_TYPE => {
+                let Some(state) = crate::state::service_state(&*self.engine) else {
+                    // This operation models a server fault, so an unreachable store is
+                    // reported as that rather than as a client error the caller could act
+                    // on.
+                    return Err(GetDashboardUrlErrorModeled::InternalServiceException(
+                        InternalServiceException {
+                            message: Some("the Glue session store is unavailable".into()),
+                        },
+                    )
+                    .into());
+                };
+                let region = crate::state::request_region(ctx.parts());
+                // Read-only: whether this endpoint holds the session decides the answer,
+                // and nothing is written either way.
+                let held = state.lock().session(&region, &input.resource_id).is_some();
+                if !held {
+                    return Err(GetDashboardUrlErrorModeled::EntityNotFoundException(
+                        EntityNotFoundException {
+                            message: Some(crate::state::messages::session_not_found(
+                                &input.resource_id,
+                            )),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into());
+                }
+                Ok(GetDashboardUrlOutput {
+                    url: session_dashboard_url(&region, &input.resource_id),
+                })
+            }
             // Every other kind of resource — `JOB`, and anything a later model version
             // adds — has no dashboard this operation serves, which is a refusal about the
-            // kind and not about the resource.
+            // kind and not about the resource, so nothing is looked up for it.
             unsupported => Err(
                 GetDashboardUrlErrorModeled::OperationNotSupportedException(
                     OperationNotSupportedException {

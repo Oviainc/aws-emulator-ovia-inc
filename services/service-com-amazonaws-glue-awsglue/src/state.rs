@@ -213,6 +213,17 @@
 //! on the transform as the create named them ([`MlTransformEntry::input_record_tables`]),
 //! which is where its reported schema is taken from.
 //!
+//! INTERACTIVE SESSIONS — the remote Spark runtime environments `CreateSession` provisions
+//! ([`ComAmazonawsGlueAwsglueState::sessions`]) — sit beside the catalog tree, keyed by the
+//! REGION they were created in and then by the `Id` the create chose: every operation that
+//! addresses a session names it by `Id` alone with no `CatalogId`, and the runtime a session
+//! is is provisioned in the Region its create was served in, so a session is served by the
+//! endpoint that created it exactly as a job definition is. A session's status is not final
+//! when the create returns — the environment is still being provisioned — so the record
+//! carries the instant the clock owes it the next status ([`SessionEntry::settles_at`]) and
+//! the instant its own timeouts fall due, and whichever later call reads it materialises
+//! what the clock had already reached.
+//!
 //! Database and table names are folded to lowercase on the way in — the model says
 //! so for both `DatabaseInput$Name` ("For Hive compatibility, this is folded to
 //! lowercase when it is stored") and `TableInput$Name` — and every lookup folds the
@@ -245,7 +256,8 @@ use crate::ops::types::{
     CreateIcebergTableInput, IcebergSchema, JobBookmarkEntry, TableOptimizer,
     TableOptimizerConfiguration,
     CreateMLTransformInput, CsvClassifier,
-    CreateSecurityConfigurationInput, CreateTriggerInput, CreateWorkflowInput, CustomEntityType,
+    CreateSecurityConfigurationInput, CreateSessionInput, CreateTriggerInput, CreateWorkflowInput,
+    CustomEntityType,
     DataCatalogEncryptionSettings, DataLakeAccessPropertiesOutput, DataLakePrincipal,
     DataQualityRuleRecommendationRunAdditionalRunOptions, DataQualityTargetTable,
     DataSource, Database, DatabaseIdentifier, DatabaseInput,
@@ -260,7 +272,8 @@ use crate::ops::types::{
     ProfileConfiguration,
     RLSProperties,
     RecrawlPolicy, RegistryId, Schedule,
-    SchemaChangePolicy, SchemaColumn, SchemaId, SecurityConfiguration, SourceControlDetails,
+    SchemaChangePolicy, SchemaColumn, SchemaId, SecurityConfiguration, Session, SessionCommand,
+    SourceControlDetails,
     SourceProcessingProperties, SourceTableConfig,
     StartColumnStatisticsTaskRunInput,
     StartDataQualityRuleRecommendationRunInput,
@@ -471,6 +484,13 @@ pub const MAX_WORKFLOWS: usize = 1_000;
 /// of records one process will hold is bounded here. A create past the ceiling is refused
 /// with `CreateBlueprint`'s own modelled `ResourceNumberLimitExceededException`.
 pub const MAX_BLUEPRINTS: usize = 1_000;
+
+/// Ceiling on the interactive sessions this emulator will hold, for the same reason as
+/// [`MAX_CRAWLERS`]: `CreateSession` writes a record any caller can reach, each one carrying
+/// its default arguments and connections, so the number of records one process will hold is
+/// bounded here. A create past the ceiling is refused with `CreateSession`'s own modelled
+/// `ResourceNumberLimitExceededException`.
+pub const MAX_SESSIONS: usize = 1_000;
 
 /// Ceiling on the glossary terms this emulator will hold, for the same reason as
 /// [`MAX_GLOSSARIES`]: `CreateGlossaryTerm` writes a record any caller can reach, each one
@@ -1079,6 +1099,19 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// case fold for a blueprint name, whose pattern (`^[\.\-_A-Za-z0-9]+$`) admits both
     /// cases and so distinguishes them.
     pub blueprints: BTreeMap<String, BlueprintEntry>,
+    /// Every interactive session this emulator holds, keyed by the REGION it was created in
+    /// and then by the `Id` its create chose, in id order.
+    ///
+    /// Sessions live BESIDE the catalog tree, like jobs and triggers: `GetSession`,
+    /// `StopSession`, `DeleteSession` and every statement operation address a session by
+    /// `Id` alone, with no `CatalogId` member. The outer key is the Region for the reason a
+    /// job's is: Glue is a REGIONAL service and a session is a runtime provisioned in the
+    /// Region its create was served in, so a session created through one Region's endpoint is
+    /// served only through that endpoint and the same id is free in every other Region. The
+    /// inner map is ordered, so `ListSessions` has one deterministic order to page over, and
+    /// bounded by [`MAX_SESSIONS`]; its key is the id exactly as sent — the model documents
+    /// no case fold for `NameString`.
+    pub sessions: HashMap<String, BTreeMap<String, SessionEntry>>,
     /// The Glue IDENTITY CENTER CONFIGURATION of this account, or `None` while the account
     /// has none.
     ///
@@ -1707,6 +1740,44 @@ impl ComAmazonawsGlueAwsglueState {
     /// [`Self::blueprint`] mutably: the one record every write to a blueprint lands in.
     pub fn blueprint_mut(&mut self, name: &str) -> Option<&mut BlueprintEntry> {
         self.blueprints.get_mut(name)
+    }
+
+    /// Whether the store can hold another interactive session, i.e. is below
+    /// [`MAX_SESSIONS`].
+    pub fn can_store_session(&self) -> bool {
+        self.stored_sessions() < MAX_SESSIONS
+    }
+
+    /// How many interactive sessions this store holds across every Region. The walk is over
+    /// the Regions one process has been addressed in, so it is bounded.
+    pub fn stored_sessions(&self) -> usize {
+        self.sessions.values().map(BTreeMap::len).sum()
+    }
+
+    /// The session `id` of the Region `region`, or `None` when that Region holds no session
+    /// under that id — which is every session of every other Region, because a session is
+    /// served only through the endpoint that created it.
+    pub fn session(&self, region: &str, id: &str) -> Option<&SessionEntry> {
+        self.sessions
+            .get(region)
+            .and_then(|sessions| sessions.get(id))
+    }
+
+    /// [`Self::session`] mutably: the one record every write to a session lands in, so the
+    /// operations that read, stop and delete a session reach the record its reads report
+    /// rather than a copy of it.
+    pub fn session_mut(&mut self, region: &str, id: &str) -> Option<&mut SessionEntry> {
+        self.sessions
+            .get_mut(region)
+            .and_then(|sessions| sessions.get_mut(id))
+    }
+
+    /// Store `entry` as the Region `region`'s session under its own id.
+    pub fn insert_session(&mut self, region: &str, entry: SessionEntry) {
+        self.sessions
+            .entry(region.to_string())
+            .or_default()
+            .insert(entry.id.clone(), entry);
     }
 
     /// Start a run of the blueprint `input` names at `now` and answer the id minted for that
@@ -5293,6 +5364,274 @@ impl CustomEntityTypeEntry {
     }
 }
 
+/// The `SessionStatus` a session is in the instant its create returns: the remote Spark
+/// environment is still being provisioned. One of the modelled `SessionStatus` values
+/// (`PROVISIONING`, `READY`, `FAILED`, `TIMEOUT`, `STOPPING`, `STOPPED`, from
+/// `smithy_query shape=SessionStatus`).
+pub const SESSION_STATUS_PROVISIONING: &str = "PROVISIONING";
+
+/// The `SessionStatus` of a session whose environment is up and can take statements. See
+/// [`SESSION_STATUS_PROVISIONING`].
+pub const SESSION_STATUS_READY: &str = "READY";
+
+/// The `SessionStatus` of a session its own timeout ended: "the number of minutes when idle
+/// before session times out" (`CreateSessionRequest$IdleTimeout`) has passed. See
+/// [`SESSION_STATUS_PROVISIONING`].
+pub const SESSION_STATUS_TIMEOUT: &str = "TIMEOUT";
+
+/// How long a session stays in [`SESSION_STATUS_PROVISIONING`] before the clock owes it
+/// [`SESSION_STATUS_READY`].
+///
+/// CHOSEN, not documented: Glue publishes no duration for provisioning a session, so this is
+/// the emulator's own span, the same one a blueprint registration takes
+/// ([`BLUEPRINT_SETTLES_AFTER`]) — deliberately not zero, so a caller that reads a session
+/// straight after creating it still observes it being provisioned, and the refusals that go
+/// with a session that is not ready. The due instant is stored on the record and
+/// materialised by whichever later call reads it; nothing sleeps.
+pub const SESSION_SETTLES_AFTER: Duration = BLUEPRINT_SETTLES_AFTER;
+
+/// `CreateSessionRequest$Timeout` when the create named none: "The number of minutes before
+/// session times out. Default for Spark ETL jobs is 48 hours (2880 minutes)."
+pub const DEFAULT_SESSION_TIMEOUT_MINUTES: i32 = 2_880;
+
+/// The Glue version a session has to run on, as `CreateSessionRequest$GlueVersion` states
+/// the restriction: "The GlueVersion must be greater than 2.0." A create naming a version
+/// that is not is refused rather than stored.
+pub const MIN_SESSION_GLUE_VERSION: f64 = 2.0;
+
+/// How many seconds one minute of a session's documented timeouts is: both `Timeout` and
+/// `IdleTimeout` are stated in minutes.
+const SECONDS_PER_MINUTE: u64 = 60;
+
+/// Whether `glue_version` fails the restriction quoted on [`MIN_SESSION_GLUE_VERSION`], and
+/// the refusal to state when it does.
+///
+/// A `GlueVersion` this cannot read as a number (the model's pattern `^(\w+\.)+\w+$` is
+/// wider than a decimal) fails nothing: the restriction is stated as a version comparison,
+/// so a version no comparison can be made against is not refused by it — the same reading
+/// [`admits_flex_execution_class`] takes of its own version restriction.
+pub fn session_glue_version_defect(glue_version: &str) -> Option<String> {
+    let version = glue_version.parse::<f64>().ok()?;
+    (version <= MIN_SESSION_GLUE_VERSION)
+        .then(|| messages::session_glue_version_too_low(glue_version))
+}
+
+/// A stored interactive session: the remote Spark runtime environment a session create
+/// provisions, "the period in which a remote Spark runtime environment is running"
+/// (`Session`).
+///
+/// Everything a caller can observe through the modelled `Session` shape is held here — the
+/// id it is addressed by, the command, role and capacity the create asked for, when it was
+/// created and the status its provisioning has reached — plus the two documented timeouts
+/// and the `Tags` the create carried, neither of which that shape reports.
+#[derive(Debug, Clone)]
+pub struct SessionEntry {
+    /// `Session$Id`: "The ID of the session", which is also this record's key in
+    /// [`ComAmazonawsGlueAwsglueState::sessions`]. The create chooses it
+    /// (`CreateSessionRequest$Id`, "The ID of the session request"), so it is not minted
+    /// here.
+    pub id: String,
+    /// `Session$CreatedOn`: "The time and date when the session was created."
+    pub created_on: SystemTime,
+    /// The instant this session was last active, which is where the IDLE leg of its timeout
+    /// is measured from ([`Self::times_out_at`]). A session nothing has run a statement on
+    /// has been idle since it was created.
+    pub last_active_on: SystemTime,
+    /// One of the modelled `SessionStatus` values: "The session status."
+    pub status: String,
+    /// The instant the clock owes this session its next status; `None` once its
+    /// provisioning has settled.
+    pub settles_at: Option<SystemTime>,
+    /// `Session$CompletedOn`: "The date and time that this session is completed", and
+    /// `None` while it is still running.
+    pub completed_on: Option<SystemTime>,
+    /// `Session$Description`: "The description of the session", and `None` when the create
+    /// carried none.
+    pub description: Option<String>,
+    /// `Session$Role`: "The name or Amazon Resource Name (ARN) of the IAM role associated
+    /// with the Session", exactly as the create sent it.
+    pub role: String,
+    /// `Session$Command`: "The command object", as the create described it.
+    pub command: SessionCommand,
+    /// `Session$DefaultArguments`: "A map array of key-value pairs", and `None` when the
+    /// create carried no map at all — which a read reports differently from an empty one.
+    pub default_arguments: Option<HashMap<String, String>>,
+    /// `Session$Connections`: "The number of connections used for the session."
+    pub connections: Option<ConnectionsList>,
+    /// The session's capacity in DPUs: what the create named, else what its worker
+    /// configuration maps to ([`dpu_per_worker`]), resolved by the one helper every
+    /// capacity-carrying request goes through.
+    pub max_capacity: Option<f64>,
+    /// `Session$NumberOfWorkers`: "The number of workers of a defined `WorkerType` to use
+    /// for the session", as the create named it.
+    pub number_of_workers: Option<i32>,
+    /// `Session$WorkerType`: "The type of predefined worker that is allocated when a
+    /// session runs", as the create named it.
+    pub worker_type: Option<String>,
+    /// `Session$SecurityConfiguration`: "The name of the SecurityConfiguration structure to
+    /// be used with the session."
+    pub security_configuration: Option<String>,
+    /// `Session$GlueVersion`: "The Glue version determines the versions of Apache Spark and
+    /// Python that Glue supports", as the create named it. `None` when it named none: the
+    /// model documents no default for a session's Glue version, so none is invented here.
+    pub glue_version: Option<String>,
+    /// `Session$SessionType`: "The type of the session", one of the modelled `SessionType`
+    /// values, as the create named it.
+    pub session_type: Option<String>,
+    /// "The number of minutes before session times out"
+    /// (`CreateSessionRequest$Timeout`), defaulted by
+    /// [`DEFAULT_SESSION_TIMEOUT_MINUTES`] when the create named none.
+    ///
+    /// The modelled `Session` shape carries NO `Timeout` member, so this is not reported;
+    /// it is kept because it bounds how long the session runs and is the documented default
+    /// for [`Self::idle_timeout`].
+    pub timeout: i32,
+    /// `Session$IdleTimeout`: "The number of minutes when idle before the session times
+    /// out", which for a create that named none is the value of [`Self::timeout`] ("Default
+    /// for Spark ETL jobs is value of Timeout").
+    pub idle_timeout: i32,
+    /// The tags the session was created with, which the modelled `Session` shape does not
+    /// carry.
+    ///
+    /// Kept because `ListSessions` takes "the tags" to narrow its answer by, so they decide
+    /// which sessions a filtered listing reports. NOT yet reachable through the tagging
+    /// operations, for the reason [`BlueprintEntry::tags`] gives: [`TaggedResourceKind`]
+    /// carries no session variant yet.
+    pub tags: HashMap<String, String>,
+}
+
+impl SessionEntry {
+    /// Record the session a session create describes, in [`SESSION_STATUS_PROVISIONING`]
+    /// with [`SESSION_STATUS_READY`] due [`SESSION_SETTLES_AFTER`] out, and every other
+    /// member taken from the request or from the default the model documents for it.
+    pub fn from_create_input(input: &CreateSessionInput, now: SystemTime) -> Self {
+        let timeout = input.timeout.unwrap_or(DEFAULT_SESSION_TIMEOUT_MINUTES);
+        Self {
+            id: input.id.clone(),
+            created_on: now,
+            last_active_on: now,
+            status: SESSION_STATUS_PROVISIONING.to_string(),
+            settles_at: Some(now.checked_add(SESSION_SETTLES_AFTER).unwrap_or(now)),
+            completed_on: None,
+            description: input.description.clone(),
+            role: input.role.clone(),
+            command: input.command.clone(),
+            default_arguments: input.default_arguments.clone(),
+            connections: input.connections.clone(),
+            // The same three members a job's capacity is read from, with the same
+            // documentation, so they resolve through the same helper.
+            max_capacity: capacity_from(
+                input.max_capacity,
+                0,
+                input.worker_type.as_deref(),
+                input.number_of_workers,
+            ),
+            number_of_workers: input.number_of_workers,
+            worker_type: input.worker_type.clone(),
+            security_configuration: input.security_configuration.clone(),
+            glue_version: input.glue_version.clone(),
+            session_type: input.session_type.clone(),
+            timeout,
+            // "Default for Spark ETL jobs is value of Timeout."
+            idle_timeout: input.idle_timeout.unwrap_or(timeout),
+            tags: input.tags.clone().unwrap_or_default(),
+        }
+    }
+
+    /// The instant this session's own timeouts fall due: the earlier of the two the model
+    /// documents — [`Self::timeout`] minutes after it was created ("The number of minutes
+    /// before session times out") and [`Self::idle_timeout`] minutes after it was last
+    /// active ("The number of minutes when idle before the session times out").
+    ///
+    /// `None` when neither instant is representable, which leaves the session running.
+    pub fn times_out_at(&self) -> Option<SystemTime> {
+        let after = |from: SystemTime, minutes: i32| {
+            let minutes = u64::try_from(minutes).ok()?;
+            from.checked_add(Duration::from_secs(minutes * SECONDS_PER_MINUTE))
+        };
+        let whole_life = after(self.created_on, self.timeout);
+        let idle = after(self.last_active_on, self.idle_timeout);
+        match (whole_life, idle) {
+            (Some(whole_life), Some(idle)) => Some(whole_life.min(idle)),
+            (due, None) | (None, due) => due,
+        }
+    }
+
+    /// Move this session into the status the clock owed it at `now`, if it owed one.
+    ///
+    /// Two changes are due by the clock alone, so materialising them on a read reports the
+    /// status the clock had already reached and two reads of a settled session agree: the
+    /// provisioning that was due to finish at [`Self::settles_at`], and the timeout that
+    /// was due at [`Self::times_out_at`]. A session already in a status nothing but a
+    /// caller can leave is untouched.
+    pub fn settle_if_due(&mut self, now: SystemTime) {
+        if self.status == SESSION_STATUS_PROVISIONING {
+            if self.settles_at.is_none_or(|due| due > now) {
+                return;
+            }
+            self.settles_at = None;
+            self.status = SESSION_STATUS_READY.to_string();
+        }
+        if self.status != SESSION_STATUS_READY {
+            return;
+        }
+        if let Some(due) = self.times_out_at().filter(|due| *due <= now) {
+            self.status = SESSION_STATUS_TIMEOUT.to_string();
+            // The session ended when the timeout fell due, not when somebody read it.
+            self.completed_on = Some(due);
+        }
+    }
+
+    /// `Session$ExecutionTime`: "The total time the session ran for", in seconds — the span
+    /// from the instant it was created to the instant it completed, and `None` while it is
+    /// still running.
+    fn execution_time(&self) -> Option<f64> {
+        self.completed_on?
+            .duration_since(self.created_on)
+            .ok()
+            .map(|ran| ran.as_secs_f64())
+    }
+
+    /// Rebuild the modelled `Session` shape from what is stored, so every reader of a
+    /// session reports the same record.
+    pub fn to_session(&self) -> Session {
+        let execution_time = self.execution_time();
+        Session {
+            id: Some(self.id.clone()),
+            created_on: Some(to_date_time(self.created_on)),
+            status: Some(self.status.clone()),
+            // "The error message displayed during the session": a session this store
+            // accepted has none.
+            error_message: None,
+            description: self.description.clone(),
+            role: Some(self.role.clone()),
+            command: Some(self.command.clone()),
+            default_arguments: self.default_arguments.clone(),
+            connections: self.connections.clone(),
+            // "The code execution progress of the session", which is the model's own
+            // default until a statement of this session has run code.
+            progress: 0.0,
+            max_capacity: self.max_capacity,
+            security_configuration: self.security_configuration.clone(),
+            glue_version: self.glue_version.clone(),
+            number_of_workers: self.number_of_workers,
+            worker_type: self.worker_type.clone(),
+            completed_on: self.completed_on.map(to_date_time),
+            execution_time,
+            // "The DPUs consumed by the session (formula: ExecutionTime * MaxCapacity)",
+            // which is reportable once both of those are.
+            dpu_seconds: execution_time
+                .zip(self.max_capacity)
+                .map(|(ran, capacity)| ran * capacity),
+            idle_timeout: Some(self.idle_timeout),
+            // "The name of an Glue usage profile associated with the session": a session
+            // create carries no profile member, so no session this store holds has one.
+            profile_name: None,
+            session_type: self.session_type.clone(),
+        }
+    }
+}
+
 /// The `BlueprintStatus` a blueprint is in the instant its registration is recorded:
 /// "Creating — The blueprint registration is in progress" (`Blueprint$Status`). One of the
 /// modelled `BlueprintStatus` values, whose published list the generated
@@ -8243,7 +8582,8 @@ fn capacity_members(
 /// configuration the model gives a DPU figure for is named.
 ///
 /// `CreateJob`, `UpdateJob` and `StartJobRun` carry the same four members and the same
-/// documentation for each, so all three resolve capacity here.
+/// documentation for each, and a session create carries three of them under that same
+/// documentation, so all of them resolve capacity here.
 fn capacity_from(
     max_capacity: Option<f64>,
     allocated_capacity: i32,
@@ -10494,6 +10834,33 @@ pub mod messages {
     /// including its wording, built from the requested `Name`.
     pub fn usage_profile_not_found(name: &str) -> String {
         format!("UsageProfile {name} does not exists")
+    }
+
+    /// A session create for an `Id` this Region already holds a session under. NOT
+    /// recorded: the sentence follows the per-resource template of [`session_not_found`],
+    /// built from the id the request sent, which is the whole address of a session, and the
+    /// behaviour it goes with is 400 with the create's modelled `AlreadyExistsException`.
+    pub fn session_already_exists(id: &str) -> String {
+        format!("Session {id} already exists.")
+    }
+
+    /// A session create whose `GlueVersion` fails the restriction the model states for it
+    /// ([`super::session_glue_version_defect`]). NOT recorded: what is pinned is the
+    /// behaviour — 400 with the create's modelled `InvalidInputException` — and a sentence
+    /// carrying the value the request sent plus the bound it has to clear, as
+    /// [`malformed_identity_center_instance_arn`] does for its own member.
+    pub fn session_glue_version_too_low(glue_version: &str) -> String {
+        let minimum = super::MIN_SESSION_GLUE_VERSION;
+        format!(
+            "GlueVersion {glue_version} is not supported for sessions, whose GlueVersion \
+             must be greater than {minimum:.1}"
+        )
+    }
+
+    /// A session create this endpoint cannot take another session for. Its own capacity,
+    /// not an AWS quota, so the sentence says which ceiling was reached.
+    pub fn too_many_sessions(ceiling: usize) -> String {
+        format!("this endpoint holds {ceiling} sessions, which is as many as it can hold")
     }
 
     /// A usage profile write whose `ConfigurationObject` sets a `DefaultValue` above the

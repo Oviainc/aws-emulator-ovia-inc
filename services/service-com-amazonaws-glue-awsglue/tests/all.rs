@@ -187,6 +187,8 @@ mod schema_registry;
 mod search_tables;
 #[path = "all/security_configurations.rs"]
 mod security_configurations;
+#[path = "all/sessions.rs"]
+mod sessions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/store_capacity.rs"]
