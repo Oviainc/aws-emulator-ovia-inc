@@ -79,6 +79,8 @@ mod list_ingest_configurations;
 mod list_participant_replicas_paging;
 #[path = "all/minted_identities.rs"]
 mod minted_identities;
+#[path = "all/page_token_filter_scope.rs"]
+mod page_token_filter_scope;
 #[path = "all/page_token_scope.rs"]
 mod page_token_scope;
 #[path = "all/participant_events.rs"]

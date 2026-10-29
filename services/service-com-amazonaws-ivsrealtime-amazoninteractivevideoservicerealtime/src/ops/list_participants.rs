@@ -208,36 +208,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // member and `false` are one value on the wire and in this input: the filter
         // is the one the member describes ("only show participants who published"),
         // which `false` does not ask for.
-        let supplied: Vec<&str> = [
-            ("filterByUserId", input.filter_by_user_id.is_some()),
-            ("filterByPublished", input.filter_by_published),
-            ("filterByState", input.filter_by_state.is_some()),
+        let filters: [crate::state::FilterTerm<'_>; 4] = [
+            ("filterByUserId", input.filter_by_user_id.as_deref()),
+            (
+                "filterByPublished",
+                // The filter is the one the member describes, which only `true` asks for,
+                // so `false` — the modelled default, and an absent member — is the same
+                // scope as carrying no filter at all.
+                input.filter_by_published.then_some("true"),
+            ),
+            ("filterByState", input.filter_by_state.as_deref()),
             (
                 "filterByRecordingState",
-                input.filter_by_recording_state.is_some(),
+                input.filter_by_recording_state.as_deref(),
             ),
-        ]
-        .into_iter()
-        .filter(|(_, provided)| *provided)
-        .map(|(member, _)| member)
-        .collect();
+        ];
+        let supplied: Vec<&str> = filters
+            .iter()
+            .filter(|(_, value)| value.is_some())
+            .map(|(member, _)| *member)
+            .collect();
         if supplied.len() > 1 {
             return Err(crate::state::validation_failed(
                 ListParticipantsErrorModeled::ValidationException,
                 crate::state::mutually_exclusive_members_message(
                     Self::NAME,
                     &supplied,
-                    &EXCLUSIVE_FILTERS,
+                    // The whole exclusive set is the filter members this listing has, in
+                    // the order the model's own doc lists them.
+                    &filters.map(|(member, _)| member),
                 ),
             ));
         }
 
         // A `nextToken` this operation did not issue names no position, so it is
         // refused rather than read as "start from the beginning" — including a token
-        // from this service's other listing, and one this operation issued for ANOTHER
-        // stage session, each of which names a position among records these pages do not
-        // hold. A position is an ordinal among the participants of one session, so the
-        // token is read only for the session this request itself names.
+        // from this service's other listing, one this operation issued for ANOTHER
+        // stage session, and one it issued under ANOTHER filter selection, each of which
+        // names a position among records these pages do not hold. A position is an
+        // ordinal among the participants ONE request's terms select, so the token is read
+        // only for the session and the filter this request itself names.
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
@@ -245,6 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &region,
                     &input.stage_arn,
                     &input.session_id,
+                    &filters,
                     token,
                 )
                 .ok_or_else(|| {
@@ -320,6 +331,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &region,
                 &input.stage_arn,
                 &input.session_id,
+                &filters,
                 matching[page_size - 1].sequence,
             )
         });
@@ -330,15 +342,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The four filter members, in the order the model's own doc lists them, only one of
-/// which one request may carry.
-const EXCLUSIVE_FILTERS: [&str; 4] = [
-    "filterByUserId",
-    "filterByPublished",
-    "filterByState",
-    "filterByRecordingState",
-];
 
 /// Whether `record` is selected by the filter the request carries.
 ///

@@ -169,21 +169,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::store_unavailable(ListCompositionsErrorModeled::InternalServerException)
         })?;
 
+        // The filter members this request carries, in the order the model declares them,
+        // each with the value this request gave it. ONE list, read by both the filtering
+        // below and the page token: a filter selects which compositions a page holds, so
+        // it is a term of that page's scope.
+        let filters: [crate::state::FilterTerm<'_>; 2] = [
+            ("filterByStageArn", input.filter_by_stage_arn.as_deref()),
+            (
+                "filterByEncoderConfigurationArn",
+                input.filter_by_encoder_configuration_arn.as_deref(),
+            ),
+        ];
+        let [(_, by_stage_arn), (_, by_encoder_configuration_arn)] = filters;
+
         // A `nextToken` this listing did not issue names no position, so it is refused
         // rather than read as "start from the beginning" — including a token from this
-        // service's other listings, and one this listing issued in ANOTHER region, each
-        // of which names a position among records these pages do not hold.
+        // service's other listings, one this listing issued in ANOTHER region, and one it
+        // issued under ANOTHER filter selection, each of which names a position among
+        // records these pages do not hold: the filters are applied before the position is
+        // compared, so a position counted among one stage's or one encoder
+        // configuration's compositions is no position among another's.
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
-                crate::state::decode_composition_page_token(&region, token).ok_or_else(|| {
-                    crate::state::validation_failed(
-                        ListCompositionsErrorModeled::ValidationException,
-                        // The one rule this service words a foreign page token with,
-                        // shared with its other listings.
-                        crate::state::foreign_page_token_message(Self::NAME),
-                    )
-                })?,
+                crate::state::decode_composition_page_token(&region, &filters, token).ok_or_else(
+                    || {
+                        crate::state::validation_failed(
+                            ListCompositionsErrorModeled::ValidationException,
+                            // The one rule this service words a foreign page token with,
+                            // shared with its other listings.
+                            crate::state::foreign_page_token_message(Self::NAME),
+                        )
+                    },
+                )?,
             ),
         };
         let page_size = input
@@ -219,15 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .compositions_in_order(&region)
             .into_iter()
             .filter(|record| {
-                input
-                    .filter_by_stage_arn
-                    .as_deref()
-                    .is_none_or(|stage_arn| record.stage_arn == stage_arn)
+                by_stage_arn.is_none_or(|stage_arn| record.stage_arn == stage_arn)
             })
             .filter(|record| {
-                input
-                    .filter_by_encoder_configuration_arn
-                    .as_deref()
+                by_encoder_configuration_arn
                     .is_none_or(|arn| record.uses_encoder_configuration(arn))
             })
             .filter(|record| resume_after.is_none_or(|after| record.sequence > after))
@@ -240,7 +253,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A token only when a composition is left over, and it names the position this
         // page ended at: the last page carries none.
         let next_token = (matching.len() > page_size).then(|| {
-            crate::state::encode_composition_page_token(&region, matching[page_size - 1].sequence)
+            crate::state::encode_composition_page_token(
+                &region,
+                &filters,
+                matching[page_size - 1].sequence,
+            )
         });
 
         Ok(ListCompositionsOutput {

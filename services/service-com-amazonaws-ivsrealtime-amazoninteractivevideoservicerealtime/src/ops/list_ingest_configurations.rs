@@ -174,46 +174,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // The filter members this request carries, in the order the model declares them,
+        // each with the value this request gave it. ONE list, read by both the "only one
+        // filter" refusal below and the page token further down: a filter selects which
+        // configurations a page holds, so it is a term of that page's scope.
+        let filters: [crate::state::FilterTerm<'_>; 2] = [
+            ("filterByStageArn", input.filter_by_stage_arn.as_deref()),
+            ("filterByState", input.filter_by_state.as_deref()),
+        ];
+        let [(_, by_stage_arn), (_, by_state)] = filters;
+
         // "Only one filter (by stage ARN or by state) can be used at a time", as both
         // filter members' own doc states it. A request carrying both is refused rather
         // than served by applying both, the same way `ListParticipants` refuses two of
         // its four — one rule, one wording.
-        let supplied: Vec<&str> = [
-            ("filterByStageArn", input.filter_by_stage_arn.is_some()),
-            ("filterByState", input.filter_by_state.is_some()),
-        ]
-        .into_iter()
-        .filter(|(_, provided)| *provided)
-        .map(|(member, _)| member)
-        .collect();
+        let supplied: Vec<&str> = filters
+            .iter()
+            .filter(|(_, value)| value.is_some())
+            .map(|(member, _)| *member)
+            .collect();
         if supplied.len() > 1 {
             return Err(crate::state::validation_failed(
                 ListIngestConfigurationsErrorModeled::ValidationException,
                 crate::state::mutually_exclusive_members_message(
                     Self::NAME,
                     &supplied,
-                    &EXCLUSIVE_FILTERS,
+                    // The whole exclusive set is the filter members this listing has, in
+                    // the order the model's own doc names them.
+                    &filters.map(|(member, _)| member),
                 ),
             ));
         }
 
         // A `nextToken` this listing did not issue names no position, so it is refused
         // rather than read as "start from the beginning" — including a token from this
-        // service's other listings, and one this listing issued in ANOTHER region, each
-        // of which names a position among records these pages do not hold.
+        // service's other listings, one this listing issued in ANOTHER region, and one it
+        // issued under ANOTHER filter selection, each of which names a position among
+        // records these pages do not hold: the filters are applied before the position is
+        // compared, so a position counted among one stage's or one state's configurations
+        // is no position among another's.
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
-                crate::state::decode_ingest_configuration_page_token(&region, token).ok_or_else(
-                    || {
+                crate::state::decode_ingest_configuration_page_token(&region, &filters, token)
+                    .ok_or_else(|| {
                         crate::state::validation_failed(
                             ListIngestConfigurationsErrorModeled::ValidationException,
                             // The one rule this service words a foreign page token with,
                             // shared with its other listings.
                             crate::state::foreign_page_token_message(Self::NAME),
                         )
-                    },
-                )?,
+                    })?,
             ),
         };
         let page_size = input
@@ -241,19 +252,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ingest_configurations_in_order(&region)
             .into_iter()
             .filter(|record| {
-                input
-                    .filter_by_stage_arn
-                    .as_deref()
-                    .is_none_or(|stage_arn| record.stage_arn == stage_arn)
+                by_stage_arn.is_none_or(|stage_arn| record.stage_arn == stage_arn)
             })
             .filter(|record| {
-                input
-                    .filter_by_state
-                    .as_deref()
-                    // The state a configuration reports is the one its publishers make
-                    // true at this instant, read through the same accessor the full read
-                    // reports, so a filter and a read cannot disagree.
-                    .is_none_or(|wanted| record.state(&store) == wanted)
+                // The state a configuration reports is the one its publishers make true
+                // at this instant, read through the same accessor the full read reports,
+                // so a filter and a read cannot disagree.
+                by_state.is_none_or(|wanted| record.state(&store) == wanted)
             })
             .filter(|record| resume_after.is_none_or(|after| record.sequence > after))
             .collect();
@@ -267,6 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let next_token = (matching.len() > page_size).then(|| {
             crate::state::encode_ingest_configuration_page_token(
                 &region,
+                &filters,
                 matching[page_size - 1].sequence,
             )
         });
@@ -278,7 +284,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The two filter members, in the order the model's own doc names them, only one of which
-/// one request may carry ("Only one filter (by stage ARN or by state) can be used at a
-/// time").
-const EXCLUSIVE_FILTERS: [&str; 2] = ["filterByStageArn", "filterByState"];

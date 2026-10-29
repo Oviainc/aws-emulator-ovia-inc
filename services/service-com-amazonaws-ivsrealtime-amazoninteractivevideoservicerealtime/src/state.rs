@@ -4661,13 +4661,13 @@ pub fn mint_stream_key(
 /// AWS region where the API request is processed" — so the position means nothing in
 /// another region's page and is refused there ([`encode_after`]).
 pub fn encode_page_token(region: &str, after_sequence: u64) -> String {
-    encode_after(PAGE_TOKEN_PREFIX, &[region], after_sequence)
+    encode_after(PAGE_TOKEN_PREFIX, &[region], NO_FILTERS, after_sequence)
 }
 
 /// The creation sequence a `nextToken` resumes after in `region`'s page, or `None` when
 /// the token was not issued by [`encode_page_token`] for that same scope.
 pub fn decode_page_token(region: &str, token: &str) -> Option<u64> {
-    decode_after(PAGE_TOKEN_PREFIX, &[region], token)
+    decode_after(PAGE_TOKEN_PREFIX, &[region], NO_FILTERS, token)
 }
 
 /// The opaque `nextToken` a `ListParticipants` page ends with: the join sequence of
@@ -4675,34 +4675,39 @@ pub fn decode_page_token(region: &str, token: &str) -> Option<u64> {
 ///
 /// Encoded exactly as [`encode_page_token`] is, under its own prefix
 /// ([`PARTICIPANT_PAGE_TOKEN_PREFIX`]) and over the scope this listing pages within —
-/// the region, the stage and the session whose participants the page held — so a token
-/// one listing or one session issued names no position in another.
+/// the region, the stage and the session whose participants the page held, and the
+/// filter members the request carried, which narrow those participants further — so a
+/// token one listing, one session or one filter issued names no position in another.
 pub fn encode_participant_page_token(
     region: &str,
     stage_arn: &str,
     session_id: &str,
+    filters: &[FilterTerm<'_>],
     after_sequence: u64,
 ) -> String {
     encode_after(
         PARTICIPANT_PAGE_TOKEN_PREFIX,
         &[region, stage_arn, session_id],
+        filters,
         after_sequence,
     )
 }
 
 /// The join sequence a `ListParticipants` `nextToken` resumes after among the
 /// participants of this stage session, or `None` when the token was not issued by
-/// [`encode_participant_page_token`] for that same scope — a token of another listing or
-/// of another session included.
+/// [`encode_participant_page_token`] for that same scope — a token of another listing, of
+/// another session or of another filter selection included.
 pub fn decode_participant_page_token(
     region: &str,
     stage_arn: &str,
     session_id: &str,
+    filters: &[FilterTerm<'_>],
     token: &str,
 ) -> Option<u64> {
     decode_after(
         PARTICIPANT_PAGE_TOKEN_PREFIX,
         &[region, stage_arn, session_id],
+        filters,
         token,
     )
 }
@@ -4721,6 +4726,7 @@ pub fn encode_participant_event_page_token(
     encode_after(
         PARTICIPANT_EVENT_PAGE_TOKEN_PREFIX,
         &[region, stage_arn, session_id, participant_id],
+        NO_FILTERS,
         after_sequence,
     )
 }
@@ -4739,6 +4745,7 @@ pub fn decode_participant_event_page_token(
     decode_after(
         PARTICIPANT_EVENT_PAGE_TOKEN_PREFIX,
         &[region, stage_arn, session_id, participant_id],
+        NO_FILTERS,
         token,
     )
 }
@@ -4754,6 +4761,7 @@ pub fn encode_stage_session_page_token(
     encode_after(
         STAGE_SESSION_PAGE_TOKEN_PREFIX,
         &[region, stage_arn],
+        NO_FILTERS,
         after_sequence,
     )
 }
@@ -4767,7 +4775,12 @@ pub fn decode_stage_session_page_token(
     stage_arn: &str,
     token: &str,
 ) -> Option<u64> {
-    decode_after(STAGE_SESSION_PAGE_TOKEN_PREFIX, &[region, stage_arn], token)
+    decode_after(
+        STAGE_SESSION_PAGE_TOKEN_PREFIX,
+        &[region, stage_arn],
+        NO_FILTERS,
+        token,
+    )
 }
 
 /// [`encode_page_token`] for a `ListParticipantReplicas` page: the start sequence the
@@ -4783,6 +4796,7 @@ pub fn encode_replica_page_token(
     encode_after(
         REPLICA_PAGE_TOKEN_PREFIX,
         &[region, source_stage_arn, participant_id],
+        NO_FILTERS,
         after_sequence,
     )
 }
@@ -4800,6 +4814,7 @@ pub fn decode_replica_page_token(
     decode_after(
         REPLICA_PAGE_TOKEN_PREFIX,
         &[region, source_stage_arn, participant_id],
+        NO_FILTERS,
         token,
     )
 }
@@ -4811,6 +4826,7 @@ pub fn encode_storage_configuration_page_token(region: &str, after_sequence: u64
     encode_after(
         STORAGE_CONFIGURATION_PAGE_TOKEN_PREFIX,
         &[region],
+        NO_FILTERS,
         after_sequence,
     )
 }
@@ -4819,7 +4835,12 @@ pub fn encode_storage_configuration_page_token(region: &str, after_sequence: u64
 /// when the token was not issued by [`encode_storage_configuration_page_token`] for that
 /// same scope — a token of another listing or of another region included.
 pub fn decode_storage_configuration_page_token(region: &str, token: &str) -> Option<u64> {
-    decode_after(STORAGE_CONFIGURATION_PAGE_TOKEN_PREFIX, &[region], token)
+    decode_after(
+        STORAGE_CONFIGURATION_PAGE_TOKEN_PREFIX,
+        &[region],
+        NO_FILTERS,
+        token,
+    )
 }
 
 /// [`encode_page_token`] for a `ListEncoderConfigurations` page: the creation sequence
@@ -4829,6 +4850,7 @@ pub fn encode_encoder_configuration_page_token(region: &str, after_sequence: u64
     encode_after(
         ENCODER_CONFIGURATION_PAGE_TOKEN_PREFIX,
         &[region],
+        NO_FILTERS,
         after_sequence,
     )
 }
@@ -4837,79 +4859,156 @@ pub fn encode_encoder_configuration_page_token(region: &str, after_sequence: u64
 /// when the token was not issued by [`encode_encoder_configuration_page_token`] for that
 /// same scope — a token of another listing or of another region included.
 pub fn decode_encoder_configuration_page_token(region: &str, token: &str) -> Option<u64> {
-    decode_after(ENCODER_CONFIGURATION_PAGE_TOKEN_PREFIX, &[region], token)
+    decode_after(
+        ENCODER_CONFIGURATION_PAGE_TOKEN_PREFIX,
+        &[region],
+        NO_FILTERS,
+        token,
+    )
 }
 
 /// [`encode_page_token`] for a `ListIngestConfigurations` page: the creation sequence the
 /// next page of ingest configurations resumes after, under that listing's own marker and
-/// over the region whose view the page reported.
-pub fn encode_ingest_configuration_page_token(region: &str, after_sequence: u64) -> String {
+/// over the scope the page reported — the region whose view it is, and the filter members
+/// the request carried, which select which of that region's configurations the page
+/// holds.
+pub fn encode_ingest_configuration_page_token(
+    region: &str,
+    filters: &[FilterTerm<'_>],
+    after_sequence: u64,
+) -> String {
     encode_after(
         INGEST_CONFIGURATION_PAGE_TOKEN_PREFIX,
         &[region],
+        filters,
         after_sequence,
     )
 }
 
 /// The creation sequence an ingest-configuration `nextToken` resumes after, or `None`
 /// when the token was not issued by [`encode_ingest_configuration_page_token`] for that
-/// same scope — a token of another listing or of another region included.
-pub fn decode_ingest_configuration_page_token(region: &str, token: &str) -> Option<u64> {
-    decode_after(INGEST_CONFIGURATION_PAGE_TOKEN_PREFIX, &[region], token)
+/// same scope — a token of another listing, of another region or of another filter
+/// selection included.
+pub fn decode_ingest_configuration_page_token(
+    region: &str,
+    filters: &[FilterTerm<'_>],
+    token: &str,
+) -> Option<u64> {
+    decode_after(
+        INGEST_CONFIGURATION_PAGE_TOKEN_PREFIX,
+        &[region],
+        filters,
+        token,
+    )
 }
 
 /// [`encode_page_token`] for a `ListCompositions` page: the start sequence the next page
-/// of compositions resumes after, under that listing's own marker and over the region
-/// whose view the page reported.
-pub fn encode_composition_page_token(region: &str, after_sequence: u64) -> String {
-    encode_after(COMPOSITION_PAGE_TOKEN_PREFIX, &[region], after_sequence)
+/// of compositions resumes after, under that listing's own marker and over the scope the
+/// page reported — the region whose view it is, and the filter members the request
+/// carried, which select which of that region's compositions the page holds.
+pub fn encode_composition_page_token(
+    region: &str,
+    filters: &[FilterTerm<'_>],
+    after_sequence: u64,
+) -> String {
+    encode_after(
+        COMPOSITION_PAGE_TOKEN_PREFIX,
+        &[region],
+        filters,
+        after_sequence,
+    )
 }
 
 /// The start sequence a composition `nextToken` resumes after, or `None` when the token
 /// was not issued by [`encode_composition_page_token`] for that same scope — a token of
-/// another listing or of another region included.
-pub fn decode_composition_page_token(region: &str, token: &str) -> Option<u64> {
-    decode_after(COMPOSITION_PAGE_TOKEN_PREFIX, &[region], token)
+/// another listing, of another region or of another filter selection included.
+pub fn decode_composition_page_token(
+    region: &str,
+    filters: &[FilterTerm<'_>],
+    token: &str,
+) -> Option<u64> {
+    decode_after(COMPOSITION_PAGE_TOKEN_PREFIX, &[region], filters, token)
 }
+
+/// One filter member of a listing request: the member's name as the model declares it,
+/// and the value this request gave it — `None` when the request carries that filter not
+/// at all.
+///
+/// A filter member SELECTS which records a page holds, so it is a term of that page's
+/// scope beside the identity terms, and every listing that has filter members hands its
+/// whole set (in the order the model declares them) to the token codec below.
+pub type FilterTerm<'a> = (&'a str, Option<&'a str>);
+
+/// The filter set of a listing whose request has no filter member at all: its scope is
+/// its identity terms alone.
+const NO_FILTERS: &[FilterTerm<'static>] = &[];
 
 /// The one page-token codec, so the listings cannot encode a position two ways.
 ///
 /// A page position is an ordinal in ONE list of records, and which records a listing
-/// pages over is decided by `scope`: the terms of the request that select them. The
-/// token therefore carries that scope beside the position, and [`decode_after`] reads a
-/// position out of it only for the scope the resuming request itself names — so a token
-/// offered to any other scope names no position in the records that page holds, whatever
-/// store-wide sequence it carries.
-fn encode_after(prefix: &str, scope: &[&str], after_sequence: u64) -> String {
+/// pages over is decided by the terms of the request that select them: the identity terms
+/// `scope` names, and the `filters` the request narrows them by. The token therefore
+/// carries both beside the position, and [`decode_after`] reads a position out of it only
+/// for the scope the resuming request itself names — so a token offered to any other
+/// scope names no position in the records that page holds, whatever store-wide sequence it
+/// carries.
+fn encode_after(
+    prefix: &str,
+    scope: &[&str],
+    filters: &[FilterTerm<'_>],
+    after_sequence: u64,
+) -> String {
     ::aws_smithy_types::base64::encode(format!(
         "{}{after_sequence}",
-        scope_marker(prefix, scope)
+        scope_marker(prefix, scope, filters)
     ))
 }
 
-/// The position `token` names under `prefix` within `scope`, or `None` when it names
-/// none there.
-fn decode_after(prefix: &str, scope: &[&str], token: &str) -> Option<u64> {
+/// The position `token` names under `prefix` within the scope `scope` and `filters` name,
+/// or `None` when it names none there.
+fn decode_after(
+    prefix: &str,
+    scope: &[&str],
+    filters: &[FilterTerm<'_>],
+    token: &str,
+) -> Option<u64> {
     let decoded = String::from_utf8(::aws_smithy_types::base64::decode(token).ok()?).ok()?;
     decoded
-        .strip_prefix(&scope_marker(prefix, scope))?
+        .strip_prefix(&scope_marker(prefix, scope, filters))?
         .parse()
         .ok()
 }
 
-/// `prefix` followed by every term of `scope`, each written as its byte length, a `/` and
-/// the term itself, so two different scopes cannot build the same marker however the
-/// terms are punctuated — an ARN carries both `:` and `/`, which a plain separator would
-/// let one term imitate.
-fn scope_marker(prefix: &str, scope: &[&str]) -> String {
+/// `prefix` followed by every term of `scope` and then every filter member, each written
+/// as its byte length, a `/` and the term itself, so two different scopes cannot build the
+/// same marker however the terms are punctuated — an ARN carries both `:` and `/`, which a
+/// plain separator would let one term imitate.
+///
+/// A filter the request carries is written as its member name and then its value; one it
+/// carries not at all is written as its member name alone, so "no filter" and "this
+/// filter, with the empty value" are two scopes — the empty string is a value a filter
+/// member can carry (`ListParticipants`' `filterByUserId` is `@length 0..128`).
+fn scope_marker(prefix: &str, scope: &[&str], filters: &[FilterTerm<'_>]) -> String {
     let mut marker = String::from(prefix);
     for term in scope {
-        marker.push_str(&term.len().to_string());
-        marker.push('/');
-        marker.push_str(term);
-        marker.push(':');
+        push_scope_term(&mut marker, term);
+    }
+    for (member, value) in filters {
+        push_scope_term(&mut marker, member);
+        if let Some(value) = value {
+            marker.push('=');
+            push_scope_term(&mut marker, value);
+        }
     }
     marker
+}
+
+/// Write one scope term onto `marker`: its byte length, a `/`, the term and a `:`.
+fn push_scope_term(marker: &mut String, term: &str) {
+    marker.push_str(&term.len().to_string());
+    marker.push('/');
+    marker.push_str(term);
+    marker.push(':');
 }
 
 // =============================================================================
