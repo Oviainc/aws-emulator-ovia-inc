@@ -10,7 +10,7 @@
 
 use crate::ops::types::{
     Cluster, ClusterInList, ClusterSnapshot, ConflictException, ResourceNotFoundException,
-    ServiceQuotaExceededException, Shard, ValidationException, ValidationExceptionField,
+    ServiceQuotaExceededException, Shard, ValidationException,
 };
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -356,11 +356,13 @@ pub const AWS_OWNED_KMS_KEY: &str = "AWS_OWNED_KMS_KEY";
 /// Tue, Wed, Thu, Fri, Sat, Sun".
 pub const MAINTENANCE_DAYS: &[&str] = &["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
-/// The values `shardCapacity` accepts.
+/// The inclusive bounds `shardCapacity` lies within; inside them it must be a power
+/// of two.
 ///
 /// Source: `CreateClusterInput$shardCapacity` doc — "Maximum is 64. Allowed values
-/// are 2, 4, 8, 16, 32, 64".
-pub const SHARD_CAPACITY_VALUES: &[i32] = &[2, 4, 8, 16, 32, 64];
+/// are 2, 4, 8, 16, 32, 64", which is exactly the powers of two from 2 to 64, and the
+/// form the service's own refusal of the member states the rule in.
+pub const SHARD_CAPACITY_RANGE: (i32, i32) = (2, 64);
 
 /// The largest `shardCount` a cluster may have.
 ///
@@ -437,32 +439,49 @@ pub const SNAPSHOT_NAME_LEN: (usize, usize) = (1, 63);
 /// which fit inside the AWS maximum ARN length.
 pub const MAX_KMS_KEY_ID_LEN: usize = 2048;
 
-/// A `ValidationException` (HTTP 400) for one member that failed a documented
-/// constraint the model does not express.
+/// A `ValidationException` (HTTP 400) for a request value this service refuses.
 ///
-/// The message is built from the request — it names the member and the constraint it
-/// broke — and `reason` is the modelled `fieldValidationFailed`.
-pub fn field_validation_failed(member: &str, constraint: &str) -> ValidationException {
+/// The service states such a refusal as one sentence: the subject it is about, then
+/// the rule that subject broke — `Invalid Input - '<subject>'. <rule>` — and it
+/// carries that sentence in `message` and nothing else, which is why
+/// `ValidationException` declares `reason` and `fieldList` unsupported (see
+/// `ops::types::shared_types`).
+///
+/// `subject` is the rejected value as the request spelled it, which is what a caller
+/// recognises. Where the value cannot be stated back — it is `@sensitive`, it is a
+/// list or a map rather than a scalar, or the rule it broke is its own length, so
+/// restating it would repeat the oversized input — the subject is the name of the
+/// member it arrived on instead. `rule` is a full sentence, ending in a period, that
+/// names the member and states what it must be.
+pub fn invalid_input(subject: &str, rule: &str) -> ValidationException {
     ValidationException {
-        message: format!(
-            "1 validation error detected: Value at '{member}' failed to satisfy constraint: {constraint}"
-        ),
-        reason: "fieldValidationFailed".to_string(),
-        field_list: Some(vec![ValidationExceptionField {
-            name: member.to_string(),
-            message: constraint.to_string(),
-        }]),
+        message: format!("Invalid Input - '{subject}'. {rule}"),
     }
 }
 
-/// Refuse a `shardCapacity` outside the documented allowed values.
+/// The member name as this service spells it inside a refusal sentence: the modelled
+/// member name with an initial capital (`shardCapacity` -> `ShardCapacity`, the
+/// spelling the recorded refusal of that member uses).
+fn member_label(member: &str) -> String {
+    let mut chars = member.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Refuse a `shardCapacity` outside the documented value domain.
 pub fn validate_shard_capacity(member: &str, value: i32) -> Result<(), ValidationException> {
-    if SHARD_CAPACITY_VALUES.contains(&value) {
+    let (min, max) = SHARD_CAPACITY_RANGE;
+    if (min..=max).contains(&value) && (value as u32).is_power_of_two() {
         return Ok(());
     }
-    Err(field_validation_failed(
-        member,
-        "Member must be one of the allowed values [2, 4, 8, 16, 32, 64]",
+    Err(invalid_input(
+        &value.to_string(),
+        &format!(
+            "{} must be a power of 2 within [{min}, {max}].",
+            member_label(member)
+        ),
     ))
 }
 
@@ -471,9 +490,12 @@ pub fn validate_shard_count(member: &str, value: i32) -> Result<(), ValidationEx
     if (1..=SHARD_COUNT_MAX).contains(&value) {
         return Ok(());
     }
-    Err(field_validation_failed(
-        member,
-        &format!("Member must be between 1 and {SHARD_COUNT_MAX}, inclusive"),
+    Err(invalid_input(
+        &value.to_string(),
+        &format!(
+            "{} must be within [1, {SHARD_COUNT_MAX}].",
+            member_label(member)
+        ),
     ))
 }
 
@@ -483,28 +505,34 @@ pub fn validate_shard_instance_count(member: &str, value: i32) -> Result<(), Val
     if value >= 1 {
         return Ok(());
     }
-    Err(field_validation_failed(
-        member,
-        "Member must be at least 1",
+    Err(invalid_input(
+        &value.to_string(),
+        &format!("{} must be at least 1.", member_label(member)),
     ))
 }
 
 /// Refuse an `adminUserPassword` outside the documented length or character rules.
+///
+/// The value is `@sensitive`, so the refusal names the member and never states the
+/// password back.
 pub fn validate_admin_user_password(
     member: &str,
     value: &str,
 ) -> Result<(), ValidationException> {
     let (min, max) = PASSWORD_LEN;
+    let label = member_label(member);
     if !(min..=max).contains(&value.chars().count()) {
-        return Err(field_validation_failed(
+        return Err(invalid_input(
             member,
-            &format!("Member must have length between {min} and {max}, inclusive"),
+            &format!("{label} must contain from {min} to {max} characters."),
         ));
     }
     if value.chars().any(|c| PASSWORD_FORBIDDEN.contains(&c)) {
-        return Err(field_validation_failed(
+        return Err(invalid_input(
             member,
-            "Member must not contain a forward slash (/), a double quote (\") or an at symbol (@)",
+            &format!(
+                "{label} must not contain a forward slash (/), double quote (\") or the at symbol (@)."
+            ),
         ));
     }
     Ok(())
@@ -513,37 +541,50 @@ pub fn validate_admin_user_password(
 /// Refuse a `clusterName` outside the documented form.
 pub fn validate_cluster_name(member: &str, value: &str) -> Result<(), ValidationException> {
     let (min, max) = NAME_LEN;
-    let constraint = format!(
-        "Member must have length between {min} and {max}, inclusive, contain only letters, numbers and hyphens, start with a letter, not end with a hyphen and not contain two consecutive hyphens"
-    );
-    let len = value.chars().count();
-    let well_formed = (min..=max).contains(&len)
-        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    let label = member_label(member);
+    if !(min..=max).contains(&value.chars().count()) {
+        return Err(invalid_input(
+            member,
+            &format!(
+                "{label} must contain from {min} to {max} letters, numbers or hyphens."
+            ),
+        ));
+    }
+    let well_formed = value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         && value.starts_with(|c: char| c.is_ascii_alphabetic())
         && !value.ends_with('-')
         && !value.contains("--");
     if well_formed {
         Ok(())
     } else {
-        Err(field_validation_failed(member, &constraint))
+        Err(invalid_input(
+            value,
+            &format!(
+                "{label} must begin with a letter, contain only letters, numbers or hyphens, \
+                 and must not end with a hyphen or contain two consecutive hyphens."
+            ),
+        ))
     }
 }
 
 /// Refuse an `adminUserName` outside the documented form.
 pub fn validate_admin_user_name(member: &str, value: &str) -> Result<(), ValidationException> {
     let (min, max) = NAME_LEN;
-    let len = value.chars().count();
-    let well_formed = (min..=max).contains(&len)
-        && value.chars().all(|c| c.is_ascii_alphanumeric())
+    let label = member_label(member);
+    if !(min..=max).contains(&value.chars().count()) {
+        return Err(invalid_input(
+            member,
+            &format!("{label} must contain from {min} to {max} letters or numbers."),
+        ));
+    }
+    let well_formed = value.chars().all(|c| c.is_ascii_alphanumeric())
         && value.starts_with(|c: char| c.is_ascii_alphabetic());
     if well_formed {
         Ok(())
     } else {
-        Err(field_validation_failed(
-            member,
-            &format!(
-                "Member must have length between {min} and {max}, inclusive, contain only letters and numbers and start with a letter"
-            ),
+        Err(invalid_input(
+            value,
+            &format!("{label} must begin with a letter and contain only letters or numbers."),
         ))
     }
 }
@@ -654,23 +695,24 @@ pub fn validate_tags(
     member: &str,
     tags: &::std::collections::HashMap<String, String>,
 ) -> Result<(), ValidationException> {
+    let label = member_label(member);
     if tags.len() > MAX_TAGS {
-        return Err(field_validation_failed(
+        return Err(invalid_input(
             member,
-            &format!("Member must not have more than {MAX_TAGS} entries"),
+            &format!("{label} must not contain more than {MAX_TAGS} entries."),
         ));
     }
     for (key, value) in tags {
         if key.is_empty() || key.chars().count() > MAX_TAG_KEY_LEN {
-            return Err(field_validation_failed(
+            return Err(invalid_input(
                 member,
-                &format!("Member keys must have length between 1 and {MAX_TAG_KEY_LEN}, inclusive"),
+                &format!("{label} keys must contain from 1 to {MAX_TAG_KEY_LEN} characters."),
             ));
         }
         if value.chars().count() > MAX_TAG_VALUE_LEN {
-            return Err(field_validation_failed(
+            return Err(invalid_input(
                 member,
-                &format!("Member values must have length at most {MAX_TAG_VALUE_LEN}"),
+                &format!("{label} values must contain at most {MAX_TAG_VALUE_LEN} characters."),
             ));
         }
     }
@@ -680,19 +722,22 @@ pub fn validate_tags(
 /// Refuse a `subnetIds` / `vpcSecurityGroupIds` list longer than
 /// [`MAX_NETWORK_IDS`], or an entry longer than [`MAX_NETWORK_ID_LEN`].
 pub fn validate_id_list(member: &str, ids: &[String]) -> Result<(), ValidationException> {
+    let label = member_label(member);
     if ids.len() > MAX_NETWORK_IDS {
-        return Err(field_validation_failed(
+        return Err(invalid_input(
             member,
-            &format!("Member must not have more than {MAX_NETWORK_IDS} entries"),
+            &format!("{label} must not contain more than {MAX_NETWORK_IDS} entries."),
         ));
     }
     if ids
         .iter()
         .any(|id| id.is_empty() || id.chars().count() > MAX_NETWORK_ID_LEN)
     {
-        return Err(field_validation_failed(
+        return Err(invalid_input(
             member,
-            &format!("Member entries must have length between 1 and {MAX_NETWORK_ID_LEN}, inclusive"),
+            &format!(
+                "{label} entries must contain from 1 to {MAX_NETWORK_ID_LEN} characters."
+            ),
         ));
     }
     Ok(())
@@ -704,9 +749,12 @@ pub fn validate_snapshot_name(member: &str, value: &str) -> Result<(), Validatio
     if (min..=max).contains(&value.chars().count()) {
         return Ok(());
     }
-    Err(field_validation_failed(
+    Err(invalid_input(
         member,
-        &format!("Member must have length between {min} and {max}, inclusive"),
+        &format!(
+            "{} must contain from {min} to {max} characters.",
+            member_label(member)
+        ),
     ))
 }
 
@@ -715,9 +763,12 @@ pub fn validate_kms_key_id(member: &str, value: &str) -> Result<(), ValidationEx
     if !value.is_empty() && value.chars().count() <= MAX_KMS_KEY_ID_LEN {
         return Ok(());
     }
-    Err(field_validation_failed(
+    Err(invalid_input(
         member,
-        &format!("Member must have length between 1 and {MAX_KMS_KEY_ID_LEN}, inclusive"),
+        &format!(
+            "{} must contain from 1 to {MAX_KMS_KEY_ID_LEN} characters.",
+            member_label(member)
+        ),
     ))
 }
 
@@ -733,9 +784,13 @@ pub fn validate_maintenance_window(member: &str, value: &str) -> Result<(), Vali
     if well_formed {
         Ok(())
     } else {
-        Err(field_validation_failed(
-            member,
-            "Member must be of the form ddd:hh24:mi-ddd:hh24:mi, with ddd one of Mon, Tue, Wed, Thu, Fri, Sat, Sun",
+        Err(invalid_input(
+            value,
+            &format!(
+                "{} must be of the form ddd:hh24:mi-ddd:hh24:mi, with ddd one of {days}.",
+                member_label(member),
+                days = MAINTENANCE_DAYS.join(", ")
+            ),
         ))
     }
 }
@@ -752,9 +807,12 @@ pub fn validate_backup_window(member: &str, value: &str) -> Result<(), Validatio
     if well_formed {
         Ok(())
     } else {
-        Err(field_validation_failed(
-            member,
-            "Member must be of the form hh24:mi-hh24:mi",
+        Err(invalid_input(
+            value,
+            &format!(
+                "{} must be of the form hh24:mi-hh24:mi.",
+                member_label(member)
+            ),
         ))
     }
 }

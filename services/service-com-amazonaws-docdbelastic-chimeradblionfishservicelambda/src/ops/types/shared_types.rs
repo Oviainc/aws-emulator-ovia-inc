@@ -64,12 +64,22 @@ pub struct ThrottlingException {
     pub retry_after_seconds: Option<i32>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.docdbelastic#ValidationException")]
+// `ValidationException` models `reason` (@required, one of unknownOperation |
+// cannotParse | fieldValidationFailed | other) and `fieldList`, but DocDB Elastic puts
+// neither on the wire for a refusal it raises itself: the recorded refusal of an
+// out-of-domain `shardCapacity` carries `message` alone, which is the service stating
+// its own rule rather than reporting a per-field boundary failure. Both members are
+// therefore declared unsupported, which keeps them out of the shape's schema and so out
+// of the body the framework writes — rather than classifying every refusal of this
+// service as `fieldValidationFailed` and handing a client a `fieldList` it branches on
+// to tell a boundary failure apart from a service rule.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.docdbelastic#ValidationException",
+    unsupported = ["reason", "fieldList"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ValidationException {
     pub message: String,
-    pub reason: String,
-    pub field_list: Option<Vec<ValidationExceptionField>>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.docdbelastic#ValidationExceptionField")]

@@ -162,9 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let start = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(state::decode_page_token(token).ok_or_else(|| {
-                ListClustersErrorModeled::ValidationException(state::field_validation_failed(
-                    "nextToken",
-                    "Member must be a pagination token this service issued",
+                ListClustersErrorModeled::ValidationException(state::invalid_input(
+                    token,
+                    "NextToken must be a pagination token this service issued.",
                 ))
             })?),
         };
