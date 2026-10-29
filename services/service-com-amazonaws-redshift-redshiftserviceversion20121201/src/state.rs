@@ -1329,9 +1329,13 @@ pub fn reserved_node_exchange_not_found_message(request_id: &str) -> String {
 }
 
 /// What a reserved-node exchange operation answers a `ClusterIdentifier` that
-/// names no cluster this account holds.
+/// names no cluster this account holds: this family's own wording from the
+/// per-operation catalog, [`ClusterNotFoundWording`].
 pub fn exchange_cluster_not_found_message(cluster_identifier: &str) -> String {
-    format!("The cluster {cluster_identifier} was not found.")
+    cluster_not_found_message(
+        ClusterNotFoundWording::TheClusterWasNotFound,
+        cluster_identifier,
+    )
 }
 
 /// What a reserved-node exchange operation answers a `SnapshotIdentifier` that
@@ -1591,6 +1595,58 @@ pub const STATUS_MODIFYING: &str = "modifying";
 pub const STATUS_REBOOTING: &str = "rebooting";
 /// `ClusterStatus` a `DeleteCluster` response reports.
 pub const STATUS_DELETING: &str = "deleting";
+
+/// Which sentence a `ClusterNotFoundFault` is worded with.
+///
+/// The fault's status (404) and awsQuery code (`ClusterNotFound`) are what the
+/// model fixes; the MESSAGE is an attribute of the OPERATION rather than of the
+/// service. Every one of the sentences below interpolates the
+/// `ClusterIdentifier` the request named — that part is the rule — but the fixed
+/// text around it differs from operation to operation, and recorded refusals
+/// show these four sentences in use. Naming each wording here keeps the choice
+/// at the handler that makes it, so no operation can quietly inherit another
+/// one's sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterNotFoundWording {
+    /// `Cluster not found: <ClusterIdentifier>` — what `RebootCluster`,
+    /// `ModifyCluster`, `ModifyClusterIamRoles`, `EnableSnapshotCopy`,
+    /// `DisableSnapshotCopy`, `ModifySnapshotCopyRetentionPeriod`,
+    /// `CreateClusterSnapshot` and `CreateUsageLimit` answer.
+    NotFoundThenIdentifier,
+    /// `Cluster <ClusterIdentifier> not found.` — what `DescribeClusters` and
+    /// `DeleteCluster` answer, and the sentence every other cluster-scoped
+    /// operation carries until a recorded refusal gives it one of its own.
+    IdentifierThenNotFound,
+    /// `Cluster <ClusterIdentifier> can't be found.` — what the namespace
+    /// registration pair, `RegisterNamespace` and `DeregisterNamespace`, answer.
+    IdentifierCannotBeFound,
+    /// `The cluster <ClusterIdentifier> was not found.` — what the reserved-node
+    /// exchange operations answer (reached through
+    /// [`exchange_cluster_not_found_message`]).
+    TheClusterWasNotFound,
+}
+
+/// The `ClusterNotFoundFault` message `wording` words, naming the
+/// `ClusterIdentifier` the request asked about.
+pub fn cluster_not_found_message(
+    wording: ClusterNotFoundWording,
+    cluster_identifier: &str,
+) -> String {
+    match wording {
+        ClusterNotFoundWording::NotFoundThenIdentifier => {
+            format!("Cluster not found: {cluster_identifier}")
+        }
+        ClusterNotFoundWording::IdentifierThenNotFound => {
+            format!("Cluster {cluster_identifier} not found.")
+        }
+        ClusterNotFoundWording::IdentifierCannotBeFound => {
+            format!("Cluster {cluster_identifier} can't be found.")
+        }
+        ClusterNotFoundWording::TheClusterWasNotFound => {
+            format!("The cluster {cluster_identifier} was not found.")
+        }
+    }
+}
 
 /// The snapshot `Status` a snapshot this service no longer holds reports.
 ///
@@ -3785,8 +3841,12 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         match &namespace {
             RegisteredNamespace::Provisioned { cluster_identifier } => {
                 let Some(stored) = self.cluster(cluster_identifier) else {
-                    return Err(NamespaceRefusal::ClusterNotFound(format!(
-                        "Cluster not found: {cluster_identifier}"
+                    // The sentence is this pair of operations' own, from the
+                    // per-operation catalog [`ClusterNotFoundWording`], with the
+                    // identifier interpolated from the request.
+                    return Err(NamespaceRefusal::ClusterNotFound(cluster_not_found_message(
+                        ClusterNotFoundWording::IdentifierCannotBeFound,
+                        cluster_identifier,
                     )));
                 };
                 let status = stored

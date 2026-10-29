@@ -212,7 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.cluster(&cluster_identifier).is_none() {
             return Err(RevokeEndpointAccessErrorModeled::ClusterNotFoundFault(
                 ClusterNotFoundFault {
-                    message: Some(format!("Cluster {cluster_identifier} not found.")),
+                    message: Some(st::cluster_not_found_message(
+                        st::ClusterNotFoundWording::IdentifierThenNotFound,
+                        &cluster_identifier,
+                    )),
                 },
             )
             .into());

@@ -208,8 +208,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RebootCluster<Eng
                     // refusal shows: the fixed text is "Cluster not found:" and
                     // the identifier is interpolated verbatim from the request.
                     // A read of the same missing identifier is worded
-                    // differently, so the template cannot be shared.
-                    message: Some(format!("Cluster not found: {}", input.cluster_identifier)),
+                    // differently, so the template cannot be shared — see the
+                    // per-operation catalog [`st::ClusterNotFoundWording`].
+                    message: Some(st::cluster_not_found_message(
+                        st::ClusterNotFoundWording::NotFoundThenIdentifier,
+                        &input.cluster_identifier,
+                    )),
                 },
             )
             .into());

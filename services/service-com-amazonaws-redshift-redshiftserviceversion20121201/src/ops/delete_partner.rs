@@ -176,7 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.cluster(&input.cluster_identifier).is_none() {
             return Err(DeletePartnerErrorModeled::ClusterNotFoundFault(
                 ClusterNotFoundFault {
-                    message: Some(format!("Cluster {} not found.", input.cluster_identifier)),
+                    message: Some(st::cluster_not_found_message(
+                        st::ClusterNotFoundWording::IdentifierThenNotFound,
+                        &input.cluster_identifier,
+                    )),
                 },
             )
             .into());

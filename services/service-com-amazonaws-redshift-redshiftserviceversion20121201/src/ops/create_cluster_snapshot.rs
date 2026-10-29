@@ -236,9 +236,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateClusterSnap
         let Some(stored_cluster) = store.cluster(&input.cluster_identifier).cloned() else {
             return Err(CreateClusterSnapshotErrorModeled::ClusterNotFoundFault(
                 ClusterNotFoundFault {
-                    message: Some(format!(
-                        "Cluster {} not found.",
-                        input.cluster_identifier
+                    message: Some(st::cluster_not_found_message(
+                        st::ClusterNotFoundWording::NotFoundThenIdentifier,
+                        &input.cluster_identifier,
                     )),
                 },
             )

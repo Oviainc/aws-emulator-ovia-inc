@@ -304,9 +304,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteCluster<Eng
         let Some(position) = store.cluster_position(&input.cluster_identifier) else {
             return Err(DeleteClusterErrorModeled::ClusterNotFoundFault(
                 ClusterNotFoundFault {
-                    message: Some(format!(
-                        "Cluster {} not found.",
-                        input.cluster_identifier
+                    // The recorded refusal for THIS operation carries the
+                    // identifier-first sentence, so the catalog's
+                    // `IdentifierThenNotFound` is this operation's own wording
+                    // and not an inherited default.
+                    message: Some(st::cluster_not_found_message(
+                        st::ClusterNotFoundWording::IdentifierThenNotFound,
+                        &input.cluster_identifier,
                     )),
                 },
             )

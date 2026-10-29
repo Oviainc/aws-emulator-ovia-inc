@@ -211,7 +211,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.cluster(wanted).is_none() {
                 return Err(DescribeClustersErrorModeled::ClusterNotFoundFault(
                     ClusterNotFoundFault {
-                        message: Some(format!("Cluster {wanted} not found.")),
+                        // The recorded refusal for THIS operation carries the
+                        // identifier-first sentence; see the per-operation
+                        // catalog [`st::ClusterNotFoundWording`].
+                        message: Some(st::cluster_not_found_message(
+                            st::ClusterNotFoundWording::IdentifierThenNotFound,
+                            wanted,
+                        )),
                     },
                 )
                 .into());

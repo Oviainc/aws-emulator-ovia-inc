@@ -282,7 +282,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored_cluster) = store.cluster(&input.cluster_identifier) else {
             return Err(CreateUsageLimitErrorModeled::ClusterNotFoundFault(
                 ClusterNotFoundFault {
-                    message: Some(format!("Cluster {} not found.", input.cluster_identifier)),
+                    message: Some(st::cluster_not_found_message(
+                        st::ClusterNotFoundWording::NotFoundThenIdentifier,
+                        &input.cluster_identifier,
+                    )),
                 },
             )
             .into());

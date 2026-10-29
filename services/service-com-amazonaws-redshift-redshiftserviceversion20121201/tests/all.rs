@@ -27,6 +27,8 @@ mod cluster_endpoint_publication;
 mod cluster_iam_roles;
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
+#[path = "all/cluster_not_found_messages.rs"]
+mod cluster_not_found_messages;
 #[path = "all/cluster_parameter_groups.rs"]
 mod cluster_parameter_groups;
 #[path = "all/cluster_parameters.rs"]

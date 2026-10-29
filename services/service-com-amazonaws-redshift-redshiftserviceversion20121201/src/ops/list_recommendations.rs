@@ -204,11 +204,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that is not there rather than reported as an empty page. Decided
         // before any record is walked, and each member is RESOLVED to the
         // cluster it names, so the two agree on the same CLUSTER rather than on
-        // the same member. One message, the crate's own `ClusterNotFoundFault`
-        // wording, with the value the request carried interpolated into it.
+        // the same member. One message, this operation's own wording from the
+        // per-operation catalog [`st::ClusterNotFoundWording`], with the value
+        // the request carried interpolated into it.
         let not_found = |wanted: &str| -> Self::Error {
             ListRecommendationsErrorModeled::ClusterNotFoundFault(ClusterNotFoundFault {
-                message: Some(format!("Cluster {wanted} not found.")),
+                message: Some(st::cluster_not_found_message(
+                    st::ClusterNotFoundWording::IdentifierThenNotFound,
+                    wanted,
+                )),
             })
             .into()
         };

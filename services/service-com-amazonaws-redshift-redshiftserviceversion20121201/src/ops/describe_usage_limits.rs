@@ -203,7 +203,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.cluster(wanted).is_none() {
                 return Err(DescribeUsageLimitsErrorModeled::ClusterNotFoundFault(
                     ClusterNotFoundFault {
-                        message: Some(format!("Cluster {wanted} not found.")),
+                        message: Some(st::cluster_not_found_message(
+                            st::ClusterNotFoundWording::IdentifierThenNotFound,
+                            wanted,
+                        )),
                     },
                 )
                 .into());

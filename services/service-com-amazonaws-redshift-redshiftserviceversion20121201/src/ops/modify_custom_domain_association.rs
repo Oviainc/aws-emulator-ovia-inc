@@ -187,9 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ModifyCustomDomainAssociationErrorModeled::ClusterNotFoundFault(
                     ClusterNotFoundFault {
-                        message: Some(format!(
-                            "Cluster {} not found.",
-                            input.cluster_identifier
+                        message: Some(st::cluster_not_found_message(
+                            st::ClusterNotFoundWording::IdentifierThenNotFound,
+                            &input.cluster_identifier,
                         )),
                     },
                 )

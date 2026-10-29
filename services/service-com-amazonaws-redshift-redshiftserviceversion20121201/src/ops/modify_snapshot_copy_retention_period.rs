@@ -209,7 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ModifySnapshotCopyRetentionPeriodErrorModeled::ClusterNotFoundFault(
                     ClusterNotFoundFault {
-                        message: Some(format!("Cluster {} not found.", input.cluster_identifier)),
+                        message: Some(st::cluster_not_found_message(
+                            st::ClusterNotFoundWording::NotFoundThenIdentifier,
+                            &input.cluster_identifier,
+                        )),
                     },
                 )
                 .into(),
