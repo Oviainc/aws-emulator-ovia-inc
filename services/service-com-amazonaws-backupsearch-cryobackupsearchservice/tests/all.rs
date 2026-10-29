@@ -19,6 +19,8 @@ mod client_token_replay_rule;
 mod client_token_window;
 #[path = "all/completed_with_issues_status_message.rs"]
 mod completed_with_issues_status_message;
+#[path = "all/empty_scope_filter_states_no_requirement.rs"]
+mod empty_scope_filter_states_no_requirement;
 #[path = "all/export_client_token_expiry.rs"]
 mod export_client_token_expiry;
 #[path = "all/export_jobs.rs"]

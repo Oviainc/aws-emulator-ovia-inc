@@ -65,9 +65,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    ConflictException, CurrentSearchProgress, EBSItemFilter, EBSResultItem, ExportSpecification,
-    ItemFilters, LongCondition, ResultItem, S3ItemFilter, S3ResultItem, SearchJobBackupsResult,
-    SearchScope, SearchScopeSummary, StringCondition, TimeCondition,
+    BackupCreationTimeFilter, ConflictException, CurrentSearchProgress, EBSItemFilter,
+    EBSResultItem, ExportSpecification, ItemFilters, LongCondition, ResultItem, S3ItemFilter,
+    S3ResultItem, SearchJobBackupsResult, SearchScope, SearchScopeSummary, StringCondition,
+    TimeCondition,
 };
 
 /// The HTTP status a successful call of this service that has NO content to report
@@ -1500,10 +1501,12 @@ fn new_uuid(sequence: u64) -> String {
 /// Every member of `SearchScope` is a filter over the backup index: the resource type
 /// (the model allows exactly one), the recovery-point and source-resource ARNs, the
 /// window the backup was created in, and the backup's tags. A filter the request leaves
-/// out admits everything; a filter it carries admits only what matches it, and a record
-/// that cannot be judged against a filter it carries (no creation time against a creation
-/// window, no tags at all against a tag filter) is not selected, because nothing shows it
-/// to be in scope.
+/// out admits everything, and so does one it carries that states no constraint at all (an
+/// empty ARN list, an empty tag map, a creation window with neither bound set — all of
+/// which the model allows); a filter that states a constraint admits only what matches it,
+/// and a record that cannot be judged against such a filter (no creation time against a
+/// bounded creation window, no tags at all against a non-empty tag filter) is not
+/// selected, because nothing shows it to be in scope.
 fn in_scope(point: &SearchJobBackupsResult, scope: &SearchScope) -> bool {
     // `BackupResourceTypes` is @required and @length(min: 1, max: 1), so it always names
     // a type and is never "no filter": a record whose type it does not name is out of
@@ -1522,21 +1525,11 @@ fn in_scope(point: &SearchJobBackupsResult, scope: &SearchScope) -> bool {
     if !arn_admits(scope.source_resource_arns.as_deref(), point.source_resource_arn.as_deref()) {
         return false;
     }
-    if let Some(window) = scope.backup_resource_creation_time.as_ref() {
-        let Some(created) = point.backup_creation_time.map(instant_key) else {
-            return false;
-        };
-        // "only created after"/"only created before" the given instant, with the bound
-        // itself in scope: the filter names the edge of the window, not a point outside it.
-        if window
-            .created_after
-            .is_some_and(|after| created < instant_key(after))
-            || window
-                .created_before
-                .is_some_and(|before| created > instant_key(before))
-        {
-            return false;
-        }
+    if !creation_window_admits(
+        scope.backup_resource_creation_time.as_ref(),
+        point.backup_creation_time,
+    ) {
+        return false;
     }
     // A tag filter: a recovery point carries no tags in this model, so no record this
     // store holds can be shown to carry the ones the scope asks for. Revisit this branch
@@ -1557,6 +1550,34 @@ fn arn_admits(filter: Option<&[String]>, candidate: Option<&str>) -> bool {
         Some([]) => true,
         Some(arns) => candidate.is_some_and(|arn| arns.iter().any(|wanted| wanted == arn)),
     }
+}
+
+/// Whether a creation-window filter admits `candidate`: an absent window is no filter at
+/// all, and neither is a window PRESENT but stating no bound — both of its bounds are
+/// optional in the model, so `{}` is a value a request may send and it constrains nothing,
+/// exactly as an empty ARN list or an empty tag map does. A window that names at least one
+/// bound admits the instants inside it, the bounds themselves included (the filter names
+/// the edge of the window, not a point outside it), and a record carrying no instant cannot
+/// be shown to fall inside it.
+fn creation_window_admits(
+    window: Option<&BackupCreationTimeFilter>,
+    candidate: Option<DateTime>,
+) -> bool {
+    let Some(window) = window else {
+        return true;
+    };
+    if window.created_after.is_none() && window.created_before.is_none() {
+        return true;
+    }
+    let Some(created) = candidate.map(instant_key) else {
+        return false;
+    };
+    !window
+        .created_after
+        .is_some_and(|after| created < instant_key(after))
+        && !window
+            .created_before
+            .is_some_and(|before| created > instant_key(before))
 }
 
 /// A `DateTime` as a totally ordered key, so two instants can be compared: the model's
