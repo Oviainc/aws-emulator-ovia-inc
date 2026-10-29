@@ -1413,9 +1413,15 @@ pub fn bound_origin_endpoint_durations(
 // published default covers it (`HlsPackage`, a CMAF child `HlsManifest`, `DashPackage`,
 // `MssPackage`); where a default belongs to one packaging format it is named for that
 // format. A member whose default neither the model, a recording nor the service's published
-// configuration publishes is left exactly as the request sent it — `Encryption`,
-// `HlsPackage$SegmentDurationSeconds` and the `MssPackage` window and segment members —
-// because inventing a value for it would be a fabrication, not a default.
+// configuration publishes is left exactly as the request sent it —
+// `HlsPackage$SegmentDurationSeconds`, the `MssPackage` window and segment members, and
+// every encryption member except the one named below — because inventing a value for it
+// would be a fabrication, not a default.
+//
+// Separately from the table above: where the MODEL states that the service itself CREATES a
+// member's value when the request omits it, that member is not a default but a value
+// MediaPackage supplies, so it is materialised at write time like the ARN and the playback
+// URLs ([`created_initialization_vector`], called from [`stored_cmaf_package`]).
 // ---------------------------------------------------------------------------
 
 /// `Origination`'s default: a new endpoint may be requested unless the caller denies it.
@@ -2719,15 +2725,44 @@ pub fn cmaf_manifest_url(
     format!("{prefix}/{manifest_label}/{manifest_name}/index.m3u8")
 }
 
+/// How many hex characters a constant initialization vector is written as.
+///
+/// The model documents `CmafEncryption$ConstantInitializationVector` as "an optional
+/// 128-bit, 16-byte hex value represented by a 32-character string"
+/// (`smithy_query(query="doc",shape="com.amazonaws.mediapackage#CmafEncryption",member="ConstantInitializationVector",model_path="services/service-com-amazonaws-mediapackage-mediapackage/smithy-model/com-amazonaws-mediapackage-mediapackage.json")`),
+/// so the created value is 16 bytes rendered as this many hex characters.
+pub const INITIALIZATION_VECTOR_CHARS: usize = 32;
+
+/// The constant initialization vector the service creates for the CMAF encryption
+/// configuration of ONE OriginEndpoint, for a request that supplied none.
+///
+/// The model states what the service does when the caller omits this member — "if you
+/// don't specify a value, then MediaPackage creates the constant initialization vector
+/// (IV)" — so the value is one the SERVICE supplies, not a default constant: it is
+/// materialised at write time like the endpoint's ARN and playback URLs, and so every
+/// projection of the stored endpoint reports it. The HLS sibling documents no created
+/// value ("when not specified the initialization vector will be periodically rotated"), so
+/// no block other than the CMAF one gains one.
+///
+/// Derived from the endpoint's own identity with [`stable_label`], which renders exactly
+/// 16 bytes as [`INITIALIZATION_VECTOR_CHARS`] hex characters — the member's documented
+/// form — so one endpoint's IV is its own and never moves between reads or between writes
+/// that do not resend the encryption block.
+pub fn created_initialization_vector(region: &str, channel_id: &str, endpoint_id: &str) -> String {
+    stable_label(&["cmaf-encryption-iv", channel_id, endpoint_id, region])
+}
+
 /// The `CmafPackage` to store for the `CmafPackageCreateOrUpdateParameters` an input
 /// carried.
 ///
-/// The create/update parameter shape differs from the stored shape in exactly three ways,
+/// The create/update parameter shape differs from the stored shape in exactly four ways,
 /// all of them values the SERVICE supplies: each child HLS manifest gains the playback
 /// `Url` derived for it, a child manifest sent without a `ManifestName` takes its
 /// documented default — the endpoint's own effective `ManifestName`, which
-/// `endpoint_manifest_name` carries already resolved — and an absent `SegmentPrefix` takes
-/// its documented default, the ChannelId.
+/// `endpoint_manifest_name` carries already resolved — an absent `SegmentPrefix` takes
+/// its documented default, the ChannelId, and an `Encryption` block sent without a
+/// `ConstantInitializationVector` gains the one the service creates for this endpoint
+/// ([`created_initialization_vector`]).
 pub fn stored_cmaf_package(
     params: &CmafPackageCreateOrUpdateParameters,
     region: &str,
@@ -2765,7 +2800,16 @@ pub fn stored_cmaf_package(
         })
         .collect();
     CmafPackage {
-        encryption: params.encryption.clone(),
+        encryption: params.encryption.clone().map(|mut encryption| {
+            encryption.constant_initialization_vector = encryption
+                .constant_initialization_vector
+                .or_else(|| {
+                    Some(created_initialization_vector(
+                        region, channel_id, endpoint_id,
+                    ))
+                });
+            encryption
+        }),
         hls_manifests: Some(hls_manifests),
         segment_duration_seconds: params.segment_duration_seconds,
         segment_prefix: Some(

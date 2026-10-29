@@ -21,6 +21,8 @@ mod cmaf_child_manifest_ids_are_unique;
 mod cmaf_child_manifest_name;
 #[path = "all/cmaf_child_manifest_name_follows_the_endpoint.rs"]
 mod cmaf_child_manifest_name_follows_the_endpoint;
+#[path = "all/created_initialization_vector.rs"]
+mod created_initialization_vector;
 #[path = "all/dash_live_manifest_defaults.rs"]
 mod dash_live_manifest_defaults;
 #[path = "all/duration_floor_one_implementation.rs"]
