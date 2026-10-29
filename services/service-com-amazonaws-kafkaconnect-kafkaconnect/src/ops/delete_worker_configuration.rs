@@ -11,6 +11,8 @@
 //! `@idempotent` trait on this operation calls for. A `workerConfigurationArn`
 //! that is not a well-formed ARN of this service is the modelled
 //! `BadRequestException` (HTTP 400) instead: it names no configuration at all.
+//! A configuration a stored connector runs with is kept, and that delete is the
+//! same modelled `BadRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -189,6 +191,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Whether a connector this store still holds runs with this
+        // configuration, asked before the configuration record is borrowed for
+        // the write below and acted on only once the ARN has resolved, so an
+        // ARN this region does not hold is still answered as the absent
+        // resource it names.
+        let in_use = state.dependency_in_use_refusal(
+            &region,
+            &input.worker_configuration_arn,
+            "workerConfigurationArn",
+            "worker configuration",
+        );
+
         // A regional endpoint resolves only its own region's configurations, so
         // a workerConfigurationArn minted in another region deletes nothing and
         // is answered exactly as an ARN this service never minted.
@@ -205,6 +219,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A configuration a stored connector runs with is not removed: the
+        // model gives this operation no conflict channel, so the refusal is the
+        // modelled 400, blaming the member that carried the ARN. Refused before
+        // any state is touched, so nothing is marked for deletion and the
+        // configuration stays readable in the state it was in.
+        if let Some(message) = in_use {
+            return Err(DeleteWorkerConfigurationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // The first delete starts the clock; a repeat while the configuration is
         // still DELETING answers the same state and leaves the due instant where

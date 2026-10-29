@@ -797,6 +797,24 @@ impl ConnectorRecord {
             .then(|| invalid_parameter_because("connectorArn", &connector_is_not_running()))
     }
 
+    /// Whether this connector names the resource `arn` names among the
+    /// resources it runs on: one of the custom plugins of its `plugins`, or the
+    /// worker configuration it was created with.
+    ///
+    /// Both references are stored verbatim and both are echoed back by the read
+    /// operations ([`Self::plugin_descriptions`] and
+    /// [`Self::worker_configuration_description`]), so they are the same kind of
+    /// dependency and are answered here by the one rule.
+    pub fn names_dependency(&self, arn: &str) -> bool {
+        self.plugins
+            .iter()
+            .any(|plugin| plugin.custom_plugin.custom_plugin_arn == arn)
+            || self
+                .worker_configuration
+                .as_ref()
+                .is_some_and(|worker| worker.worker_configuration_arn == arn)
+    }
+
     /// This connector's stored capacity, as the read operations report it.
     pub fn capacity_description(&self) -> CapacityDescription {
         capacity_description(&self.capacity)
@@ -1486,6 +1504,36 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
         records_in(&self.connectors, region)
     }
 
+    /// The message a delete of the resource `arn` names is refused with while a
+    /// connector this store still holds runs on it, or `None` when no connector
+    /// names it and the delete may proceed.
+    ///
+    /// The ONE rule both deletes of a connector's dependencies run (a custom
+    /// plugin and a worker configuration), so neither can differ from the other
+    /// on when a dependency may be removed, on the member the refusal blames or
+    /// on how it is worded. A stored connector names the plugins it runs on and
+    /// the configuration it runs with by ARN, and a connector is only stored
+    /// against references that resolve, in its own region, to a resource that is
+    /// ACTIVE: removing a resource a connector still names would leave the store
+    /// holding a connector the create path refuses to store, and the reads
+    /// echoing an ARN that resolves to nothing. `member` is the request member
+    /// that carried the ARN and `resource` the service's own name for the kind
+    /// of resource it names; only the modelled error VARIANT stays with the
+    /// handler, since the error enum is per-operation — the same shape as
+    /// [`ConnectorRecord::not_running_refusal`] and [`capacity_refusal`], the
+    /// other rules these handlers share.
+    pub fn dependency_in_use_refusal(
+        &self,
+        region: &str,
+        arn: &str,
+        member: &str,
+        resource: &str,
+    ) -> Option<String> {
+        self.connectors_in(region)
+            .any(|connector| connector.names_dependency(arn))
+            .then(|| invalid_parameter_because(member, &resource_is_in_use(resource)))
+    }
+
     /// The worker configuration `arn` names, as an endpoint for `region` sees
     /// it: `None` for a configuration of another region, exactly as for one
     /// this store does not hold.
@@ -1896,6 +1944,17 @@ pub const VERSION_IS_NOT_CURRENT: &str = "The specified version is not the curre
 /// members of which a connector has exactly one — "whether it is auto scaled or
 /// provisioned", as the member's own documentation puts it.
 pub const ONE_CAPACITY_FORM: &str = "Specify exactly one of autoScaling or provisionedCapacity.";
+
+/// The reason a delete of a resource a connector this account holds still runs
+/// on is refused with: a connector is only stored against references that
+/// resolve to an ACTIVE resource, so the resource stays while the connector
+/// naming it does. `resource` is the service's own name for the kind of
+/// resource the refused ARN names, and nothing else is interpolated: the
+/// refusal is the same whichever connector names it and whatever ARN that
+/// connector carries.
+pub fn resource_is_in_use(resource: &str) -> String {
+    format!("The {resource} is in use by a connector.")
+}
 
 /// The reason a call only a RUNNING connector can serve is refused with for a
 /// connector in any other state: one still being created, already restarting,

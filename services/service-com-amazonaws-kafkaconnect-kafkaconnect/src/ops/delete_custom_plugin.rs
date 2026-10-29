@@ -5,7 +5,8 @@
 //! and the clock drops it `crate::state::TRANSITION_SPAN` later. A `customPluginArn` that
 //! is not a well-formed ARN of this service is a `BadRequestException`; a well-formed one
 //! no stored plugin
-//! carries is a `NotFoundException`. Idempotent: a repeat while the plugin is already
+//! carries is a `NotFoundException`. A plugin a stored connector runs on is kept: that
+//! delete is a `BadRequestException` too. Idempotent: a repeat while the plugin is already
 //! `DELETING` answers the same state without moving the due instant.
 //!
 //! ## Shape of an operation
@@ -183,6 +184,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Whether a connector this store still holds runs on this plugin,
+        // asked before the plugin record is borrowed for the write below and
+        // acted on only once the ARN has resolved, so an ARN this region does
+        // not hold is still answered as the absent resource it names.
+        let in_use = state.dependency_in_use_refusal(
+            &region,
+            &input.custom_plugin_arn,
+            "customPluginArn",
+            "custom plugin",
+        );
+
         // A regional endpoint resolves only its own region's plugins, so a
         // customPluginArn minted in another region deletes nothing and is
         // answered exactly as an ARN this service never minted.
@@ -195,6 +207,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+
+        // A plugin a stored connector runs on is not removed: the model gives
+        // this operation no conflict channel, so the refusal is the modelled
+        // 400, blaming the member that carried the ARN. Refused before any
+        // state is touched, so nothing is marked for deletion and the plugin
+        // stays readable in the state it was in.
+        if let Some(message) = in_use {
+            return Err(DeleteCustomPluginErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         if plugin.state != crate::state::CUSTOM_PLUGIN_DELETING {
             plugin.state = crate::state::CUSTOM_PLUGIN_DELETING.to_string();

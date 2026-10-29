@@ -539,7 +539,22 @@ async fn a_connector_is_only_created_against_a_worker_configuration_this_account
 
     // A configuration on its way out of the account cannot back a connector
     // either: between the delete and the removal the clock owes, the reference
-    // resolves to a DELETING resource, which is refused as a bad request.
+    // resolves to a DELETING resource, which is refused as a bad request. The
+    // configuration can only START that delete once no stored connector names
+    // it, so the connector created above goes first and the clock is given the
+    // span it needs to drop it.
+    let (status, dropped) = call(
+        &emulator,
+        "DELETE",
+        &format!("/v1/connectors/{}", label(&connector)),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the connector's own delete must be accepted, got {status} {dropped}"
+    );
+    tokio::time::sleep(TRANSITION_SPAN + Duration::from_millis(400)).await;
     let (status, deleted) = call(
         &emulator,
         "DELETE",
