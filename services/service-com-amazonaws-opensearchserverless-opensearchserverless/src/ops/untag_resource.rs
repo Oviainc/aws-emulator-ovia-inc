@@ -4,7 +4,8 @@
 //! IMPLEMENTED: removes the tag keys the request names from the `CollectionRecord` whose
 //! stored ARN is `resourceArn`, so `ListTagsForResource` no longer reports them. A
 //! `resourceArn` that names no collection this account holds — including one whose
-//! deletion has been accepted — is refused with `ResourceNotFoundException`.
+//! deletion has been accepted — is refused with `ResourceNotFoundException`, and a
+//! `tagKeys` that names one key twice with `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -142,6 +143,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // `tagKeys` is a SET of keys — "All tag keys in the request must be unique" — and
+        // the list carries no `@uniqueItems`, so the boundary admits a repeat and the rule
+        // is held here: a member that names one key twice is the invalid input
+        // `ValidationException` describes, and nothing is removed.
+        if let Some(repeated) =
+            crate::state::first_repeated_tag_key(input.tag_keys.iter().map(String::as_str))
+        {
+            return Err(UntagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::repeated_tag_key_message(
+                        "tagKeys", &repeated,
+                    )),
+                },
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalServerException(
                 InternalServerException {

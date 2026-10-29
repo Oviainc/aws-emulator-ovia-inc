@@ -53,6 +53,8 @@ mod security_configs;
 mod security_policy_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_key_uniqueness.rs"]
+mod tag_key_uniqueness;
 #[path = "all/vpc_endpoint.rs"]
 mod vpc_endpoint;
 #[path = "all/vpc_endpoint_batch_read.rs"]

@@ -2016,6 +2016,46 @@ pub fn validate_index_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The first tag key a request names more than once, if one does.
+///
+/// A tag set is a map keyed by tag key, which the model states for every member that
+/// carries tags: `TagResourceRequest$tags` and `UntagResourceRequest$tagKeys` each document
+/// "All tag keys in the request must be unique", and the create requests' `tags` is
+/// documented as "an arbitrary SET of tags (key–value pairs)". Neither `Tags` nor `TagKeys`
+/// carries `@uniqueItems` (`smithy_query(query="shape", shape="Tags,TagKeys")`), so the
+/// boundary validator admits a repeat and the rule is enforced by the handler that takes
+/// the member. Keys are compared as sent, since a tag key is case-sensitive.
+pub fn first_repeated_tag_key<'keys>(
+    keys: impl IntoIterator<Item = &'keys str>,
+) -> Option<String> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for key in keys {
+        if !seen.insert(key) {
+            return Some(key.to_string());
+        }
+    }
+    None
+}
+
+/// How this service words a tagging member that names one tag key twice: the clause the
+/// boundary validator renders for a repeated element of a list, at the member that carried
+/// it, so a repeat refused by a handler reads exactly like one refused at the boundary.
+///
+/// The sentence itself comes from the framework's own renderer rather than being spelled
+/// here, so this refusal cannot drift from the ones `src/service.rs` words.
+pub fn repeated_tag_key_message(member: &str, key: &str) -> String {
+    use ::aws_smithy_schema_server::constraints::{envelope, Violation, ViolationKind};
+
+    let violation = Violation {
+        path: member.to_string(),
+        kind: ViolationKind::UniqueItems,
+        value: Some(key.to_string()),
+    };
+    // One violation always renders; the bare clause is the same sentence without the
+    // envelope's count prefix.
+    envelope(::std::slice::from_ref(&violation)).unwrap_or_else(|| violation.message())
+}
+
 /// How this service words a RESOURCE ARN that names no collection this account holds: by
 /// the collection id the ARN carries where it carries one (`…:collection/<id>`), and by
 /// the ARN itself otherwise, since there is no id in it to name.

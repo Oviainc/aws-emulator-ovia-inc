@@ -5,8 +5,9 @@
 //! ARN is `resourceArn`, replacing the value of a key the resource already carries, so
 //! `ListTagsForResource` reports them. A `resourceArn` that names no collection this
 //! account holds — including one whose deletion has been accepted — is refused with
-//! `ResourceNotFoundException`, and a write that would take the resource past the
-//! documented 50-tag quota with `ServiceQuotaExceededException`.
+//! `ResourceNotFoundException`, a write that would take the resource past the
+//! documented 50-tag quota with `ServiceQuotaExceededException`, and a `tags` that names
+//! one key twice with `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -147,6 +148,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // A tag set is a map keyed by tag key — "All tag keys in the request must be
+        // unique" — and `Tags` carries no `@uniqueItems`, so the boundary admits a repeat
+        // and the rule is held here: a member that names one key twice is the invalid input
+        // `ValidationException` describes, and nothing is stored.
+        if let Some(repeated) =
+            crate::state::first_repeated_tag_key(input.tags.iter().map(|tag| tag.key.as_str()))
+        {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::repeated_tag_key_message("tags", &repeated)),
+                },
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalServerException(
                 InternalServerException {

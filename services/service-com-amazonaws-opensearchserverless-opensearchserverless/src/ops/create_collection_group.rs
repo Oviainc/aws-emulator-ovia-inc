@@ -222,6 +222,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let capacity_limits =
             crate::state::effective_capacity_limits(input.capacity_limits.as_ref());
 
+        // `tags` is "an arbitrary SET of tags (key–value pairs)" — a map keyed by tag key —
+        // and `Tags` carries no `@uniqueItems`, so a member that names one key twice is the
+        // invalid input `ValidationException` describes and no group is created.
+        if let Some(repeated) = crate::state::first_repeated_tag_key(
+            input.tags.iter().flatten().map(|tag| tag.key.as_str()),
+        ) {
+            return Err(CreateCollectionGroupErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::repeated_tag_key_message("tags", &repeated)),
+                },
+            )
+            .into());
+        }
+
         let mut store = state.lock();
 
         // A replayed `clientToken` is a retry of the call that created the group, so it
