@@ -63,7 +63,7 @@ const SECRET_ARN: &str = "arn:aws:secretsmanager:us-west-2:000000000000:secret:e
 
 /// The bare metal instance type every host of this suite runs on, one value of the
 /// modelled `InstanceType` enum.
-const INSTANCE_TYPE: &str = "i4i.metal";
+pub(crate) const INSTANCE_TYPE: &str = "i4i.metal";
 
 /// The appliance FQDN an update reconfigures a connector onto.
 const RECONFIGURED_FQDN: &str = "reconfigured.evs.example.com";
@@ -78,14 +78,14 @@ fn fqdn_for(connector_type: &str) -> String {
 
 /// One VCF license key of the modelled shape
 /// (`^[a-zA-Z0-9]{5}-[a-zA-Z0-9]{5}-[a-zA-Z0-9]{5}-[a-zA-Z0-9]{5}-[a-zA-Z0-9]{5}$`).
-fn license_info() -> Value {
+pub(crate) fn license_info() -> Value {
     json!([{ "solutionKey": "AAAAA-AAAAA-AAAAA-AAAAA-AAAAA", "vsanKey": "BBBBB-BBBBB-BBBBB-BBBBB-BBBBB" }])
 }
 
 /// The physical processor cores one host running on `instance_type` has, as Amazon EC2's
 /// own instance-type record reports them (`VCpuInfo$DefaultCores`) — the same fact the
 /// check reads, so this suite pins the RULE and not a core count copied by hand.
-fn cores(instance_type: &str) -> u64 {
+pub(crate) fn cores(instance_type: &str) -> u64 {
     let record = ec2::state::instance_type_record(instance_type).unwrap_or_else(|| {
         panic!("Amazon EC2 describes the Amazon EVS instance type {instance_type}")
     });
@@ -130,7 +130,7 @@ async fn environment_at_its_minimum_host_count(
 }
 
 /// The `environment` object `GetEnvironment` reports.
-async fn get_environment(router: &Emulator, case: &str, environment_id: &str) -> Value {
+pub(crate) async fn get_environment(router: &Emulator, case: &str, environment_id: &str) -> Value {
     let (status, body) = call(
         router,
         "GetEnvironment",
@@ -165,7 +165,10 @@ async fn listed_summary(router: &Emulator, case: &str, environment_id: &str) -> 
 /// The (check type, result) pairs the STORE holds for one environment, read straight out
 /// of it — so what a call left behind is observed without a read of the service
 /// recomputing it first.
-fn stored_check_results(router: &Emulator, environment_id: &str) -> Vec<(String, String)> {
+pub(crate) fn stored_check_results(
+    router: &Emulator,
+    environment_id: &str,
+) -> Vec<(String, String)> {
     let store = evs::service_state(&*router.engine)
         .expect("the in-memory engine carries this service's store");
     let store = store.lock();
@@ -186,7 +189,7 @@ fn stored_check_results(router: &Emulator, environment_id: &str) -> Vec<(String,
 }
 
 /// The same pairs, as a reported `Environment` carries them.
-fn reported_check_results(environment: &Value) -> Vec<(String, String)> {
+pub(crate) fn reported_check_results(environment: &Value) -> Vec<(String, String)> {
     environment["checks"]
         .as_array()
         .cloned()
@@ -202,7 +205,7 @@ fn reported_check_results(environment: &Value) -> Vec<(String, String)> {
 }
 
 /// One check's result out of those pairs.
-fn result_of(checks: &[(String, String)], check_type: &str) -> String {
+pub(crate) fn result_of(checks: &[(String, String)], check_type: &str) -> String {
     checks
         .iter()
         .find(|(reported, _)| reported == check_type)

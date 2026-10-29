@@ -182,6 +182,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut state = state.lock();
+        // The derived health checks this call recomputes below read each environment's
+        // lifecycle state, so the transitions the clock has already made due are
+        // materialised FIRST — they were owed whether or not anybody called, and a
+        // recomputation that ran before them would derive the checks from states this
+        // instant has already moved past.
+        state.materialise_due_transitions();
         if !input.settings.is_empty() && !state.has_room_for_account_settings(&region) {
             // The emulator's own bound on how many Regions it holds settings for, so a
             // caller cannot grow the store by naming new Regions. Refused rather than

@@ -169,7 +169,7 @@ fn stored_tags_and_modified_at(
 
 /// The `environmentState` the store holds for one environment, for an assertion that
 /// names the state the row set up.
-fn stored_state(router: &Emulator, environment_id: &str) -> String {
+pub(crate) fn stored_state(router: &Emulator, environment_id: &str) -> String {
     let state = evs::state::service_state(&*router.engine)
         .expect("the in-memory engine carries this service's store");
     let store = state.lock();

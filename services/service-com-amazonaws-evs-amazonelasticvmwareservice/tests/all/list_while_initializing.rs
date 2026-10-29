@@ -112,7 +112,7 @@ fn list_requests(environment: &str, connector_id: &str) -> Vec<(&'static str, Va
 /// Put one stored environment into `state` and drop the transition it owed, so a state
 /// the lifecycle does not pass through on its own — or one it would leave while the test
 /// runs — can be exercised too.
-fn force_state(router: &Emulator, environment_id: &str, state: &str) {
+pub(crate) fn force_state(router: &Emulator, environment_id: &str, state: &str) {
     let store = evs::state::service_state(&*router.engine)
         .expect("the in-memory engine carries this service's store");
     let mut store = store.lock();

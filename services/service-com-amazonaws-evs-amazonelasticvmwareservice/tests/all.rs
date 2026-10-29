@@ -92,6 +92,8 @@ mod list_while_initializing;
 mod page_size_bound;
 #[path = "all/public_vlan_netmask.rs"]
 mod public_vlan_netmask;
+#[path = "all/put_account_settings_due_transitions.rs"]
+mod put_account_settings_due_transitions;
 #[path = "all/record_stamp_monotonicity.rs"]
 mod record_stamp_monotonicity;
 #[path = "all/reserved_tag_keys.rs"]
