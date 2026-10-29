@@ -61,6 +61,31 @@ pub const GAME_SESSION_STATUS_ACTIVE: &str = "ACTIVE";
 /// (`smithy_query shape=PlayerSessionStatus`).
 pub const PLAYER_SESSION_STATUS_RESERVED: &str = "RESERVED";
 
+/// The `FlexMatchMode` that forms matches without starting a game session: that member's
+/// own doc — "STANDALONE - FlexMatch forms matches and returns match information,
+/// including players and team assignments, in a MatchmakingSucceeded event." Both values
+/// come from the modelled enum (`smithy_query shape=FlexMatchMode`), which
+/// `FLEX_MATCH_MODE_VALUES` carries.
+pub const FLEX_MATCH_MODE_STANDALONE: &str = "STANDALONE";
+
+/// The `BackfillMode` that has Amazon GameLift Servers create backfill requests itself
+/// (`smithy_query shape=BackfillMode`), which the STANDALONE mode cannot combine with:
+/// "Automatic backfill is not available when FlexMatchMode is set to STANDALONE."
+pub const BACKFILL_MODE_AUTOMATIC: &str = "AUTOMATIC";
+
+/// The `BackfillMode` a configuration created without one carries: that member's own doc —
+/// "MANUAL indicates that the game makes backfill requests or does not use the match
+/// backfill feature", which is what a configuration that asked for no backfilling does.
+/// Both values come from the modelled enum (`smithy_query shape=BackfillMode`), which
+/// `BACKFILL_MODE_VALUES` carries.
+pub const DEFAULT_BACKFILL_MODE: &str = "MANUAL";
+
+/// The `AdditionalPlayerCount` a configuration created without one carries: that member is
+/// "the number of player slots in a match to keep open for future players", so a
+/// configuration that asked for none keeps none open — the minimum of the modelled
+/// `WholeNumber` (range min 0).
+pub const DEFAULT_ADDITIONAL_PLAYER_COUNT: i32 = 0;
+
 /// `MatchmakingConfigurationStatus` value a ticket `StartMatchmaking` has just accepted
 /// carries: that operation's own doc — "If successful, a matchmaking ticket is returned
 /// with status set to `QUEUED`."
@@ -1164,16 +1189,19 @@ pub const DEFAULT_NODE_JS_VERSION: &str = NODE_JS_VERSIONS[0];
 /// location reflects this location." The bucket belongs to the service rather than to the
 /// caller, so the location carries no `RoleArn` — that member "allows Amazon GameLift
 /// Servers to access the S3 bucket" of ANOTHER account, and none is involved here — and no
-/// `ObjectVersion`, which is the caller's own bucket versioning. The bucket and key
-/// formats are CHOSEN (the service documents neither): they name the Region the upload was
-/// served in and the script that holds it, so two scripts never share a location.
+/// `ObjectVersion`, which is the caller's own bucket versioning.
+///
+/// The service names one script bucket per Region (`prod-gamescale-scripts-<region>`) and
+/// holds each account's scripts under their own prefix, so the key is the account that
+/// owns the script and the script that holds the files: two scripts never share a
+/// location, and nothing the caller supplies names either part.
 pub fn service_owned_script_location(region: &str, script_id: &str) -> S3Location {
     S3Location {
-        bucket: Some(format!(
-            "gamelift-script-uploads-{region}-{}",
+        bucket: Some(format!("prod-gamescale-scripts-{region}")),
+        key: Some(format!(
+            "{}/{script_id}",
             ::engine::emulator_account_id()
         )),
-        key: Some(format!("{script_id}/script.zip")),
         role_arn: None,
         object_version: None,
     }

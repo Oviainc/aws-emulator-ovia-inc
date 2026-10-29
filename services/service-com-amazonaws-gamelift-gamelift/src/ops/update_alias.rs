@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the properties the request supplies onto the stored alias and reports that one
+//! record, so this response and every later read of the alias (`DescribeAlias`) are
+//! served from the same stored values. A property the request omits keeps the value the
+//! stored alias already carries.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +152,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAlias"))
+        // "When reassigning an alias to a new fleet, provide an updated routing strategy":
+        // a supplied strategy REPLACES the stored one whole, so it must be one of the two
+        // forms an alias can carry — the same rule a create is held to. Refused BEFORE any
+        // state is locked and before anything is written.
+        if let Some(routing_strategy) = input.routing_strategy.as_ref() {
+            if let Err(reason) = crate::state::validate_routing_strategy(routing_strategy) {
+                return Err(UpdateAliasErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(reason),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateAliasErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // "Specify the unique identifier of the alias to be updated" — by alias id or by
+        // ARN. An identifier that names no stored alias is the modelled `NotFoundException`
+        // ("The resource was either not created yet or deleted"), and nothing is written.
+        let Some(alias_id) = state
+            .resolve_alias(&input.alias_id)
+            .map(|alias| alias.alias_id.clone())
+        else {
+            return Err(UpdateAliasErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("The alias {} was not found.", input.alias_id)),
+            })
+            .into());
+        };
+        let Some(alias) = state.aliases.get_mut(&alias_id) else {
+            return Err(UpdateAliasErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the alias to update could not be read back".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "Updates properties for an alias. Specify ... the new property values": each
+        // property the request supplies is written onto the stored alias, and one it omits
+        // is not touched — so a later read reports the supplied values and keeps the rest.
+        let mut modified = false;
+        if let Some(name) = input.name.clone() {
+            alias.name = name;
+            modified = true;
+        }
+        if let Some(description) = input.description.clone() {
+            alias.description = Some(description);
+            modified = true;
+        }
+        if let Some(routing_strategy) = input.routing_strategy.clone() {
+            alias.routing_strategy = routing_strategy;
+            modified = true;
+        }
+        // `Alias$LastUpdatedTime` is "the time that this data object was last modified", so
+        // it moves only when this call actually changed one of the alias's properties.
+        if modified {
+            alias.last_updated_time = now;
+        }
+
+        // Report the STORED record, so this response and every later read of the same alias
+        // can only agree.
+        Ok(UpdateAliasOutput {
+            alias: Some(alias.to_modelled()),
+        })
     }
 }

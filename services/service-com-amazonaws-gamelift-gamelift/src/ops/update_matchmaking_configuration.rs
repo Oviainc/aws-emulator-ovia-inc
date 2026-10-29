@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMatchmakingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMatchmakingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMatchmakingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the settings the request supplies onto the stored matchmaking configuration and
+//! reports that one record, so this response and every later read of the configuration
+//! (`DescribeMatchmakingConfigurations`) are served from the same stored values. A setting
+//! the request omits keeps the value the stored configuration already carries.
 //!
 //! ## Shape of an operation
 //!
@@ -213,20 +209,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMatchmakingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMatchmakingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMatchmakingConfiguration"))
+        use crate::state::{BACKFILL_MODE_AUTOMATIC, FLEX_MATCH_MODE_STANDALONE};
+
+        let invalid = |message: String| -> Self::Error {
+            UpdateMatchmakingConfigurationErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateMatchmakingConfigurationErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the GameLift emulator state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // "To update settings, specify the configuration name to be updated" — by name or
+        // by ARN. A name that identifies no stored configuration is the modelled
+        // `NotFoundException` ("The resource was either not created yet or deleted"), and
+        // nothing is written.
+        let Some(name) = state.resolve_matchmaking_configuration_name(&input.name) else {
+            return Err(
+                UpdateMatchmakingConfigurationErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!(
+                        "The matchmaking configuration {} was not found.",
+                        input.name
+                    )),
+                })
+                .into(),
+            );
+        };
+
+        // `RuleSetName`'s doc: "A unique identifier for the matchmaking rule set to use
+        // with this configuration. You can use either the rule set name or ARN value." So a
+        // request can only move the configuration onto a rule set that EXISTS, which is
+        // what makes a typo'd rule set a refused request instead of a matchmaker that can
+        // never match.
+        let resolved_rule_set = match input.rule_set_name.as_deref() {
+            Some(requested) => {
+                let rule_set = state
+                    .resolve_rule_set_name(requested)
+                    .and_then(|rule_set_name| state.matchmaking_rule_sets.get(&rule_set_name))
+                    .map(|rule_set| (rule_set.rule_set_name.clone(), rule_set.rule_set_arn.clone()));
+                let Some(rule_set) = rule_set else {
+                    return Err(invalid(format!(
+                        "RuleSet with name {requested} does not exist"
+                    )));
+                };
+                Some(rule_set)
+            }
+            None => None,
+        };
+
+        let Some(configuration) = state.matchmaking_configurations.get(&name) else {
+            return Err(
+                UpdateMatchmakingConfigurationErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some(
+                            "the matchmaking configuration to update could not be read back"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "These changes affect all matches and game sessions that are created after the
+        // update": the settings the request supplies are what the configuration carries
+        // afterwards, and the ones it omits keep the values the stored configuration
+        // already has. The cross-member rules hold over that RESULTING configuration, not
+        // only over what this one request named, so they are checked on the merged values
+        // before anything is written.
+        let queue_arns = input
+            .game_session_queue_arns
+            .clone()
+            .unwrap_or_else(|| configuration.game_session_queue_arns.clone());
+        let flex_match_mode = input
+            .flex_match_mode
+            .clone()
+            .or_else(|| configuration.flex_match_mode.clone());
+        let backfill_mode = input
+            .backfill_mode
+            .clone()
+            .or_else(|| configuration.backfill_mode.clone());
+
+        // `GameSessionQueueArns`' doc: "A matchmaking configuration supports only one
+        // queue; if you specify more than one ARN, the request fails with an
+        // InvalidRequestException. If FlexMatchMode is set to STANDALONE, do not set this
+        // parameter."
+        if queue_arns.len() > 1 {
+            return Err(invalid(format!(
+                "GameSessionQueueArns names {} queues; a matchmaking configuration supports only \
+                 one queue.",
+                queue_arns.len()
+            )));
+        }
+        let standalone = flex_match_mode.as_deref() == Some(FLEX_MATCH_MODE_STANDALONE);
+        if standalone && !queue_arns.is_empty() {
+            return Err(invalid(format!(
+                "GameSessionQueueArns must not be set when FlexMatchMode is \
+                 {FLEX_MATCH_MODE_STANDALONE}: that mode returns match information instead of \
+                 starting a game session."
+            )));
+        }
+        // `BackfillMode`'s doc: "Automatic backfill is not available when FlexMatchMode is
+        // set to STANDALONE."
+        if standalone && backfill_mode.as_deref() == Some(BACKFILL_MODE_AUTOMATIC) {
+            return Err(invalid(format!(
+                "BackfillMode {BACKFILL_MODE_AUTOMATIC} is not available when FlexMatchMode is \
+                 {FLEX_MATCH_MODE_STANDALONE}."
+            )));
+        }
+
+        let Some(configuration) = state.matchmaking_configurations.get_mut(&name) else {
+            return Err(
+                UpdateMatchmakingConfigurationErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some(
+                            "the matchmaking configuration to update could not be read back"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        configuration.game_session_queue_arns = queue_arns;
+        configuration.flex_match_mode = flex_match_mode;
+        configuration.backfill_mode = backfill_mode;
+        if let Some(description) = input.description.clone() {
+            configuration.description = Some(description);
+        }
+        if let Some(request_timeout_seconds) = input.request_timeout_seconds {
+            configuration.request_timeout_seconds = request_timeout_seconds;
+        }
+        if let Some(acceptance_timeout_seconds) = input.acceptance_timeout_seconds {
+            configuration.acceptance_timeout_seconds = Some(acceptance_timeout_seconds);
+        }
+        if let Some(acceptance_required) = input.acceptance_required {
+            configuration.acceptance_required = acceptance_required;
+        }
+        if let Some((rule_set_name, rule_set_arn)) = resolved_rule_set {
+            configuration.rule_set_name = rule_set_name;
+            configuration.rule_set_arn = rule_set_arn;
+        }
+        if let Some(notification_target) = input.notification_target.clone() {
+            configuration.notification_target = Some(notification_target);
+        }
+        if let Some(additional_player_count) = input.additional_player_count {
+            configuration.additional_player_count = Some(additional_player_count);
+        }
+        if let Some(custom_event_data) = input.custom_event_data.clone() {
+            configuration.custom_event_data = Some(custom_event_data);
+        }
+        if let Some(game_properties) = input.game_properties.clone() {
+            configuration.game_properties = game_properties;
+        }
+        if let Some(game_session_data) = input.game_session_data.clone() {
+            configuration.game_session_data = Some(game_session_data);
+        }
+
+        // Report the STORED record, so this response and every later describe of the same
+        // configuration can only agree.
+        Ok(UpdateMatchmakingConfigurationOutput {
+            configuration: Some(configuration.to_modelled()),
+        })
     }
 }

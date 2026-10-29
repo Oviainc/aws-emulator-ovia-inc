@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBuild
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBuild`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBuild::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the build metadata the request supplies onto the stored build and reports that
+//! one record, so this response and every later read of the build (`DescribeBuild`) are
+//! served from the same stored values. A property the request omits keeps the value the
+//! stored build already carries.
 //!
 //! ## Shape of an operation
 //!
@@ -152,20 +148,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBuild` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBuildErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBuild"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateBuildErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // "Specify the build ID to update" — by build id or by ARN. An identifier that
+        // names no stored build is the modelled `NotFoundException` ("The resource was
+        // either not created yet or deleted"), and nothing is written.
+        let Some(build_id) = state.resolve_build_id(&input.build_id) else {
+            return Err(UpdateBuildErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("The build {} was not found.", input.build_id)),
+            })
+            .into());
+        };
+        let Some(build) = state.builds.get_mut(&build_id) else {
+            return Err(UpdateBuildErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the build to update could not be read back".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "Updates metadata in a build resource, including the build name and version. To
+        // update the metadata, specify the build ID to update and provide the new values":
+        // each member the request supplies is written onto the stored build, and one it
+        // omits is not touched — so a later read reports the supplied values and keeps the
+        // rest. The build's own status, operating system and storage location are not
+        // metadata this operation carries, so they are left as they are.
+        if let Some(name) = input.name.clone() {
+            build.name = Some(name);
+        }
+        if let Some(version) = input.version.clone() {
+            build.version = Some(version);
+        }
+
+        // Report the STORED record, so this response and every later read of the same build
+        // can only agree.
+        Ok(UpdateBuildOutput {
+            build: Some(build.to_modelled()),
+        })
     }
 }

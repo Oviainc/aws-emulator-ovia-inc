@@ -29,6 +29,8 @@ mod locations;
 mod matchmaking;
 #[path = "all/matchmaking_rule_set_persistence.rs"]
 mod matchmaking_rule_set_persistence;
+#[path = "all/resource_updates.rs"]
+mod resource_updates;
 #[path = "all/scripts.rs"]
 mod scripts;
 #[path = "all/server_process_capacity.rs"]

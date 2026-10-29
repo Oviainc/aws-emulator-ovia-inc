@@ -238,7 +238,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::MAX_MATCHMAKING_CONFIGURATIONS_PER_ACCOUNT;
+        use crate::state::{
+            BACKFILL_MODE_AUTOMATIC, DEFAULT_ADDITIONAL_PLAYER_COUNT, DEFAULT_BACKFILL_MODE,
+            FLEX_MATCH_MODE_STANDALONE, MAX_MATCHMAKING_CONFIGURATIONS_PER_ACCOUNT,
+        };
 
         let invalid = |message: String| -> Self::Error {
             CreateMatchmakingConfigurationErrorModeled::InvalidRequestException(
@@ -387,11 +390,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             rule_set_name,
             rule_set_arn,
             notification_target: input.notification_target.clone(),
-            additional_player_count: input.additional_player_count,
+            // Settings the request left out are the ones the SERVICE decides, so the
+            // stored configuration carries the documented default and every read of it
+            // reports that decision rather than nothing.
+            additional_player_count: Some(
+                input
+                    .additional_player_count
+                    .unwrap_or(DEFAULT_ADDITIONAL_PLAYER_COUNT),
+            ),
             custom_event_data: input.custom_event_data.clone(),
             game_properties: input.game_properties.clone().unwrap_or_default(),
             game_session_data: input.game_session_data.clone(),
-            backfill_mode: input.backfill_mode.clone(),
+            backfill_mode: Some(
+                input
+                    .backfill_mode
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_BACKFILL_MODE.to_string()),
+            ),
             flex_match_mode: input.flex_match_mode.clone(),
             tags,
             creation_time: now,
@@ -420,14 +435,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The `FlexMatchMode` that forms matches without starting a game session: that member's
-/// own doc — "STANDALONE - FlexMatch forms matches and returns match information,
-/// including players and team assignments, in a MatchmakingSucceeded event." Both values
-/// come from the modelled enum (`smithy_query shape=FlexMatchMode`), which
-/// `FLEX_MATCH_MODE_VALUES` carries.
-const FLEX_MATCH_MODE_STANDALONE: &str = "STANDALONE";
-
-/// The `BackfillMode` that has Amazon GameLift Servers create backfill requests itself
-/// (`smithy_query shape=BackfillMode`), which the STANDALONE mode cannot combine with.
-const BACKFILL_MODE_AUTOMATIC: &str = "AUTOMATIC";

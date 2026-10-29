@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateScript
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateScript`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateScript::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the script metadata and content the request supplies onto the stored script and
+//! reports that one record, so this response and every later read of the script
+//! (`DescribeScript`) are served from the same stored values. A property the request omits
+//! keeps the value the stored script already carries.
 //!
 //! ## Shape of an operation
 //!
@@ -176,20 +172,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateScript` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateScriptErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateScript"))
+        let invalid = |message: String| -> Self::Error {
+            UpdateScriptErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // "To update script content, provide an updated zip file by pointing to either a
+        // local file or an Amazon S3 bucket location. You can use either method regardless
+        // of how the original script was uploaded." The two members are the two
+        // alternatives of ONE choice, so a request that updates the content names exactly
+        // one of them — with both there are two sources for one script. A request that
+        // names neither updates only the metadata. Refused BEFORE any state is locked and
+        // before anything is written.
+        let zip_file = input.zip_file.as_deref();
+        let requested_location = input.storage_location.as_ref();
+        if zip_file.is_some() && requested_location.is_some() {
+            return Err(invalid(
+                "ZipFile and StorageLocation are the two alternatives for providing the script \
+                 file; a request names at most one of them."
+                    .to_string(),
+            ));
+        }
+
+        // "The storage location must specify the Amazon S3 bucket name, the zip file name
+        // (the "key"), and a role ARN that allows Amazon GameLift Servers to access the
+        // Amazon S3 storage location." The modelled `S3Location` leaves all three members
+        // optional, so the documented requirement is enforced where the request is served.
+        if let Some(location) = requested_location {
+            for (member, value) in [
+                ("Bucket", &location.bucket),
+                ("Key", &location.key),
+                ("RoleArn", &location.role_arn),
+            ] {
+                if value.as_ref().is_none_or(|value| value.trim().is_empty()) {
+                    return Err(invalid(format!(
+                        "StorageLocation must specify {member}: a storage location names the S3 \
+                         bucket, the zip file key, and the role ARN that lets Amazon GameLift \
+                         Servers read it."
+                    )));
+                }
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateScriptErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // "To update script metadata, specify the script ID" — by script id or by ARN. An
+        // identifier that names no stored script is the modelled `NotFoundException` ("The
+        // resource was either not created yet or deleted"), and nothing is written.
+        let Some((script_id, region)) = state
+            .resolve_script(&input.script_id)
+            .map(|script| (script.script_id.clone(), script.region.clone()))
+        else {
+            return Err(UpdateScriptErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("The script {} was not found.", input.script_id)),
+            })
+            .into());
+        };
+        let Some(script) = state.scripts.get_mut(&script_id) else {
+            return Err(UpdateScriptErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the script to update could not be read back".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "provide updated name and/or version values": each member the request supplies is
+        // written onto the stored script, and one it omits is not touched — so a later read
+        // reports the supplied values and keeps the rest.
+        if let Some(name) = input.name.clone() {
+            script.name = Some(name);
+        }
+        if let Some(version) = input.version.clone() {
+            script.version = Some(version);
+        }
+
+        // "If the call is successful, the updated metadata is stored in the script record
+        // and a revised script is uploaded": where the revised content came from is what
+        // the record's storage location reports, exactly as it does for a create — a local
+        // zip file is held at the Amazon GameLift Servers-owned location, and an S3 upload
+        // "reflects the information that was provided in the" request. `SizeOnDisk`
+        // "remains at 0" for files that stay in the caller's own bucket, which is why only
+        // the zip-file form reports a size.
+        match (zip_file, requested_location) {
+            (Some(zip), _) => {
+                script.storage_location =
+                    crate::state::service_owned_script_location(&region, &script_id);
+                script.size_on_disk = i64::try_from(zip.len()).unwrap_or(i64::MAX);
+            }
+            (None, Some(location)) => {
+                script.storage_location = location.clone();
+                script.size_on_disk = 0;
+            }
+            (None, None) => {}
+        }
+
+        // Report the STORED record, so this response and every later read of the same
+        // script can only agree.
+        Ok(UpdateScriptOutput {
+            script: Some(script.to_modelled()),
+        })
     }
 }
