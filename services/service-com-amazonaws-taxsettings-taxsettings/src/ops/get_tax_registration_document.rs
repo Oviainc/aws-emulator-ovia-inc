@@ -11,8 +11,10 @@
 //! * `presignedS3Url` — where the document itself is
 //!   ([`crate::state::document_download_url`]), reported for every held document.
 //! * `destinationFilePath` — reported only when the request names a
-//!   `destinationS3Location`: the object key the document occupies in THAT
-//!   bucket, which is the file path the request asked it to be downloaded to. A
+//!   `destinationS3Location`: the place in THAT location the document is asked
+//!   to be downloaded to, naming the whole location the request gave — its
+//!   `bucket`, then the object key the document occupies under its `prefix` — so
+//!   two requests naming different destinations are answered different paths. A
 //!   request that names no destination asked for no download, so there is no
 //!   destination path to report.
 //!
@@ -185,8 +187,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The object key the document occupies in the bucket a request named: the
-/// prefix the request asked for, then the document's own name.
+/// The place in the location a request named that the document is to be
+/// downloaded to: the bucket the request gave, then the prefix it asked for,
+/// then the document's own name.
+///
+/// `bucket` is the location's one `@required` member — "the name of your Amazon
+/// S3 bucket that you specify to download your tax documents to" — and the
+/// reported member is "the file path of the Amazon S3 bucket where you want to
+/// download your tax document to", so the path names that bucket as well as the
+/// key under it: a caller that asks for the same document into two different
+/// buckets is told two different places. It is written in the `s3://` form AWS
+/// writes a path to an S3 object in, which `DestinationFilePath`'s pattern
+/// (`^[\s\S]*$`) admits.
 ///
 /// `prefix` is documented as "the Amazon S3 object prefix that you specify for
 /// your tax document file", so it PREFIXES the key rather than replacing it, and
@@ -194,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// a request whose prefix ends in the separator names the same place in the
 /// bucket as one that leaves it off, so both get the same key.
 fn destination_file_path(destination: &DestinationS3Location, name: &str) -> String {
-    match destination
+    let key = match destination
         .prefix
         .as_deref()
         .map(|prefix| prefix.trim_end_matches('/'))
@@ -202,5 +214,6 @@ fn destination_file_path(destination: &DestinationS3Location, name: &str) -> Str
     {
         Some(prefix) => format!("{prefix}/{name}"),
         None => name.to_string(),
-    }
+    };
+    format!("s3://{}/{key}", destination.bucket)
 }

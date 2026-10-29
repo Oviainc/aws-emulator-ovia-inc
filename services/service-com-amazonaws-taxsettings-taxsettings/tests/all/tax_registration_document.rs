@@ -19,8 +19,8 @@
 //! carrying the path separator, non-ASCII names and a name far longer than the
 //! 200-character cap the model puts on the reported URL, every form of
 //! `destinationS3Location` (absent, a bucket alone, a bucket with a prefix, the
-//! same prefix spelled with its trailing separator), and each way a token can
-//! fail to name a held document.
+//! same prefix spelled with its trailing separator, the same prefix under a
+//! different bucket), and each way a token can fail to name a held document.
 //!
 //! The harness (`emulator`, `call`, `field_list`, `make_validations_due`) lives
 //! in `tax_registration_lifecycle.rs`; nothing here builds a second one.
@@ -201,15 +201,17 @@ fn document_rows() -> Vec<DocumentRow> {
 }
 
 /// The destinations the rule holds over: `destinationS3Location` is optional
-/// (`smithy_query(query="operation", operation="GetTaxRegistrationDocument")`)
-/// and its `prefix` is "the Amazon S3 object prefix that you specify for your
-/// tax document file", so the rows are no destination at all, a bucket alone, a
-/// bucket with a prefix, and the same prefix spelled with its trailing
-/// separator — which names the same place in the bucket.
+/// (`smithy_query(query="operation", operation="GetTaxRegistrationDocument")`),
+/// its `bucket` is "the name of your Amazon S3 bucket that you specify to
+/// download your tax documents to" and its `prefix` is "the Amazon S3 object
+/// prefix that you specify for your tax document file", so the rows are no
+/// destination at all, a bucket alone, a bucket with a prefix, the same prefix
+/// spelled with its trailing separator — which names the same place in the
+/// bucket — and the same prefix under a different bucket.
 ///
 /// The third element is the prefix the reported path is expected to carry:
-/// `None` with a destination means the path is the document's name alone, and no
-/// destination at all means no path is reported.
+/// `None` with a destination means the path is the bucket and the document's
+/// name alone, and no destination at all means no path is reported.
 fn destination_rows() -> Vec<(&'static str, Option<Value>, Option<&'static str>)> {
     vec![
         ("no destination", None, None),
@@ -228,13 +230,19 @@ fn destination_rows() -> Vec<(&'static str, Option<Value>, Option<&'static str>)
             Some(json!({ "bucket": "my-tax-documents", "prefix": "tax/2026/" })),
             Some("tax/2026"),
         ),
+        (
+            "the same prefix under a different bucket",
+            Some(json!({ "bucket": "somewhere-else-entirely", "prefix": "tax/2026" })),
+            Some("tax/2026"),
+        ),
     ]
 }
 
 /// RULE: the metadata a stored registration reports for one of its documents is
 /// answered with that document's download location — a URL within the modelled
 /// `Url` constraints naming the document's own object, and, when the request
-/// names a destination bucket, the object key the document occupies there.
+/// names a destination, the place in THAT location (its bucket, then the key
+/// under its prefix) the document is asked to be downloaded to.
 ///
 /// Asserted over every document shape and every destination form, and the same
 /// question asked twice: a read reports what it reported before and leaves the
@@ -310,9 +318,19 @@ async fn a_held_documents_metadata_resolves_to_its_download_location() {
                 urls.insert(url);
 
                 let reported_path = answer.get("destinationFilePath").as_str().map(str::to_string);
-                let expected_path = destination.as_ref().map(|_| match expected_prefix {
-                    Some(prefix) => format!("{prefix}/{document_name}"),
-                    None => document_name.clone(),
+                // The path names the whole location the request gave: the bucket
+                // it asked the document to be downloaded to, then the key under
+                // the prefix. Written out rather than computed from the
+                // handler's own helper, for the reason above.
+                let expected_path = destination.as_ref().map(|destination| {
+                    let bucket = destination
+                        .get("bucket")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    match expected_prefix {
+                        Some(prefix) => format!("s3://{bucket}/{prefix}/{document_name}"),
+                        None => format!("s3://{bucket}/{document_name}"),
+                    }
                 });
                 assert_eq!(
                     reported_path, expected_path,

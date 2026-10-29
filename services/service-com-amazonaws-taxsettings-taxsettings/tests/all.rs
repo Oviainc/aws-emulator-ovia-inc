@@ -35,6 +35,8 @@ mod declared_member_defaults;
 mod derived_address_precedence;
 #[path = "all/derived_registration_members.rs"]
 mod derived_registration_members;
+#[path = "all/document_destination_location.rs"]
+mod document_destination_location;
 #[path = "all/exemption_identity_padding.rs"]
 mod exemption_identity_padding;
 #[path = "all/exemption_type_admission.rs"]
