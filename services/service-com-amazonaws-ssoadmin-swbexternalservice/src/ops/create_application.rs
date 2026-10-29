@@ -259,17 +259,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The ARN of the application provider under which the operation will run": an
         // application provider is AWS-owned, so the only ones that exist are the ones this
         // service publishes, and an ARN naming no provider of that catalog resolves to
-        // nothing — the same `ResourceNotFoundException` `DescribeApplicationProvider`
-        // answers an unknown provider ARN with.
+        // nothing — the same `ResourceNotFoundException`, carrying the same detail text
+        // (`crate::state::application_provider_not_found_message`),
+        // `DescribeApplicationProvider` answers an unknown provider ARN with.
         let provider = crate::state::built_in_application_provider(
             &input.application_provider_arn,
         )
         .ok_or_else(|| {
             CreateApplicationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "Could not find ApplicationProvider with arn {}.",
-                    input.application_provider_arn
+                message: Some(crate::state::application_provider_not_found_message(
+                    &input.application_provider_arn,
                 )),
+                // The model's `ResourceNotFoundExceptionReason` enum carries only KMS key
+                // states, none of which this refusal is.
                 reason: None,
             })
         })?;

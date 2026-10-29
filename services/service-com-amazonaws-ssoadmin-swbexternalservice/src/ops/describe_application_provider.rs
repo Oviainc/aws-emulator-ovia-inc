@@ -12,7 +12,10 @@
 //! [`crate::state::BUILT_IN_APPLICATION_PROVIDERS`], which this read answers from; an
 //! ARN outside it names nothing, which is the modelled `ResourceNotFoundException`
 //! (answered at the HTTP 400 this service answers a refused request with — see
-//! [`crate::scaffolded::modeled_error_status`]). The lookup is by provider ID — the whole
+//! [`crate::scaffolded::modeled_error_status`]), reported through
+//! [`crate::state::application_provider_not_found_message`]: the one sentence every
+//! operation that resolves an `ApplicationProviderArn` states that condition with. The
+//! lookup is by provider ID — the whole
 //! id, so a `catalog/<Name>` application resolves as readily as a service slug — which is
 //! why the same provider resolves in every partition the pattern admits, and the ARN
 //! reported back is the one asked for. Every member of the record is reported: the
@@ -175,9 +178,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeApplicationProviderErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "No application provider with arn '{}' was found",
-                            input.application_provider_arn
+                        message: Some(crate::state::application_provider_not_found_message(
+                            &input.application_provider_arn,
                         )),
                         // The model's `ResourceNotFoundExceptionReason` enum carries only
                         // `KMS_NotFoundException`, which this is not.

@@ -486,6 +486,26 @@ pub fn application_provider_unsupported_message(application_provider_arn: &str) 
     )
 }
 
+/// The refusal an `ApplicationProviderArn` that names no PUBLISHED application provider
+/// earns, as the message of the modelled `ResourceNotFoundException` (HTTP 404).
+///
+/// An application provider is AWS-owned (the modelled `ApplicationProviderArn` pattern
+/// pins the owner segment to `aws`) and no operation creates one, so the providers that
+/// exist are exactly the published catalogue
+/// ([`BUILT_IN_APPLICATION_PROVIDERS`]) and an ARN outside it resolves to nothing.
+///
+/// One condition reads ONE way, exactly as [`instance_not_found_message`] keeps it for the
+/// instance: every operation that resolves an `ApplicationProviderArn` reports it through
+/// this helper, so a client that branches on the detail text — the only member these error
+/// shapes carry — sees the same sentence for one provider ARN whichever operation it
+/// called. It is distinct from [`application_provider_unsupported_message`], which a
+/// provider that IS published but backs no customer managed OAuth 2.0 application earns.
+///
+/// Built from the request: it names the ARN that resolved to nothing.
+pub fn application_provider_not_found_message(application_provider_arn: &str) -> String {
+    format!("No application provider with arn '{application_provider_arn}' was found")
+}
+
 /// `KmsKeyType::AWS_OWNED_KMS_KEY` — the instance is encrypted with an Amazon Web
 /// Services owned key, so no `KmsKeyArn` names it ("Cannot be specified when KeyType is
 /// AWS_OWNED_KMS_KEY", `EncryptionConfiguration$KmsKeyArn`).
