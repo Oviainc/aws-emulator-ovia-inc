@@ -203,8 +203,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The parameters an `@idempotencyToken` retry is compared on, as this operation
+        // RESOLVES them: the lens counts as the lens its `LensAlias` names rather than as
+        // the spelling it was named by (`crate::state::lens_alias`, the identity
+        // `lens_by_alias` resolves the lens through below), so a retry that spells the
+        // same lens the other way is the SAME request and replays.
         let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
-            "LensAlias": &input.lens_alias,
+            "LensAlias": crate::state::lens_alias(&input.lens_alias),
             "SharedWith": &input.shared_with,
         }));
 

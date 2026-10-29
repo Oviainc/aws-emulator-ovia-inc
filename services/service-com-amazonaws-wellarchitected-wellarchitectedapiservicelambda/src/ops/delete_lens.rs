@@ -228,9 +228,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // token and the same parameters, after the original request completed
         // successfully, replays that request's result. The parameters besides the token
         // are the lens and the status, so the fingerprint is over both — a token reused to
-        // delete another part of the lens is not the same request.
+        // delete another part of the lens is not the same request. The lens is taken as
+        // the lens its `LensAlias` NAMES rather than as the spelling it was named by,
+        // because that is the identity the alias is resolved through below
+        // (`crate::state::lens_alias`): a retry that spells the same lens the other way is
+        // the SAME request.
         let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
-            "LensAlias": &input.lens_alias,
+            "LensAlias": crate::state::lens_alias(&input.lens_alias),
             "LensStatus": &input.lens_status,
         }));
 

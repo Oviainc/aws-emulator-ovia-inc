@@ -69,8 +69,15 @@ struct Refusal {
 
 /// `DELETE /lenses/{LensAlias}/shares/{ShareId}?ClientRequestToken=…`, the wire form of
 /// `DeleteLensShare`: both labels are non-greedy, so each travels percent-encoded in one
-/// path segment, and the `@idempotencyToken` is bound to the query string.
-async fn delete_share(client: &Client, alias: &str, share_id: &str, token: &str) -> Answer {
+/// path segment, and the `@idempotencyToken` is bound to the query string. `pub(crate)`
+/// because `super::lens_token_alias_spelling` revokes its shares through this one spelling
+/// of the request.
+pub(crate) async fn delete_share(
+    client: &Client,
+    alias: &str,
+    share_id: &str,
+    token: &str,
+) -> Answer {
     client
         .send(
             "DELETE",

@@ -56,8 +56,15 @@ use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state
 
 /// `DELETE /lenses/{LensAlias}`, the wire form of `DeleteLens`, with both required query
 /// members bound to the query string. The alias is percent-encoded because a custom lens
-/// is named by its ARN, which carries `:` and `/` inside ONE path segment.
-async fn delete_lens(client: &Client, alias: &str, status: &str, token: &str) -> Answer {
+/// is named by its ARN, which carries `:` and `/` inside ONE path segment. `pub(crate)`
+/// because `super::lens_token_alias_spelling` deletes its lenses through this one spelling
+/// of the request.
+pub(crate) async fn delete_lens(
+    client: &Client,
+    alias: &str,
+    status: &str,
+    token: &str,
+) -> Answer {
     client
         .send(
             "DELETE",

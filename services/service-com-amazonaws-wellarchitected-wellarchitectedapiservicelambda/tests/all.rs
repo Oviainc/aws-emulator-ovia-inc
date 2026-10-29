@@ -421,3 +421,8 @@ mod agent_profile_tag_writes;
 // position for a review-template share suite falls in a crowded run of this list.
 #[path = "all/template_share_invitation_answers.rs"]
 mod template_share_invitation_answers;
+
+// Appended at the end of this list for the reason the notes above give: the sorted position
+// for a lens suite falls in a crowded run of this list.
+#[path = "all/lens_token_alias_spelling.rs"]
+mod lens_token_alias_spelling;

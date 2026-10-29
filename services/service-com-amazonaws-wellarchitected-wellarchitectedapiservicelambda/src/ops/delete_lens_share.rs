@@ -26,7 +26,9 @@
 //! parameters is a different request, which is the modelled `ConflictException` (409), and
 //! the token is recorded only once a removal has landed, so a refused request leaves it
 //! free. A delete of a share that is gone under a token of its own is still the 404 any
-//! other `ShareId` naming no share gets.
+//! other `ShareId` naming no share gets. Those parameters are compared as this operation
+//! RESOLVES them, so the lens counts as the lens its `LensAlias` names rather than as the
+//! spelling it was named by: a retry that spells the same lens the other way replays.
 //!
 //! ## Shape of an operation
 //!
@@ -220,9 +222,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // under the same token and the same parameters, after the original request
         // completed successfully, replays that request's result. The parameters besides
         // the token are the lens the share belongs to and the share itself, so the
-        // fingerprint is over those two.
+        // fingerprint is over those two — with the lens taken as the lens its `LensAlias`
+        // NAMES rather than as the spelling it was named by, because that is the identity
+        // this request resolves the share against below (`crate::state::lens_alias`, the
+        // same normalisation `UpgradeLensReview` fingerprints through): a retry that
+        // spells the same lens the other way is the SAME request and must replay, not
+        // conflict. That identity is the lens ID the alias ends in, and the fingerprint is
+        // read before anything is resolved (the share the original request removed no
+        // longer resolves), so an ARN naming another account or Region fingerprints as the
+        // lens id it carries rather than as the lens it fails to resolve to.
         let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
-            "LensAlias": &input.lens_alias,
+            "LensAlias": crate::state::lens_alias(&input.lens_alias),
             "ShareId": &input.share_id,
         }));
 
