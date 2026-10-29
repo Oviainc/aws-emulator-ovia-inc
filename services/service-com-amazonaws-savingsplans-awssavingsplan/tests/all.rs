@@ -25,6 +25,8 @@ mod offering_catalog;
 mod offering_product_type_coverage;
 #[path = "all/offering_rate_catalog.rs"]
 mod offering_rate_catalog;
+#[path = "all/offering_service_code.rs"]
+mod offering_service_code;
 #[path = "all/plan_rate_card.rs"]
 mod plan_rate_card;
 #[path = "all/property_filter_rule.rs"]

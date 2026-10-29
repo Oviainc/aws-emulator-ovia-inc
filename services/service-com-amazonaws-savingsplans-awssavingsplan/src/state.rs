@@ -808,6 +808,48 @@ const PAYMENT_OPTIONS: [&str; 3] = [
     PAYMENT_PARTIAL_UPFRONT,
 ];
 
+/// Whether `code` is a value of `SavingsPlanServiceCode` — the shape BOTH
+/// `SavingsPlanOffering$serviceCode` and the offerings search's own
+/// `serviceCodes` filter target: letters only, at least one and at most 255 of
+/// them (pattern `^[a-zA-Z]+$`, length 0..255).
+///
+/// The two directions are one shape, so a code the catalog reports is a code the
+/// same operation's filter accepts; a code outside it could never be fed back.
+fn is_service_code(code: &str) -> bool {
+    !code.is_empty() && code.len() <= 255 && code.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
+/// The billing line item a **compute** plan type's offerings bill under, which
+/// is what `SavingsPlanOffering$serviceCode` reports for them.
+///
+/// BOTH compute plan types report it, and that is a deliberate divergence worth
+/// stating: the live service answers an EC2 Instance offering with the EC2
+/// service's own per-service pricing code, whose spelling carries a digit — a
+/// value its OWN model excludes, since `SavingsPlanServiceCode` (the shape this
+/// member and the search's `serviceCodes` filter share) admits letters only
+/// ([`is_service_code`]). An emulator that validates requests from the model
+/// cannot report both halves of that: a digit-carrying code is refused as a
+/// filter value before any offering is compared, so reporting it would publish a
+/// code its own search rejects. This crate follows the model and reports the
+/// letters-only line item the plan bills under — the compute Savings Plans line
+/// item AWS publishes Compute and EC2 Instance Savings Plans in one price list
+/// for. A plan type that spans several services has no single member service's
+/// code to report anyway ([`SERVICE_CODE_DATABASE`]).
+///
+/// Where a digit-carrying per-service code IS a modelled value, the RATE catalog
+/// reports it unchanged: `SavingsPlanRateServiceCode` is an enum that lists those
+/// spellings ([`crate::ops::types::SAVINGS_PLAN_RATE_SERVICE_CODE_VALUES`]).
+const SERVICE_CODE_COMPUTE: &str = "ComputeSavingsPlans";
+
+/// The line item a SageMaker plan type's offerings bill under: the one service
+/// such a plan is scoped to. See [`SERVICE_CODE_COMPUTE`].
+const SERVICE_CODE_SAGEMAKER: &str = "AmazonSageMaker";
+
+/// The line item a Database plan type's offerings bill under. A plan type that
+/// spans several services bills under its OWN Savings Plans line item rather
+/// than under one member service's. See [`SERVICE_CODE_COMPUTE`].
+const SERVICE_CODE_DATABASE: &str = "DatabaseSavingsPlans";
+
 /// How an offering's `description` names it: the term, the payment option and
 /// the plan type, in that order (`SavingsPlanDescription`, pattern
 /// `^[a-zA-Z0-9_\- ]+$`, so no punctuation beyond `-` and `_`).
@@ -979,7 +1021,7 @@ fn seed_offerings(id_seed: u128) -> Vec<Offering> {
                 payment_option,
                 duration_seconds,
                 "USD",
-                "ComputeSavingsPlans",
+                SERVICE_CODE_COMPUTE,
                 &offering_usage_type("ComputeSP", term_token, payment_option),
                 "",
                 Vec::new(),
@@ -997,7 +1039,7 @@ fn seed_offerings(id_seed: u128) -> Vec<Offering> {
                         payment_option,
                         duration_seconds,
                         currency,
-                        "AmazonEC2",
+                        SERVICE_CODE_COMPUTE,
                         &offering_usage_type(
                             &format!("{region}-EC2SP:{family}"),
                             term_token,
@@ -1023,7 +1065,7 @@ fn seed_offerings(id_seed: u128) -> Vec<Offering> {
                     payment_option,
                     duration_seconds,
                     currency,
-                    "AmazonSageMaker",
+                    SERVICE_CODE_SAGEMAKER,
                     &offering_usage_type(
                         &format!("{region}-SageMakerSP"),
                         term_token,
@@ -1045,14 +1087,10 @@ fn seed_offerings(id_seed: u128) -> Vec<Offering> {
                     payment_option,
                     duration_seconds,
                     currency,
-                    // A plan type that spans several services bills under its
-                    // OWN Savings Plans line item rather than under one member
-                    // service's — the way a Compute plan bills under
-                    // `ComputeSavingsPlans` with no single service operation —
-                    // so a Database plan, which covers every database product
-                    // the model enumerates, reports the plan's line item here
+                    // A Database plan covers every database product the model
+                    // enumerates, so it reports the plan's own line item here
                     // and no per-service `operation`.
-                    "DatabaseSavingsPlans",
+                    SERVICE_CODE_DATABASE,
                     &offering_usage_type(
                         &format!("{region}-DatabaseSP"),
                         term_token,
@@ -1119,6 +1157,10 @@ fn offering(
     operation: &str,
     properties: Vec<(String, String)>,
 ) -> Offering {
+    debug_assert!(
+        is_service_code(service_code),
+        "the catalog may only report a service code the offerings search's own serviceCodes filter accepts, got {service_code:?}"
+    );
     Offering {
         offering_id: String::new(),
         product_types: product_types.iter().map(|p| (*p).to_string()).collect(),
