@@ -83,11 +83,13 @@ const REGISTRY_REFUSAL_CODE: &str = "CFNRegistryException";
 /// refuses what the lookup cannot resolve with the registry's modelled error — the ARN is not
 /// gated on syntax ahead of the registry, so the modelled `ThirdPartyTypeArn` pattern (which
 /// is narrower than the ARNs CloudFormation parses) must not pre-empt that refusal with a
-/// different error class. This restates exactly the one refusal the registry owns: a value
-/// whose name segment is no extension type name ([`registry::is_type_name`]), which is the
-/// same refusal `ActivateType`'s handler answers for an ARN the pattern let through. Every
-/// other refusal of that member, and every other member's, keeps the framework's wording:
-/// this service has no evidence that CloudFormation words those as registry failures.
+/// different error class. This restates exactly the two refusals the registry owns: a value
+/// pinning a public version number past the extension's name
+/// ([`registry::PublicTypeArnParts::public_version_number`]), and one whose name segment is no
+/// extension type name ([`registry::is_type_name`]) — the same refusals, in the same order,
+/// that `ActivateType`'s handler answers for an ARN the pattern let through. Every other
+/// refusal of that member, and every other member's, keeps the framework's wording: this
+/// service has no evidence that CloudFormation words those as registry failures.
 fn registry_refusal_of_a_public_extension_arn(violations: &[Violation]) -> Option<Refused> {
     violations.iter().find_map(|violation| {
         if violation.path != PUBLIC_EXTENSION_ARN_PATH
@@ -96,11 +98,17 @@ fn registry_refusal_of_a_public_extension_arn(violations: &[Violation]) -> Optio
             return None;
         }
         let arn = violation.value.as_deref()?;
-        let resolves = registry::split_public_type_arn(arn)
-            .is_some_and(|(_, _, type_name)| registry::is_type_name(&type_name));
-        (!resolves).then(|| Refused {
+        let parts = registry::split_public_type_arn(arn);
+        let message = match &parts {
+            Some(parts) if parts.public_version_number.is_some() => {
+                registry::PUBLIC_VERSION_NUMBER_IN_ARN
+            }
+            Some(parts) if registry::is_type_name(&parts.type_name) => return None,
+            _ => registry::INVALID_TYPE_NAME,
+        };
+        Some(Refused {
             code: REGISTRY_REFUSAL_CODE.to_string(),
-            message: registry::INVALID_TYPE_NAME.to_string(),
+            message: message.to_string(),
         })
     })
 }

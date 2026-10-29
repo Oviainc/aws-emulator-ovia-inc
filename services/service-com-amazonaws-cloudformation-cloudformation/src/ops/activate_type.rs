@@ -16,7 +16,11 @@
 //! `PublicTypeArn` carries, which CloudFormation reads out of the ARN itself
 //! ([`crate::state::registry::split_public_type_arn`]) rather than leaving the ARN to a
 //! syntax gate. An ARN carrying no extension type name resolves no extension, so it is
-//! refused with the registry's own modelled `CFNRegistryException` (400) and writes nothing.
+//! refused with the registry's own modelled `CFNRegistryException` (400) and writes nothing;
+//! so is one that pins a public version number past the extension's name, since a public
+//! extension ARN addresses the extension and not one version of it — that refusal is answered
+//! on the shape of the ARN alone, ahead of the registry lookup and of every other rule of the
+//! activation.
 //!
 //! What the activation installs comes from the PUBLIC extension it activates, where this
 //! Region's registry holds the publication it was published by
@@ -359,11 +363,12 @@ impl PublicExtension {
     ///
     /// What is left for this reading are the rules the model states in prose rather than in a
     /// constraint: "You must specify PublicTypeArn, or TypeName, Type, and PublisherId" and
-    /// "You can specify MajorVersion or VersionBump, but not both" — plus the one rule the
+    /// "You can specify MajorVersion or VersionBump, but not both" — plus the two rules the
     /// registry owns itself, that the ARN must carry an extension type name
-    /// ([`registry::is_type_name`]), since CloudFormation reads the name out of the ARN
-    /// instead of leaving the ARN to a syntax gate (see [`crate::service`], which states the
-    /// same refusal for an ARN the modelled pattern stops ahead of this handler).
+    /// ([`registry::is_type_name`]) and must pin no public version number past it
+    /// ([`registry::PUBLIC_VERSION_NUMBER_IN_ARN`]), since CloudFormation reads the ARN apart
+    /// itself instead of leaving it to a syntax gate (see [`crate::service`], which states the
+    /// same refusals for an ARN the modelled pattern stops ahead of this handler).
     ///
     /// The first of those is a rule about what must be IDENTIFIED, not about which members
     /// may appear: a `PublicTypeArn` carries the kind, the publisher and the name itself, so
@@ -386,11 +391,24 @@ impl PublicExtension {
                 // NAME it carries, so an ARN that carries no extension type name — one whose
                 // segments say nothing, and one whose name segment is not a type name at all
                 // ([`registry::is_type_name`]) — names no extension and is refused as the
-                // registry refuses every unresolvable name.
-                let (type_kind, publisher_id, type_name) =
-                    registry::split_public_type_arn(public_type_arn)
-                        .filter(|(_, _, type_name)| registry::is_type_name(type_name))
-                        .ok_or_else(|| registry::INVALID_TYPE_NAME.to_string())?;
+                // registry refuses every unresolvable name. An ARN that pins a public VERSION
+                // number past that name addresses no activatable extension either, and is
+                // refused on the shape of the ARN alone — before the name it carries is
+                // resolved, and so before every later rule of the activation.
+                let parts = registry::split_public_type_arn(public_type_arn)
+                    .ok_or_else(|| registry::INVALID_TYPE_NAME.to_string())?;
+                if parts.public_version_number.is_some() {
+                    return Err(registry::PUBLIC_VERSION_NUMBER_IN_ARN.to_string());
+                }
+                let registry::PublicTypeArnParts {
+                    type_kind,
+                    publisher_id,
+                    type_name,
+                    ..
+                } = parts;
+                if !registry::is_type_name(&type_name) {
+                    return Err(registry::INVALID_TYPE_NAME.to_string());
+                }
                 for (member, spelled, carried) in [
                     ("Type", input.r#type.as_deref(), type_kind.as_str()),
                     (

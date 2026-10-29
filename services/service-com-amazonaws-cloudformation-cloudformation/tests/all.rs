@@ -149,6 +149,8 @@ mod no_echo_parameters;
 mod operation_events;
 #[path = "all/provisioned_resources.rs"]
 mod provisioned_resources;
+#[path = "all/public_extension_arn_versions.rs"]
+mod public_extension_arn_versions;
 #[path = "all/public_extension_arns.rs"]
 mod public_extension_arns;
 #[path = "all/publish_type.rs"]

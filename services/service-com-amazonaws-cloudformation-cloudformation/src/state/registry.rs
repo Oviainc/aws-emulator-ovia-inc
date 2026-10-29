@@ -230,6 +230,25 @@ pub fn public_type_arn(region: &str, type_kind: &str, type_name: &str) -> String
     )
 }
 
+/// What a PUBLIC extension ARN names: the extension's kind, the publisher that published
+/// it, its name — and the public VERSION NUMBER the ARN pins past that name, where it pins
+/// one ([`split_public_type_arn`] reads all four out of one ARN).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicTypeArnParts {
+    /// The kind of extension, in the spelling [`registry_type`] keys a record by.
+    pub type_kind: String,
+    /// The id of the publisher that published the extension.
+    pub publisher_id: String,
+    /// The extension's own name, in the `::`-separated spelling the registry keys a record
+    /// by.
+    pub type_name: String,
+    /// What the ARN pins PAST the extension's name, which in the public-extension ARN form
+    /// `…::type/<kind>/<publisher id>/<Type-Name>/<version>` is a public version number.
+    /// `None` for an ARN that names the extension itself, which is the only form an
+    /// extension is addressable by ([`PUBLIC_VERSION_NUMBER_IN_ARN`]).
+    pub public_version_number: Option<String>,
+}
+
 /// The extension NAME an account-scoped registry ARN carries, as the registry keys a record
 /// by it.
 ///
@@ -259,22 +278,26 @@ pub fn arn_extension_name(arn: &str) -> Option<String> {
     Some(dashed_name.replace('-', "::"))
 }
 
-/// The kind, the publisher id and the extension name a PUBLIC extension ARN carries.
+/// The kind, the publisher id, the extension name and any pinned public version a PUBLIC
+/// extension ARN carries.
 ///
-/// CloudFormation addresses a public extension by `…::type/<kind>/<publisher id>/<Type-Name>`
-/// ([`public_type_arn`] mints exactly that), so the three segments after `type/` are read
-/// back here: the kind, the id of the publisher that published it, and the extension's name.
-/// A registry ARN spells the kind in lower case and the `::` separators of a type name as `-`
-/// ([`arn_kind_segment`], [`arn_type_name`]), so both are read back into the spellings the
-/// registry keys a record by — a type name's own segments carry no `-` of their own (the
-/// modelled `TypeName` pattern admits only letters and digits in them), so that reading is
-/// unambiguous, and a kind the registry does not name is read as the extension kind it
-/// spells. `None` for an ARN carrying no such segments at all.
+/// CloudFormation addresses a public extension by `…::type/<kind>/<publisher id>/<Type-Name>`,
+/// so the three segments after `type/` are read back here: the kind, the id of the publisher
+/// that published it, and the extension's name. A registry ARN spells the kind in lower case
+/// and the `::` separators of a type name as `-` ([`arn_kind_segment`], [`arn_type_name`]), so
+/// both are read back into the spellings the registry keys a record by — a type name's own
+/// segments carry no `-` of their own (the modelled `TypeName` pattern admits only letters and
+/// digits in them), so that reading is unambiguous, and a kind the registry does not name is
+/// read as the extension kind it spells. Anything PAST the name segment is the public version
+/// number the ARN pins, reported in
+/// [`PublicTypeArnParts::public_version_number`]. `None` for an ARN carrying no such segments
+/// at all.
 ///
 /// The registry PARSES this ARN itself rather than leaving it to a syntax gate, which is why
 /// this reading is shared: the refusal an unresolvable one gets is the registry's own
-/// ([`INVALID_TYPE_NAME`]).
-pub fn split_public_type_arn(arn: &str) -> Option<(String, String, String)> {
+/// ([`INVALID_TYPE_NAME`]), as is the refusal of one pinning a version
+/// ([`PUBLIC_VERSION_NUMBER_IN_ARN`]).
+pub fn split_public_type_arn(arn: &str) -> Option<PublicTypeArnParts> {
     let (_, path) = arn.split_once(":type/")?;
     let mut segments = path.split('/');
     let type_kind = segments.next()?;
@@ -291,11 +314,16 @@ pub fn split_public_type_arn(arn: &str) -> Option<(String, String, String)> {
     .into_iter()
     .find(|kind| arn_kind_segment(kind).eq_ignore_ascii_case(type_kind))
     .map_or_else(|| type_kind.to_ascii_uppercase(), str::to_string);
-    Some((
+    // Everything past the name segment, kept whole: an extension's name carries no `/` of
+    // its own, so whatever follows it is the version the ARN pins rather than part of the
+    // name.
+    let pinned = path.splitn(4, '/').nth(3).unwrap_or_default();
+    Some(PublicTypeArnParts {
         type_kind,
-        publisher_id.to_string(),
-        type_name.replace('-', "::"),
-    ))
+        publisher_id: publisher_id.to_string(),
+        type_name: type_name.replace('-', "::"),
+        public_version_number: (!pinned.is_empty()).then(|| pinned.to_string()),
+    })
 }
 
 /// Whether `type_name` is a well-formed extension type name: the form the modelled `TypeName`
@@ -336,6 +364,15 @@ const TYPE_NAME_SEGMENT_MAX_LEN: usize = 64;
 /// reads out of it itself. Entirely fixed text: no part of it comes from the request or from
 /// the store.
 pub const INVALID_TYPE_NAME: &str = "TypeName is invalid";
+
+/// The message the registry refuses a public-extension ARN that pins a public VERSION NUMBER
+/// past the extension's name with.
+///
+/// A public extension ARN addresses the EXTENSION — its kind, its publisher and its name — and
+/// which version of it a caller gets is said by the request's own version members, never by
+/// the ARN, so an ARN carrying a further segment addresses nothing the registry can act on.
+/// Entirely fixed text: no part of it comes from the request or from the store.
+pub const PUBLIC_VERSION_NUMBER_IN_ARN: &str = "You cannot specify public version number in the arn";
 
 /// How many versions of ONE public extension this registry holds, oldest reclaimed first.
 ///
