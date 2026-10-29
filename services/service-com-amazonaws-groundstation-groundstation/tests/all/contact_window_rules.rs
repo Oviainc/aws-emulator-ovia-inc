@@ -14,7 +14,7 @@
 //!
 //! A ground station's antennas are FINITE, which is what makes the second condition
 //! reachable: the antennas this account has been told are at the station, or the single one
-//! the emulator numbers for a station it was told nothing about.
+//! the emulator numbers for a station it has been told no antenna for.
 //!
 //! So the suites below assert that rule over SETS of inputs rather than over one call:
 //!
@@ -84,7 +84,10 @@ fn overlaps(first: (i64, i64), second: (i64, i64)) -> bool {
 
 /// Record `count` antennas at `ground_station`, as a handler sees them — seeded where
 /// `state::GROUND_STATIONS_ENV` lands them, which is how an account is told which antennas
-/// a ground station has.
+/// a ground station has. A `count` of zero records the ground station itself with no
+/// antenna: a station this account can address — and ask for the antenna time held at it —
+/// and has been told no antenna for, which the placement gives the one antenna the emulator
+/// numbers for it.
 fn stock_inventory(engine: &engine::InMemoryEngine, ground_station: &str, count: usize) {
     let names: Vec<String> = (1..=count).map(antenna_name).collect();
     let inventory = parse_ground_stations(&format!("{ground_station}={}", names.join("+")));
@@ -388,24 +391,22 @@ async fn a_window_an_antenna_already_holds_is_not_reservable() {
 
 #[tokio::test]
 async fn the_antennas_a_ground_station_has_bound_the_passes_it_holds_at_once() {
-    // Rows differ along how many antennas the ground station has: one it was told nothing
-    // about, and inventories of one, two, three and five antennas. An inventory is at most
+    // Rows differ along how many antennas the ground station has: none it was told about,
+    // and inventories of one, two, three and five antennas. An inventory is at most
     // 100 antennas long (`smithy_query(query="shape", shape="AntennaList")` — len 0..100),
     // so every row is inside that bound.
-    let rows: [(&str, Option<usize>, usize); 5] = [
-        ("no-recorded-inventory", None, 1),
-        ("one-antenna", Some(1), 1),
-        ("two-antennas", Some(2), 2),
-        ("three-antennas", Some(3), 3),
-        ("five-antennas", Some(5), 5),
+    let rows: [(&str, usize, usize); 5] = [
+        ("no-recorded-antenna", 0, 1),
+        ("one-antenna", 1, 1),
+        ("two-antennas", 2, 2),
+        ("three-antennas", 3, 3),
+        ("five-antennas", 5, 5),
     ];
 
     for (case, inventory, capacity) in rows {
         // A store of its own per row, so what one row holds is not what the next sees.
         let (router, engine) = harness_with_engine();
-        if let Some(count) = inventory {
-            stock_inventory(&engine, STATION, count);
-        }
+        stock_inventory(&engine, STATION, inventory);
         let profile_arn = create_mission_profile(&router, "capacity", 1, None, None).await;
 
         // As many overlapping passes as the station has antennas, each on an antenna of its
@@ -465,6 +466,7 @@ async fn an_antenna_out_of_service_holds_it_against_a_reservation() {
     // The station's only antenna is out of service for the first window, and nothing holds
     // it for the second.
     let under_maintenance = (BASE, BASE + 3600);
+    stock_inventory(&engine, STATION, 1);
     schedule_maintenance(&engine, STATION, &antenna_name(1), under_maintenance);
     let profile_arn = create_mission_profile(&router, "maintenance", 60, None, None).await;
 
@@ -486,7 +488,8 @@ async fn an_antenna_out_of_service_holds_it_against_a_reservation() {
 
 #[tokio::test]
 async fn releasing_a_reservation_makes_its_window_reservable_again() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    stock_inventory(&engine, STATION, 1);
     let profile_arn = create_mission_profile(&router, "release", 60, Some(120), Some(60)).await;
     let window = (BASE, BASE + 1800);
     let first = reserve_ok(&router, &profile_arn, STATION, "the-first-pass", window).await;

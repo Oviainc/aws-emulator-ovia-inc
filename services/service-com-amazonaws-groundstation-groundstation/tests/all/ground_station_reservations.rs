@@ -32,6 +32,9 @@
 //! * paging over a table of page sizes, with `maxResults` on each published bound of
 //!   `PaginationMaxResults` and one past each, and a `nextToken` from another window or
 //!   another listing refused rather than resumed;
+//! * ground-station ids this account does not know, refused, beside ids it does know —
+//!   one holding reservations, one the inventory records with no antennas, and one known
+//!   only because a satellite is on-boarded to it — each answered;
 //! * a window that runs backwards, refused;
 //! * the operator setting that takes an antenna out of service, over a table of forms it
 //!   accepts and forms it refuses.
@@ -49,6 +52,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::contact_cancellation::put_in_status;
 use crate::minute_usage::STATUS_HOLDS_ANTENNA_TIME;
+use crate::satellite_catalog::onboard;
 use crate::scheduling_loop::{
     create_mission_profile, harness_with_engine, list_pages, send, Reply, AFTER_SETTLE,
 };
@@ -63,6 +67,11 @@ const STATION: &str = "Ohio-1";
 
 /// See [`STATION`].
 const OTHER_STATION: &str = "Oregon-1";
+
+/// A third ground station this account is served by, recorded with no antenna of its own:
+/// a station it CAN address and that holds no antenna time, which is what the empty page
+/// below asserts — a station the inventory does not record at all is refused instead.
+const EMPTY_STATION: &str = "Dubbo-1";
 
 /// The window the listings below ask about: one hour from [`BASE`].
 const WINDOW: (i64, i64) = (BASE, BASE + 3600);
@@ -207,11 +216,11 @@ fn stock_inventory(engine: &engine::InMemoryEngine, setting: &str) {
 }
 
 /// An inventory setting giving [`STATION`] `antennas` antennas, named as this emulator
-/// numbers them, and [`OTHER_STATION`] one.
+/// numbers them, [`OTHER_STATION`] one, and [`EMPTY_STATION`] none.
 fn inventory_setting(antennas: usize) -> String {
     let names: Vec<String> = (1..=antennas).map(antenna_name).collect();
     format!(
-        "{STATION}={},{OTHER_STATION}={}",
+        "{STATION}={},{OTHER_STATION}={},{EMPTY_STATION}",
         names.join("+"),
         antenna_name(1)
     )
@@ -445,14 +454,10 @@ fn expected(
 async fn the_listing_reports_every_block_of_antenna_time_in_the_window() {
     let (router, held) = stocked_harness().await;
 
-    // A ground station nothing is held at reports nothing: present, empty, and closed.
-    let bare = send(
-        &router,
-        "GET",
-        &route("Hawaii-1", WINDOW, &[]),
-        None,
-    )
-    .await;
+    // A ground station this account IS served by that holds nothing reports nothing:
+    // present, empty, and closed. (A station the account does not know is refused instead
+    // — `the_listing_refuses_a_ground_station_this_account_does_not_know`.)
+    let bare = send(&router, "GET", &route(EMPTY_STATION, WINDOW, &[]), None).await;
     assert_eq!(
         bare.status, 200,
         "case no-reservations: expected 200, got {} {}",
@@ -479,7 +484,7 @@ async fn the_listing_reports_every_block_of_antenna_time_in_the_window() {
         ("a-window-around-everything", (BASE - 86_400, BASE + 86_400)),
     ];
     for (case, window) in windows {
-        for ground_station in [STATION, OTHER_STATION] {
+        for ground_station in [STATION, OTHER_STATION, EMPTY_STATION] {
             let case = format!("{case}-at-{ground_station}");
             let reported = reservations(&router, ground_station, window, &[]).await;
             assert_eq!(
@@ -541,6 +546,9 @@ async fn the_type_filter_selects_the_reservation_types_it_names() {
 #[tokio::test]
 async fn only_a_contact_still_holding_antenna_time_holds_a_reservation() {
     let (router, engine) = harness_with_engine();
+    // The ground station the listing asks about is one this account is served by: an id it
+    // does not know is refused rather than listed.
+    stock_inventory(&engine, &inventory_setting(1));
     let profile_arn = create_mission_profile(&router, "status table", 60, None, None).await;
     let window = (BASE, BASE + 1800);
     let contact_id = reserve_pass_at(&router, &profile_arn, STATION, "status table", window).await;
@@ -589,7 +597,8 @@ async fn only_a_contact_still_holding_antenna_time_holds_a_reservation() {
 
 #[tokio::test]
 async fn cancelling_a_contact_releases_its_reservation_and_frees_the_antenna() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    stock_inventory(&engine, &inventory_setting(1));
     let profile_arn = create_mission_profile(&router, "release", 60, None, None).await;
     let window = (BASE, BASE + 1800);
     let contact_id = reserve_pass_at(&router, &profile_arn, STATION, "release", window).await;
@@ -640,15 +649,31 @@ async fn cancelling_a_contact_releases_its_reservation_and_frees_the_antenna() {
     );
 }
 
-/// The ground station one row of a table holds its pass at, named after the row.
+/// Record `ground_station` as one this account is served by, with no antenna of its own,
+/// ALONGSIDE whatever the inventory already holds — so a table whose rows each hold their
+/// pass at a station of their own can address every one of them, and the placement gives
+/// each the single antenna the emulator numbers for a station no antenna is recorded at.
+fn record_station(engine: &engine::InMemoryEngine, ground_station: &str) {
+    let recorded = parse_ground_stations(ground_station);
+    service_state(engine)
+        .expect("this service's state store")
+        .lock()
+        .ground_stations
+        .extend(recorded);
+}
+
+/// The ground station one row of a table holds its pass at, named after the row and
+/// recorded as one this account is served by.
 ///
 /// A row's pass must be the only thing holding an antenna at its station — an antenna
 /// serves one pass at a time, so one row's hold would otherwise be what the next row
 /// observes. `GroundStationName` admits only ` a-zA-Z0-9-._:=`
 /// (`smithy_query(query="shape", shape="GroundStationName")`), so an underscore in a
 /// status name becomes a dash.
-fn row_station(case: &str) -> String {
-    format!("{STATION}-{}", case.replace('_', "-"))
+fn row_station(engine: &engine::InMemoryEngine, case: &str) -> String {
+    let station = format!("{STATION}-{}", case.replace('_', "-"));
+    record_station(engine, &station);
+    station
 }
 
 #[tokio::test]
@@ -664,7 +689,7 @@ async fn spent_antenna_time_does_not_keep_an_antenna_held() {
     for (status, holds) in STATUS_HOLDS_ANTENNA_TIME {
         for spent in [false, true] {
             let case = format!("{status}-{}", if spent { "spent" } else { "unspent" });
-            let station = row_station(&case);
+            let station = row_station(&engine, &case);
             let contact_id =
                 reserve_pass_at(&router, &profile_arn, &station, &case, window).await;
             {
@@ -761,7 +786,7 @@ async fn a_release_frees_the_antenna_from_whichever_side_of_the_pass_it_arrives_
 
     let mut released: Vec<(&str, String, String)> = Vec::new();
     for (status, stopped) in rows {
-        let station = row_station(status);
+        let station = row_station(&engine, status);
         let contact_id = reserve_pass_at(&router, &profile_arn, &station, status, window).await;
         put_in_status(&engine, &contact_id, status);
 
@@ -1117,6 +1142,169 @@ async fn a_window_that_runs_backwards_is_refused() {
 }
 
 #[tokio::test]
+async fn the_listing_refuses_a_ground_station_this_account_does_not_know() {
+    let (router, engine) = harness_with_engine();
+    stock_inventory(&engine, &inventory_setting(1));
+    // A ground station this account knows only because a satellite is on-boarded to it:
+    // addressable, with nothing held at it.
+    onboard(&engine, "25994=Punta Arenas 1");
+    let profile_arn = create_mission_profile(&router, "known stations", 60, None, None).await;
+    let window = (BASE, BASE + 1800);
+    reserve_pass_at(&router, &profile_arn, STATION, "a-station-it-knows", window).await;
+
+    // Rows differ along WHY the account can address the station and along how much it
+    // holds: the inventory records it and a reservation is held at it, the inventory
+    // records it with no antenna and nothing is held, and only a satellite's onboarding
+    // records it. Each is answered with the page the lookup selects, empty or not.
+    for (case, segment, held) in [
+        ("recorded, holding a reservation", STATION, 1_usize),
+        ("recorded with no antenna, holding nothing", EMPTY_STATION, 0),
+        (
+            "known only through an onboarding",
+            "Punta%20Arenas%201",
+            0,
+        ),
+    ] {
+        let reply = send(&router, "GET", &route(segment, WINDOW, &[]), None).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case} ({segment}): a ground station this account knows is answered, got \
+             {} {}",
+            reply.status, reply.body
+        );
+        let reported = reply
+            .field("reservationList")
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case}: reservationList must be a list"))
+            .len();
+        assert_eq!(
+            reported, held,
+            "case {case} ({segment}): expected {held} reservation(s) in the window, got {}",
+            reply.body
+        );
+    }
+
+    // Rows differ along WHY the account does not know the station: a name nothing records,
+    // one differing only in case from a station it does know (a ground station is addressed
+    // by its exact name), one that is a prefix of a known name, one shaped like a known
+    // name, one carrying a space, and one at the longest length the model allows
+    // (`GroundStationName` is 4..97 \u2014 `smithy_query(query="shape",
+    // shape="GroundStationName")`).
+    let longest = "Z".repeat(97);
+    let rows: Vec<(&str, String, String)> = vec![
+        (
+            "a name nothing records",
+            "Bahrain-1".to_string(),
+            "Bahrain-1".to_string(),
+        ),
+        (
+            "a known name in another case",
+            "ohio-1".to_string(),
+            "ohio-1".to_string(),
+        ),
+        (
+            "a prefix of a known name",
+            "Ohio".to_string(),
+            "Ohio".to_string(),
+        ),
+        (
+            "a name shaped like a known one",
+            "Ohio-2".to_string(),
+            "Ohio-2".to_string(),
+        ),
+        (
+            "a name carrying a space",
+            "Punta%20Arenas%202".to_string(),
+            "Punta Arenas 2".to_string(),
+        ),
+        (
+            "a name at the longest allowed length",
+            longest.clone(),
+            longest,
+        ),
+    ];
+    for (case, segment, ground_station) in rows {
+        let reply = send(&router, "GET", &route(&segment, WINDOW, &[]), None).await;
+        assert_eq!(
+            reply.status, 431,
+            "case {case} ({ground_station}): expected the modelled \
+             InvalidParameterException status 431, got {} {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            "InvalidParameterException",
+            "case {case} ({ground_station}): wrong error shape, got {}",
+            reply.body
+        );
+        assert_eq!(
+            reply.string("parameterName"),
+            "groundStationId",
+            "case {case} ({ground_station}): the refusal must name the parameter at fault, \
+             got {}",
+            reply.body
+        );
+        assert!(
+            reply.string("message").contains(&ground_station),
+            "case {case}: the refusal must name the id it was given, got {}",
+            reply.body
+        );
+        assert!(
+            reply.field("reservationList").is_null(),
+            "case {case}: a refused listing carries no page, got {}",
+            reply.body
+        );
+    }
+
+    // The order this service reads the two rules in: the window a listing searches is
+    // judged before the label is resolved, so a request wrong in both ways is refused on
+    // `endTime` — the same answer every window-filtered listing of this service gives a
+    // window that runs backwards (`search_window_rule.rs`), whatever station it names.
+    let backwards = (BASE + 3600, BASE);
+    for (case, ground_station) in [
+        ("a station this account knows", STATION),
+        ("a station it does not", "Bahrain-1"),
+    ] {
+        let reply = send(&router, "GET", &route(ground_station, backwards, &[]), None).await;
+        assert_eq!(
+            reply.status, 431,
+            "case backwards-window/{case}: expected 431, got {} {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.string("parameterName"),
+            "endTime",
+            "case backwards-window/{case}: the window is judged first, so the refusal \
+             names endTime, got {}",
+            reply.body
+        );
+    }
+
+    // The sibling listing bound under the same `{groundStationId}` answers a name this
+    // account does not know the same way, so a caller cannot tell the two rules apart.
+    let antennas = send(&router, "GET", "/groundstation/Bahrain-1/antenna", None).await;
+    let reserved = send(&router, "GET", &route("Bahrain-1", WINDOW, &[]), None).await;
+    assert_eq!(
+        (
+            antennas.status,
+            antennas.error_code(),
+            antennas.string("parameterName"),
+            antennas.string("message"),
+        ),
+        (
+            reserved.status,
+            reserved.error_code(),
+            reserved.string("parameterName"),
+            reserved.string("message"),
+        ),
+        "case the-two-listings-on-one-path: both must refuse an unknown ground station \
+         alike, got {} and {}",
+        antennas.body,
+        reserved.body
+    );
+}
+
+#[tokio::test]
 async fn the_operator_setting_reads_the_antennas_out_of_service() {
     // Rows differ along the form of the setting: one window, several, surrounding
     // whitespace, names at the published length bounds of `GroundStationName` (4..97) and
@@ -1238,7 +1426,8 @@ async fn the_operator_setting_reads_the_antennas_out_of_service() {
 /// handler percent-encoded.
 #[tokio::test]
 async fn a_ground_station_name_carrying_a_space_addresses_its_own_reservations() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    stock_inventory(&engine, "Ohio 1");
     let profile_arn = create_mission_profile(&router, "spaced", 60, None, None).await;
     let window = (BASE, BASE + 1800);
     let contact_id = reserve_pass_at(&router, &profile_arn, "Ohio 1", "spaced", window).await;
@@ -1296,17 +1485,22 @@ async fn a_pass_is_placed_on_an_antenna_its_ground_station_has() {
     // `ListAntennas` reports.
     {
         let state = service_state(&*engine).expect("this service's state store");
-        state.lock().ground_stations = parse_ground_stations(&format!("{STATION}=Dish B+Dish A"));
+        // [`OTHER_STATION`] is recorded with no antenna of its own, which is the station
+        // the last row below reserves at: one this account can address and has been told
+        // no antenna for.
+        state.lock().ground_stations =
+            parse_ground_stations(&format!("{STATION}=Dish B+Dish A,{OTHER_STATION}"));
     }
     let profile_arn = create_mission_profile(&router, "inventory", 1, None, None).await;
 
     // Rows differ along how each window relates to the ones reserved before it, and along
-    // whether their ground station has a recorded inventory at all: the first pass and one
+    // whether their ground station has any recorded antenna at all: the first pass and one
     // overlapping it take the station's own antennas in name order, a third overlapping
     // both is REFUSED (the station has two antennas and both are held, so the window holds
     // no antenna time left to reserve), one disjoint from everything takes the station's
-    // first antenna again, and one at a station this account was told nothing about takes
-    // the single antenna the emulator numbers for it. `None` is the refused row.
+    // first antenna again, and one at a station this account knows but has been told no
+    // antenna for takes the single antenna the emulator numbers for it. `None` is the
+    // refused row.
     let rows: [PlacementRow; 5] = [
         (
             "first-pass-takes-the-first-antenna",
@@ -1333,7 +1527,7 @@ async fn a_pass_is_placed_on_an_antenna_its_ground_station_has() {
             Some("Dish A"),
         ),
         (
-            "a-station-with-no-recorded-inventory",
+            "a-station-with-no-recorded-antenna",
             OTHER_STATION,
             (BASE, BASE + 600),
             Some("Antenna 1"),
@@ -1378,7 +1572,8 @@ async fn a_pass_is_placed_on_an_antenna_its_ground_station_has() {
 
 #[tokio::test]
 async fn the_window_binds_in_the_epoch_seconds_form_the_model_declares() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    stock_inventory(&engine, &inventory_setting(1));
     let profile_arn = create_mission_profile(&router, "wire form", 60, None, None).await;
     let window = (BASE, BASE + 1800);
     reserve_pass_at(&router, &profile_arn, STATION, "wire form", window).await;

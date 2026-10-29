@@ -154,8 +154,9 @@ which is why they are settings rather than operations:
   none that reports one other than the listings themselves. So an account starts knowing
   only the ground stations its satellite onboardings name, none of which lists an antenna,
   until an inventory is listed here; `ListAntennas` then reports the antennas at the named
-  ground station and refuses a `groundStationId` no onboarding and no inventory records
-  with `InvalidParameterException`. A pass reserved at a ground station whose antennas are
+  ground station and `ListGroundStationReservations` the antenna time held at it, and both
+  refuse a `groundStationId` no onboarding and no inventory records with
+  `InvalidParameterException`. A pass reserved at a ground station whose antennas are
   listed here is placed on one of THEM; at a ground station whose antennas this account has
   not been told about, the emulator numbers them itself (`state::antenna_name`).
 

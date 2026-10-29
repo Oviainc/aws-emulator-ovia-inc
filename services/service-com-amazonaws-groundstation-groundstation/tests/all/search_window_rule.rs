@@ -17,9 +17,12 @@
 //! window on the boundary between the two.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_groundstation_groundstation::state::{
+    parse_ground_stations, service_state,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::scheduling_loop::{harness, send};
+use crate::scheduling_loop::{harness, harness_with_engine, send};
 
 /// The instant every window below is measured from: a round epoch-seconds value in the
 /// future, as the other suites of this target use.
@@ -27,8 +30,22 @@ const BASE: f64 = 1_800_000_000.0;
 
 /// The ground station `ListGroundStationReservations` is asked about. Nothing is reserved
 /// at it in this suite — an answered listing here is an empty page, which is all this
-/// suite needs from it.
+/// suite needs from it — but it IS a station the account is served by
+/// ([`harness_serving_the_station`]), since a listing only reaches the window rule for an
+/// id it can resolve.
 const STATION: &str = "Ohio-1";
+
+/// A router holding this service on an account served by [`STATION`], recorded where
+/// `state::GROUND_STATIONS_ENV` lands it — so what this suite asserts is the window rule
+/// rather than the resolution of the id the reservation listing is addressed by.
+fn harness_serving_the_station() -> MultiServiceRouter {
+    let (router, engine) = harness_with_engine();
+    service_state(&*engine)
+        .expect("this service's state store")
+        .lock()
+        .ground_stations = parse_ground_stations(STATION);
+    router
+}
 
 /// One window-filtered listing, as this suite drives it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,7 +167,7 @@ async fn ask(router: &MultiServiceRouter, listing: Listing, window: (f64, f64)) 
 
 #[tokio::test]
 async fn every_window_filtered_listing_refuses_a_window_that_does_not_run_forwards() {
-    let router = harness();
+    let router = harness_serving_the_station();
 
     // Rows differ along the direction of the window and the size of the gap, including the
     // zero-length window on the boundary: `endTime` equal to `startTime` still describes

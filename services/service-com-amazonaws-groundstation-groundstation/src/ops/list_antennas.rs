@@ -74,15 +74,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// What this operation answers when a `groundStationId` names no ground station this
-/// account is served by.
-///
-/// Built from the request: the refusal names the id it was given, so a caller can tell
-/// which of its parameters is the one that resolves to nothing.
-fn ground_station_not_found_message(ground_station_id: &str) -> String {
-    format!("No ground station found with id {ground_station_id}")
-}
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -210,7 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !guard.knows_ground_station(&input.ground_station_id) {
             return Err(ListAntennasErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(ground_station_not_found_message(&input.ground_station_id)),
+                    message: Some(crate::state::ground_station_not_found_message(
+                        &input.ground_station_id,
+                    )),
                     parameter_name: Some("groundStationId".to_string()),
                 },
             )

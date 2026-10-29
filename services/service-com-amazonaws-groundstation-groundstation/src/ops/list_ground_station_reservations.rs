@@ -42,6 +42,12 @@
 //!
 //! Returns a list of reservations for a specified ground station.
 //!
+//! The `groundStationId` is the ground station whose antenna time this reports, resolved
+//! against the ground stations this account is served by — the inventory written when this
+//! service's store was created (see [`crate::state::GROUND_STATIONS_ENV`]) together with
+//! the stations its satellite onboardings name — so an id naming none of them is refused
+//! as the bad parameter it is, exactly as the sibling listing on the same path refuses it.
+//!
 //! ## Input
 //!
 //! * `endTime` (Timestamp) **required** — End time of the reservation window in UTC.
@@ -144,6 +150,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// narrowed to the requested `reservationTypes` when the request names any, in
     /// chronological order.
     ///
+    /// A `groundStationId` naming no ground station this account knows addresses no
+    /// ground station at all, so it is refused rather than answered with the empty page
+    /// the lookup selects for it.
+    ///
     /// `@readonly`: the answer is computed from this service's contacts and from
     /// [`crate::state::ComAmazonawsGroundstationGroundstationState::maintenance_reservations`].
     /// The one write is [`crate::state::ComAmazonawsGroundstationGroundstationState::settle_due_contacts`],
@@ -244,6 +254,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         let mut guard = state.lock();
+
+        // A `groundStationId` naming no ground station this account knows references
+        // nothing, so the request is answered as the bad parameter it carries rather than
+        // with the empty page the lookup would otherwise select — which a caller could not
+        // tell from "this ground station holds no antenna time". The same rule the sibling
+        // listing bound under this id reads, under the same text
+        // (`crate::state::ground_station_not_found_message`), and refused before anything
+        // is written.
+        if !guard.knows_ground_station(&input.ground_station_id) {
+            return Err(
+                ListGroundStationReservationsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::ground_station_not_found_message(
+                            &input.ground_station_id,
+                        )),
+                        parameter_name: Some("groundStationId".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // Apply every status move already due, so a reservation released by a cancel that
         // has since settled is no longer reported as holding its antenna.
         guard.settle_due_contacts();

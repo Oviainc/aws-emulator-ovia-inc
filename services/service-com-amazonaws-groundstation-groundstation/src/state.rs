@@ -4043,6 +4043,18 @@ pub fn parse_maintenance(setting: &str) -> Vec<MaintenanceReservation> {
     windows
 }
 
+/// What this service answers when a `groundStationId` names no ground station this
+/// account is served by.
+///
+/// Shared by every operation whose subject is a ground station addressed by name
+/// ([`ComAmazonawsGroundstationGroundstationState::knows_ground_station`]), so the two
+/// listings bound under that id answer one text. Built from the request: the refusal names
+/// the id it was given, so a caller can tell which of its parameters is the one that
+/// resolves to nothing.
+pub fn ground_station_not_found_message(ground_station_id: &str) -> String {
+    format!("No ground station found with id {ground_station_id}")
+}
+
 /// The environment variable an operator uses to describe the ground stations THIS
 /// emulated account is served by and the antennas at each, since the API models no
 /// operation that builds one: a comma-separated list of entries, each either a bare
