@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/discovery_from_ec2.rs"]
 mod discovery_from_ec2;
+#[path = "all/discovery_switch_off.rs"]
+mod discovery_switch_off;
 #[path = "all/error_taxonomy.rs"]
 mod error_taxonomy;
 #[path = "all/harness.rs"]

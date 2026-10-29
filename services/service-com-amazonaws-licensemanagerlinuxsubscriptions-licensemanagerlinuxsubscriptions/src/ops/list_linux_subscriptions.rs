@@ -166,8 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not anybody calls: the pass this report materializes asks the owner of instances
         // what the account's inventory holds in the configured source Regions at the
         // instant it runs, so what is reported below is what a caller would have been shown
-        // had nobody called at all. Nothing is recorded for an account that did not enable
-        // discovery, and a pass over an unchanged inventory records what is already there.
+        // had nobody called at all. An account whose discovery is not enabled NOW discovers
+        // no Region, so nothing is recorded for it and nothing an earlier pass found stays
+        // behind; a pass over an unchanged inventory records what is already there.
         //
         // WHETHER this request runs a pass is the discovery module's decision, not this
         // handler's: the request's cursor is what it takes it on.
