@@ -69,6 +69,8 @@ mod key_lifecycle;
 mod key_policy;
 #[path = "all/key_policy_conditions.rs"]
 mod key_policy_conditions;
+#[path = "all/key_policy_deny_scope.rs"]
+mod key_policy_deny_scope;
 #[path = "all/key_rotation_on_demand.rs"]
 mod key_rotation_on_demand;
 #[path = "all/key_rotation_schedule.rs"]
