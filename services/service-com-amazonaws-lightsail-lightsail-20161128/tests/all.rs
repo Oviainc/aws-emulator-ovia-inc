@@ -111,6 +111,8 @@ mod disk_delete;
 mod disk_detach;
 #[path = "all/disk_listing.rs"]
 mod disk_listing;
+#[path = "all/disk_restore_from_auto_snapshot.rs"]
+mod disk_restore_from_auto_snapshot;
 #[path = "all/disk_restore_from_snapshot.rs"]
 mod disk_restore_from_snapshot;
 #[path = "all/disk_restore_snapshot_completeness.rs"]

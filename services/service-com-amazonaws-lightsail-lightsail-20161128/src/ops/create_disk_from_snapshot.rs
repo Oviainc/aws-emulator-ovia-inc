@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDiskFromSnapshot
-//! Inserts one block storage disk restored from a disk snapshot this account holds
-//! and has finished taking into this service's store, under the disk name the
-//! request names, in the zone it names and at the size it asks for — never below the
-//! snapshotted volume's — and answers the operation-log entry the insert appended.
-//! The snapshot itself is only read.
+//! Inserts one block storage disk restored from a snapshot of a disk this
+//! account holds and has finished taking — a manual disk snapshot, or an
+//! automatic copy the `AutoSnapshot` add-on took of a disk — into this service's
+//! store, under the disk name the request names, in the zone it names and at the
+//! size it asks for — never below the snapshotted volume's — and answers the
+//! operation-log entry the insert appended. The snapshot itself is only read.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -265,82 +266,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
 
-            // The snapshotted volume the new disk is a copy of. The snapshot's
-            // own record is the source of truth for its size and its region;
-            // nothing here reads the disk the snapshot was taken of, which may
-            // have been resized or deleted since.
-            let (snapshot_name, snapshot_region, snapshot_size_in_gb, snapshot_state) = match
-                &source
-            {
-                RequestedSource::Snapshot(requested) => {
-                    let snapshot = store.disk_snapshot(requested).ok_or_else(|| {
-                        not_found(crate::state::RESOURCE_TYPE_DISK_SNAPSHOT, requested)
-                    })?;
-                    (
-                        snapshot.name.clone(),
-                        snapshot.location.region_name.clone(),
-                        snapshot.size_in_gb,
-                        snapshot.state,
-                    )
-                }
-                // An AUTOMATIC snapshot is one the `AutoSnapshot` add-on takes on
-                // the daily schedule a disk carries. This store holds none — the
-                // add-on records the hour it would run at and nothing takes a
-                // copy — so, once the source disk is known to exist, there is no
-                // automatic snapshot of it to restore from and the request is
-                // refused with the service's `DoesNotExist` envelope rather than
-                // answered with a disk restored from nothing.
-                RequestedSource::AutoSnapshot {
-                    resource_name: disk_name,
-                    date,
-                } => {
-                    store
-                        .disk(disk_name)
-                        .ok_or_else(|| not_found(crate::state::RESOURCE_TYPE_DISK, disk_name))?;
-                    let date = date
-                        .as_deref()
-                        .unwrap_or(crate::state::LATEST_RESTORABLE_AUTO_SNAPSHOT);
-                    return Err(crate::scaffolded::Scaffolded::does_not_exist(format!(
-                        "no automatic snapshot of the Disk {disk_name} is available to \
-                         restore ({date}): this account has taken none"
-                    )));
-                }
-            };
-            // A snapshot belongs to the region it was taken in, and only that
-            // region's Lightsail endpoint can restore it: moving one between
-            // regions is what `CopySnapshot` is for.
-            if snapshot_region != region {
-                return Err(invalid(format!(
-                    "diskSnapshotName '{snapshot_name}' is a snapshot of region \
-                     {snapshot_region}, which cannot be restored into availabilityZone \
-                     '{availability_zone}' of region {region}"
-                )));
-            }
-            // A snapshot is restorable only once every block it captures is
-            // captured: while Lightsail is still taking it the snapshot reports
-            // `pending` (`DiskSnapshot$state`, "the status of the disk snapshot
-            // operation"), and one whose capture ended any other way than
-            // `completed` holds no usable copy either — in neither case is there
-            // a complete volume to restore from. That is a well-formed request
-            // the resources' state does not allow, which is what the modelled
-            // `OperationFailureException` is for, and it is the same check the
-            // other restore operations of this service apply to their own
-            // sources.
-            if snapshot_state != crate::state::DISK_SNAPSHOT_STATE_COMPLETED {
-                return Err(operation_failure(format!(
-                    "The disk snapshot {snapshot_name} is {snapshot_state}: a disk can be \
-                     restored only from a snapshot that is {}.",
-                    crate::state::DISK_SNAPSHOT_STATE_COMPLETED
-                )));
-            }
+            // The snapshotted volume the new disk is a copy of, resolved from
+            // the one source the request named and held to what a restore of it
+            // needs.
+            let snapshotted = snapshotted_volume(store, &source, region, &availability_zone)?;
             // A restored volume holds every block the snapshot captured, so it
             // cannot be smaller than the volume that was snapshotted; a larger
             // size is accepted and the extra space is the new disk's.
-            if size_in_gb < snapshot_size_in_gb {
+            if size_in_gb < snapshotted.size_in_gb {
                 return Err(invalid(format!(
-                    "sizeInGb {size_in_gb} is smaller than the {snapshot_size_in_gb} GB \
-                     volume disk snapshot '{snapshot_name}' captured: a disk restored from \
-                     a snapshot must be at least as large as the snapshotted volume"
+                    "sizeInGb {size_in_gb} is smaller than the {} GB volume {} captured: a \
+                     disk restored from a snapshot must be at least as large as the \
+                     snapshotted volume",
+                    snapshotted.size_in_gb, snapshotted.described
                 )));
             }
 
@@ -421,6 +359,126 @@ fn requested_source(
     .map_err(invalid)
 }
 
+/// The snapshotted volume a restore makes a copy of, once the source the
+/// request named is known to hold one this account can restore.
+struct SnapshottedVolume {
+    /// The size of the volume the snapshot captured, in GB: the floor under the
+    /// new disk's own size.
+    size_in_gb: i32,
+    /// How a refusal names the snapshot that captured it. A manual snapshot is
+    /// a resource with a name of its own, while an automatic one has neither
+    /// name nor ARN and is named by the resource it was taken of and the date
+    /// it was taken on (`AutoSnapshotDetails$date`, `DeleteAutoSnapshot$date`).
+    described: String,
+}
+
+/// The volume the ONE source `source` names captured, or the refusal that source
+/// earns against this store's own state.
+///
+/// Both forms of source answer the same three questions — does this account
+/// hold it, is it in the Region the new disk is being created in, and has the
+/// service finished taking it — because a restore needs a complete copy of a
+/// volume of this Region whichever way the request addressed it. What differs is
+/// where each is held: a manual snapshot is a record of its own, and so the
+/// source of truth for its own size and Region, while an automatic snapshot is a
+/// copy held beside the schedule that took it, whose volume is the disk it was
+/// taken of ([`crate::state::ComAmazonawsLightsailLightsail20161128State::auto_snapshot`]) —
+/// the same resolution `CopySnapshot` makes of the same source form, since this
+/// service models no call that resizes a disk.
+fn snapshotted_volume(
+    store: &crate::state::ComAmazonawsLightsailLightsail20161128State,
+    source: &RequestedSource,
+    region: &str,
+    availability_zone: &str,
+) -> Result<SnapshottedVolume, CreateDiskFromSnapshotError> {
+    match source {
+        RequestedSource::Snapshot(requested) => {
+            let snapshot = store.disk_snapshot(requested).ok_or_else(|| {
+                not_found(crate::state::RESOURCE_TYPE_DISK_SNAPSHOT, requested)
+            })?;
+            // A snapshot belongs to the region it was taken in, and only that
+            // region's Lightsail endpoint can restore it: moving one between
+            // regions is what `CopySnapshot` is for.
+            if snapshot.location.region_name != region {
+                return Err(invalid(format!(
+                    "diskSnapshotName '{}' is a snapshot of region {}, which cannot be \
+                     restored into availabilityZone '{availability_zone}' of region {region}",
+                    snapshot.name, snapshot.location.region_name
+                )));
+            }
+            // A snapshot is restorable only once every block it captures is
+            // captured: while Lightsail is still taking it the snapshot reports
+            // `pending` (`DiskSnapshot$state`, "the status of the disk snapshot
+            // operation"), and one whose capture ended any other way than
+            // `completed` holds no usable copy either — in neither case is there
+            // a complete volume to restore from. That is a well-formed request
+            // the resources' state does not allow, which is what the modelled
+            // `OperationFailureException` is for, and it is the same check the
+            // other restore operations of this service apply to their own
+            // sources.
+            if snapshot.state != crate::state::DISK_SNAPSHOT_STATE_COMPLETED {
+                return Err(operation_failure(format!(
+                    "The disk snapshot {} is {}: a disk can be restored only from a snapshot \
+                     that is {}.",
+                    snapshot.name,
+                    snapshot.state,
+                    crate::state::DISK_SNAPSHOT_STATE_COMPLETED
+                )));
+            }
+            Ok(SnapshottedVolume {
+                size_in_gb: snapshot.size_in_gb,
+                described: format!("disk snapshot '{}'", snapshot.name),
+            })
+        }
+        // An AUTOMATIC snapshot is one the `AutoSnapshot` add-on took of the
+        // disk on the daily schedule that disk carries, addressed by that disk
+        // plus the date the copy was taken on — or, where the request asked for
+        // the latest restorable copy, by the disk alone. The volume it captured
+        // is the disk's own.
+        RequestedSource::AutoSnapshot {
+            resource_name: disk_name,
+            date,
+        } => {
+            let disk = store
+                .disk(disk_name)
+                .ok_or_else(|| not_found(crate::state::RESOURCE_TYPE_DISK, disk_name))?;
+            if disk.location.region_name != region {
+                return Err(invalid(format!(
+                    "sourceDiskName '{}' names a disk of region {}, whose automatic snapshots \
+                     cannot be restored into availabilityZone '{availability_zone}' of region \
+                     {region}",
+                    disk.name, disk.location.region_name
+                )));
+            }
+            let copy = store
+                .auto_snapshot(crate::state::RESOURCE_TYPE_DISK, disk_name, date.as_deref())
+                .ok_or_else(|| auto_snapshot_not_found(disk_name, date.as_deref()))?;
+            // The same rule the manual source is held to: a copy the service
+            // has not finished taking holds no complete volume to restore from.
+            // A request for the latest RESTORABLE copy never reaches this, the
+            // lookup answering it with a copy that is finished.
+            if copy.status != crate::state::AUTO_SNAPSHOT_STATUS_SUCCESS {
+                return Err(operation_failure(format!(
+                    "The automatic snapshot of the {} {disk_name} dated {} is {}: a disk can \
+                     be restored only from a snapshot that is {}.",
+                    crate::state::RESOURCE_TYPE_DISK,
+                    copy.date,
+                    copy.status,
+                    crate::state::AUTO_SNAPSHOT_STATUS_SUCCESS
+                )));
+            }
+            Ok(SnapshottedVolume {
+                size_in_gb: disk.size_in_gb,
+                described: format!(
+                    "the automatic snapshot of the {} {disk_name} dated {}",
+                    crate::state::RESOURCE_TYPE_DISK,
+                    copy.date
+                ),
+            })
+        }
+    }
+}
+
 /// Lightsail's refusal of a well-formed request its resources' state does not
 /// allow: the modelled `OperationFailureException` — HTTP 400, "Lightsail throws
 /// this exception when an operation fails to execute" — whose message names the
@@ -450,6 +508,20 @@ fn invalid(message: String) -> CreateDiskFromSnapshotError {
 /// resource type and the requested name.
 fn not_found(resource_type: &str, name: &str) -> CreateDiskFromSnapshotError {
     crate::scaffolded::Scaffolded::resource_does_not_exist(resource_type, name)
+}
+
+/// The disk holds no automatic snapshot the request addressed — no copy taken on
+/// the date it named, or no finished copy at all where it asked for the latest
+/// restorable one: the same `DoesNotExist` envelope, in the one wording every
+/// operation that addresses such a copy refuses a missing one with
+/// ([`crate::state::no_such_auto_snapshot`]).
+fn auto_snapshot_not_found(disk_name: &str, date: Option<&str>) -> CreateDiskFromSnapshotError {
+    crate::scaffolded::Scaffolded::does_not_exist(crate::state::no_such_auto_snapshot(
+        crate::state::DISK_RESTORE_SOURCE_MEMBERS,
+        crate::state::RESOURCE_TYPE_DISK,
+        disk_name,
+        date,
+    ))
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

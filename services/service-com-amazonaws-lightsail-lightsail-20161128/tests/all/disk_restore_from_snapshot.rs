@@ -831,15 +831,19 @@ async fn the_automatic_snapshot_members_must_hold_together() {
     }
 }
 
-/// RULE: an automatic snapshot is one the `AutoSnapshot` add-on took, and this
-/// account has taken none, so a restore that addresses one is refused with the
-/// service's `DoesNotExist` envelope — and a `sourceDiskName` that names no disk
-/// at all is refused the same way, naming the Disk.
+/// RULE: an automatic snapshot is one the `AutoSnapshot` add-on took of the
+/// disk, so a restore addressing a copy this account holds none of — of a disk
+/// whose add-on was never enabled, or for a date no copy of it was taken on — is
+/// refused with the service's `DoesNotExist` envelope, and a `sourceDiskName`
+/// that names no disk at all is refused the same way, naming the Disk. What a
+/// restore of a copy the account DOES hold answers is pinned in
+/// `disk_restore_from_auto_snapshot.rs`.
 #[tokio::test]
-async fn an_automatic_snapshot_this_account_has_not_taken_cannot_be_restored() {
+async fn an_automatic_snapshot_this_account_does_not_hold_cannot_be_restored() {
     let emulator = with_one_snapshot().await;
-    // A disk with the add-on enabled: the add-on records the hour it would run
-    // at, and still nothing has taken an automatic copy.
+    // A disk with the add-on enabled, addressed below by a date no copy of it
+    // was taken on: the add-on takes one copy a day, and no copy of this disk is
+    // dated that way.
     emulator
         .ok(
             "CreateDisk",

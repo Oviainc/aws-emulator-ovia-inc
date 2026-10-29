@@ -111,6 +111,31 @@ pub const INSTANCE_RESTORE_SOURCE_MEMBERS: SnapshotSourceMembers = SnapshotSourc
                     automatic snapshot of one",
 };
 
+/// How a refusal names the automatic snapshot a request addressed and this
+/// account holds no copy for: the resource it would have been taken of, and the
+/// date it was asked for by — or, when the request asked for the latest
+/// restorable copy instead of naming a date, that the resource has none.
+///
+/// One sentence per door would be one wording per door for one rule, so the two
+/// operations that resolve such a copy build it here, each in its own verb
+/// ([`SnapshotSourceMembers::verb`]).
+pub fn no_such_auto_snapshot(
+    members: SnapshotSourceMembers,
+    resource_type: &str,
+    resource_name: &str,
+    date: Option<&str>,
+) -> String {
+    let verb = members.verb;
+    match date {
+        Some(date) => format!(
+            "The automatic snapshot of the {resource_type} {resource_name} does not exist: {date}"
+        ),
+        None => format!(
+            "The {resource_type} {resource_name} has no restorable automatic snapshot to {verb}"
+        ),
+    }
+}
+
 /// The snapshot the request's source members address, or the refusal their
 /// combination earns.
 ///

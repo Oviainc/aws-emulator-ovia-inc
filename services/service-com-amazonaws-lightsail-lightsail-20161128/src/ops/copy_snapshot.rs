@@ -520,22 +520,12 @@ fn automatic_snapshot(
     } else {
         return Err(resource_not_found(resource_name));
     };
-    let taken = store
-        .auto_snapshots
-        .get(&(resource_type, resource_name.to_string()))
-        .map(|schedule| schedule.taken.as_slice())
-        .unwrap_or_default();
-    // One copy a day, so a date addresses exactly one of a resource's copies;
-    // the latest RESTORABLE one is the newest the service has finished taking,
-    // the copies being held oldest first.
-    let copy = match date {
-        Some(date) => taken.iter().find(|copy| copy.date == date),
-        None => taken
-            .iter()
-            .rev()
-            .find(|copy| copy.status == crate::state::AUTO_SNAPSHOT_STATUS_SUCCESS),
-    }
-    .ok_or_else(|| auto_snapshot_not_found(resource_type, resource_name, date))?;
+    // Which copy a date — or a request for the latest restorable one —
+    // addresses is the store's own rule, shared with the restores that address
+    // a copy under their own member names.
+    let copy = store
+        .auto_snapshot(resource_type, resource_name, date)
+        .ok_or_else(|| auto_snapshot_not_found(resource_type, resource_name, date))?;
     // The same rule the manual sources are held to: a copy the service has not
     // finished taking holds no complete snapshot to copy from.
     if copy.status != crate::state::AUTO_SNAPSHOT_STATUS_SUCCESS {
@@ -651,15 +641,12 @@ fn auto_snapshot_not_found(
     resource_name: &str,
     date: Option<&str>,
 ) -> CopySnapshotError {
-    crate::scaffolded::Scaffolded::does_not_exist(match date {
-        Some(date) => format!(
-            "The automatic snapshot of the {resource_type} {resource_name} does not exist: \
-             {date}"
-        ),
-        None => format!(
-            "The {resource_type} {resource_name} has no restorable automatic snapshot to copy"
-        ),
-    })
+    crate::scaffolded::Scaffolded::does_not_exist(crate::state::no_such_auto_snapshot(
+        crate::state::COPY_SNAPSHOT_SOURCE_MEMBERS,
+        resource_type,
+        resource_name,
+        date,
+    ))
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

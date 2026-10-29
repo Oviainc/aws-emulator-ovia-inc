@@ -13413,6 +13413,42 @@ impl ComAmazonawsLightsailLightsail20161128State {
         Some((resource_type, reported))
     }
 
+    /// The automatic snapshot of the resource `name` of kind `resource_type`
+    /// that `date` addresses — the latest RESTORABLE copy of it when `date` is
+    /// absent, which is what a request asking for "the latest available
+    /// automatic snapshot" addresses. `None` when the resource holds no copy the
+    /// request addresses.
+    ///
+    /// The add-on takes one copy a day ([`StoredAutoSnapshots::take`]), so a
+    /// date addresses exactly one of a resource's copies; the latest restorable
+    /// one is the newest copy the service has finished taking, the copies being
+    /// held oldest first. A copy that is still being taken is held, and
+    /// addressable by its date — what a caller may do with one is the caller's
+    /// own rule, so the lookup answers it rather than hiding it.
+    ///
+    /// The ONE lookup every operation that addresses an automatic snapshot of a
+    /// resource resolves it through, so the same request shape finds the same
+    /// copy at whichever of those doors it arrives.
+    pub fn auto_snapshot(
+        &self,
+        resource_type: &'static str,
+        name: &str,
+        date: Option<&str>,
+    ) -> Option<&StoredAutoSnapshot> {
+        let taken = self
+            .auto_snapshots
+            .get(&(resource_type, name.to_string()))
+            .map(|schedule| schedule.taken.as_slice())
+            .unwrap_or_default();
+        match date {
+            Some(date) => taken.iter().find(|copy| copy.date == date),
+            None => taken
+                .iter()
+                .rev()
+                .find(|copy| copy.status == AUTO_SNAPSHOT_STATUS_SUCCESS),
+        }
+    }
+
     /// Remove the automatic snapshot of the resource `name` names that was taken
     /// on `date`. `None` when this account holds no instance or disk of that
     /// name.
@@ -16185,9 +16221,9 @@ pub fn is_auto_snapshot_date(value: &str) -> bool {
 /// module.
 pub mod snapshot_source;
 pub use snapshot_source::{
-    requested_snapshot_source, RequestedSnapshotSource, SnapshotSourceMembers,
-    COPY_SNAPSHOT_SOURCE_MEMBERS, DISK_RESTORE_SOURCE_MEMBERS, INSTANCE_RESTORE_SOURCE_MEMBERS,
-    LATEST_RESTORABLE_AUTO_SNAPSHOT,
+    no_such_auto_snapshot, requested_snapshot_source, RequestedSnapshotSource,
+    SnapshotSourceMembers, COPY_SNAPSHOT_SOURCE_MEMBERS, DISK_RESTORE_SOURCE_MEMBERS,
+    INSTANCE_RESTORE_SOURCE_MEMBERS, LATEST_RESTORABLE_AUTO_SNAPSHOT,
 };
 
 /// Whether `value` is a daily automatic-snapshot hour an `AutoSnapshot` add-on
