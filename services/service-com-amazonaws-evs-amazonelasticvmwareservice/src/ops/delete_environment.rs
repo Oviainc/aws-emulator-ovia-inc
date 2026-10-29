@@ -256,7 +256,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // account's `Address` records, which the release below clears. Taken out
                 // of the record here so no reader is told the VLAN holds an address that
                 // nothing is associated with any more.
-                for association in vlan.eip_associations.drain(..) {
+                for association in std::mem::take(&mut vlan.eip_associations) {
+                    // The association this deletion ends is one this VLAN HELD, so a
+                    // disassociate addressed to it afterwards resolves to a removal this
+                    // service already carried out rather than to no association at all.
+                    if let Some(association_id) = association.association_id.as_deref() {
+                        vlan.note_eip_association_removed(association_id);
+                    }
                     if let (Some(allocation_id), Some(association_id)) =
                         (association.allocation_id, association.association_id)
                     {

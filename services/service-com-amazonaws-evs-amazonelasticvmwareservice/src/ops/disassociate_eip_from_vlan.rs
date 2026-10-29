@@ -17,6 +17,13 @@
 //!    call answers with the VLAN that no longer carries the `associationId`, whether
 //!    this call removed it or an earlier one did, so a retried disassociate cannot
 //!    fail because the first one succeeded.
+//! 5. `associationId` is a handle on an association OF THE ADDRESSED VLAN: an id that
+//!    VLAN has never carried names no association of the resource the request addresses,
+//!    so it is answered with the modelled `ResourceNotFoundException` — the reading
+//!    `DeleteEnvironmentHost` and `DeleteEnvironmentConnector` take of the handles they
+//!    are addressed by. An association of another environment's VLAN is such an id: this
+//!    call can only remove one of the VLAN it names, which is why `AssociateEipToVlan`
+//!    refuses an allocation another environment's VLAN holds rather than moving it.
 //!
 //! An association this call really removes is also ended on the account's own Amazon EC2
 //! store ([`crate::state::ec2_resources::release_elastic_ips`]): the `eipassoc-` id names
@@ -256,14 +263,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `@idempotent`: the end state is what the call asks for — the VLAN no longer
-        // carries this association — so a repeat of a call that already removed it is
-        // not a failure. Only a call that really removed something re-stamps the record.
+        // `associationId` is a required handle on an association OF THIS VLAN: an id the
+        // addressed VLAN has never carried names no association of the resource the
+        // request addresses, so it is the missing resource — whichever other VLAN of the
+        // account holds an association of that id. The same line
+        // `DeleteEnvironmentHost` and `DeleteEnvironmentConnector` draw for the handles
+        // they are addressed by, and the one `AssociateEipToVlan` draws for an Elastic IP
+        // allocation another environment's VLAN is using.
+        //
+        // `@idempotent` covers the other case: an association THIS VLAN carried and a
+        // disassociate already removed ([`crate::state::EipAssociationHandle::Removed`])
+        // is the end state the call asks for, so the repeat answers with the VLAN that no
+        // longer carries it. Only a call that really removed something re-stamps the
+        // record.
         //
         // The association the call ends is an Amazon EC2 fact as much as one of this
         // service's: the allocation goes back to being an unassociated Elastic IP
         // address of the account, so the pairs removed here are released on EC2's own
         // `Address` records below.
+        if vlan.resolve_eip_association(&input.association_id)
+            == crate::state::EipAssociationHandle::Unknown
+        {
+            return Err(
+                DisassociateEipFromVlanErrorModeled::ResourceNotFoundException(
+                    crate::state::eip_association_not_found(&input.association_id),
+                )
+                .into(),
+            );
+        }
         let before = vlan.eip_associations.len();
         let mut released: Vec<(String, String)> = Vec::new();
         vlan.eip_associations.retain(|association| {
@@ -281,6 +308,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
         let removed = vlan.eip_associations.len() != before;
         if removed {
+            // Remembered as a removal of THIS VLAN, so the idempotent repeat of this
+            // call resolves to it instead of to no association at all.
+            vlan.note_eip_association_removed(&input.association_id);
             // The VLAN's own stamp goes through the same guard the environment's does
             // below, so neither can move backwards past a transition the clock had
             // already made due.

@@ -769,6 +769,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     created_at_ms,
                     modified_at_ms: created_at_ms,
                     eip_associations: Vec::new(),
+                    removed_eip_association_ids: Vec::new(),
                 }
             })
             .collect();

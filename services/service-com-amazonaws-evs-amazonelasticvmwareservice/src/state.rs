@@ -182,6 +182,13 @@ pub const RESOURCE_TYPE_CONNECTOR: &str = "connector";
 /// an Amazon EC2 bare metal instance").
 pub const RESOURCE_TYPE_HOST: &str = "host";
 
+/// The resource type `ResourceNotFoundException` reports for an Elastic IP association —
+/// the resource `DisassociateEipFromVlan` addresses by `associationId`
+/// (`EipAssociation`, "An Elastic IP address association with the elastic network
+/// interface in the VLAN subnet"), named as the `Vlan$eipAssociations` member that
+/// reports it spells it.
+pub const RESOURCE_TYPE_EIP_ASSOCIATION: &str = "eipAssociation";
+
 /// The `ConnectorState` values a stored connector moves through.
 ///
 /// The model declares `CREATING | CREATE_FAILED | ACTIVE | UPDATING | UPDATE_FAILED |
@@ -609,6 +616,21 @@ pub fn host_not_found(resource_id: &str) -> ResourceNotFoundException {
         message: format!("Host {resource_id} was not found"),
         resource_id: resource_id.to_string(),
         resource_type: RESOURCE_TYPE_HOST.to_string(),
+    }
+}
+
+/// The `ResourceNotFoundException` an operation answers for an `associationId` the
+/// VLAN the request addresses holds no record of.
+///
+/// Built from the request exactly as [`environment_not_found`] and [`host_not_found`]
+/// are: the service names the association the caller asked for, so the text is a
+/// function of the lookup key and never of the store's contents — in particular it does
+/// not say which other VLAN, if any, holds an association of that id.
+pub fn eip_association_not_found(resource_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("EIP association {resource_id} was not found"),
+        resource_id: resource_id.to_string(),
+        resource_type: RESOURCE_TYPE_EIP_ASSOCIATION.to_string(),
     }
 }
 
@@ -1222,6 +1244,23 @@ impl Ipv4Cidr {
     }
 }
 
+/// What an `associationId` a request carries names ON THE VLAN that request addresses.
+///
+/// The resolution of a handle scoped to one parent resource: an id is an association of
+/// the VLAN the request names or it is nothing, whichever other VLAN of the account
+/// holds one of that id ([`StoredVlan::resolve_eip_association`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EipAssociationHandle {
+    /// The VLAN carries the association now.
+    Live,
+    /// The VLAN carried it and a disassociate has already removed it
+    /// ([`StoredVlan::note_eip_association_removed`]) — what an idempotent repeat of
+    /// that call resolves.
+    Removed,
+    /// This VLAN has never carried an association of that id: the missing resource.
+    Unknown,
+}
+
 /// One VLAN subnet of an environment, materialised from an `initialVlans` entry.
 #[derive(Debug, Clone)]
 pub struct StoredVlan {
@@ -1250,9 +1289,69 @@ pub struct StoredVlan {
     pub modified_at_ms: i64,
     /// Elastic IP associations, which `AssociateEipToVlan` adds to a public VLAN.
     pub eip_associations: Vec<EipAssociation>,
+    /// The `associationId`s this VLAN CARRIED and `DisassociateEipFromVlan` has already
+    /// removed, oldest first.
+    ///
+    /// The records that let that `@idempotent` operation tell a REPEAT of a call which
+    /// already removed an association from an id this VLAN never carried, exactly as the
+    /// `DELETED` host and connector records kept beside the live ones do for
+    /// `DeleteEnvironmentHost` and `DeleteEnvironmentConnector`
+    /// ([`StoredEnvironment::purge_finished_hosts`]). Not part of
+    /// [`StoredVlan::to_wire`]: a removed association is no association of the VLAN, so
+    /// nothing reports it.
+    ///
+    /// Bounded by [`MAX_EIP_ASSOCIATIONS_PER_VLAN`]
+    /// ([`StoredVlan::note_eip_association_removed`]), so an associate/disassociate loop
+    /// cannot grow it without bound; a removal dropped for the room is not found again.
+    pub removed_eip_association_ids: Vec<String>,
 }
 
 impl StoredVlan {
+    /// What `association_id` names on this VLAN.
+    pub fn resolve_eip_association(&self, association_id: &str) -> EipAssociationHandle {
+        if self
+            .eip_associations
+            .iter()
+            .any(|association| association.association_id.as_deref() == Some(association_id))
+        {
+            return EipAssociationHandle::Live;
+        }
+        if self
+            .removed_eip_association_ids
+            .iter()
+            .any(|removed| removed == association_id)
+        {
+            return EipAssociationHandle::Removed;
+        }
+        EipAssociationHandle::Unknown
+    }
+
+    /// Record that this VLAN's association `association_id` has been removed, so a
+    /// repeat of the call that removed it still resolves to the removal rather than to
+    /// no resource at all.
+    ///
+    /// Keeps the most recently removed ids and drops the oldest once there are more than
+    /// [`MAX_EIP_ASSOCIATIONS_PER_VLAN`] of them, the same retention
+    /// [`StoredEnvironment::purge_finished_hosts`] gives a finished host record.
+    pub fn note_eip_association_removed(&mut self, association_id: &str) {
+        if self
+            .removed_eip_association_ids
+            .iter()
+            .any(|removed| removed == association_id)
+        {
+            return;
+        }
+        self.removed_eip_association_ids
+            .push(association_id.to_string());
+        let over = self
+            .removed_eip_association_ids
+            .len()
+            .saturating_sub(MAX_EIP_ASSOCIATIONS_PER_VLAN);
+        if over > 0 {
+            self.removed_eip_association_ids.drain(..over);
+        }
+    }
+
     /// This VLAN as the modelled `Vlan` shape.
     ///
     /// `availabilityZone` is the zone of the EC2 subnet this service provisioned for

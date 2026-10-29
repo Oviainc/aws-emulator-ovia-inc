@@ -44,6 +44,8 @@ mod delete_entitlement;
 mod depot_url;
 #[path = "all/eip_allocation_existence.rs"]
 mod eip_allocation_existence;
+#[path = "all/eip_association_existence.rs"]
+mod eip_association_existence;
 #[path = "all/eip_ec2_propagation.rs"]
 mod eip_ec2_propagation;
 #[path = "all/eip_release_on_environment_deletion.rs"]

@@ -428,6 +428,15 @@ async fn only_the_public_hcx_vlan_of_a_stored_environment_takes_an_eip() {
             } else {
                 request["associationId"] = json!("eipassoc-0123456789abcdef0");
             }
+            // The disassociate half is addressed by an `associationId` as well as by the
+            // VLAN, and the id every row gives it is one nothing minted: a row this
+            // `vlanName` rule ACCEPTS is then refused by the association handle instead,
+            // which `tests/all/eip_association_existence.rs` owns.
+            let expected = if expected.is_empty() && operation == "DisassociateEipFromVlan" {
+                "ResourceNotFoundException"
+            } else {
+                expected
+            };
             let (status, body) = call(&router, operation, &request).await;
             if expected.is_empty() {
                 assert_eq!(
