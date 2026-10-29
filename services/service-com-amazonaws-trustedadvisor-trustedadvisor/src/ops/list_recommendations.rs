@@ -6,6 +6,15 @@
 //! request's filters keep, in recommendation-ARN order and cut into a page by
 //! the shared cursor helper.
 //!
+//! This is the ACCOUNT-level listing (`RecommendationSummary` is documented
+//! "Summary of Recommendation for an Account" and its `arn` is an
+//! `AccountRecommendationArn`, whose account segment names the owner), so it
+//! reports only the rows the calling account owns
+//! ([`crate::state::is_foreign_resource`]): the store spans the organization's
+//! member accounts, and the view that aggregates OTHER accounts' rows is
+//! `ListOrganizationRecommendations` ("within an Organization"). A foreign row
+//! is skipped before paginating, so it consumes no page slot either.
+//!
 //! `resourcesAggregates` is COUNTED from the recommendation's own resources on
 //! every read ([`crate::state::ComAmazonawsTrustedadvisorTrustedadvisorState::aggregates_for`]),
 //! so it always agrees with `ListRecommendationResources`.
@@ -248,7 +257,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .recommendations
             .iter()
             .filter(|(_, entry)| {
-                input.r#type.as_ref().is_none_or(|kind| &entry.r#type == kind)
+                // The row's own ARN names its owning account: another account's
+                // recommendation is not part of this account's listing, whatever
+                // the request's filters keep.
+                !crate::state::is_foreign_resource(&entry.arn)
+                    && input.r#type.as_ref().is_none_or(|kind| &entry.r#type == kind)
                     && input.status.as_ref().is_none_or(|status| &entry.status == status)
                     && input
                         .pillar

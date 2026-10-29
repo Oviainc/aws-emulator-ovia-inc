@@ -63,6 +63,14 @@
 //! ANOTHER account answers for that resource first
 //! ([`foreign_resource_refusal`]): no support plan grants an account access to
 //! another account's resources.
+//!
+//! The same ownership test ([`is_foreign_resource`]) SCOPES the account-level
+//! views: [`recommendations`](ComAmazonawsTrustedadvisorTrustedadvisorState::recommendations)
+//! and [`recommendation_resources`](ComAmazonawsTrustedadvisorTrustedadvisorState::recommendation_resources)
+//! hold every account's rows — the organization surface exists to aggregate the
+//! member accounts' recommendations — so an account-level listing reports only
+//! the rows whose own ARN names the calling account, and the cross-account view
+//! of those same rows is the organization listing.
 
 use std::collections::BTreeMap;
 
@@ -579,9 +587,12 @@ pub struct ResourceEntry {
 pub struct ComAmazonawsTrustedadvisorTrustedadvisorState {
     /// Keyed by check id.
     pub checks: BTreeMap<String, Check>,
-    /// Keyed by recommendation ARN.
+    /// Keyed by recommendation ARN, whose account segment names the account that
+    /// owns the row: the map spans the organization's member accounts, so an
+    /// account-level view of it is scoped by [`is_foreign_resource`].
     pub recommendations: BTreeMap<String, RecommendationEntry>,
-    /// Keyed by recommendation-resource ARN.
+    /// Keyed by recommendation-resource ARN, which likewise names the owning
+    /// account.
     pub recommendation_resources: BTreeMap<String, ResourceEntry>,
     /// Keyed by organization-recommendation ARN.
     pub organization_recommendations: BTreeMap<String, OrganizationRecommendationEntry>,
@@ -1705,18 +1716,34 @@ pub fn arn_account_id(arn: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether `arn` names a resource owned by an account OTHER than the calling
+/// one: the account segment of the resource's OWN ARN ([`arn_account_id`])
+/// differs from the account the request is made from. An ARN that names no
+/// account at all (see [`arn_account`]) is not another account's resource.
+///
+/// The ONE test every account-level view of a stored resource makes, so a
+/// listing and a refusal cannot disagree about who owns one stored resource:
+///
+/// * an account-level LISTING reports a row only when this answers `false` —
+///   such a list reports the calling account's own resources, and the
+///   cross-account view of the same resources is the organization surface;
+/// * an operation whose INPUT names such a resource answers for it first, with
+///   the refusal [`foreign_resource_refusal`] builds.
+pub fn is_foreign_resource(arn: &str) -> bool {
+    arn_account_id(arn).is_some_and(|account| account != ::engine::emulator_account_id())
+}
+
 /// The resource-authorization refusal: `Some(..)` when `aws_resource_arn` names a
-/// resource in an account other than the caller's, so the request is refused for
-/// THAT resource — 403 `AccessDeniedException`, whatever the caller's support
-/// plan, because no support plan grants an account access to another account's
-/// resources.
+/// resource in an account other than the caller's ([`is_foreign_resource`]), so
+/// the request is refused for THAT resource — 403 `AccessDeniedException`,
+/// whatever the caller's support plan, because no support plan grants an account
+/// access to another account's resources.
 ///
 /// The message is built from the request: it names the resource that was refused,
 /// which is the only thing the service knows about the refusal and the only way a
 /// caller passing several ARNs learns which one was denied.
 pub fn foreign_resource_refusal(aws_resource_arn: &str) -> Option<AccessDeniedException> {
-    let account = arn_account_id(aws_resource_arn)?;
-    (account != ::engine::emulator_account_id()).then(|| AccessDeniedException {
+    is_foreign_resource(aws_resource_arn).then(|| AccessDeniedException {
         message: format!("Access denied to resource: {aws_resource_arn}"),
     })
 }

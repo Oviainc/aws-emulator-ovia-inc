@@ -93,7 +93,7 @@ fn resources_path() -> String {
 /// `arn:aws:trustedadvisor::<account>:recommendation/<check>-recommendation` —
 /// the ARN pattern `AccountRecommendationArn` declares, for any member account
 /// of the organization (the emulator's own included).
-fn member_recommendation_arn(account_id: &str, check_id: &str) -> String {
+pub(crate) fn member_recommendation_arn(account_id: &str, check_id: &str) -> String {
     format!("arn:aws:trustedadvisor::{account_id}:recommendation/{check_id}-recommendation")
 }
 
@@ -107,18 +107,20 @@ fn member_resource_arn(account_id: &str, check_id: &str, resource_id: &str) -> S
     )
 }
 
-/// Enrol one more member account of the organization: a copy of `check_id`'s
-/// seeded recommendation and of every one of its resources, owned by
-/// `account_id` and aggregated by that check's organization recommendation.
+/// Store one member account's copy of `check_id`'s seeded recommendation and of
+/// every one of its resources, owned by `account_id`; answers that member
+/// recommendation's ARN.
 ///
 /// Written in process because no modelled operation of this API enrols an
 /// account or produces its check results — organization membership comes from
 /// AWS Organizations, outside this service — exactly as the sibling suites do
-/// it. The member list is grown in an order that is not ARN order, so the rows
-/// below depend on nothing but each stored ARN.
-fn enrol_member_account(engine: &engine::InMemoryEngine, check_id: &str, account_id: &str) {
+/// it.
+pub(crate) fn store_member_recommendation(
+    engine: &engine::InMemoryEngine,
+    check_id: &str,
+    account_id: &str,
+) -> String {
     let seeded_arn = recommendation_arn(check_id);
-    let organization_arn = organization_recommendation_arn(check_id);
     let state = service_state(engine).expect("the in-memory engine carries this service's state");
     let mut state = state.lock();
 
@@ -144,7 +146,25 @@ fn enrol_member_account(engine: &engine::InMemoryEngine, check_id: &str, account
     for copy in copies {
         state.recommendation_resources.insert(copy.arn.clone(), copy);
     }
+    member_arn
+}
+
+/// Enrol one more member account of the organization: the member copy
+/// [`store_member_recommendation`] stores, aggregated by that check's
+/// organization recommendation.
+///
+/// The member list is grown in an order that is not ARN order, so the rows below
+/// depend on nothing but each stored ARN.
+pub(crate) fn enrol_member_account(
+    engine: &engine::InMemoryEngine,
+    check_id: &str,
+    account_id: &str,
+) {
+    let member_arn = store_member_recommendation(engine, check_id, account_id);
+    let organization_arn = organization_recommendation_arn(check_id);
+    let state = service_state(engine).expect("the in-memory engine carries this service's state");
     state
+        .lock()
         .organization_recommendations
         .get_mut(&organization_arn)
         .unwrap_or_else(|| panic!("no organization recommendation for {check_id}"))
