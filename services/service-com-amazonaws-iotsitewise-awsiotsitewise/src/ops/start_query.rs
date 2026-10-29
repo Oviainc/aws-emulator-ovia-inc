@@ -158,26 +158,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             internal_failure("the IoT SiteWise store is unavailable".to_string())
         })?;
+        let region = crate::state::request_region(ctx.parts());
         let submitted_at = ::std::time::SystemTime::now();
+
+        // "A unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request": the token is resolved against the store's record
+        // of the tokens THIS operation has already served, the way every other
+        // idempotent write of this service resolves one (cf. `StartSearch`), so the
+        // members the request is recognised by are rendered once here and compared with
+        // what the call that spent the token sent.
+        let fingerprint = crate::state::request_fingerprint(
+            &[&input.workspace_name, &input.query_statement],
+            None,
+        );
 
         // Everything that can REFUSE this request is decided before the statement
         // runs, so a refused request runs nothing and writes nothing.
         {
             let store = state.lock();
-            // "A unique case-sensitive identifier that you can provide to ensure the
-            // idempotency of the request": a retry carrying the token of a query
-            // this workspace already started reports THAT query — its id and the
-            // status the clock has made due for it — and starts no second one.
-            if let Some(existing) = replayed(&store, &input.workspace_name, &input) {
-                return Ok(StartQueryOutput {
-                    query_id: existing.query_id.clone(),
-                    status: existing.status(submitted_at).to_string(),
-                });
+            if let Some(answer) = token_answer(
+                &store,
+                Self::NAME,
+                input.client_token.as_deref(),
+                &fingerprint,
+                &region,
+                submitted_at,
+            )? {
+                return Ok(answer);
             }
             check_can_start(&store, &input.workspace_name)?;
         }
@@ -234,11 +246,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Checked again now the write lock is held: another request carrying this
         // same token may have landed while this one was running its statement, and
         // one token names one query.
-        if let Some(existing) = replayed(&store, &input.workspace_name, &input) {
-            return Ok(StartQueryOutput {
-                query_id: existing.query_id.clone(),
-                status: existing.status(::std::time::SystemTime::now()).to_string(),
-            });
+        if let Some(answer) = token_answer(
+            &store,
+            Self::NAME,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &region,
+            ::std::time::SystemTime::now(),
+        )? {
+            return Ok(answer);
         }
         check_can_start(&store, &input.workspace_name)?;
 
@@ -275,24 +291,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::QUERY_SUBMITTED.to_string(),
         };
         let key = crate::state::query_key(&record.workspace_name, &record.query_id);
+        let token_resource =
+            crate::state::workspace_scoped_token_resource(&record.workspace_name, &record.query_id);
         store.queries.insert(key, record);
+        // The token is spent only now that the query has been started: a refused
+        // request started none, so the caller may send it again under that token.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &token_resource,
+            submitted_at,
+        );
 
         Ok(output)
     }
 }
 
-/// The query of `workspace` that a request carrying `input`'s `clientToken` already
-/// started, if any. A request carrying no token replays nothing: the token is what
-/// makes a retry recognisable.
-fn replayed<'a>(
-    store: &'a crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
-    workspace: &str,
-    input: &StartQueryInput,
-) -> Option<&'a crate::state::QueryRecord> {
-    let token = input.client_token.as_deref()?;
-    store.queries.values().find(|query| {
-        query.workspace_name == workspace && query.client_token.as_deref() == Some(token)
+/// What the `clientToken` this request carries says about it, as of `now`: the
+/// answer a RETRY replays (`Some`), the modelled conflict for a token a DIFFERENT
+/// request already spent (`Err`), or nothing to say (`None`), which is a request
+/// to be served as the start it is.
+///
+/// A token identifies the CALL that spent it, so a retry — the same request under
+/// that token — reports the query that call started, at the status the clock has
+/// made due for it, and starts no second one, while a request differing in any
+/// member it is recognised by repeats no call and is the conflict this operation
+/// models rather than an answer about a query it never asked for.
+fn token_answer(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    operation: &str,
+    token: Option<&str>,
+    fingerprint: &str,
+    region: &str,
+    now: ::std::time::SystemTime,
+) -> Result<Option<StartQueryOutput>, StartQueryError> {
+    match store.idempotent_verdict(operation, token, fingerprint) {
+        // One gone since — its workspace emptied — leaves the retry nothing to answer
+        // from, so that retry is served as the fresh start it now is.
+        crate::state::TokenVerdict::Replay(replayed) => {
+            let (workspace_name, query_id) = crate::state::workspace_scoped_token_key(&replayed);
+            let key = crate::state::query_key(&workspace_name, &query_id);
+            Ok(store.queries.get(&key).map(|existing| StartQueryOutput {
+                query_id: existing.query_id.clone(),
+                status: existing.status(now).to_string(),
+            }))
+        }
+        // The conflict names the query the token's own call started — the query the
+        // caller has to look at — as the error's required members state it.
+        crate::state::TokenVerdict::Spent(spent_on) => {
+            let (workspace_name, query_id) = crate::state::workspace_scoped_token_key(&spent_on);
+            Err(token_spent(
+                &query_id,
+                crate::state::query_arn(region, &workspace_name, &query_id),
+            ))
+        }
+        crate::state::TokenVerdict::Serve => Ok(None),
+    }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the query that request started, so
+/// `resourceId`/`resourceArn` name it.
+fn token_spent(query_id: &str, resource_arn: String) -> StartQueryError {
+    StartQueryErrorModeled::ConflictingOperationException(ConflictingOperationException {
+        message: crate::state::already_using_message("query", "clientToken"),
+        resource_id: query_id.to_string(),
+        resource_arn,
     })
+    .into()
 }
 
 /// Refuse a request this store cannot take another query of: one naming a workspace

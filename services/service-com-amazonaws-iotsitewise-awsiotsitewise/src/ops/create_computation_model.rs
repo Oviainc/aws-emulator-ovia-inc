@@ -6,7 +6,10 @@
 //! service's store with the configuration, data binding and tags the request
 //! carries plus the actions its computation type exposes, and starts the
 //! `CREATING` -> `ACTIVE` transition the call owes, so a later
-//! `DescribeComputationModel` reports exactly what was written here.
+//! `DescribeComputationModel` reports exactly what was written here. A
+//! `clientToken` is resolved against the store's registry of spent tokens, so a
+//! retry of the call that spent one replays its answer and a different request
+//! reusing it is the modelled conflict.
 //!
 //! ## Shape of an operation
 //!
@@ -210,20 +213,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `clientToken` makes the create idempotent, as the member documents: "A unique
         // case-sensitive identifier that you can provide to ensure the idempotency of
-        // the request." A computation model is named by the id this call mints, so the
-        // token of the create that minted one is what a retry is recognised by.
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(existing) = store
-                .computation_models
-                .values()
-                .find(|model| model.client_token.as_deref() == Some(token))
-            {
-                return Ok(CreateComputationModelOutput {
-                    computation_model_id: existing.id.clone(),
-                    computation_model_arn: existing.arn.clone(),
-                    computation_model_status: existing.status(now),
-                });
+        // the request." The token is resolved against the store's record of the tokens
+        // THIS operation has already served, the way every other idempotent write of
+        // this service resolves one (cf. `UpdateComputationModel`): a token identifies
+        // the CALL that spent it, so a retry — the SAME request under that token, every
+        // member the create is recognised by included — replays the model that call
+        // minted and writes nothing, while a request differing in any of them belongs to
+        // no served call and is the modelled conflict rather than an answer about a model
+        // it never asked for. Decided BEFORE anything is written, so a refused create
+        // stores no computation model.
+        //
+        // The data binding is a MAP, which has no order of its own, so its entries are
+        // rendered through a `BTreeMap`: a retry of one request has to render identically
+        // however its map was built.
+        let binding_entries: ::std::collections::BTreeMap<_, _> =
+            input.computation_model_data_binding.iter().collect();
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.computation_model_name,
+                &input.computation_model_description,
+                &input.computation_model_configuration,
+                &binding_entries,
+            ],
+            input.tags.as_ref(),
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // One deleted since leaves the retry nothing to answer from, so that
+                // retry is served as the fresh create it now is.
+                if let Some(existing) = store.computation_models.get(&replayed) {
+                    return Ok(CreateComputationModelOutput {
+                        computation_model_id: existing.id.clone(),
+                        computation_model_arn: existing.arn.clone(),
+                        computation_model_status: existing.status(now),
+                    });
+                }
             }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                // The ARN the conflict reports is the one the stored model CARRIES, read
+                // back from the record rather than rebuilt, so the refusal cannot name an
+                // ARN no model of this store has. One removed since the token was spent
+                // leaves only its id to build one from, and it is built for the region
+                // THIS request is signed for.
+                let arn = store
+                    .computation_models
+                    .get(&spent_on)
+                    .map(|model| model.arn.clone())
+                    .unwrap_or_else(|| crate::state::computation_model_arn(&region, &spent_on));
+                return Err(token_spent(&spent_on, arn));
+            }
+            crate::state::TokenVerdict::Serve => {}
         }
 
         // The store is bounded: a create is the only thing that adds a computation
@@ -280,10 +319,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             computation_model_status: record.status(now),
         };
 
-        store.computation_models.insert(record.id.clone(), record);
+        let computation_model_id = record.id.clone();
+        store
+            .computation_models
+            .insert(computation_model_id.clone(), record);
+        // The token is spent only now that the create has succeeded: a refused request
+        // created nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &computation_model_id,
+            now,
+        );
 
         Ok(output)
     }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the computation model that request
+/// created, so `resourceId`/`resourceArn` name it — the model the caller has to
+/// look at.
+fn token_spent(computation_model_id: &str, arn: String) -> CreateComputationModelError {
+    CreateComputationModelError::Modeled(
+        CreateComputationModelErrorModeled::ConflictingOperationException(
+            ConflictingOperationException {
+                message: crate::state::already_using_message("computation model", "clientToken"),
+                resource_id: computation_model_id.to_string(),
+                resource_arn: arn,
+            },
+        ),
+    )
 }
 
 /// HTTP 400 `InvalidRequestException` carrying `message`.

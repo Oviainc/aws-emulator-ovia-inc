@@ -3524,8 +3524,12 @@ pub struct DatasetExportJobRecord {
     /// "The processing input that was provided in the CreateDatasetExportJob
     /// request", kept verbatim so the reader answers the request's own input.
     pub input: ProcessingInput,
-    /// The `clientToken` the create carried, if any: what makes a retry of that
-    /// same create replay this job rather than start a second one.
+    /// The `clientToken` the create carried, if any, recorded as part of what
+    /// that call asked for. What recognises a RETRY of that call is the store's
+    /// registry of spent tokens
+    /// ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::idempotent_verdict`]),
+    /// which compares the request too: a token alone says only that some call
+    /// used it, not that this one repeats it.
     pub client_token: Option<String>,
     /// When the job was created, which is the `startedAt` a read reports.
     pub started_at: SystemTime,
@@ -3559,6 +3563,23 @@ impl DatasetExportJobRecord {
 /// workspace is not reachable through another.
 pub fn dataset_export_job_key(workspace_name: &str, job_id: &str) -> (String, String) {
     (workspace_name.to_string(), job_id.to_string())
+}
+
+/// The resource type section a dataset export job's ARN carries, which is what
+/// the modelled conflict refusal reports for one.
+pub const DATASET_EXPORT_JOB_RESOURCE_TYPE: &str = "dataset-export-job";
+
+/// The canonical ARN of a dataset export job in `region`.
+///
+/// The resource section carries the WORKSPACE as well as the id, for the reason
+/// [`query_arn`] states: a job is addressed only inside the workspace it was
+/// created in.
+pub fn dataset_export_job_arn(region: &str, workspace_name: &str, job_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{DATASET_EXPORT_JOB_RESOURCE_TYPE}/{workspace_name}/{job_id}"),
+    )
 }
 
 /// Refuse a `ProcessingInput` whose items break a rule the shapes state, in the
@@ -3787,8 +3808,12 @@ pub struct QueryRecord {
     /// operation reports it back; it is kept because it is what the query IS, and
     /// what a reader of the query's results re-reads the store with.
     pub query_statement: String,
-    /// The `clientToken` the request carried, if any: what makes a retry of that
-    /// same request replay this query rather than start a second one.
+    /// The `clientToken` the request carried, if any, recorded as part of what
+    /// that call asked for. What recognises a RETRY of that call is the store's
+    /// registry of spent tokens
+    /// ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::idempotent_verdict`]),
+    /// which compares the request too: a token alone says only that some call
+    /// used it, not that this one repeats it.
     pub client_token: Option<String>,
     /// When the query was submitted, which is the `submittedAt` a read reports.
     pub submitted_at: SystemTime,
@@ -8227,9 +8252,12 @@ pub struct ComputationModelRecord {
     /// `computationModelVersion` it reports; see
     /// [`COMPUTATION_MODEL_INITIAL_VERSION`].
     pub version: u64,
-    /// The `clientToken` of the create that made this model, if it carried one,
-    /// so a retry of that same create replays its answer rather than minting a
-    /// second model.
+    /// The `clientToken` the create that made this model carried, if it carried
+    /// one, recorded as part of what that call asked for. What recognises a
+    /// RETRY of that call is the store's registry of spent tokens
+    /// ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::idempotent_verdict`]),
+    /// which compares the request too: a token alone says only that some call
+    /// used it, not that this one repeats it.
     pub client_token: Option<String>,
     pub tags: HashMap<String, String>,
 }

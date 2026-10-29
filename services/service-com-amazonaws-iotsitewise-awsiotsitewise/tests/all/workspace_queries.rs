@@ -20,8 +20,10 @@
 //!   501 the emulator reserves for that and also starts none;
 //! * a query is addressed only inside the workspace it was started in, and a
 //!   workspace this service does not hold is the modelled not-found refusal;
-//! * a retry carrying the client token of a query that was already started reports
-//!   that one query and starts no second;
+//! * a retry carrying the client token of a query that was already started — the
+//!   SAME request under that token — reports that one query and starts no second,
+//!   while a DIFFERENT request reusing the token repeats no call and is refused the
+//!   modelled conflict naming the query that token's own call started;
 //! * a run that outruns the engine's budget is a FAILED query carrying the message
 //!   saying why — not a refused request, because an asynchronous query reports the
 //!   fate of its run through its own status.
@@ -52,6 +54,19 @@ pub(crate) const WORKSPACE: &str = "Plant1";
 /// RUNNING | COMPLETED | FAILED | CANCELED | CANCELING, of which the first two and
 /// `CANCELING` are the ones a query is still on its way through.
 const TERMINAL_STATUSES: [&str; 3] = ["COMPLETED", "FAILED", "CANCELED"];
+
+/// What a `StartQuery` request carrying a `clientToken` is answered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// The request is served: it starts a query of its own.
+    Started,
+    /// The request REPEATS the call its token was spent on, so it reports that
+    /// call's query and starts none.
+    Replayed,
+    /// The request differs from the call its token was spent on, so it repeats no
+    /// call and is refused the modelled conflict.
+    Refused,
+}
 
 /// Long enough that the whole span the clock owes a query has elapsed.
 pub(crate) fn settled() -> Duration {
@@ -520,42 +535,73 @@ async fn a_retry_carrying_the_same_client_token_starts_no_second_query() {
     let first = "11111111-1111-4111-8111-111111111111-token";
     let second = "22222222-2222-4222-8222-222222222222-token";
     // Rows: the same token with the same statement, the same token with a DIFFERENT
-    // statement, a second token, and two requests carrying no token at all. The
-    // token alone decides whether a request is a retry, so only the rows that reuse
-    // one may answer an id already issued.
-    let cases: Vec<(&str, &str, Option<&str>, bool)> = vec![
+    // statement, a second token, and two requests carrying no token at all. A token
+    // is spent by ONE request, so only a REPEAT of that request may answer an id
+    // already issued; a request differing in the statement repeats no call and is
+    // the conflict this operation models.
+    let cases: Vec<(&str, &str, Option<&str>, Answer)> = vec![
         (
             "the first request",
             "SELECT asset_name FROM asset",
             Some(first),
-            false,
+            Answer::Started,
         ),
         (
             "the same token and statement",
             "SELECT asset_name FROM asset",
             Some(first),
-            true,
+            Answer::Replayed,
         ),
         (
             "the same token, another statement",
             "SELECT asset_id FROM asset_property",
             Some(first),
-            true,
+            Answer::Refused,
         ),
         (
             "another token",
             "SELECT asset_name FROM asset",
             Some(second),
-            false,
+            Answer::Started,
         ),
-        ("no token", "SELECT asset_name FROM asset", None, false),
-        ("no token again", "SELECT asset_name FROM asset", None, false),
+        (
+            "no token",
+            "SELECT asset_name FROM asset",
+            None,
+            Answer::Started,
+        ),
+        (
+            "no token again",
+            "SELECT asset_name FROM asset",
+            None,
+            Answer::Started,
+        ),
     ];
 
     let mut by_token: HashMap<&str, String> = HashMap::new();
     let mut ids: Vec<String> = Vec::new();
-    for (case, statement, token, replayed) in &cases {
+    for (case, statement, token, answer) in &cases {
         let (status, body) = start_in(&router, WORKSPACE, statement, *token).await;
+        if *answer == Answer::Refused {
+            assert_eq!(
+                status, 409,
+                "case {case:?}: a request differing from the call its token was spent on \
+                 expected 409, got {status} {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ConflictingOperationException",
+                "case {case:?}: unexpected error code in {body}"
+            );
+            let spent_on = token.and_then(|token| by_token.get(token)).cloned();
+            assert_eq!(
+                body["resourceId"].as_str().map(str::to_string),
+                spent_on,
+                "case {case:?}: the conflict must name the query that token's own call \
+                 started, got {body}"
+            );
+            continue;
+        }
         assert_eq!(
             status, 202,
             "case {case:?}: expected 202, got {status} {body}"
@@ -564,8 +610,8 @@ async fn a_retry_carrying_the_same_client_token_starts_no_second_query() {
             .as_str()
             .unwrap_or_else(|| panic!("case {case:?}: no queryId in {body}"))
             .to_string();
-        match (token, replayed) {
-            (Some(token), true) => assert_eq!(
+        match (token, answer) {
+            (Some(token), Answer::Replayed) => assert_eq!(
                 by_token.get(token),
                 Some(&query_id),
                 "case {case:?}: a retry reports the query its token already started, got {body}"
@@ -586,12 +632,13 @@ async fn a_retry_carrying_the_same_client_token_starts_no_second_query() {
     assert_eq!(
         queries_held(&engine),
         ids.len(),
-        "the store holds one query per request that was not a retry"
+        "the store holds one query per request that was served as a start of its own: \
+         neither the retry nor the refused request started one"
     );
 
     // The replayed query is the one the FIRST request started, so what it reports is
     // that request's own run: the row count of `SELECT asset_name FROM asset`, not
-    // of the statement the retry carried.
+    // of the statement any later request under that token carried.
     tokio::time::sleep(settled()).await;
     let replayed = described(&router, &by_token[first]).await;
     let expected = rows_through_execute_query(&router, "SELECT asset_name FROM asset").await;

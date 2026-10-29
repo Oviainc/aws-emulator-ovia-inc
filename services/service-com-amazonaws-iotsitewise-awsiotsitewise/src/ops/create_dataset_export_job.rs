@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateDatasetExportJobError::Modeled(
@@ -168,6 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
         // The rules the input shapes state, checked before anything is written so a
@@ -195,20 +196,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "If you retry a request that completed successfully using the same client
         // token, the server returns the cached result from the original successful
-        // request without performing the operation again": the retry writes nothing
-        // and reports the job the ORIGINAL call started. Answered BEFORE the input
-        // the job processes is resolved against the store, so a replay stays the
-        // answer the first call gave whatever has changed since.
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(existing) = store.dataset_export_jobs.values().find(|job| {
-                job.workspace_name == input.workspace_name
-                    && job.client_token.as_deref() == Some(token)
-            }) {
-                return Ok(CreateDatasetExportJobOutput {
-                    job_id: existing.job_id.clone(),
-                    workspace_name: existing.workspace_name.clone(),
-                });
+        // request without performing the operation again": the cached result is that
+        // REQUEST's, so the token is resolved against the store's record of the tokens
+        // THIS operation has already served, the way every other idempotent write of
+        // this service resolves one (cf. `CreateEnrichmentJob`). A token identifies the
+        // CALL that spent it: a retry — the same request under that token, every member
+        // the job is described by included — reports the job that call started and
+        // writes nothing, while a request differing in any of them repeats no call and
+        // is the modelled conflict rather than an answer about a job it never asked
+        // for. Decided BEFORE the input the job processes is resolved against the store,
+        // so a replay stays the answer the first call gave whatever has changed since.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.workspace_name,
+                &input.destination_s3_uri,
+                &input.error_report_location,
+                &input.input,
+            ],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // One gone since — its workspace emptied — leaves the retry nothing to
+                // answer from, so that retry is served as the fresh create it now is.
+                let (workspace_name, job_id) = crate::state::workspace_scoped_token_key(&replayed);
+                let key = crate::state::dataset_export_job_key(&workspace_name, &job_id);
+                if let Some(existing) = store.dataset_export_jobs.get(&key) {
+                    return Ok(CreateDatasetExportJobOutput {
+                        job_id: existing.job_id.clone(),
+                        workspace_name: existing.workspace_name.clone(),
+                    });
+                }
             }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                // The conflict names the job the token's own call started — the job the
+                // caller has to look at — as the error's required members state it.
+                let (workspace_name, job_id) = crate::state::workspace_scoped_token_key(&spent_on);
+                return Err(token_spent(
+                    &job_id,
+                    crate::state::dataset_export_job_arn(&region, &workspace_name, &job_id),
+                ));
+            }
+            crate::state::TokenVerdict::Serve => {}
         }
 
         // "A dataset containing multiple items to process": the input names a
@@ -279,10 +308,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             workspace_name: record.workspace_name.clone(),
         };
         let key = crate::state::dataset_export_job_key(&record.workspace_name, &record.job_id);
+        let token_resource =
+            crate::state::workspace_scoped_token_resource(&record.workspace_name, &record.job_id);
         store.dataset_export_jobs.insert(key, record);
+        // The token is spent only now that the create has SUCCEEDED: a refused request
+        // started no job, so the caller may send it again under that token.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &token_resource,
+            now,
+        );
 
         Ok(output)
     }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the job that request started, so
+/// `resourceId`/`resourceArn` name it — the job the caller has to look at.
+fn token_spent(job_id: &str, resource_arn: String) -> CreateDatasetExportJobError {
+    CreateDatasetExportJobError::Modeled(
+        CreateDatasetExportJobErrorModeled::ConflictingOperationException(
+            ConflictingOperationException {
+                message: crate::state::already_using_message(
+                    "dataset export job",
+                    "clientToken",
+                ),
+                resource_id: job_id.to_string(),
+                resource_arn,
+            },
+        ),
+    )
 }
 
 /// HTTP 400 `InvalidRequestException` carrying `message`.

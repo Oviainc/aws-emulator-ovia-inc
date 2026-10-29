@@ -151,6 +151,13 @@ mod computation_model_execution_summary;
 #[path = "all/computation_model_delete.rs"]
 mod computation_model_delete;
 
+// `computation_model_client_token_names_the_call` is declared HERE, beside the
+// computation-model suites above, for the reason their notes give: the sorted list
+// and the END of this file are both stretches every concurrent iotsitewise change
+// puts a declaration of its own in. Fold it into the list once the churn settles.
+#[path = "all/computation_model_client_token_names_the_call.rs"]
+mod computation_model_client_token_names_the_call;
+
 // `workspace_scoped_creates` is declared HERE, beside the suites above, for the
 // reason their notes give: the sorted list and the END of this file are both
 // where every concurrent iotsitewise change puts a declaration of its own. Fold

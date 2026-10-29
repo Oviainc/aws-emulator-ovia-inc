@@ -71,7 +71,11 @@ async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
 }
 
 /// The `computationModelId`s `ListComputationModels` reports, sorted.
-async fn listed_ids(router: &MultiServiceRouter) -> Vec<String> {
+///
+/// `pub(crate)` because the sibling `computation_model_client_token_names_the_call`
+/// suite reads which models the service holds through the same route: one
+/// definition of it, so the two cannot drift.
+pub(crate) async fn listed_ids(router: &MultiServiceRouter) -> Vec<String> {
     let (status, body) = call(router, "GET", "/computation-models", None).await;
     assert_eq!(status, 200, "ListComputationModels got {status} {body}");
     let mut ids: Vec<String> = body["computationModelSummaries"]

@@ -20,10 +20,12 @@
 //! * a create whose input breaks a rule the input shapes state is the modelled
 //!   `InvalidRequestException` and starts NO job, and one naming a dataset the
 //!   store does not hold is the modelled not-found refusal;
-//! * a retried create carrying the same `clientToken` replays the job the first
-//!   one started rather than starting a second, whatever else that retry names,
-//!   and rewrites nothing on the job it replays — while the same token in another
-//!   workspace is a different call and starts a job of its own;
+//! * a retried create — the SAME request under the same `clientToken` — replays the
+//!   job the first one started rather than starting a second, and rewrites nothing
+//!   on the job it replays, while a DIFFERENT request reusing that token repeats no
+//!   call and is refused the modelled conflict naming the job the token's own call
+//!   started, the workspace the create names being one of the members that call is
+//!   recognised by;
 //! * a create answers in the workspace its request names, whatever form that name
 //!   takes within the modelled constraint, and the store bounds how many jobs one
 //!   workspace holds, past which the create is the modelled refusal and starts no
@@ -666,7 +668,7 @@ async fn a_retried_create_carrying_the_same_client_token_replays_the_first_job()
 }
 
 #[tokio::test]
-async fn a_retry_replays_the_first_request_and_rewrites_nothing_on_the_job() {
+async fn a_retry_replays_the_first_request_and_a_differing_one_is_refused() {
     let (router, engine) = router_with_engine();
     let dataset_id = create_dataset(&router, "Export source").await;
     let first_input = json!({ "timeseries": [{ "timeSeriesId": ASSOCIATED_SERIES }] });
@@ -676,86 +678,123 @@ async fn a_retry_replays_the_first_request_and_rewrites_nothing_on_the_job() {
     assert_eq!(status, 202, "the first create got {status} {first}");
     let job_id = first["jobId"].as_str().unwrap_or("").to_string();
 
-    // (case, the whole body the retry sends) — the retry carries the token the
-    // first create carried and differs in every other member in turn: the answer
-    // is the cached result of that first call, so the job it reports is the one
-    // the first request started and the rest of the retry changes nothing.
-    let retries: Vec<(&str, Value)> = vec![
-        ("the same request again", create_body(&first_input, Some(token))),
+    // (case, the whole body the second call sends, whether it REPEATS the first
+    // request) — the token is the one the first create spent, and the rows differ
+    // in each member the create is recognised by in turn: the repeat replays that
+    // call's answer, every differing request repeats no call at all.
+    let calls: Vec<(&str, Value, bool)> = vec![
+        (
+            "the same request again",
+            create_body(&first_input, Some(token)),
+            true,
+        ),
         (
             "another destination",
             create_body_from(OTHER_DESTINATION, ERROR_REPORT, &first_input, Some(token)),
+            false,
         ),
         (
             "another error report location",
             create_body_from(DESTINATION, OTHER_ERROR_REPORT, &first_input, Some(token)),
+            false,
         ),
         (
             "another processing input",
             create_body(&json!({ "dataset": { "datasetId": dataset_id } }), Some(token)),
+            false,
         ),
     ];
 
-    for (label, body) in retries {
-        let (status, replayed) = create(&router, WORKSPACE, body).await;
-        assert_eq!(
-            status, 202,
-            "case {label:?}: expected 202, got {status} {replayed}"
-        );
-        assert_eq!(
-            replayed["jobId"].as_str().unwrap_or(""),
-            job_id,
-            "case {label:?}: a retry must replay the job the first create started, got {replayed}"
-        );
+    for (label, body, repeats) in calls {
+        let (status, answered) = create(&router, WORKSPACE, body).await;
+        if repeats {
+            assert_eq!(
+                status, 202,
+                "case {label:?}: a retry expected 202, got {status} {answered}"
+            );
+            assert_eq!(
+                answered["jobId"].as_str().unwrap_or(""),
+                job_id,
+                "case {label:?}: a retry must replay the job the first create started, \
+                 got {answered}"
+            );
+        } else {
+            assert_eq!(
+                status, 409,
+                "case {label:?}: a request differing from the call its token was spent on \
+                 expected 409, got {status} {answered}"
+            );
+            assert_eq!(
+                error_code(&answered),
+                "ConflictingOperationException",
+                "case {label:?}: unexpected error code in {answered}"
+            );
+            assert_eq!(
+                answered["resourceId"].as_str().unwrap_or(""),
+                job_id,
+                "case {label:?}: the conflict must name the job the token's own call \
+                 started, got {answered}"
+            );
+            assert!(
+                answered["resourceArn"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .ends_with(&format!("{WORKSPACE}/{job_id}")),
+                "case {label:?}: the conflict must carry that job's ARN, got {answered}"
+            );
+        }
 
         let (status, described) = describe(&router, WORKSPACE, &job_id).await;
         assert_eq!(
             status, 200,
-            "case {label:?}: the read of the replayed job got {status} {described}"
+            "case {label:?}: the read of the first job got {status} {described}"
         );
         assert_eq!(
             described["destinationS3Uri"].as_str().unwrap_or(""),
             DESTINATION,
-            "case {label:?}: a retry must not rewrite the job's destination, got {described}"
+            "case {label:?}: the second call must not rewrite the job's destination, \
+             got {described}"
         );
         assert_eq!(
             described["errorReportLocation"],
             json!({ "s3Uri": ERROR_REPORT }),
-            "case {label:?}: a retry must not rewrite the job's error report location, \
-             got {described}"
+            "case {label:?}: the second call must not rewrite the job's error report \
+             location, got {described}"
         );
         assert_eq!(
             described["input"], first_input,
-            "case {label:?}: a retry must not rewrite the job's processing input, got {described}"
+            "case {label:?}: the second call must not rewrite the job's processing input, \
+             got {described}"
         );
     }
 
-    // A token makes a call a retry of the call it repeats, and a create names the
-    // workspace it creates in: the same token in ANOTHER workspace is a different
-    // call, so it starts a job of its own there.
+    // A token is spent by one CALL of this operation, and the workspace the create
+    // names is a member of that call: the same token in ANOTHER workspace is a
+    // different request, so it repeats no call and is refused too — the rule
+    // `StartSearch` already states for a token reused against another workspace.
     let (status, elsewhere) =
         create(&router, "other-floor", create_body(&first_input, Some(token))).await;
     assert_eq!(
-        status, 202,
-        "the same token in another workspace got {status} {elsewhere}"
-    );
-    assert_ne!(
-        elsewhere["jobId"].as_str().unwrap_or(""),
-        job_id,
-        "a create in another workspace must start a job of its own, got {elsewhere}"
+        status, 409,
+        "the same token in another workspace expected 409, got {status} {elsewhere}"
     );
     assert_eq!(
-        elsewhere["workspaceName"].as_str().unwrap_or(""),
-        "other-floor",
-        "unexpected workspaceName in {elsewhere}"
+        error_code(&elsewhere),
+        "ConflictingOperationException",
+        "the same token in another workspace: unexpected error code in {elsewhere}"
+    );
+    assert_eq!(
+        elsewhere["resourceId"].as_str().unwrap_or(""),
+        job_id,
+        "the conflict must name the job the token's own call started, got {elsewhere}"
     );
 
-    // Two jobs: the one the first create started and the one the other workspace
-    // got. The four retries wrote nothing.
+    // One job: the one the first create started. The replay and the four refusals
+    // wrote nothing.
     let held = jobs_held(&engine);
     assert_eq!(
-        held, 2,
-        "the four retries must have written nothing, the store holds {held}"
+        held, 1,
+        "the replay and the refused creates must have written nothing, the store holds {held}"
     );
 }
 
