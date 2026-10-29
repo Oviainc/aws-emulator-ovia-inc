@@ -30,6 +30,11 @@
 //! have to be evaluated against interaction history this emulator does not store, and
 //! silently ignoring it would make the filter claim to filter when it does not.
 //!
+//! The expression's SUBJECT states which of the two the expression selects — `ItemID`
+//! for Items entries, `ActionID` for Actions ones — so [`parse`] accepts those two
+//! identifiers and nothing else, and [`bind`] requires the subject to name the entity
+//! the operation applying the filter recommends ([`Entity`]).
+//!
 //! A categorical attribute may hold several values separated by `|`, the separator
 //! Personalize's own Items CSV uses, so a predicate matches when ANY of the attribute's
 //! values matches, and a negated one when none does.
@@ -71,8 +76,9 @@ pub enum FilterKind {
     Exclude,
 }
 
-/// The kind of catalog entry a filter is applied to, and therefore the only dataset
-/// name whose clauses can be evaluated for it.
+/// The kind of catalog entry a filter is applied to, and therefore both the subject an
+/// expression that selects it names and the only dataset name whose clauses can be
+/// evaluated for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entity {
     /// An Items-dataset entry, filtered by `Items.<COLUMN>` clauses.
@@ -89,12 +95,38 @@ impl Entity {
             Self::Actions => DATASET_ACTIONS,
         }
     }
+
+    /// The subject an expression that selects entries of this kind names.
+    pub fn subject(self) -> &'static str {
+        match self {
+            Self::Items => SUBJECT_ITEM_ID,
+            Self::Actions => SUBJECT_ACTION_ID,
+        }
+    }
+
+    /// The entity the expression subject `word` selects, or `None` when the word is
+    /// neither identifier the grammar's subject slot admits.
+    ///
+    /// The identifier is spelled exactly, the way a clause's dataset and column are:
+    /// only the expression language's KEYWORDS are matched case-insensitively.
+    pub fn from_subject(word: &str) -> Option<Self> {
+        match word {
+            SUBJECT_ITEM_ID => Some(Self::Items),
+            SUBJECT_ACTION_ID => Some(Self::Actions),
+            _ => None,
+        }
+    }
 }
 
 /// The Items dataset name, as a filter expression spells it.
 pub const DATASET_ITEMS: &str = "Items";
 /// The Actions dataset name, as a filter expression spells it.
 pub const DATASET_ACTIONS: &str = "Actions";
+
+/// The subject an expression selecting Items-dataset entries names.
+pub const SUBJECT_ITEM_ID: &str = "ItemID";
+/// The subject an expression selecting Actions-dataset entries names.
+pub const SUBJECT_ACTION_ID: &str = "ActionID";
 
 /// How two clauses combine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,8 +235,10 @@ pub struct Clause {
 pub struct FilterExpression {
     /// `INCLUDE` or `EXCLUDE`.
     pub kind: FilterKind,
-    /// The subject the expression selects — `ItemID` or `ActionID`.
-    pub subject: String,
+    /// The entity the expression's subject (`ItemID` or `ActionID`) selects: the part
+    /// of the expression that states WHICH catalog it filters, so it is the entity an
+    /// operation applying this filter has to be recommending ([`bind`]).
+    pub subject: Entity,
     /// The clauses, each with the combinator that joins it to the one before. The
     /// first entry's combinator is [`Combinator::And`] and is never read.
     pub clauses: Vec<(Combinator, Clause)>,
@@ -543,7 +577,10 @@ fn orderable(dataset: &str, column: &str, predicate: &Predicate) -> Result<(), S
 ///
 /// `Err` carries a message naming what was wrong, for the caller that registered the
 /// filter: the real service validates the expression when the filter is CREATED, so a
-/// stored filter is always one this evaluator can apply.
+/// stored filter is always one this evaluator can apply. EVERY element of the grammar
+/// is checked here, the subject included: the slot admits the two identifiers the
+/// language defines and nothing else, so a stored expression always names the entity it
+/// selects.
 pub fn parse(expression: &str) -> Result<FilterExpression, String> {
     let mut parser = Parser {
         tokens: tokenize(expression)?,
@@ -559,7 +596,14 @@ pub fn parse(expression: &str) -> Result<FilterExpression, String> {
             "filter expression must start with INCLUDE or EXCLUDE, found '{action}'"
         ));
     };
-    let subject = parser.word("the filtered subject (ItemID or ActionID)")?;
+    let word =
+        parser.word(&format!("the filtered subject ({SUBJECT_ITEM_ID} or {SUBJECT_ACTION_ID})"))?;
+    let subject = Entity::from_subject(&word).ok_or_else(|| {
+        format!(
+            "filter expression selects '{word}'; the filtered subject must be \
+             {SUBJECT_ITEM_ID} or {SUBJECT_ACTION_ID}"
+        )
+    })?;
     parser.keyword("WHERE")?;
 
     let mut clauses = vec![(Combinator::And, parser.clause()?)];
@@ -647,9 +691,10 @@ pub struct BoundFilter {
 /// [`unbound_parameter`] — so the two kinds differ only in what the rule does, never in
 /// which requests reach it.
 ///
-/// A clause over the other dataset cannot be evaluated against this entity's stored
-/// attributes at all, which is an error for either kind: the caller applied an Items
-/// filter to action recommendations, or the reverse. So is a value the request DID
+/// A filter whose SUBJECT names the other entity does not select what this operation
+/// recommends, and a clause over the other dataset cannot be evaluated against this
+/// entity's stored attributes at all; either is an error for either kind: the caller
+/// applied an Items filter to action recommendations, or the reverse. So is a value the request DID
 /// supply that the clause cannot compare — an ordering operator against text: the
 /// asymmetry above is about a value the request OMITS, and a supplied value the clause
 /// cannot apply is reported here rather than filtering nothing.
@@ -658,6 +703,13 @@ pub fn bind(
     entity: Entity,
     filter_values: Option<&HashMap<String, String>>,
 ) -> Result<BoundFilter, String> {
+    if expression.subject != entity {
+        return Err(format!(
+            "the filter selects {}, which is not the {} this operation recommends",
+            expression.subject.subject(),
+            entity.subject()
+        ));
+    }
     let mut clauses: Vec<(Combinator, BoundClause)> = Vec::new();
     for (combinator, clause) in &expression.clauses {
         if clause.dataset != entity.dataset() {
