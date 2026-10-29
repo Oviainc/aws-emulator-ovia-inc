@@ -187,17 +187,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rows the STATEMENT this request carries answers, so a token minted while
         // paging another statement — or by the operation that pages a stored query's
         // rows — names no page of this one and is refused rather than silently
-        // resuming this result at that other enumeration's position.
+        // resuming this result at that other enumeration's position. WHICH offsets of
+        // its OWN enumeration this operation accepts is its own question, answered
+        // below: a token is issued only for a row this result HAS, so an offset at or
+        // past the end is one it never issued — including every offset at all for a
+        // statement that answers no rows — and is refused rather than answered with
+        // an empty page, which would report absence as success.
         let scope = RowPageScope::of_statement(&input.query_statement);
         let start = match input.next_token.as_deref() {
-            Some(token) => decode_token(token, &scope)?,
+            Some(token) => {
+                let resume = decode_token(token, &scope)?;
+                if resume >= result.rows.len() {
+                    return Err(invalid_token());
+                }
+                resume
+            }
             None => 0,
         };
-        if start > result.rows.len() {
-            return Err(invalid_request(
-                "The nextToken is not a token this operation issued.".to_string(),
-            ));
-        }
         let max_results = input
             .max_results
             .unwrap_or(DEFAULT_MAX_RESULTS)
@@ -2112,7 +2118,13 @@ pub(crate) fn decode_row_offset(token: &str, scope: &RowPageScope) -> Option<usi
 
 /// Decode a `nextToken` back into the row offset it resumes from in `scope`.
 fn decode_token(token: &str, scope: &RowPageScope) -> Result<usize, ExecuteQueryError> {
-    decode_row_offset(token, scope).ok_or_else(|| {
-        invalid_request("The nextToken is not a token this operation issued.".to_string())
-    })
+    decode_row_offset(token, scope).ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
+/// issued: text that is not one of its tokens, a token issued for another
+/// enumeration of rows, or an offset at or past the end of the result it was issued
+/// for.
+fn invalid_token() -> ExecuteQueryError {
+    invalid_request("The nextToken is not a token this operation issued.".to_string())
 }

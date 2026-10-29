@@ -602,6 +602,155 @@ async fn a_statement_is_answered_from_the_stored_resources() {
 }
 
 #[tokio::test]
+async fn a_row_page_token_is_honoured_only_for_a_row_the_result_still_has() {
+    // The rule: a page token names a position in the enumeration it was issued for,
+    // and this operation issues one only for a row the result HAS, so an offset at
+    // or past the end of the result it is presented against is a token it never
+    // issued and is refused with the modelled `InvalidRequestException` (400) —
+    // never answered with an empty page, which would report absence as success.
+    let router = router();
+    let model_id = create_model(
+        &router,
+        "Boiler",
+        json!([{"name": "Temperature", "dataType": "DOUBLE", "type": {"measurement": {}}}]),
+    )
+    .await;
+    // Three assets, so a token can be minted at more than one position of the
+    // enumeration the statement's rows form.
+    let mut ids: Vec<(&str, String)> = Vec::new();
+    for name in ["Boiler1", "Boiler2", "Boiler3"] {
+        ids.push((name, create_asset(&router, name, &model_id).await));
+    }
+    let statement = "SELECT asset_name FROM asset ORDER BY asset_name";
+
+    // Tokens this operation DID issue, minted at two positions of the result: the
+    // rule is about which rows a position names, so it is exercised at more than
+    // one position.
+    let mut minted: Vec<(usize, String)> = Vec::new();
+    for at in [1usize, 2] {
+        let (status, body) = call(
+            &router,
+            "POST",
+            "/queries/execution",
+            Some(json!({ "queryStatement": statement, "maxResults": at })),
+        )
+        .await;
+        assert_eq!(status, 200, "a page of {at} row(s): got {status} {body}");
+        let token = body["nextToken"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("a page of {at} of 3 row(s) must carry a nextToken, got {body}")
+            })
+            .to_string();
+        minted.push((at, token));
+    }
+
+    // The control: while the result still HAS the row a token names, that token is
+    // honoured and resumes the result exactly there.
+    let (_, whole_body) = query(&router, statement).await;
+    let whole = rows(&whole_body);
+    assert_eq!(
+        whole.len(),
+        3,
+        "the fixture must answer three rows to page over, got {whole_body}"
+    );
+    for (at, token) in &minted {
+        let (status, body) = call(
+            &router,
+            "POST",
+            "/queries/execution",
+            Some(json!({ "queryStatement": statement, "nextToken": token })),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {at}: its own token must resume the result, got {status} {body}"
+        );
+        assert_eq!(
+            rows(&body),
+            whole[*at..].to_vec(),
+            "case {at}: the token must resume the result at row {at}, got {body}"
+        );
+    }
+
+    // Now SHRINK the result, one row at a time off the end of its order, so each
+    // token above comes to name a row the result no longer has: an offset at the
+    // end, an offset past the end, and — once nothing is left — every offset at all.
+    // Each row lists the offsets the shrunken result must refuse; the others are
+    // still rows it has, so they must still be honoured.
+    let cases: Vec<(&str, &str, Vec<usize>)> = vec![
+        ("an offset at the end of the result", "Boiler3", vec![2]),
+        ("an offset past the end of the result", "Boiler2", vec![1, 2]),
+        ("every offset into a result of no rows", "Boiler1", vec![1, 2]),
+    ];
+    for (case, removed, refused) in &cases {
+        let id = ids
+            .iter()
+            .find(|(name, _)| name == removed)
+            .map(|(_, id)| id.clone())
+            .unwrap_or_else(|| panic!("case {case:?}: no fixture asset named {removed}"));
+        let (status, body) = call(&router, "DELETE", &format!("/assets/{id}"), None).await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: removing {removed}: got {status} {body}"
+        );
+        let (status, held_body) = query(&router, statement).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the shrunken result must still be answered, got {status} {held_body}"
+        );
+        let held = rows(&held_body);
+        // A result holding no rows is still ANSWERED to a caller that presents no
+        // token: one empty page that resumes nowhere.
+        if held.is_empty() {
+            assert!(
+                held_body["nextToken"].is_null(),
+                "case {case:?}: a result of no rows resumes nowhere, got {held_body}"
+            );
+        }
+        for (at, token) in &minted {
+            let (status, body) = call(
+                &router,
+                "POST",
+                "/queries/execution",
+                Some(json!({ "queryStatement": statement, "nextToken": token })),
+            )
+            .await;
+            if refused.contains(at) {
+                assert_eq!(
+                    status,
+                    400,
+                    "case {case:?}: offset {at} of a result of {} row(s) is a token this \
+                     operation never issued, got {status} {body}",
+                    held.len()
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "InvalidRequestException",
+                    "case {case:?}: offset {at}: unexpected error code in {body}"
+                );
+                assert_eq!(
+                    body["message"].as_str(),
+                    Some("The nextToken is not a token this operation issued."),
+                    "case {case:?}: offset {at}: unexpected message in {body}"
+                );
+            } else {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: offset {at} is still a row this result has, \
+                     got {status} {body}"
+                );
+                assert_eq!(
+                    rows(&body),
+                    held[*at..].to_vec(),
+                    "case {case:?}: offset {at} must resume the result there, got {body}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_statement_past_the_engine_budget_ends_in_a_modelled_error() {
     let nested_router = router();
 
