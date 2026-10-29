@@ -47,6 +47,9 @@ mod profile_permissions;
 #[path = "all/profile_revocation_and_identity.rs"]
 mod profile_revocation_and_identity;
 
+#[path = "all/profile_revocation_capability.rs"]
+mod profile_revocation_capability;
+
 #[path = "all/profile_revocation_is_recorded_once.rs"]
 mod profile_revocation_is_recorded_once;
 

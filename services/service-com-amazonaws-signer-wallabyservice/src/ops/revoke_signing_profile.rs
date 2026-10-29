@@ -10,6 +10,12 @@
 //! leaves the first record standing: the revocation is a fact about trust that
 //! has already ended, so it is recorded once.
 //!
+//! A profile whose platform publishes no revocation capability
+//! ([`crate::state::platform_supports_revocation`]) is refused with the modelled
+//! 400 `ValidationException` instead, the same judgement `RevokeSignature`
+//! applies to the signatures that platform produces: nothing a platform cannot
+//! revoke becomes revocable through the profile that signed it.
+//!
 //! The success answer is `204 No Content` with no body: the output is `Unit`, and
 //! the recorded AWS answer to this `PUT` is 204, not the 200 the model's `@http`
 //! code states (the two disagree; the wire is what a client reads).
@@ -167,6 +173,20 @@ fn profile_not_found(profile_name: &str) -> RevokeSigningProfileError {
     .into()
 }
 
+/// The modelled 400 for revoking on a platform published without the revocation
+/// capability.
+///
+/// The same shape, `code` and prose `RevokeSignature` refuses a signature of such
+/// a platform with, so a client reads one answer for the capability however it
+/// asks for the revocation.
+fn revocation_unsupported(platform_id: &str) -> RevokeSigningProfileError {
+    RevokeSigningProfileErrorModeled::ValidationException(ValidationException {
+        message: Some(crate::state::revocation_unsupported_message(platform_id)),
+        code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
+    })
+    .into()
+}
+
 /// The modelled 404 for a `profileVersion` the profile has never had.
 ///
 /// The profile itself was resolved, so what the request failed to name is a
@@ -257,6 +277,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.profile_name,
                 &input.profile_version,
             ));
+        }
+
+        // A platform published as not supporting revocation produces signatures
+        // that cannot be revoked, and revoking the profile is what stops its
+        // signatures being trusted — so there is no revocation for this call to
+        // record either.
+        if !crate::state::platform_supports_revocation(&profile.platform_id) {
+            return Err(revocation_unsupported(&profile.platform_id));
         }
 
         // Recording is idempotent: a profile already revoked keeps the instant,

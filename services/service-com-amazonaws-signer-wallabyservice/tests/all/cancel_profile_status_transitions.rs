@@ -282,7 +282,9 @@ const CASES: &[Case] = &[
     Case {
         name: "Revoked_Then_Reput",
         region: "eu-west-1",
-        platform: "AmazonFreeRTOS-TI-CC3220SF",
+        // Seeded through a revoke, so the platform has to publish the revocation
+        // capability (see `profile_revocation_capability.rs`).
+        platform: "Notation-OCI-SHA384-ECDSA",
         setup: Setup::RevokedThenReput,
         // A re-put re-versions the profile without restoring trust in what the
         // revocation untrusted, so the revoked status stands — and a cancel,

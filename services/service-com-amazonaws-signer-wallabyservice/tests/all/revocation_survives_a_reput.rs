@@ -257,7 +257,10 @@ fn cases() -> Vec<Case> {
         Case {
             name: "Revoked_Then_Reput_Three_Times",
             region: "us-east-1",
-            platform: "AmazonFreeRTOS-Default",
+            // The revoke is seeded on this platform, so it is one that publishes
+            // the revocation capability; the writes that follow it name platforms
+            // that do not, which the revocation already recorded outlives.
+            platform: "AWSIoTDeviceManagement-SHA256-ECDSA",
             reputs: &[
                 "AmazonFreeRTOS-Default",
                 "AmazonFreeRTOS-TI-CC3220SF",
