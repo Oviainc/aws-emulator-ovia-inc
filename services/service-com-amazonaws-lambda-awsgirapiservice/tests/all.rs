@@ -75,6 +75,8 @@ mod durable_execution_stop;
 mod event_source_mapping_delete_in_use;
 #[path = "all/event_source_mapping_deletion.rs"]
 mod event_source_mapping_deletion;
+#[path = "all/event_source_mapping_event_counts.rs"]
+mod event_source_mapping_event_counts;
 #[path = "all/event_source_mapping_queue_visibility.rs"]
 mod event_source_mapping_queue_visibility;
 #[path = "all/event_source_mapping_sqs_delivery.rs"]

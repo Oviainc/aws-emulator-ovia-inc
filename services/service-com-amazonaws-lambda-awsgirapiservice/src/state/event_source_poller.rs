@@ -729,8 +729,11 @@ fn kinesis_event(
 ///
 /// Each slot remembers the Region its client was built for, because a resource is reached
 /// in the Region ITS OWN ARN names.
+///
+/// Shared with [`super::sqs_poller`], the reader of the other kind of event source, so both
+/// pollers reach this emulator the one way.
 #[derive(Default)]
-struct Clients {
+pub(crate) struct Clients {
     kinesis: Option<(String, ::aws_sdk_kinesis::Client)>,
     lambda: Option<(String, ::aws_sdk_lambda::Client)>,
 }
@@ -749,7 +752,7 @@ struct Clients {
 /// each need a sleep implementation the callback transport is not given.
 macro_rules! callback_client {
     ($field:ident, $sdk:ident, $endpoint:literal) => {
-        fn $field(
+        pub(crate) fn $field(
             &mut self,
             callback: &smithy_server_runtime::EmbeddedEmulator,
             region: &str,

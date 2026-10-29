@@ -692,7 +692,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // has anything to do. The store's lock is released first (each poller takes it
         // itself) and nothing here waits for a poll: they run on their own clock.
         drop(store);
-        crate::state::drive_sqs_pollers(&self.engine);
+        crate::state::drive_sqs_pollers(ctx, &self.engine);
         crate::state::event_source_poller::drive_mapping(ctx, &self.engine, &uuid);
 
         Ok(reported)

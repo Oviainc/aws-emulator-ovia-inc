@@ -8,6 +8,12 @@
 //! about itself. It goes to the [`METRIC_NAMESPACE`] namespace, dimensioned on the
 //! function the batch was handed to ([`FUNCTION_NAME_DIMENSION`]).
 //!
+//! A mapping's own work is reported per MAPPING rather than per function: how many events
+//! its poller took out of the source, how many its filter criteria rejected, how many
+//! reached the function and how many it deleted from the source are quantities of that one
+//! mapping ([`EVENT_SOURCE_MAPPING_UUID_DIMENSION`]), and a client asks for them with the
+//! mapping's own `MetricsConfig` ([`publishes_event_counts`]).
+//!
 //! The datapoints are appended to the CloudWatch store directly rather than sent through
 //! `PutMetricData`: CloudWatch reserves the `AWS/` namespaces for the services that own
 //! them ("you should not specify a namespace that begins with `AWS/`",
@@ -52,6 +58,30 @@ pub const METRIC_NAMESPACE: &str = "AWS/Lambda";
 /// The dimension they are reported per: the function the work was done for.
 pub const FUNCTION_NAME_DIMENSION: &str = "FunctionName";
 
+/// The dimension a series about ONE EVENT SOURCE MAPPING's own work is reported per: that
+/// mapping's `UUID`, which is "The identifier of the event source mapping". The work such a
+/// series measures belongs to the mapping rather than to the function it invokes — several
+/// mappings can invoke one function — so the mapping is what identifies it.
+pub const EVENT_SOURCE_MAPPING_UUID_DIMENSION: &str = "EventSourceMappingUUID";
+
+/// The `EventSourceMappingMetric` a mapping's `MetricsConfig` turns the event-count family
+/// on with: "`EventCount` to receive metrics related to the number of events processed by
+/// your event source mapping" (`EventSourceMappingMetricsConfig$Metrics`).
+pub const EVENT_COUNT_METRICS_SELECTOR: &str = "EventCount";
+
+/// How many events a mapping's poller took out of its event source.
+pub const POLLED_EVENT_COUNT_METRIC: &str = "PolledEventCount";
+
+/// How many of the polled events the mapping's `FilterCriteria` rejected — "the filter
+/// criteria that determine whether Lambda should process an event".
+pub const FILTERED_OUT_EVENT_COUNT_METRIC: &str = "FilteredOutEventCount";
+
+/// How many of the polled events were handed to the function in an invocation it accepted.
+pub const INVOKED_EVENT_COUNT_METRIC: &str = "InvokedEventCount";
+
+/// How many events the mapping's poller deleted from its event source.
+pub const DELETED_EVENT_COUNT_METRIC: &str = "DeletedEventCount";
+
 /// How long the newest record of a batch had been sitting in the shard when the event
 /// source mapping read that batch.
 pub const ITERATOR_AGE_METRIC: &str = "IteratorAgeMilliseconds";
@@ -89,6 +119,50 @@ pub fn function_dimensions(function_name: &str) -> cloudwatch::DimensionSet {
     )]
     .into_iter()
     .collect()
+}
+
+/// The dimension set of a series reported per event source mapping: the mapping whose
+/// poller did the work.
+#[must_use]
+pub fn mapping_dimensions(uuid: &str) -> cloudwatch::DimensionSet {
+    [(
+        EVENT_SOURCE_MAPPING_UUID_DIMENSION.to_string(),
+        uuid.to_string(),
+    )]
+    .into_iter()
+    .collect()
+}
+
+/// What ONE pass of a mapping's poller did with the events it took out of the event
+/// source — each count a tally of that pass's own work, never a running total kept here:
+/// the totals a client reads are the SUM CloudWatch computes over the datapoints.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EventCounts {
+    /// How many events the pass took out of the event source.
+    pub polled: u32,
+    /// How many of them the mapping's `FilterCriteria` rejected.
+    pub filtered_out: u32,
+    /// How many of them an invocation of the mapping's function accepted.
+    pub invoked: u32,
+    /// How many of them the pass deleted from the event source.
+    pub deleted: u32,
+}
+
+/// Whether `metrics_config` selects the event-count family, which is the documented switch
+/// for it: "the metrics you want your event source mapping to produce". A mapping carrying
+/// no `MetricsConfig`, or one whose `Metrics` list does not hold
+/// [`EVENT_COUNT_METRICS_SELECTOR`] — an emptied list included — produces none of them.
+#[must_use]
+pub fn publishes_event_counts(
+    metrics_config: Option<&crate::ops::types::EventSourceMappingMetricsConfig>,
+) -> bool {
+    metrics_config
+        .and_then(|config| config.metrics.as_ref())
+        .is_some_and(|metrics| {
+            metrics
+                .iter()
+                .any(|metric| metric == EVENT_COUNT_METRICS_SELECTOR)
+        })
 }
 
 /// ONE measurement of a series, taken at `at_secs` (epoch seconds), published at the
@@ -131,7 +205,9 @@ pub fn append(
     true
 }
 
-/// The publisher of ONE function's metrics, held by the poller that moves batches to it.
+/// The publisher of the metrics Lambda publishes about its own work — on the function a
+/// batch is handed to and on the event source mapping that polled it — held by the poller
+/// doing that work.
 ///
 /// It holds no counts of its own: every observation is a datapoint in the CloudWatch
 /// store, never a second copy kept here.
@@ -166,15 +242,80 @@ impl FunctionMetrics {
         self.publish(ITERATOR_AGE_METRIC, function_name, age_millis, ITERATOR_AGE_UNIT);
     }
 
+    /// Publish what ONE pass of the event source mapping `uuid` names did with the events
+    /// it polled, at `at_secs` (epoch seconds): the whole event-count family, one
+    /// observation of each, so a reader summing a period over any one of them gets the
+    /// events of that period.
+    ///
+    /// Every count is published, a zero included: "the number of events" a pass filtered
+    /// out, invoked the function with or deleted is as much a measurement when it is none
+    /// as when it is many, and a series that skipped its zeros would leave a client unable
+    /// to tell a poller that did nothing from one that is not publishing at all.
+    pub fn publish_event_counts(&self, uuid: &str, counts: &EventCounts, at_secs: f64) {
+        for (metric, value) in [
+            (POLLED_EVENT_COUNT_METRIC, counts.polled),
+            (FILTERED_OUT_EVENT_COUNT_METRIC, counts.filtered_out),
+            (INVOKED_EVENT_COUNT_METRIC, counts.invoked),
+            (DELETED_EVENT_COUNT_METRIC, counts.deleted),
+        ] {
+            self.publish_series(
+                metric,
+                mapping_dimensions(uuid),
+                f64::from(value),
+                COUNT_UNIT,
+                at_secs,
+                uuid,
+            );
+        }
+    }
+
+    /// Publish that the mapping `uuid` names polled NOTHING: one 0-valued
+    /// [`POLLED_EVENT_COUNT_METRIC`] observation at `at_secs` (epoch seconds).
+    ///
+    /// This is what makes an empty window mean "nothing was there to poll" rather than
+    /// "the poller is not publishing": a client reading a zero knows the mapping polled and
+    /// found its source empty.
+    pub fn publish_idle_poll(&self, uuid: &str, at_secs: f64) {
+        self.publish_series(
+            POLLED_EVENT_COUNT_METRIC,
+            mapping_dimensions(uuid),
+            0.0,
+            COUNT_UNIT,
+            at_secs,
+            uuid,
+        );
+    }
+
     /// Append one observation of `metric` for one function.
     fn publish(&self, metric: &str, function_name: &str, value: f64, unit: &str) {
+        self.publish_series(
+            metric,
+            function_dimensions(function_name),
+            value,
+            unit,
+            cloudwatch::now_secs(),
+            function_name,
+        );
+    }
+
+    /// Append one observation of the series `metric` and `dimensions` identify, taken at
+    /// `at_secs`. `about` is the resource the observation is of, named in the one log line
+    /// a store at capacity produces.
+    fn publish_series(
+        &self,
+        metric: &str,
+        dimensions: cloudwatch::DimensionSet,
+        value: f64,
+        unit: &str,
+        at_secs: f64,
+        about: &str,
+    ) {
         let Some(store) = self.store.as_ref() else {
             return;
         };
-        let key = series(metric, function_dimensions(function_name));
-        if !append(store, key, observation(value, unit, cloudwatch::now_secs())) {
+        if !append(store, series(metric, dimensions), observation(value, unit, at_secs)) {
             ::tracing::warn!(
-                function = %function_name,
+                resource = %about,
                 metric = %metric,
                 "the CloudWatch store is at capacity; a Lambda metric could not be published"
             );

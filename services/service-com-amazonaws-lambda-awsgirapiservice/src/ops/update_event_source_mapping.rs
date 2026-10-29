@@ -565,7 +565,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reader keeps the one it has: the claim keeps a second from starting). The store's
         // lock is released first, because each poller takes it itself.
         drop(store);
-        crate::state::drive_sqs_pollers(&self.engine);
+        crate::state::drive_sqs_pollers(ctx, &self.engine);
         crate::state::event_source_poller::drive_mapping(ctx, &self.engine, &input.uuid);
 
         Ok(reported)

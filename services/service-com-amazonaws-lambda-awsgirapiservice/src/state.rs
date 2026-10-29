@@ -229,7 +229,7 @@ pub use capacity_provider::{
 pub mod event_source_poller;
 pub mod metrics;
 pub mod sqs_poller;
-pub use sqs_poller::{drive_sqs_pollers, poll_due, BATCH_NOT_PROCESSED_RESULT, POLL_INTERVAL};
+pub use sqs_poller::{drive_sqs_pollers, poll_due, PollSession, POLL_INTERVAL};
 
 /// What the account's CONCURRENCY does with no client action at all — the series Lambda
 /// publishes about how much of the Region's capacity the account has claimed, and how much
@@ -3677,11 +3677,8 @@ pub const LAST_PROCESSING_RESULT_OK: &str = "OK";
 
 /// `LastProcessingResult` after an attempt whose invocation of the function was MADE and
 /// did not succeed — whatever refused it — in the `PROBLEM: <reason>` form Lambda words an
-/// unsuccessful attempt in. The batch is not checkpointed past, so it is read again.
-///
-/// Distinct from [`BATCH_NOT_PROCESSED_RESULT`], which a queue mapping's poller reports for
-/// a batch it handed over that nothing ran: there no invocation is attempted at all, while
-/// this one is the result of a call that was attempted and came back refused.
+/// unsuccessful attempt in. The batch is not consumed, so it is read again: a shard source
+/// is not checkpointed past it and a queue source deletes none of its messages.
 pub const LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED: &str = "PROBLEM: Function call failed";
 
 /// Where in ONE shard of a mapping's event source that mapping reads next.
