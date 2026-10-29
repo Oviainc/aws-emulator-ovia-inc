@@ -127,6 +127,11 @@ pub const STATUS_CANCELLED: &str = "CANCELLED";
 /// from then on: "REPLACED – The agreement was replaced using an agreement
 /// replacement offer."
 pub const STATUS_REPLACED: &str = "REPLACED";
+/// The `AgreementStatus` an agreement carries once its own end date has passed:
+/// "EXPIRED – The agreement ended on the defined end date" — reached by the
+/// clock rather than by any call, and materialised by
+/// [`Agreement::expire`].
+pub const STATUS_EXPIRED: &str = "EXPIRED";
 
 // ---------------------------------------------------------------------------
 // Entitlements
@@ -2233,6 +2238,58 @@ impl Agreement {
     #[must_use]
     pub fn replace(&mut self, now: SystemTime) -> bool {
         self.leave_active(STATUS_REPLACED, now)
+    }
+
+    /// Materialise the expiry this agreement's own stored end date has already
+    /// made due by `now`.
+    ///
+    /// `endTime` is "the date and time when the agreement ends", and the status
+    /// the model gives for having reached it is "EXPIRED – The agreement ended
+    /// on the defined end date": the transition is owed at that instant whether
+    /// or not anybody calls, so every operation that reports or guards on an
+    /// agreement's status materialises it before it answers — the same way the
+    /// billing readers settle a pending adjustment at its own due instant
+    /// ([`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::settle_billing_adjustments`]).
+    /// An agreement with no end date ("the field is null for pay-as-you-go
+    /// agreements, which don't have end dates") never reaches one, so nothing is
+    /// ever due for it.
+    ///
+    /// Only an agreement its end date ENDS is moved. `EndTimeBehaviorType`
+    /// distinguishes the two ends: `EXPIRE` is "the agreement ends and isn't
+    /// renewed or replaced", while `RENEW` is "a new agreement is created from
+    /// the accepted terms of this agreement" — whose status is then `RENEWED`,
+    /// "the agreement was renewed into a new agreement". This service creates no
+    /// renewal agreement, so one whose acceptor enabled auto-renewal is left as
+    /// it stands rather than reported with a status that contradicts the
+    /// behaviour it reports at that same end date.
+    ///
+    /// `updated_at` becomes the instant the change was DUE, never the instant it
+    /// was observed, so repeated reads report the same `lastUpdateTime`. Guarded
+    /// by [`Agreement::leave_active`] exactly as [`Agreement::cancel`] is, so an
+    /// agreement the acceptor cancelled or a replacement superseded before its
+    /// end date keeps the status it reached.
+    pub fn expire(&mut self, now: SystemTime) {
+        let Some(end) = self.end_time else {
+            // No end date: nothing is ever due.
+            return;
+        };
+        if now < end {
+            // The end date is still ahead: the agreement runs on.
+            return;
+        }
+        if self.auto_renew() == Some(true) {
+            // The acceptor's renewal term carries this agreement past its end
+            // date instead of ending it, and the renewal agreement that
+            // transition creates is not something this service mints — so the
+            // agreement is left as it stands rather than reported with a status
+            // contradicting the behaviour it reports at the same date. The
+            // renewal itself is filed as its own gap (the auto-renewal report
+            // under `issues/`); nothing in this call claims it happened.
+            return;
+        }
+        // Whether this call is what moved it matters to nobody: no audit record
+        // is owed for a transition no caller made.
+        let _ = self.leave_active(STATUS_EXPIRED, end);
     }
 
     /// Whether the acceptor asked for auto-renewal, as the accepted renewal
@@ -4684,6 +4741,34 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
         self.billing_adjustment_requests
             .values()
             .find(|request| request.client_token == token)
+    }
+
+    /// Materialise the expiry the clock has already made due by `now` for the
+    /// ONE agreement `agreement_id` names ([`Agreement::expire`]), or nothing
+    /// when this store holds no agreement under that id.
+    ///
+    /// What an operation answering about a single agreement calls: the record it
+    /// is about is the only one its answer depends on, so it is the only one to
+    /// bring up to date. An id that names nothing is left to the operation's own
+    /// refusal.
+    pub fn expire_agreement(&mut self, agreement_id: &str, now: SystemTime) {
+        if let Some(agreement) = self.agreements.get_mut(agreement_id) {
+            agreement.expire(now);
+        }
+    }
+
+    /// Materialise every agreement expiry the clock has already made due by
+    /// `now` ([`Agreement::expire`]).
+    ///
+    /// What an operation that SCANS the store calls, where the answer depends on
+    /// every agreement rather than on one: the status an agreement past its own
+    /// end date is searched by, and the summary status reported beside it, are
+    /// then the ones the clock already owed it. An operation answering about a
+    /// single agreement calls [`Self::expire_agreement`] instead.
+    pub fn expire_agreements(&mut self, now: SystemTime) {
+        for agreement in self.agreements.values_mut() {
+            agreement.expire(now);
+        }
     }
 
     /// Materialise every billing adjustment status change the clock has already

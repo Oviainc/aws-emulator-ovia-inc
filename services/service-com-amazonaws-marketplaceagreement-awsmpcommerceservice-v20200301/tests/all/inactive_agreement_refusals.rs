@@ -35,15 +35,21 @@ use crate::error_bodies::assert_input_fault;
 /// The `VariablePaymentTerm` every agreement here is accepted on, so a payment
 /// request sent under it is refused for the agreement's status rather than for a
 /// term the agreement does not carry.
-const PAYMENT_TERM: &str = "vpt-inactive";
+///
+/// `pub(crate)` because the suite over the status the CLOCK leaves an agreement
+/// in (`tests/all/agreement_expiry.rs`) drives the same operations over the same
+/// terms rather than keeping a second copy of them.
+pub(crate) const PAYMENT_TERM: &str = "vpt-inactive";
 
 /// The `ValidationExceptionReason` the model publishes for an `agreementId` that
 /// names an agreement which is not active, and the member a refusal of it names.
 /// Spelled out here rather than imported from the crate, so a handler that
 /// reported another reason fails this test instead of agreeing with it.
-const INACTIVE_AGREEMENT: &str = "INACTIVE_AGREEMENT";
+///
+/// `pub(crate)` for the reason [`PAYMENT_TERM`] is.
+pub(crate) const INACTIVE_AGREEMENT: &str = "INACTIVE_AGREEMENT";
 /// See [`INACTIVE_AGREEMENT`].
-const AGREEMENT_ID: &str = "agreementId";
+pub(crate) const AGREEMENT_ID: &str = "agreementId";
 
 /// How an agreement leaves `ACTIVE`: every path this service has to a terminal
 /// `AgreementStatus`.
@@ -79,7 +85,10 @@ impl LeftActive {
 /// active agreement", `SendAgreementCancellationRequest` "allows sellers
 /// (proposers) to submit a cancellation request for an active agreement", and
 /// `SendAgreementPaymentRequest` states "the agreement must be active".
-const NEEDS_AN_ACTIVE_AGREEMENT: [&str; 3] = [
+///
+/// `pub(crate)` for the reason [`PAYMENT_TERM`] is: the set is the one place this
+/// crate's tests name the operations that require an active agreement.
+pub(crate) const NEEDS_AN_ACTIVE_AGREEMENT: [&str; 3] = [
     "CancelAgreement",
     "SendAgreementCancellationRequest",
     "SendAgreementPaymentRequest",
@@ -88,7 +97,9 @@ const NEEDS_AN_ACTIVE_AGREEMENT: [&str; 3] = [
 /// The request `operation` takes over `agreement_id`, with every OTHER member a
 /// value the operation accepts — so the only thing a row varies is the status of
 /// the agreement `agreementId` names.
-fn request_for(operation: &str, agreement_id: &str) -> Value {
+///
+/// `pub(crate)` for the reason [`PAYMENT_TERM`] is.
+pub(crate) fn request_for(operation: &str, agreement_id: &str) -> Value {
     match operation {
         "CancelAgreement" => json!({"agreementId": agreement_id}),
         "SendAgreementCancellationRequest" => {

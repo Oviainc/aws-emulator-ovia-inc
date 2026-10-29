@@ -182,8 +182,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A pure report: it reads the stored agreement and writes nothing.
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A report, of the agreement as the clock has already left it: an
+        // agreement whose own stored end date has passed ended at that instant
+        // whether or not anybody called, so the status that transition is owed
+        // ("EXPIRED – The agreement ended on the defined end date") is
+        // materialised before it is reported — and with it the
+        // `endTimeBehavior` this output only carries "for every active
+        // agreement". Nothing else here writes: every other member is read from
+        // the record `AcceptAgreementRequest` stored.
+        store.expire_agreement(&input.agreement_id, now);
         let Some(agreement) = store.agreements.get(&input.agreement_id) else {
             // The lookup found nothing: the modelled not-found body, at the
             // status this service answers it with (`state::NOT_FOUND_STATUS`).

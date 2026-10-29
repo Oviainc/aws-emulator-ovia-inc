@@ -88,11 +88,21 @@ pub(crate) fn is_next_token(value: &str) -> bool {
 /// unknown-id and refusal-class ones) drive the same emulator over the same wire
 /// helpers rather than building a second harness.
 pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_over_engine().0
+}
+
+/// The same emulator, with the shared engine it was built over in hand.
+///
+/// The ONE place this harness is set up; `emulator` is this with the engine
+/// dropped. `pub(crate)` because the suite over the status the CLOCK leaves an
+/// agreement in (`tests/all/agreement_expiry.rs`) has to reach the stored
+/// agreements to place their windows in the past, which needs that engine.
+pub(crate) fn emulator_over_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.

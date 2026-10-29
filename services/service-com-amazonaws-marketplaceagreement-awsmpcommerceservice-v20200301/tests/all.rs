@@ -21,6 +21,8 @@ mod agreement_charges;
 mod agreement_end_dates;
 #[path = "all/agreement_entitlements.rs"]
 mod agreement_entitlements;
+#[path = "all/agreement_expiry.rs"]
+mod agreement_expiry;
 #[path = "all/agreement_lifecycle.rs"]
 mod agreement_lifecycle;
 #[path = "all/agreement_parties.rs"]

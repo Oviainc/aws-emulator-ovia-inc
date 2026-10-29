@@ -190,6 +190,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is not is unresolvable, not a new chain of its own.
         let mut source = None;
         if let Some(id) = request.source_agreement_identifier.as_deref() {
+            // The agreement a `REPLACE` request acts upon is moved below, and
+            // only an active agreement is: one past its own stored end date
+            // expired at that instant, so it keeps the status the clock gave it
+            // rather than being moved to `REPLACED` afterwards.
+            store.expire_agreement(id, now);
             let Some(stored) = store.agreements.get(id) else {
                 // The agreement this request acts upon is gone: the same
                 // not-found refusal, naming the agreement that was looked for.
