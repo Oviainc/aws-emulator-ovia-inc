@@ -9,7 +9,9 @@
 //! the input member the identifier arrived in and the value is what the client
 //! sent, verbatim. Not an English sentence, and never normalised: a request that
 //! named a resource by ARN reads its ARN back, not the bare id the service
-//! resolved it to.
+//! resolved it to. The one thing done to a value is FITTING it to the modelled
+//! message bound, which is stated and exercised in [`crate::error_message_bound`];
+//! every identifier here is well inside it, so these rows read it back whole.
 //!
 //! Rule B — `ValidationException` (HTTP 400): the body is the standard AWS
 //! validation report — the violation count, then one

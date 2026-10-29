@@ -5181,22 +5181,38 @@ fn zone_pair_refusal(zone: Option<&str>, zone_id: Option<&str>) -> Option<String
 }
 
 /// How this API words a zone of another region, as the recorded response does:
-/// the value exactly as the request supplied it, and no more.
+/// the value as the request supplied it, and no more — cut to the room that
+/// wording leaves it inside [`ERROR_MESSAGE_MAX`], since the modelled
+/// `AvailabilityZone` reaches that bound on its own.
 fn wrong_region(value: &str) -> String {
-    format!("{value} does not match your region.")
+    const WORDING: &str = " does not match your region.";
+    let [value] = echoes(WORDING.len(), [value]);
+    format!("{value}{WORDING}")
 }
 
 /// How this service words a value that names the request's own region but no zone
 /// within it — refused for the same reason (it is no zone of this region) but
 /// stated separately, because calling it a region mismatch would be wrong.
+///
+/// Cut by the same rule as [`wrong_region`]: the region is the one this endpoint
+/// serves, not something the caller supplied, so it counts towards the fixed part
+/// and the whole remaining room is the supplied value's.
 fn names_no_zone(value: &str, region: &str) -> String {
-    format!("{value} is not an Availability Zone of {region}.")
+    const WORDING: &str = " is not an Availability Zone of ";
+    const STOP: &str = ".";
+    let [value] = echoes(WORDING.len() + STOP.len() + region.len(), [value]);
+    format!("{value}{WORDING}{region}{STOP}")
 }
 
 /// How this service words a pair of identities that name two zones: both values as
-/// supplied, since either of them could be the one the caller meant.
+/// supplied, since either of them could be the one the caller meant — and so both
+/// cut, by the same rule as [`wrong_region`], to their share of the room the
+/// wording leaves.
 fn two_zones(zone: &str, zone_id: &str) -> String {
-    format!("{zone} and {zone_id} do not name the same Availability Zone.")
+    const JOIN: &str = " and ";
+    const WORDING: &str = " do not name the same Availability Zone.";
+    let [zone, zone_id] = echoes(JOIN.len() + WORDING.len(), [zone, zone_id]);
+    format!("{zone}{JOIN}{zone_id}{WORDING}")
 }
 
 /// The `Site` projection of an operating address: the three members `Site`
@@ -5388,20 +5404,59 @@ pub fn apply<T>(stored: &mut Option<T>, update: Option<T>) {
 //   `<member>=<value as supplied>`. See [`identifier_not_found`].
 // * `ValidationException` — the body is the standard AWS validation report, and
 //   it never renders the offending value. See [`validation_report`].
+//
+// Whichever rule words it, the body has to FIT the member it is carried in:
+// every error shape in this API declares its message as `ErrorMessage`, so a
+// body past [`ERROR_MESSAGE_MAX`] is one the model forbids. Where a rule renders
+// a value the caller supplied, that echo is what takes the cut ([`echoes`]), so
+// the fixed wording survives whatever arrives.
 // ---------------------------------------------------------------------------
+
+/// The longest message the model accepts in a failure of this API: every error
+/// shape here carries its message as `ErrorMessage`, `length(min: 1, max: 1000)`.
+///
+/// Several members a refusal echoes are modelled LONGER than this on their own —
+/// `ConnectionId` is `length(1..1024)`, the `Arn` every tagging operation binds
+/// `length(0..1011)`, `AvailabilityZone` `length(1..1000)` — so a value the
+/// boundary accepts can be longer than the body that reports it. The echo of it is
+/// therefore cut to the room the refusal's own wording leaves, which is what keeps
+/// every refusal this service words inside the model for any value that reaches a
+/// handler.
+pub const ERROR_MESSAGE_MAX: usize = 1000;
+
+/// The caller-supplied parts of one refusal, each cut to the room the `fixed`
+/// bytes of that refusal's own wording leave inside [`ERROR_MESSAGE_MAX`]
+/// ([`clip`]).
+///
+/// A message holding several echoes SHARES that room equally between them, so one
+/// long value cannot crowd another out of the body and each echo is reported as
+/// far as the bound allows. `fixed` counts everything the message renders that the
+/// caller did not supply: its wording, and the member names and stored values this
+/// service puts in it.
+fn echoes<const N: usize>(fixed: usize, parts: [&str; N]) -> [String; N] {
+    let room = ERROR_MESSAGE_MAX.saturating_sub(fixed) / N;
+    parts.map(|part| clip(part, room))
+}
 
 /// How this service states that an identifier names no resource it holds.
 ///
 /// The body is the identifier ECHO: the name of the input member the identifier
-/// arrived in, `=`, and the value EXACTLY as the client sent it — so a caller
-/// that sent the ARN form reads its ARN back, not the bare id the service
-/// resolved it to, and a caller can parse the identifier it sent out of the
-/// message. It is not an English sentence, and it never normalises the value.
+/// arrived in, `=`, and the value as the client sent it — so a caller that sent
+/// the ARN form reads its ARN back, not the bare id the service resolved it to,
+/// and a caller can parse the identifier it sent out of the message. It is not an
+/// English sentence, and it never normalises the value.
+///
+/// The one thing it does to the value is FIT it: the echo is cut to the room
+/// `<member>=` leaves inside [`ERROR_MESSAGE_MAX`] ([`echoes`]), so an identifier
+/// modelled longer than the message that reports it — a `ConnectionId`, a tagging
+/// `ResourceArn` — is refused within the model instead of overrunning it.
 ///
 /// `member` is the member's validation-path name (see [`SITE_ID_MEMBER`]);
 /// `supplied` is the raw input member, before [`resolve_id`] touches it.
 pub fn identifier_not_found(member: &str, supplied: &str) -> String {
-    format!("{member}={supplied}")
+    const SEPARATOR: &str = "=";
+    let [supplied] = echoes(member.len() + SEPARATOR.len(), [supplied]);
+    format!("{member}{SEPARATOR}{supplied}")
 }
 
 /// The validation-path name of the `SiteId` input member.

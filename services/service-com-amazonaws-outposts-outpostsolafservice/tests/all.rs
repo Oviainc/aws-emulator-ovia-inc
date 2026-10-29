@@ -43,6 +43,8 @@ mod delete_conflicts;
 mod dependent_resource_conflict;
 #[path = "all/error_classification.rs"]
 mod error_classification;
+#[path = "all/error_message_bound.rs"]
+mod error_message_bound;
 #[path = "all/error_message_rules.rs"]
 mod error_message_rules;
 #[path = "all/filter_selection.rs"]
