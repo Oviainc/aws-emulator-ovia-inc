@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUsageReportSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUsageReportSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enables daily usage reporting for the account by persisting the single
+//! [`crate::state::UsageReportSubscriptionRecord`] this service's store holds, and
+//! reports the bucket and schedule FROM that record, so a later
+//! `DescribeUsageReportSubscriptions` answers with the same values.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUsageReportSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The request carries no members and usage reporting is ONE account-and-Region-wide
+//! setting, so enabling it again has nothing to conflict with: a repeated call reports
+//! the subscription the account already has, and the account still has exactly one.
 //!
 //! ## Shape of an operation
 //!
@@ -141,21 +140,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        _input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUsageReportSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUsageReportSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUsageReportSubscription"))
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_implemented("CreateUsageReportSubscription")
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = state.lock();
+
+        // Enabling usage reporting when it is already enabled reports the subscription
+        // the account has: the request carries nothing that could conflict with it, and
+        // the account keeps exactly one subscription.
+        if let Some(existing) = state.usage_report_subscription.as_ref() {
+            return Ok(CreateUsageReportSubscriptionOutput {
+                s3_bucket_name: Some(existing.s3_bucket_name.clone()),
+                schedule: Some(existing.schedule.clone()),
+            });
+        }
+
+        let record = crate::state::UsageReportSubscriptionRecord {
+            // The bucket the service creates to store this account's reports in.
+            s3_bucket_name: crate::state::usage_report_bucket_name(&region),
+            schedule: crate::state::USAGE_REPORT_SCHEDULE.to_string(),
+            // Reports are generated daily, so a subscription enabled now has neither a
+            // generated report nor an error from generating one.
+            last_generated_report_date: None,
+            subscription_errors: Vec::new(),
+        };
+
+        // The response is rendered FROM the record that is persisted, so it cannot
+        // disagree with what a later read of the subscription returns.
+        let output = CreateUsageReportSubscriptionOutput {
+            s3_bucket_name: Some(record.s3_bucket_name.clone()),
+            schedule: Some(record.schedule.clone()),
+        };
+        state.usage_report_subscription = Some(record);
+        Ok(output)
     }
 }

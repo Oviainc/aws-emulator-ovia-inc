@@ -8,6 +8,11 @@
 //! stored record back, `AssociateFleet` records the fleet/stack edge, and
 //! `DeleteStack`/`DeleteFleet` refuse while an edge still names the resource.
 //!
+//! Usage reporting lives here too: it is ONE account-and-Region-wide setting, so
+//! `CreateUsageReportSubscription` writes the single [`UsageReportSubscriptionRecord`]
+//! this struct holds and `DescribeUsageReportSubscriptions` renders that same record
+//! back.
+//!
 //! Records hold the MODELLED sub-shapes (`StorageConnector`, `UserSetting`,
 //! `VpcConfig`, …) rather than copies of them, so what a Describe returns is literally
 //! what the Create persisted.
@@ -16,8 +21,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
     AccessEndpoint, AgentAccessConfig, ApplicationSettingsResponse, ComputeCapacityStatus,
-    ContentRedirection, DomainJoinInfo, Fleet, FleetError, S3Location, Stack, StackError,
-    StorageConnector, StreamingExperienceSettings, UserSetting, VolumeConfig, VpcConfig,
+    ContentRedirection, DomainJoinInfo, Fleet, FleetError, LastReportGenerationExecutionError,
+    S3Location, Stack, StackError, StorageConnector, StreamingExperienceSettings,
+    UsageReportSubscription, UserSetting, VolumeConfig, VpcConfig,
 };
 
 /// The ARN namespace this service stamps on every resource ARN
@@ -66,6 +72,12 @@ pub fn limit_exceeded_message(store: &str) -> String {
     )
 }
 
+/// The `Schedule` a usage report subscription carries. The model's
+/// `UsageReportSchedule` enum has the single value `DAILY`
+/// (`USAGE_REPORT_SCHEDULE_VALUES` in `ops/types/shared_types.rs`), matching the
+/// operation's documented "Usage reports are generated daily".
+pub const USAGE_REPORT_SCHEDULE: &str = "DAILY";
+
 /// The region to stamp into the ARNs a request mints: the SigV4 credential scope's
 /// region, else [`DEFAULT_REGION`].
 pub fn request_region(parts: &::http::request::Parts) -> String {
@@ -82,6 +94,22 @@ pub fn stack_arn(region: &str, name: &str) -> String {
 /// `arn:aws:appstream:<region>:<account>:fleet/<name>`.
 pub fn fleet_arn(region: &str, name: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("fleet/{name}"))
+}
+
+/// The S3 bucket a usage report subscription stores its generated reports in.
+///
+/// AppStream names the bucket it creates for log and usage-report output
+/// `appstream-logs-<region>-<account>-<identifier>`, where the trailing identifier is
+/// what makes the name globally unique. The model documents that bucket as "unique to
+/// your account and Region", so the identifier here is a digest of exactly those two:
+/// enabling usage reporting again for the same account and Region reports the SAME
+/// bucket rather than a name that changes from run to run.
+pub fn usage_report_bucket_name(region: &str) -> String {
+    let account = ::emulator_server::emulator_account_id();
+    let digest =
+        <::sha2::Sha256 as ::sha2::Digest>::digest(format!("appstream-logs:{region}:{account}"));
+    let identifier: String = hex::encode(digest).chars().take(8).collect();
+    format!("appstream-logs-{region}-{account}-{identifier}")
 }
 
 /// The instant a record is created, as the wire type the modelled `CreatedTime`
@@ -235,6 +263,41 @@ impl FleetRecord {
     }
 }
 
+/// The account's usage report subscription: the daily usage reports it has enabled, and
+/// where they are written.
+///
+/// There is no name or id in the modelled shape because usage reporting is a single
+/// account-and-Region-wide setting — hence one record, not a map.
+#[derive(Debug, Clone)]
+pub struct UsageReportSubscriptionRecord {
+    pub s3_bucket_name: String,
+    /// One of `USAGE_REPORT_SCHEDULE_VALUES`; [`USAGE_REPORT_SCHEDULE`] for a
+    /// subscription this emulator created.
+    pub schedule: String,
+    /// When the last usage report was generated. `None` until one has been: reports are
+    /// generated daily, so a freshly enabled subscription has none, and this emulator
+    /// never claims a report it did not produce.
+    pub last_generated_report_date: Option<::aws_smithy_types::DateTime>,
+    /// The errors that stopped a usage report being generated; empty while none has.
+    pub subscription_errors: Vec<LastReportGenerationExecutionError>,
+}
+
+impl UsageReportSubscriptionRecord {
+    /// Render the stored record as the modelled `UsageReportSubscription` a reader
+    /// returns.
+    pub fn to_usage_report_subscription(&self) -> UsageReportSubscription {
+        UsageReportSubscription {
+            s3_bucket_name: Some(self.s3_bucket_name.clone()),
+            schedule: Some(self.schedule.clone()),
+            last_generated_report_date: self.last_generated_report_date,
+            // "The errors that were returned if usage reports couldn't be generated":
+            // with no error to report the member is a configuration the subscription
+            // does not have, so it is ABSENT rather than present-and-empty.
+            subscription_errors: reported(&self.subscription_errors),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-appstream-photonadminproxyservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAppstreamPhotonadminproxyserviceState {
@@ -244,6 +307,9 @@ pub struct ComAmazonawsAppstreamPhotonadminproxyserviceState {
     pub fleets: BTreeMap<String, FleetRecord>,
     /// `(FleetName, StackName)` edges written by `AssociateFleet`.
     pub fleet_stack_associations: BTreeSet<(String, String)>,
+    /// The account's usage report subscription, once one has been created; `None` while
+    /// usage reporting is not enabled.
+    pub usage_report_subscription: Option<UsageReportSubscriptionRecord>,
 }
 
 impl ComAmazonawsAppstreamPhotonadminproxyserviceState {

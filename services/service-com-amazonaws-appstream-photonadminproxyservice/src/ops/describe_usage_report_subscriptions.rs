@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeUsageReportSubscriptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeUsageReportSubscriptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeUsageReportSubscriptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: renders the account's stored usage report subscription (the record
+//! `CreateUsageReportSubscription` persisted) back, as the one-entry list the modelled
+//! `UsageReportSubscriptionList` carries. An account with usage reporting disabled has
+//! no subscription to list, which is an EMPTY list rather than a refusal. A read only,
+//! which never changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -140,20 +136,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeUsageReportSubscriptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeUsageReportSubscriptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeUsageReportSubscriptions"))
+        // `MaxResults` is "the maximum size of each page of results", so a page of fewer
+        // than one record is not a size this operation can answer with.
+        if let Some(max_results) = input.max_results.filter(|max_results| *max_results < 1) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "MaxResults must be at least 1, was {max_results}"
+            )));
+        }
+        // The account holds at most one subscription, so one page always carries the
+        // whole collection and this operation issues no pagination token: a request that
+        // carries one carries a token this service never minted.
+        if input.next_token.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "NextToken is not a pagination token this service issued",
+            ));
+        }
+
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_implemented("DescribeUsageReportSubscriptions")
+        })?;
+        // A read: the guard is only ever read through, so this can never change what a
+        // later caller sees.
+        let state = state.lock();
+
+        // The account's subscriptions, which is the one it has or none at all: a
+        // disabled account lists nothing, the way a collection with no members does.
+        let subscriptions: Vec<UsageReportSubscription> = state
+            .usage_report_subscription
+            .iter()
+            .map(crate::state::UsageReportSubscriptionRecord::to_usage_report_subscription)
+            .collect();
+
+        Ok(DescribeUsageReportSubscriptionsOutput {
+            usage_report_subscriptions: Some(subscriptions),
+            // Nothing remains after this page, so there is no token to resume from.
+            next_token: None,
+        })
     }
 }
