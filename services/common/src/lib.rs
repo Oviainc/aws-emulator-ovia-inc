@@ -116,6 +116,14 @@
 //! sentinels) for all of them and they all keep claiming everything. The RPC
 //! conjunct is what separates them.
 //!
+//! Two API VERSIONS of one service are the sharpest case of that: AWS publishes both
+//! behind one endpoint and one signing name (Kinesis Analytics' 2015-08-14 and
+//! 2018-05-23 services both carry `endpointPrefix`/`sigv4Name` `kinesisanalytics`), so
+//! their shape names differ ONLY by the trailing `_<digits>` API-version suffix — the
+//! suffix the framework's routing-key comparison drops. [`claims_versioned_rpc_request`]
+//! is the RPC conjunct with that suffix KEPT, so each version claims its own targets and
+//! neither claims its peer's.
+//!
 //! When two REST peers' path spaces overlap at EVERY segment a prefix test can read, no
 //! segment index separates them either. What does is the whole modelled route: AWS
 //! dispatches a REST request on the endpoint host and then on the operation's method +
@@ -385,13 +393,62 @@ pub fn claims_request(
     path_segments: &[&str],
     rpc_service_shape_id: Option<&str>,
 ) -> bool {
+    claims_request_naming(
+        parts,
+        signing_name,
+        path_segments,
+        rpc_service_shape_id,
+        rpc_target::names_service,
+    )
+}
+
+/// [`claims_request`] for an RPC service whose signing name is shared with ANOTHER API
+/// VERSION of itself: the service an `X-Amz-Target` names is read with the API-version
+/// suffix compared rather than dropped ([`rpc_target::names_service_version`]).
+///
+/// One endpoint serving several API versions of a service is normal at AWS — both versions
+/// carry the same `endpointPrefix` and the same `sigv4Name`, and the version is named only
+/// by the target's service-shape prefix — so the signing name tells the two apart no better
+/// than it tells either from the other. [`claims_request`] still leaves both claiming every
+/// request there, because the comparison it inherits from the framework's routing key drops
+/// the very suffix that differs; this is the same rule with that suffix kept, so each
+/// version claims exactly its own traffic.
+///
+/// `service_shape_id` is REQUIRED (not `Option`): a shared signing name with no RPC wire
+/// form to read the version from has no discriminator at all, and such a pair must be
+/// separated by its path space through [`claims_request`] instead.
+pub fn claims_versioned_rpc_request(
+    parts: &http::request::Parts,
+    signing_name: &str,
+    path_segments: &[&str],
+    service_shape_id: &str,
+) -> bool {
+    claims_request_naming(
+        parts,
+        signing_name,
+        path_segments,
+        Some(service_shape_id),
+        rpc_target::names_service_version,
+    )
+}
+
+/// [`claims_request`]'s body, with the comparison that decides whether an RPC wire form
+/// NAMES this service handed in, so the two claim rules cannot drift into two different
+/// readings of a path or a routing key.
+fn claims_request_naming(
+    parts: &http::request::Parts,
+    signing_name: &str,
+    path_segments: &[&str],
+    rpc_service_shape_id: Option<&str>,
+    names_service: fn(&str, &str) -> bool,
+) -> bool {
     if !routes_to(parts, signing_name) {
         return false;
     }
     match rpc_service_shape_id {
         None => claims_modeled_path(parts, path_segments),
         Some(shape_id) if is_rpc_addressed(parts) => {
-            rpc_names_this_service(parts, shape_local_name(shape_id))
+            rpc_names_this_service(parts, shape_local_name(shape_id), names_service)
                 && (claims_rpc_path(parts) || claims_literal_path(parts, path_segments))
         }
         // Not addressed in an RPC form at all: only a URI this model binds itself.
@@ -458,13 +515,22 @@ fn is_rpc_addressed(parts: &http::request::Parts) -> bool {
 /// is consulted only for a request that carries no such header (one that does and names
 /// another service contradicts itself, so it reaches nobody). The URI is still the reader
 /// for a header whose bytes are not text at all, which names no service.
-fn rpc_names_this_service(parts: &http::request::Parts, declared: &str) -> bool {
+///
+/// `names_service` is the comparison the CALLER chose for the `X-Amz-Target` half —
+/// [`rpc_target::names_service`] for peers whose shape names differ by more than an
+/// API-version suffix, [`rpc_target::names_service_version`] for two API versions of one
+/// service, which that suffix is the only difference between.
+fn rpc_names_this_service(
+    parts: &http::request::Parts,
+    declared: &str,
+    names_service: fn(&str, &str) -> bool,
+) -> bool {
     if let Some(target) = parts
         .headers
         .get(rpc_target::TARGET_HEADER)
         .and_then(|target| target.to_str().ok())
     {
-        return rpc_target::names_service(target, declared);
+        return names_service(target, declared);
     }
     rpcv2_cbor_service_named(parts.uri.path())
         .is_some_and(|named| named.eq_ignore_ascii_case(declared))
@@ -1237,6 +1303,73 @@ mod tests {
             assert_eq!(
                 claimed, expected,
                 "case {case:?}: expected claimed == {expected}, got {claimed}"
+            );
+        }
+    }
+
+    /// RULE: where one endpoint and one signing name serve SEVERAL API VERSIONS of a
+    /// service, each version claims exactly the targets that name its own service shape —
+    /// the version suffix included, because it is the only thing that differs.
+    ///
+    /// The two shape ids are Kinesis Analytics' (`smithy_query(query="service_info")` on
+    /// each model); both models declare `endpointPrefix`/`sigv4Name` `kinesisanalytics`,
+    /// so every row routes to that one key and only the target decides.
+    #[test]
+    fn each_api_version_under_one_signing_name_claims_only_its_own_targets() {
+        const V1: &str = "com.amazonaws.kinesisanalytics#KinesisAnalytics_20150814";
+        const V2: &str = "com.amazonaws.kinesisanalyticsv2#KinesisAnalytics_20180523";
+        const KEY: &str = "kinesisanalytics";
+
+        // (case, target, the version that claims it: Some(shape id), or None for neither)
+        let rows: [(&str, &str, Option<&str>); 8] = [
+            (
+                "v2's own target",
+                "KinesisAnalytics_20180523.CreateApplication",
+                Some(V2),
+            ),
+            (
+                "v1's own target",
+                "KinesisAnalytics_20150814.CreateApplication",
+                Some(V1),
+            ),
+            (
+                "an operation only v2 models",
+                "KinesisAnalytics_20180523.CreateApplicationSnapshot",
+                Some(V2),
+            ),
+            (
+                "an operation only v1 models",
+                "KinesisAnalytics_20150814.DescribeApplication",
+                Some(V1),
+            ),
+            (
+                "v2's target written out as a Coral name",
+                "com.amazonaws.kinesisanalyticsv2.KinesisAnalytics_20180523.StartApplication",
+                Some(V2),
+            ),
+            (
+                "v1's target written out as a Coral name",
+                "com.amazonaws.kinesisanalytics.KinesisAnalytics_20150814.StartApplication",
+                Some(V1),
+            ),
+            // No version named at all: the target names neither service shape.
+            ("the version suffix dropped", "KinesisAnalytics.CreateApplication", None),
+            ("another service entirely", "AWSKMS.Encrypt", None),
+        ];
+
+        for (case, target, expected) in rows {
+            let parts = parts(KEY, "/", Some(target));
+            let v1 = claims_versioned_rpc_request(&parts, KEY, &[], V1);
+            let v2 = claims_versioned_rpc_request(&parts, KEY, &[], V2);
+            let claimants: Vec<&str> = [(V1, v1), (V2, v2)]
+                .into_iter()
+                .filter_map(|(shape, claimed)| claimed.then_some(shape))
+                .collect();
+            let expected_claimants: Vec<&str> = expected.into_iter().collect();
+            assert_eq!(
+                claimants, expected_claimants,
+                "case {case:?}: expected target {target:?} to be claimed by \
+                 {expected_claimants:?}, got {claimants:?}"
             );
         }
     }

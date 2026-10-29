@@ -74,25 +74,49 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service is the 2015-08-14 API version of Kinesis Analytics, and AWS serves
+        // it behind the SAME endpoint and the same SigV4 signing name as the 2018-05-23
+        // version (`endpointPrefix`/`sigv4Name` `kinesisanalytics` in both models). The
+        // router resolves a request's routing key from the credential scope, so both
+        // versions see that one key: claiming on the signing name alone makes both of them
+        // claim every request, which the router answers `500 AmbiguousService` — a code no
+        // AWS model carries — instead of serving either.
+        //
+        // What names the version is the `awsJson1_1` wire form itself:
+        // `X-Amz-Target: KinesisAnalytics_20150814.<Operation>` for this service and
+        // `KinesisAnalytics_20180523.<Operation>` for its peer. So the claim is the one
+        // rule `service-common` states for an endpoint serving several API versions — the
+        // routing key AND a target naming THIS service shape, API-version suffix included,
+        // since that suffix is the only difference between the two names.
+        service_common::claims_versioned_rpc_request(
+            parts,
+            self.entry.identity().signing_name(),
+            crate::ROUTE_PATH_SEGMENTS,
+            self.entry.identity().shape_id(),
+        )
     }
 
     fn override_operation(
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // An `awsJson` target names its operation in the segment after its LAST dot,
+        // whatever prefix stands in front of it — and some SDKs write that prefix as the
+        // fully qualified Coral name, which carries dots of its own
+        // (`com.amazonaws.kinesisanalytics.KinesisAnalytics_20150814.<Operation>`). The
+        // framework resolves a routing key from everything after the FIRST dot, so a
+        // dotted prefix resolves a key no modelled operation is wired under and the
+        // request is refused before any handler runs, even though `can_handle` above
+        // (which reads the same target by the same rule) claimed it.
+        //
+        // So the operation is resolved here through `service_common::rpc_target`, this
+        // emulator's one statement of that rule. It is the same answer for the short
+        // prefix an SDK normally sends, so one rule serves both forms; a target naming
+        // another service, or an operation this model does not bind, resolves to `None`
+        // and is left to the generated routing table and its protocol-correct refusal.
+        let operation =
+            service_common::rpc_target::requested_operation(req, self.entry.identity().shape_id())?;
+        self.entry.routing_table().get(operation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

@@ -11,112 +11,15 @@
 //! actually persisted.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The emulator account id every ARN this service mints carries.
-const ACCOUNT: &str = "000000000000";
-
-/// Longer than the span the service gives a clock-owed status transition, so a read
-/// after this wait must see the settled status.
-const SETTLE_WAIT: Duration = Duration::from_millis(1_200);
-
-/// A router with this one service mounted on `engine`, so a test can inspect the same
-/// store the handlers write to.
-fn router_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::EmulatedService::new(
-            engine,
-        ),
-    );
-    router
-}
-
-/// A router with this one service mounted on a fresh shared engine.
-fn router() -> MultiServiceRouter {
-    router_on(Arc::new(engine::InMemoryEngine::new()))
-}
-
-/// Call one operation and return `(http status, parsed body)`.
-async fn call_in(router: &MultiServiceRouter, region: &str, op: &str, body: &Value) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("x-amz-target", format!("KinesisAnalytics_20180523.{op}"))
-        .header("content-type", "application/x-amz-json-1.1")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{region}/kinesisanalytics/\
-                 aws4_request, SignedHeaders=host;x-amz-date, Signature=deadbeef"
-            ),
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("the request body serializes"),
-        ))
-        .expect("a valid request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or_else(|e| {
-            panic!(
-                "{op} answered a body that is not JSON ({e}): {}",
-                String::from_utf8_lossy(response.body())
-            )
-        })
-    };
-    (status, parsed)
-}
-
-/// Call one operation in the default test region.
-async fn call(router: &MultiServiceRouter, op: &str, body: &Value) -> (u16, Value) {
-    call_in(router, "us-east-1", op, body).await
-}
-
-/// The wire error code of an error body (`__type` on awsJson1_1), as a bare shape name.
-fn error_code(body: &Value) -> String {
-    body.get("__type")
-        .and_then(Value::as_str)
-        .unwrap_or("<no __type>")
-        .rsplit(['#', '/'])
-        .next()
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// A minimal valid `CreateApplication` body.
-fn create_body(name: &str, runtime: &str) -> Value {
-    json!({
-        "ApplicationName": name,
-        "RuntimeEnvironment": runtime,
-        "ServiceExecutionRole": "arn:aws:iam::000000000000:role/kda-service-role",
-    })
-}
-
-/// Create an application and return the `ApplicationDetail` the service answered with.
-async fn create(router: &MultiServiceRouter, name: &str, runtime: &str) -> Value {
-    let (status, body) = call(router, "CreateApplication", &create_body(name, runtime)).await;
-    assert_eq!(status, 200, "case {name:?}: CreateApplication got {body}");
-    body["ApplicationDetail"].clone()
-}
-
-/// Describe an application, asserting the call succeeded.
-async fn describe(router: &MultiServiceRouter, name: &str) -> Value {
-    let (status, body) = call(
-        router,
-        "DescribeApplication",
-        &json!({"ApplicationName": name}),
-    )
-    .await;
-    assert_eq!(status, 200, "case {name:?}: DescribeApplication got {body}");
-    body["ApplicationDetail"].clone()
-}
+// The wire plumbing lives in `tests/all/harness.rs`, shared with every other suite in
+// this crate, so both read one response envelope.
+use super::harness::{
+    call, call_in, create, create_body, create_startable, describe, error_code, router, router_on,
+    ACCOUNT, SETTLE_WAIT,
+};
 
 // ---------------------------------------------------------------------------
 // Create / Describe
@@ -126,8 +29,10 @@ async fn describe(router: &MultiServiceRouter, name: &str) -> Value {
 /// the same record.
 ///
 /// The table spans the whole class the rule covers: every `RuntimeEnvironment` family
-/// the model declares (`smithy_query(query="shape",shape="RuntimeEnvironment")` —
-/// including values the issue never cited), both `ApplicationMode` values and none, a
+/// this API still creates applications for
+/// (`smithy_query(query="shape",shape="RuntimeEnvironment")` — including values the issue
+/// never cited; the retired SQL family is refused instead, which
+/// `modeled_client_errors.rs` asserts), both `ApplicationMode` values and none, a
 /// present / empty / absent `ApplicationDescription`, and the shortest and longest name
 /// `ApplicationName` (len 1..128) admits.
 #[tokio::test]
@@ -137,7 +42,7 @@ async fn create_persists_an_application_that_describe_reports_identically() {
     // (name, RuntimeEnvironment, ApplicationMode, ApplicationDescription)
     let cases: [(&str, &str, Option<&str>, Option<&str>); 7] = [
         ("flink-1-20-app", "FLINK-1_20", Some("STREAMING"), Some("a flink app")),
-        ("sql_1_0_app", "SQL-1_0", None, None),
+        ("flink-1-11-app", "FLINK-1_11", None, None),
         ("flink.1.19.app", "FLINK-1_19", Some("STREAMING"), Some("")),
         ("zeppelin-flink-3-0", "ZEPPELIN-FLINK-3_0", Some("INTERACTIVE"), Some("studio")),
         ("flink-2-3-app", "FLINK-2_3", Some("STREAMING"), None),
@@ -247,13 +152,18 @@ async fn an_application_arn_carries_the_region_the_caller_signed_for() {
 }
 
 /// An `ApplicationConfiguration` supplied at create is persisted and described, with the
-/// ids and derived values the service assigns, and the same ids on every later read.
+/// ids and derived values the service assigns.
+///
+/// The runtime is a Flink one because this API no longer creates SQL applications (see
+/// `modeled_client_errors.rs`); the configuration itself is unchanged, since what is under
+/// test is that every member a creator sets is stored and described, whichever runtime the
+/// application declares.
 #[tokio::test]
 async fn an_application_configuration_is_persisted_and_described() {
     let router = router();
     let body = json!({
         "ApplicationName": "configured-app",
-        "RuntimeEnvironment": "SQL-1_0",
+        "RuntimeEnvironment": "FLINK-1_20",
         "ServiceExecutionRole": "arn:aws:iam::000000000000:role/kda-service-role",
         "ApplicationConfiguration": {
             "SqlApplicationConfiguration": {
@@ -518,7 +428,7 @@ async fn a_limit_outside_the_modelled_range_is_refused() {
 #[tokio::test]
 async fn start_and_stop_move_the_stored_status_through_the_transient_state() {
     let router = router();
-    create(&router, "lifecycle-app", "FLINK-1_20").await;
+    create_startable(&router, "lifecycle-app", "FLINK-1_20").await;
 
     let (status, started) = call(
         &router,
@@ -621,7 +531,7 @@ async fn start_and_stop_move_the_stored_status_through_the_transient_state() {
 #[tokio::test]
 async fn a_forced_stop_is_accepted_from_the_transient_starting_status() {
     let router = router();
-    create(&router, "force-app", "FLINK-1_20").await;
+    create_startable(&router, "force-app", "FLINK-1_20").await;
     call(
         &router,
         "StartApplication",
@@ -731,7 +641,7 @@ async fn delete_removes_the_application_from_every_reader() {
 #[tokio::test]
 async fn a_running_application_cannot_be_deleted() {
     let router = router();
-    let created = create(&router, "busy-app", "FLINK-1_20").await;
+    let created = create_startable(&router, "busy-app", "FLINK-1_20").await;
     let create_timestamp = created["CreateTimestamp"].as_i64().expect("create timestamp");
     call(
         &router,
@@ -812,7 +722,7 @@ async fn an_unknown_or_duplicate_application_is_refused_with_the_modelled_error(
         (
             "create-duplicate",
             "CreateApplication",
-            create_body("known-app", "SQL-1_0"),
+            create_body("known-app", "FLINK-1_8"),
             "ResourceInUseException",
         ),
     ];
@@ -938,7 +848,10 @@ async fn input_parallelism_is_bounded_by_the_modelled_range() {
     ];
     for (count, expected_status, expected_names) in cases {
         let name = format!("parallel-{count}");
-        let mut body = create_body(&name, "SQL-1_0");
+        // A Flink runtime: the SQL one is no longer created (see
+        // `modeled_client_errors.rs`), while the input configuration under test is stored
+        // and described the same way whichever runtime the application declares.
+        let mut body = create_body(&name, "FLINK-1_20");
         body["ApplicationConfiguration"] = json!({
             "SqlApplicationConfiguration": {
                 "Inputs": [{

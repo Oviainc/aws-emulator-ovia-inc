@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(application) = store.applications.get(&name) else {
             return Err(StopApplicationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Application {name} not found")),
+                    message: Some(crate::state::missing_application_message(&name)),
                 },
             )
             .into());

@@ -34,6 +34,10 @@
 //! * [`names_service`] is the SERVICE half, which [`crate::claims_request`] reads instead
 //!   of the framework's first-dot `service_from_target`, so every service claiming
 //!   through this crate claims its own dotted-prefix traffic;
+//! * [`names_service_version`] is that same half for an endpoint serving several API
+//!   VERSIONS of one service, read by [`crate::claims_versioned_rpc_request`]: there the
+//!   `_<digits>` suffix is the only difference between the two shape names, so it is
+//!   compared rather than dropped;
 //! * [`operation_for_service`] / [`requested_operation`] / [`target_operation_of`] are the
 //!   OPERATION half, which a service whose published prefix is dotted resolves its own
 //!   targets with through the `Service::override_operation` seam, and recognises its own
@@ -47,7 +51,12 @@
 //! * the CLAIM half is the framework's own routing-key comparison (trailing `_<digits>`
 //!   API-version suffix dropped, case-insensitive). It has to be: the framework resolves
 //!   a routing key that way, so a service that claimed more strictly would leave requests
-//!   the router already matched to its endpoint with no claimant at all.
+//!   the router already matched to its endpoint with no claimant at all. The ONE exception
+//!   is [`names_service_version`]: where two API versions of one service share an
+//!   endpoint, dropping the suffix leaves BOTH claiming every request (which the router
+//!   refuses outright), so there the suffix is part of the name and a target that names no
+//!   version is claimed by NOBODY — the router's `UnknownService`, which is honest, where
+//!   picking a version would be a guess.
 //! * the DISPATCH half matches the shape name EXACTLY as the model spells it, because its
 //!   answer indexes that service's generated routing table, whose keys are the model's own
 //!   shape names.
@@ -122,6 +131,25 @@ pub fn names_service(target: &str, service_shape_id: &str) -> bool {
     let declared = strip_version_suffix(shape_local_name(service_shape_id).trim());
     service_in_target(target)
         .is_some_and(|named| strip_version_suffix(named).eq_ignore_ascii_case(declared))
+}
+
+/// Whether `target` names the service whose shape id (or shape-local name) is
+/// `service_shape_id`, with the API-version suffix COMPARED rather than dropped.
+///
+/// [`names_service`] drops a trailing `_<digits>` suffix because the framework's own
+/// routing-key comparison does, which is right while a signing name is shared by services
+/// whose shape names differ in more than that suffix. It is NOT right for an endpoint that
+/// serves several API VERSIONS of one service: two shape names that differ only by their
+/// version suffix collapse to the same name under that comparison, so both versions claim
+/// every request and the router, which refuses an ambiguity rather than guessing, serves
+/// neither. The version label is the ONLY thing in the target that tells those two apart,
+/// so here it is part of the name: the whole shape-local name is compared, trimmed and
+/// case-insensitively (the framework compares a routing key case-insensitively, and a
+/// request the router matched to the endpoint must still find a claimant).
+#[must_use]
+pub fn names_service_version(target: &str, service_shape_id: &str) -> bool {
+    let declared = shape_local_name(service_shape_id).trim();
+    service_in_target(target).is_some_and(|named| named.trim().eq_ignore_ascii_case(declared))
 }
 
 /// The operation `target` names FOR the service whose shape id (or shape-local name) is
@@ -400,6 +428,84 @@ mod tests {
                 actual, expected,
                 "case {case:?}: expected names_service({target:?}, {shape_id}) == {expected}, \
                  got {actual}"
+            );
+        }
+    }
+
+    /// Two API versions of ONE service, published behind one endpoint and one signing
+    /// name, whose shape names differ only by their `_<digits>` version suffix. Shape ids
+    /// from `smithy_query(query="service_info")` on each model.
+    const ANALYTICS_V1: &str = "com.amazonaws.kinesisanalytics#KinesisAnalytics_20150814";
+    const ANALYTICS_V2: &str = "com.amazonaws.kinesisanalyticsv2#KinesisAnalytics_20180523";
+
+    /// RULE: where the version suffix is the only difference between two service shape
+    /// names, it is part of the name — each version's target names that version and not
+    /// its peer, and a target that drops the suffix names neither.
+    #[test]
+    fn a_version_suffixed_target_names_only_its_own_api_version() {
+        // (case, target, shape id, expected)
+        let rows: [(&str, &str, &str, bool); 10] = [
+            ("v2's own prefix", "KinesisAnalytics_20180523.CreateApplication", ANALYTICS_V2, true),
+            ("v1's own prefix", "KinesisAnalytics_20150814.CreateApplication", ANALYTICS_V1, true),
+            (
+                "v2's prefix asked of v1",
+                "KinesisAnalytics_20180523.CreateApplication",
+                ANALYTICS_V1,
+                false,
+            ),
+            (
+                "v1's prefix asked of v2",
+                "KinesisAnalytics_20150814.CreateApplication",
+                ANALYTICS_V2,
+                false,
+            ),
+            (
+                "v2's prefix written out as a Coral name",
+                "com.amazonaws.kinesisanalyticsv2.KinesisAnalytics_20180523.StartApplication",
+                ANALYTICS_V2,
+                true,
+            ),
+            (
+                "v2's prefix written out as a Coral name, asked of v1",
+                "com.amazonaws.kinesisanalyticsv2.KinesisAnalytics_20180523.StartApplication",
+                ANALYTICS_V1,
+                false,
+            ),
+            // The suffix is part of the name here, so dropping it names no version.
+            ("the version suffix dropped, v1", "KinesisAnalytics.CreateApplication", ANALYTICS_V1, false),
+            ("the version suffix dropped, v2", "KinesisAnalytics.CreateApplication", ANALYTICS_V2, false),
+            // Casing is still the framework's routing-key comparison.
+            (
+                "v2's prefix lower-cased",
+                "kinesisanalytics_20180523.CreateApplication",
+                ANALYTICS_V2,
+                true,
+            ),
+            ("another service entirely", "AWSKMS.Encrypt", ANALYTICS_V2, false),
+        ];
+
+        for (case, target, shape_id, expected) in rows {
+            let actual = names_service_version(target, shape_id);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected names_service_version({target:?}, {shape_id}) == \
+                 {expected}, got {actual}"
+            );
+        }
+
+        // The two halves still agree for a prefix spelled as the model spells its shape
+        // name: the version that CLAIMS the target is the one the operation is resolved
+        // for. (A loosely spelled prefix keeps the asymmetry
+        // `a_loosely_spelled_prefix_is_claimed_and_then_refused` pins.)
+        for (shape_id, target) in [
+            (ANALYTICS_V1, "KinesisAnalytics_20150814.StartApplication"),
+            (ANALYTICS_V2, "KinesisAnalytics_20180523.StartApplication"),
+        ] {
+            assert_eq!(
+                operation_for_service(target, shape_id),
+                operation_in_target(target),
+                "case {target:?}: the version that claims it must resolve the operation it \
+                 names"
             );
         }
     }

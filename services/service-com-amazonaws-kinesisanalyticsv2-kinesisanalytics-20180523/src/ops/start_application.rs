@@ -166,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(application) = store.applications.get(&name) else {
             return Err(StartApplicationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Application {name} not found")),
+                    message: Some(crate::state::missing_application_message(&name)),
                 },
             )
             .into());
@@ -186,6 +186,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // An application only starts once it is configured to RUN something: a streaming
+        // application's code lives in its `ApplicationCodeConfiguration`, so one stored
+        // without code content has no valid configuration to start and the start is
+        // refused with the modelled `InvalidApplicationConfigurationException` (HTTP 400)
+        // rather than moved into STARTING. A Studio notebook (the ZEPPELIN-FLINK runtime
+        // family, run INTERACTIVE) carries its code in the notebook instead, so the
+        // requirement is on the runtimes that run submitted code.
+        if runtime_runs_submitted_code(&application.runtime_environment)
+            && !application.has_code_content()
+        {
+            return Err(
+                StartApplicationErrorModeled::InvalidApplicationConfigurationException(
+                    InvalidApplicationConfigurationException {
+                        message: Some(format!(
+                            "Application '{name}' under account '{}' does not have a valid \
+                             configuration to start. Application is not configured with a \
+                             valid code content. Please update the application with a valid \
+                             code content.",
+                            ::engine::emulator_account_id()
+                        )),
+                    },
+                )
+                .into(),
+            );
         }
 
         // Carry the RunConfiguration the caller asked to run with into the stored
@@ -220,4 +246,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation_id: Some(operation_id),
         })
     }
+}
+
+/// The `RuntimeEnvironment` family of a Studio notebook, as the enum spells its members
+/// (`smithy_query(query="shape",shape="RuntimeEnvironment")`: `ZEPPELIN-FLINK-<version>`,
+/// beside the `FLINK-` and `SQL-` families).
+const NOTEBOOK_RUNTIME_FAMILY: &str = "ZEPPELIN-FLINK-";
+
+/// Whether an application of `runtime` runs code SUBMITTED to the service, and so needs
+/// code content stored before it can start.
+///
+/// Stated as the complement of the notebook family rather than as a list of the streaming
+/// runtimes, so a later `FLINK-` or `SQL-` enum member needs no entry here: a Studio
+/// notebook's code is entered in the notebook, every other runtime runs what the
+/// application's `ApplicationCodeConfiguration` carries.
+fn runtime_runs_submitted_code(runtime: &str) -> bool {
+    !runtime.starts_with(NOTEBOOK_RUNTIME_FAMILY)
 }

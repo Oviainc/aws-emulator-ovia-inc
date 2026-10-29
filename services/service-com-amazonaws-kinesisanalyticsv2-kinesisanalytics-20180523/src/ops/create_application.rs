@@ -192,6 +192,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Which runtimes this API still CREATES applications for is the service's own
+        // rule, not a modelled constraint: the SQL runtime family stays in the
+        // `RuntimeEnvironment` enum so that applications created before it was retired
+        // can still be read and run, while a create naming it is refused with the
+        // modelled `UnsupportedOperationException` (HTTP 400). Checked before anything is
+        // looked up or stored, because it is a property of the request alone.
+        if is_sql_runtime(&input.runtime_environment) {
+            return Err(
+                CreateApplicationErrorModeled::UnsupportedOperationException(
+                    UnsupportedOperationException {
+                        message: Some(format!(
+                            "{} is not supported for SQL applications in this Region. You can \
+                             use KDA Studio to build streaming applications with Flink SQL.",
+                            Self::NAME
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let tags = input.tags.clone().unwrap_or_default();
         // "the maximum number of user-defined application tags is 50" — the
         // `CreateApplication$Tags` doc; the modelled `Tags` bound (1..200) counts system
@@ -275,6 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|tag| (tag.key, tag.value.unwrap_or_default()))
                 .collect(),
             operations: Vec::new(),
+            snapshots: Default::default(),
         };
 
         store.applications.insert(name.clone(), application);
@@ -293,3 +315,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The ceiling on user-defined application tags, from the `CreateApplication$Tags` and
 /// `TooManyTagsException` docs: "the maximum number of user-defined application tags is 50".
 const MAX_USER_TAGS: usize = 50;
+
+/// The `RuntimeEnvironment` family that names a SQL application, as the enum spells its
+/// members (`smithy_query(query="shape",shape="RuntimeEnvironment")`: the SQL family is
+/// `SQL-<major>_<minor>`, today `SQL-1_0`, beside the `FLINK-` and `ZEPPELIN-FLINK-`
+/// families).
+const SQL_RUNTIME_FAMILY: &str = "SQL-";
+
+/// Whether `runtime` names a SQL application's runtime — any version of that family, not
+/// one spelled-out value, so a later enum member of the same family is read the same way.
+///
+/// The value reaching here is already one the enum admits (the boundary validator refuses
+/// anything else), and the enum's members are the exact strings a client sends, so the
+/// comparison is on those bytes.
+fn is_sql_runtime(runtime: &str) -> bool {
+    runtime.starts_with(SQL_RUNTIME_FAMILY)
+}

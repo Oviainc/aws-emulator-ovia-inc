@@ -6,6 +6,8 @@
 //! `CreateApplication` writes an [`Application`] here, and `DescribeApplication`,
 //! `ListApplications`, `StartApplication`, `StopApplication` and `DeleteApplication`
 //! all read or mutate THIS struct — nothing is echoed from a request or canned.
+//! `CreateApplicationSnapshot` writes a [`Snapshot`] onto the application it names and
+//! `DescribeApplicationSnapshot` reads it back from there.
 //!
 //! Beside the records themselves this module owns the two projections every reader
 //! needs ([`Application::detail`], [`Application::summary`]) and the clock-owed status
@@ -31,7 +33,7 @@ use crate::ops::types::{
     KinesisStreamsInputDescription, KinesisStreamsOutputDescription, LambdaOutputDescription,
     MonitoringConfigurationDescription, OutputDescription, ParallelismConfigurationDescription,
     ReferenceDataSourceDescription, S3ApplicationCodeLocationDescription,
-    S3ContentBaseLocationDescription, S3ReferenceDataSourceDescription,
+    S3ContentBaseLocationDescription, S3ReferenceDataSourceDescription, SnapshotDetails,
     SqlApplicationConfigurationDescription, VpcConfigurationDescription,
     ZeppelinApplicationConfigurationDescription, ZeppelinMonitoringConfigurationDescription,
 };
@@ -47,6 +49,11 @@ pub const STATUS_STOPPING: &str = "STOPPING";
 /// `OperationStatus` values, from the model's `OperationStatus` enum.
 pub const OPERATION_IN_PROGRESS: &str = "IN_PROGRESS";
 pub const OPERATION_SUCCESSFUL: &str = "SUCCESSFUL";
+
+/// `SnapshotStatus` values this slice drives, spelled exactly as the model's
+/// `SnapshotStatus` enum does (`smithy_query(query="shape",shape="SnapshotStatus")`).
+pub const SNAPSHOT_CREATING: &str = "CREATING";
+pub const SNAPSHOT_READY: &str = "READY";
 
 /// How long a status transition the clock owes stays pending.
 ///
@@ -86,6 +93,54 @@ pub struct AppOperation {
     pub end_time: Option<DateTime>,
 }
 
+/// One stored snapshot of an application's state.
+///
+/// `CreateApplicationSnapshot` writes one of these and `DescribeApplicationSnapshot`
+/// reports it, so the `SnapshotDetails` a reader sees is the record the writer stored.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub name: String,
+    /// A `SnapshotStatus` enum value.
+    pub status: String,
+    /// The application version the snapshot was taken of.
+    pub application_version_id: i64,
+    pub creation_timestamp: DateTime,
+    /// The application's `RuntimeEnvironment` when the snapshot was taken.
+    pub runtime_environment: String,
+    /// When `CREATING` becomes `READY` on the monotonic clock, while that change is
+    /// outstanding.
+    pub ready_at: Option<Instant>,
+}
+
+impl Snapshot {
+    /// Apply the status change the clock owes this snapshot, if it is due at `now`.
+    ///
+    /// The same rule as [`Application::settle`]: the change was owed at `ready_at`
+    /// whether or not anybody called, so materialising it on a read is not a read-driven
+    /// mutation.
+    fn settle(&mut self, now: Instant) {
+        if self.ready_at.is_some_and(|due| now >= due) {
+            self.status = SNAPSHOT_READY.to_string();
+            self.ready_at = None;
+        }
+    }
+
+    /// The `SnapshotDetails` `DescribeApplicationSnapshot` and `ListApplicationSnapshots`
+    /// report.
+    pub fn details(&self) -> SnapshotDetails {
+        SnapshotDetails {
+            snapshot_name: self.name.clone(),
+            snapshot_status: self.status.clone(),
+            application_version_id: self.application_version_id,
+            snapshot_creation_timestamp: Some(self.creation_timestamp),
+            runtime_environment: Some(self.runtime_environment.clone()),
+            // The emulator stores no customer-managed key for an application, so a
+            // snapshot carries no encryption description of its own.
+            application_encryption_configuration_description: None,
+        }
+    }
+}
+
 /// One stored Managed Service for Apache Flink application.
 #[derive(Debug, Clone)]
 pub struct Application {
@@ -113,6 +168,9 @@ pub struct Application {
     pub conditional_token: Option<String>,
     pub tags: BTreeMap<String, String>,
     pub operations: Vec<AppOperation>,
+    /// The snapshots taken of this application, by `SnapshotName`, so a reader walks a
+    /// stable name-ordered sequence. Bounded by [`MAX_SNAPSHOTS_PER_APPLICATION`].
+    pub snapshots: BTreeMap<String, Snapshot>,
 }
 
 impl Application {
@@ -123,6 +181,9 @@ impl Application {
     /// read-driven mutation. Everything derived from it (the completion timestamps) is
     /// stamped at `due_wall`, so repeated reads report identical values.
     fn settle(&mut self, now: Instant) {
+        for snapshot in self.snapshots.values_mut() {
+            snapshot.settle(now);
+        }
         let Some(pending) = self.pending.clone() else {
             return;
         };
@@ -140,6 +201,29 @@ impl Application {
             op.end_time = Some(pending.due_wall);
         }
         self.pending = None;
+    }
+
+    /// Whether this application's stored configuration carries the code its runtime would
+    /// run: `ApplicationCodeConfigurationDescription.CodeContentDescription` naming
+    /// non-empty inline text, an S3 object, or a non-empty zip the creator uploaded (which
+    /// the description reports as a code size, since AWS does not echo the bytes back).
+    ///
+    /// Read off the STORED description rather than off a request, so what decides is the
+    /// configuration a create or an update actually persisted. An EMPTY text content or an
+    /// empty zip is no more code than an absent one, so neither counts.
+    pub fn has_code_content(&self) -> bool {
+        self.configuration
+            .as_ref()
+            .and_then(|cfg| cfg.application_code_configuration_description.as_ref())
+            .and_then(|code| code.code_content_description.as_ref())
+            .is_some_and(|content| {
+                content
+                    .text_content
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty())
+                    || content.s3_application_code_location_description.is_some()
+                    || content.code_size.is_some_and(|size| size > 0)
+            })
     }
 
     /// The `ApplicationDetail` `CreateApplication` and `DescribeApplication` return.
@@ -204,6 +288,13 @@ pub const MAX_APPLICATIONS: usize = 5_000;
 
 /// See [`MAX_APPLICATIONS`].
 pub const MAX_OPERATIONS_PER_APPLICATION: usize = 200;
+
+/// The ceiling on how many snapshots one application retains. Same reasoning as
+/// [`MAX_APPLICATIONS`]: a snapshot is held for the life of the process and only a caller
+/// adds one, so the count needs a maximum — and `CreateApplicationSnapshot` declares the
+/// modelled `LimitExceededException` (HTTP 400) for a caller that reaches it, so the
+/// refusal is the service's own rather than a trim a reader could not explain.
+pub const MAX_SNAPSHOTS_PER_APPLICATION: usize = 1_000;
 
 /// Per-service state for com-amazonaws-kinesisanalyticsv2-kinesisanalytics-20180523. A handler reaches it through [`service_state`].
 ///
@@ -296,6 +387,34 @@ impl ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State {
                 due_at: Instant::now() + TRANSITION_DELAY,
                 due_wall,
             });
+        }
+    }
+
+    /// Take a snapshot of `application`'s current version: stored `CREATING`, with `READY`
+    /// owed to the clock [`TRANSITION_DELAY`] from now, so a caller reading straight back
+    /// still sees the transient status.
+    ///
+    /// The span is this crate's ONE clock-owed span — the same one `StartApplication` and
+    /// `StopApplication` already settle on — rather than a second one of its own, so the
+    /// emulator has a single answer to "how long does a transition this service starts stay
+    /// pending", and the wire fixtures that poll one status poll them all the same way.
+    ///
+    /// The version and the runtime recorded are the application's as it stands now, so the
+    /// `SnapshotDetails` a reader gets is about the application that was snapshotted and
+    /// not about whatever it is later updated to.
+    pub fn begin_snapshot(&mut self, application: &str, snapshot_name: &str, now: DateTime) {
+        if let Some(app) = self.applications.get_mut(application) {
+            app.snapshots.insert(
+                snapshot_name.to_string(),
+                Snapshot {
+                    name: snapshot_name.to_string(),
+                    status: SNAPSHOT_CREATING.to_string(),
+                    application_version_id: app.version_id,
+                    creation_timestamp: now,
+                    runtime_environment: app.runtime_environment.clone(),
+                    ready_at: Some(Instant::now() + TRANSITION_DELAY),
+                },
+            );
         }
     }
 
@@ -599,6 +718,18 @@ pub fn now_timestamp() -> DateTime {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     DateTime::from_secs(secs as i64)
+}
+
+/// How this service words a lookup miss on an application: the name the caller asked for,
+/// quoted, and the fact that no such application exists.
+///
+/// One wording for every operation that looks an application up by name, so two readers
+/// of the same absent application cannot report it differently. The error CODE stays each
+/// operation's own — the model does not declare the same error on all of them, and
+/// `CreateApplicationSnapshot` reports the miss as `InvalidArgumentException` with its own
+/// wording — but the sentence a `ResourceNotFoundException` carries is this one.
+pub fn missing_application_message(name: &str) -> String {
+    format!("Application '{name}' does not exist.")
 }
 
 /// The region every ARN this service mints carries: the one the caller signed for.
