@@ -45,6 +45,10 @@ const LOG_GROUP: &str = "arn:aws:logs:us-east-1:000000000000:log-group:transfer-
 /// (`smithy_query(query="shape", shape="com.amazonaws.transfer#WorkflowStepType")`).
 const STEP_TYPES: [&str; 5] = ["COPY", "CUSTOM", "TAG", "DELETE", "DECRYPT"];
 
+/// The refusal the service answers for a `CUSTOM` step that names no Lambda function;
+/// `workflow_custom_step_function` asserts it in full over the whole class.
+const CUSTOM_STEP_FUNCTION_INVALID: &str = "Invalid function provided";
+
 /// `MaxResults`' modelled maximum (`range 1..1000`), which is also the page bound a
 /// call that sends no `MaxResults` gets.
 const MAX_PAGE_SIZE: usize = 1000;
@@ -607,6 +611,11 @@ async fn a_created_workflow_keeps_the_values_the_request_named() {
 /// The rows differ along which step type is wrong, which way it is wrong (details
 /// missing, details belonging to another type, the acted-on member missing, no `Type`),
 /// which of the two step lists the step sits in, and its index in that list.
+///
+/// A `CUSTOM` step naming no Lambda function is refused in the service's own fixed
+/// wording for that defect, which names no member path and no index, so its rows name
+/// that sentence instead; `workflow_custom_step_function` asserts the wording over the
+/// whole class.
 #[tokio::test]
 async fn a_step_must_carry_the_details_its_type_names_and_what_it_acts_on() {
     let emulator = Emulator::new();
@@ -629,7 +638,7 @@ async fn a_step_must_carry_the_details_its_type_names_and_what_it_acts_on() {
         (
             "CUSTOM with no details at all",
             json!({"Steps": [{"Type": "CUSTOM"}]}),
-            vec!["Steps[0].CustomStepDetails", "Type is CUSTOM"],
+            vec![CUSTOM_STEP_FUNCTION_INVALID],
         ),
         (
             "TAG with no details at all",
@@ -658,7 +667,7 @@ async fn a_step_must_carry_the_details_its_type_names_and_what_it_acts_on() {
         (
             "CUSTOM naming no Lambda target",
             json!({"Steps": [{"Type": "CUSTOM", "CustomStepDetails": {"Name": "custom-step"}}]}),
-            vec!["Steps[0].CustomStepDetails.Target", "Type is CUSTOM"],
+            vec![CUSTOM_STEP_FUNCTION_INVALID],
         ),
         (
             "COPY naming no destination",
@@ -680,8 +689,8 @@ async fn a_step_must_carry_the_details_its_type_names_and_what_it_acts_on() {
         ),
         (
             "the SECOND step is the wrong one",
-            json!({"Steps": [valid_step("DELETE"), {"Type": "CUSTOM"}]}),
-            vec!["Steps[1].CustomStepDetails", "Type is CUSTOM"],
+            json!({"Steps": [valid_step("DELETE"), {"Type": "DECRYPT"}]}),
+            vec!["Steps[1].DecryptStepDetails", "Type is DECRYPT"],
         ),
         (
             "an exception step is the wrong one",

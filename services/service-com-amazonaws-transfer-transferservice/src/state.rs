@@ -483,6 +483,16 @@ pub const WORKFLOW_STEP_TYPE_TAG: &str = "TAG";
 pub const WORKFLOW_STEP_TYPE_DELETE: &str = "DELETE";
 pub const WORKFLOW_STEP_TYPE_DECRYPT: &str = "DECRYPT";
 
+/// The fixed `Message` the service answers for a [`WORKFLOW_STEP_TYPE_CUSTOM`] step
+/// that names no Lambda function to invoke — the one thing such a step acts through
+/// (`CustomStepDetails` "consists of the Lambda function's name, target, and timeout",
+/// and `Target` is "The ARN for the Lambda function that is being called").
+///
+/// FIXED text in its entirety: the refusal reports the defect, not the request, so it
+/// carries no step index, no member path and no step name — the same sentence whichever
+/// step list the step sat in and wherever in it.
+pub const CUSTOM_STEP_FUNCTION_INVALID: &str = "Invalid function provided";
+
 /// `SourceFileLocation`'s documented default, on every step-details shape that carries
 /// the member ("To use the previous file as the input, enter `${previous.file}`. In
 /// this case, this workflow step uses the output file from the previous workflow step
@@ -3066,11 +3076,14 @@ impl WorkflowExecution {
 }
 
 /// The first documented step requirement a submitted step LIST violates, worded as the
-/// refusal states it and naming the step by its zero-based index in `member` — the way
-/// a JSON request indexes the list — `None` when every step satisfies them.
+/// refusal states it — `None` when every step satisfies them.
 ///
-/// `member` is the request member the list came from (`Steps` or `OnExceptionSteps`),
-/// so one message locates the step a caller has to fix.
+/// A requirement the service reports as a missing or misplaced member names the step by
+/// its zero-based index in `member` — the way a JSON request indexes the list — so one
+/// message locates the step a caller has to fix; `member` is the request member the list
+/// came from (`Steps` or `OnExceptionSteps`). A requirement the service states as a
+/// FIXED sentence about the defect itself (see [`CUSTOM_STEP_FUNCTION_INVALID`]) names
+/// neither, whichever list and index the step sat at.
 pub fn workflow_steps_violation(member: &str, steps: &[WorkflowStep]) -> Option<String> {
     steps
         .iter()
@@ -3096,6 +3109,11 @@ pub fn workflow_steps_violation(member: &str, steps: &[WorkflowStep]) -> Option<
 ///   two (`Type`, `DestinationFileLocation`) are `@required` members of
 ///   `DecryptStepDetails`, so the boundary validator refuses those before a handler
 ///   runs, and `DELETE` acts on the source file alone.
+///
+/// A `CUSTOM` step is the one case the service words as a fixed sentence of its own
+/// rather than as a member requirement: whether it sent no details or details naming no
+/// Lambda function, the step provides no function to invoke and the refusal says so
+/// ([`CUSTOM_STEP_FUNCTION_INVALID`]).
 fn workflow_step_violation(path: &str, step: &WorkflowStep) -> Option<String> {
     let Some(step_type) = step.r#type.as_deref().filter(|named| !named.is_empty()) else {
         return Some(required_member(&format!("{path}.Type")));
@@ -3133,6 +3151,10 @@ fn workflow_step_violation(path: &str, step: &WorkflowStep) -> Option<String> {
     ] {
         let member = format!("{path}.{member}");
         match (submitted, step_type == selected_by) {
+            // A `CUSTOM` step that sent no details named no function either, which the
+            // function requirement below reports — in the service's own wording for
+            // that defect, rather than as a missing member.
+            (false, true) if selected_by == WORKFLOW_STEP_TYPE_CUSTOM => {}
             (false, true) => return Some(required_when(&member, &condition)),
             (true, false) => {
                 return Some(settable_only_when(
@@ -3149,18 +3171,20 @@ fn workflow_step_violation(path: &str, step: &WorkflowStep) -> Option<String> {
     // `^arn:[a-z-]+:lambda:.*$` is what refuses it at the boundary — this is the
     // belt-and-braces check that an absent target is refused here either way.
     match step_type {
+        // A `CUSTOM` step is "a custom step with an Lambda function target", so the
+        // function it calls is what the step acts through: a step that names none —
+        // because it sent no details at all, or details with no `Target`, or a blank
+        // one — is refused for the function, in the service's own fixed wording for
+        // that defect, which reports nothing from the request.
         WORKFLOW_STEP_TYPE_CUSTOM
-            if step.custom_step_details.as_ref().is_some_and(|details| {
+            if step.custom_step_details.as_ref().is_none_or(|details| {
                 details
                     .target
                     .as_deref()
                     .is_none_or(|target| target.trim().is_empty())
             }) =>
         {
-            Some(required_when(
-                &format!("{path}.CustomStepDetails.Target"),
-                &condition,
-            ))
+            Some(CUSTOM_STEP_FUNCTION_INVALID.to_string())
         }
         WORKFLOW_STEP_TYPE_COPY
             if step

@@ -101,6 +101,8 @@ mod web_app_lifecycle;
 mod web_app_listing;
 #[path = "all/web_app_updates.rs"]
 mod web_app_updates;
+#[path = "all/workflow_custom_step_function.rs"]
+mod workflow_custom_step_function;
 #[path = "all/workflow_execution_listing.rs"]
 mod workflow_execution_listing;
 #[path = "all/workflow_lifecycle.rs"]
