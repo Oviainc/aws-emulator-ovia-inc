@@ -1138,6 +1138,22 @@ impl Channel {
         is_multiview_input_type(&self.input_type)
     }
 
+    /// Discard everything this channel's ingest data plane has accepted.
+    ///
+    /// The one place a channel's retained content is dropped short of dropping the whole
+    /// channel record, so the content stops being retained AND the budget it occupied —
+    /// the per-channel object count ([`MAX_INGESTED_OBJECTS_PER_CHANNEL`]) and this
+    /// channel's share of the store-wide retained bytes ([`MAX_INGESTED_BYTES`]), which
+    /// [`ComAmazonawsMediapackagev2Mediapackagev2State::retained_ingested_bytes`] sums off
+    /// the same map — is free for a later push.
+    ///
+    /// Touches no member of the channel's CONFIGURATION, so it neither bumps the version
+    /// nor rotates the entity tag: ingested content takes no part in either (see
+    /// [`Channel::ingested_objects`]).
+    pub fn discard_ingested_content(&mut self) {
+        self.ingested_objects.clear();
+    }
+
     /// Whether this channel's ingest data plane serves a push.
     ///
     /// Read off the ingest endpoints the channel PUBLISHES rather than decided again from

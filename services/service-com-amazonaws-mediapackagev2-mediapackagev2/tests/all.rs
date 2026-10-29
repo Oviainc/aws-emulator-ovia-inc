@@ -124,3 +124,5 @@ mod channel_members_by_input_type;
 mod entity_tag_precondition_precedence;
 #[path = "all/tagging_arn_refusal_parity.rs"]
 mod tagging_arn_refusal_parity;
+#[path = "all/channel_reset_removes_ingested_content.rs"]
+mod channel_reset_removes_ingested_content;

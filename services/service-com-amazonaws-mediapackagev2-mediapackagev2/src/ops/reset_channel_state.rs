@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetChannelState
-//! IMPLEMENTED. Records, on the addressed channel in [`crate::state`], the instant its
-//! ingest state was refreshed, and reports that instant with the channel's identity. A
-//! reset leaves the channel's CONFIGURATION alone, so `ModifiedAt` and the ETag — which
-//! track the configuration a conditional update races with — keep their values, and a
-//! later `GetChannel` reports the stored `ResetAt` byte for byte. A channel that receives
-//! no ingest of its own has no ingest state to refresh, so the reset is refused there
-//! instead and records nothing.
+//! IMPLEMENTED. Refreshes the addressed channel's ingest state in [`crate::state`]: it
+//! DISCARDS the content that channel's ingest data plane accepted before the call, and
+//! records the instant it did so, reporting that instant with the channel's identity. The
+//! discarded objects stop being retained and stop occupying the per-channel object count
+//! and the store-wide retained bytes, so a channel that had filled either ceiling takes
+//! ingest again. A reset leaves the channel's CONFIGURATION alone, so `ModifiedAt` and the
+//! ETag — which track the configuration a conditional update races with — keep their
+//! values, and a later `GetChannel` reports the stored `ResetAt` byte for byte. A channel
+//! that receives no ingest of its own has no ingest state to refresh, so the reset is
+//! refused there instead and changes nothing.
 //!
 //! `handle` below is the implementation; `crate::state` holds the store it writes.
 //!
@@ -220,6 +223,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // What the reset DOES to the stream: the content ingested before this call is
+        // removed, so it is no longer retained for the channel and no longer occupies the
+        // ceilings a later push is judged against. Only this channel's content goes; the
+        // channel's configuration, its policy and its origin endpoints are untouched, so
+        // the reset rotates neither `ModifiedAt` nor the ETag.
+        channel.discard_ingested_content();
 
         // The reset instant: the moment this call refreshed the channel's ingest stream.
         // It is persisted, and OVERWRITTEN by each later reset, because the field records

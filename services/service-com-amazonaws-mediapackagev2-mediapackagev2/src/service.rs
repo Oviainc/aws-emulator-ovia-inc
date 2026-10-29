@@ -97,7 +97,9 @@
 //!   recorded against the channel, within the three
 //!   bounds the store declares: the per-object size, the per-channel object count, and the
 //!   store-wide retained bytes (`state::MAX_INGESTED_BYTES`), since the channel count is
-//!   itself caller-driven.
+//!   itself caller-driven. What a channel retains is released by resetting the channel,
+//!   which removes its previous content
+//!   ([`crate::state::Channel::discard_ingested_content`]), or by deleting it.
 //!
 //! Both halves resolve the group, channel and endpoint their path names in the REGION the
 //! published hostname belongs to ([`crate::state::data_plane_region`]): the data plane is

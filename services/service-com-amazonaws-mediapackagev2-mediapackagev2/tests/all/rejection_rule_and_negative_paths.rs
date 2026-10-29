@@ -150,7 +150,11 @@ impl Emulator {
 
     /// The same, with the body sent verbatim rather than as JSON — what an ingest push
     /// looks like, since the data plane takes opaque bytes.
-    async fn send_raw(
+    ///
+    /// `pub(crate)` for the same reason [`Emulator`] itself is: a suite that pushes a body
+    /// of a chosen SIZE to the ingest data plane drives it through this client rather than
+    /// carrying a second copy of one.
+    pub(crate) async fn send_raw(
         &self,
         method: &str,
         path: &str,
