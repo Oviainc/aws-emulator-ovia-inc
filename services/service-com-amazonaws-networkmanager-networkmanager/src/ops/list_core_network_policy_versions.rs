@@ -168,18 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused on the member rather than answered with an empty page — the refusal every
         // other paginated listing of this service gives it.
         let after = match input.next_token.as_deref() {
-            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
-                ListCoreNetworkPolicyVersionsErrorModeled::ValidationException(
-                    ValidationException {
-                        message: "NextToken is not a token this service issued".to_string(),
-                        reason: Some("FieldValidationFailed".to_string()),
-                        fields: Some(vec![ValidationExceptionField {
-                            name: "NextToken".to_string(),
-                            message: "the token could not be parsed".to_string(),
-                        }]),
-                    },
-                )
-            })?),
+            Some(token) => Some(
+                crate::state::decode_page_token_or_reject(token)
+                    .map_err(ListCoreNetworkPolicyVersionsErrorModeled::ValidationException)?,
+            ),
             None => None,
         };
 

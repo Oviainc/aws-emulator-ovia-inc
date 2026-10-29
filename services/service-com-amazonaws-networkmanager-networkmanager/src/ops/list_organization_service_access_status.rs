@@ -147,20 +147,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // A token that is not one this service minted is refused before anything is
-        // reported, the same way every other paginated listing of this service refuses it.
+        // reported, through the same [`crate::state::decode_page_token_or_reject`] every
+        // other paginated listing of this service refuses it with, so the `Reason` and the
+        // `Fields` entry this answer carries are that one refusal.
         // An EMPTY `NextToken` is not such a token: the member is modelled `length 0..2048`,
         // so an empty string satisfies the schema, and the only page it can name is the
         // first one — it is read as "no token" rather than refused.
         let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
-            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
-                ListOrganizationServiceAccessStatusErrorModeled::ValidationException(
-                    crate::state::field_rejection(
-                        crate::state::FIELD_NEXT_TOKEN,
-                        crate::state::REASON_CANNOT_PARSE,
-                        "NextToken is not a token this service issued".to_string(),
-                    ),
-                )
-            })?),
+            Some(token) => Some(
+                crate::state::decode_page_token_or_reject(token).map_err(
+                    ListOrganizationServiceAccessStatusErrorModeled::ValidationException,
+                )?,
+            ),
             None => None,
         };
 

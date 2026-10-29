@@ -205,15 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let after = match input.next_token.as_deref() {
-            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
-                GetNetworkResourcesErrorModeled::ValidationException(
-                    crate::state::field_rejection(
-                        "NextToken",
-                        crate::state::REASON_FIELD_VALIDATION_FAILED,
-                        "NextToken is not a token this service issued".to_string(),
-                    ),
-                )
-            })?),
+            Some(token) => Some(
+                crate::state::decode_page_token_or_reject(token)
+                    .map_err(GetNetworkResourcesErrorModeled::ValidationException)?,
+            ),
             None => None,
         };
 

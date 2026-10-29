@@ -5413,8 +5413,11 @@ pub fn parse_resource_arn(arn: &str) -> Option<ArnParts<'_>> {
 }
 
 /// The `Reason` a `ValidationException` of this service carries when one input MEMBER is
-/// at fault, and the one it carries when the member's text could not be parsed at all.
-/// Both are values the modelled enumeration lists
+/// at fault — whatever is wrong with the value it carried — and the one it carries when a
+/// DOCUMENT this service has to read was not readable as the format it is written in (a
+/// policy document that is no JSON: [`validate_resource_policy_document`]). A member whose
+/// value this service rejects is the first of the two, not the second, however the value
+/// failed. Both are values the modelled enumeration lists
 /// (`ops::types::VALIDATION_EXCEPTION_REASON_VALUES`: `CannotParse`,
 /// `FieldValidationFailed`, `Other`, `UnknownOperation`).
 pub const REASON_FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
@@ -8375,6 +8378,27 @@ fn encode_page_token(last_key: &str) -> String {
 pub fn decode_page_token(token: &str) -> Option<String> {
     let text = String::from_utf8(hex::decode(token).ok()?).ok()?;
     text.strip_prefix(PAGE_TOKEN_PREFIX).map(str::to_string)
+}
+
+/// Decode a continuation token with [`decode_page_token`], or answer the ONE refusal every
+/// paginated listing of this service gives for a token it did not mint.
+///
+/// A request carrying such a token was itself read perfectly well — it is the value of the
+/// single input member `NextToken` that names no position in the listing — so the refusal
+/// is the member failure [`REASON_FIELD_VALIDATION_FAILED`], naming [`FIELD_NEXT_TOKEN`]
+/// in `Fields`, and not [`REASON_CANNOT_PARSE`], which this service answers only where the
+/// TEXT it was handed could not be read at all (a resource policy document that is no
+/// JSON: [`validate_resource_policy_document`]). Stated once here so no listing of this
+/// service can answer another `Reason`, or another `Fields` entry, for the same input.
+pub fn decode_page_token_or_reject(token: &str) -> Result<String, ValidationException> {
+    decode_page_token(token).ok_or_else(|| ValidationException {
+        message: "NextToken is not a token this service issued".to_string(),
+        reason: Some(REASON_FIELD_VALIDATION_FAILED.to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: FIELD_NEXT_TOKEN.to_string(),
+            message: "the token could not be parsed".to_string(),
+        }]),
+    })
 }
 
 /// Take one page of `entries` (which must be sorted by key) starting after `after`.
