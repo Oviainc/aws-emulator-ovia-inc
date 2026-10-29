@@ -61,6 +61,8 @@ mod list_target_account_configurations;
 mod list_target_resource_types;
 #[path = "all/modelled_map_key_bounds.rs"]
 mod modelled_map_key_bounds;
+#[path = "all/report_follows_whoever_ends_the_run.rs"]
+mod report_follows_whoever_ends_the_run;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/safety_lever.rs"]

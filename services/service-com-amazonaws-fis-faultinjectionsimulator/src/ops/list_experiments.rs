@@ -6,8 +6,14 @@
 //!
 //! Paginates exactly as `ListExperimentTemplates` does: the `nextToken` is the id the
 //! next page starts at, and it arrives only when experiments remain. Reporting, with the
-//! one write [`crate::state::ExperimentRecord::settle`] performs — so a status listed
-//! here agrees with the status `GetExperiment` reports at the same instant.
+//! TWO writes the CLOCK owes, neither of them this call's:
+//! [`crate::state::ExperimentRecord::settle`] materialises the transition every experiment
+//! was already owed at this instant — including the END of a run that elapsed — and
+//! [`crate::state::materialise_experiment_reports`] materialises the EXPERIMENT REPORT that
+//! end makes due, writing it to the Amazon S3 output the experiment's configuration names.
+//! Both were due whether or not anybody called, so a status listed here and the report
+//! state of the same experiment agree with what `GetExperiment` reports at the same
+//! instant.
 //!
 //! ## Shape of an operation
 //!
@@ -160,6 +166,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::page_size(input.max_results);
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+
+        // The report generation every ENDED experiment owes the clock, which writes each
+        // report to the Amazon S3 output its configuration names. This operation settles
+        // EVERY experiment, so it materialises the end of every run that elapsed — the very
+        // event that makes the generation due — and therefore owes the generation of each of
+        // them, exactly as `GetExperiment` owes it for the one experiment it settles. It
+        // settles the store and takes the lock itself, holding it across no call, so it runs
+        // before this handler takes the lock to cut the page. A no-op for an experiment that
+        // configured no report, that has not ended, or whose report has already been
+        // generated.
+        crate::state::materialise_experiment_reports(&*self.engine, ctx, &region, now).await;
+
         // The guard is taken, spent and RELEASED inside this block, so the records the
         // settle produced are written after it rather than while the store is locked.
         let (page, deliveries) = {

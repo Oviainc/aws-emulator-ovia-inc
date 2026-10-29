@@ -7,6 +7,11 @@
 //! records to the destinations their templates configured. See
 //! [`crate::state::experiment_logs`].
 //!
+//! That sweep SETTLES every experiment first, so it can materialise the end of a run that
+//! elapsed — the event that makes that experiment's report generation due. The generation
+//! was owed at this instant whether or not anybody called, so engaging the lever
+//! materialises it too ([`crate::state::materialise_experiment_reports`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -186,14 +191,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+
+        let engaging = input.state.status == crate::state::SafetyLeverStatusKind::Engaged.as_wire();
+        // Engaging settles every experiment before it stops the running ones, so it
+        // materialises the end of every run that elapsed — and with it the report generation
+        // that end makes due, written to the Amazon S3 output each experiment's
+        // configuration names. It takes the store lock itself, holding it across no call, so
+        // it runs before this handler takes the lock. A disengage settles nothing and so
+        // owes nothing.
+        if engaging {
+            crate::state::materialise_experiment_reports(&*self.engine, ctx, &region, now).await;
+        }
+
         // The guard is taken, spent and RELEASED inside this block: the log records the
         // stops below produced are written after it, so nothing is delivered while the
         // store is locked.
         let (safety_lever, deliveries) = {
             let mut store = state.lock();
 
-            let engaging =
-                input.state.status == crate::state::SafetyLeverStatusKind::Engaged.as_wire();
             // Engaging the lever stops the experiments that are running. Done before the
             // lever's own state is written, and on the same clock a `StopExperiment` puts an
             // experiment on, so the lever reports `engaging` exactly while the experiments it

@@ -26,8 +26,9 @@
 //! not ended, and then — once the clock has ended the run, which is when FIS generates the
 //! report — the report is WRITTEN to the Amazon S3 output the configuration names, by
 //! calling this emulator's own S3 service in process
-//! ([`materialise_experiment_report`]), and `experimentReport.s3Reports` names the object
-//! that was written. The document is built from the experiment's own record
+//! ([`materialise_experiment_report`] for one experiment,
+//! [`materialise_experiment_reports`] for an operation that settles every experiment at
+//! once), and `experimentReport.s3Reports` names the object that was written. The document is built from the experiment's own record
 //! ([`experiment_report_document`]); a generation with nowhere to write, or an output that
 //! will not take it, ends in the modelled `failed` state with the code that says which it
 //! was, rather than reporting a report nothing holds.
@@ -2393,6 +2394,29 @@ impl ComAmazonawsFisFaultinjectionsimulatorState {
         for record in self.experiments.values_mut() {
             record.settle(now);
         }
+    }
+
+    /// Claim the report generation the CLOCK owes EVERY experiment at `now`, as one
+    /// (experiment id, generation) pair per claim — the whole-store form of
+    /// [`ExperimentRecord::claim_report_generation`].
+    ///
+    /// Call it on a SETTLED store ([`settle_experiments`](Self::settle_experiments)): the
+    /// settle is what ends a run, and the end is what makes the generation due, so the two
+    /// belong to the same instant. An experiment that configured no report, that has not
+    /// ended, or whose generation has already run contributes nothing.
+    ///
+    /// The walk is over the whole experiment map, bounded by [`MAX_EXPERIMENTS`], exactly
+    /// as [`take_pending_log_deliveries`](Self::take_pending_log_deliveries)'s is: an
+    /// operation that settles already walks or indexes that same map.
+    pub fn claim_report_generations(&mut self, now: SystemTime) -> Vec<(String, ReportGeneration)> {
+        self.experiments
+            .values_mut()
+            .filter_map(|record| {
+                record
+                    .claim_report_generation(now)
+                    .map(|generation| (record.id.clone(), generation))
+            })
+            .collect()
     }
 
     /// Take every experiment log record the store holds and has not delivered, as one
@@ -5289,7 +5313,54 @@ pub async fn materialise_experiment_report<Eng: Send + Sync + 'static>(
         }
     };
 
-    let outcome = match generation {
+    let outcome = write_report_generation(ctx, region, generation).await;
+    record_report_generation(&state, id, outcome);
+}
+
+/// Materialise the report generation the CLOCK owes EVERY experiment at `now` — what
+/// [`materialise_experiment_report`] does for one, for an operation that settles the whole
+/// store rather than a single record.
+///
+/// Settling is what MATERIALISES the end of a run, and the end is what makes the
+/// generation due, so an operation that ends every elapsed run owes the second write for
+/// each of them: otherwise a client polling that operation reads the terminal status while
+/// the report of that same run goes unwritten until somebody reads the experiment itself,
+/// and two callers at one instant disagree about whether the report exists.
+///
+/// Takes the store lock to settle and claim, releases it, and takes it again per write to
+/// record what that write did — so no lock is held across a call. Claiming is what keeps
+/// the report object written once ([`ExperimentRecord::claim_report_generation`]).
+pub async fn materialise_experiment_reports<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    now: SystemTime,
+) {
+    let Some(state) = service_state(engine) else {
+        return;
+    };
+    let generations = {
+        let mut store = state.lock();
+        store.settle_experiments(now);
+        store.claim_report_generations(now)
+    };
+    for (id, generation) in generations {
+        let outcome = write_report_generation(ctx, region, generation).await;
+        record_report_generation(&state, &id, outcome);
+    }
+}
+
+/// Carry out one CLAIMED generation: the ARN of the report object it wrote, or the error
+/// code and the reason the generation failed with.
+///
+/// Takes no store lock at all — the document was already built from the record at the
+/// instant the generation fell due — so the write happens with the store free.
+async fn write_report_generation(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    generation: ReportGeneration,
+) -> Result<String, (&'static str, String)> {
+    match generation {
         // Nowhere to write it: the configuration asked for a report without naming an
         // output, so the generation fails rather than reporting a report nothing holds.
         ReportGeneration::NoOutput => Err((
@@ -5322,8 +5393,16 @@ pub async fn materialise_experiment_report<Eng: Send + Sync + 'static>(
                 ),
             )),
         },
-    };
+    }
+}
 
+/// Record what the write of the experiment `id`'s report did on that experiment's own
+/// generation record, so a later read reports the generation that happened.
+fn record_report_generation(
+    state: &::engine::ServiceState<ComAmazonawsFisFaultinjectionsimulatorState>,
+    id: &str,
+    outcome: Result<String, (&'static str, String)>,
+) {
     let mut store = state.lock();
     let Some(report) = store
         .experiments

@@ -12,6 +12,15 @@
 //! FINAL state is refused with `ValidationException` (HTTP 400) and leaves the record
 //! untouched. An id naming no record answers `ResourceNotFoundException` (HTTP 404).
 //!
+//! Stopping SETTLES the experiment first, so the stop lands on the status the clock
+//! already owed — which can be the END of a run that elapsed, the event that makes the
+//! experiment's report generation due. That generation
+//! ([`crate::state::materialise_experiment_report`]) was due at this instant whether or
+//! not anybody called, so it is materialised here as well, including on the path where
+//! this handler then REFUSES the stop for the run the settle ended: a caller that reads
+//! the experiment afterwards sees the same report state whichever operation observed the
+//! end.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -146,6 +155,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+
+        // The report generation an ENDED experiment owes the clock, materialised before the
+        // stop below settles that same experiment: the settle can end a run that elapsed,
+        // and the generation that end makes due is owed even when the stop is then refused
+        // for having arrived too late. It settles the record and takes the store lock
+        // itself, holding it across no call, so it runs before this handler takes the lock.
+        // A no-op for an experiment that configured no report, that has not ended, or whose
+        // report has already been generated.
+        crate::state::materialise_experiment_report(&*self.engine, ctx, &region, &input.id, now)
+            .await;
+
         // The guard is taken, spent and RELEASED inside this block, so the experiment's
         // log records are written after it rather than while the store is locked.
         let (experiment, deliveries) = {

@@ -22,10 +22,11 @@
 //! modelled `failed`, or no report member at all), and WHEN the retry arrives (before the
 //! run ended, and after it).
 //!
-//! The run is driven to its end through `ListExperiments`, whose summary carries no
-//! `experimentReport`: that leaves the generation owed but unmaterialised, so the replay
-//! under test is the first call that could materialise it and the written object is
-//! attributable to it.
+//! The run is driven to its end through `ListExperiments`, which is the operation that
+//! materialises that end: the generation the end makes due is therefore performed on that
+//! path, and what the replay under test must do is report the generation that was owed
+//! rather than one of its own — the same one the sibling read reports at the same instant,
+//! naming the one object that was written.
 
 use std::time::{Duration, Instant};
 
@@ -143,8 +144,8 @@ fn replay_rows() -> Vec<ReplayRow> {
 }
 
 /// The `state.status` `ListExperiments` reports for `id`, walking the pages until the
-/// summary is found. The summary carries no `experimentReport`, so polling through it
-/// leaves the report generation owed.
+/// summary is found. The summary carries no `experimentReport`, but the listing materialises
+/// the end of the run it reports and with it the generation that end makes due.
 async fn listed_status(router: &MultiServiceRouter, case: &str, id: &str) -> String {
     let mut next_token: Option<String> = None;
     loop {
@@ -294,8 +295,9 @@ async fn a_token_replay_reports_the_experiment_report_the_clock_already_owed() {
     }
 
     for (row, template_id, id) in &started {
-        // Driven to its end through the listing, which reports no report: the generation
-        // is owed and nothing has materialised it when the replay below arrives.
+        // Driven to its end through the listing, which is the operation that materialises
+        // that end — and so the generation the end makes due is performed there, before the
+        // replay below arrives.
         let status = poll_until_listed_terminal(&router, row.case, id).await;
         assert_eq!(
             status,
@@ -306,10 +308,10 @@ async fn a_token_replay_reports_the_experiment_report_the_clock_already_owed() {
         );
         if let Some(key) = row.object_key(id) {
             let (status, _) = s3(&router, "GET", &format!("/{BUCKET}/{key}")).await;
-            assert_ne!(
+            assert_eq!(
                 status, 200,
-                "case {:?}: nothing may have written s3://{BUCKET}/{key} before the \
-                 replay under test",
+                "case {:?}: expected the listing that reported the end to have written \
+                 s3://{BUCKET}/{key}",
                 row.case
             );
         }
@@ -368,8 +370,8 @@ async fn a_token_replay_reports_the_experiment_report_the_clock_already_owed() {
                 );
 
                 // And the object the replay named is really there, holding this
-                // experiment's own record — written by the replay, which is the only call
-                // that could have.
+                // experiment's own record — the one object the generation wrote, which the
+                // replay reports rather than writing a second one.
                 let (status, body) = s3(&router, "GET", &format!("/{BUCKET}/{key}")).await;
                 assert_eq!(
                     status,
