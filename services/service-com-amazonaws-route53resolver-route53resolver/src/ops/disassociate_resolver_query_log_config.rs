@@ -179,9 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(
                 DisassociateResolverQueryLogConfigErrorModeled::ResourceNotFoundException(
-                    crate::state::resolver_query_log_config_not_found(
-                        &input.resolver_query_log_config_id,
-                    ),
+                    crate::state::resolver_query_log_config_not_found(),
                 )
                 .into(),
             );
@@ -190,17 +188,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // This call addresses an association by the PAIR it was made from, so a
         // VPC this configuration was never associated with, and a second
         // disassociate of the same pair, are both "the specified resource
-        // doesn't exist". The record leaves the configuration it was kept on, so
-        // the `AssociationCount` every later read of that configuration reports
-        // no longer counts it, and the configuration can be deleted once the
-        // last VPC has been disassociated from it.
+        // doesn't exist" — the same missing ASSOCIATION a read of one by its own
+        // id reports, and reported with the same body. The record leaves the
+        // configuration it was kept on, so the `AssociationCount` every later
+        // read of that configuration reports no longer counts it, and the
+        // configuration can be deleted once the last VPC has been disassociated
+        // from it.
         let Some(record) = config.remove_association_for_vpc(&input.resource_id) else {
             return Err(
                 DisassociateResolverQueryLogConfigErrorModeled::ResourceNotFoundException(
-                    crate::state::resolver_query_log_config_vpc_association_not_found(
-                        &input.resolver_query_log_config_id,
-                        &input.resource_id,
-                    ),
+                    crate::state::resolver_query_log_config_association_not_found(),
                 )
                 .into(),
             );

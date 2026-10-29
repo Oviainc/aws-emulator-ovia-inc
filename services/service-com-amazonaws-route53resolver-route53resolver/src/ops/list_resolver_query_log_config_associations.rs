@@ -253,13 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(key) = crate::state::QueryLogConfigAssociationFilterKey::parse(&name) else {
                 return Err(
                     ListResolverQueryLogConfigAssociationsErrorModeled::InvalidParameterException(
-                        InvalidParameterException {
-                            message: format!(
-                                "'{name}' is not a valid filter name for \
-                                 ListResolverQueryLogConfigAssociations"
-                            ),
-                            field_name: Some("Name".to_string()),
-                        },
+                        crate::state::invalid_filter_name(&name),
                     )
                     .into(),
                 );

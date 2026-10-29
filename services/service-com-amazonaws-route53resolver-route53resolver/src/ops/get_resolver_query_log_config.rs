@@ -175,9 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             None => Err(
                 GetResolverQueryLogConfigErrorModeled::ResourceNotFoundException(
-                    crate::state::resolver_query_log_config_not_found(
-                        &input.resolver_query_log_config_id,
-                    ),
+                    crate::state::resolver_query_log_config_not_found(),
                 )
                 .into(),
             ),

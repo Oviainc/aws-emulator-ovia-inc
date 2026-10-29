@@ -293,6 +293,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A rule selects on a DNS name, which travels as ASCII octets, so a
+        // domain-shaped member has to be spelled the way the protocol carries
+        // it: an internationalized label only in its IDNA/punycode form. A
+        // member carrying the raw-unicode spelling of such a label is refused
+        // here — before the store is locked, so a refused create leaves no rule
+        // behind — rather than stored as a selector no query could match.
+        if [
+            input.domain_name.as_deref(),
+            input.delegation_record.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| !crate::state::domain_spelling_is_ascii(value))
+        {
+            return Err(CreateResolverRuleErrorModeled::InvalidParameterException(
+                crate::state::invalid_domain_or_delegation_record(),
+            )
+            .into());
+        }
+
         // `TargetIps`: "when creating a DELEGATE rule, you must not provide the
         // TargetIps parameter. If you provide the TargetIps, you may receive an
         // ERROR message similar to 'Delegate resolver rules need to specify a
@@ -307,6 +327,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // Resolver selects on a fully-qualified domain name, so the name a rule
+        // reports is canonical whatever form the request wrote it in, and its
+        // target addresses are normalized the same way. Both are settled here,
+        // before the store is reached, because they are what the replay
+        // comparison below reads the REQUEST as — the stored rule holds exactly
+        // these forms.
+        let domain_name = input
+            .domain_name
+            .as_deref()
+            .map(crate::state::canonical_domain_name);
+        let stored_targets = crate::state::normalize_target_addresses(&target_ips);
 
         // `ResolverEndpointId`: "The ID of the outbound Resolver endpoint that
         // you want to use to route DNS queries to the IP addresses that you
@@ -335,15 +367,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // `CreatorRequestId` "allows failed requests to be retried without the
-        // risk of running the operation twice": a repeat of a request id that
-        // already created a rule resolves to THAT rule and creates nothing.
+        // `CreatorRequestId` "identifies the request and ... allows failed
+        // requests to be retried without the risk of running the operation
+        // twice": a repeat of the SAME request resolves to the rule that
+        // request already made and creates nothing, while a DIFFERENT request
+        // wearing a token already spent is refused — the token identifies one
+        // request, so it is not available to a second one, and the rule the
+        // first one made is left exactly as it was.
+        //
+        // What the request asked for beside the token is compared through the
+        // one digest both sides are read with, so the two cases are told apart
+        // by content and not by which members a handler happened to check.
+        let requested_content = crate::state::rule_content_digest(&crate::state::RuleContent {
+            name: input.name.as_deref(),
+            rule_type,
+            domain_name: domain_name.as_deref(),
+            target_ips: &stored_targets,
+            resolver_endpoint_id: input.resolver_endpoint_id.as_deref(),
+            delegation_record: input.delegation_record.as_deref(),
+            tags: input.tags.as_deref().unwrap_or_default(),
+        });
         if let Some(existing_id) = store.rule_creator_request_id_index.get(&input.creator_request_id)
         {
             if let Some(record) = store.resolver_rules.get(existing_id) {
-                return Ok(CreateResolverRuleOutput {
-                    resolver_rule: Some(record.to_rule()),
-                });
+                if crate::state::rule_content_digest(&record.content()) == requested_content {
+                    return Ok(CreateResolverRuleOutput {
+                        resolver_rule: Some(record.to_rule()),
+                    });
+                }
+                return Err(CreateResolverRuleErrorModeled::ResourceExistsException(
+                    crate::state::resolver_rule_creator_request_id_exists(
+                        &input.creator_request_id,
+                    ),
+                )
+                .into());
             }
         }
 
@@ -363,13 +420,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Resolver selects on a fully-qualified domain name, so the name a rule
-        // reports is canonical whatever form the request wrote it in.
-        let domain_name = input
-            .domain_name
-            .as_deref()
-            .map(crate::state::canonical_domain_name);
-
         let region = crate::state::request_region(&ctx.parts().headers);
         let timestamp = crate::state::now_rfc3339();
         let seq = store.next_seq();
@@ -379,8 +429,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &format!("resolver-rule/{id}"),
         );
-
-        let stored_targets = crate::state::normalize_target_addresses(&target_ips);
 
         let record = crate::state::ResolverRuleRecord {
             seq,

@@ -99,6 +99,8 @@ mod resolver_rule_error_bodies;
 mod resolver_rule_listing_bounds;
 #[path = "all/resolver_rule_policies.rs"]
 mod resolver_rule_policies;
+#[path = "all/resolver_rule_tokens_and_refusal_sentences.rs"]
+mod resolver_rule_tokens_and_refusal_sentences;
 #[path = "all/resolver_rule_updates.rs"]
 mod resolver_rule_updates;
 #[path = "all/resolver_rules.rs"]

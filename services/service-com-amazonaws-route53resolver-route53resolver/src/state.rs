@@ -33,7 +33,7 @@ use crate::ops::types::{
     FirewallDomainListMetadata,
     FirewallRule, FirewallRuleGroup, FirewallRuleGroupAssociation, FirewallRuleGroupMetadata,
     FirewallRuleType,
-    InvalidParameterException,
+    InvalidNextTokenException, InvalidParameterException,
     InvalidPolicyDocument, InvalidRequestException, IpAddressResponse, IpAddressUpdate,
     LimitExceededException, OutpostResolver, ResolverConfig, ResolverDnssecConfig, ResolverEndpoint,
     ResolverQueryLogConfig, ResolverQueryLogConfigAssociation, ResolverRule, ResolverRuleAssociation,
@@ -284,6 +284,45 @@ pub const RSLVR_CODE_OUTPOST_NOT_FOUND: &str = "RSLVR-03007";
 /// `ResolverRuleId` and raise `ResourceNotFoundException`.
 pub const RSLVR_CODE_RULE_NOT_FOUND: &str = "RSLVR-00703";
 
+/// The Route 53 Resolver service error code reported when a rule create carries
+/// a `CreatorRequestId` an earlier create of a DIFFERENT rule already spent.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ENDPOINT_NOT_FOUND`]: the HTTP
+/// status (400) and the exception shape name together do not say which Resolver
+/// fault occurred, and the model states no message text, so this code comes
+/// from the recorded responses of the rule create that raises
+/// `ResourceExistsException` for it. See
+/// [`resolver_rule_creator_request_id_exists`].
+pub const RSLVR_CODE_RULE_CREATOR_REQUEST_ID_EXISTS: &str = "RSLVR-00701";
+
+/// The Route 53 Resolver service error code reported when a rule create carries
+/// a domain name, or a delegation record, the service will not read as a DNS
+/// name.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ENDPOINT_NOT_FOUND`], and it
+/// covers BOTH members with one code, as the sentence it goes with does. See
+/// [`invalid_domain_or_delegation_record`].
+pub const RSLVR_CODE_INVALID_DOMAIN_OR_DELEGATION_RECORD: &str = "RSLVR-00711";
+
+/// The Route 53 Resolver service error code reported when a paginated listing
+/// is handed a `NextToken` the service never issued.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ENDPOINT_NOT_FOUND`]: the HTTP
+/// status (400) and the exception shape name together do not say which Resolver
+/// fault occurred, and the model states no message text, so this code comes
+/// from the recorded responses of the listings that raise
+/// `InvalidNextTokenException`. See [`invalid_next_token`].
+pub const RSLVR_CODE_INVALID_NEXT_TOKEN: &str = "RSLVR-00302";
+
+/// The Route 53 Resolver service error code reported when a listing is handed a
+/// `Filters[].Name` outside the vocabulary that listing selects on.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ENDPOINT_NOT_FOUND`]: the
+/// listings raise `InvalidParameterException` for several distinct faults, so
+/// the code is what tells a bad filter key from the rest. See
+/// [`invalid_filter_name`].
+pub const RSLVR_CODE_INVALID_FILTER_KEY: &str = "RSLVR-01004";
+
 /// The Route 53 Resolver service error code reported when a delete names a
 /// Resolver rule that is still associated with a VPC.
 ///
@@ -355,6 +394,16 @@ pub const RSLVR_CODE_QUERY_LOG_CONFIG_POLICY_ACCESS_DENIED: &str = "RSLVR-01600"
 /// associations by its own id. See
 /// [`resolver_query_log_config_association_not_found`].
 pub const RSLVR_CODE_QUERY_LOG_CONFIG_ASSOCIATION_NOT_FOUND: &str = "RSLVR-01602";
+
+/// The Route 53 Resolver service error code reported when a request names a
+/// query logging configuration the service holds nothing under.
+///
+/// Carried for the same reason as
+/// [`RSLVR_CODE_QUERY_LOG_CONFIG_ASSOCIATION_NOT_FOUND`], and it is what tells
+/// "the configuration is gone" apart from "the association is gone": the two
+/// faults share the HTTP status and the exception shape, so the code is the
+/// only discriminator. See [`resolver_query_log_config_not_found`].
+pub const RSLVR_CODE_QUERY_LOG_CONFIG_NOT_FOUND: &str = "RSLVR-01601";
 
 /// The Route 53 Resolver service error code reported when a DNS Firewall
 /// rule-group association is asked for a `Priority` another association of the
@@ -1451,16 +1500,117 @@ pub fn resolver_rule_not_found(resolver_rule_id: &str) -> ResourceNotFoundExcept
 /// [`outpost_resolver_not_found`] on the absent service error code: the
 /// recordings available here state no code for an association addressed by its
 /// OWN id, so none is invented for it.
+///
+/// The sentence names the missing resource by its MODELLED shape name
+/// ([`RESOURCE_TYPE_RESOLVER_RULE_ASSOCIATION`], which the body also reports as
+/// `ResourceType`) and double-quotes the id the request asked for, which is its
+/// one variable part; the capital in "Exist" is the service's own spelling of
+/// this sentence.
 pub fn resolver_rule_association_not_found(
     resolver_rule_association_id: &str,
 ) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!(
-            r#"Resolver rule association with ID "{resolver_rule_association_id}" does not exist."#
+            r#"{RESOURCE_TYPE_RESOLVER_RULE_ASSOCIATION} "{resolver_rule_association_id}" does not Exist."#
         )),
         resource_type: Some(RESOURCE_TYPE_RESOLVER_RULE_ASSOCIATION.to_string()),
     }
 }
+
+/// The `ResourceExistsException` `CreateResolverRule` answers for a
+/// `CreatorRequestId` an earlier create of a DIFFERENT rule already spent.
+///
+/// `CreatorRequestId` is "a unique string that identifies the request": one
+/// token stands for one request, so the token a rule was made with is not
+/// available to a second, different request. The sentence states that fault
+/// behind the service error code for it
+/// ([`RSLVR_CODE_RULE_CREATOR_REQUEST_ID_EXISTS`]) and has one variable part,
+/// the token the request carried.
+pub fn resolver_rule_creator_request_id_exists(
+    creator_request_id: &str,
+) -> ResourceExistsException {
+    ResourceExistsException {
+        message: Some(rslvr_message(
+            RSLVR_CODE_RULE_CREATOR_REQUEST_ID_EXISTS,
+            &format!(
+                r#"Resolver rule with creator request ID "{creator_request_id}" already exists"#
+            ),
+        )),
+        resource_type: Some(RESOURCE_TYPE_RESOLVER_RULE.to_string()),
+    }
+}
+
+/// Whether a domain-shaped member is spelled the way Resolver reads a DNS name:
+/// in ASCII.
+///
+/// A DNS name travels as ASCII octets, so an internationalized label reaches
+/// the protocol only in its IDNA/punycode (ACE, `xn--`-prefixed) spelling —
+/// RFC 5890 §2.3.2.1. A member carrying the raw-unicode spelling of the same
+/// label is therefore not a name the service can resolve on, and is refused
+/// ([`invalid_domain_or_delegation_record`]) rather than stored as a selector no
+/// query can ever match. Only the SPELLING is checked here: the label syntax of
+/// a rule's domain is the service's to decide, and the member's length is the
+/// model's own (1..256), already enforced before a handler runs.
+pub fn domain_spelling_is_ascii(value: &str) -> bool {
+    value.is_ascii()
+}
+
+/// The `InvalidParameterException` a Resolver rule write answers for a
+/// `DomainName` or a `DelegationRecord` outside the spelling
+/// [`domain_spelling_is_ascii`] admits.
+///
+/// The sentence is the service's own for this fault and is ENTIRELY fixed text:
+/// it names neither the member at fault nor the value it was handed — which is
+/// why it is not built through [`rslvr_message`], whose terminating period this
+/// sentence does not carry — so no `FieldName` is added beside it either.
+pub fn invalid_domain_or_delegation_record() -> InvalidParameterException {
+    InvalidParameterException {
+        message: format!(
+            "[{RSLVR_CODE_INVALID_DOMAIN_OR_DELEGATION_RECORD}] Invalid domain or delegation record"
+        ),
+        field_name: None,
+    }
+}
+
+/// The `InvalidNextTokenException` a paginated listing answers for a
+/// `NextToken` this service did not mint for that query.
+///
+/// Built here so every listing that models `InvalidNextTokenException` reports
+/// the one body: the sentence the service words this fault with, behind the
+/// service error code for it ([`RSLVR_CODE_INVALID_NEXT_TOKEN`]), with the
+/// token the request sent double-quoted inside it as its one variable part. A
+/// listing whose recorded refusal of an unissued token is the PARAMETER fault
+/// instead reports [`invalid_next_token_parameter`].
+pub fn invalid_next_token(next_token: &str) -> InvalidNextTokenException {
+    InvalidNextTokenException {
+        message: Some(rslvr_message(
+            RSLVR_CODE_INVALID_NEXT_TOKEN,
+            &format!(r#"Invalid next token: "{next_token}", invalid version"#),
+        )),
+    }
+}
+
+/// The `InvalidParameterException` a listing answers for a `Filters[].Name`
+/// outside the vocabulary it selects on.
+///
+/// Built here so every listing that accepts `Filters` reports the one body: the
+/// sentence the service words this fault with, behind the service error code
+/// for it ([`RSLVR_CODE_INVALID_FILTER_KEY`]), with the filter name the request
+/// sent double-quoted inside it as its ONE variable part — the operation is not
+/// named, so two listings handed the same unknown key answer the same sentence.
+pub fn invalid_filter_name(name: &str) -> InvalidParameterException {
+    InvalidParameterException {
+        message: rslvr_message(
+            RSLVR_CODE_INVALID_FILTER_KEY,
+            &format!(r#"The filter key "{name}" is invalid"#),
+        ),
+        field_name: Some(FILTER_NAME_MEMBER.to_string()),
+    }
+}
+
+/// The modelled member name a bad filter key is reported against, as the model
+/// spells it (`smithy_query(query="shape",shape="Filter")`).
+const FILTER_NAME_MEMBER: &str = "Name";
 
 /// The `ResourceNotFoundException` `DisassociateResolverRule` answers when the
 /// store holds no association of that RULE with that VPC — the pair that call
@@ -2867,6 +3017,90 @@ impl OutpostResolverRecord {
     }
 }
 
+/// What one `CreateResolverRule` request asked for, apart from the token it
+/// carried: the members that DEFINE the rule it would make.
+///
+/// It exists so the token a create carries can be compared against the request
+/// the stored rule was made from, in [`rule_content_digest`], without a handler
+/// listing those members a second time.
+#[derive(Debug, Clone, Copy)]
+pub struct RuleContent<'a> {
+    pub name: Option<&'a str>,
+    pub rule_type: &'a str,
+    /// The domain name in the CANONICAL form a rule stores it in
+    /// ([`canonical_domain_name`]), so two requests that differ only in how
+    /// they wrote the root label are one request.
+    pub domain_name: Option<&'a str>,
+    /// The target addresses in the NORMALIZED form a rule stores them in
+    /// ([`normalize_target_addresses`]), for the same reason.
+    pub target_ips: &'a [TargetAddress],
+    pub resolver_endpoint_id: Option<&'a str>,
+    pub delegation_record: Option<&'a str>,
+    pub tags: &'a [Tag],
+}
+
+/// A digest of everything a `CreateResolverRule` request asked for beside its
+/// `CreatorRequestId`.
+///
+/// `CreatorRequestId` "identifies the request", so deciding whether a replayed
+/// token is a RETRY of the request that minted the rule, or a different request
+/// wearing the same token, is a comparison of the rest of the request against
+/// the rule that token made. Every member is fed length-prefixed
+/// ([`feed_field`]), so no two different requests collide by running their
+/// values together, and the tag list is folded order-insensitively because a
+/// tag set is not ordered.
+pub fn rule_content_digest(content: &RuleContent<'_>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"route53resolver/resolver-rule/content/v1");
+    feed_field(&mut hasher, content.name.unwrap_or_default().as_bytes());
+    feed_field(&mut hasher, content.rule_type.as_bytes());
+    feed_field(
+        &mut hasher,
+        content.domain_name.unwrap_or_default().as_bytes(),
+    );
+    feed_field(
+        &mut hasher,
+        content.resolver_endpoint_id.unwrap_or_default().as_bytes(),
+    );
+    feed_field(
+        &mut hasher,
+        content.delegation_record.unwrap_or_default().as_bytes(),
+    );
+    for target in content.target_ips {
+        feed_field(&mut hasher, target.ip.clone().unwrap_or_default().as_bytes());
+        feed_field(
+            &mut hasher,
+            target.ipv6.clone().unwrap_or_default().as_bytes(),
+        );
+        feed_field(
+            &mut hasher,
+            target.port.unwrap_or_default().to_string().as_bytes(),
+        );
+        feed_field(
+            &mut hasher,
+            target.protocol.clone().unwrap_or_default().as_bytes(),
+        );
+        feed_field(
+            &mut hasher,
+            target
+                .server_name_indication
+                .clone()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+    }
+    let mut tags: Vec<String> = content
+        .tags
+        .iter()
+        .map(|tag| format!("{}={}", tag.key, tag.value))
+        .collect();
+    tags.sort();
+    for tag in &tags {
+        feed_field(&mut hasher, tag.as_bytes());
+    }
+    hex::encode(&hasher.finalize()[..16])
+}
+
 /// A Resolver rule, as stored.
 #[derive(Debug, Clone)]
 pub struct ResolverRuleRecord {
@@ -2903,6 +3137,20 @@ pub struct ResolverRuleRecord {
 }
 
 impl ResolverRuleRecord {
+    /// What the request that made this rule asked for, for the replay
+    /// comparison [`rule_content_digest`] describes.
+    pub fn content(&self) -> RuleContent<'_> {
+        RuleContent {
+            name: self.name.as_deref(),
+            rule_type: &self.rule_type,
+            domain_name: self.domain_name.as_deref(),
+            target_ips: &self.target_ips,
+            resolver_endpoint_id: self.resolver_endpoint_id.as_deref(),
+            delegation_record: self.delegation_record.as_deref(),
+            tags: &self.tags,
+        }
+    }
+
     /// Project the record onto the modelled `ResolverRule`.
     pub fn to_rule(&self) -> ResolverRule {
         ResolverRule {
@@ -3651,54 +3899,42 @@ pub fn invalid_query_log_config_name(name: &str) -> InvalidParameterException {
 
 /// The `ResourceNotFoundException` the query-logging operations answer for an id
 /// they hold no configuration under, built here so every operation that resolves
-/// a `ResolverQueryLogConfigId` reports the same body. See
-/// [`outpost_resolver_not_found`] on the absent `RSLVR-nnnnn` service error code.
-pub fn resolver_query_log_config_not_found(
-    resolver_query_log_config_id: &str,
-) -> ResourceNotFoundException {
+/// a `ResolverQueryLogConfigId` reports the same body.
+///
+/// The sentence is the service's own for this fault
+/// ([`RSLVR_CODE_QUERY_LOG_CONFIG_NOT_FOUND`]) and is ENTIRELY fixed text:
+/// Resolver does not name the configuration the caller asked for, so a caller
+/// that cannot address one learns nothing else about it — the same reticence as
+/// [`resource_not_found_message`], and the reason the fault is told apart by its
+/// code rather than by the id in the message.
+pub fn resolver_query_log_config_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
-            r#"Resolver query log config with ID "{resolver_query_log_config_id}" does not exist."#
+        message: Some(rslvr_message(
+            RSLVR_CODE_QUERY_LOG_CONFIG_NOT_FOUND,
+            "The specified query logging configuration doesn't exist",
         )),
         resource_type: Some(RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG.to_string()),
     }
 }
 
 /// The `ResourceNotFoundException` the query-logging operations answer for an
-/// association id they hold no association under, built here so every operation
-/// that resolves a `ResolverQueryLogConfigAssociationId` reports the same body.
+/// association they hold nothing under, built here so every operation that
+/// addresses one — by its own id (`GetResolverQueryLogConfigAssociation`) or by
+/// the (configuration, VPC) pair it was made from
+/// (`DisassociateResolverQueryLogConfig`) — reports the same body.
 ///
 /// The sentence is the service's own for this fault
 /// ([`RSLVR_CODE_QUERY_LOG_CONFIG_ASSOCIATION_NOT_FOUND`]) and is ENTIRELY
-/// fixed text: Resolver names neither the association the caller asked for nor
-/// the configuration it would belong to, so a caller that cannot address an
-/// association learns nothing else about it — the same reticence as
-/// [`resource_not_found_message`].
+/// fixed text: Resolver names neither the association the caller asked for, nor
+/// the configuration or the VPC it would join, so a caller that cannot address
+/// an association learns nothing else about it — the same reticence as
+/// [`resource_not_found_message`]. Its code is what distinguishes it from a
+/// configuration that is itself gone ([`resolver_query_log_config_not_found`]).
 pub fn resolver_query_log_config_association_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(rslvr_message(
             RSLVR_CODE_QUERY_LOG_CONFIG_ASSOCIATION_NOT_FOUND,
             "The specified query logging configuration association doesn't exist",
-        )),
-        resource_type: Some(RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG_ASSOCIATION.to_string()),
-    }
-}
-
-/// The `ResourceNotFoundException` `DisassociateResolverQueryLogConfig` answers
-/// when the store holds no association of that CONFIGURATION with that VPC —
-/// the pair that call addresses an association by, rather than the
-/// association's own id, the same way
-/// [`resolver_rule_vpc_association_not_found`] reports the rule-and-VPC pair.
-///
-/// The missing resource the sentence names is the ASSOCIATION itself, and its
-/// two variable parts are the configuration and the VPC the request named.
-pub fn resolver_query_log_config_vpc_association_not_found(
-    resolver_query_log_config_id: &str,
-    resource_id: &str,
-) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!(
-            r#"Resolver query log config association between Resolver query log config "{resolver_query_log_config_id}" and VPC "{resource_id}" does not exist."#
         )),
         resource_type: Some(RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG_ASSOCIATION.to_string()),
     }

@@ -201,12 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) else {
             return Err(
                 ListResolverEndpointIpAddressesErrorModeled::InvalidNextTokenException(
-                    InvalidNextTokenException {
-                        message: Some(
-                            "The NextToken you provided was not issued by this service for this Resolver endpoint"
-                                .to_string(),
-                        ),
-                    },
+                    crate::state::invalid_next_token(
+                        input.next_token.as_deref().unwrap_or_default(),
+                    ),
                 )
                 .into(),
             );

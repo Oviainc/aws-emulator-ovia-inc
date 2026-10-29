@@ -219,12 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(key) = crate::state::RuleAssociationFilterKey::parse(&name) else {
                 return Err(
                     ListResolverRuleAssociationsErrorModeled::InvalidParameterException(
-                        InvalidParameterException {
-                            message: format!(
-                                "'{name}' is not a valid filter name for ListResolverRuleAssociations"
-                            ),
-                            field_name: Some("Name".to_string()),
-                        },
+                        crate::state::invalid_filter_name(&name),
                     )
                     .into(),
                 );
@@ -268,12 +263,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(page) = page else {
             return Err(
                 ListResolverRuleAssociationsErrorModeled::InvalidNextTokenException(
-                    InvalidNextTokenException {
-                        message: Some(
-                            "The NextToken you provided was not issued by this service for this query"
-                                .to_string(),
-                        ),
-                    },
+                    crate::state::invalid_next_token(
+                        input.next_token.as_deref().unwrap_or_default(),
+                    ),
                 )
                 .into(),
             );

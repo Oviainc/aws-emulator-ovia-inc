@@ -190,14 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A `NextToken` this service did not mint for THIS resource's tags
             // is refused with the `InvalidNextTokenException` this operation
             // models, rather than being read as "start from the beginning" and
-            // silently repeating page one.
+            // silently repeating page one. The body is the shared one every
+            // listing of this service reports for an unissued token.
             return Err(ListTagsForResourceErrorModeled::InvalidNextTokenException(
-                InvalidNextTokenException {
-                    message: Some(
-                        "The NextToken you provided was not issued by this service for this query"
-                            .to_string(),
-                    ),
-                },
+                crate::state::invalid_next_token(input.next_token.as_deref().unwrap_or_default()),
             )
             .into());
         };

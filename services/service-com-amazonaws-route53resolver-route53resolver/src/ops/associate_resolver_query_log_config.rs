@@ -186,9 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(
                     AssociateResolverQueryLogConfigErrorModeled::ResourceNotFoundException(
-                        crate::state::resolver_query_log_config_not_found(
-                            &input.resolver_query_log_config_id,
-                        ),
+                        crate::state::resolver_query_log_config_not_found(),
                     )
                     .into(),
                 );
@@ -225,9 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(
                 AssociateResolverQueryLogConfigErrorModeled::ResourceNotFoundException(
-                    crate::state::resolver_query_log_config_not_found(
-                        &input.resolver_query_log_config_id,
-                    ),
+                    crate::state::resolver_query_log_config_not_found(),
                 )
                 .into(),
             );

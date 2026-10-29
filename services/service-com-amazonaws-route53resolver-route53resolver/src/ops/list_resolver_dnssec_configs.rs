@@ -224,12 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(key) = crate::state::DnssecConfigFilterKey::parse(&name) else {
                 return Err(
                     ListResolverDnssecConfigsErrorModeled::InvalidParameterException(
-                        InvalidParameterException {
-                            message: format!(
-                                "'{name}' is not a valid filter name for ListResolverDnssecConfigs"
-                            ),
-                            field_name: Some("Name".to_string()),
-                        },
+                        crate::state::invalid_filter_name(&name),
                     )
                     .into(),
                 );
@@ -283,12 +278,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(page) = page else {
             return Err(
                 ListResolverDnssecConfigsErrorModeled::InvalidNextTokenException(
-                    InvalidNextTokenException {
-                        message: Some(
-                            "The NextToken you provided was not issued by this service for this query"
-                                .to_string(),
-                        ),
-                    },
+                    crate::state::invalid_next_token(
+                        input.next_token.as_deref().unwrap_or_default(),
+                    ),
                 )
                 .into(),
             );
