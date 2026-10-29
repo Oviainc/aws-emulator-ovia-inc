@@ -8,7 +8,10 @@
 //!
 //! * The request names exactly one stream, by `StreamName` or `StreamARN`;
 //!   neither or both is `InvalidArgumentException` (400) and a name or ARN no
-//!   stream answers to is `ResourceNotFoundException` (404).
+//!   stream answers to is `ResourceNotFoundException` (404). The stream is
+//!   resolved in the Kinesis Video Streams registry — the store `CreateStream`
+//!   writes — so a stream the control plane holds is found here, with its
+//!   current retention.
 //! * "Data retention must be greater than 0": a stream with
 //!   `DataRetentionInHours` of 0 is `NoDataRetentionException` (400).
 //! * The clip is assembled from the fragments the archive holds whose selected
@@ -127,7 +130,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{date_time_millis, service_state, ArchivedStream, StreamLookupError, TimestampOrigin};
+use crate::state::{
+    date_time_millis, service_state, ArchivedStream, StreamLookupError, TimestampOrigin,
+    NO_DATA_RETENTION_MESSAGE, TIMESTAMP_RANGE_ORDER_MESSAGE,
+};
 
 /// The content type `GetClip` reports.
 ///
@@ -139,6 +145,13 @@ const CLIP_CONTENT_TYPE: &str = "video/mp4";
 /// The documented fragment ceiling of one clip: "The output will contain the
 /// first 100 MB or the first 200 fragments from the specified start timestamp."
 const MAX_CLIP_FRAGMENTS: usize = 200;
+
+/// The refusal a clip request over a range the archive holds no fragment in
+/// carries. `ResourceNotFoundException` (404) is what Kinesis Video Streams
+/// raises when it "can't find the stream that you specified" AND when the clip
+/// request names no archived media; this message is the second case, entirely
+/// fixed text naming neither the stream nor the range.
+const NO_FRAGMENTS_MESSAGE: &str = "No fragments found in the stream for the clip request.";
 
 /// The documented byte ceiling of one clip: the 100 MB of the same sentence.
 /// It is the same ceiling [`crate::state::MAX_PAYLOAD_BYTES`] applies to every
@@ -245,9 +258,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let state = state.lock();
 
-        let stream = match state
-            .resolve_stream(input.stream_name.as_deref(), input.stream_arn.as_deref())
-        {
+        let stream = match state.resolve_stream(
+            &*self.engine,
+            input.stream_name.as_deref(),
+            input.stream_arn.as_deref(),
+        ) {
             Ok(stream) => stream,
             Err(StreamLookupError::InvalidArgument(message)) => return Err(invalid(message)),
             Err(StreamLookupError::NotFound(message)) => {
@@ -264,10 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !stream.retains_data() {
             return Err(GetClipErrorModeled::NoDataRetentionException(
                 NoDataRetentionException {
-                    message: Some(format!(
-                        "Stream {} does not retain data (DataRetentionInHours is 0)",
-                        stream.name
-                    )),
+                    message: Some(NO_DATA_RETENTION_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -282,22 +294,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let start_millis = date_time_millis(&selector.timestamp_range.start_timestamp);
         let end_millis = date_time_millis(&selector.timestamp_range.end_timestamp);
-        if end_millis < start_millis {
-            return Err(invalid(
-                "ClipFragmentSelector.TimestampRange.EndTimestamp must not be earlier than \
-                 StartTimestamp"
-                    .to_string(),
-            ));
+        // `ClipTimestampRange$EndTimestamp` "must be later than the
+        // StartTimestamp value", so a range that ends where it starts is as
+        // much a refusal as one that ends before it.
+        if end_millis <= start_millis {
+            return Err(invalid(TIMESTAMP_RANGE_ORDER_MESSAGE.to_string()));
         }
 
         let in_range = stream.fragments_in_range(origin, start_millis, end_millis);
         if in_range.is_empty() {
             return Err(GetClipErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No fragments found in the requested time range for stream {}",
-                        stream.name
-                    )),
+                    message: Some(NO_FRAGMENTS_MESSAGE.to_string()),
                 },
             )
             .into());

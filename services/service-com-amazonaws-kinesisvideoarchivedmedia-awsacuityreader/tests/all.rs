@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/archived_media_read_path.rs"]
 mod archived_media_read_path;
+#[path = "all/control_plane_stream_resolution.rs"]
+mod control_plane_stream_resolution;
 #[path = "all/route_claims.rs"]
 mod route_claims;
 #[path = "all/state_roundtrip.rs"]

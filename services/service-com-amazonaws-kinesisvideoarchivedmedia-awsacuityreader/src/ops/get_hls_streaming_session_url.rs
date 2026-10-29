@@ -8,7 +8,10 @@
 //!
 //! * The request names exactly one stream, by `StreamName` or `StreamARN`;
 //!   neither or both is `InvalidArgumentException` (400) and a name or ARN no
-//!   stream answers to is `ResourceNotFoundException` (404).
+//!   stream answers to is `ResourceNotFoundException` (404). The stream is
+//!   resolved in the Kinesis Video Streams registry — the store `CreateStream`
+//!   writes — so a stream the control plane holds is found here, with its
+//!   current retention.
 //! * "Data retention must be greater than 0": a stream with
 //!   `DataRetentionInHours` of 0 is `NoDataRetentionException` (400).
 //! * The documented parameter defaults are applied: `PlaybackMode` LIVE,
@@ -203,7 +206,7 @@
 use super::types::*;
 use crate::state::{
     date_time_millis, epoch_millis, service_state, SessionProtocol, StreamLookupError,
-    StreamingSession, TimestampOrigin,
+    StreamingSession, TimestampOrigin, NO_DATA_RETENTION_MESSAGE, TIMESTAMP_RANGE_ORDER_MESSAGE,
 };
 use std::time::{Duration, SystemTime};
 
@@ -230,6 +233,13 @@ const LIVE_FRAGMENT_WINDOW: Duration = Duration::from_secs(30);
 /// loopback literal, never a real AWS host: the session this URL names is
 /// served by this emulator.
 const LOOPBACK_HOST: &str = "127.0.0.1";
+
+/// The refusal a streaming-session request carries when the stream holds no
+/// fragment the session could serve — none in the requested range for
+/// `ON_DEMAND`/`LIVE_REPLAY`, none in the last 30 seconds for `LIVE`, the two
+/// cases `ResourceNotFoundException`'s own documentation gives this operation.
+/// Entirely fixed text: it names neither the stream nor the window.
+const NO_FRAGMENTS_MESSAGE: &str = "No fragments found in the stream for the streaming request.";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -424,11 +434,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is the model's, not an inconsistency here.
             if let (Some(start), Some(end)) = (&range.start_timestamp, &range.end_timestamp) {
                 if date_time_millis(end) <= date_time_millis(start) {
-                    return Err(invalid(
-                        "HLSFragmentSelector.TimestampRange.EndTimestamp must be later than \
-                         StartTimestamp"
-                            .to_string(),
-                    ));
+                    return Err(invalid(TIMESTAMP_RANGE_ORDER_MESSAGE.to_string()));
                 }
             }
         }
@@ -449,9 +455,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Resolve the stream and take the playlist snapshot while the borrow of
         // the archive is still immutable, then record the session.
         let (stream_name, fragment_numbers) = {
-            let stream = match state
-                .resolve_stream(input.stream_name.as_deref(), input.stream_arn.as_deref())
-            {
+            let stream = match state.resolve_stream(
+                &*self.engine,
+                input.stream_name.as_deref(),
+                input.stream_arn.as_deref(),
+            ) {
                 Ok(stream) => stream,
                 Err(StreamLookupError::InvalidArgument(message)) => return Err(invalid(message)),
                 Err(StreamLookupError::NotFound(message)) => return Err(not_found(message)),
@@ -461,10 +469,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !stream.retains_data() {
                 return Err(GetHLSStreamingSessionURLErrorModeled::NoDataRetentionException(
                     NoDataRetentionException {
-                        message: Some(format!(
-                            "Stream {} does not retain data (DataRetentionInHours is 0)",
-                            stream.name
-                        )),
+                        message: Some(NO_DATA_RETENTION_MESSAGE.to_string()),
                     },
                 )
                 .into());
@@ -485,11 +490,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     epoch_millis(fragment.server_timestamp) >= window_start
                 });
                 if !fresh {
-                    return Err(not_found(format!(
-                        "Stream {} has no fragments within the last {} seconds",
-                        stream.name,
-                        LIVE_FRAGMENT_WINDOW.as_secs()
-                    )));
+                    return Err(not_found(NO_FRAGMENTS_MESSAGE.to_string()));
                 }
                 let mut newest: Vec<&crate::state::StoredFragment> =
                     stream.fragments.iter().collect();
@@ -515,10 +516,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map_or(i64::MAX, date_time_millis);
                 let in_range = stream.fragments_in_range(origin, start_millis, end_millis);
                 if in_range.is_empty() {
-                    return Err(not_found(format!(
-                        "Stream {} has no fragments within the requested time range",
-                        stream.name
-                    )));
+                    return Err(not_found(NO_FRAGMENTS_MESSAGE.to_string()));
                 }
                 in_range
                     .into_iter()

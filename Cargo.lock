@@ -10911,6 +10911,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-kinesisvideo-kinesisvideo-20170930",
  "sha2 0.10.9",
  "tokio",
  "tracing",

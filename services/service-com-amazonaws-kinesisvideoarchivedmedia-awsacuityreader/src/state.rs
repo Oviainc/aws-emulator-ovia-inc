@@ -3,13 +3,20 @@
 //! Engine state for the com-amazonaws-kinesisvideoarchivedmedia-awsacuityreader service.
 //!
 //! This service is a READ plane over a fragment archive: it has no create
-//! operation of its own (streams and fragments are ingested through the Kinesis
-//! Video Streams control/data plane), so everything the handlers answer is
-//! computed from the archive held here. The archive is populated through
+//! operation of its own, so everything the handlers answer is computed from
+//! state somebody else wrote.
+//!
+//! A stream itself belongs to the Kinesis Video Streams CONTROL plane
+//! (`CreateStream` creates it, `UpdateDataRetention` changes its retention,
+//! `DeleteStream` removes it), so a read resolves the stream it addresses in
+//! that service's registry in the shared engine — not in a second copy of it
+//! held here. The FRAGMENTS of a resolved stream are this service's own
+//! archive, populated through
 //! [`ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState::put_stream`] /
 //! [`ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState::append_fragment`],
 //! which an ingest path (or a seed/test harness) calls on the one shared engine
-//! store.
+//! store; a registered stream nothing has been ingested into simply has an
+//! empty archive.
 //!
 //! The query helpers (stream resolution, timestamp-range filtering, pagination
 //! cursors) live here beside the data they read, so every operation resolves a
@@ -17,6 +24,8 @@
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use ::service_com_amazonaws_kinesisvideo_kinesisvideo_20170930::state as control_plane;
 
 /// Milliseconds since the Unix epoch for `t`, negative for an instant before it.
 ///
@@ -192,6 +201,13 @@ pub const ARCHIVE_CONTENT_TYPE: &str = "video/webm";
 /// a round "100 MB" with no unit base, so one is chosen here and named.
 pub const MAX_PAYLOAD_BYTES: usize = 100 * 1024 * 1024;
 
+/// The refusal every archived-media operation that models
+/// `NoDataRetentionException` carries: the error is raised for "a stream that
+/// does not retain data (that is, has a `DataRetentionInHours` of 0)", and the
+/// condition is that retention value alone, so the message is entirely fixed
+/// text naming no stream.
+pub const NO_DATA_RETENTION_MESSAGE: &str = "The stream data retention is set to 0 hours.";
+
 impl ArchivedStream {
     /// A stream with an empty archive, with the ARN shape the model's
     /// `ResourceARN` pattern requires
@@ -232,9 +248,7 @@ impl ArchivedStream {
     /// The fragment with this fragment number, if the archive holds it.
     #[must_use]
     pub fn fragment(&self, fragment_number: &str) -> Option<&StoredFragment> {
-        self.fragments
-            .iter()
-            .find(|f| f.fragment_number == fragment_number)
+        fragment_in(&self.fragments, fragment_number)
     }
 
     /// The archived fragments whose `origin` timestamp falls in the inclusive
@@ -246,13 +260,7 @@ impl ArchivedStream {
         start_millis: i64,
         end_millis: i64,
     ) -> Vec<&StoredFragment> {
-        self.fragments
-            .iter()
-            .filter(|f| {
-                let at = epoch_millis(origin.of(f));
-                at >= start_millis && at <= end_millis
-            })
-            .collect()
+        fragments_in_range(&self.fragments, origin, start_millis, end_millis)
     }
 
     /// The total size of `fragments`, saturating rather than overflowing.
@@ -282,6 +290,93 @@ impl ArchivedStream {
             payload.extend_from_slice(&fragment.media);
         }
         Ok(payload)
+    }
+}
+
+/// The fragment of `fragments` carrying this fragment number, if there is one.
+///
+/// The one lookup rule every operation that addresses a fragment by number
+/// uses, so [`ArchivedStream`] and [`ResolvedStream`] cannot drift apart.
+#[must_use]
+pub fn fragment_in<'a>(
+    fragments: &'a [StoredFragment],
+    fragment_number: &'_ str,
+) -> Option<&'a StoredFragment> {
+    fragments
+        .iter()
+        .find(|f| f.fragment_number == fragment_number)
+}
+
+/// The fragments of `fragments` whose `origin` timestamp falls in the inclusive
+/// range `[start_millis, end_millis]`, in ingestion order.
+///
+/// The one range rule every selector-driven operation uses.
+#[must_use]
+pub fn fragments_in_range(
+    fragments: &[StoredFragment],
+    origin: TimestampOrigin,
+    start_millis: i64,
+    end_millis: i64,
+) -> Vec<&StoredFragment> {
+    fragments
+        .iter()
+        .filter(|f| {
+            let at = epoch_millis(origin.of(f));
+            at >= start_millis && at <= end_millis
+        })
+        .collect()
+}
+
+/// The one stream an archived-media read addresses.
+///
+/// Its IDENTITY and RETENTION are the Kinesis Video Streams control plane's,
+/// read through [`ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState::resolve_stream`]
+/// on every call, so a retention change the control plane accepted is observed
+/// by the very next read rather than by a copy taken earlier. Its FRAGMENTS are
+/// this service's archive for that stream, which is empty for a stream nothing
+/// has been ingested into.
+#[derive(Debug)]
+pub struct ResolvedStream<'a> {
+    /// The stream's `StreamName`.
+    pub name: String,
+    /// The stream's `StreamARN`.
+    pub arn: String,
+    /// How long the stream retains data, in hours. `0` means no retention is
+    /// configured, which is what makes the archived-media operations answer
+    /// `NoDataRetentionException`.
+    pub data_retention_in_hours: i64,
+    /// The content type of the archived container, reported by
+    /// `GetMediaForFragmentList$ContentType`.
+    pub archive_content_type: String,
+    /// This stream's archive, in ingestion order (ascending fragment number).
+    pub fragments: &'a [StoredFragment],
+}
+
+impl ResolvedStream<'_> {
+    /// Whether this stream retains data at all. A stream with no retention
+    /// holds no archive, which the archived-media operations report as
+    /// `NoDataRetentionException`.
+    #[must_use]
+    pub fn retains_data(&self) -> bool {
+        self.data_retention_in_hours > 0
+    }
+
+    /// The fragment with this fragment number, if the archive holds it.
+    #[must_use]
+    pub fn fragment(&self, fragment_number: &str) -> Option<&StoredFragment> {
+        fragment_in(self.fragments, fragment_number)
+    }
+
+    /// The archived fragments whose `origin` timestamp falls in the inclusive
+    /// range `[start_millis, end_millis]`, in ingestion order.
+    #[must_use]
+    pub fn fragments_in_range(
+        &self,
+        origin: TimestampOrigin,
+        start_millis: i64,
+        end_millis: i64,
+    ) -> Vec<&StoredFragment> {
+        fragments_in_range(self.fragments, origin, start_millis, end_millis)
     }
 }
 
@@ -338,6 +433,30 @@ impl StreamingSession {
         self.created_at + Duration::from_secs(u64::from(self.expires_in_secs))
     }
 }
+
+/// The refusal an identifier no stream answers to carries, reported as
+/// `ResourceNotFoundException` (404) — the error raised when Kinesis Video
+/// Streams "can't find the stream that you specified". Entirely fixed text: it
+/// names neither the stream nor which identifier form was used.
+///
+/// The control plane words its own 404 with the same sentence, and this copy is
+/// DELIBERATE rather than an oversight: each service states the refusals it
+/// answers with, and a reader of this crate must be able to see what it sends
+/// without following a dependency.
+pub const STREAM_NOT_FOUND_MESSAGE: &str = "The requested stream is not found or not active.";
+
+/// The refusal a request that does not name exactly one stream carries.
+///
+/// `StreamName` and `StreamARN` are each documented as "You must specify either
+/// the StreamName or the StreamARN", so one identifier is required and two are
+/// a contradiction; the message states that whole rule, which is why both cases
+/// carry it.
+pub const ONE_STREAM_IDENTIFIER_MESSAGE: &str =
+    "One of StreamName or StreamARN must be provided, but not both.";
+
+/// The refusal a timestamp range whose end does not come after its start
+/// carries: `EndTimestamp` "must be later than the StartTimestamp value".
+pub const TIMESTAMP_RANGE_ORDER_MESSAGE: &str = "StartTimestamp must be before EndTimestamp.";
 
 /// Why a `StreamName`/`StreamARN` pair did not name one stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -472,30 +591,71 @@ impl ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState {
     ///
     /// The model documents `StreamName` and `StreamARN` as "Specify either this
     /// parameter or the StreamName parameter", so exactly one must be present:
-    /// neither and both are client errors, and a name or ARN that answers to no
-    /// stream is a missing resource.
-    pub fn resolve_stream(
+    /// neither and both are client errors.
+    ///
+    /// A stream EXISTS because the Kinesis Video Streams control plane created
+    /// it, so the identifier is resolved in that service's registry in the
+    /// shared engine first, and its record is what the stream's ARN and current
+    /// retention are read from — re-read here on every call, so a retention
+    /// change is visible to the next read. Only an identifier neither that
+    /// registry nor this service's own archive answers to is a missing
+    /// resource.
+    ///
+    /// The control-plane store is locked while this service's own store is
+    /// already locked (the caller holds that guard); the control plane never
+    /// reads this service's state, so there is no cycle between the two.
+    pub fn resolve_stream<Eng: Send + Sync + 'static>(
         &self,
+        engine: &Eng,
         stream_name: Option<&str>,
         stream_arn: Option<&str>,
-    ) -> Result<&ArchivedStream, StreamLookupError> {
+    ) -> Result<ResolvedStream<'_>, StreamLookupError> {
         match (stream_name, stream_arn) {
-            (Some(_), Some(_)) => Err(StreamLookupError::InvalidArgument(
-                "StreamName and StreamARN are mutually exclusive: specify exactly one".to_string(),
-            )),
-            (None, None) => Err(StreamLookupError::InvalidArgument(
-                "Either StreamName or StreamARN is required".to_string(),
-            )),
-            (Some(name), None) => self.streams.get(name).ok_or_else(|| {
-                StreamLookupError::NotFound(format!("No such stream: StreamName {name}"))
+            (Some(_), Some(_)) | (None, None) => {
+                return Err(StreamLookupError::InvalidArgument(
+                    ONE_STREAM_IDENTIFIER_MESSAGE.to_string(),
+                ))
+            }
+            _ => {}
+        }
+
+        // The stream as the control plane holds it right now, with this
+        // service's archive for it — which is empty for a registered stream
+        // nothing has been ingested into, and that emptiness is what the
+        // per-operation no-fragments behaviour is computed from.
+        if let Some(registered) = registered_stream(engine, stream_name, stream_arn) {
+            let archive = self.streams.get(&registered.name);
+            return Ok(ResolvedStream {
+                name: registered.name,
+                arn: registered.arn,
+                data_retention_in_hours: registered.data_retention_in_hours,
+                archive_content_type: archive.map_or_else(
+                    || ARCHIVE_CONTENT_TYPE.to_string(),
+                    |held| held.archive_content_type.clone(),
+                ),
+                fragments: archive.map_or(&[][..], |held| held.fragments.as_slice()),
+            });
+        }
+
+        // No control-plane record: the archive's own entry is the registration
+        // of a stream whose fragments were ingested into this store directly,
+        // so it answers for itself rather than being reported absent.
+        let archive = match (stream_name, stream_arn) {
+            (Some(name), _) => self.streams.get(name),
+            (_, Some(arn)) => self.arn_index.get(arn).and_then(|name| self.streams.get(name)),
+            (None, None) => None,
+        };
+        match archive {
+            Some(held) => Ok(ResolvedStream {
+                name: held.name.clone(),
+                arn: held.arn.clone(),
+                data_retention_in_hours: i64::from(held.data_retention_in_hours),
+                archive_content_type: held.archive_content_type.clone(),
+                fragments: held.fragments.as_slice(),
             }),
-            (None, Some(arn)) => self
-                .arn_index
-                .get(arn)
-                .and_then(|name| self.streams.get(name))
-                .ok_or_else(|| {
-                    StreamLookupError::NotFound(format!("No such stream: StreamARN {arn}"))
-                }),
+            None => Err(StreamLookupError::NotFound(
+                STREAM_NOT_FOUND_MESSAGE.to_string(),
+            )),
         }
     }
 
@@ -560,6 +720,44 @@ fn numeric_order(a: &str, b: &str) -> std::cmp::Ordering {
         (Ok(a), Ok(b)) => a.cmp(&b),
         _ => a.cmp(b),
     }
+}
+
+/// What the Kinesis Video Streams control plane holds for one stream: the half
+/// of a [`ResolvedStream`] this service does not own.
+#[derive(Debug, Clone)]
+struct RegisteredStream {
+    /// The registered `StreamName`.
+    name: String,
+    /// The registered `StreamARN`.
+    arn: String,
+    /// The stream's retention AS OF THIS CALL.
+    data_retention_in_hours: i64,
+}
+
+/// The stream the Kinesis Video Streams control plane registry holds under this
+/// `StreamName`/`StreamARN`, or `None` when it holds none.
+///
+/// The registry is that service's state in the SHARED engine, so a stream a
+/// client created through `CreateStream` is the very record read here — no copy
+/// of it is kept on this side, and nothing here writes to it.
+///
+/// The record's `Status` is not read: a stream is resolved whatever status the
+/// control plane holds it in, so whether a read of a stream that is still
+/// creating (or already deleting) should be refused belongs with the
+/// stream-state work on the control plane, not here.
+fn registered_stream<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    stream_name: Option<&str>,
+    stream_arn: Option<&str>,
+) -> Option<RegisteredStream> {
+    let registry = control_plane::service_state(engine)?;
+    let registry = registry.lock();
+    let stream = registry.resolve(stream_name, stream_arn).ok()?;
+    Some(RegisteredStream {
+        name: stream.stream_name.clone(),
+        arn: stream.stream_arn.clone(),
+        data_retention_in_hours: i64::from(stream.data_retention_in_hours),
+    })
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

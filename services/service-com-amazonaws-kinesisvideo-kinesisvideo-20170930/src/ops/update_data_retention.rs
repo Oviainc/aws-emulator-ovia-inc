@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDataRetention
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDataRetention`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Moves one stream's data-retention period by the hours the request names, up
+//! or down. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDataRetention::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## Behaviour
+//!
+//! * The request names exactly one stream, by `StreamName` or `StreamARN`, and
+//!   must carry the stream's current `Version`: a stale one is
+//!   `VersionMismatchException` (400) and the record is left untouched.
+//! * "The value you specify is added to or subtracted from the current value,
+//!   depending on the operation" — `INCREASE_DATA_RETENTION` adds it,
+//!   `DECREASE_DATA_RETENTION` subtracts it, and a result outside the published
+//!   0..87600 hours is `InvalidArgumentException` (400).
+//! * On success the stored stream carries the new retention and a NEW version,
+//!   so `DescribeStream` reports the current retention and the next update must
+//!   quote the version this call minted.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +182,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDataRetention` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDataRetentionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDataRetention"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateDataRetentionErrorModeled::ClientLimitExceededException(
+                ClientLimitExceededException {
+                    message: Some("The stream store is unavailable. Try again later.".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.settle_clock();
+
+        // ONE resolution per call: the identifier is walked once and the record it
+        // names is remembered by its stream NAME, which is the primary index, so the
+        // mutation below reaches that same record without resolving again.
+        let stream = store
+            .resolve(input.stream_name.as_deref(), input.stream_arn.as_deref())
+            .map_err(lookup_error)?;
+        let stream_name = stream.stream_name.clone();
+        let stored_version = stream.version.clone();
+        let current = i64::from(stream.data_retention_in_hours);
+
+        // The optimistic-concurrency check: "To make sure that you have the latest
+        // version of the stream before updating it" the caller passes the version it
+        // read, so a stale one leaves the record untouched.
+        if input.current_version != stored_version {
+            return Err(UpdateDataRetentionErrorModeled::VersionMismatchException(
+                VersionMismatchException {
+                    message: Some(crate::state::STREAM_VERSION_MISMATCH_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "The value you specify is added to or subtracted from the current value,
+        // depending on the operation", and the result must stay inside the published
+        // bounds: "The minimum value for data retention is 0 and the maximum value is
+        // 87600 (ten years)."
+        let change = i64::from(input.data_retention_change_in_hours);
+        let updated = match input.operation.as_str() {
+            crate::state::INCREASE_DATA_RETENTION => current.saturating_add(change),
+            crate::state::DECREASE_DATA_RETENTION => current.saturating_sub(change),
+            other => {
+                return Err(UpdateDataRetentionErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(format!(
+                            "Operation must be one of [{}], not {other}.",
+                            UPDATE_DATA_RETENTION_OPERATION_VALUES.join(", ")
+                        )),
+                    },
+                )
+                .into())
+            }
+        };
+        if !(0..=crate::state::MAX_DATA_RETENTION_IN_HOURS).contains(&updated) {
+            return Err(UpdateDataRetentionErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(format!(
+                        "The resulting data retention of {updated} hours is outside the \
+                         supported range: the minimum value for data retention is 0 and the \
+                         maximum value is {} (ten years).",
+                        crate::state::MAX_DATA_RETENTION_IN_HOURS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // One mutation of the ONE stored record: the new retention, and a fresh
+        // version, because "when you update a stream, Kinesis Video Streams assigns a
+        // new version number" — so the next caller's `CurrentVersion` is this one.
+        // The record is reached by the name the resolution above yielded, which is the
+        // primary index; it cannot have gone while this call holds the store, and a
+        // miss is reported as the missing resource rather than as a success that
+        // wrote nothing.
+        let version = store.mint_version();
+        let Some(stream) = store.streams.get_mut(&stream_name) else {
+            return Err(lookup_error(crate::state::LookupError::NotFound));
+        };
+        stream.data_retention_in_hours = i32::try_from(updated).unwrap_or(i32::MAX);
+        stream.version = version;
+
+        Ok(UpdateDataRetentionOutput {})
     }
+}
+
+/// State the failure to resolve a `StreamName`/`StreamARN` pair as this operation's
+/// own modeled error: absent or contradictory identifiers are a bad argument (400),
+/// a well-formed identifier for no stored stream is a missing resource (404).
+fn lookup_error(error: crate::state::LookupError) -> UpdateDataRetentionError {
+    match error {
+        crate::state::LookupError::NoIdentifier => {
+            UpdateDataRetentionErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(crate::state::STREAM_IDENTIFIER_REQUIRED_MESSAGE.to_string()),
+            })
+        }
+        crate::state::LookupError::Mismatch => {
+            UpdateDataRetentionErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(crate::state::STREAM_IDENTIFIER_MISMATCH_MESSAGE.to_string()),
+            })
+        }
+        crate::state::LookupError::NotFound => {
+            UpdateDataRetentionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::STREAM_NOT_FOUND_MESSAGE.to_string()),
+            })
+        }
+    }
+    .into()
 }

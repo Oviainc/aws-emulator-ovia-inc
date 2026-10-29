@@ -9,7 +9,10 @@
 //!
 //! * The request names exactly one stream, by `StreamName` or `StreamARN`;
 //!   neither or both is `InvalidArgumentException` (400) and a name or ARN no
-//!   stream answers to is `ResourceNotFoundException` (404).
+//!   stream answers to is `ResourceNotFoundException` (404). The stream is
+//!   resolved in the Kinesis Video Streams registry — the store `CreateStream`
+//!   writes — so a registered stream with nothing archived in the selector's
+//!   window is a SUCCESS carrying an empty `Fragments` list, not a 404.
 //! * `FragmentSelector` is required on the first page only — the model
 //!   documents it as "only required when the NextToken isn't passed in the
 //!   API", because a continuation re-uses the selector its token remembers.
@@ -122,7 +125,7 @@
 use super::types::*;
 use crate::state::{
     date_time_millis, service_state, to_date_time, FragmentCursor, StreamLookupError,
-    TimestampOrigin,
+    TimestampOrigin, TIMESTAMP_RANGE_ORDER_MESSAGE,
 };
 
 /// The page size `ListFragments` uses when the request names no `MaxResults`.
@@ -229,6 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
 
         let stream = match state.resolve_stream(
+            &*self.engine,
             input.stream_name.as_deref(),
             input.stream_arn.as_deref(),
         ) {
@@ -273,11 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let start_millis = date_time_millis(&selector.timestamp_range.start_timestamp);
                 let end_millis = date_time_millis(&selector.timestamp_range.end_timestamp);
                 if end_millis < start_millis {
-                    return Err(invalid(
-                        "FragmentSelector.TimestampRange.EndTimestamp must not be earlier than \
-                         StartTimestamp"
-                            .to_string(),
-                    ));
+                    return Err(invalid(TIMESTAMP_RANGE_ORDER_MESSAGE.to_string()));
                 }
                 FragmentCursor {
                     stream_name: stream.name.clone(),

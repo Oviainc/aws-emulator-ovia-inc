@@ -188,9 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(DeleteStreamErrorModeled::VersionMismatchException(
                     VersionMismatchException {
                         message: Some(
-                            "The stream version specified is not the latest version. \
-                             To get the latest version, use the DescribeStream API."
-                                .to_string(),
+                            crate::state::STREAM_VERSION_MISMATCH_MESSAGE.to_string(),
                         ),
                     },
                 )

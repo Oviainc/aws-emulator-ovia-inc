@@ -8,12 +8,14 @@
 //!
 //! * The request names exactly one stream, by `StreamName` or `StreamARN`;
 //!   neither or both is `InvalidArgumentException` (400) and a name or ARN no
-//!   stream answers to is `ResourceNotFoundException` (404).
+//!   stream answers to is `ResourceNotFoundException` (404). The stream is
+//!   resolved in the Kinesis Video Streams registry — the store `CreateStream`
+//!   writes.
 //! * `Payload` is the stored media of the requested fragments, concatenated in
 //!   the order the request lists them — "a sequence of chunks from the
 //!   specified stream".
-//! * A fragment number the archive does not hold is
-//!   `InvalidArgumentException`, naming that fragment number.
+//! * Fragment numbers that name no fragment on the stream are
+//!   `InvalidArgumentException` (400), listing every one of them.
 //! * `ContentType` is the archive's own container content type, held on the
 //!   stream.
 //!
@@ -116,6 +118,11 @@
 use super::types::*;
 use crate::state::{service_state, ArchivedStream, StreamLookupError, MAX_PAYLOAD_BYTES};
 
+/// The fixed head of the refusal that carries the fragment numbers naming no
+/// fragment on the stream; the rest of the message is those numbers, in request
+/// order, inside the brackets this prefix opens.
+const INVALID_FRAGMENT_NUMBERS_PREFIX: &str = "Fragment numbers are invalid : [";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -204,9 +211,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let state = state.lock();
 
-        let stream = match state
-            .resolve_stream(input.stream_name.as_deref(), input.stream_arn.as_deref())
-        {
+        let stream = match state.resolve_stream(
+            &*self.engine,
+            input.stream_name.as_deref(),
+            input.stream_arn.as_deref(),
+        ) {
             Ok(stream) => stream,
             Err(StreamLookupError::InvalidArgument(message)) => {
                 return Err(GetMediaForFragmentListErrorModeled::InvalidArgumentException(
@@ -228,7 +237,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Exactly the requested fragments, in the order requested — a number
         // the archive does not hold is refused rather than silently skipped,
-        // which would hand back a payload that is not what was asked for.
+        // which would hand back a payload that is not what was asked for. The
+        // refusal lists EVERY offending number, in request order, so a client
+        // learns in one round trip which numbers to drop; the list it echoes is
+        // bounded by the model's own `Fragments` length (1..1000) and member
+        // length (1..128), so the message cannot be larger than the request
+        // that asked for it.
         //
         // The payload is the archive's own stored bytes. The real service also
         // adds per-chunk MKV tags (AWS_KINESISVIDEO_FRAGMENT_NUMBER and the two
@@ -236,19 +250,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not parse or rewrite media, so it returns the stored chunks unaltered
         // rather than synthesising a container it cannot read.
         let mut requested = Vec::with_capacity(input.fragments.len());
+        let mut invalid: Vec<&str> = Vec::new();
         for fragment_number in &input.fragments {
-            let Some(fragment) = stream.fragment(fragment_number) else {
-                return Err(GetMediaForFragmentListErrorModeled::InvalidArgumentException(
-                    InvalidArgumentException {
-                        message: Some(format!(
-                            "Fragment {fragment_number} is not archived for stream {}",
-                            stream.name
-                        )),
-                    },
-                )
-                .into());
-            };
-            requested.push(fragment);
+            match stream.fragment(fragment_number) {
+                Some(fragment) => requested.push(fragment),
+                None => invalid.push(fragment_number.as_str()),
+            }
+        }
+        if !invalid.is_empty() {
+            return Err(GetMediaForFragmentListErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(format!(
+                        "{INVALID_FRAGMENT_NUMBERS_PREFIX}{}]",
+                        invalid.join(", ")
+                    )),
+                },
+            )
+            .into());
         }
 
         // The assembled payload is bounded in BYTES, not only in the number of

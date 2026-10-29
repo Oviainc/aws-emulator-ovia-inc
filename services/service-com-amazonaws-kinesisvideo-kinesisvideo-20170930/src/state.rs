@@ -27,6 +27,20 @@ pub const STATUS_ACTIVE: &str = "ACTIVE";
 /// See [`STATUS_CREATING`].
 pub const STATUS_UPDATING: &str = "UPDATING";
 
+/// `UpdateDataRetentionOperation` values, from
+/// `smithy_query(query="shape", shape="UpdateDataRetentionOperation")` via
+/// [`crate::ops::types::UPDATE_DATA_RETENTION_OPERATION_VALUES`]: which way
+/// `UpdateDataRetention` moves a stream's retention.
+pub const INCREASE_DATA_RETENTION: &str = "INCREASE_DATA_RETENTION";
+/// See [`INCREASE_DATA_RETENTION`].
+pub const DECREASE_DATA_RETENTION: &str = "DECREASE_DATA_RETENTION";
+
+/// The most hours a stream may retain data for: "The minimum value for data retention
+/// is 0 and the maximum value is 87600 (ten years)"
+/// (`UpdateDataRetentionInput$DataRetentionChangeInHours` docs), so a published bound
+/// rather than one chosen here.
+pub const MAX_DATA_RETENTION_IN_HOURS: i64 = 87_600;
+
 /// The `DefaultStorageTier` a stream carries when the create call named no
 /// `StreamStorageConfiguration`: `HOT`, the tier `DefaultStorageTier`'s docs describe as
 /// "Optimized for frequent access with the lowest latency and highest performance", from
@@ -141,6 +155,14 @@ pub const STREAM_NOT_FOUND_MESSAGE: &str = "The requested stream is not found or
 /// StreamARN"), so the refusal is stated once here.
 pub const STREAM_IDENTIFIER_REQUIRED_MESSAGE: &str =
     "Either StreamName or StreamARN must be specified.";
+
+/// How this service words the `VersionMismatchException` every stream mutation
+/// guarded by `CurrentVersion` answers: "The stream version that you specified is not
+/// the latest version. To get the latest version, use the DescribeStream API." Stated
+/// once so the operations that take a version word one failure one way.
+pub const STREAM_VERSION_MISMATCH_MESSAGE: &str =
+    "The stream version specified is not the latest version. To get the latest version, \
+     use the DescribeStream API.";
 
 /// How this service words the `InvalidArgumentException` for a request whose
 /// `StreamName` and `StreamARN` name two different streams. The companion of

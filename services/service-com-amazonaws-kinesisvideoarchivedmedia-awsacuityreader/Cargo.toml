@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The Kinesis Video Streams control plane's own store: `CreateStream` is what creates
+# the streams this read plane serves, so a stream's existence, ARN and current
+# retention are read from that state in the shared engine rather than kept a second
+# time here.
+service-com-amazonaws-kinesisvideo-kinesisvideo-20170930 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

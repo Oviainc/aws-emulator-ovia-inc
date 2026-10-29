@@ -114,24 +114,29 @@ const CASES: &[Case] = &[
         },
     },
     Case {
-        // The archived-media service words a missing stream its own way.
+        // The archived-media reader words the one-identifier rule its own way: the
+        // control plane says "Either StreamName or StreamARN must be specified." and
+        // the media service "Only one of StreamName and StreamARN", so this sentence
+        // names the service that served it. (Its missing-stream wording no longer
+        // does: the reader and the control plane word a 404 for an absent stream the
+        // same way the real services do.)
         name: "Archived Media GetHLSStreamingSessionURL reaches the reader service",
         host: "kinesisvideo.us-east-1.amazonaws.com",
         path: "/getHLSStreamingSessionURL",
-        body: r#"{"StreamName":"absent-stream"}"#,
+        body: r#"{"StreamName":"absent-stream","StreamARN":"arn:aws:kinesisvideo:us-east-1:000000000000:stream/absent-stream/1"}"#,
         expect: Expect::Answered {
-            status: 404,
-            contains: "No such stream: StreamName absent-stream",
+            status: 400,
+            contains: "One of StreamName or StreamARN must be provided, but not both.",
         },
     },
     Case {
         name: "Archived Media ListFragments reaches the reader service",
         host: "127.0.0.1:9297",
         path: "/listFragments",
-        body: r#"{"StreamName":"absent-stream"}"#,
+        body: r#"{"StreamName":"absent-stream","StreamARN":"arn:aws:kinesisvideo:us-east-1:000000000000:stream/absent-stream/1"}"#,
         expect: Expect::Answered {
-            status: 404,
-            contains: "No such stream: StreamName absent-stream",
+            status: 400,
+            contains: "One of StreamName or StreamARN must be provided, but not both.",
         },
     },
     Case {

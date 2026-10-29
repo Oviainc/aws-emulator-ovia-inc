@@ -19,6 +19,8 @@ mod signaling_channel_lifecycle;
 mod state_roundtrip;
 #[path = "all/stream_configuration.rs"]
 mod stream_configuration;
+#[path = "all/stream_data_retention.rs"]
+mod stream_data_retention;
 #[path = "all/stream_lifecycle.rs"]
 mod stream_lifecycle;
 #[path = "all/stream_tags.rs"]
