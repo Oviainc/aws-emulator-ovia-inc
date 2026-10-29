@@ -376,6 +376,23 @@ where
     ))
 }
 
+/// A map the REQUEST carried, in key order.
+///
+/// Every modelled request map deserializes into a
+/// [`std::collections::HashMap`], whose iteration order is neither key order nor
+/// the same from one process to the next. A rule that refuses a request by
+/// walking one of its maps answers with the FIRST offender it meets, so walking
+/// it in hash order would answer one identical request with different messages
+/// on different runs. Collected into a [`BTreeMap`] here, so which entry a
+/// refusal names — and the order in which entries are applied — is a function of
+/// the request alone. Shared by every writer that walks a requested map, and an
+/// absent map reads as an empty one so a caller has one less `Option` to guard.
+pub fn requested_in_key_order<T>(
+    requested: Option<std::collections::HashMap<String, T>>,
+) -> BTreeMap<String, T> {
+    requested.unwrap_or_default().into_iter().collect()
+}
+
 /// The most workspaces this emulator holds, the most entities one workspace
 /// holds, and the most component types one workspace holds, before
 /// `CreateWorkspace` / `CreateEntity` / `CreateComponentType` answer the

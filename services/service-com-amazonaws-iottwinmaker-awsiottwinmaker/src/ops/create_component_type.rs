@@ -322,16 +322,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let extends_from = input.extends_from.clone().unwrap_or_default();
-        let property_definitions = input.property_definitions.clone().unwrap_or_default();
-        let composite_component_types: ::std::collections::BTreeMap<
-            String,
-            CompositeComponentTypeRequest,
-        > = input
-            .composite_component_types
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        // Both requested maps are walked by a rule below, so both are taken in
+        // KEY order (`crate::state::requested_in_key_order`): which entry a
+        // refusal names is decided by the request, not by the iteration order
+        // of the hash map it was deserialized into.
+        let property_definitions =
+            crate::state::requested_in_key_order(input.property_definitions.clone());
+        let composite_component_types =
+            crate::state::requested_in_key_order(input.composite_component_types.clone());
         // A reference this create DECLARES has to resolve: the ids it puts in
         // `extendsFrom` and in `compositeComponentTypes` must name component
         // types the service holds, and the inheritance it declares must not
@@ -361,7 +359,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the `PropertyDefinitionResponse` a read reports, so a definition may
         // omit it only where it refines one it inherits — the rule
         // `crate::state::property_definition_needs_data_type` holds for every
-        // writer of a definition.
+        // writer of a definition. Walked in property-NAME order, so a request
+        // carrying more than one definition without a `dataType` is always
+        // refused for the first of them in key order, exactly as the sibling
+        // `UpdateComponentType` refuses it.
         for (property_name, definition) in &property_definitions {
             if crate::state::property_definition_needs_data_type(&extends_from, definition) {
                 return Err(validation_exception(format!(

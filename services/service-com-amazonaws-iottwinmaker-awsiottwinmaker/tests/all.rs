@@ -128,6 +128,9 @@ mod region_scoping;
 #[path = "all/reported_members.rs"]
 mod reported_members;
 
+#[path = "all/requested_map_refusal_order.rs"]
+mod requested_map_refusal_order;
+
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 

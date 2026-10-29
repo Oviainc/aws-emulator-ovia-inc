@@ -284,16 +284,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The component entries are applied in component-NAME order and the
-        // composite ones in component-PATH order (both maps are collected into
-        // a `BTreeMap`), so which entry a refusal names does not depend on the
-        // request map's iteration order. The composite entries are applied
+        // composite ones in component-PATH order (both maps are taken through
+        // `crate::state::requested_in_key_order`), so which entry a refusal
+        // names does not depend on the request map's iteration order. The
+        // composite entries are applied
         // AFTER the top-level ones, because a composite component's path is
         // resolved against the entity's components: a component this very
         // request creates can hold one.
-        for (component_name, update) in sorted(input.component_updates) {
+        for (component_name, update) in
+            crate::state::requested_in_key_order(input.component_updates)
+        {
             apply_component_update(workspace, &mut updated, &component_name, update)?;
         }
-        for (component_path, update) in sorted(input.composite_component_updates) {
+        for (component_path, update) in
+            crate::state::requested_in_key_order(input.composite_component_updates)
+        {
             apply_composite_component_update(workspace, &mut updated, &component_path, update)?;
         }
 
@@ -353,14 +358,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(output)
     }
-}
-
-/// A requested map in KEY order, so which entry a refusal names does not depend
-/// on the request map's iteration order.
-fn sorted<T>(
-    requested: Option<::std::collections::HashMap<String, T>>,
-) -> ::std::collections::BTreeMap<String, T> {
-    requested.unwrap_or_default().into_iter().collect()
 }
 
 /// What one entry of a request map asks for: the entry's `updateType`, read as
@@ -596,7 +593,7 @@ fn apply_property_updates(
     member_path: &str,
     updates: Option<::std::collections::HashMap<String, PropertyRequest>>,
 ) -> Result<(), UpdateEntityError> {
-    for (property_name, update) in sorted(updates) {
+    for (property_name, update) in crate::state::requested_in_key_order(updates) {
         let member = format!("{member_path}.propertyUpdates.{property_name}");
         match update.update_type.as_deref() {
             Some(UPDATE_TYPE_DELETE) => {
@@ -666,7 +663,7 @@ fn apply_property_group_updates(
     member_path: &str,
     updates: Option<::std::collections::HashMap<String, ComponentPropertyGroupRequest>>,
 ) -> Result<(), UpdateEntityError> {
-    for (group_name, update) in sorted(updates) {
+    for (group_name, update) in crate::state::requested_in_key_order(updates) {
         let member = format!("{member_path}.propertyGroupUpdates.{group_name}");
         let exists = property_groups.contains_key(&group_name);
         let action = map_entry_action(

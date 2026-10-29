@@ -322,12 +322,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let components = input.components.unwrap_or_default();
-        let composite_components = input.composite_components.unwrap_or_default();
+        // Both requested maps are walked by the rules below, so both are taken
+        // in KEY order (`crate::state::requested_in_key_order`): which entry a
+        // refusal names is decided by the request, not by the iteration order
+        // of the hash map it was deserialized into.
+        let components = crate::state::requested_in_key_order(input.components);
+        let composite_components = crate::state::requested_in_key_order(input.composite_components);
         // Every property a `CreateEntity` declares is a NEW property, so its
         // definition must carry the `dataType` the modelled
         // `PropertyDefinitionResponse` requires back — in a component and in a
-        // composite component alike.
+        // composite component alike. Walked in component-name then
+        // component-path order, each component's properties in property-name
+        // order ([`require_data_types`]).
         for (component_name, component) in &components {
             require_data_types(
                 &format!("components.{component_name}"),
@@ -366,9 +372,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::resolve_composite_component_path`). Walked in path
         // order, so which unresolvable path a refusal names does not depend on
         // the request map's iteration order.
-        let mut composite_components: Vec<(String, CompositeComponentRequest)> =
-            composite_components.into_iter().collect();
-        composite_components.sort_by(|(left, _), (right, _)| left.cmp(right));
         for (component_path, composite) in composite_components {
             let resolved = crate::state::resolve_composite_component_path(
                 &component_records,
@@ -489,7 +492,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// path that has to be resolved against the workspace's component types, which
 /// the handler does once the components are in hand.
 fn components_from_request(
-    components: ::std::collections::HashMap<String, ComponentRequest>,
+    components: ::std::collections::BTreeMap<String, ComponentRequest>,
 ) -> ::std::collections::BTreeMap<String, crate::state::ComponentRecord> {
     components
         .into_iter()
@@ -583,11 +586,18 @@ fn abstract_component_type_refusal(
 /// `member_path` is the request member the map hangs off (`components.<name>`,
 /// `compositeComponents.<path>`), so the refusal names the exact member the
 /// caller has to fix.
+///
+/// The requested properties are walked in property-NAME order, so a request
+/// carrying more than one definition without a `dataType` is always refused for
+/// the first of them in key order rather than for whichever one the hash map's
+/// iteration order reached first.
 fn require_data_types(
     member_path: &str,
     properties: Option<&::std::collections::HashMap<String, PropertyRequest>>,
 ) -> Result<(), CreateEntityErrorModeled> {
-    for (property_name, property) in properties.into_iter().flatten() {
+    let properties: ::std::collections::BTreeMap<&String, &PropertyRequest> =
+        properties.into_iter().flatten().collect();
+    for (property_name, property) in properties {
         if property
             .definition
             .as_ref()
