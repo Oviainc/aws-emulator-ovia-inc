@@ -142,6 +142,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The ARN resolves among the policies of the region this request was
         // signed for, so an ARN naming another region names no policy here.
         let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let policy = store
             .policy_mut_by_arn(&region, &input.resource_arn)
@@ -152,6 +153,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for key in &input.tag_keys {
             policy.tags.remove(key);
         }
+        // The tags are a member of the policy a read projects, so this call
+        // modified the policy and the instant it reports as last modified is
+        // this one.
+        policy.mark_modified(now);
 
         Ok(UntagResourceOutput {})
     }

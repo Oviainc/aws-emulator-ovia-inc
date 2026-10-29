@@ -59,5 +59,7 @@ mod schedule_rule_forms;
 mod state_roundtrip;
 #[path = "all/tag_arn_resolution.rs"]
 mod tag_arn_resolution;
+#[path = "all/tag_write_date_modified.rs"]
+mod tag_write_date_modified;
 #[path = "all/unresolvable_policy_id.rs"]
 mod unresolvable_policy_id;

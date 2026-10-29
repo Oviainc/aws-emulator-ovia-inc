@@ -412,7 +412,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy.exclusions = Some(exclusions);
         }
         // "The local date and time when the lifecycle policy was last modified."
-        policy.date_modified = now;
+        policy.mark_modified(now);
 
         Ok(UpdateLifecyclePolicyOutput {})
     }

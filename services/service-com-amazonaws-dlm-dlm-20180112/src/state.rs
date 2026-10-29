@@ -611,6 +611,21 @@ impl LifecyclePolicyRecord {
         self.exclusions = configuration.exclusions;
     }
 
+    /// Stamp the instant this policy was last written, which
+    /// `LifecyclePolicy$DateModified` reports as "the local date and time when
+    /// the lifecycle policy was last modified".
+    ///
+    /// EVERY accepted write of this record goes through here, whichever member
+    /// it changes — the configuration, the activation state, the tags — because
+    /// a read projects the whole record ([`LifecyclePolicyRecord::to_policy`])
+    /// and the instant it reports is therefore the instant of the last change
+    /// to ANY of it, not of the last change to one chosen member. A refused
+    /// request never reaches it: every refusal is decided before the first
+    /// write, so a policy nothing changed keeps the instant it had.
+    pub fn mark_modified(&mut self, now: SystemTime) {
+        self.date_modified = now;
+    }
+
     /// The `PolicyLanguage` this policy's KIND names:
     /// `PolicyDetails$PolicyLanguage` documents `SIMPLIFIED` as "To create a
     /// default policy" and `STANDARD` as "To create a custom policy", so the

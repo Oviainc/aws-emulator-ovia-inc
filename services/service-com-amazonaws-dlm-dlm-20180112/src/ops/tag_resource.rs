@@ -154,6 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // `ResourceArn` is a `PolicyArn`, so the resource it names is the policy
         // whose STORED `PolicyArn` it equals — not one derived from the request —
@@ -166,6 +167,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (key, value) in input.tags {
             policy.tags.insert(key, value);
         }
+        // The tags are a member of the policy a read projects, so this call
+        // modified the policy and the instant it reports as last modified is
+        // this one.
+        policy.mark_modified(now);
 
         Ok(TagResourceOutput {})
     }
