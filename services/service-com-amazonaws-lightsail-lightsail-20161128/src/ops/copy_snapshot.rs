@@ -333,18 +333,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The snapshot the request asked to copy: exactly one of the two mutually
 /// exclusive sources the modelled input admits, resolved against the store once
 /// the request is known to name one.
-enum RequestedSource {
-    /// A manual snapshot of the source Region, named by `sourceSnapshotName`.
-    Snapshot(String),
-    /// An AUTOMATIC snapshot of the instance or disk `sourceResourceName` names,
-    /// addressed either by the `restoreDate` the request carried, or — for
-    /// `None` — by asking for the latest restorable copy, as the modelled
-    /// `useLatestRestorableAutoSnapshot` documentation words it.
-    AutoSnapshot {
-        resource_name: String,
-        date: Option<String>,
-    },
-}
+///
+/// The three operations of this service that can address an automatic snapshot
+/// take the same pair of sources under their own member names, so which source a
+/// request names is settled by the one owner they share
+/// ([`crate::state::requested_snapshot_source`]) and its answer is what this
+/// operation then resolves.
+type RequestedSource = crate::state::RequestedSnapshotSource;
 
 /// The source `input` names, or the refusal its combination of members earns.
 ///
@@ -356,66 +351,18 @@ enum RequestedSource {
 /// and `useLatestRestorableAutoSnapshot` "are mutually exclusive" and are to be
 /// defined "only when copying an automatic snapshot as a manual snapshot", which
 /// is what `sourceResourceName` names the source of — and one of them has to
-/// say WHICH copy, since the add-on takes one a day.
+/// say WHICH copy, since the add-on takes one a day. All of that is the rule the
+/// shared owner answers, in this operation's own words
+/// ([`crate::state::COPY_SNAPSHOT_SOURCE_MEMBERS`]).
 fn requested_source(input: &CopySnapshotInput) -> Result<RequestedSource, CopySnapshotError> {
-    let wants_latest = input.use_latest_restorable_auto_snapshot == Some(true);
-    if let Some(restore_date) = &input.restore_date {
-        if !crate::state::is_auto_snapshot_date(restore_date) {
-            return Err(invalid(format!(
-                "restoreDate '{restore_date}' must be specified in YYYY-MM-DD format"
-            )));
-        }
-        if wants_latest {
-            return Err(invalid(
-                "restoreDate and useLatestRestorableAutoSnapshot are mutually exclusive: \
-                 name the date of the automatic snapshot to copy, or ask for the latest \
-                 restorable one, but not both"
-                    .to_string(),
-            ));
-        }
-    }
-    match (&input.source_snapshot_name, &input.source_resource_name) {
-        (Some(snapshot_name), None) => {
-            if input.restore_date.is_some() || wants_latest {
-                return Err(invalid(
-                    "restoreDate and useLatestRestorableAutoSnapshot are to be defined only \
-                     when copying an automatic snapshot as a manual snapshot, which \
-                     sourceResourceName names the source of, not together with \
-                     sourceSnapshotName"
-                        .to_string(),
-                ));
-            }
-            Ok(RequestedSource::Snapshot(snapshot_name.clone()))
-        }
-        (None, Some(resource_name)) => match (&input.restore_date, wants_latest) {
-            (Some(restore_date), false) => Ok(RequestedSource::AutoSnapshot {
-                resource_name: resource_name.clone(),
-                date: Some(restore_date.clone()),
-            }),
-            (None, true) => Ok(RequestedSource::AutoSnapshot {
-                resource_name: resource_name.clone(),
-                date: None,
-            }),
-            _ => Err(invalid(
-                "sourceResourceName names the source instance or disk of an automatic \
-                 snapshot, so one of restoreDate or useLatestRestorableAutoSnapshot must be \
-                 defined with it"
-                    .to_string(),
-            )),
-        },
-        (Some(_), Some(_)) => Err(invalid(
-            "sourceSnapshotName and sourceResourceName are mutually exclusive: name the \
-             manual snapshot to copy, or the source instance or disk of the automatic \
-             snapshot to copy, but not both"
-                .to_string(),
-        )),
-        (None, None) => Err(invalid(
-            "one of sourceSnapshotName or sourceResourceName must be defined: a manual \
-             snapshot is copied as another manual snapshot, or an automatic snapshot of an \
-             instance or disk is copied as a manual one"
-                .to_string(),
-        )),
-    }
+    crate::state::requested_snapshot_source(
+        crate::state::COPY_SNAPSHOT_SOURCE_MEMBERS,
+        input.source_snapshot_name.as_deref(),
+        input.source_resource_name.as_deref(),
+        input.restore_date.as_deref(),
+        input.use_latest_restorable_auto_snapshot,
+    )
+    .map_err(invalid)
 }
 
 /// What the copy will hold, which is what the snapshot being copied holds: a

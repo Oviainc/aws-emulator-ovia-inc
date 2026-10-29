@@ -545,18 +545,18 @@ enum RequestedSource {
 /// one `relationalDatabaseSnapshotName` names ("The name of the database
 /// snapshot from which to create your new database"). A restore of nothing is
 /// not a restore, so naming neither source is refused too.
+///
+/// WHICH source the request names is settled before any constraint on the
+/// members that address a point in time, exactly as the sibling rule the
+/// automatic-snapshot members are judged by settles it
+/// ([`crate::state::requested_snapshot_source`]): a request carrying those
+/// members with a SNAPSHOT source is told they do not belong there, rather than
+/// being told two members it should not have sent at all conflict with each
+/// other.
 fn requested_source(
     input: &CreateRelationalDatabaseFromSnapshotInput,
 ) -> Result<RequestedSource, CreateRelationalDatabaseFromSnapshotError> {
     let wants_latest = input.use_latest_restorable_time == Some(true);
-    if input.restore_time.is_some() && wants_latest {
-        return Err(invalid(
-            "restoreTime and useLatestRestorableTime are mutually exclusive: name the point in \
-             time to restore the database from, or ask for the latest restorable one, but not \
-             both"
-                .to_string(),
-        ));
-    }
     match (
         &input.relational_database_snapshot_name,
         &input.source_relational_database_name,
@@ -584,7 +584,13 @@ fn requested_source(
                 database_name: database_name.clone(),
                 time: "the latest restorable time".to_string(),
             }),
-            _ => Err(invalid(
+            (Some(_), true) => Err(invalid(
+                "restoreTime and useLatestRestorableTime are mutually exclusive: name the point \
+                 in time to restore the database from, or ask for the latest restorable one, but \
+                 not both"
+                    .to_string(),
+            )),
+            (None, false) => Err(invalid(
                 "sourceRelationalDatabaseName names the database to restore a point in time of, \
                  so one of restoreTime or useLatestRestorableTime must be defined with it"
                     .to_string(),

@@ -16178,6 +16178,18 @@ pub fn is_auto_snapshot_date(value: &str) -> bool {
             .all(|index| bytes[*index].is_ascii_digit())
 }
 
+/// The source members of the operations that can address an AUTOMATIC snapshot
+/// — the one rule those three requests are judged by, and the sentences it
+/// refuses a combination with — in a module of its own. Re-exported here, so
+/// every caller reaches it as `crate::state::…` exactly like the rest of this
+/// module.
+pub mod snapshot_source;
+pub use snapshot_source::{
+    requested_snapshot_source, RequestedSnapshotSource, SnapshotSourceMembers,
+    COPY_SNAPSHOT_SOURCE_MEMBERS, DISK_RESTORE_SOURCE_MEMBERS, INSTANCE_RESTORE_SOURCE_MEMBERS,
+    LATEST_RESTORABLE_AUTO_SNAPSHOT,
+};
+
 /// Whether `value` is a daily automatic-snapshot hour an `AutoSnapshot` add-on
 /// can be scheduled at.
 ///

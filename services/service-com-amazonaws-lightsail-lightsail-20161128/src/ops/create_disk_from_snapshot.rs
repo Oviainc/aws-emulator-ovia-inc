@@ -290,10 +290,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // automatic snapshot of it to restore from and the request is
                 // refused with the service's `DoesNotExist` envelope rather than
                 // answered with a disk restored from nothing.
-                RequestedSource::AutoSnapshot { disk_name, date } => {
+                RequestedSource::AutoSnapshot {
+                    resource_name: disk_name,
+                    date,
+                } => {
                     store
                         .disk(disk_name)
                         .ok_or_else(|| not_found(crate::state::RESOURCE_TYPE_DISK, disk_name))?;
+                    let date = date
+                        .as_deref()
+                        .unwrap_or(crate::state::LATEST_RESTORABLE_AUTO_SNAPSHOT);
                     return Err(crate::scaffolded::Scaffolded::does_not_exist(format!(
                         "no automatic snapshot of the Disk {disk_name} is available to \
                          restore ({date}): this account has taken none"
@@ -384,15 +390,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The snapshot the request asked to restore: exactly one of the two mutually
 /// exclusive sources the modelled input admits, resolved against the store once
 /// the request is known to name one.
-enum RequestedSource {
-    /// A manual snapshot, named by `diskSnapshotName`.
-    Snapshot(String),
-    /// An AUTOMATIC snapshot of `disk_name`, addressed either by the
-    /// `restoreDate` the request carried or by the latest restorable one — which
-    /// `date` reports as the modelled `useLatestRestorableAutoSnapshot`
-    /// documentation words it.
-    AutoSnapshot { disk_name: String, date: String },
-}
+///
+/// The three operations of this service that can address an automatic snapshot
+/// take the same pair of sources under their own member names, so which source a
+/// request names is settled by the one owner they share
+/// ([`crate::state::requested_snapshot_source`]) and its answer is what this
+/// operation then resolves.
+type RequestedSource = crate::state::RequestedSnapshotSource;
 
 /// The source `input` names, or the refusal its combination of members earns.
 ///
@@ -401,66 +405,20 @@ enum RequestedSource {
 /// `useLatestRestorableAutoSnapshot` "are mutually exclusive"; and both of the
 /// latter are to be defined "only when creating a new disk from an automatic
 /// snapshot", which is what `sourceDiskName` names the source of. A restore of
-/// nothing is not a restore, so naming neither source is refused too.
+/// nothing is not a restore, so naming neither source is refused too. All of
+/// that is the rule the shared owner answers, in this operation's own words
+/// ([`crate::state::DISK_RESTORE_SOURCE_MEMBERS`]).
 fn requested_source(
     input: &CreateDiskFromSnapshotInput,
 ) -> Result<RequestedSource, CreateDiskFromSnapshotError> {
-    let wants_latest = input.use_latest_restorable_auto_snapshot == Some(true);
-    if let Some(restore_date) = &input.restore_date {
-        if !crate::state::is_auto_snapshot_date(restore_date) {
-            return Err(invalid(format!(
-                "restoreDate '{restore_date}' must be specified in YYYY-MM-DD format"
-            )));
-        }
-        if wants_latest {
-            return Err(invalid(
-                "restoreDate and useLatestRestorableAutoSnapshot are mutually exclusive: \
-                 name the date of the automatic snapshot to restore, or ask for the latest \
-                 restorable one, but not both"
-                    .to_string(),
-            ));
-        }
-    }
-    match (&input.disk_snapshot_name, &input.source_disk_name) {
-        (Some(snapshot_name), None) => {
-            if input.restore_date.is_some() || wants_latest {
-                return Err(invalid(
-                    "restoreDate and useLatestRestorableAutoSnapshot are to be defined only \
-                     when creating a new disk from an automatic snapshot, which \
-                     sourceDiskName names the source of, not together with \
-                     diskSnapshotName"
-                        .to_string(),
-                ));
-            }
-            Ok(RequestedSource::Snapshot(snapshot_name.clone()))
-        }
-        (None, Some(disk_name)) => match (&input.restore_date, wants_latest) {
-            (Some(restore_date), false) => Ok(RequestedSource::AutoSnapshot {
-                disk_name: disk_name.clone(),
-                date: restore_date.clone(),
-            }),
-            (None, true) => Ok(RequestedSource::AutoSnapshot {
-                disk_name: disk_name.clone(),
-                date: "the latest restorable automatic snapshot".to_string(),
-            }),
-            _ => Err(invalid(
-                "sourceDiskName names the source disk of an automatic snapshot, so one of \
-                 restoreDate or useLatestRestorableAutoSnapshot must be defined with it"
-                    .to_string(),
-            )),
-        },
-        (Some(_), Some(_)) => Err(invalid(
-            "diskSnapshotName and sourceDiskName are mutually exclusive: name the disk \
-             snapshot to restore, or the source disk of the automatic snapshot to restore, \
-             but not both"
-                .to_string(),
-        )),
-        (None, None) => Err(invalid(
-            "one of diskSnapshotName or sourceDiskName must be defined: a disk is created \
-             from a manual snapshot of a disk, or from an automatic snapshot of one"
-                .to_string(),
-        )),
-    }
+    crate::state::requested_snapshot_source(
+        crate::state::DISK_RESTORE_SOURCE_MEMBERS,
+        input.disk_snapshot_name.as_deref(),
+        input.source_disk_name.as_deref(),
+        input.restore_date.as_deref(),
+        input.use_latest_restorable_auto_snapshot,
+    )
+    .map_err(invalid)
 }
 
 /// Lightsail's refusal of a well-formed request its resources' state does not

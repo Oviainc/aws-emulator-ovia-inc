@@ -309,6 +309,8 @@ mod resource_tags;
 mod setup_history_reporting;
 #[path = "all/snapshot_copy.rs"]
 mod snapshot_copy;
+#[path = "all/snapshot_source_members.rs"]
+mod snapshot_source_members;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/static_ip_allocation.rs"]
