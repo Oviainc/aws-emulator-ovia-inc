@@ -13,14 +13,24 @@
 //! materialises the removal for every later reader — nothing sleeps, and no read starts
 //! a deletion.
 //!
-//! * The account boundary is decided FIRST: an ARN outside the caller's own account is
-//!   refused with `AccessDeniedException` (403) before the source is resolved
-//!   ([`crate::state::authorize_resource_arn`]), so an unauthorized deletion is never
-//!   reported as a completed one. `IdentitySourceArn` carries no ARN `@pattern` of its
-//!   own here (`length(max: 1000)` only), so a value that is not a well-formed ARN is
-//!   refused by this handler with the one sentence this service answers that class with
-//!   ([`crate::state::invalid_arn`]): `ValidationException` (400).
-//! * An ARN under which this store holds no identity source is a success that changes
+//! * `IdentitySourceArn` carries no ARN `@pattern` of its own here (`length(max: 1000)`
+//!   only), so the malformed-ARN class is decided FIRST by this handler, against the
+//!   grammar the member ADDRESSES ([`crate::state::is_identity_source_arn`]): a value
+//!   that is not an ARN this service could have minted for an identity source — another
+//!   service's namespace, another resource kind of this service, a partition outside the
+//!   `aws` family, an account that is not twelve digits, a missing resource id, or no ARN
+//!   at all — names no identity source whatever this store holds, so it is refused with
+//!   the one sentence this service answers that class with
+//!   ([`crate::state::invalid_arn`]): `ValidationException` (400), never reported as a
+//!   deletion that was carried out. The screen is the one `get_identity_source.rs`
+//!   applies to the same member, so this service answers one value that addresses no
+//!   identity source one way whichever operation is asked.
+//! * The account boundary is decided next, before the source is resolved: an
+//!   identity-source ARN outside the caller's own account is refused with
+//!   `AccessDeniedException` (403) ([`crate::state::authorize_resource_arn`]), so an
+//!   unauthorized deletion is never reported as a completed one.
+//! * An identity-source ARN under which this store holds no identity source is a success
+//!   that changes
 //!   nothing: the operation is `@idempotent` and its model declares NO
 //!   `ResourceNotFoundException` (`smithy_query(query="operation",
 //!   operation="DeleteIdentitySource")`: `AccessDenied`, `Conflict`, `InternalServer`,
@@ -206,8 +216,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         // `IdentitySourceArn` carries no ARN `@pattern` here, so the malformed-ARN class
         // is refused by this handler with the one sentence this service answers it with
-        // (`crate::state::invalid_arn`, 400) rather than by the boundary.
-        if !crate::state::is_well_formed_arn(&input.identity_source_arn) {
+        // (`crate::state::invalid_arn`, 400) rather than by the boundary. A value that is
+        // not an identity source's own ARN addresses no identity source, so it is refused
+        // as that class rather than reported as a delete that was carried out — the same
+        // screen `get_identity_source.rs` applies to the same member.
+        if !crate::state::is_identity_source_arn(&input.identity_source_arn) {
             return Err(DeleteIdentitySourceErrorModeled::ValidationException(
                 crate::state::invalid_arn(),
             )
@@ -233,9 +246,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         state.materialize_due(now);
 
-        // An ARN under which nothing is stored leaves the caller in the state it asked
-        // for: the operation is `@idempotent` and models no not-found error, so an
-        // identity source that is already gone is a success that writes nothing.
+        // An identity-source ARN under which nothing is stored leaves the caller in the
+        // state it asked for: the operation is `@idempotent` and models no not-found
+        // error, so an identity source that is already gone is a success that writes
+        // nothing. Only a value that ADDRESSES an identity source reaches here.
         if state.identity_source(&input.identity_source_arn).is_none() {
             return Ok(DeleteIdentitySourceOutput);
         }

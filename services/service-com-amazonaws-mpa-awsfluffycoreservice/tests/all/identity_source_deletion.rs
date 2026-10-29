@@ -11,7 +11,9 @@
 //! no `ResourceNotFoundException`); a source a stored approval team's approvers
 //! authenticate through is `ConflictException` (409); an ARN outside the caller's account
 //! is `AccessDeniedException` (403), decided before the source is resolved; and a value
-//! that is not a well-formed ARN is `ValidationException` (400).
+//! that is not an ARN of this service's identity-source resource — the kind of ARN the
+//! member addresses — is `ValidationException` (400), decided before the account boundary
+//! and before anything is looked up.
 //!
 //! The tables below span that class along what the rule generalises over: the stored
 //! source's status when the delete is issued (`CREATING` and `ACTIVE`, the two statuses a
@@ -291,9 +293,10 @@ async fn a_deleted_identity_source_is_deleting_then_gone_and_nothing_else_moves(
     }
 }
 
-/// An ARN in the caller's own account under which no identity source is stored: the
-/// source is already absent, so the idempotent delete succeeds and writes nothing —
-/// whatever the ARN names.
+/// An identity-source ARN in the caller's own account under which no identity source is
+/// stored: the source is already absent, so the idempotent delete succeeds and writes
+/// nothing. A value that addresses no identity source at all is NOT this class — see
+/// `a_malformed_identity_source_arn_is_refused`.
 #[tokio::test]
 async fn deleting_an_identity_source_that_is_not_stored_changes_nothing() {
     let harness = Harness::new();
@@ -329,10 +332,12 @@ async fn deleting_an_identity_source_that_is_not_stored_changes_nothing() {
     let team_arn = text(&team, "Arn");
 
     let account = engine::emulator_account_id();
-    // (case, the ARN asked for). Every row names the caller's OWN account, the
-    // boundary being decided first: an ARN naming another account — or none, as an
-    // AWS-managed policy's does — is the 403 the cross-account table asserts.
-    let rows: [(&str, String); 4] = [
+    // (case, the ARN asked for). Every row IS an ARN of this service's identity-source
+    // resource in the caller's OWN account — the only values that reach the lookup at all —
+    // and differs along what the store holds nothing under: an id never minted, a region
+    // nothing was created in, the whole resource-id character class, and the longest id a
+    // conforming request can carry.
+    let rows: [(&str, String); 5] = [
         (
             "an identity-source id this account never minted",
             format!("arn:aws:mpa:{REGION}:{account}:identity-source/ids-000000009999"),
@@ -342,12 +347,24 @@ async fn deleting_an_identity_source_that_is_not_stored_changes_nothing() {
             format!("arn:aws:mpa:eu-west-1:{account}:identity-source/ids-000000000001"),
         ),
         (
-            "an approval team's ARN — a resource of another type",
-            team_arn.clone(),
+            // `[a-zA-Z0-9._-]+` is the resource-id class this service's ARN patterns
+            // declare (`ApprovalTeamArn`'s own pattern).
+            "an id spanning the resource-id character class",
+            format!("arn:aws:mpa:{REGION}:{account}:identity-source/Ids.000_000-9"),
         ),
         (
-            "an identity-source ARN of another service's namespace",
-            format!("arn:aws:sso:{REGION}:{account}:identity-source/ids-000000000001"),
+            // `aws(-[^:]+)?` in the same pattern admits every suffixed partition.
+            "an identity source of the China partition",
+            format!("arn:aws-cn:mpa:cn-north-1:{account}:identity-source/ids-000000000001"),
+        ),
+        (
+            // `@length(max: 1000)`: an ARN padded in its id to the member's maximum.
+            "an ARN at the member's maximum length",
+            {
+                let base =
+                    format!("arn:aws:mpa:{REGION}:{account}:identity-source/ids-");
+                format!("{base}{}", "0".repeat(1000 - base.len()))
+            },
         ),
     ];
 
@@ -555,23 +572,9 @@ async fn an_identity_source_outside_the_callers_account_is_denied_before_resolut
     }
 
     // An ARN that names NO account — the form an AWS-managed MPA policy's ARN takes
-    // (`arn:aws:mpa:::aws:policy/...`) — is not the caller's either, so it earns the
-    // same refusal rather than the no-op success an absent source does.
-    for (case, arn) in [(
-        "a global ARN naming no account",
-        "arn:aws:mpa:::aws:policy/IdentityCenter/MPAApprovalTeamPolicy/$DEFAULT".to_string(),
-    )] {
-        let (status, body) = delete_source(&harness, &arn).await;
-        assert_eq!(
-            status, 403,
-            "case {case:?}: expected HTTP 403, got {status} with {body:?}"
-        );
-        assert_eq!(
-            error_code(&body),
-            "AccessDeniedException",
-            "case {case:?}: expected error code AccessDeniedException, got {body:?}"
-        );
-    }
+    // (`arn:aws:mpa:::aws:policy/...`) — carries no account for this boundary to compare
+    // and names no identity source either, so it is the malformed-ARN class the table in
+    // `a_malformed_identity_source_arn_is_refused` asserts, decided before this boundary.
 
     // A refused request is a refusal: the caller's own source is exactly as it was.
     assert!(
@@ -581,18 +584,26 @@ async fn an_identity_source_outside_the_callers_account_is_denied_before_resolut
 }
 
 /// `IdentitySourceArn` carries no ARN pattern of its own (`length(max: 1000)` only), so a
-/// value that is not a well-formed ARN is refused by this service's malformed-ARN rule:
-/// `ValidationException` (400) with [`state::INVALID_ARN_MESSAGE`].
+/// value that is not an ARN of this service's identity-source resource — the kind of ARN
+/// the member addresses — is refused by this service's malformed-ARN rule:
+/// `ValidationException` (400) with [`state::INVALID_ARN_MESSAGE`], decided before the
+/// account boundary and before anything is looked up.
 #[tokio::test]
 async fn a_malformed_identity_source_arn_is_refused() {
     let harness = Harness::new();
     let owned = create_source(&harness, 1, 0).await;
 
     let account = engine::emulator_account_id();
-    // (case, the value asked for) — rows differ along WHICH part of the ARN grammar
-    // `arn:<partition>:<service>:<region>:<account>:<resource>` is missing or empty.
-    let rows: [(&str, String); 7] = [
+    // (case, the value asked for) — rows differ along WHICH part of the grammar
+    // `arn:<partition>:mpa:<region>:<account>:identity-source/<id>` the value misses: the
+    // ARN syntax itself, the partition, the service namespace, the region, the account,
+    // the resource kind and the resource id.
+    let rows: [(&str, String); 18] = [
         ("no colons at all", "not-an-arn".to_string()),
+        (
+            "an identity source's id, not its ARN",
+            "ids-000000000001".to_string(),
+        ),
         ("the arn prefix misspelled", format!("srn:aws:mpa:{REGION}:{account}:identity-source/ids-1")),
         ("too few fields", "arn:aws:mpa".to_string()),
         (
@@ -608,8 +619,58 @@ async fn a_malformed_identity_source_arn_is_refused() {
             format!("arn::mpa:{REGION}:{account}:identity-source/ids-1"),
         ),
         (
+            // `aws(-[^:]+)?` is the partition segment of this service's ARN patterns
+            // (`ApprovalTeamArn`).
+            "a partition outside the aws family",
+            format!("arn:not-aws:mpa:{REGION}:{account}:identity-source/ids-1"),
+        ),
+        (
             "an empty service",
             format!("arn:aws::{REGION}:{account}:identity-source/ids-1"),
+        ),
+        (
+            "another service's namespace",
+            format!("arn:aws:sso:{REGION}:{account}:identity-source/ids-000000000001"),
+        ),
+        (
+            // `[a-z0-9-]{1,20}` in the same pattern, so an empty region is no ARN of this
+            // service.
+            "no region",
+            format!("arn:aws:mpa::{account}:identity-source/ids-000000000001"),
+        ),
+        (
+            // `[0-9]{12}` in the same pattern.
+            "an account that is not twelve digits",
+            format!("arn:aws:mpa:{REGION}:12345:identity-source/ids-000000000001"),
+        ),
+        (
+            "no account",
+            format!("arn:aws:mpa:{REGION}::identity-source/ids-000000000001"),
+        ),
+        (
+            // `ApprovalTeamArn`: another resource kind of this same service.
+            "an approval team's ARN",
+            format!("arn:aws:mpa:{REGION}:{account}:approval-team/some-team"),
+        ),
+        (
+            // `QualifiedPolicyArn`: an AWS-owned, global resource of this service, whose
+            // ARN names no account at all.
+            "an AWS-managed MPA policy's ARN",
+            "arn:aws:mpa:::aws:policy/IdentityCenter/MPAApprovalTeamPolicy/$DEFAULT".to_string(),
+        ),
+        (
+            "the resource kind with no id",
+            format!("arn:aws:mpa:{REGION}:{account}:identity-source"),
+        ),
+        (
+            "the resource kind with an empty id",
+            format!("arn:aws:mpa:{REGION}:{account}:identity-source/"),
+        ),
+        (
+            // `[a-zA-Z0-9._-]+` is the resource-id class this service's ARN patterns
+            // declare, so a tilde is not one of its characters.
+            "a resource id outside the id character class",
+            format!("arn:aws:mpa:{REGION}:{account}:identity-source/ids~1"),
         ),
     ];
 

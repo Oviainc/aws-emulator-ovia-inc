@@ -37,11 +37,13 @@
 //! apply: this request identifies its resource BY ARN, so its authorization decision reads
 //! a value out of the request — it is the cross-account check above.
 //!
-//! `DeleteIdentitySource` reads the same member and stops at [`crate::state::is_well_formed_arn`]
-//! on purpose: it is `@idempotent` and declares NO `ResourceNotFoundException`, so an ARN it
-//! holds nothing under is a success that writes nothing whatever that ARN names, and the
-//! resource KIND makes no difference to its answer. It does to this one, which has to tell a
-//! value that addresses no identity source from an identity source that is not there.
+//! `DeleteIdentitySource` reads the same member and screens it with the same grammar
+//! ([`crate::state::is_identity_source_arn`]): the member ADDRESSES an identity source on
+//! both operations, so a value that addresses none is the malformed-ARN class on both. The
+//! two part only AFTER the address is resolved: this read answers
+//! `ResourceNotFoundException` for an identity-source ARN this store holds nothing under,
+//! while the delete is `@idempotent`, declares no such error and answers that same ARN a
+//! success that writes nothing.
 //!
 //! ## Shape of an operation
 //!

@@ -37,6 +37,8 @@ mod clock_owed_order;
 mod create_tag_ceiling;
 #[path = "all/identity_source_approval_portal.rs"]
 mod identity_source_approval_portal;
+#[path = "all/identity_source_arn_addressing.rs"]
+mod identity_source_arn_addressing;
 #[path = "all/identity_source_deletion.rs"]
 mod identity_source_deletion;
 #[path = "all/identity_source_detail.rs"]
