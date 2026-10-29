@@ -14,9 +14,11 @@
 //! replaces that generation, because one billing period has one version of the item.
 //! The newest element is the item as a read of the item itself reports it, a frozen
 //! element keeps what it held, the request's billing-period filter selects the
-//! generations in effect anywhere in that span, `MaxResults`/`NextToken` page the
-//! sequence, and an `Arn` that names no stored item — or a filter range whose end
-//! precedes its start — is refused 400 `ValidationException`.
+//! generations in effect anywhere in that span — its `StartBillingPeriod` inclusive and
+//! its `EndBillingPeriod` exclusive, as the model documents them — `MaxResults`/
+//! `NextToken` page the sequence, and an `Arn` that names no stored item — or a filter
+//! range whose exclusive end is at or before its inclusive start, which covers no
+//! billing period — is refused 400 `ValidationException`.
 //!
 //! The rows span what the rule generalises over rather than one recorded call: how many
 //! writes the item has taken (none, one, several), which billing period each takes
@@ -24,7 +26,8 @@
 //! and whether that range has an end, how a month is spelled (one-digit / zero-padded
 //! month),
 //! which attribute a write changes, where a filter's span falls relative to a
-//! generation's (before, at the start, inside, across, after, open at either end), the
+//! generation's (before, at the start, inside, across, at its exclusive end, after, open
+//! at either end, empty), the
 //! page size (each published bound of `MaxCustomLineItemResults` and one past each), and
 //! the form the `Arn` takes (full ARN / bare resource id).
 
@@ -273,14 +276,23 @@ fn period_key(value: &str) -> Option<i64> {
 fn period(months: i64) -> String {
     let current =
         service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period();
-    let (year, month) = current
-        .split_once('-')
-        .expect("the current billing period is spelled YYYY-MM");
-    let total = year.parse::<i64>().expect("a four-digit year") * 12
-        + month.parse::<i64>().expect("a month")
-        - 1
-        + months;
-    format!("{:04}-{:02}", total.div_euclid(12), total.rem_euclid(12) + 1)
+    let key = period_key(&current).expect("the current billing period is spelled YYYY-MM");
+    period_of_key(key + months)
+}
+
+/// The `BillingPeriod` a month count names, zero-padded — the inverse of [`period_key`].
+fn period_of_key(key: i64) -> String {
+    format!(
+        "{:04}-{:02}",
+        (key - 1).div_euclid(12),
+        (key - 1).rem_euclid(12) + 1
+    )
+}
+
+/// The billing period directly AFTER `billing_period`, i.e. the exclusive end bound of
+/// the half-open range that covers exactly that one period.
+fn next_period(billing_period: &str) -> String {
+    period_of_key(period_key(billing_period).expect("a billing period spelled YYYY-MM") + 1)
 }
 
 /// The same billing period with its month spelled without a leading zero — the other
@@ -902,7 +914,8 @@ async fn a_frozen_version_keeps_the_association_size_it_had() {
 }
 
 /// THE RULE on the filter: a billing-period range selects the generations in effect
-/// anywhere inside it — both of its bounds inclusive, an absent bound open.
+/// anywhere inside it — its start bound INCLUSIVE and its end bound EXCLUSIVE, as the
+/// model documents them, and an absent bound open.
 #[tokio::test]
 async fn the_billing_period_filter_selects_the_versions_in_effect_in_that_span() {
     // The fixture's generations: [period(-1), period(0)) and [period(0), period(4)) —
@@ -920,19 +933,31 @@ async fn the_billing_period_filter_selects_the_versions_in_effect_in_that_span()
         (
             "one period, the first generation's own start",
             json!({ "Filters": { "BillingPeriodRange": {
-                "StartBillingPeriod": period(-1), "EndBillingPeriod": period(-1) } } }),
+                "StartBillingPeriod": period(-1), "EndBillingPeriod": period(0) } } }),
             vec![period(-1)],
         ),
         (
             "one period inside the newest generation",
             json!({ "Filters": { "BillingPeriodRange": {
-                "StartBillingPeriod": period(2), "EndBillingPeriod": period(2) } } }),
+                "StartBillingPeriod": period(2), "EndBillingPeriod": period(3) } } }),
             vec![period(0)],
+        ),
+        (
+            "one period, the last the newest generation is in effect in",
+            json!({ "Filters": { "BillingPeriodRange": {
+                "StartBillingPeriod": period(3), "EndBillingPeriod": period(4) } } }),
+            vec![period(0)],
+        ),
+        (
+            "one period, the newest generation's own exclusive end",
+            json!({ "Filters": { "BillingPeriodRange": {
+                "StartBillingPeriod": period(4), "EndBillingPeriod": period(5) } } }),
+            vec![],
         ),
         (
             "a span across two generations",
             json!({ "Filters": { "BillingPeriodRange": {
-                "StartBillingPeriod": period(-1), "EndBillingPeriod": period(0) } } }),
+                "StartBillingPeriod": period(-1), "EndBillingPeriod": period(1) } } }),
             generations.clone(),
         ),
         (
@@ -944,7 +969,7 @@ async fn the_billing_period_filter_selects_the_versions_in_effect_in_that_span()
         (
             "a span open at its start",
             json!({ "Filters": { "BillingPeriodRange": {
-                "EndBillingPeriod": period(-1) } } }),
+                "EndBillingPeriod": period(0) } } }),
             vec![period(-1)],
         ),
         (
@@ -956,14 +981,14 @@ async fn the_billing_period_filter_selects_the_versions_in_effect_in_that_span()
         (
             "a span entirely before the item existed",
             json!({ "Filters": { "BillingPeriodRange": {
-                "StartBillingPeriod": period(-13), "EndBillingPeriod": period(-2) } } }),
+                "StartBillingPeriod": period(-13), "EndBillingPeriod": period(-1) } } }),
             vec![],
         ),
         (
             "months spelled without their leading zeroes",
             json!({ "Filters": { "BillingPeriodRange": {
                 "StartBillingPeriod": one_digit_month(&period(3)),
-                "EndBillingPeriod": one_digit_month(&period(3)) } } }),
+                "EndBillingPeriod": one_digit_month(&period(4)) } } }),
             vec![period(0)],
         ),
     ];
@@ -1149,6 +1174,14 @@ async fn a_request_the_store_or_the_model_cannot_serve_is_refused() {
             Some("Filters.BillingPeriodRange.EndBillingPeriod"),
         ),
         (
+            "a filter range whose exclusive end IS its inclusive start",
+            item.clone(),
+            json!({ "Filters": { "BillingPeriodRange": {
+                "StartBillingPeriod": period(0), "EndBillingPeriod": period(0) } } }),
+            Some("ILLEGAL_BILLING_PERIOD_RANGE"),
+            Some("Filters.BillingPeriodRange.EndBillingPeriod"),
+        ),
+        (
             "a MaxResults one below its modelled range",
             item.clone(),
             json!({ "MaxResults": MAX_RESULTS_BOUNDS.0 - 1 }),
@@ -1247,7 +1280,7 @@ async fn a_create_without_a_range_starts_the_version_in_the_period_it_landed_in(
             case,
             &item,
             json!({ "Filters": { "BillingPeriodRange": {
-                "StartBillingPeriod": start, "EndBillingPeriod": start } } }),
+                "StartBillingPeriod": start, "EndBillingPeriod": next_period(&start) } } }),
         )
         .await;
     assert_eq!(
@@ -1255,4 +1288,111 @@ async fn a_create_without_a_range_starts_the_version_in_the_period_it_landed_in(
         "case {case:?}: expected the version to be selected by the period it starts in, got \
          {selected:?}"
     );
+}
+
+/// THE RULE on an empty filter range: the filter's start billing period is INCLUSIVE and
+/// its end billing period EXCLUSIVE, so a range whose end is at or before its start
+/// covers no billing period at all and is refused 400 `ValidationException` with the
+/// `Reason` this service enumerates for an illegal billing period range — the answer
+/// every operation of this service gives such a range. The smallest range that covers a
+/// billing period ends at the period AFTER it, and a range open at either end is never
+/// empty.
+#[tokio::test]
+async fn a_filter_range_covering_no_billing_period_is_refused() {
+    let (emulator, _, item) =
+        fixture(json!({ "BillingPeriodRange": period_range(&period(-1), None) })).await;
+
+    // (case, the filter's StartBillingPeriod, its EndBillingPeriod) — the bounds are
+    // compared as billing PERIODS, so two spellings of one month are one period and
+    // bound the same empty range.
+    let empty: Vec<(&str, String, String)> = vec![
+        (
+            "equal bounds, the generation's own start period",
+            period(-1),
+            period(-1),
+        ),
+        (
+            "equal bounds, the current billing period",
+            period(0),
+            period(0),
+        ),
+        (
+            "equal bounds, a period the item is in effect in",
+            period(2),
+            period(2),
+        ),
+        (
+            "equal bounds, one of them spelled without its leading zero",
+            one_digit_month(&period(3)),
+            period(3),
+        ),
+        ("the end one period before the start", period(3), period(2)),
+        ("the end many periods before the start", period(5), period(-7)),
+        (
+            "the end a year before the start",
+            period(0),
+            period(-12),
+        ),
+    ];
+    for (case, start, end) in empty {
+        let (status, body) = emulator
+            .versions(
+                &item,
+                json!({ "Filters": { "BillingPeriodRange": {
+                    "StartBillingPeriod": start, "EndBillingPeriod": end } } }),
+            )
+            .await;
+        assert_refused(
+            case,
+            status,
+            &body,
+            400,
+            "ValidationException",
+            Some("ILLEGAL_BILLING_PERIOD_RANGE"),
+            Some("Filters.BillingPeriodRange.EndBillingPeriod"),
+        );
+    }
+
+    // (case, a non-empty range) — each of these covers at least one billing period, so
+    // each is served, whether or not a generation falls inside it.
+    let served: Vec<(&str, Value)> = vec![
+        (
+            "one period, the generation's own start",
+            json!({ "StartBillingPeriod": period(-1), "EndBillingPeriod": period(0) }),
+        ),
+        (
+            "one period, the current one",
+            json!({ "StartBillingPeriod": period(0), "EndBillingPeriod": period(1) }),
+        ),
+        (
+            "one period, spelled without its leading zeroes",
+            json!({
+                "StartBillingPeriod": one_digit_month(&period(3)),
+                "EndBillingPeriod": one_digit_month(&period(4)),
+            }),
+        ),
+        (
+            "a span of a year",
+            json!({ "StartBillingPeriod": period(-6), "EndBillingPeriod": period(6) }),
+        ),
+        (
+            "open at its end",
+            json!({ "StartBillingPeriod": period(9) }),
+        ),
+        (
+            "open at its start",
+            json!({ "EndBillingPeriod": period(-7) }),
+        ),
+        ("open at both ends", json!({})),
+    ];
+    for (case, range) in served {
+        let (status, body) = emulator
+            .versions(&item, json!({ "Filters": { "BillingPeriodRange": range } }))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected a range covering a billing period to be served with HTTP \
+             200, got {status} with {body}"
+        );
+    }
 }

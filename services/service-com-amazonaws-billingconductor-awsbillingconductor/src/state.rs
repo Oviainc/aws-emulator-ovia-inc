@@ -4118,6 +4118,50 @@ pub fn first_duplicate(values: &[String]) -> Option<&String> {
     values.iter().find(|value| !seen.insert(value.as_str()))
 }
 
+/// Does a half-open billing-period range — an INCLUSIVE start bound and an EXCLUSIVE
+/// end bound, either of which may be absent and so open — cover at least one billing
+/// period?
+///
+/// The start is in the range and the end is not, so an end at or before the start covers
+/// no billing period at all. The bounds are the STRINGS a request carried, parsed through
+/// [`billing_period_key`] so two spellings of one month are one period, and ordered by
+/// the crate's one half-open comparison, [`billing_period_precedes`].
+pub fn half_open_billing_period_range_is_ordered(
+    inclusive_start: Option<&str>,
+    exclusive_end: Option<&str>,
+) -> bool {
+    billing_period_precedes(
+        inclusive_start.and_then(billing_period_key),
+        exclusive_end.and_then(billing_period_key),
+    )
+}
+
+/// Does a half-open billing-period range cover a non-empty span of billing periods — or
+/// is that the refusal it earns?
+///
+/// The rule is [`half_open_billing_period_range_is_ordered`], and
+/// `exclusive_end_member` is the member path of the end bound in the shape that carried
+/// it, so every spelling of the one range — a write's
+/// `InclusiveStartBillingPeriod`/`ExclusiveEndBillingPeriod` and a filter's
+/// inclusive-start/exclusive-end pair alike — earns the same refusal naming its own
+/// member.
+pub fn check_half_open_billing_period_range_is_ordered(
+    inclusive_start: Option<&str>,
+    exclusive_end: Option<&str>,
+    exclusive_end_member: &'static str,
+) -> Result<(), ValidationRefusal> {
+    if half_open_billing_period_range_is_ordered(inclusive_start, exclusive_end) {
+        return Ok(());
+    }
+    Err((
+        "ILLEGAL_BILLING_PERIOD_RANGE",
+        exclusive_end_member,
+        "the exclusive end billing period must be later than the inclusive start billing \
+         period"
+            .to_string(),
+    ))
+}
+
 /// Is a `CustomLineItemBillingPeriodRange` ordered, i.e. does it describe a non-empty
 /// span of billing periods?
 ///
@@ -4128,14 +4172,10 @@ pub fn first_duplicate(values: &[String]) -> Option<&String> {
 pub fn billing_period_range_is_ordered(
     range: &crate::ops::types::CustomLineItemBillingPeriodRange,
 ) -> bool {
-    let Some(end) = range
-        .exclusive_end_billing_period
-        .as_deref()
-        .and_then(billing_period_key)
-    else {
-        return true;
-    };
-    billing_period_key(&range.inclusive_start_billing_period).is_none_or(|start| start < end)
+    half_open_billing_period_range_is_ordered(
+        Some(range.inclusive_start_billing_period.as_str()),
+        range.exclusive_end_billing_period.as_deref(),
+    )
 }
 
 /// Does `range` describe a non-empty span of billing periods — or is that the refusal
@@ -4151,16 +4191,11 @@ pub fn billing_period_range_is_ordered(
 pub fn check_billing_period_range_is_ordered(
     range: &crate::ops::types::CustomLineItemBillingPeriodRange,
 ) -> Result<(), ValidationRefusal> {
-    if billing_period_range_is_ordered(range) {
-        return Ok(());
-    }
-    Err((
-        "ILLEGAL_BILLING_PERIOD_RANGE",
+    check_half_open_billing_period_range_is_ordered(
+        Some(range.inclusive_start_billing_period.as_str()),
+        range.exclusive_end_billing_period.as_deref(),
         "BillingPeriodRange.ExclusiveEndBillingPeriod",
-        "the exclusive end billing period must be later than the inclusive start billing \
-         period"
-            .to_string(),
-    ))
+    )
 }
 
 /// How many billing periods back a request may still apply a change to, counted from

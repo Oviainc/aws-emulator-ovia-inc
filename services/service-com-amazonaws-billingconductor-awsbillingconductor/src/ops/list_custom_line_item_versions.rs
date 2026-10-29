@@ -148,15 +148,14 @@ fn end_billing_period(
 /// Is a generation in effect anywhere inside the billing periods the request's filter
 /// names?
 ///
-/// The filter is the span of billing periods the versions "are applied" in, and its
-/// member names carry no inclusive/exclusive marker — unlike the half-open
-/// `CustomLineItemBillingPeriodRange` a write carries, whose members spell both out —
-/// so both of its bounds are read as INCLUSIVE and an absent bound as open. A
-/// generation is selected when its own half-open span shares at least one billing
-/// period with that span. Every generation reaching this filter applies in some billing
-/// period, because a generation that applies in none is a version of the item nowhere
-/// and is not reported at all
-/// ([`crate::state::CustomLineItemRecord::versions`]).
+/// The filter is the span of billing periods the versions "are applied" in, and the
+/// model documents its bounds: its start billing period is INCLUSIVE and its end
+/// billing period EXCLUSIVE, the same half-open span a write's
+/// `CustomLineItemBillingPeriodRange` names, with an absent bound open. A generation is
+/// selected when its own half-open span shares at least one billing period with that
+/// span. Every generation reaching this filter applies in some billing period, because a
+/// generation that applies in none is a version of the item nowhere and is not reported
+/// at all ([`crate::state::CustomLineItemRecord::versions`]).
 fn in_filter(
     start_billing_period: &str,
     end_billing_period: Option<&str>,
@@ -171,7 +170,7 @@ fn in_filter(
         .end_billing_period
         .as_deref()
         .and_then(crate::state::billing_period_key)
-        .is_none_or(|filter_end| start.is_none_or(|start| start <= filter_end));
+        .is_none_or(|filter_end| start.is_none_or(|start| start < filter_end));
     let not_before_filter = filter
         .start_billing_period
         .as_deref()
@@ -298,29 +297,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filters
             .as_ref()
             .and_then(|filters| filters.billing_period_range.as_ref());
-        // Both bounds of the filter are inclusive (see [`in_filter`]), so a range whose
-        // end comes before its start names no billing period at all.
+        // The filter's end bound is EXCLUSIVE and its start bound inclusive (see
+        // [`in_filter`]), so a range whose end is at or before its start names no
+        // billing period at all — the refusal this crate's one rule for a half-open
+        // billing-period range gives such a range wherever an operation takes one.
         if let Some(range) = filter {
-            let bounds = (
-                range
-                    .start_billing_period
-                    .as_deref()
-                    .and_then(crate::state::billing_period_key),
-                range
-                    .end_billing_period
-                    .as_deref()
-                    .and_then(crate::state::billing_period_key),
-            );
-            if let (Some(start), Some(end)) = bounds {
-                if start > end {
-                    return Err(validation(
-                        "ILLEGAL_BILLING_PERIOD_RANGE",
-                        "Filters.BillingPeriodRange.EndBillingPeriod",
-                        "the end billing period must not be earlier than the start billing \
-                         period"
-                            .to_string(),
-                    ));
-                }
+            if let Err((reason, field, message)) =
+                crate::state::check_half_open_billing_period_range_is_ordered(
+                    range.start_billing_period.as_deref(),
+                    range.end_billing_period.as_deref(),
+                    "Filters.BillingPeriodRange.EndBillingPeriod",
+                )
+            {
+                return Err(validation(reason, field, message));
             }
         }
 
