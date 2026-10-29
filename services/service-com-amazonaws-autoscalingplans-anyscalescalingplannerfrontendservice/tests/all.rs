@@ -57,6 +57,8 @@ mod scheduled_action_buffer_time;
 mod scheduled_action_capacity_band;
 #[path = "all/set_identity_multiplicity.rs"]
 mod set_identity_multiplicity;
+#[path = "all/shared_paged_walk.rs"]
+mod shared_paged_walk;
 #[path = "all/stack_arn_predicate_consistency.rs"]
 mod stack_arn_predicate_consistency;
 #[path = "all/state_roundtrip.rs"]

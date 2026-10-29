@@ -225,21 +225,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .collect();
                     covered.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-                    // One resource more than the page is taken, so "is there another
-                    // page?" is answered from state rather than guessed — the same way
-                    // the sibling read over the plans themselves answers it.
-                    let mut page: Vec<(String, &ScalingInstruction)> = covered
-                        .into_iter()
-                        .filter(|(identity, _)| after.as_ref().is_none_or(|last| identity > last))
-                        .take(page_size + 1)
-                        .collect();
-                    let next_token = if page.len() > page_size {
-                        page.truncate(page_size);
-                        page.last()
-                            .map(|(identity, _)| crate::state::encode_cursor(CURSOR_KIND, identity))
-                    } else {
-                        None
-                    };
+                    // The page boundary is `crate::state::take_page`'s — the one rule the
+                    // sibling read over the plans themselves pages by.
+                    let (page, next_token) = crate::state::take_page(
+                        CURSOR_KIND,
+                        covered,
+                        after.as_deref(),
+                        page_size,
+                        |(identity, _)| identity.as_str(),
+                    );
 
                     let resources: Vec<ScalingPlanResource> = page
                         .into_iter()

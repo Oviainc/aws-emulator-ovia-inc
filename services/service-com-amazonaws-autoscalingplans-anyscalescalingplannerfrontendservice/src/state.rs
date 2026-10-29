@@ -4,8 +4,8 @@
 //!
 //! The whole service is one resource — the scaling plan — so this module owns the
 //! stored record, the lifecycle clock that moves a plan out of its non-terminal
-//! status, and the two value helpers (timestamps and pagination cursors) that more
-//! than one handler in `src/ops/` reaches.
+//! status, and the value helpers (timestamps and pagination cursors) plus the paged
+//! walk itself ([`take_page`]) that more than one handler in `src/ops/` reaches.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
@@ -1641,6 +1641,43 @@ pub fn effective_max_results(requested: Option<i32>) -> Result<usize, String> {
              constraint: Member must be between {MAX_RESULTS_MIN} and {MAX_RESULTS_MAX}"
         )),
     }
+}
+
+/// Take one page out of an ordered walk, and mint the token that continues it.
+///
+/// The whole page rule lives here, once: `entries` is walked in the order it already
+/// has, resumption starts STRICTLY AFTER the key the previous page stopped at (`after`,
+/// as [`decode_cursor`] handed it back), one entry MORE than the page is taken so "is
+/// there another page?" is answered from state rather than guessed, and the token —
+/// minted by [`encode_cursor`] under `kind`, so it decodes only for the operation that
+/// minted it — carries the key of the last entry KEPT.
+///
+/// `key` reads the key an entry is ordered and resumed by; `entries` must already be in
+/// that key's order, since the walk resumes by comparing keys rather than by counting
+/// positions. `pub` so every paginated read in `src/ops/` pages the same way: a change
+/// to how a page boundary is decided is made here, not once per handler.
+pub fn take_page<T, I, K>(
+    kind: &str,
+    entries: I,
+    after: Option<&str>,
+    page_size: usize,
+    key: K,
+) -> (Vec<T>, Option<String>)
+where
+    I: IntoIterator<Item = T>,
+    K: Fn(&T) -> &str,
+{
+    let mut page: Vec<T> = entries
+        .into_iter()
+        .filter(|entry| after.is_none_or(|last| key(entry) > last))
+        .take(page_size + 1)
+        .collect();
+    if page.len() <= page_size {
+        return (page, None);
+    }
+    page.truncate(page_size);
+    let next_token = page.last().map(|entry| encode_cursor(kind, key(entry)));
+    (page, next_token)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

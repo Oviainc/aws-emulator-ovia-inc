@@ -228,20 +228,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             true
         });
-        let mut page: Vec<&crate::state::ScalingPlanRecord> = matching
-            .filter(|plan| after.as_ref().is_none_or(|last| plan.name > *last))
-            .take(page_size + 1)
-            .collect();
-
-        // One record more than the page was taken, so "is there another page?" is
-        // answered from state rather than guessed.
-        let next_token = if page.len() > page_size {
-            page.truncate(page_size);
-            page.last()
-                .map(|plan| crate::state::encode_cursor(CURSOR_KIND, &plan.name))
-        } else {
-            None
-        };
+        // The page boundary — resume strictly after the cursor, over-fetch one to answer
+        // "is there another page?" from state, mint the token from the last kept key —
+        // is `crate::state::take_page`'s, so both paginated reads page identically.
+        let (page, next_token) = crate::state::take_page(
+            CURSOR_KIND,
+            matching,
+            after.as_deref(),
+            page_size,
+            |plan| plan.name.as_str(),
+        );
         let scaling_plans: Vec<ScalingPlan> = page.into_iter().map(project).collect();
 
         Ok(DescribeScalingPlansOutput {
