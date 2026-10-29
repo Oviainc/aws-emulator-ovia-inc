@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourceShareInvitations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourceShareInvitations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the invitations [`crate::state`] holds, filtered by the
+//! invitations and the resource shares the request names, one `@paginated` page at a
+//! time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourceShareInvitations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A read: the only thing it writes is the `PENDING` -> `EXPIRED` move the clock
+//! already owed an invitation nobody answered in time, which is due whether or not
+//! anybody calls.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +181,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourceShareInvitations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourceShareInvitationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourceShareInvitations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetResourceShareInvitationsErrorModeled::ServerInternalException(
+                ServerInternalException {
+                    message: "the resource share store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        let invitation_arns = input.resource_share_invitation_arns.clone().unwrap_or_default();
+        let share_arns = input.resource_share_arns.clone().unwrap_or_default();
+
+        // A filter entry that is not an ARN of the resource it filters on is
+        // malformed, whether or not anything has it — the `MalformedArnException`
+        // case, as distinct from the not-found ones below.
+        if let Some(why) = invitation_arns
+            .iter()
+            .find(|arn| !crate::state::is_invitation_arn(arn))
+            .map(|arn| {
+                crate::state::not_an_arn_message("resourceShareInvitationArns entry", arn)
+            })
+            .or_else(|| {
+                share_arns.iter().find_map(|arn| {
+                    crate::state::share_arn_rejection("resourceShareArns entry", arn)
+                })
+            })
+        {
+            return Err(GetResourceShareInvitationsErrorModeled::MalformedArnException(
+                MalformedArnException { message: why },
+            )
+            .into());
+        }
+
+        let page_size = crate::state::page_size(input.max_results);
+        let start = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_invitation_cursor(token).ok_or_else(|| {
+                GetResourceShareInvitationsErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: "nextToken is not a pagination token issued by \
+                                  GetResourceShareInvitations"
+                            .to_string(),
+                    },
+                )
+            })?),
+        };
+
+        let mut store = state.lock();
+        let now = store.tick();
+        // Reporting only: this materialises the move the clock already owed an
+        // invitation nobody answered within its window, so the status reported is the
+        // one that was already true at `now`.
+        store.settle_due_invitations(now);
+
+        // A filter that names an invitation or a share the store does not hold is
+        // refused rather than quietly reported as "no invitations": the caller asked
+        // about something by name.
+        if let Some(unknown) = invitation_arns
+            .iter()
+            .find(|arn| store.invitation(arn.as_str()).is_none())
+        {
+            return Err(
+                GetResourceShareInvitationsErrorModeled::ResourceShareInvitationArnNotFoundException(
+                    ResourceShareInvitationArnNotFoundException {
+                        message: crate::state::invitation_arn_message(unknown),
+                    },
+                )
+                .into(),
+            );
+        }
+        if let Some(unknown) = share_arns
+            .iter()
+            .find(|arn| store.share(arn.as_str()).is_none())
+        {
+            return Err(
+                GetResourceShareInvitationsErrorModeled::UnknownResourceException(
+                    UnknownResourceException {
+                        message: crate::state::unknown_share_message(unknown),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut resource_share_invitations =
+            Vec::with_capacity(page_size.min(store.invitations.len()));
+        let mut next_token = None;
+        let mut remaining = match &start {
+            Some(arn) => store.invitations.range(arn.clone()..),
+            None => store.invitations.range::<String, _>(..),
+        };
+        for (arn, invitation) in remaining.by_ref() {
+            if !invitation_arns.is_empty() && !invitation_arns.contains(arn) {
+                continue;
+            }
+            if !share_arns.is_empty() && !share_arns.contains(&invitation.resource_share_arn) {
+                continue;
+            }
+            // The first invitation that does not fit becomes the next page's start,
+            // and only then is a `nextToken` emitted.
+            if resource_share_invitations.len() == page_size {
+                next_token = Some(crate::state::encode_invitation_cursor(arn));
+                break;
+            }
+            resource_share_invitations.push(invitation.view());
+        }
+
+        Ok(GetResourceShareInvitationsOutput {
+            resource_share_invitations: Some(resource_share_invitations),
+            next_token,
+        })
     }
 }

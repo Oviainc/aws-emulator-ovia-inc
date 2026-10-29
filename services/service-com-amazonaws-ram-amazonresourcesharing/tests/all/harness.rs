@@ -30,13 +30,29 @@ pub const FOREIGN_RESOURCE: &str = "arn:aws:ec2:us-west-2:111122223333:subnet/su
 
 /// One emulator with an empty store, mounted exactly as the router mounts it.
 pub fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// The same emulator, with the shared engine behind it handed back too, for a case
+/// that has to reach a stored record no implemented operation reports yet.
+pub fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
-        service_com_amazonaws_ram_amazonresourcesharing::EmulatedService::new(engine),
+        service_com_amazonaws_ram_amazonresourcesharing::EmulatedService::new(Arc::clone(&engine)),
     );
-    router
+    (router, engine)
+}
+
+/// This service's store in the shared engine, reached the way a handler reaches it.
+pub fn store(
+    engine: &engine::InMemoryEngine,
+) -> engine::ServiceState<
+    service_com_amazonaws_ram_amazonresourcesharing::ComAmazonawsRamAmazonresourcesharingState,
+> {
+    service_com_amazonaws_ram_amazonresourcesharing::state::service_state(engine)
+        .expect("the ram store is reachable from the shared engine")
 }
 
 /// A request signed for `ram` in [`REGION`], the signal the router routes on and the

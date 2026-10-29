@@ -13,6 +13,10 @@
 //! Both maps are `BTreeMap`s: the key order is total and stable, so a paginated read
 //! can name the next entry in an opaque `nextToken` and a page boundary survives
 //! later writes.
+//!
+//! Sharing with a principal outside the owning account's organization also stores an
+//! **invitation**, keyed by its own ARN, beside the share: the invited account joins
+//! the share only once it answers, so what is pending for it is a record of its own.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,7 +24,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ResourceShare, ResourceShareAssociation, ResourceShareConfiguration, Tag, TagFilter,
+    Resource, ResourceShare, ResourceShareAssociation, ResourceShareConfiguration,
+    ResourceShareInvitation, Tag, TagFilter,
 };
 
 /// This service's ARN namespace and sigv4 signing name (`awsService.arnNamespace`:
@@ -30,10 +35,21 @@ pub const ARN_SERVICE: &str = "ram";
 /// The resource portion a resource-share ARN carries before its id.
 pub const SHARE_ARN_RESOURCE_PREFIX: &str = "resource-share/";
 
+/// The resource portion a resource-share-invitation ARN carries before its id.
+pub const INVITATION_ARN_RESOURCE_PREFIX: &str = "resource-share-invitation/";
+
 /// The ARN service field of AWS Organizations, the service whose ARNs name a part of
 /// an organization's hierarchy (`arn:aws:organizations::<account>:organization/o-…`,
 /// `…:ou/o-…/ou-…`, `…:root/o-…/r-…`, `…:account/o-…/<id>`).
 pub const ORGANIZATIONS_ARN_SERVICE: &str = "organizations";
+
+/// The ARN service field of AWS Identity and Access Management, the service whose
+/// ARNs name a user or a role — the principal forms a RAM invitation can be
+/// addressed to (`ResourceShareInvitation$receiverArn`).
+pub const IAM_ARN_SERVICE: &str = "iam";
+
+/// The number of digits in an Amazon Web Services account id.
+pub const ACCOUNT_ID_LEN: usize = 12;
 
 /// The id prefixes AWS Organizations gives the parts of its hierarchy, which a RAM
 /// principal may name without an ARN: an organization (`o-`), an organizational unit
@@ -117,6 +133,39 @@ pub const ASSOCIATION_TYPE_PRINCIPAL: &str = "PRINCIPAL";
 /// The association type of an entry that came from `sources`.
 pub const ASSOCIATION_TYPE_SOURCE: &str = "SOURCE";
 
+/// `ResourceShareInvitationStatus` values this slice stores, from
+/// `smithy_query(query="shape",shape="ResourceShareInvitationStatus")`. An invitation
+/// starts `PENDING` — the invited account has neither accepted nor rejected it and it
+/// has not expired — and the other three are the answers it can reach.
+pub const INVITATION_STATUS_PENDING: &str = "PENDING";
+/// The status of an invitation the invited account accepted.
+pub const INVITATION_STATUS_ACCEPTED: &str = "ACCEPTED";
+/// The status of an invitation the invited account rejected.
+pub const INVITATION_STATUS_REJECTED: &str = "REJECTED";
+/// The status of an invitation nobody answered before it expired.
+pub const INVITATION_STATUS_EXPIRED: &str = "EXPIRED";
+
+/// `ResourceStatus` values this slice reports for a resource association, from
+/// `smithy_query(query="shape",shape="ResourceStatus")`.
+pub const RESOURCE_STATUS_AVAILABLE: &str = "AVAILABLE";
+/// The status of a resource whose association with the share has not settled yet.
+pub const RESOURCE_STATUS_PENDING: &str = "PENDING";
+/// The status of a resource the share no longer shares.
+pub const RESOURCE_STATUS_UNAVAILABLE: &str = "UNAVAILABLE";
+
+/// `ResourceRegionScope` values, from
+/// `smithy_query(query="shape",shape="ResourceRegionScope")`: a resource reachable
+/// "from any Amazon Web Services Region" is `GLOBAL`, and one reachable "only by
+/// using requests that target the Amazon Web Services Region in which the resource
+/// exists" is `REGIONAL` (`Resource$resourceRegionScope`).
+pub const RESOURCE_REGION_SCOPE_GLOBAL: &str = "GLOBAL";
+/// The scope of a resource that exists in one Region.
+pub const RESOURCE_REGION_SCOPE_REGIONAL: &str = "REGIONAL";
+/// The `ResourceRegionScopeFilter` value that filters nothing out, and the value a
+/// read uses when the request names no scope: "The default value is ALL"
+/// (`ListPendingInvitationResources$resourceRegionScope`).
+pub const RESOURCE_REGION_SCOPE_FILTER_ALL: &str = "ALL";
+
 /// `ResourceOwner` values, from `smithy_query(query="shape",shape="ResourceOwner")`.
 pub const RESOURCE_OWNER_SELF: &str = "SELF";
 /// Shares another account shares with this one — none, in this emulator, because
@@ -135,6 +184,16 @@ pub const RESOURCE_OWNER_OTHER_ACCOUNTS: &str = "OTHER-ACCOUNTS";
 /// straight back still observes `ASSOCIATING`. Nothing sleeps for it: the due
 /// instant is stored and the move is materialised by the first call at or after it.
 pub const ASSOCIATION_READY_AFTER_MILLIS: i64 = 500;
+
+/// How long a resource share invitation stays answerable before it expires.
+///
+/// RAM gives the invited account SEVEN DAYS to accept or reject an invitation to a
+/// resource share, and the invitation expires at the end of them — which is what the
+/// modelled `EXPIRED` invitation status and the
+/// `ResourceShareInvitationExpiredException` ("the specified invitation is past its
+/// expiration date and time") report. The expiry is a move the clock owes: the due
+/// instant is stored on the record and nothing sleeps for it.
+pub const INVITATION_EXPIRES_AFTER_MILLIS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 /// How long after the call that tears an association down RAM takes to move it from
 /// `DISASSOCIATING` to `DISASSOCIATED`.
@@ -173,6 +232,15 @@ pub const MAX_ENTITIES_PER_CALL: usize = 100;
 ///
 /// Emulator resource guard, NOT an AWS quota.
 pub const MAX_ASSOCIATIONS_PER_SHARE: usize = 1000;
+
+/// The most invitations one share keeps, across every account it has invited and
+/// every answer those invitations reached.
+///
+/// Emulator resource guard, NOT an AWS quota. An answered invitation is kept beside
+/// its share so a read can still report what became of it; at the cap the oldest
+/// ANSWERED one is forgotten, and a share whose invitations are all unanswered
+/// invites nobody further rather than growing past it.
+pub const MAX_INVITATIONS_PER_SHARE: usize = 1000;
 
 /// The most tags one resource share may carry.
 ///
@@ -359,6 +427,65 @@ impl AssociationRecord {
     }
 }
 
+/// One stored invitation for an account to join a resource share.
+///
+/// RAM shares with an account OUTSIDE the owner's organization by invitation: the
+/// invited account joins the share only once it accepts
+/// (`AcceptResourceShareInvitation`/`RejectResourceShareInvitation`), so the
+/// invitation is a resource of its own, keyed by its ARN, and the record is what
+/// says whether it is still unanswered.
+#[derive(Debug, Clone, Default)]
+pub struct InvitationRecord {
+    /// The invitation's ARN: this record's store key.
+    pub arn: String,
+    /// The share the invitation is to.
+    pub resource_share_arn: String,
+    pub resource_share_name: String,
+    /// The account that owns the share, which is the one that sent the invitation.
+    pub sender_account_id: String,
+    /// The account that was invited.
+    pub receiver_account_id: String,
+    /// The IAM principal that was invited, when the association named one rather
+    /// than a whole account.
+    pub receiver_arn: Option<String>,
+    /// Epoch milliseconds, as on [`ShareRecord`].
+    pub invitation_timestamp: i64,
+    pub status: String,
+    /// When a still-`PENDING` invitation expires, in epoch milliseconds:
+    /// [`INVITATION_EXPIRES_AFTER_MILLIS`] after it was sent. The move to `EXPIRED`
+    /// is one the clock owes, so the instant is stored and
+    /// [`ComAmazonawsRamAmazonresourcesharingState::settle_due_invitations`]
+    /// materialises it on the first call at or after it.
+    pub expires_at: i64,
+}
+
+impl InvitationRecord {
+    /// This record as the modelled `ResourceShareInvitation` wire shape.
+    pub fn view(&self) -> ResourceShareInvitation {
+        ResourceShareInvitation {
+            resource_share_invitation_arn: Some(self.arn.clone()),
+            resource_share_name: Some(self.resource_share_name.clone()),
+            resource_share_arn: Some(self.resource_share_arn.clone()),
+            sender_account_id: Some(self.sender_account_id.clone()),
+            receiver_account_id: Some(self.receiver_account_id.clone()),
+            invitation_timestamp: Some(to_date_time(self.invitation_timestamp)),
+            status: Some(self.status.clone()),
+            // The member is deprecated in favour of `ListPendingInvitationResources`
+            // ("To view the resources associated with a pending resource share
+            // invitation, use ListPendingInvitationResources"), so an invitation
+            // reports no associations and a caller is pointed at that operation.
+            resource_share_associations: None,
+            receiver_arn: self.receiver_arn.clone(),
+        }
+    }
+
+    /// Whether this invitation is still unanswered and unexpired \u2014 the state the
+    /// resources of its share are \"pending\" in.
+    pub fn is_pending(&self) -> bool {
+        self.status == INVITATION_STATUS_PENDING
+    }
+}
+
 /// What one `(operation, clientToken)` pair already did, so repeating the request
 /// repeats the answer instead of acting twice.
 #[derive(Debug, Clone)]
@@ -380,6 +507,10 @@ pub struct ComAmazonawsRamAmazonresourcesharingState {
     pub resource_shares: BTreeMap<String, ShareRecord>,
     /// Every association, keyed by [`AssociationKey`].
     pub associations: BTreeMap<AssociationKey, AssociationRecord>,
+    /// Every invitation this service has sent, keyed by its ARN. An invitation is
+    /// created only beside a principal association, dropped with its share, and
+    /// capped per share by [`MAX_INVITATIONS_PER_SHARE`].
+    pub invitations: BTreeMap<String, InvitationRecord>,
     /// `(operation, clientToken)` -> what that token already did.
     client_tokens: HashMap<(String, String), ClientTokenRecord>,
     /// The order tokens were remembered in, so the oldest can be forgotten at the
@@ -426,6 +557,25 @@ impl ComAmazonawsRamAmazonresourcesharingState {
             record.last_updated_time = owed.due_at;
             record.owed_move = None;
         }
+    }
+
+    /// Expire every invitation whose answering window the clock has already closed.
+    ///
+    /// Like [`Self::settle_due_associations`], this only materialises what was
+    /// already due: an invitation nobody answered within
+    /// [`INVITATION_EXPIRES_AFTER_MILLIS`] of being sent is `EXPIRED` from that
+    /// instant on, whether or not anybody asks.
+    pub fn settle_due_invitations(&mut self, now: i64) {
+        for record in self.invitations.values_mut() {
+            if record.is_pending() && record.expires_at <= now {
+                record.status = INVITATION_STATUS_EXPIRED.to_string();
+            }
+        }
+    }
+
+    /// The invitation `arn` names, whatever its status.
+    pub fn invitation(&self, arn: &str) -> Option<&InvitationRecord> {
+        self.invitations.get(arn)
     }
 
     /// The share `arn` names, whether live or tombstoned.
@@ -496,6 +646,12 @@ impl ComAmazonawsRamAmazonresourcesharingState {
             record.status == ASSOCIATION_STATUS_ASSOCIATING
                 || record.status == ASSOCIATION_STATUS_ASSOCIATED
         };
+        // Whether THIS call is what starts the attach, which is what decides whether
+        // a principal is being invited now or was already on its way in.
+        let started = self
+            .associations
+            .get(&key)
+            .is_none_or(|record| !attaching(record));
         let record = self
             .associations
             .entry(key)
@@ -526,7 +682,99 @@ impl ComAmazonawsRamAmazonresourcesharingState {
             });
         }
         record.resource_share_name = share.name.clone();
-        record.clone()
+        let view = record.clone();
+        // Sharing with a principal OUTSIDE the owner's organization invites the
+        // account that principal belongs to: the account joins the share only once
+        // it accepts. A principal inside the organization, and any entity that is
+        // not a principal, is associated directly and invites nobody.
+        if started && association_type == ASSOCIATION_TYPE_PRINCIPAL && view.external {
+            self.invite(share, entity, now);
+        }
+        view
+    }
+
+    /// Invite the account `entity` belongs to to join `share`, and answer the
+    /// invitation — or `None` when `entity` names no account to invite (a service
+    /// principal, say), because there is then nobody to answer one.
+    ///
+    /// An account that already has an unanswered invitation to this share is not
+    /// invited twice: the pending invitation it is already holding is the one it
+    /// answers. An account whose previous invitation was answered or expired is
+    /// invited again, since this call shares with it afresh.
+    fn invite(&mut self, share: &ShareRecord, entity: &str, now: i64) -> Option<String> {
+        let receiver = invitation_receiver_account(entity)?.to_string();
+        let pending = self.invitations.values().find(|invitation| {
+            invitation.resource_share_arn == share.arn
+                && invitation.receiver_account_id == receiver
+                && invitation.is_pending()
+        });
+        if let Some(invitation) = pending {
+            return Some(invitation.arn.clone());
+        }
+        // The store is finite: at the cap the share forgets the invitation whose
+        // answer is oldest, and one whose invitations are all still unanswered
+        // invites nobody further rather than growing past it.
+        if !self.make_room_for_invitation(&share.arn) {
+            return None;
+        }
+        // The invitation lives in the same partition, Region and account as the
+        // share it invites to: it is a resource of the sending account.
+        let region = arn_region(&share.arn)
+            .filter(|region| !region.is_empty())
+            .unwrap_or(DEFAULT_REGION)
+            .to_string();
+        let arn = self.fresh_invitation_arn(&region);
+        self.invitations.insert(
+            arn.clone(),
+            InvitationRecord {
+                arn: arn.clone(),
+                resource_share_arn: share.arn.clone(),
+                resource_share_name: share.name.clone(),
+                sender_account_id: share.owning_account_id.clone(),
+                receiver_account_id: receiver,
+                // Only an IAM principal ARN names the user or role that received
+                // the invitation; a bare account id names the account alone.
+                receiver_arn: invitation_receiver_arn(entity).map(str::to_string),
+                invitation_timestamp: now,
+                status: INVITATION_STATUS_PENDING.to_string(),
+                expires_at: now + INVITATION_EXPIRES_AFTER_MILLIS,
+            },
+        );
+        Some(arn)
+    }
+
+    /// Make room for one more invitation to the share `arn` names, and answer whether
+    /// there is any: the oldest ANSWERED invitation to that share is forgotten when it
+    /// already holds [`MAX_INVITATIONS_PER_SHARE`], and a share holding that many
+    /// unanswered ones has no room at all.
+    fn make_room_for_invitation(&mut self, arn: &str) -> bool {
+        let held: Vec<(i64, String, bool)> = self
+            .invitations
+            .values()
+            .filter(|invitation| invitation.resource_share_arn == arn)
+            .map(|invitation| {
+                (
+                    invitation.invitation_timestamp,
+                    invitation.arn.clone(),
+                    invitation.is_pending(),
+                )
+            })
+            .collect();
+        if held.len() < MAX_INVITATIONS_PER_SHARE {
+            return true;
+        }
+        let oldest_answered = held
+            .into_iter()
+            .filter(|(_, _, pending)| !pending)
+            .min()
+            .map(|(_, arn, _)| arn);
+        match oldest_answered {
+            Some(forgotten) => {
+                self.invitations.remove(&forgotten);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Tear the association between the share `arn` and `entity` under
@@ -603,6 +851,10 @@ impl ComAmazonawsRamAmazonresourcesharingState {
             share.last_updated_time = now;
         }
         self.associations.retain(|key, _| key.0 != arn);
+        // An invitation to a share that no longer shares anything invites nobody to
+        // anything, so no later read reports one.
+        self.invitations
+            .retain(|_, invitation| invitation.resource_share_arn != arn);
     }
 
     /// What this `(operation, clientToken)` pair already did, if anything.
@@ -641,6 +893,23 @@ impl ComAmazonawsRamAmazonresourcesharingState {
                 resource_share_arn,
             },
         );
+    }
+
+    /// A resource-share-invitation ARN in `region` that no stored invitation is
+    /// using. Built the way [`Self::fresh_share_arn`] builds a share's.
+    pub fn fresh_invitation_arn(&mut self, region: &str) -> String {
+        for _ in 0..1024 {
+            let candidate = invitation_arn(region, &self.fresh_uuid());
+            if !self.invitations.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+        // Bounded fallback, as on [`Self::fresh_share_arn`]: there are always more of
+        // these than there are stored invitations.
+        (0u64..=self.invitations.len() as u64)
+            .map(|n| invitation_arn(region, &format!("00000000-0000-4000-8000-{n:012x}")))
+            .find(|arn| !self.invitations.contains_key(arn))
+            .unwrap_or_else(|| invitation_arn(region, "00000000-0000-4000-8000-ffffffffffff"))
     }
 
     /// A resource-share ARN in `region` that no stored share is using.
@@ -708,6 +977,89 @@ pub fn share_configuration(
 /// so a caller can read the ARN back out of the message it gets.
 pub fn unknown_share_message(arn: &str) -> String {
     format!("ResourceShare {arn} could not be found.")
+}
+
+/// The message RAM reports with every error that refuses a
+/// `resourceShareInvitationArn`: the ARN itself.
+///
+/// RAM's invitation-ARN errors (`InvalidResourceShareInvitationArn.NotFound`,
+/// `.AlreadyRejected`, `.Expired`) carry the ARN the request named as their whole
+/// message — the error code says what is wrong with it and the message says which
+/// invitation it was — so one template serves every operation that takes the member.
+pub fn invitation_arn_message(arn: &str) -> String {
+    arn.to_string()
+}
+
+/// The `type` RAM reports for a shared resource: `<service-code>:<resource-code>`,
+/// or `None` when the ARN's resource field names no type.
+///
+/// From `Resource$type`: "The resource type. This takes the form of:
+/// service-code:resource-code … For example, an Amazon EC2 Subnet would be
+/// represented by the string ec2:subnet" — so both halves are read off the
+/// resource's own ARN rather than stored beside it.
+pub fn resource_type_of_arn(arn: &str) -> Option<String> {
+    let service = arn_service(arn)?;
+    // The resource field is everything after the fifth colon, and its type is the
+    // first segment of it: `subnet/subnet-1111` and `subnet:subnet-1111` both name
+    // the type `subnet`. A resource field with no separator (an S3 bucket name, say)
+    // names no type.
+    let resource = arn.splitn(6, ':').nth(5)?;
+    let (code, _) = resource.split_once(['/', ':'])?;
+    (!code.is_empty() && !service.is_empty()).then(|| format!("{service}:{code}"))
+}
+
+/// The `ResourceRegionScope` of the resource `arn` names.
+///
+/// An ARN that names no Region belongs to a service whose resources are reachable
+/// "from any Amazon Web Services Region", which is what `GLOBAL` reports; one that
+/// names a Region exists in it and is `REGIONAL`
+/// (`Resource$resourceRegionScope`).
+pub fn resource_region_scope(arn: &str) -> &'static str {
+    match arn_region(arn) {
+        Some("") | None => RESOURCE_REGION_SCOPE_GLOBAL,
+        Some(_) => RESOURCE_REGION_SCOPE_REGIONAL,
+    }
+}
+
+/// Whether a resource of this scope passes a `ResourceRegionScopeFilter`.
+///
+/// "ALL – the results include both global and regional resources … GLOBAL – … only
+/// global resources … REGIONAL – … only regional resources", and "The default value
+/// is ALL", so a request that names no filter keeps everything.
+pub fn resource_region_scope_matches(filter: Option<&str>, scope: &str) -> bool {
+    match filter.unwrap_or(RESOURCE_REGION_SCOPE_FILTER_ALL) {
+        RESOURCE_REGION_SCOPE_FILTER_ALL => true,
+        requested => requested == scope,
+    }
+}
+
+/// A resource association as the modelled `Resource` wire shape.
+///
+/// Everything a `Resource` reports about a shared resource is either read off its
+/// ARN (the type and the Region scope) or taken from the association that shares it:
+/// `creationTime` is "the date and time when the resource was associated with the
+/// resource share" and `status` is where that association has got to — a resource
+/// whose association is still being made is `PENDING`, one whose association has
+/// been made is `AVAILABLE`, and one the share no longer shares is `UNAVAILABLE`.
+pub fn resource_view(record: &AssociationRecord) -> Resource {
+    let status = match record.status.as_str() {
+        ASSOCIATION_STATUS_ASSOCIATED => RESOURCE_STATUS_AVAILABLE,
+        ASSOCIATION_STATUS_ASSOCIATING => RESOURCE_STATUS_PENDING,
+        _ => RESOURCE_STATUS_UNAVAILABLE,
+    };
+    Resource {
+        arn: Some(record.associated_entity.clone()),
+        r#type: resource_type_of_arn(&record.associated_entity),
+        resource_share_arn: Some(record.resource_share_arn.clone()),
+        // "This value is available only if the resource is part of a resource
+        // group", and nothing in this service puts one in a group.
+        resource_group_arn: None,
+        status: Some(status.to_string()),
+        status_message: record.status_message.clone(),
+        creation_time: Some(to_date_time(record.creation_time)),
+        last_updated_time: Some(to_date_time(record.last_updated_time)),
+        resource_region_scope: Some(resource_region_scope(&record.associated_entity).to_string()),
+    }
 }
 
 /// The `statusMessage` an association of this type carries while it has not settled
@@ -904,6 +1256,15 @@ pub fn arn_account(value: &str) -> Option<&str> {
     value.split(':').nth(4)
 }
 
+/// The region field of an ARN, or `None` when `value` is not one. Empty for an ARN
+/// that names no Region.
+pub fn arn_region(value: &str) -> Option<&str> {
+    if !is_arn(value) {
+        return None;
+    }
+    value.split(':').nth(3)
+}
+
 /// The service field of an ARN, or `None` when `value` is not one.
 pub fn arn_service(value: &str) -> Option<&str> {
     if !is_arn(value) {
@@ -914,14 +1275,64 @@ pub fn arn_service(value: &str) -> Option<&str> {
 
 /// Whether `value` is an ARN of THIS service's resource-share resource.
 pub fn is_share_arn(value: &str) -> bool {
+    is_arn_of_resource(value, SHARE_ARN_RESOURCE_PREFIX)
+}
+
+/// Whether `value` is an ARN of THIS service's resource-share-invitation resource.
+pub fn is_invitation_arn(value: &str) -> bool {
+    is_arn_of_resource(value, INVITATION_ARN_RESOURCE_PREFIX)
+}
+
+/// Whether `value` is an ARN of this service naming a resource of the kind
+/// `prefix` introduces, with a non-empty id after it.
+fn is_arn_of_resource(value: &str, prefix: &str) -> bool {
     if !is_arn(value) {
         return false;
     }
     let mut fields = value.splitn(6, ':');
     let (service, resource) = (fields.nth(2), fields.nth(2));
     service == Some(ARN_SERVICE)
-        && resource.and_then(|resource| resource.strip_prefix(SHARE_ARN_RESOURCE_PREFIX))
+        && resource
+            .and_then(|resource| resource.strip_prefix(prefix))
             .is_some_and(|id| !id.is_empty())
+}
+
+/// The ARN of the resource share invitation `id` in `region`.
+pub fn invitation_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{INVITATION_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// The account an invited principal belongs to — the one that answers its invitation
+/// — or `None` when `entity` names no account.
+///
+/// `ResourceShareAssociation$associatedEntity` admits several forms for a principal;
+/// of those, an ARN carries the account in its account field, and a bare Amazon Web
+/// Services account id IS the account. A service principal name (`…amazonaws.com`)
+/// names no account, so there is nobody to invite.
+pub fn invitation_receiver_account(entity: &str) -> Option<&str> {
+    if let Some(account) = arn_account(entity) {
+        return (!account.is_empty()).then_some(account);
+    }
+    is_account_id(entity).then_some(entity)
+}
+
+/// The IAM principal an invitation was sent to, when the invited entity names one
+/// rather than a whole account.
+///
+/// `ResourceShareInvitation$receiverArn` is "the ARN of the IAM user or role that
+/// received the invitation", so only an `iam` ARN fills it; an account id or any
+/// other form invites the account itself and leaves the member out.
+pub fn invitation_receiver_arn(entity: &str) -> Option<&str> {
+    (arn_service(entity) == Some(IAM_ARN_SERVICE)).then_some(entity)
+}
+
+/// Whether `value` is an Amazon Web Services account id: twelve digits.
+fn is_account_id(value: &str) -> bool {
+    value.len() == ACCOUNT_ID_LEN && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// The ARN of the resource share `id` in `region`.
@@ -1002,12 +1413,19 @@ pub fn share_arn_rejection(member: &str, arn: &str) -> Option<String> {
 /// Why an entry of `resourceArns` (or a `resourceArn` filter) is not usable, or
 /// `None` when every entry is an ARN.
 pub fn resource_arn_rejection(member: &str, arns: &[String]) -> Option<String> {
-    arns.iter().find(|arn| !is_arn(arn)).map(|arn| {
-        format!(
-            "{member} '{}' is not an ARN of the form arn:<partition>:<service>:<region>:<account>:<resource>",
-            truncate(arn)
-        )
-    })
+    arns.iter()
+        .find(|arn| !is_arn(arn))
+        .map(|arn| not_an_arn_message(member, arn))
+}
+
+/// Why a value this service expected to be an ARN cannot be read as one, as the
+/// message of the `MalformedArnException` that refuses it: one template for every
+/// member that takes an ARN, naming the member and the value it refused.
+pub fn not_an_arn_message(member: &str, value: &str) -> String {
+    format!(
+        "{member} '{}' is not an ARN of the form arn:<partition>:<service>:<region>:<account>:<resource>",
+        truncate(value)
+    )
 }
 
 /// Why a list of entities to associate is too long for one call, or `None`.
@@ -1124,6 +1542,17 @@ pub fn decode_association_cursor(token: &str) -> Option<AssociationKey> {
         association_type.to_string(),
         entity.to_string(),
     ))
+}
+
+/// A `nextToken` naming the invitation the next page starts at.
+pub fn encode_invitation_cursor(arn: &str) -> String {
+    hex::encode(arn)
+}
+
+/// The invitation ARN a `nextToken` names, or `None` when the token is not one this
+/// service issued — the `InvalidNextTokenException` case.
+pub fn decode_invitation_cursor(token: &str) -> Option<String> {
+    decode_cursor(token).filter(|arn| is_invitation_arn(arn))
 }
 
 fn decode_cursor(token: &str) -> Option<String> {

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPendingInvitationResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPendingInvitationResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the resources a resource share shares, for a share whose
+//! invitation [`crate::state`] still holds unanswered, one `@paginated` page at a
+//! time and filtered by the Region scope the request asks for.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPendingInvitationResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A read: the only thing it writes is what the clock already owed — an association
+//! reaching its settled status, and an invitation nobody answered in time reaching
+//! `EXPIRED` — each due whether or not anybody calls.
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +189,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPendingInvitationResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPendingInvitationResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPendingInvitationResources"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPendingInvitationResourcesErrorModeled::ServerInternalException(
+                ServerInternalException {
+                    message: "the resource share store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // A value that is not an ARN at all is malformed, whether or not any
+        // invitation has it — the `MalformedArnException` case, as distinct from the
+        // `ResourceShareInvitationArnNotFoundException` one below.
+        if !crate::state::is_arn(&input.resource_share_invitation_arn) {
+            return Err(
+                ListPendingInvitationResourcesErrorModeled::MalformedArnException(
+                    MalformedArnException {
+                        message: crate::state::not_an_arn_message(
+                            "resourceShareInvitationArn",
+                            &input.resource_share_invitation_arn,
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `resourceRegionScope` is a modelled enum, so a value outside
+        // `ResourceRegionScopeFilter` is already refused before this handler runs.
+        let page_size = crate::state::page_size(input.max_results);
+        let start = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_association_cursor(token).ok_or_else(|| {
+                ListPendingInvitationResourcesErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: "nextToken is not a pagination token issued by \
+                                  ListPendingInvitationResources"
+                            .to_string(),
+                    },
+                )
+            })?),
+        };
+
+        let mut store = state.lock();
+        let now = store.tick();
+        // Reporting only: both calls materialise a move the clock already owed — an
+        // association reaching its settled status, and an invitation nobody answered
+        // in time reaching `EXPIRED` — so this read reports what was already true at
+        // `now`, whether or not anybody asked.
+        store.settle_due_associations(now);
+        store.settle_due_invitations(now);
+
+        let invitation = store
+            .invitation(&input.resource_share_invitation_arn)
+            .cloned()
+            .ok_or_else(|| {
+                ListPendingInvitationResourcesErrorModeled::ResourceShareInvitationArnNotFoundException(
+                    ResourceShareInvitationArnNotFoundException {
+                        message: crate::state::invitation_arn_message(
+                            &input.resource_share_invitation_arn,
+                        ),
+                    },
+                )
+            })?;
+
+        // A share's resources stop being "pending" for an invitation once it leaves
+        // the unanswered state, and the two ways out of it this operation models an
+        // error for refuse the read: a rejection the invited account gave, and an
+        // expiry that took the answer away from it. An accepted invitation has no
+        // modelled refusal here, so the share it joined still reports its resources.
+        if invitation.status == crate::state::INVITATION_STATUS_REJECTED {
+            return Err(
+                ListPendingInvitationResourcesErrorModeled::ResourceShareInvitationAlreadyRejectedException(
+                    ResourceShareInvitationAlreadyRejectedException {
+                        message: crate::state::invitation_arn_message(&invitation.arn),
+                    },
+                )
+                .into(),
+            );
+        }
+        if invitation.status == crate::state::INVITATION_STATUS_EXPIRED {
+            return Err(
+                ListPendingInvitationResourcesErrorModeled::ResourceShareInvitationExpiredException(
+                    ResourceShareInvitationExpiredException {
+                        message: crate::state::invitation_arn_message(&invitation.arn),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The resources the invitation's share shares, in the store's stable key
+        // order, so a page boundary survives later writes. A resource whose
+        // association was torn down is no longer in the share and is not one of them.
+        let mut resources = Vec::with_capacity(page_size.min(store.associations.len()));
+        let mut next_token = None;
+        let mut remaining = match &start {
+            Some(key) => store.associations.range(key.clone()..),
+            None => store.associations.range::<crate::state::AssociationKey, _>(..),
+        };
+        for (key, association) in remaining.by_ref() {
+            if association.resource_share_arn != invitation.resource_share_arn
+                || association.association_type != crate::state::ASSOCIATION_TYPE_RESOURCE
+            {
+                continue;
+            }
+            let resource = crate::state::resource_view(association);
+            if resource.status.as_deref() == Some(crate::state::RESOURCE_STATUS_UNAVAILABLE) {
+                continue;
+            }
+            if !crate::state::resource_region_scope_matches(
+                input.resource_region_scope.as_deref(),
+                resource
+                    .resource_region_scope
+                    .as_deref()
+                    .unwrap_or_default(),
+            ) {
+                continue;
+            }
+            // The first resource that does not fit becomes the next page's start, and
+            // only then is a `nextToken` emitted.
+            if resources.len() == page_size {
+                next_token = Some(crate::state::encode_association_cursor(key));
+                break;
+            }
+            resources.push(resource);
+        }
+
+        Ok(ListPendingInvitationResourcesOutput {
+            resources: Some(resources),
+            next_token,
+        })
     }
 }
