@@ -361,63 +361,6 @@ async fn a_write_naming_no_status_leaves_the_stored_status_unchanged() {
 // Every write leaves a structured, attributable record
 // ---------------------------------------------------------------------------
 
-/// A `tracing` subscriber that renders each event as one `target field=value …` line and
-/// keeps the lines so a test can read them back.
-///
-/// Written against `tracing`'s own `Subscriber` trait rather than pulling in a formatting
-/// subscriber crate — the same harness this tree's other audit suites use (e.g.
-/// `service-com-amazonaws-ssmguiconnect-ssmguiconnect/tests/all/connection_recording_preferences.rs`)
-/// — so this change adds no dependency.
-#[derive(Clone, Default)]
-struct CapturedRecords(Arc<std::sync::Mutex<Vec<String>>>);
-
-impl CapturedRecords {
-    /// Every record captured since the last drain, clearing the buffer.
-    fn drain(&self) -> Vec<String> {
-        std::mem::take(&mut *self.0.lock().expect("the audit capture lock"))
-    }
-}
-
-/// Renders an event's fields as ` name=value` onto one line.
-struct RecordLine(String);
-
-impl tracing::field::Visit for RecordLine {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        use std::fmt::Write as _;
-        let _ = write!(self.0, " {}={value:?}", field.name());
-    }
-
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        use std::fmt::Write as _;
-        let _ = write!(self.0, " {}={value}", field.name());
-    }
-}
-
-impl tracing::Subscriber for CapturedRecords {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        *metadata.level() <= tracing::Level::INFO
-    }
-
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        // The service emits events, never spans; an id is still required by the trait.
-        tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-        let mut line = RecordLine(format!("{} ", event.metadata().target()));
-        event.record(&mut line);
-        self.0.lock().expect("the audit capture lock").push(line.0);
-    }
-
-    fn enter(&self, _span: &tracing::span::Id) {}
-
-    fn exit(&self, _span: &tracing::span::Id) {}
-}
-
 /// The access key id the audit case signs with, so it can pick its own records out of a
 /// process-wide log that sibling tests also write to.
 const AUDIT_AKID: &str = "AKIDAUDITSETTINGS";
@@ -430,34 +373,16 @@ const AUDIT_REGION: &str = "ap-southeast-2";
 /// The region [`SIGNED_FOR_EU_WEST_1`] signs for, which every other case here uses.
 const REGION_EU_WEST_1: &str = "eu-west-1";
 
-/// The capture for audit records, installed ONCE as this test binary's global `tracing`
-/// subscriber.
-///
-/// Global rather than scoped on purpose: `tracing` caches per callsite whether any
-/// subscriber is interested, the cache is process-wide, and sibling tests run in parallel
-/// on other threads. [`AUDIT_AKID`] is what keeps a sibling's records out of this one's
-/// assertions.
-static AUDIT_CAPTURE: std::sync::OnceLock<CapturedRecords> = std::sync::OnceLock::new();
+/// The capture for audit records, which `tests/all/audit_capture.rs` owns: a test binary
+/// admits one global `tracing` subscriber, and more than one suite here reads records
+/// back. [`AUDIT_AKID`] is what keeps a sibling suite's records out of this one's
+/// assertions, and out of its drain.
+use super::audit_capture::audit_capture;
 
-fn audit_capture() -> &'static CapturedRecords {
-    AUDIT_CAPTURE.get_or_init(|| {
-        let captured = CapturedRecords::default();
-        tracing::subscriber::set_global_default(captured.clone())
-            .expect("this test binary installs no other global tracing subscriber");
-        captured
-    })
-}
-
-/// The captured records that are THIS case's: on the `emulator::audit` target and
-/// presenting [`AUDIT_AKID`].
-fn audit_records(captured: &[String]) -> Vec<String> {
-    captured
-        .iter()
-        .filter(|record| {
-            record.starts_with("emulator::audit ") && record.contains(&format!("akid={AUDIT_AKID}"))
-        })
-        .cloned()
-        .collect()
+/// The captured records that are THIS case's: on the audit target and presenting
+/// [`AUDIT_AKID`], taken out of the shared capture.
+fn audit_records(captured: &super::audit_capture::CapturedRecords) -> Vec<String> {
+    captured.drain_for(AUDIT_AKID)
 }
 
 #[tokio::test]
@@ -467,7 +392,7 @@ async fn every_write_emits_a_structured_audit_record() {
     // Harness self-test, so a failure below can never be mistaken for a missing audit
     // record: the capture must receive an event emitted right here.
     tracing::info!(target: "emulator::audit", akid = AUDIT_AKID, "probe");
-    let probe = audit_records(&captured.drain());
+    let probe = audit_records(captured);
     assert_eq!(
         probe.len(),
         1,
@@ -523,7 +448,7 @@ async fn every_write_emits_a_structured_audit_record() {
             answer.status, answer.body
         );
 
-        let records = audit_records(&captured.drain());
+        let records = audit_records(captured);
         assert_eq!(
             records.len(),
             1,

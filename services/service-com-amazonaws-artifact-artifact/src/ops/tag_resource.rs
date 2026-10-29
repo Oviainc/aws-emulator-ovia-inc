@@ -21,6 +21,13 @@
 //! are field-validation failures, so both are worded in the one validation envelope this
 //! service states such a refusal in.
 //!
+//! The write changes persisted state, so it is ATTRIBUTABLE: this handler leaves exactly
+//! one structured record naming the caller (the access-key id and the credential-scope
+//! region the request presented), the resource whose tag set it changed, which keys it
+//! wrote and the outcome — on the refusal paths as much as on the success one, since a
+//! state-changing call that changed nothing is still attributable. Never a tag VALUE, and
+//! never the inquiry's `@sensitive` name or content.
+//!
 //! The resource is named by its ARN, and the only resource an account owns in this service
 //! is a compliance inquiry — see
 //! [`crate::state::ComAmazonawsArtifactArtifactState::tagged_resource`]. An ARN that
@@ -158,9 +165,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Nothing in the request metadata shapes the tag set this writes; the request's
+        // credential scope is read only to ATTRIBUTE the change below, exactly as the
+        // account-wide write reads it.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+        // WHICH keys this call writes, in the one stable order a record states them in
+        // ([`crate::state::tag_key_list`]). The keys and the ARN are rendered through
+        // their `Debug` form below — both admit whitespace under their modelled patterns,
+        // and one record is one line.
+        let tag_keys = crate::state::tag_key_list(input.tags.keys().map(String::as_str));
+        let tag_count = input.tags.len();
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            // A state-changing call that changed nothing is still attributable, so the
+            // failure path records its outcome rather than passing silently.
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "TagResource",
+                akid = %akid,
+                region = %region,
+                resource_arn = ?input.resource_arn,
+                tag_keys = ?tag_keys,
+                tag_count,
+                outcome = "unavailable",
+                "state-changing operation"
+            );
             return Err(TagResourceErrorModeled::InternalServerException(
                 InternalServerException {
                     message: "the artifact compliance inquiry store is unavailable".to_string(),
@@ -177,6 +209,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ARN is resolved, so the refusal neither depends on nor discloses whether the
         // account holds the resource, and nothing is written either way.
         if crate::state::reserved_tag_key(input.tags.keys().map(String::as_str)).is_some() {
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "TagResource",
+                akid = %akid,
+                region = %region,
+                resource_arn = ?input.resource_arn,
+                tag_keys = ?tag_keys,
+                tag_count,
+                outcome = "refused",
+                reason = "tags name a key in the reserved namespace",
+                "state-changing operation"
+            );
             return Err(TagResourceErrorModeled::ValidationException(
                 crate::state::reserved_tag_keys("tags"),
             )
@@ -189,6 +233,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // may tag, and whether such a resource exists at all is not disclosed: the
             // front door's refusal is what the caller sees, exactly as a report lookup
             // answers an identifier it cannot authorize.
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "TagResource",
+                akid = %akid,
+                region = %region,
+                resource_arn = ?input.resource_arn,
+                tag_keys = ?tag_keys,
+                tag_count,
+                outcome = "refused",
+                reason = "resourceArn names no resource this account holds",
+                "state-changing operation"
+            );
             return Err(crate::scaffolded::Scaffolded::unauthorized());
         };
 
@@ -197,6 +253,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut tags = resource.tags.clone();
         tags.extend(input.tags);
         if tags.len() > crate::state::TAGS_PER_RESOURCE_LIMIT {
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "TagResource",
+                akid = %akid,
+                region = %region,
+                resource_arn = ?input.resource_arn,
+                compliance_inquiry_id = %resource.id,
+                tag_keys = ?tag_keys,
+                tag_count,
+                outcome = "refused",
+                reason = "the write would take the resource past its tag limit",
+                "state-changing operation"
+            );
             return Err(TagResourceErrorModeled::ValidationException(
                 crate::state::too_many_tags("tags"),
             )
@@ -206,6 +275,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `updatedAt` is NOT moved: it reports when the inquiry's own record was last
         // modified, which this service moves with the processing transition the clock owes
         // it, and no AWS documentation ties it to a write of the resource's tag set.
+
+        // The tag write is attributable: the access key id the caller presented (a public
+        // identifier, never a secret), the scope's region, the resource whose tag set
+        // changed — by the ARN the request named and by the stored record's own id — and
+        // WHICH keys were written, with the count the resource now carries. NEVER a tag
+        // VALUE, nor the inquiry's name or content, both `@sensitive` in the model.
+        ::tracing::info!(
+            target: "emulator::audit",
+            operation = "TagResource",
+            akid = %akid,
+            region = %region,
+            resource_arn = ?input.resource_arn,
+            compliance_inquiry_id = %resource.id,
+            tag_keys = ?tag_keys,
+            tag_count,
+            tags_on_resource = resource.tags.len(),
+            outcome = "recorded",
+            "state-changing operation"
+        );
 
         Ok(TagResourceOutput {})
     }

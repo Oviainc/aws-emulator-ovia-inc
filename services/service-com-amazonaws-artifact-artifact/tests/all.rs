@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/audit_capture.rs"]
+mod audit_capture;
 #[path = "all/compliance_inquiry_export.rs"]
 mod compliance_inquiry_export;
 #[path = "all/compliance_inquiry_export_url_resolves.rs"]
@@ -67,6 +69,8 @@ mod report_projection;
 mod report_workflow;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
+#[path = "all/resource_tag_write_audit.rs"]
+mod resource_tag_write_audit;
 #[path = "all/resource_tag_writes.rs"]
 mod resource_tag_writes;
 #[path = "all/resource_tags.rs"]

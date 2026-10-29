@@ -456,6 +456,22 @@ where
     keys.into_iter().find(|key| is_reserved_tag_key(key))
 }
 
+/// The keys `keys` names as ONE field value: sorted, and joined with `,`.
+///
+/// What a record of a tag write names the keys it wrote or removed in, so the record is
+/// the same whatever order the request listed them in (a `TagsMap` arrives as an unordered
+/// map). `TagKey`'s modelled pattern `^[a-zA-Z0-9\s_.:/=+\-@]*$`
+/// (`smithy_query(query="shape",shape="TagsMap")`) admits no comma, so the separator
+/// cannot be mistaken for part of a key.
+pub fn tag_key_list<'a, I>(keys: I) -> String
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut keys: Vec<&str> = keys.into_iter().collect();
+    keys.sort_unstable();
+    keys.join(",")
+}
+
 /// The visibility of a report AWS publishes in the Artifact catalog: it is visible to
 /// every account, as opposed to a report scoped to one customer.
 pub const VISIBILITY_PUBLIC: &str = "PUBLIC";

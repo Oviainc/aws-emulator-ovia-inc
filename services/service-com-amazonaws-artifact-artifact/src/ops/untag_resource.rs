@@ -12,6 +12,11 @@
 //! a tag Amazon Web Services owns, which a caller may no more remove than create: such a
 //! request is refused with the modelled 400 `ValidationException` and removes nothing.
 //!
+//! The removal changes persisted state, so it is ATTRIBUTABLE on the same terms as the tag
+//! write ([`crate::ops::tag_resource`]): exactly one structured record naming the caller,
+//! the resource whose tag set it changed, which keys the request named and the outcome, on
+//! the refusal paths as much as on the success one.
+//!
 //! An ARN that names no resource this account holds is answered HTTP 401
 //! `UnauthorizedException`, as every resource lookup in this service is — see
 //! [`crate::ops::tag_resource`].
@@ -146,9 +151,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Nothing in the request metadata shapes which keys this removes; the request's
+        // credential scope is read only to ATTRIBUTE the change below, exactly as the tag
+        // write reads it.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+        // WHICH keys this call removes, in the one stable order a record states them in
+        // ([`crate::state::tag_key_list`]). The keys and the ARN are rendered through
+        // their `Debug` form below — both admit whitespace under their modelled patterns,
+        // and one record is one line.
+        let tag_keys = crate::state::tag_key_list(input.tag_keys.iter().map(String::as_str));
+        let tag_count = input.tag_keys.len();
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            // A state-changing call that changed nothing is still attributable, so the
+            // failure path records its outcome rather than passing silently.
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "UntagResource",
+                akid = %akid,
+                region = %region,
+                resource_arn = ?input.resource_arn,
+                tag_keys = ?tag_keys,
+                tag_count,
+                outcome = "unavailable",
+                "state-changing operation"
+            );
             return Err(UntagResourceErrorModeled::InternalServerException(
                 InternalServerException {
                     message: "the artifact compliance inquiry store is unavailable".to_string(),
@@ -163,6 +193,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request is refused as a field validation failure naming `tagKeys` — decided from
         // the request alone, before the ARN is resolved, exactly as the tag write decides it.
         if crate::state::reserved_tag_key(input.tag_keys.iter().map(String::as_str)).is_some() {
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "UntagResource",
+                akid = %akid,
+                region = %region,
+                resource_arn = ?input.resource_arn,
+                tag_keys = ?tag_keys,
+                tag_count,
+                outcome = "refused",
+                reason = "tagKeys name a key in the reserved namespace",
+                "state-changing operation"
+            );
             return Err(UntagResourceErrorModeled::ValidationException(
                 crate::state::reserved_tag_keys("tagKeys"),
             )
@@ -173,14 +215,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(resource) = store.tagged_resource_mut(&input.resource_arn) else {
             // The same refusal a tag write answers: whether the account holds the resource
             // the ARN names is not information this API discloses.
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "UntagResource",
+                akid = %akid,
+                region = %region,
+                resource_arn = ?input.resource_arn,
+                tag_keys = ?tag_keys,
+                tag_count,
+                outcome = "refused",
+                reason = "resourceArn names no resource this account holds",
+                "state-changing operation"
+            );
             return Err(crate::scaffolded::Scaffolded::unauthorized());
         };
 
+        let mut removed = 0usize;
         for key in &input.tag_keys {
             // A key the resource does not carry is already in the state the request asks
             // for, which is what makes the operation `@idempotent`.
-            resource.tags.remove(key);
+            if resource.tags.remove(key).is_some() {
+                removed += 1;
+            }
         }
+
+        // The removal is attributable on the same terms as the tag write: the caller's
+        // access key id (a public identifier, never a secret), the scope's region, the
+        // resource whose tag set changed — by the ARN the request named and by the stored
+        // record's own id — WHICH keys the request named, how many of them the resource
+        // actually carried, and how many tags it is left holding. NEVER a tag VALUE, nor
+        // the inquiry's name or content, both `@sensitive` in the model.
+        ::tracing::info!(
+            target: "emulator::audit",
+            operation = "UntagResource",
+            akid = %akid,
+            region = %region,
+            resource_arn = ?input.resource_arn,
+            compliance_inquiry_id = %resource.id,
+            tag_keys = ?tag_keys,
+            tag_count,
+            removed,
+            tags_on_resource = resource.tags.len(),
+            outcome = "removed",
+            "state-changing operation"
+        );
 
         Ok(UntagResourceOutput {})
     }
