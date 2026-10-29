@@ -14,12 +14,12 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AccountInfo, ColumnGroup, ColumnLevelPermissionRule, DataPrepConfiguration, DataSet,
-    DataSetSummary, DataSetUsageConfiguration, DataSource, DataSourceErrorInfo,
-    DataSourceParameters, DatasetParameter, FieldFolder, InputColumn, LogicalTable, OutputColumn,
-    PerformanceConfiguration, PhysicalTable, ResourcePermission, RowLevelPermissionDataSet,
-    RowLevelPermissionTagConfiguration, SemanticModelConfiguration, SslProperties, Tag,
-    VpcConnectionProperties,
+    AccountInfo, ColumnGroup, ColumnLevelPermissionRule, CustomInstructions,
+    DataPrepConfiguration, DataSet, DataSetSummary, DataSetUsageConfiguration, DataSource,
+    DataSourceErrorInfo, DataSourceParameters, DatasetParameter, FieldFolder, InputColumn,
+    LogicalTable, OutputColumn, PerformanceConfiguration, PhysicalTable, ResourcePermission,
+    RowLevelPermissionDataSet, RowLevelPermissionTagConfiguration, SemanticModelConfiguration,
+    SslProperties, Tag, TopicDetails, VpcConnectionProperties,
 };
 
 /// Per-service state for com-amazonaws-quicksight-quicksight-20180401. A handler reaches it through [`service_state`].
@@ -35,6 +35,8 @@ pub struct ComAmazonawsQuicksightQuicksight20180401State {
     pub data_sets: HashMap<(String, String), DataSetRecord>,
     /// Ingestions by `(AwsAccountId, DataSetId, IngestionId)`.
     pub ingestions: HashMap<(String, String, String), IngestionRecord>,
+    /// Q topics by `(AwsAccountId, TopicId)`.
+    pub topics: HashMap<(String, String), TopicRecord>,
     /// The sign-up details `CreateAccountSubscription` stored, by `AwsAccountId`.
     ///
     /// An account with no entry here is still a QuickSight account — see
@@ -85,6 +87,42 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
             .keys()
             .filter(|(account, _)| account == aws_account_id)
             .count()
+    }
+
+    /// One account's topics, ordered by id — the order a topic read iterates in.
+    pub fn topics_in(&self, aws_account_id: &str) -> Vec<&TopicRecord> {
+        let mut records: Vec<&TopicRecord> = self
+            .topics
+            .iter()
+            .filter(|((account, _), _)| account == aws_account_id)
+            .map(|(_, record)| record)
+            .collect();
+        records.sort_by(|left, right| left.topic_id.cmp(&right.topic_id));
+        records
+    }
+
+    /// How many topics `aws_account_id` holds — what [`MAX_TOPICS_PER_ACCOUNT`] is
+    /// checked against.
+    pub fn topic_count(&self, aws_account_id: &str) -> usize {
+        self.topics
+            .keys()
+            .filter(|(account, _)| account == aws_account_id)
+            .count()
+    }
+
+    /// The data set in `aws_account_id` whose ARN is `arn`, if any. A topic's
+    /// `DatasetMetadata` names the data set it is built on by ARN, so resolving a
+    /// submitted association means resolving that ARN inside the same account.
+    ///
+    /// Resolved the same way as [`Self::data_source_by_arn`]: a QuickSight data set ARN
+    /// ends in `dataset/<DataSetId>`, so the id is read off the ARN and the candidate's
+    /// own ARN is then compared in full — an ARN that differs anywhere else (another
+    /// account, another region, another service) matches nothing.
+    pub fn data_set_by_arn(&self, aws_account_id: &str, arn: &str) -> Option<&DataSetRecord> {
+        let data_set_id = arn.rsplit_once("dataset/").map(|(_, id)| id)?;
+        self.data_sets
+            .get(&(aws_account_id.to_string(), data_set_id.to_string()))
+            .filter(|record| record.arn == arn)
     }
 
     /// The data source in `aws_account_id` whose ARN is `arn`, if any. A
@@ -402,6 +440,47 @@ pub const INGESTION_STATUS_COMPLETED: &str = "COMPLETED";
 /// opposed to one a refresh schedule started.
 pub const INGESTION_REQUEST_SOURCE_MANUAL: &str = "MANUAL";
 
+/// A stored Q topic: what `CreateTopic` persisted, which is what every later topic
+/// read reports.
+///
+/// The submitted [`TopicDetails`] is held whole rather than split into its members:
+/// `DescribeTopic` returns that same structure, so storing it is what makes the read
+/// report the definition the create was given.
+#[derive(Debug, Clone)]
+pub struct TopicRecord {
+    pub arn: String,
+    pub topic_id: String,
+    pub topic: TopicDetails,
+    pub custom_instructions: Option<CustomInstructions>,
+    /// The folder the topic was asked to reside in, if any — stored so a folder read
+    /// reports the membership once folders are implemented.
+    pub folder_arns: Vec<String>,
+    pub tags: Vec<Tag>,
+    pub created_time: DateTime,
+    /// The refresh that indexes the topic's associated data sets, minted by the create
+    /// that associated them; `None` for a topic associated with no data set, which has
+    /// nothing to index.
+    pub refresh: Option<TopicRefreshRecord>,
+}
+
+/// A stored topic refresh: the one `CreateTopic` starts, so the `RefreshArn` it
+/// reports names a real object.
+#[derive(Debug, Clone)]
+pub struct TopicRefreshRecord {
+    pub arn: String,
+    pub refresh_id: String,
+    pub created_time: DateTime,
+}
+
+/// How many topics one account may hold before `CreateTopic` refuses with the
+/// modelled `LimitExceededException`. Same standing as
+/// [`MAX_DATA_SETS_PER_ACCOUNT`]: a fidelity limit, not the process bound.
+pub const MAX_TOPICS_PER_ACCOUNT: usize = 1_000;
+
+/// The TOTAL number of topics this emulator holds, across every account — the
+/// process bound, for the same reason as [`MAX_DATA_SOURCES`].
+pub const MAX_TOPICS: usize = 10_000;
+
 /// `ResourceStatus` of a resource whose creation succeeded (model enum
 /// `com.amazonaws.quicksight#ResourceStatus`).
 pub const RESOURCE_STATUS_CREATION_SUCCESSFUL: &str = "CREATION_SUCCESSFUL";
@@ -495,6 +574,27 @@ pub fn ingestion_arn(
     )
 }
 
+/// The ARN of a Q topic: `.../topic/<TopicId>`.
+pub fn topic_arn(region: &str, aws_account_id: &str, topic_id: &str) -> String {
+    quicksight_arn(region, aws_account_id, &format!("topic/{topic_id}"))
+}
+
+/// The ARN of one topic's refresh: `.../topic/<TopicId>/refresh/<RefreshId>` — the
+/// resource the `DescribeTopicRefresh` route addresses
+/// (`/accounts/{AwsAccountId}/topics/{TopicId}/refresh/{RefreshId}`).
+pub fn topic_refresh_arn(
+    region: &str,
+    aws_account_id: &str,
+    topic_id: &str,
+    refresh_id: &str,
+) -> String {
+    quicksight_arn(
+        region,
+        aws_account_id,
+        &format!("topic/{topic_id}/refresh/{refresh_id}"),
+    )
+}
+
 /// The source of every server-minted id in this service.
 ///
 /// Process-wide rather than a field of the state struct on purpose: a reporting
@@ -522,6 +622,12 @@ pub fn next_request_id() -> String {
 /// The `IngestionId` for a newly started ingestion. Matches the model's
 /// `IngestionId` pattern (`^[a-zA-Z0-9-_]+$`, 1..128).
 pub fn next_ingestion_id() -> String {
+    uuid_shaped(next_minted_id())
+}
+
+/// The `RefreshId` of a newly started topic refresh. Matches the model's
+/// `ResourceId`, the shape the `DescribeTopicRefresh` label targets.
+pub fn next_topic_refresh_id() -> String {
     uuid_shaped(next_minted_id())
 }
 

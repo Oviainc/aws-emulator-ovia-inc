@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTopic
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTopic`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTopic::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +161,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTopic` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTopicErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTopic"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateTopicErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(crate::state::next_request_id()),
+                },
+            )
+            .into());
+        };
+
+        let request_id = crate::state::next_request_id();
+
+        if input.topic_id.is_empty() {
+            return Err(CreateTopicErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some("TopicId must not be empty.".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::topic_arn(&region, &input.aws_account_id, &input.topic_id);
+        let created_time = crate::state::now_timestamp(std::time::SystemTime::now());
+
+        let mut store = state.lock();
+        let key = (input.aws_account_id.clone(), input.topic_id.clone());
+        if store.topics.contains_key(&key) {
+            return Err(CreateTopicErrorModeled::ResourceExistsException(
+                ResourceExistsException {
+                    message: Some(format!(
+                        "The topic with ID {} already exists.",
+                        input.topic_id
+                    )),
+                    // `ExceptionResourceType` declares no member for a topic, so this
+                    // read reports none rather than an unmodelled value.
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // Both halves of the store key come from the request — the account id is an
+        // `@httpLabel` the caller chooses — so the total-records ceiling is what bounds
+        // this process and the per-account one is the fidelity limit on top of it.
+        if store.topics.len() >= crate::state::MAX_TOPICS {
+            return Err(CreateTopicErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This QuickSight emulator holds the maximum of {} topics.",
+                        crate::state::MAX_TOPICS
+                    )),
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+        if store.topic_count(&input.aws_account_id) >= crate::state::MAX_TOPICS_PER_ACCOUNT {
+            return Err(CreateTopicErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} topics.",
+                        crate::state::MAX_TOPICS_PER_ACCOUNT
+                    )),
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // A topic answers questions about the data sets it is associated with, each
+        // named by ARN. An association naming an ARN no stored data set in this account
+        // has is a reference to a resource that does not exist.
+        let associated_data_sets = input.topic.data_sets.as_deref().unwrap_or_default();
+        for data_set in associated_data_sets {
+            if store
+                .data_set_by_arn(&input.aws_account_id, &data_set.dataset_arn)
+                .is_none()
+            {
+                return Err(CreateTopicErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "DataSets names data set {}, which does not exist.",
+                            data_set.dataset_arn
+                        )),
+                        resource_type: Some("DATA_SET".to_string()),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Creating a topic indexes the data sets it was associated with, so a topic
+        // that has some gets a refresh whose ARN this response reports; one associated
+        // with no data set has nothing to index and so no refresh.
+        let refresh = (!associated_data_sets.is_empty()).then(|| {
+            let refresh_id = crate::state::next_topic_refresh_id();
+            crate::state::TopicRefreshRecord {
+                arn: crate::state::topic_refresh_arn(
+                    &region,
+                    &input.aws_account_id,
+                    &input.topic_id,
+                    &refresh_id,
+                ),
+                refresh_id,
+                created_time,
+            }
+        });
+        let refresh_arn = refresh.as_ref().map(|refresh| refresh.arn.clone());
+
+        store.topics.insert(
+            key,
+            crate::state::TopicRecord {
+                arn: arn.clone(),
+                topic_id: input.topic_id.clone(),
+                topic: input.topic,
+                custom_instructions: input.custom_instructions,
+                folder_arns: input.folder_arns.unwrap_or_default(),
+                tags: input.tags.unwrap_or_default(),
+                created_time,
+                refresh,
+            },
+        );
+
+        Ok(CreateTopicOutput {
+            arn: Some(arn),
+            topic_id: Some(input.topic_id),
+            refresh_arn,
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }

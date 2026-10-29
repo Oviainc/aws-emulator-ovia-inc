@@ -17,3 +17,5 @@ mod account_subscription;
 mod data_source_data_set_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/topic_lifecycle.rs"]
+mod topic_lifecycle;
