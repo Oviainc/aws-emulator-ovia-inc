@@ -13,10 +13,12 @@
 //! only wins when the request is well formed on its own terms.
 //!
 //! The rows span the operations, the request-only members (`numResults`, `inputList`,
-//! and the `@required` `userId` of `GetPersonalizedRanking`), the bound each one is
-//! measured against — including the lower maximum a request that asks for metadata gets
-//! — and the resource state the request names: unregistered,
-//! registered-but-wrong-recipe, and registered-but-missing-the-input.
+//! the `@required` `userId` of `GetPersonalizedRanking`, the `metadataColumns` map key
+//! and column count, and the `promotions` members a promoted subset needs), the bound
+//! each one is measured against — including the lower maximum a request that asks for
+//! metadata gets — and the resource state the request names: unregistered,
+//! registered-but-wrong-recipe, registered-but-missing-the-input, and a promotion whose
+//! filter the registry does not hold.
 //!
 //! A member the model leaves OPTIONAL is not such a refusal: it is an input of the
 //! resolved resource, so it is answered after resolution — see
@@ -25,8 +27,8 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_personalizeruntime_amazonpersonalizeruntime::state::{
-    self as registry, Campaign, RecipeType, MAX_NUM_ACTION_RESULTS, MAX_NUM_RESULTS,
-    MAX_NUM_RESULTS_WITH_METADATA,
+    self as registry, Campaign, RecipeType, MAX_METADATA_COLUMNS, MAX_NUM_ACTION_RESULTS,
+    MAX_NUM_RESULTS, MAX_NUM_RESULTS_WITH_METADATA, METADATA_DATASET_ITEMS,
 };
 
 use crate::support::{
@@ -52,6 +54,9 @@ const UNREGISTERED_CAMPAIGN: &str =
 /// A well-formed recommender ARN the registry does not hold.
 const UNREGISTERED_RECOMMENDER: &str =
     "arn:aws:personalize:us-east-1:123456789012:recommender/never-created";
+/// A well-formed filter ARN the registry does not hold — what a promotion that IS well
+/// formed on the request's own terms still earns a refusal for.
+const UNREGISTERED_FILTER: &str = "arn:aws:personalize:us-east-1:123456789012:filter/never-created";
 
 /// How many entries the seeded catalogs hold.
 const CATALOG_SIZE: usize = 8;
@@ -131,6 +136,49 @@ fn merged(base: &Value, patch: &Value) -> Value {
     body
 }
 
+/// The refusal for a `metadataColumns` map key other than the documented one: "The map
+/// key is `ITEMS`" (`GetRecommendationsRequest$metadataColumns` doc).
+fn metadata_key_past(key: &str) -> String {
+    format!(
+        "Value '{key}' at 'metadataColumns' failed to satisfy constraint: the map key must be \
+         {METADATA_DATASET_ITEMS}"
+    )
+}
+
+/// The refusal for more `metadataColumns` than "The maximum number of columns you can
+/// provide is 10." (`GetRecommendationsRequest$metadataColumns` doc).
+fn metadata_columns_past(count: usize) -> String {
+    format!(
+        "Value '{count}' at 'metadataColumns' failed to satisfy constraint: at most \
+         {MAX_METADATA_COLUMNS} columns can be provided"
+    )
+}
+
+/// `count` distinct Items-dataset column names, for `metadataColumns`.
+fn column_names(count: usize) -> Value {
+    Value::from(
+        (0..count)
+            .map(|index| Value::from(format!("COLUMN_{index}")))
+            .collect::<Vec<Value>>(),
+    )
+}
+
+/// A one-entry `promotions` list carrying every member except `missing`, so the only
+/// thing wrong with it is the member the refusal has to name.
+fn promotion_without(missing: &str) -> Value {
+    let mut promotion = json!({
+        "name": "promo",
+        "percentPromotedItems": 50,
+        "filterArn": UNREGISTERED_FILTER,
+    });
+    promotion
+        .as_object_mut()
+        .expect("a promotion is a JSON object")
+        .remove(missing)
+        .unwrap_or_else(|| panic!("case {missing}: the promotion must carry the member to drop"));
+    json!([promotion])
+}
+
 /// A list of `length` item ids, for `GetPersonalizedRanking$inputList`.
 fn input_list(length: usize) -> Value {
     Value::from(
@@ -173,6 +221,18 @@ fn table(route: &str) -> (Value, Vec<Resource>, Vec<RequestOnly>) {
                          {CAMPAIGN_RELATED} (RELATED_ITEMS)."
                     ),
                 },
+                Resource {
+                    case: "a promotion whose filter the registry does not hold",
+                    members: json!({
+                        "campaignArn": CAMPAIGN_USER,
+                        "promotions": [{
+                            "name": "promo",
+                            "percentPromotedItems": 50,
+                            "filterArn": UNREGISTERED_FILTER,
+                        }],
+                    }),
+                    refusal: unresolvable(UNREGISTERED_FILTER),
+                },
             ],
             vec![
                 RequestOnly {
@@ -195,6 +255,45 @@ fn table(route: &str) -> (Value, Vec<Resource>, Vec<RequestOnly>) {
                         MAX_NUM_RESULTS_WITH_METADATA + 1,
                         MAX_NUM_RESULTS_WITH_METADATA,
                     ),
+                },
+                RequestOnly {
+                    case: "a metadataColumns map key naming another dataset type",
+                    members: json!({ "metadataColumns": { "INTERACTIONS": [COLUMN_GENRE] } }),
+                    refusal: metadata_key_past("INTERACTIONS"),
+                },
+                RequestOnly {
+                    case: "a metadataColumns map key that is the right word in the wrong case",
+                    members: json!({ "metadataColumns": { "items": [COLUMN_GENRE] } }),
+                    refusal: metadata_key_past("items"),
+                },
+                RequestOnly {
+                    case: "one metadataColumns column past the documented maximum",
+                    members: json!({
+                        "metadataColumns": { "ITEMS": column_names(MAX_METADATA_COLUMNS + 1) },
+                    }),
+                    refusal: metadata_columns_past(MAX_METADATA_COLUMNS + 1),
+                },
+                RequestOnly {
+                    case: "far more metadataColumns columns than the documented maximum",
+                    members: json!({
+                        "metadataColumns": { "ITEMS": column_names(MAX_METADATA_COLUMNS * 3) },
+                    }),
+                    refusal: metadata_columns_past(MAX_METADATA_COLUMNS * 3),
+                },
+                RequestOnly {
+                    case: "a promotion with no name",
+                    members: json!({ "promotions": promotion_without("name") }),
+                    refusal: "promotions[0].name is required.".to_string(),
+                },
+                RequestOnly {
+                    case: "a promotion with no percentPromotedItems",
+                    members: json!({ "promotions": promotion_without("percentPromotedItems") }),
+                    refusal: "promotions[0].percentPromotedItems is required.".to_string(),
+                },
+                RequestOnly {
+                    case: "a promotion with no filterArn",
+                    members: json!({ "promotions": promotion_without("filterArn") }),
+                    refusal: "promotions[0].filterArn is required.".to_string(),
                 },
             ],
         ),
@@ -277,6 +376,18 @@ fn table(route: &str) -> (Value, Vec<Resource>, Vec<RequestOnly>) {
                     refusal: "userId is required: it is the user the campaign provides a \
                               personalized ranking for."
                         .to_string(),
+                },
+                RequestOnly {
+                    case: "a metadataColumns map key naming another dataset type",
+                    members: json!({ "metadataColumns": { "USERS": [COLUMN_GENRE] } }),
+                    refusal: metadata_key_past("USERS"),
+                },
+                RequestOnly {
+                    case: "one metadataColumns column past the documented maximum",
+                    members: json!({
+                        "metadataColumns": { "ITEMS": column_names(MAX_METADATA_COLUMNS + 1) },
+                    }),
+                    refusal: metadata_columns_past(MAX_METADATA_COLUMNS + 1),
                 },
             ],
         ),

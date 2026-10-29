@@ -599,24 +599,32 @@ pub fn too_long(member: &str, max: usize) -> Denied {
     ))
 }
 
-/// The metadata columns a request asked for, validated against the resolved
-/// resource and its catalog.
+/// The metadata columns a request asked for, measured against the two documented
+/// `metadataColumns` rules whose every input is the REQUEST.
 ///
-/// `Ok(None)` means the request asked for no metadata, in which case `PredictedItem`
-/// must carry no `metadata` member at all. Refusals follow the documented rules: the
-/// map key is `ITEMS`, at most [`MAX_METADATA_COLUMNS`] columns, the columns come
-/// "from your Items dataset", and metadata in recommendations has to have been
-/// enabled on the campaign or recommender.
+/// "The map key is `ITEMS`" and "The maximum number of columns you can provide is 10"
+/// are facts about the value the caller sent, so a request that breaks either is
+/// refused with the clause naming the member before any campaign or recommender is
+/// resolved — the same precedence `numResults` and `inputList` follow. The two rules
+/// that need the resolved resource are
+/// [`metadata_columns_in_catalog`]'s.
+///
+/// `Ok(None)` means the request asked for no metadata at all, in which case
+/// `PredictedItem` must carry no `metadata` member — a map naming no column asks for
+/// nothing, exactly as [`asks_for_metadata`] reports it.
 pub fn requested_metadata_columns(
     metadata_columns: Option<&HashMap<String, Vec<String>>>,
-    metadata_enabled: bool,
-    columns_in_catalog: &BTreeSet<String>,
-) -> Result<Option<Vec<String>>, Denied> {
+) -> Result<Option<&[String]>, Denied> {
     let Some(metadata_columns) = metadata_columns else {
         return Ok(None);
     };
     let mut requested: Option<&Vec<String>> = None;
-    for (dataset, columns) in metadata_columns {
+    // The map is modelled `len 0..1`, so one key is the ordinary case; a request that
+    // sent several is walked in key order, so the key the refusal names is the same on
+    // every run rather than whichever one the hash order visited first.
+    let mut entries: Vec<(&String, &Vec<String>)> = metadata_columns.iter().collect();
+    entries.sort_by_key(|(dataset, _)| *dataset);
+    for (dataset, columns) in entries {
         if dataset != METADATA_DATASET_ITEMS {
             return Err(Denied::invalid(format!(
                 "Value '{dataset}' at 'metadataColumns' failed to satisfy constraint: the map key \
@@ -635,6 +643,24 @@ pub fn requested_metadata_columns(
             requested.len()
         )));
     }
+    Ok(Some(requested.as_slice()))
+}
+
+/// The columns [`requested_metadata_columns`] admitted, validated against the RESOLVED
+/// resource and its catalog.
+///
+/// These are the `metadataColumns` rules that cannot be answered from the request:
+/// metadata in recommendations has to have been enabled on the campaign or
+/// recommender, and the columns come "from your Items dataset". `None` carries through
+/// a request that asked for no metadata.
+pub fn metadata_columns_in_catalog(
+    requested: Option<&[String]>,
+    metadata_enabled: bool,
+    columns_in_catalog: &BTreeSet<String>,
+) -> Result<Option<Vec<String>>, Denied> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
     if !metadata_enabled {
         return Err(Denied::invalid(
             "metadataColumns was provided but metadata in recommendations is not enabled for this \

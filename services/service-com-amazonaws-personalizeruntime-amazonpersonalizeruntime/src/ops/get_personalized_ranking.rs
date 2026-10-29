@@ -9,10 +9,13 @@
 //! response is the REQUEST'S OWN `inputList`, re-ordered — never a list this handler
 //! chooses:
 //!
-//! 1. `inputList`'s length is checked FIRST, because its bound is a fact about the
-//!    request alone: "If you are including metadata in recommendations, the maximum is
-//!    50. Otherwise, the maximum is 500." A longer list is 400 `Length of 'inputList'
-//!    cannot be greater than <max>` before anything is resolved.
+//! 1. What the REQUEST alone settles is checked FIRST, before anything is resolved:
+//!    `inputList`'s length against the bound the same request fixes ("If you are
+//!    including metadata in recommendations, the maximum is 50. Otherwise, the maximum
+//!    is 500." — a longer list is 400 `Length of 'inputList' cannot be greater than
+//!    <max>`), the `@required` `userId`, and the `metadataColumns` rules that read
+//!    nothing else ("The map key is `ITEMS`", "The maximum number of columns you can
+//!    provide is 10" — see [`crate::state::requested_metadata_columns`]).
 //! 2. `campaignArn` is resolved against the registry in [`crate::state`] (400 "does
 //!    not exist or is not active yet" when it resolves to nothing — see
 //!    [`crate::state::Denied::unresolvable`]), and the campaign must deploy a
@@ -205,6 +208,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  for.",
             ));
         }
+        //    So are the `metadataColumns` rules that need nothing but the request: the
+        //    map key, and how many columns it may name.
+        let requested_metadata =
+            registry::requested_metadata_columns(input.metadata_columns.as_ref()).map_err(deny)?;
 
         // 2. The campaign, and the recipe type this operation serves. `campaignArn` is
         //    `@required` and targets `Arn`, whose `@pattern` no empty or blank string
@@ -223,10 +230,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // 3. Metadata, validated against the resolved campaign and its catalog. How
-        //    long `inputList` may be was already settled in step 1, from the request.
-        let metadata_columns = registry::requested_metadata_columns(
-            input.metadata_columns.as_ref(),
+        // 3. Metadata, validated against the resolved campaign and its catalog — the
+        //    parts of `metadataColumns` that need it; its map key and column cap were
+        //    already settled in step 1, from the request.
+        let metadata_columns = registry::metadata_columns_in_catalog(
+            requested_metadata,
             campaign.metadata_enabled,
             &registry::catalog_columns(&campaign.items),
         )

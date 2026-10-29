@@ -6,11 +6,15 @@
 //!
 //! Everything it returns is read from the inference registry in [`crate::state`]:
 //!
-//! 1. **Settle `numResults`.** "The default is 25. If you are including metadata in
-//!    recommendations, the maximum is 50. Otherwise, the maximum is 500." Both the
-//!    value and the bound it has to satisfy are facts about the REQUEST, so a
-//!    `numResults` past the bound is `InvalidInputException` (400) naming the member
-//!    and the bound BEFORE anything is resolved.
+//! 1. **Settle what the REQUEST alone decides.** A refusal whose every input is the
+//!    request is `InvalidInputException` (400) naming the member the caller got wrong,
+//!    BEFORE anything is resolved, so one malformed request earns one refusal whatever
+//!    the registry holds. That covers `numResults` against the bound the same request
+//!    fixes ("The default is 25. If you are including metadata in recommendations, the
+//!    maximum is 50. Otherwise, the maximum is 500."), the `metadataColumns` rules that
+//!    read nothing else ("The map key is `ITEMS`", "The maximum number of columns you
+//!    can provide is 10" — see [`crate::state::requested_metadata_columns`]), and the
+//!    `promotions` members a promoted subset cannot be defined without.
 //! 2. **Resolve the resource.** Exactly one of `campaignArn` / `recommenderArn`
 //!    identifies what to recommend from; an ARN the registry does not hold is
 //!    `InvalidInputException` (400), "does not exist or is not active yet" (see
@@ -204,13 +208,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = SystemTime::now();
         let mut guard = state.lock();
 
-        // 1. How many results to compute. Both `numResults` and the maximum it has to
+        // 1. What the REQUEST alone settles, before anything is resolved: every
+        //    refusal here measures a value the caller sent against a documented bound or
+        //    against a member without which the request defines nothing, so a malformed
+        //    request earns the clause naming that member whatever the registry holds.
+        //
+        //    How many results to compute. Both `numResults` and the maximum it has to
         //    satisfy — "If you are including metadata in recommendations, the maximum
         //    is 50. Otherwise, the maximum is 500." — are facts about the REQUEST: the
         //    bound is keyed off the same predicate `GetPersonalizedRanking` bounds
-        //    `inputList` with, so one request means one bound in both operations. It is
-        //    therefore settled BEFORE anything is resolved, and a `numResults` past the
-        //    bound is refused whatever the resource turns out to be.
+        //    `inputList` with, so one request means one bound in both operations.
         let max_num_results = registry::metadata_bounded_max(registry::asks_for_metadata(
             input.metadata_columns.as_ref(),
         ));
@@ -220,6 +227,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             max_num_results,
         )
         .map_err(deny)?;
+        //    The `metadataColumns` rules that need nothing but the request: the map key
+        //    and how many columns it may name.
+        let requested_metadata =
+            registry::requested_metadata_columns(input.metadata_columns.as_ref()).map_err(deny)?;
+        //    The `promotions` members themselves: a promotion missing one of them
+        //    defines no promoted subset, which is a fact about the request.
+        let requested_promotion = requested_promotion(input.promotions.as_deref())?;
 
         // 2. Resolve the campaign or recommender this request recommends from.
         let resolved = resolve(
@@ -248,16 +262,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // 4. Which metadata columns come back, validated against the RESOLVED resource
-        //    and its catalog — the one part of `metadataColumns` that needs it; how
-        //    many results the request may ask for was already settled in step 1.
-        let metadata_columns = registry::requested_metadata_columns(
-            input.metadata_columns.as_ref(),
+        //    and its catalog — the parts of `metadataColumns` that need it; the map key
+        //    and the column cap were already settled in step 1, from the request.
+        let metadata_columns = registry::metadata_columns_in_catalog(
+            requested_metadata,
             resolved.metadata_enabled,
             &registry::catalog_columns(&resolved.items),
         )
         .map_err(deny)?;
 
-        // 5. The request's filter, and the request's promotion.
+        // 5. The request's filter, and the registry-bound filter of the promotion step
+        //    1 already read off the request.
         let request_filter = guard
             .bind_filter(
                 registry::present(input.filter_arn.as_deref()),
@@ -265,7 +280,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.filter_values.as_ref(),
             )
             .map_err(deny)?;
-        let promotion = promotion(&guard, input.promotions.as_deref())?;
+        let promotion = bind_promotion(&guard, requested_promotion)?;
 
         // 6. Score the resolved resource's WHOLE stored catalog and settle each entry's
         //    share of the certainty over it. `RELATED_ITEMS` recommends items related
@@ -454,15 +469,28 @@ struct PreparedPromotion {
     filter: BoundFilter,
 }
 
-/// Validate and bind the request's promotion, if it carries one.
+/// The request's promotion, as the REQUEST states it: every member a promoted subset
+/// needs, read off the request and not yet looked up anywhere.
+struct RequestedPromotion<'a> {
+    /// `Promotion$name`.
+    name: &'a str,
+    /// `Promotion$percentPromotedItems`.
+    percent: i32,
+    /// `Promotion$filterArn`, still to be resolved against the registry.
+    filter_arn: &'a str,
+    /// `Promotion$filterValues`, bound to that filter's placeholders.
+    filter_values: Option<&'a std::collections::HashMap<String, String>>,
+}
+
+/// Read the request's promotion, if it carries one, from the REQUEST alone.
 ///
 /// `PromotionList` is modelled `len 0..1`, so at most one promotion can arrive. A
 /// promotion without a name, a percentage or a filter defines no promoted subset at
-/// all, which is a refusal naming the member.
-fn promotion(
-    state: &crate::state::ComAmazonawsPersonalizeruntimeAmazonpersonalizeruntimeState,
+/// all, which is a refusal naming the member — and one that needs nothing but the
+/// request, so it is settled before the campaign or recommender is resolved.
+fn requested_promotion(
     promotions: Option<&[Promotion]>,
-) -> Result<Option<PreparedPromotion>, GetRecommendationsError> {
+) -> Result<Option<RequestedPromotion<'_>>, GetRecommendationsError> {
     let Some(promotion) = promotions.and_then(<[Promotion]>::first) else {
         return Ok(None);
     };
@@ -475,19 +503,40 @@ fn promotion(
     let Some(filter_arn) = registry::present(promotion.filter_arn.as_deref()) else {
         return Err(invalid("promotions[0].filterArn is required."));
     };
+    Ok(Some(RequestedPromotion {
+        name,
+        percent,
+        filter_arn,
+        filter_values: promotion.filter_values.as_ref(),
+    }))
+}
+
+/// Bind the requested promotion's filter to the registry and to this request.
+///
+/// Everything left here needs the REGISTRY: "This filter defines the criteria for
+/// promoted items", so an ARN the registry does not hold, or a `filterValues` binding
+/// the stored expression cannot apply, is reported once the promotion's own members are
+/// known to be well formed.
+fn bind_promotion(
+    state: &crate::state::ComAmazonawsPersonalizeruntimeAmazonpersonalizeruntimeState,
+    requested: Option<RequestedPromotion<'_>>,
+) -> Result<Option<PreparedPromotion>, GetRecommendationsError> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
     let Some(filter) = state
         .bind_filter(
-            Some(filter_arn),
+            Some(requested.filter_arn),
             Entity::Items,
-            promotion.filter_values.as_ref(),
+            requested.filter_values,
         )
         .map_err(deny)?
     else {
         return Err(invalid("promotions[0].filterArn is required."));
     };
     Ok(Some(PreparedPromotion {
-        name: name.to_string(),
-        percent,
+        name: requested.name.to_string(),
+        percent: requested.percent,
         filter,
     }))
 }
