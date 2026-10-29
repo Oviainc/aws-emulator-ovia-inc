@@ -16,7 +16,10 @@
 //! Removal is idempotent — a key the resource does not carry is simply not
 //! there afterwards — and the keys that remain are the ones every later read of
 //! that resource (`GetMonitor`'s `tags`, and its `probes[].tags`) reports,
-//! because there is exactly one stored tag map per resource.
+//! because there is exactly one stored tag map per resource. A removal that
+//! lands in a PROBE rewrites a record the monitor holds and every read of the
+//! monitor reports, so the monitor's own `modifiedAt` moves with the probe's
+//! ([`crate::state::Monitor::follow_probe_write`]).
 //!
 //! The removal reports nothing back, so a success is answered with the
 //! no-content status ([`crate::state::TAG_MUTATION_SUCCESS_STATUS`]) rather than
@@ -239,6 +242,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for key in &input.tag_keys {
             changed |= tags.remove(key).is_some();
         }
+        // A removal that removed nothing modified nothing, so it moves no
+        // `modifiedAt`. A removal that landed in a probe rewrote a record the
+        // MONITOR holds and every read of the monitor reports, so the monitor's
+        // own `modifiedAt` moves with the probe's
+        // ([`crate::state::Monitor::follow_probe_write`], applied by
+        // `mark_modified`).
         if changed {
             store.mark_modified(&target, now);
         }

@@ -1127,9 +1127,12 @@ impl Monitor {
     /// repeat of one leaves both records exactly as they were.
     ///
     /// Called by every operation that writes a probe of a stored monitor, so
-    /// one rule is applied however the probes changed. NOT part of the settle
-    /// walk a read performs: a transition the clock made due was already owed by
-    /// the call that scheduled it, and a read modifies nothing.
+    /// one rule is applied however the probes changed — the probe-shaped
+    /// operations directly, and a tag write against a probe's ARN through
+    /// [`ComAmazonawsNetworkmonitorNetworkmonitorState::mark_modified`]. NOT
+    /// part of the settle walk a read performs: a transition the clock made due
+    /// was already owed by the call that scheduled it, and a read modifies
+    /// nothing.
     pub fn follow_probe_write(&mut self, stored_change: bool, now: SystemTime) {
         if stored_change {
             self.modified_at = now;
@@ -1502,6 +1505,12 @@ impl ComAmazonawsNetworkmonitorNetworkmonitorState {
     /// Tags are part of the resource every read reports, so a call that removes
     /// or adds one modified the resource. Called only when the stored tag map
     /// actually changed: a tagging call that is a no-op modified nothing.
+    ///
+    /// A write that landed in a PROBE rewrote a record the monitor holds and
+    /// every read of the monitor reports, so it changed the monitor too and the
+    /// monitor's own `modifiedAt` moves with the probe's
+    /// ([`Monitor::follow_probe_write`]) — the one rule every probe-writing path
+    /// of this crate applies, whatever member of the probe it rewrote.
     pub fn mark_modified(&mut self, resource: &TaggedResource, now: SystemTime) {
         match resource {
             TaggedResource::Monitor {
@@ -1517,12 +1526,14 @@ impl ComAmazonawsNetworkmonitorNetworkmonitorState {
                 monitor_name,
                 probe_id,
             } => {
-                if let Some(probe) = self
-                    .monitor_mut(region, monitor_name)
-                    .and_then(|monitor| monitor.probes.get_mut(probe_id))
-                {
-                    probe.modified_at = now;
-                }
+                let Some(monitor) = self.monitor_mut(region, monitor_name) else {
+                    return;
+                };
+                let Some(probe) = monitor.probes.get_mut(probe_id) else {
+                    return;
+                };
+                probe.modified_at = now;
+                monitor.follow_probe_write(true, now);
             }
         }
     }

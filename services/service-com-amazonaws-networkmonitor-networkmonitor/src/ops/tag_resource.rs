@@ -10,6 +10,12 @@
 //! an ARN no stored resource answers to is
 //! refused with the modelled 404 `ResourceNotFoundException`.
 //!
+//! A write that lands in a PROBE rewrites a record the monitor holds and every
+//! read of the monitor reports, so it changed the monitor too and the monitor's
+//! own `modifiedAt` moves with the probe's
+//! ([`crate::state::Monitor::follow_probe_write`]), exactly as a create, update
+//! or delete of a probe moves it.
+//!
 //! A resource whose teardown has already been accepted is not a target for this
 //! write either: it is on its way out, so an ARN naming it is refused with the
 //! same 404
@@ -260,7 +266,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A write that assigned every key the value it already had modified
         // nothing, so it does not move `modifiedAt` — the same rule
-        // `UntagResource` applies to a removal that removed nothing.
+        // `UntagResource` applies to a removal that removed nothing. A write
+        // that landed in a probe rewrote a record the MONITOR holds and every
+        // read of the monitor reports, so the monitor's own `modifiedAt` moves
+        // with the probe's
+        // ([`crate::state::Monitor::follow_probe_write`], applied by
+        // `mark_modified`).
         if changed {
             store.mark_modified(&target, now);
         }

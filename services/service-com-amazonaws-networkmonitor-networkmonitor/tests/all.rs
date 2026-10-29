@@ -33,6 +33,8 @@ mod monitor_modified_at_follows_probe_writes;
 mod monitor_state_follows_probe_activation;
 #[path = "all/probe_subnet_identity.rs"]
 mod probe_subnet_identity;
+#[path = "all/probe_tag_writes_move_the_monitor.rs"]
+mod probe_tag_writes_move_the_monitor;
 #[path = "all/probe_teardown.rs"]
 mod probe_teardown;
 #[path = "all/probes_per_monitor_limit.rs"]
