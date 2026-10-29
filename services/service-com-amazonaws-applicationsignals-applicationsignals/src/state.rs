@@ -1393,6 +1393,28 @@ pub fn page_bound(member_path: &str, max_results: i32, maximum: i32) -> Result<u
     Ok(max_results as usize)
 }
 
+/// The page size a read serves for a `MaxResults` whose own model declares the WHOLE range it
+/// admits together with the `@default` its documentation names, where `default` is the page
+/// that operation documents for a caller who states no bound.
+///
+/// The centralized walk enforces both ends of such a member's range before any handler runs,
+/// so the only case left for a handler to decide is the member that carries no bound at all: a
+/// non-positive value can therefore only mean the member was ABSENT, and is read as the
+/// documented default rather than as a page of nothing, which could not advance its own cursor
+/// ([`page_of`]).
+///
+/// [`page_bound`] is the same rule for a member whose model states a maximum ONLY: there the
+/// bound is refused rather than defaulted, because such a member documents no default to fall
+/// back on. Both live here so every read of this service that holds to one of them holds to
+/// ONE copy of it, and the page sizes they default to are the constants beside them.
+pub fn defaulted_page_bound(max_results: i32, default: i32) -> usize {
+    if max_results < MIN_PAGE_BOUND {
+        default as usize
+    } else {
+        max_results as usize
+    }
+}
+
 /// One page of a derived projection, plus the token for the page after it.
 ///
 /// The projections the time-ranged topology reads page over are DERIVED (they are

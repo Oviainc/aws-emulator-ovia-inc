@@ -192,16 +192,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.environment,
         );
 
-        // `MaxResults` is modelled with a `@default` of 50 and `range 1..100`, so the
-        // boundary validator has already refused anything outside the range and filled the
-        // default for an absent member. A non-positive value can therefore only mean the
-        // member was absent, and is read as the documented default rather than as a page of
-        // nothing.
-        let page_size = if input.max_results < 1 {
-            crate::state::DEFAULT_INSTRUMENTATION_CONFIGURATION_PAGE as usize
-        } else {
-            input.max_results as usize
-        };
+        // `MaxResults` carries both its range and a documented `@default`, so the page size
+        // is the one rule this service words once for such a member.
+        let page_size = crate::state::defaulted_page_bound(
+            input.max_results,
+            crate::state::DEFAULT_INSTRUMENTATION_CONFIGURATION_PAGE,
+        );
 
         // The token is resolved under the tag of the scope that issued it, so a token from
         // another service, environment or instrumentation type is refused rather than

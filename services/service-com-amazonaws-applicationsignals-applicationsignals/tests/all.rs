@@ -25,6 +25,8 @@ mod budget_status_agreement;
 mod change_event_attribution;
 #[path = "all/code_location_class_name.rs"]
 mod code_location_class_name;
+#[path = "all/defaulted_page_bound.rs"]
+mod defaulted_page_bound;
 #[path = "all/discovered_metric_references.rs"]
 mod discovered_metric_references;
 #[path = "all/discovery_enablement.rs"]
