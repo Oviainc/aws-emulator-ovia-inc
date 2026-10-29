@@ -168,6 +168,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A filter the request CARRIES has to name something to narrow by, so each of the
+        // two free-text ones is tested before the store is touched: `Queue` is a reference
+        // to a queue resource and `InputFile` is "your input file URL or your partial
+        // input file name", and a value carrying no characters is neither of those nor the
+        // member left out — it names no queue this account could hold and no text an input
+        // could be matched against — so it is the bad request every other door that
+        // resolves such a member answers with, naming the member it arrived in. `Status`
+        // and `Order` target enums and `MaxResults` a bounded integer, so the boundary
+        // validator has already refused a value outside those.
+        for (member, value) in [
+            ("Queue", input.queue.as_deref()),
+            ("InputFile", input.input_file.as_deref()),
+        ] {
+            if let Some(message) = crate::state::blank_member_problem(member, value) {
+                return Err(
+                    SearchJobsErrorModeled::BadRequestException(BadRequestException {
+                        message: Some(message),
+                    })
+                    .into(),
+                );
+            }
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();

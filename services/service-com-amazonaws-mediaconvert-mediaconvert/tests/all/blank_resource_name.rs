@@ -40,18 +40,20 @@ use super::resource_tagging::encode_label;
 /// A value a resource-naming member can be made ENTIRELY of, which is what the rule
 /// generalises over: whether there are any characters at all, which whitespace character is
 /// used, how many there are, and whether they are mixed.
-struct Blank {
-    label: &'static str,
+pub(crate) struct Blank {
+    pub(crate) label: &'static str,
     /// The member value exactly as the request body carries it.
-    value: &'static str,
+    pub(crate) value: &'static str,
     /// `value` percent-encoded for a `{Name}` path label, so a case can try to READ the
-    /// resource a refused create must not have stored. Empty for the zero-length value,
-    /// which is no path label at all.
-    path: &'static str,
+    /// resource a refused create must not have stored, and the same encoding a QUERY
+    /// member's value carries (`tests/all/blank_filter_value.rs` drives the rule's
+    /// reporting half through those). Empty for the zero-length value, which is no path
+    /// label at all.
+    pub(crate) path: &'static str,
 }
 
 /// The blank forms every row below is driven through.
-fn blanks() -> Vec<Blank> {
+pub(crate) fn blanks() -> Vec<Blank> {
     vec![
         Blank {
             label: "no characters at all",
@@ -157,8 +159,10 @@ fn create_request(door: &Door, name: &str) -> Value {
     body
 }
 
-/// How this service words the refusal of a member that carries no characters.
-fn refusal_message(member: &str) -> String {
+/// How this service words the refusal of a member that carries no characters — shared
+/// with the suites that drive the other halves of the same rule, so none of them can
+/// assert a different sentence.
+pub(crate) fn refusal_message(member: &str) -> String {
     format!("{member} must not be empty.")
 }
 

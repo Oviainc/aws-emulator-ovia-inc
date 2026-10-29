@@ -617,6 +617,25 @@ pub fn blank_member_message(member: &str) -> String {
     format!("{member} must not be empty.")
 }
 
+/// Why an OPTIONAL member a request carries cannot be the value it claims to be, or `None`
+/// when the member was left out or carries at least one character.
+///
+/// [`carries_no_characters`] for a member a request may leave out, which is what a FILTER
+/// member always is: omitting such a member and sending it with no characters are
+/// DIFFERENT requests. The first asks for the member's documented default — no narrowing
+/// for a filter, the account's default queue for a job's `Queue` — while the second
+/// supplies a value that identifies nothing: no resource a reference could resolve to and
+/// no text a match could be made against. So the second is the bad request
+/// [`blank_member_message`] words rather than a comparison resolved from a value nothing
+/// could hold, which would report a narrowing that narrowed to the empty set, or (where
+/// the comparison is containment) one that narrowed nothing at all. ONE function for every
+/// door that reads such a member, so none of them can disagree about it.
+pub fn blank_member_problem(member: &str, value: Option<&str>) -> Option<String> {
+    value
+        .is_some_and(carries_no_characters)
+        .then(|| blank_member_message(member))
+}
+
 /// How this service words a reference that resolves to nothing: it names the REQUEST
 /// MEMBER that pointed at the resource, not the value the caller supplied.
 ///
@@ -3217,6 +3236,10 @@ impl JobRecord {
     /// and `SearchJobs`'s `InputFile` ("Provide your input file URL or your partial input
     /// file name") — so a whole URL and any part of one both match, and the two cannot
     /// drift apart.
+    ///
+    /// A `needle` carrying no characters never reaches here: both readers refuse such a
+    /// value at the door ([`blank_member_problem`]), because containment against it is
+    /// satisfied by every input and so would WIDEN the set the filter was sent to narrow.
     pub fn matches_input_file(&self, needle: &str) -> bool {
         self.input_files().any(|file| file.contains(needle))
     }

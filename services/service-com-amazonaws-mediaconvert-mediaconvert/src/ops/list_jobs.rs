@@ -166,6 +166,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The `queue` filter is a reference to a queue resource, so a value carrying no
+        // characters is neither a queue this account holds nor the member left out, and it
+        // is refused naming the member it arrived in — the same test, before the store is
+        // touched, that `SearchJobs` and every minting or resolving door apply to such a
+        // member. `status` and `order` target enums, so the boundary validator has already
+        // refused a value outside them.
+        if let Some(message) = crate::state::blank_member_problem("Queue", input.queue.as_deref()) {
+            return Err(
+                ListJobsErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+                .into(),
+            );
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();

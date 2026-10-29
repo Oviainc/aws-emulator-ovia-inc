@@ -36,7 +36,7 @@ async fn search_jobs(emulator: &Emulator, query: &str) -> Reply {
 }
 
 /// The `id` of every job in a reply, in the order returned.
-fn job_ids(reply: &Reply) -> Vec<String> {
+pub(crate) fn job_ids(reply: &Reply) -> Vec<String> {
     reply
         .at("/jobs")
         .as_array()

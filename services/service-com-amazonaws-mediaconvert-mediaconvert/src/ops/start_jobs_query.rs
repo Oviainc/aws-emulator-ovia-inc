@@ -206,6 +206,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             for value in values {
+                // A value carrying no characters is the same problem as a `Values` list
+                // with no entries: it names nothing for the job detail the key chose to be
+                // compared with — no queue this account could hold, no status, and no text
+                // an input could be matched against — so it is refused naming the member it
+                // arrived in rather than matched against no job or (for a containment key)
+                // every job.
+                if let Some(message) =
+                    crate::state::blank_member_problem("FilterList.Values", Some(value))
+                {
+                    return Err(StartJobsQueryErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(message),
+                        },
+                    )
+                    .into());
+                }
                 terms.push(crate::state::JobsQueryTerm {
                     key: key.to_string(),
                     value: value.clone(),
