@@ -148,13 +148,50 @@ impl Emulator {
     /// The status and `lastUpdatedAt` the SHARED store holds — what the IoT control
     /// plane, reading the same record, would report.
     pub(crate) fn stored(&self, thing: &str, job_id: &str) -> (String, i64) {
+        let record = self.stored_execution(thing, job_id);
+        (record.status, record.last_updated_at)
+    }
+
+    /// The whole of the SHARED record — the one the IoT control plane reads too — for
+    /// a suite that asserts on more of it than the status: the version a device sees,
+    /// the stamps, and the deadlines the record's timers still carry.
+    pub(crate) fn stored_execution(&self, thing: &str, job_id: &str) -> StoredExecution {
         let store = service_state(&*self.engine).expect("the shared job-execution store");
         let store = store.lock();
         store
             .execution_index(thing, job_id, None)
             .and_then(|index| store.record(thing, index))
-            .map(|record| (record.status.clone(), record.last_updated_at))
+            .map(|record| StoredExecution {
+                status: record.status.clone(),
+                version_number: record.version_number,
+                started_at: record.started_at,
+                last_updated_at: record.last_updated_at,
+                step_timeout_expires_at: record.step_timeout_expires_at,
+                execution_timeout_expires_at: record.execution_timeout_expires_at,
+            })
             .unwrap_or_else(|| panic!("{thing} must hold the execution {job_id}"))
+    }
+}
+
+/// A stored execution as these suites assert on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredExecution {
+    pub(crate) status: String,
+    pub(crate) version_number: i64,
+    pub(crate) started_at: Option<i64>,
+    pub(crate) last_updated_at: i64,
+    pub(crate) step_timeout_expires_at: Option<i64>,
+    pub(crate) execution_timeout_expires_at: Option<i64>,
+}
+
+impl StoredExecution {
+    /// The instant this record would move to `TIMED_OUT` at: the SOONEST armed
+    /// timer's deadline, or `None` while no timer is armed.
+    pub(crate) fn deadline(&self) -> Option<i64> {
+        [self.step_timeout_expires_at, self.execution_timeout_expires_at]
+            .into_iter()
+            .flatten()
+            .min()
     }
 }
 

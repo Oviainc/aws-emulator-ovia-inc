@@ -25,6 +25,8 @@ mod job_execution_lifecycle;
 mod job_execution_state_machine;
 #[path = "all/response_document_completeness.rs"]
 mod response_document_completeness;
+#[path = "all/start_next_against_a_passed_deadline.rs"]
+mod start_next_against_a_passed_deadline;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 // The harness the suites above share: the emulator, its HTTP calls and the
