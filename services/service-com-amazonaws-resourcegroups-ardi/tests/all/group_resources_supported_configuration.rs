@@ -283,8 +283,14 @@ async fn the_refusal_follows_the_addressed_group_and_not_the_identifier_form() {
     // The served group of the same store records the same resource, twice over:
     // the refusal above is a property of the group, not of the store or the call
     // order. Only the FIRST of the two calls adds a membership, so only it
-    // reports one — the repeated call adds nothing and reports nothing.
-    for (round, added) in [("first", 1), ("second", 0)] {
+    // reports one — the repeated call adds nothing, and `Succeeded` targets a list
+    // whose declared length starts at one, so the repeat carries no `Succeeded`
+    // member at all. The wire form of a report that has nothing in it is the
+    // sibling `reported_list_wire_form` suite's own rule.
+    for (round, reported) in [
+        ("first", Some(json!([MEMBERS[0]]))),
+        ("second", None),
+    ] {
         let grouped = emulator
             .ok(
                 "/group-resources",
@@ -292,10 +298,9 @@ async fn the_refusal_follows_the_addressed_group_and_not_the_identifier_form() {
             )
             .await;
         assert_eq!(
-            grouped["Succeeded"].as_array().map(Vec::len),
-            Some(added),
-            "case {round:?}: expected the served group to report {added} membership(s) \
-             added by this call, got {grouped}",
+            grouped.get("Succeeded"),
+            reported.as_ref(),
+            "case {round:?}: expected Succeeded to be {reported:?}, got {grouped}",
         );
     }
     let stored = listed_members(&emulator, "served", "served").await;

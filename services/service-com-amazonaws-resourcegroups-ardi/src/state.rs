@@ -1974,6 +1974,19 @@ pub fn check_resource_arns(resource_arns: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// A reported list in the wire form a member whose modelled target declares a
+/// length MINIMUM admits: `Some(values)` while there is something to report, and
+/// `None` — the member ABSENT from the answer — when there is not.
+///
+/// A list target that declares a minimum of one or more admits no empty value, so
+/// "there is nothing to report" is said by leaving the member out, the way the rest
+/// of this service says it. A member whose target declares no minimum (the sibling
+/// `Failed` and `Pending` of a static-membership answer) may carry `[]` and does not
+/// go through here.
+pub fn reported_list<T>(values: Vec<T>) -> Option<Vec<T>> {
+    (!values.is_empty()).then_some(values)
+}
+
 /// The service and resource portions of `arn`, or `None` when the string is not
 /// an ARN.
 ///

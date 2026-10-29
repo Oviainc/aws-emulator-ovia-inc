@@ -5,7 +5,9 @@
 //! Records each ARN in `ResourceArns` as a static member of the group `Group` names, in
 //! [`crate::state`], and reports in `Succeeded` the memberships THIS call added. Adding an
 //! ARN that is already a member is a no-op, so a repeated call neither duplicates the
-//! membership nor reports an addition for it.
+//! membership nor reports an addition for it — and since `Succeeded` targets a list whose
+//! declared length starts at one, a call that added nothing omits the member rather than
+//! answering an empty list.
 //!
 //! Only a group whose stored service configuration declares one of the supported
 //! configuration types ([`crate::state::STATIC_MEMBERSHIP_CONFIGURATION_TYPES`]) accepts a
@@ -285,10 +287,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "resources added to a resource group",
         );
         Ok(GroupResourcesOutput {
-            succeeded: Some(succeeded),
+            // `Succeeded` targets `ResourceArnList`, whose declared length starts
+            // at one, so a call that added no membership cannot say so with an
+            // empty list: the member is left out of the answer instead.
+            succeeded: crate::state::reported_list(succeeded),
             // Nothing was refused, and a static membership this emulator accepts is
             // immediate — so neither list has an entry: an ARN the group already
-            // held did not FAIL to be added, and none is left half-added.
+            // held did not FAIL to be added, and none is left half-added. Both
+            // targets declare no length minimum, so `[]` is a value they carry.
             failed: Some(Vec::new()),
             pending: Some(Vec::new()),
         })

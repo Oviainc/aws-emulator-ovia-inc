@@ -6,7 +6,9 @@
 //! names, in [`crate::state`], and reports the resources THIS call removed in
 //! `Succeeded`. Removing an ARN the group does not hold removes nothing, so that ARN
 //! is reported in neither `Succeeded` nor `Failed`; a repeated call therefore changes
-//! nothing and reports no removal.
+//! nothing and reports no removal — and since `Succeeded` targets a list whose declared
+//! length starts at one, a call that removed nothing omits the member rather than
+//! answering an empty list.
 //!
 //! Only a group the store records as populated through a static grouping, or one whose
 //! service configuration still declares one of the supported configuration types
@@ -264,10 +266,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "resources removed from a resource group",
         );
         Ok(UngroupResourcesOutput {
-            succeeded: Some(succeeded),
+            // `Succeeded` targets `ResourceArnList`, whose declared length starts
+            // at one, so a call that dropped no membership cannot say so with an
+            // empty list: the member is left out of the answer instead.
+            succeeded: crate::state::reported_list(succeeded),
             // A removal this emulator accepts is applied in full and immediately: no
             // named resource is refused, so nothing failed to be removed, and none
-            // is left half-removed, so nothing is pending either.
+            // is left half-removed, so nothing is pending either. Both targets
+            // declare no length minimum, so `[]` is a value they carry.
             failed: Some(Vec::new()),
             pending: Some(Vec::new()),
         })
