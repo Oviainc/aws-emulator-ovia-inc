@@ -179,7 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // WHICH portal is asked about decides both the suppliers reported and the order
         // a token resumes in, so it is resolved first: an identifier naming no portal
-        // this service serves is the modelled 404.
+        // this service serves is the modelled 404, worded from the request and held to
+        // the bound the model gives the member that text travels in (see
+        // [`crate::state::no_such_procurement_portal`] — a `PortalIdentifier` carries no
+        // modelled maximum of its own).
         let portal_name =
             crate::state::procurement_portal_name_for_identifier(&input.portal_identifier)
                 .ok_or_else(|| {

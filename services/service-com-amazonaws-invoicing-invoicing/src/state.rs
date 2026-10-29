@@ -1300,11 +1300,17 @@ const PROCUREMENT_PORTAL_PREFERENCE_KIND: &str = "Procurement portal preference"
 /// capitalised key this plane's recorded bodies carry ([`MessageKey::Capitalised`]). The
 /// ARN is reported in the shape's own ARN member as well, so a client can still read it
 /// mechanically instead of parsing it out of the prose.
+///
+/// Held to the bound the model gives the member it travels in
+/// ([`crate::service::validation::bounded_message`]), as every message this service words
+/// from a request is, so no wording of this service rests on a maximum that lives in
+/// another shape — here `ProcurementPortalPreferenceArnString`'s own `@length(max: 256)`,
+/// which already leaves the sentence inside the bound.
 pub fn no_such_procurement_portal_preference(arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
+        message: Some(crate::service::validation::bounded_message(format!(
             "{PROCUREMENT_PORTAL_PREFERENCE_KIND} with arn {arn} does not exist"
-        )),
+        ))),
         resource_id: Some(arn.to_string()),
         message_key: MessageKey::Capitalised,
     }
@@ -1337,12 +1343,17 @@ pub fn no_such_resource_unnamed() -> ResourceNotFoundException {
 /// `resourceName` is left absent: the model types it as an `InvoiceUnitArnString`
 /// (`smithy_query(query="shape", shape="AccessDeniedException")`), so it names an
 /// invoice unit rather than an account.
+///
+/// Held to the bound the model gives the member it travels in
+/// ([`crate::service::validation::bounded_message`]), as every message this service words
+/// from a request is; `AccountIdString`'s own `@pattern ^\d{12}$` already leaves this
+/// sentence inside it.
 pub fn not_authorized_for_account(account_id: &str) -> AccessDeniedException {
     AccessDeniedException {
-        message: Some(format!(
+        message: Some(crate::service::validation::bounded_message(format!(
             "Account {} is not authorized to access resources for account {account_id}",
             ::engine::emulator_account_id()
-        )),
+        ))),
         resource_name: None,
     }
 }

@@ -217,13 +217,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The message states the service's own TEMPLATE over the requested `Name`: the
         // name is enclosed in angle brackets, which is what makes the offending name
         // recoverable from the refusal even when it contains the spaces `Name`'s
-        // `@pattern` permits internally.
+        // `@pattern` permits internally. It is held to the bound the model gives the
+        // member it travels in (`crate::service::validation::bounded_message`), as every
+        // message this service words from a request is; `InvoiceUnitName`'s own
+        // `@length(max: 50)` already leaves this sentence inside it.
         if store.live_invoice_units().any(|unit| unit.name == input.name) {
             return Err(CreateInvoiceUnitErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
+                message: Some(crate::service::validation::bounded_message(format!(
                     "Invoice Unit already exists with name: <{}>",
                     input.name
-                )),
+                ))),
                 reason: Some("duplicateInvoiceUnit".to_string()),
                 ..Default::default()
             })
