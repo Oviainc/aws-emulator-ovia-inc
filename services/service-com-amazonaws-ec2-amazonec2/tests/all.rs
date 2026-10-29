@@ -925,3 +925,9 @@ mod describe_transit_gateway_connects;
 // the implemented creates store — with the moves the clock owes them — read back through it.
 #[path = "all/transit_gateway_route_tables.rs"]
 mod transit_gateway_route_tables;
+// Appended at the END of this file, for the reason the header gives. What
+// `DescribeTransitGatewayAttachments` reports out of the attachment store — every kind of
+// attachment, as the kind-independent shape — how the id list, the documented filters and the
+// page size narrow it, and that the association a writer stored reads back through it.
+#[path = "all/describe_transit_gateway_attachments.rs"]
+mod describe_transit_gateway_attachments;

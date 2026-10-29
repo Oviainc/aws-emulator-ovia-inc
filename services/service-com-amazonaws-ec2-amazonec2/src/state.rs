@@ -15992,6 +15992,22 @@ pub fn image_is_deprecated(image: &Image, now: SystemTime) -> bool {
         .is_some_and(|at| iso8601_is_before(at, &reference))
 }
 
+/// A stored ISO 8601 UTC timestamp STRING as the modelled timestamp type, or `None` when
+/// there is no string or its rendering does not read as an instant.
+///
+/// EC2 models the SAME fact as a string on one shape and as a timestamp on another — an
+/// image's `CreationDate` against `ImageAncestryEntry$CreationDate`, a Client VPN
+/// attachment's `CreationTime` against `TransitGatewayAttachment$CreationTime` — so every
+/// report that carries the timestamp form of a stored string reads it back through this ONE
+/// conversion rather than re-deriving the instant from the clock, and no two reports of one
+/// record can disagree about when it happened.
+pub fn parse_iso8601_timestamp(text: Option<&str>) -> Option<::aws_smithy_types::DateTime> {
+    text.and_then(|text| {
+        ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+            .ok()
+    })
+}
+
 /// The `Image$CreationDate` of a stored image as the modelled timestamp type, or `None` for
 /// an image that carries none, or one whose stored rendering does not read as an instant.
 ///
@@ -15999,14 +16015,10 @@ pub fn image_is_deprecated(image: &Image, now: SystemTime) -> bool {
 /// and a TIMESTAMP wherever a report carries the same fact — `ImageWatermark`'s
 /// `SourceImageCreationTime` ("the creation date of the source AMI, in the following format:
 /// YYYY-MM-DDTHH:MM:SS.ssssss+HH:MM") and `ImageAncestryEntry$CreationDate` ("the date and
-/// time when this AMI was created"). Both read the stored rendering back through this ONE
-/// conversion rather than re-deriving the instant from the clock, so no two reports of one
-/// image can disagree about when it was created.
+/// time when this AMI was created"). Both read the stored rendering back through the one
+/// [`parse_iso8601_timestamp`] every such report uses.
 pub fn image_creation_time(creation_date: Option<&str>) -> Option<::aws_smithy_types::DateTime> {
-    creation_date.and_then(|text| {
-        ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
-            .ok()
-    })
+    parse_iso8601_timestamp(creation_date)
 }
 
 /// Refuse a request that named an AMI id the account can see no image for, the way EC2
@@ -28309,6 +28321,72 @@ impl TransitGatewayAttachmentView {
                 rejecting: TRANSIT_GATEWAY_ATTACHMENT_STATE_REJECTED,
                 rejected: TRANSIT_GATEWAY_ATTACHMENT_STATE_REJECTED,
             },
+        }
+    }
+
+    /// The transit gateway this attachment is on, which a report of the attachment names as
+    /// its `TransitGatewayId`.
+    ///
+    /// A peering attachment is on TWO gateways and carries neither as a plain member: the one
+    /// it belongs to is the requester's ("information about the requester transit gateway",
+    /// `TransitGatewayPeeringAttachment$RequesterTgwInfo`), the accepter's being the peer
+    /// [`Self::resource_id`] reports as the resource this attachment attaches.
+    pub fn transit_gateway_id(&self) -> Option<&str> {
+        match self {
+            Self::Vpc(attachment) => attachment.transit_gateway_id.as_deref(),
+            Self::Peering(attachment) => attachment
+                .requester_tgw_info
+                .as_ref()
+                .and_then(|info| info.transit_gateway_id.as_deref()),
+            Self::ClientVpn(attachment) => attachment.transit_gateway_id.as_deref(),
+            Self::Connect(attachment) => attachment.transit_gateway_id.as_deref(),
+        }
+    }
+
+    /// The account that owns that gateway as the ATTACHMENT records it, or `None` for a kind
+    /// whose shape carries no such member — for which the gateway's own record
+    /// (`TransitGateway$OwnerId`) is what names its owner.
+    ///
+    /// Only a peering attachment records it, because a peering spans two accounts and the
+    /// requester's gateway need not be one this store holds ("the ID of the Amazon Web
+    /// Services account that owns the transit gateway", `PeeringTgwInfo$OwnerId`).
+    pub fn transit_gateway_owner_id(&self) -> Option<&str> {
+        match self {
+            Self::Peering(attachment) => attachment
+                .requester_tgw_info
+                .as_ref()
+                .and_then(|info| info.owner_id.as_deref()),
+            Self::Vpc(_) | Self::ClientVpn(_) | Self::Connect(_) => None,
+        }
+    }
+
+    /// When the attachment was created, as the modelled timestamp a report of it carries.
+    ///
+    /// `TransitGatewayClientVpnAttachment$CreationTime` is a STRING where every other kind's
+    /// is a timestamp, so that one rendering is read back through the one
+    /// [`parse_iso8601_timestamp`] this crate reads a stored timestamp string with — and an
+    /// attachment whose stored rendering does not read as an instant carries none, rather
+    /// than a made-up one.
+    pub fn creation_time(&self) -> Option<::aws_smithy_types::DateTime> {
+        match self {
+            Self::Vpc(attachment) => attachment.creation_time,
+            Self::Peering(attachment) => attachment.creation_time,
+            Self::Connect(attachment) => attachment.creation_time,
+            Self::ClientVpn(attachment) => {
+                parse_iso8601_timestamp(attachment.creation_time.as_deref())
+            }
+        }
+    }
+
+    /// The attachment's tags, or `None` for a kind whose shape models none — reported absent
+    /// rather than as an empty set, there being no tag set on the record to report.
+    pub fn tags(&self) -> Option<&Vec<Tag>> {
+        match self {
+            Self::Vpc(attachment) => attachment.tags.as_ref(),
+            Self::Peering(attachment) => attachment.tags.as_ref(),
+            Self::Connect(attachment) => attachment.tags.as_ref(),
+            // `TransitGatewayClientVpnAttachment` models no tags at all.
+            Self::ClientVpn(_) => None,
         }
     }
 
