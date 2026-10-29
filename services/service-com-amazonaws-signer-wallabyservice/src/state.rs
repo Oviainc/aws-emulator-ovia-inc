@@ -269,16 +269,36 @@ impl SigningProfileRecord {
         self.status == PROFILE_STATUS_REVOKED
     }
 
-    /// Whether this profile's tags may still be CHANGED.
+    /// Whether a tagging API call on this profile is admitted at all.
     ///
-    /// `BadRequestException` documents the one status that forbids it: the shape
+    /// `BadRequestException` documents the one status that forbids one: the shape
     /// "also occurs when you call a tagging API on a cancelled signing profile"
-    /// (`smithy_query(query="shape", shape="BadRequestException")`). Nothing
-    /// documents a refusal for any other status, and a canceled profile is the
-    /// one Signer schedules for deletion, so `Active` and `Revoked` profiles
-    /// accept tag writes.
-    pub fn accepts_tag_writes(&self) -> bool {
+    /// (`smithy_query(query="shape", shape="BadRequestException")`) — the whole
+    /// tagging route, the calls that REPORT the map as much as the ones that
+    /// change it. Nothing documents a refusal for any other status, and a
+    /// canceled profile is the one Signer schedules for deletion, so `Active` and
+    /// `Revoked` profiles admit every tagging call.
+    ///
+    /// Private: [`Self::tagging_refusal`] is the one entry point the route's
+    /// decision is taken through, so no caller can ask the question and forget
+    /// the answer.
+    fn admits_tagging_calls(&self) -> bool {
         self.status != PROFILE_STATUS_CANCELED
+    }
+
+    /// The `(message, code)` a tagging call on this profile is refused with, or
+    /// `None` when the status the store holds NOW admits the call.
+    ///
+    /// ONE decision for the whole tagging route, so every operation bound to it
+    /// answers the same shape, message and `code` for the same profile.
+    pub fn tagging_refusal(&self) -> Option<(String, String)> {
+        if self.admits_tagging_calls() {
+            return None;
+        }
+        Some((
+            tagging_refused_message(&self.profile_name, &self.status),
+            profile_status_error_code(&self.status),
+        ))
     }
 
     /// The stored tags, as the wire map — absent when there are none.
@@ -1149,8 +1169,8 @@ pub fn too_many_tags_message(resulting: usize) -> String {
     )
 }
 
-/// The refusal prose for a tag write on a profile whose status forbids it.
-pub fn tag_write_refused_message(profile_name: &str, status: &str) -> String {
+/// The refusal prose for a tagging call on a profile whose status forbids it.
+pub fn tagging_refused_message(profile_name: &str, status: &str) -> String {
     format!(
         "Signing Profile {profile_name} cannot be tagged because it is {status}. \
          A {status} profile cannot be tagged."

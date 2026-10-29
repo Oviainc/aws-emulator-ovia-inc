@@ -224,10 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the gate reads the status the store holds NOW: a later
         // `PutSigningProfile` re-versions the profile back to `Active` and then the
         // same tag write is admitted.
-        if !profile.accepts_tag_writes() {
-            let message =
-                crate::state::tag_write_refused_message(&profile.profile_name, &profile.status);
-            let code = crate::state::profile_status_error_code(&profile.status);
+        if let Some((message, code)) = profile.tagging_refusal() {
             return Err(bad_request(message, code));
         }
 

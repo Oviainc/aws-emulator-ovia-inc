@@ -13,9 +13,9 @@
 //! outside its length bounds, one inside AWS's reserved namespace or one
 //! carrying a character outside the alphabet its pattern states — is refused 400
 //! `BadRequestException`;
-//! and a CANCELED profile's tags cannot be changed — the shape documents that it
-//! "also occurs when you call a tagging API on a cancelled signing profile". A
-//! refused call removes nothing.
+//! and a CANCELED profile is refused 400 `BadRequestException` — the shape
+//! documents that it "also occurs when you call a tagging API on a cancelled
+//! signing profile". A refused call removes nothing.
 //!
 //! Implemented alongside `ListTagsForResource` (issue
 //! `20261023T031331Z-signer-listtagsforresource-stub`): it is the same persisted
@@ -221,11 +221,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A canceled profile is the one status the modelled bad request names, and
         // the gate reads the status the store holds NOW — so a refused removal
         // leaves every tag in place.
-        if !profile.accepts_tag_writes() {
-            return Err(bad_request(
-                crate::state::tag_write_refused_message(&profile.profile_name, &profile.status),
-                crate::state::profile_status_error_code(&profile.status),
-            ));
+        if let Some((message, code)) = profile.tagging_refusal() {
+            return Err(bad_request(message, code));
         }
 
         // "Removes one or more tags from a signing profile. To remove the tags,

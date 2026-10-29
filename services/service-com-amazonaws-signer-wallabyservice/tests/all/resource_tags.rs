@@ -19,10 +19,10 @@
 //!   bounds, outside AWS's reserved namespace, and made only of the characters
 //!   its pattern's alphabet states — and every operation that takes tag keys
 //!   refuses the whole request for any other key, writing and removing nothing;
-//! * a CANCELED profile's tags cannot be CHANGED (the modelled bad request "also
-//!   occurs when you call a tagging API on a cancelled signing profile") while it
-//!   stays readable, because Signer documents a canceled profile as still
-//!   viewable.
+//! * a CANCELED profile admits no tagging call at all — the modelled bad request
+//!   "also occurs when you call a tagging API on a cancelled signing profile", so
+//!   all three operations bound to that route answer it, while the profile stays
+//!   viewable through the operations that are not tagging APIs.
 //!
 //! The cases are tables: a row per input class the rules generalise over (tag
 //! count up to the modelled maximum, key and value length at both modelled bounds,
@@ -677,38 +677,84 @@ async fn an_unresolvable_resource_arn_is_refused_the_same_way_by_every_tagging_o
     );
 }
 
-/// A profile's STORED status decides which tagging calls it admits: a CANCELED
-/// profile's tags cannot be changed (the modelled bad request names that status),
-/// while it stays readable — and an ACTIVE or REVOKED profile's tags are writable,
-/// because nothing documents a refusal for those.
-#[tokio::test]
-async fn a_tag_write_is_admitted_or_refused_by_the_profiles_status() {
-    // One row per status a profile can be in when the tagging call arrives, plus
-    // the row that reaches `Active` again through a re-put.
-    let rows: [(&str, &str, u16); 4] = [
-        ("Active", "Active_Tagging", 200),
-        ("Revoked", "Revoked_Tagging", 200),
-        ("Canceled", "Canceled_Tagging", 400),
-        ("Canceled then re-put", "Reput_Tagging", 200),
-    ];
+/// One profile status a tagging call can arrive in, and what the whole tagging
+/// route answers for it.
+struct TaggingStatusCase {
+    case: &'static str,
+    profile: &'static str,
+    /// The status the store holds for the profile when the three calls arrive —
+    /// asserted through `GetSigningProfile`, so a row that failed to reach that
+    /// status is not read as a statement about it.
+    stored_status: &'static str,
+    /// The HTTP status EVERY operation bound to `/tags/{resourceArn}` answers in
+    /// that status.
+    expected_status: u16,
+}
 
-    for (status_before, name, expected_status) in rows {
+/// One row per status a profile can be in when a tagging call arrives, plus the
+/// row that reaches `Active` again through a re-put — the statuses are
+/// `SigningProfileStatus`'s values (`smithy_query(query="shape",
+/// shape="SigningProfileStatus")`: `Active | Canceled | Revoked`).
+fn tagging_status_cases() -> [TaggingStatusCase; 4] {
+    [
+        TaggingStatusCase {
+            case: "Active",
+            profile: "Active_Tagging",
+            stored_status: "Active",
+            expected_status: 200,
+        },
+        TaggingStatusCase {
+            case: "Revoked",
+            profile: "Revoked_Tagging",
+            stored_status: "Revoked",
+            expected_status: 200,
+        },
+        TaggingStatusCase {
+            case: "Canceled",
+            profile: "Canceled_Tagging",
+            stored_status: "Canceled",
+            expected_status: 400,
+        },
+        TaggingStatusCase {
+            case: "Canceled then re-put",
+            profile: "Reput_Tagging",
+            stored_status: "Active",
+            expected_status: 200,
+        },
+    ]
+}
+
+/// A profile's STORED status decides whether the tagging route admits a call at
+/// all: a CANCELED profile refuses EVERY operation bound to
+/// `/tags/{resourceArn}` — the read as much as the two writes — with 400
+/// `BadRequestException` naming that status, because the shape documents that it
+/// "also occurs when you call a tagging API on a cancelled signing profile";
+/// an ACTIVE or REVOKED profile admits all three, because nothing documents a
+/// refusal for those. The profile itself stays viewable through the operations
+/// that are not tagging APIs, which is where a refused call is shown to have
+/// changed nothing.
+#[tokio::test]
+async fn the_profiles_status_decides_which_tagging_calls_it_admits() {
+    for row in tagging_status_cases() {
+        let case = row.case;
+        let name = row.profile;
+        let expected_status = row.expected_status;
         let router = emulator();
         let arn = seed_profile(&router, name).await;
         let seeded = tags(&[("env", "prod")]);
         assert_eq!(
             tag_resource(&router, &arn, &seeded).await.status,
             200,
-            "case {status_before:?}: the profile must be taggable while Active"
+            "case {case:?}: the profile must be taggable while Active"
         );
 
-        match status_before {
+        match case {
             "Revoked" => {
                 let version = get_profile(&router, name).await.str_member("profileVersion");
                 let revoked = revoke_profile(&router, name, &version).await;
                 assert_eq!(
                     revoked.status, 204,
-                    "case {status_before:?}: the revoke must succeed, got {:?}",
+                    "case {case:?}: the revoke must succeed, got {:?}",
                     revoked.body
                 );
             }
@@ -716,65 +762,104 @@ async fn a_tag_write_is_admitted_or_refused_by_the_profiles_status() {
                 assert_eq!(
                     cancel_profile(&router, name).await.status,
                     204,
-                    "case {status_before:?}: the cancel must succeed"
+                    "case {case:?}: the cancel must succeed"
                 );
             }
             _ => {}
         }
-        if status_before == "Canceled then re-put" {
+        if case == "Canceled then re-put" {
             // A put re-versions the profile and a re-versioned profile is
-            // `Active`, so its tags are writable again: the gate follows the
-            // STORED status, not the profile's history.
+            // `Active`, so the tagging route admits it again: the gate follows
+            // the STORED status, not the profile's history.
             seed_profile(&router, name).await;
         }
 
-        let added = tags(&[("team", "iot")]);
-        let write = tag_resource(&router, &arn, &added).await;
+        // What the store holds now, so the rest of the row is a statement about
+        // that status.
+        let before = get_profile(&router, name).await;
         assert_eq!(
-            write.status, expected_status,
-            "case {status_before:?}: expected TagResource HTTP {expected_status}, got {} {:?}",
-            write.status, write.body
-        );
-        let removal = untag_resource(&router, &arn, &["env"]).await;
-        assert_eq!(
-            removal.status, expected_status,
-            "case {status_before:?}: expected UntagResource HTTP {expected_status}, got {} {:?}",
-            removal.status, removal.body
+            before.str_member("status"),
+            row.stored_status,
+            "case {case:?}: expected the stored status {}, got {:?}",
+            row.stored_status,
+            before.body
         );
 
-        // A canceled profile is still VIEWABLE, so the read answers either way —
-        // with the map the admitted writes left, or with the untouched one.
-        let listed = list_tags(&router, &arn).await;
-        assert_eq!(
-            listed.status, 200,
-            "case {status_before:?}: a profile stays readable in every status, got {} {:?}",
-            listed.status, listed.body
-        );
+        // Every operation bound to the tagging route, asked of the profile in
+        // that status: all three answer alike, because the documented refusal
+        // names the CALL and not the change it would make.
+        let added = tags(&[("team", "iot")]);
+        for operation in ["ListTagsForResource", "TagResource", "UntagResource"] {
+            let answer = match operation {
+                "ListTagsForResource" => list_tags(&router, &arn).await,
+                "TagResource" => tag_resource(&router, &arn, &added).await,
+                _ => untag_resource(&router, &arn, &["env"]).await,
+            };
+            assert_eq!(
+                answer.status, expected_status,
+                "case {case:?} on {operation}: expected HTTP {expected_status}, got {} {:?}",
+                answer.status, answer.body
+            );
+            if expected_status == 200 {
+                continue;
+            }
+            assert_eq!(
+                answer.code(),
+                Some("ProfileCanceled"),
+                "case {case:?} on {operation}: expected the code to name the status that forbids \
+                 the call, got {:?}",
+                answer.body
+            );
+            assert_eq!(
+                answer.error_type.as_deref(),
+                Some("BadRequestException"),
+                "case {case:?} on {operation}: expected an x-amzn-errortype header, got {:?}",
+                answer.error_type
+            );
+            assert!(
+                answer
+                    .message()
+                    .is_some_and(|message| message.contains(name)
+                        && message.contains(row.stored_status)),
+                "case {case:?} on {operation}: expected a message naming the profile and the \
+                 status that forbids the call, got {:?}",
+                answer.message()
+            );
+        }
+
+        // `GetSigningProfile` is not a tagging API, so a canceled profile is
+        // still viewable through it — and the map it reports is the one the three
+        // calls left: what the admitted write and removal did, or the untouched
+        // map a refused route changed nothing of.
         let expected = if expected_status == 200 {
             // The write added a key and the removal took the seeded one.
             added
         } else {
             seeded
         };
+        let profile = get_profile(&router, name).await;
         assert_eq!(
-            listed.tags().as_ref(),
-            Some(&expected),
-            "case {status_before:?}: expected the tag map {expected:?}, got {:?}",
-            listed.tags()
+            profile.status, 200,
+            "case {case:?}: a profile stays viewable in every status, got {} {:?}",
+            profile.status, profile.body
         );
-        if expected_status != 200 {
+        assert_eq!(
+            profile.tags().as_ref(),
+            Some(&expected),
+            "case {case:?}: expected the tag map {expected:?}, got {:?}",
+            profile.tags()
+        );
+
+        // Where the route is admitted, its READ reports that same map — so the
+        // row covers the body `ListTagsForResource` answers, not only the status.
+        if expected_status == 200 {
+            let listed = list_tags(&router, &arn).await;
             assert_eq!(
-                write.code(),
-                Some("ProfileCanceled"),
-                "case {status_before:?}: expected the code to name the status that forbids the \
-                 write, got {:?}",
-                write.body
-            );
-            assert_eq!(
-                write.error_type.as_deref(),
-                Some("BadRequestException"),
-                "case {status_before:?}: expected an x-amzn-errortype header, got {:?}",
-                write.error_type
+                listed.tags().as_ref(),
+                Some(&expected),
+                "case {case:?}: expected ListTagsForResource to report the tag map \
+                 {expected:?}, got {:?}",
+                listed.tags()
             );
         }
     }

@@ -10,9 +10,11 @@
 //! A label that is not a signing-profile ARN is refused 400 `BadRequestException`
 //! ("The request contains invalid parameters for the ARN or tags"); a well-formed
 //! ARN naming no stored profile is refused 404 `NotFoundException` ("The signing
-//! profile was not found"). A CANCELED profile is still read: Signer documents
-//! that a canceled profile "is still viewable", and only the tagging calls that
-//! CHANGE it are refused.
+//! profile was not found"); and a CANCELED profile is refused 400
+//! `BadRequestException` like every other call on this route — the shape documents
+//! that it "also occurs when you call a tagging API on a cancelled signing
+//! profile", which this operation is. The profile itself stays viewable through
+//! `GetSigningProfile` and `ListSigningProfiles`, which are not tagging APIs.
 //!
 //! ## Shape of an operation
 //!
@@ -136,6 +138,16 @@ fn refused(
     .into()
 }
 
+/// A 400 `BadRequestException` carrying `message` and `code` — the shape the
+/// tagging operations refuse a bad request with.
+fn bad_request(message: String, code: String) -> ListTagsForResourceError {
+    ListTagsForResourceErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+        code: Some(code),
+    })
+    .into()
+}
+
 /// The `ListTagsForResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -194,6 +206,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let profile = store
             .profile_for_tagging(&region, &input.resource_arn)
             .map_err(|problem| refused(problem, &input.resource_arn))?;
+
+        // A canceled profile is the one status the modelled bad request names, and
+        // it names the CALL rather than the write: this operation is one of the
+        // tagging APIs, so it is refused for that status like the other two. The
+        // gate reads the status the store holds NOW, so a later
+        // `PutSigningProfile` re-versions the profile back to `Active` and the
+        // same read is admitted again.
+        if let Some((message, code)) = profile.tagging_refusal() {
+            return Err(bad_request(message, code));
+        }
 
         Ok(ListTagsForResourceOutput {
             // Present even when empty: a reader of ONE resource's tags has to be
