@@ -2413,9 +2413,15 @@ const ARN_BUDGET_PREFIX: &str = "budget/";
 
 /// A budget ACTION is named beneath the budget it acts on (`Action$BudgetName`), so its
 /// ARN is the budget's with the action's own id below it:
-/// `budget/{BudgetName}/action/{ActionId}`. That is the substring `BudgetName`'s
-/// `@pattern` forbids inside a name ("the '/action/' substring aren't allowed"), so the
-/// split below is unambiguous however many slashes a budget name holds.
+/// `budget/{BudgetName}/action/{ActionId}`.
+///
+/// `BudgetName`'s `@pattern` forbids this whole substring — both slashes — inside a
+/// name, but NOT a name that merely ends in `/action`: such a name contributes its own
+/// `/action` plus this separator's leading slash as an EARLIER occurrence of the
+/// separator's text. `ActionId` is a UUID (`@pattern`
+/// `^[a-fA-F0-9]{8}-…-[a-fA-F0-9]{12}$`, `@length(36, 36)`), so it holds no slash and
+/// contributes no occurrence of its own. The separator is therefore the LAST occurrence
+/// in the resource field, which is the split [`parse_resource_arn`] takes.
 const ARN_ACTION_INFIX: &str = "/action/";
 
 /// The resource an `AmazonResourceName` handed to the tagging operations names: a budget
@@ -2473,7 +2479,12 @@ pub fn parse_resource_arn(arn: &str) -> Result<TaggedResource, String> {
         return Err(malformed());
     }
     let resource = resource.strip_prefix(ARN_BUDGET_PREFIX).ok_or_else(malformed)?;
-    match resource.split_once(ARN_ACTION_INFIX) {
+    // The separator is the LAST occurrence, not the first: a budget name may END in
+    // `/action` (only the two-slash substring is forbidden inside a name), and such a
+    // name plus this separator's leading slash spells the separator's own text one
+    // position earlier. Taking the last occurrence resolves the ARN back to the budget
+    // name it was rendered from, whatever that name ends in.
+    match resource.rsplit_once(ARN_ACTION_INFIX) {
         Some((budget_name, action_id)) => {
             if budget_name.is_empty() || action_id.is_empty() {
                 return Err(malformed());

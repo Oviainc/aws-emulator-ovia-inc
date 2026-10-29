@@ -15,6 +15,8 @@
 mod account_notification_listing;
 #[path = "all/account_scoping.rs"]
 mod account_scoping;
+#[path = "all/action_arn_name_boundary.rs"]
+mod action_arn_name_boundary;
 #[path = "all/attached_notification_identity.rs"]
 mod attached_notification_identity;
 #[path = "all/budget_action_execution.rs"]
