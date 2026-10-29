@@ -214,8 +214,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         mut input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AWS takes the authorization decision at the IAM layer, ahead of the service
+        // looking at the request's input, so a caller whose identity-based policies do not
+        // allow this action is refused before the document is touched. Document analysis
+        // addresses no resource of its own, so it is judged against the resource IAM
+        // writes for such a request.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::service::authorization::ANY_RESOURCE,
+        )
+        .map_err(AnalyzeDocumentErrorModeled::AccessDeniedException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(AnalyzeDocumentErrorModeled::InternalServerError(
                 InternalServerError {
@@ -288,30 +301,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let key = reference.identity_key();
-        // The read happens OUTSIDE the state lock, and on the blocking pool: reading a
-        // raster is bounded but CPU-bound, so it occupies no async worker.
-        let stored = state.lock().stored_content(&key);
-        let content = match stored {
-            Some(content) => content,
-            None => {
-                let inline = input.document.bytes.take();
-                match crate::state::read_document(reference.clone(), inline).await {
-                    Ok(content) => state.lock().register_document(reference, content),
-                    Err(crate::state::ReadFailure::Unreadable(reason)) => {
-                        return Err(unreadable_error(&reason))
-                    }
-                    Err(crate::state::ReadFailure::DidNotComplete) => {
-                        return Err(AnalyzeDocumentErrorModeled::InternalServerError(
-                            InternalServerError {
-                                message: Some("reading the document did not complete".to_string()),
-                                code: None,
-                            },
-                        )
-                        .into())
-                    }
+        // The read happens OUTSIDE the state lock, and the decoding on the blocking pool:
+        // reading a raster is bounded but CPU-bound, so it occupies no async worker. The
+        // bytes are the request's own, or the object this emulator's Amazon S3 holds at
+        // the location it named.
+        let inline = input.document.bytes.take();
+        let content =
+            match crate::state::read_submitted_document(&state, ctx, &reference, inline).await {
+                crate::state::DocumentRead::Read(content) => content,
+                // A synchronous operation has no result to give either way, so both
+                // refusals are the modelled error for the reason.
+                crate::state::DocumentRead::NotTakenOn(reason)
+                | crate::state::DocumentRead::Unreadable(reason) => {
+                    return Err(unreadable_error(&reason))
                 }
-            }
-        };
+                crate::state::DocumentRead::DidNotComplete => {
+                    return Err(AnalyzeDocumentErrorModeled::InternalServerError(
+                        InternalServerError {
+                            message: Some("reading the document did not complete".to_string()),
+                            code: None,
+                        },
+                    )
+                    .into())
+                }
+            };
         // The QUERY blocks, and the QUERY_RESULT blocks that answer them, are blocks this
         // response carries, so they count against the same ceiling the document's own
         // blocks were checked against when it was read.

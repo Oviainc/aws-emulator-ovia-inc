@@ -155,8 +155,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AWS takes the authorization decision at the IAM layer, ahead of the service
+        // reading or writing anything, so a caller whose identity-based policies do not
+        // allow this action is refused without being told whether the adapter exists. The
+        // adapter the request NAMES is the resource the decision is made against.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::service::authorization::adapter_resource(ctx, Some(&input.adapter_id)),
+        )
+        .map_err(DeleteAdapterErrorModeled::AccessDeniedException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteAdapterErrorModeled::InternalServerError(
                 InternalServerError {

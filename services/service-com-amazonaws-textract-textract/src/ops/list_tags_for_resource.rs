@@ -155,8 +155,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AWS takes the authorization decision at the IAM layer, ahead of the service
+        // reading anything, so a caller whose identity-based policies do not allow this
+        // action is refused without being told whether the resource exists. The decision is
+        // made against the ARN the request CARRIED, not one resolved from a stored record.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.resource_arn,
+        )
+        .map_err(ListTagsForResourceErrorModeled::AccessDeniedException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalServerError(
                 InternalServerError {

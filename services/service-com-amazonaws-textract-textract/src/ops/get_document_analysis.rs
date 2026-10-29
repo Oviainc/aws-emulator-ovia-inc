@@ -218,8 +218,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AWS takes the authorization decision at the IAM layer, ahead of the service
+        // reading anything, so a caller whose identity-based policies do not allow this
+        // action is refused without being told whether the job exists. A job is addressed
+        // by its `JobId` and is no resource an IAM policy names, so this is judged against
+        // the resource IAM writes for such a request.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::service::authorization::ANY_RESOURCE,
+        )
+        .map_err(GetDocumentAnalysisErrorModeled::AccessDeniedException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetDocumentAnalysisErrorModeled::InternalServerError(
                 InternalServerError {

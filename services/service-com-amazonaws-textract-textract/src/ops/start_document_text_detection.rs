@@ -11,10 +11,12 @@
 //! `ClientRequestToken` returns the SAME `JobId`; reusing it for a different document
 //! is an `IdempotentParameterMismatchException`.
 //!
-//! A `DocumentLocation` names an S3 object, and this emulator's Amazon S3 cannot serve
-//! object bytes yet, so the document usually cannot be read. That is NOT answered with
-//! a hollow success: the job is created and then ends in the modelled `FAILED` state
-//! with a `StatusMessage` saying why the document could not be read.
+//! A `DocumentLocation` names an S3 object, which is read from this emulator's own Amazon
+//! S3 over the in-process callback. AWS validates that location at SUBMIT time, so an
+//! object the store answers for with no such object is refused here with the modelled
+//! `InvalidS3ObjectException` and no job is created. A document that IS taken on but whose
+//! text cannot be read is not answered with a hollow success either: the job is created and
+//! then ends in the modelled `FAILED` state with a `StatusMessage` saying why.
 //!
 //! ## Shape of an operation
 //!
@@ -213,8 +215,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AWS takes the authorization decision at the IAM layer, ahead of the service
+        // looking at the request's input, so a caller whose identity-based policies do not
+        // allow this action is refused before any job is started. Starting a job addresses
+        // no resource of its own, so it is judged against the resource IAM writes for such
+        // a request.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::service::authorization::ANY_RESOURCE,
+        )
+        .map_err(StartDocumentTextDetectionErrorModeled::AccessDeniedException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StartDocumentTextDetectionErrorModeled::InternalServerError(
                 InternalServerError {
@@ -275,19 +290,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reading the document and deriving its blocks happens OUTSIDE the state lock,
         // so one caller's work is never serialised in front of another caller's request.
         //
-        // No inline bytes here: a `DocumentLocation` names an S3 object only, so this
-        // read does no decoding or recognition — it refuses the object this emulator's
-        // Amazon S3 cannot serve yet — and so it is not the CPU-bound path that
-        // `crate::state::read_document` puts on the blocking pool.
-        let stored = state.lock().stored_content(&key);
-        let read = match stored {
-            Some(content) => Ok(content),
-            None => crate::state::read_content(&reference, None),
-        };
-        // A document this emulator cannot read is a job that ENDS in the modelled
-        // FAILED state carrying the reason, not a hollow success.
+        // A `DocumentLocation` names an S3 object only, so the bytes come from this
+        // emulator's own Amazon S3, over the in-process callback.
+        let read = crate::state::read_submitted_document(&state, ctx, &reference, None).await;
+        // AWS validates the document's LOCATION and SIZE at submit time — the two things
+        // it can establish without processing the document — so a location Amazon S3
+        // answers for with no such object, and an object over the documented ceiling, are
+        // refused here and no job is created. Anything the read of the document itself
+        // established is a job that ENDS in the modelled FAILED state carrying the reason,
+        // not a hollow success.
         let (outcome, status_message, content, blocks) = match read {
-            Ok(content) => {
+            crate::state::DocumentRead::Read(content) => {
                 let blocks =
                     crate::state::blocks(&key, &content, crate::state::FeatureSet::default());
                 (
@@ -297,12 +310,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     blocks,
                 )
             }
-            Err(reason) => (
+            crate::state::DocumentRead::NotTakenOn(reason) => return Err(not_taken_on(&reason)),
+            crate::state::DocumentRead::Unreadable(reason) => (
                 crate::state::JobOutcome::Failed,
                 Some(reason.message().to_string()),
                 crate::state::DocumentContent::default(),
                 Vec::new(),
             ),
+            crate::state::DocumentRead::DidNotComplete => {
+                return Err(StartDocumentTextDetectionErrorModeled::InternalServerError(
+                    InternalServerError {
+                        message: Some("reading the document did not complete".to_string()),
+                        code: None,
+                    },
+                )
+                .into())
+            }
         };
 
         let now = std::time::SystemTime::now();
@@ -332,9 +355,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
         }
-        if outcome == crate::state::JobOutcome::Succeeded {
-            store.register_document(reference.clone(), content.clone());
-        }
+        // The job carries the blocks derived from what was read, so nothing has to be
+        // registered for it: a `DocumentLocation` is an S3 object, whose bytes a later
+        // `PutObject` can replace, and this service keeps no stale copy of one.
         let job_id = store.mint_job_id(&key);
         let job = crate::state::Job {
             job_id: job_id.clone(),
@@ -364,4 +387,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             job_id: Some(job_id),
         })
     }
+}
+
+/// The modelled answer for a document this operation cannot take on, which it refuses at
+/// submit time rather than creating a job for.
+///
+/// Only the two reasons that are established BEFORE the document is processed reach this:
+/// an object Amazon S3 answers for with no such object (`InvalidS3ObjectException`, the
+/// error this operation documents as "Amazon Textract is unable to access the S3 object
+/// that's specified in the request") and an object over a documented size ceiling
+/// (`DocumentTooLargeException`). The remaining variants cannot be produced here, and the
+/// one honest answer for a reason this operation did not expect is its own server fault
+/// rather than a client error blaming the caller's document.
+fn not_taken_on(reason: &crate::state::Unreadable) -> StartDocumentTextDetectionError {
+    let message = Some(reason.message().to_string());
+    match reason {
+        crate::state::Unreadable::S3Unreadable(_) => {
+            StartDocumentTextDetectionErrorModeled::InvalidS3ObjectException(
+                InvalidS3ObjectException {
+                    message,
+                    code: None,
+                },
+            )
+        }
+        crate::state::Unreadable::TooLarge(_) => {
+            StartDocumentTextDetectionErrorModeled::DocumentTooLargeException(
+                DocumentTooLargeException {
+                    message,
+                    code: None,
+                },
+            )
+        }
+        crate::state::Unreadable::UnsupportedFormat(_) | crate::state::Unreadable::Corrupt(_) => {
+            StartDocumentTextDetectionErrorModeled::InternalServerError(InternalServerError {
+                message,
+                code: None,
+            })
+        }
+    }
+    .into()
 }

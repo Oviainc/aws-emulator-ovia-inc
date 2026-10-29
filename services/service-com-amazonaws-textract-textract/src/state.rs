@@ -7,37 +7,48 @@
 //!
 //! Amazon Textract has four read paths over the SAME result — `DetectDocumentText`,
 //! `AnalyzeDocument`, `GetDocumentTextDetection` and `GetDocumentAnalysis` — and the
-//! synchronous and asynchronous answers for one document must agree. So a document is
-//! registered once (keyed by its identity: an S3 object, or the SHA-256 of its inline
-//! bytes), the text read out of it is stored, and every path derives its blocks from
-//! that stored content with [`blocks`]. `AnalyzeExpense`'s `ExpenseDocuments` come from
-//! that same stored text and the same line layout, with [`expense_documents`].
+//! synchronous and asynchronous answers for one document must agree. So the text of a
+//! document is read once by [`read_submitted_document`] and every path derives its
+//! blocks from that content with [`blocks`], keyed by the document's identity (an S3
+//! object, or the SHA-256 of its inline bytes). `AnalyzeExpense`'s `ExpenseDocuments`
+//! come from that same text and the same line layout, with [`expense_documents`].
+//!
+//! Inline bytes are identified by their own digest, so a document this service has
+//! already read is the same document and its stored text is reported again. An S3 object
+//! is identified by its LOCATION, whose bytes a later `PutObject` can replace, so its
+//! current bytes are fetched on every call and nothing stale is ever reported.
 //!
 //! ## What this emulator can read, and what it refuses
 //!
-//! [`read_content`] is the ONLY source of a document's text, and it never invents one:
+//! [`read_content`] is the ONLY source of a document's text, and it never invents one.
+//! The bytes it reads are the request's own inline `Bytes` or the object this emulator's
+//! Amazon S3 holds at the named location ([`s3_source`]), and from there the two sources
+//! are read exactly alike:
 //!
-//! * inline `Bytes` that decode as text — their real lines and words are extracted
+//! * bytes that decode as text — their real lines and words are extracted
 //!   verbatim (form feed, `U+000C`, is the page break), and FORMS/TABLES analysis reads
 //!   that same real text;
-//! * inline `Bytes` that are a raster in a format Textract accepts (PNG, JPEG or TIFF) —
+//! * bytes that are a raster in a format Textract accepts (PNG, JPEG or TIFF) —
 //!   the pixels are decoded and the text recognised off them by [`ocr`], which reports
 //!   the characters it measured and the confidence it measured them with, and reports
 //!   nothing for ink it could not match to a glyph. A page with no ink is a page with no
 //!   words, answered as such rather than refused;
-//! * inline `Bytes` in one of those formats that the decoder cannot read (a truncated or
+//! * bytes in one of those formats that the decoder cannot read (a truncated or
 //!   corrupt file) — refused as [`Unreadable::Corrupt`], which the handlers answer with
 //!   the modelled `BadDocumentException`;
-//! * inline `Bytes` in no format this service reads — refused as
+//! * bytes in no format this service reads — refused as
 //!   [`Unreadable::UnsupportedFormat`], which the handlers answer with the modelled
 //!   `UnsupportedDocumentException`. A PDF is answered there too, with a reason that says
 //!   so: Textract accepts PDF, but this emulator has no page rasteriser and parses no PDF
 //!   content stream, so it reads nothing out of one and says which part it cannot read
 //!   rather than claiming the bytes are not a document;
-//! * an S3 object — this emulator's Amazon S3 cannot serve object bytes yet, so Textract
-//!   genuinely cannot access it: refused as [`Unreadable::S3Unreadable`], which the
-//!   handlers answer with the modelled `InvalidS3ObjectException` (synchronously) or a
-//!   job that ends in the modelled `FAILED` state carrying the reason (asynchronously).
+//! * an S3 object whose bytes Amazon S3 does not serve — refused as
+//!   [`Unreadable::S3Unreadable`], which the handlers answer with the modelled
+//!   `InvalidS3ObjectException`. Where Amazon S3 ESTABLISHED that it holds no such
+//!   object, that is a fact about the request, so an asynchronous `Start*` refuses the
+//!   submit with it and creates no job ([`DocumentRead::NotTakenOn`]); where nothing
+//!   answered the read at all, nothing is established, so the job is created and ends in
+//!   the modelled `FAILED` state carrying the reason ([`DocumentRead::Unreadable`]).
 //!
 //! Nothing here is derived from a digest, echoed from the request, or randomised: a
 //! block only ever describes text that was actually read out of the document.
@@ -60,6 +71,7 @@
 //!   top-level blocks rather than claiming the whole page.
 
 pub mod ocr;
+pub mod s3_source;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -97,6 +109,22 @@ pub const DEFAULT_MAX_RESULTS: usize = 1000;
 /// AWS, on `Document$Bytes`: "The maximum size of a document that's provided in a blob
 /// of bytes is 5 MB." A larger one is refused with `DocumentTooLargeException`.
 pub const MAX_INLINE_DOCUMENT_BYTES: usize = 5 * 1024 * 1024;
+
+/// The largest document this service reads out of an S3 object.
+///
+/// AWS, on `DocumentTooLargeException`: "The maximum document size for synchronous
+/// operations 10 MB." The size is checked against what Amazon S3 DECLARES the object holds
+/// before any of its bytes are taken into this process ([`s3_source`]).
+///
+/// DELIBERATELY the same ceiling on the ASYNCHRONOUS path, where AWS publishes a much
+/// larger one (500 MB for a PDF): this emulator reads a whole document into this process's
+/// memory and recognises it there, so what bounds the read is what one request may make it
+/// allocate and scan rather than what AWS can store. An object over the ceiling is refused
+/// with the modelled `DocumentTooLargeException` — the error that says exactly why — rather
+/// than read in part. A document between the two ceilings is therefore refused where AWS
+/// would accept it: that is the trade this bound makes, and the only one that keeps the
+/// read bounded by a constant instead of by the caller.
+pub const MAX_S3_DOCUMENT_BYTES: usize = 10 * 1024 * 1024;
 
 /// The most pages one document may hold.
 ///
@@ -877,6 +905,39 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsTextractTextractState>)
 }
 
+/// The Region a request carrying no SigV4 credential scope, or one that names no Region,
+/// is served in.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The Region the request was signed for, or [`DEFAULT_REGION`].
+///
+/// The scope is caller-supplied and this value reaches the address an in-process read of
+/// Amazon S3 is sent to, so a value that is not shaped like a Region identifier is not
+/// reflected: the real service would not have served the request under a Region it does
+/// not have.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| is_region_like(region))
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Whether `region` is shaped like an AWS Region identifier: two or more
+/// hyphen-separated lowercase-letter parts followed by a digit group (`us-east-1`,
+/// `ap-southeast-3`, `us-gov-west-1`, `cn-north-1`).
+fn is_region_like(region: &str) -> bool {
+    let Some((parts, index)) = region.rsplit_once('-') else {
+        return false;
+    };
+    region.len() <= 32
+        && !index.is_empty()
+        && index.bytes().all(|byte| byte.is_ascii_digit())
+        && parts.split('-').count() >= 2
+        && parts
+            .split('-')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_lowercase()))
+}
+
 // ---------------------------------------------------------------------------
 // Document identity
 // ---------------------------------------------------------------------------
@@ -1356,14 +1417,17 @@ pub enum ReadFailure {
 /// checks and other requests, and the `spawn_blocking(..).await` is a real await point a
 /// timeout, a cancellation or a shutdown can land on.
 ///
+/// `bytes` are the document's own bytes, whichever source they came from — the request's
+/// inline `Bytes`, or the S3 object [`s3_source::document_bytes`] fetched.
+///
 /// This is how a request path reads a document; [`read_content`] itself is the
 /// synchronous core, for a caller that is already off the async worker.
 pub async fn read_document(
     reference: DocumentRef,
-    inline: Option<Vec<u8>>,
+    bytes: Option<Vec<u8>>,
 ) -> Result<DocumentContent, ReadFailure> {
     let read =
-        ::tokio::task::spawn_blocking(move || read_content(&reference, inline.as_deref())).await;
+        ::tokio::task::spawn_blocking(move || read_content(&reference, bytes.as_deref())).await;
     match read {
         Ok(Ok(content)) => Ok(content),
         Ok(Err(reason)) => Err(ReadFailure::Unreadable(reason)),
@@ -1371,6 +1435,76 @@ pub async fn read_document(
             ::tracing::error!(error = %error, "reading the document did not complete");
             Err(ReadFailure::DidNotComplete)
         }
+    }
+}
+
+/// What reading a submitted document established — the one outcome every handler of this
+/// service decides its answer from.
+#[derive(Debug)]
+pub enum DocumentRead {
+    /// The document's text.
+    Read(DocumentContent),
+    /// Amazon Textract cannot take the document ON, and the reason is a fact this
+    /// service ESTABLISHED about the request before any of the document was processed:
+    /// Amazon S3 answered that it holds no such object, or the object it holds is over a
+    /// documented size limit. A synchronous operation answers the modelled error for the
+    /// reason, and so does an asynchronous `Start*` — which creates no job, because AWS
+    /// validates the location and the size of an asynchronous document at submit time.
+    NotTakenOn(Unreadable),
+    /// The document was taken on and its text could not be read out of it. A synchronous
+    /// operation answers the modelled error for the reason; an asynchronous job is
+    /// created and ends in the modelled `FAILED` state carrying it.
+    Unreadable(Unreadable),
+    /// The read did not complete — a panic or a cancellation on the blocking pool, which
+    /// says nothing about the document and is answered as the server fault it is.
+    DidNotComplete,
+}
+
+/// Read the text of a submitted document: the ONE path every handler of this service
+/// reads a `Document` or a `DocumentLocation` through.
+///
+/// The bytes come from the request's inline `Bytes` when it carried them, and otherwise
+/// from the object Amazon S3 holds at the location the request named
+/// ([`s3_source::document_bytes`]) — read over the emulator's own in-process transport,
+/// so an object a caller staged with `PutObject` is the one Textract reads. From there
+/// the two sources are decoded and recognised exactly alike ([`read_content`]), so one
+/// document answers the same whichever way it was submitted.
+///
+/// Inline bytes are keyed by their own digest, so a document already read is the same
+/// document and its stored text is reported again. An S3 object's bytes can be replaced
+/// by a later `PutObject`, so its current bytes are fetched every time and no stale text
+/// is reported for it.
+pub async fn read_submitted_document(
+    state: &::engine::ServiceState<ComAmazonawsTextractTextractState>,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    reference: &DocumentRef,
+    inline: Option<Vec<u8>>,
+) -> DocumentRead {
+    if reference.s3.is_none() {
+        if let Some(content) = state.lock().stored_content(&reference.identity_key()) {
+            return DocumentRead::Read(content);
+        }
+    }
+    let bytes = match s3_source::document_bytes(ctx, reference, inline).await {
+        s3_source::DocumentBytes::Read(bytes) => bytes,
+        s3_source::DocumentBytes::Established(reason) => return DocumentRead::NotTakenOn(reason),
+        s3_source::DocumentBytes::Unestablished(reason) => return DocumentRead::Unreadable(reason),
+    };
+    match read_document(reference.clone(), Some(bytes)).await {
+        Ok(content) => {
+            if reference.s3.is_some() {
+                return DocumentRead::Read(content);
+            }
+            DocumentRead::Read(state.lock().register_document(reference.clone(), content))
+        }
+        // The SIZE of a document is a fact about it that holds before its text is read,
+        // which is why AWS refuses an oversized document at submit time; every other
+        // reason is what reading the document established.
+        Err(ReadFailure::Unreadable(reason @ Unreadable::TooLarge(_))) => {
+            DocumentRead::NotTakenOn(reason)
+        }
+        Err(ReadFailure::Unreadable(reason)) => DocumentRead::Unreadable(reason),
+        Err(ReadFailure::DidNotComplete) => DocumentRead::DidNotComplete,
     }
 }
 
@@ -1383,20 +1517,26 @@ pub async fn read_document(
 /// runs it on the blocking pool.
 pub fn read_content(
     reference: &DocumentRef,
-    inline: Option<&[u8]>,
+    bytes: Option<&[u8]>,
 ) -> Result<DocumentContent, Unreadable> {
-    if reference.s3.is_some() {
-        return Err(Unreadable::S3Unreadable(format!(
-            "Amazon Textract is unable to access {}: this emulator's Amazon S3 cannot serve \
-             object bytes yet, so the document cannot be read",
-            reference.identity_key()
-        )));
-    }
-    let bytes = inline.unwrap_or_default();
-    if bytes.len() > MAX_INLINE_DOCUMENT_BYTES {
+    // No bytes for a document whose source is an S3 object means the object's bytes were
+    // never fetched, so Textract has nothing of the document to read. Only
+    // `s3_source::document_bytes` fetches them, and it reports WHY it could not.
+    let Some(bytes) = bytes else {
+        return Err(Unreadable::S3Unreadable(
+            s3_source::UNREADABLE_OBJECT_MESSAGE.to_string(),
+        ));
+    };
+    // A document provided as inline bytes and one read out of an S3 object carry
+    // different published ceilings, so each is held to its own.
+    let (ceiling, source) = if reference.s3.is_some() {
+        (MAX_S3_DOCUMENT_BYTES, "read from an Amazon S3 object")
+    } else {
+        (MAX_INLINE_DOCUMENT_BYTES, "provided as inline bytes")
+    };
+    if bytes.len() > ceiling {
         return Err(Unreadable::TooLarge(format!(
-            "the document is {} bytes; the maximum size of a document provided as inline bytes \
-             is {MAX_INLINE_DOCUMENT_BYTES} bytes",
+            "the document is {} bytes; the maximum size of a document {source} is {ceiling} bytes",
             bytes.len()
         )));
     }

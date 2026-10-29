@@ -45,6 +45,12 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Whether IAM lets a request to this service perform the action it asks for: the
+/// authorization step every operation of this service runs before it reads or writes
+/// anything. `AccessDeniedException` is a service-common error of this model, so the gate
+/// belongs to the service rather than to one operation.
+pub mod authorization;
+
 /// The `com-amazonaws-textract-textract` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///

@@ -32,6 +32,12 @@ use smithy_server_runtime::MultiServiceRouter;
 /// the test thread rather than the runtime's timer.
 const PAST_JOB_COMPLETION: Duration = Duration::from_millis(900);
 
+/// The message Amazon Textract states for an S3 object it could not obtain: the
+/// `InvalidS3ObjectException` sentence, which is also the `StatusMessage` of a job that
+/// failed for that reason.
+const UNREADABLE_OBJECT_MESSAGE: &str =
+    "Unable to get object metadata from S3. Check object key, region and/or access permissions.";
+
 /// The emulator, with this one service mounted on a shared engine.
 ///
 /// `pub(crate)` here and below: the other suites of this test target share this one
@@ -1018,8 +1024,11 @@ async fn start_and_get_document_text_detection_round_trip_through_the_job() {
 
     std::thread::sleep(PAST_JOB_COMPLETION);
 
-    // The document lives in S3, which this emulator cannot read, so the job ends in the
-    // modelled FAILED state with a reason — not a success carrying invented text.
+    // No Amazon S3 is mounted beside this service here, so nothing answered the read of
+    // the document object and nothing about it is established: the job is created and ends
+    // in the modelled FAILED state with a reason — not a success carrying invented text.
+    // (`crate::s3_sourced_documents` is where a mounted object store serves the document
+    // and the job reaches SUCCEEDED.)
     let (status, body) = call(
         &router,
         "GetDocumentTextDetection",
@@ -1032,11 +1041,11 @@ async fn start_and_get_document_text_detection_round_trip_through_the_job() {
         Some("FAILED"),
         "a job over a document that cannot be read must end FAILED, got {body}"
     );
-    assert!(
-        body["StatusMessage"]
-            .as_str()
-            .is_some_and(|message| message.contains("Amazon S3")),
-        "a FAILED job must say why, got {body}"
+    assert_eq!(
+        body["StatusMessage"].as_str(),
+        Some(UNREADABLE_OBJECT_MESSAGE),
+        "a FAILED job must say why, in Textract's own wording for an object it could not \
+         obtain, got {body}"
     );
     assert!(
         body.get("Blocks").is_none(),
@@ -1246,18 +1255,21 @@ async fn get_document_analysis_reports_the_job_its_start_persisted() {
             status, 200,
             "case {name:?}: the poll must succeed, got {body}"
         );
-        // The document is an S3 object this emulator cannot read, so the job ends in
-        // the modelled FAILED state with the reason rather than inventing an analysis.
+        // No Amazon S3 is mounted beside this service here, so nothing answered the read
+        // of the document object and nothing about it is established: the job is created
+        // and ends in the modelled FAILED state with the reason rather than inventing an
+        // analysis. (`crate::s3_sourced_documents` is where a mounted object store serves
+        // the document and the job reaches SUCCEEDED.)
         assert_eq!(
             body["JobStatus"].as_str(),
             Some("FAILED"),
             "case {name:?}: expected FAILED, got {body}"
         );
-        assert!(
-            body["StatusMessage"]
-                .as_str()
-                .is_some_and(|message| message.contains("Amazon S3")),
-            "case {name:?}: a FAILED job must say why, got {body}"
+        assert_eq!(
+            body["StatusMessage"].as_str(),
+            Some(UNREADABLE_OBJECT_MESSAGE),
+            "case {name:?}: a FAILED job must say why, in Textract's own wording for an object \
+             it could not obtain, got {body}"
         );
         assert!(
             body.get("Blocks").is_none(),

@@ -12,7 +12,8 @@
 //!   of an id no create minted is refused with the modelled `ResourceNotFoundException`;
 //! * one `ClientRequestToken` names one adapter: replayed with the same parameters it
 //!   answers with that adapter, and with different parameters it is refused with the
-//!   modelled `IdempotentParameterMismatchException`;
+//!   modelled `ValidationException` — the code Amazon Textract answers a `CreateAdapter`
+//!   token conflict with;
 //! * an adapter can only be trained on the feature type the service supports for
 //!   adapters, so every other modelled `FeatureType` is refused;
 //! * `GetAdapter` is a read: repeating it, and creating other adapters, never changes
@@ -475,8 +476,21 @@ async fn one_client_request_token_names_one_adapter() {
             );
             assert_eq!(
                 error_code(&body),
-                "IdempotentParameterMismatchException",
-                "case {:?}: expected IdempotentParameterMismatchException, got {body}",
+                "ValidationException",
+                "case {:?}: expected ValidationException, got {body}",
+                case.name
+            );
+            // The sentence AWS states this conflict with, and it quotes nothing of the
+            // request back — not the token, and not the adapter it already names.
+            assert_eq!(
+                body.get("Message").and_then(Value::as_str),
+                Some("ClientRequestToken already sent with different parameters."),
+                "case {:?}: expected the token-conflict wording, got {body}",
+                case.name
+            );
+            assert!(
+                !body.to_string().contains(token.as_str()),
+                "case {:?}: a refusal must not quote the token back, got {body}",
                 case.name
             );
             assert!(

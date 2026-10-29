@@ -5,11 +5,11 @@
 //!
 //! This is the ONLY file to touch for this operation.
 //!
-//! Synchronous expense analysis. The document is registered in this service's state
-//! exactly as `AnalyzeDocument` registers it, and one `ExpenseDocument` is derived per
-//! page of the text really read out of it: every labelled line outside a table becomes a
-//! `SummaryField` under its normalized `Type`, and every table becomes a `LineItemGroup`
-//! whose rows become `LineItems`. The derivation lives in
+//! Synchronous expense analysis. The document is read exactly as `AnalyzeDocument` reads
+//! it — from the request's own `Bytes` or from the Amazon S3 object it named — and one
+//! `ExpenseDocument` is derived per page of the text really read out of it: every labelled
+//! line outside a table becomes a `SummaryField` under its normalized `Type`, and every
+//! table becomes a `LineItemGroup` whose rows become `LineItems`. The derivation lives in
 //! [`crate::state::expense_documents`], beside the block model the other read paths
 //! share.
 //!
@@ -178,8 +178,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         mut input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AWS takes the authorization decision at the IAM layer, ahead of the service
+        // looking at the request's input, so a caller whose identity-based policies do not
+        // allow this action is refused before the document is touched. Expense analysis
+        // addresses no resource of its own, so it is judged against the resource IAM
+        // writes for such a request.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::service::authorization::ANY_RESOURCE,
+        )
+        .map_err(AnalyzeExpenseErrorModeled::AccessDeniedException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(AnalyzeExpenseErrorModeled::InternalServerError(
                 InternalServerError {
@@ -203,33 +216,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // A document is read once and stored, so this answer and every other read path's
-        // answer for the same document describe the same text. The read happens OUTSIDE
-        // the state lock, and on the blocking pool: reading a raster is bounded but
-        // CPU-bound, so it occupies no async worker.
+        // One document is read ONE way, so this answer and every other read path's answer
+        // for the same document describe the same text: the bytes come from the request's
+        // own `Bytes` or from the Amazon S3 object it named, and are decoded alike. The
+        // read happens OUTSIDE the state lock, and the decoding on the blocking pool:
+        // reading a raster is bounded but CPU-bound, so it occupies no async worker.
         let key = reference.identity_key();
-        let stored = state.lock().stored_content(&key);
-        let content = match stored {
-            Some(content) => content,
-            None => {
-                let inline = input.document.bytes.take();
-                match crate::state::read_document(reference.clone(), inline).await {
-                    Ok(content) => state.lock().register_document(reference, content),
-                    Err(crate::state::ReadFailure::Unreadable(reason)) => {
-                        return Err(unreadable_error(&reason))
-                    }
-                    Err(crate::state::ReadFailure::DidNotComplete) => {
-                        return Err(AnalyzeExpenseErrorModeled::InternalServerError(
-                            InternalServerError {
-                                message: Some("reading the document did not complete".to_string()),
-                                code: None,
-                            },
-                        )
-                        .into())
-                    }
+        let inline = input.document.bytes.take();
+        let content =
+            match crate::state::read_submitted_document(&state, ctx, &reference, inline).await {
+                crate::state::DocumentRead::Read(content) => content,
+                // A synchronous operation has no result to give either way, so both
+                // refusals are the modelled error for the reason.
+                crate::state::DocumentRead::NotTakenOn(reason)
+                | crate::state::DocumentRead::Unreadable(reason) => {
+                    return Err(unreadable_error(&reason))
                 }
-            }
-        };
+                crate::state::DocumentRead::DidNotComplete => {
+                    return Err(AnalyzeExpenseErrorModeled::InternalServerError(
+                        InternalServerError {
+                            message: Some("reading the document did not complete".to_string()),
+                            code: None,
+                        },
+                    )
+                    .into())
+                }
+            };
 
         Ok(AnalyzeExpenseOutput {
             document_metadata: Some(content.metadata()),

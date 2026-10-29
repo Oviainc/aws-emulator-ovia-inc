@@ -156,6 +156,12 @@ impl From<CreateAdapterErrorModeled> for CreateAdapterError {
     }
 }
 
+/// The sentence Amazon Textract refuses a `CreateAdapter` whose `ClientRequestToken` was
+/// already sent with other parameters with: WHOLLY FIXED text for this class, carrying
+/// nothing from the request or from the store.
+const TOKEN_PARAMETER_MISMATCH_MESSAGE: &str =
+    "ClientRequestToken already sent with different parameters.";
+
 /// The `CreateAdapter` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -190,8 +196,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AWS takes the authorization decision at the IAM layer, ahead of the service
+        // writing anything, so a caller whose identity-based policies do not allow this
+        // action mints no adapter and spends no idempotency token. A create names no
+        // resource yet, so it is judged against the resource IAM writes for such a request.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::service::authorization::ANY_RESOURCE,
+        )
+        .map_err(CreateAdapterErrorModeled::AccessDeniedException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateAdapterErrorModeled::InternalServerError(
                 InternalServerError {
@@ -256,19 +274,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         adapter_id: Some(existing.adapter_id.clone()),
                     });
                 }
-                let adapter_id = existing.adapter_id.clone();
-                return Err(
-                    CreateAdapterErrorModeled::IdempotentParameterMismatchException(
-                        IdempotentParameterMismatchException {
-                            message: Some(format!(
-                                "the ClientRequestToken was already used to create adapter \
-                                 {adapter_id} from different parameters"
-                            )),
-                            code: None,
-                        },
-                    )
-                    .into(),
-                );
+                // Both `ValidationException` and `IdempotentParameterMismatchException`
+                // are modelled client errors of this operation at HTTP 400, and the code
+                // Amazon Textract answers a `CreateAdapter` whose `ClientRequestToken` was
+                // reused with other parameters with is `ValidationException` — "Indicates
+                // that a request was not valid" — so that is the code a client catches for
+                // this conflict. The sentence is the one AWS states it with, and it quotes
+                // nothing of the request back: the token is a secret the caller chose and
+                // the adapter it already names is not disclosed to a call that was refused.
+                return Err(CreateAdapterErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(TOKEN_PARAMETER_MISMATCH_MESSAGE.to_string()),
+                        code: None,
+                    },
+                )
+                .into());
             }
         }
 

@@ -7,9 +7,9 @@
 //!
 //! Synchronous text detection, implemented.
 //!
-//! The document is registered in this service's state and its `PAGE`/`LINE`/`WORD`
-//! blocks are derived from the stored content, so the same document always answers
-//! with the same blocks and the asynchronous path
+//! The document is read from the `Bytes` the request carried or from the Amazon S3 object
+//! it named, and its `PAGE`/`LINE`/`WORD` blocks are derived from that content, so the
+//! same document always answers with the same blocks and the asynchronous path
 //! (`StartDocumentTextDetection` / `GetDocumentTextDetection`) agrees with it.
 //!
 //! ## Shape of an operation
@@ -179,8 +179,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         mut input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AWS takes the authorization decision at the IAM layer, ahead of the service
+        // looking at the request's input, so a caller whose identity-based policies do not
+        // allow this action is refused before the document is touched. Text detection
+        // addresses no resource of its own, so it is judged against the resource IAM
+        // writes for such a request.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::service::authorization::ANY_RESOURCE,
+        )
+        .map_err(DetectDocumentTextErrorModeled::AccessDeniedException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DetectDocumentTextErrorModeled::InternalServerError(
                 InternalServerError {
@@ -208,30 +221,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let key = reference.identity_key();
-        // Read the document's text, or refuse with the modelled error for why it cannot
-        // be read. The read happens OUTSIDE the state lock, and on the blocking pool.
-        let stored = state.lock().stored_content(&key);
-        let content = match stored {
-            Some(content) => content,
-            None => {
-                let inline = input.document.bytes.take();
-                match crate::state::read_document(reference.clone(), inline).await {
-                    Ok(content) => state.lock().register_document(reference, content),
-                    Err(crate::state::ReadFailure::Unreadable(reason)) => {
-                        return Err(unreadable_error(&reason))
-                    }
-                    Err(crate::state::ReadFailure::DidNotComplete) => {
-                        return Err(DetectDocumentTextErrorModeled::InternalServerError(
-                            InternalServerError {
-                                message: Some("reading the document did not complete".to_string()),
-                                code: None,
-                            },
-                        )
-                        .into())
-                    }
+        // Read the document's text — the request's own inline `Bytes`, or the object this
+        // emulator's Amazon S3 holds at the location it named — or refuse with the
+        // modelled error for why it cannot be read. The read happens OUTSIDE the state
+        // lock, and the decoding on the blocking pool.
+        let inline = input.document.bytes.take();
+        let content =
+            match crate::state::read_submitted_document(&state, ctx, &reference, inline).await {
+                crate::state::DocumentRead::Read(content) => content,
+                // A synchronous operation has no result to give either way, so both
+                // refusals are the modelled error for the reason.
+                crate::state::DocumentRead::NotTakenOn(reason)
+                | crate::state::DocumentRead::Unreadable(reason) => {
+                    return Err(unreadable_error(&reason))
                 }
-            }
-        };
+                crate::state::DocumentRead::DidNotComplete => {
+                    return Err(DetectDocumentTextErrorModeled::InternalServerError(
+                        InternalServerError {
+                            message: Some("reading the document did not complete".to_string()),
+                            code: None,
+                        },
+                    )
+                    .into())
+                }
+            };
 
         // `FeatureSet::default()` yields PAGE/LINE/WORD only — no `EntityTypes`,
         // `RowIndex`, `ColumnIndex`, `RowSpan` or `ColumnSpan`, which the `Block` docs

@@ -69,6 +69,43 @@ pub fn instance_profile_name(profile_arn: &str) -> Option<&str> {
     entity_name(profile_arn, "instance-profile")
 }
 
+/// The role name an STS ASSUMED-ROLE SESSION ARN names, when the session is one of THIS
+/// account (`arn:<partition>:sts::<account>:assumed-role/<role name>/<session name>`).
+///
+/// `sts:AssumeRole` reports the session it minted under that form, and the permissions in
+/// force on such a session are the ROLE's — so a service that authorizes a request reads
+/// the role out of the principal the credential speaks for, and then reads that role's
+/// policies. The role name is the first segment after `assumed-role/`: a session ARN
+/// carries no path (the role's path is not part of it) and the session name follows, which
+/// may itself carry `/`.
+///
+/// `None` when the value does not name an assumed-role session of this account: it is not
+/// an ARN of the six-field form, its vendor is not `sts`, it carries a Region (an STS
+/// session ARN is partition-global), it names another account, its resource is not an
+/// `assumed-role/…`, or either the role name or the session name is missing.
+///
+/// The one reading of this form, for the services that authorize a request against the
+/// policies of the role behind a session (`service/authorization.rs` in Amazon Textract
+/// today; the copies in AWS Certificate Manager, Amazon Bedrock, CodeArtifact, Amazon ECR
+/// Public, AWS KMS, Amazon OpenSearch Service and CloudWatch RUM are to be MIGRATED onto
+/// it, each in the change that owns its service).
+#[must_use]
+pub fn assumed_role_session_role_name(session_arn: &str) -> Option<&str> {
+    // The six fields come from the crate's ONE ARN parse (`crate::arn`), which also
+    // settles that the value is an ARN of the `sts` vendor at all.
+    let arn = crate::arn::parse_of(session_arn, "sts")?;
+    // An STS session ARN is partition-global, like every identity ARN.
+    if !arn.region.is_empty() {
+        return None;
+    }
+    if !arn.account.is_empty() && arn.account != ::emulator_server::emulator_account_id() {
+        return None;
+    }
+    let named = arn.resource.strip_prefix("assumed-role")?.strip_prefix('/')?;
+    let (role, session) = named.split_once('/')?;
+    (!role.is_empty() && !session.is_empty()).then_some(role)
+}
+
 /// The name an IAM ARN of the entity type `entity_type` carries, when the ARN names an
 /// entity of that type of THIS account: everything after the last `/`, so an entity under
 /// a path resolves to the name IAM holds it under.
@@ -224,7 +261,95 @@ async fn role_answer(
 
 #[cfg(test)]
 mod tests {
-    use super::{instance_profile_name, role_name, user_name};
+    use super::{assumed_role_session_role_name, instance_profile_name, role_name, user_name};
+
+    /// The role an STS assumed-role SESSION ARN names: the first segment after
+    /// `assumed-role/`, whatever the session name after it, and nothing from any other
+    /// form.
+    #[test]
+    fn a_session_arn_names_the_role_its_permissions_come_from() {
+        let account = ::emulator_server::emulator_account_id();
+        // (case, value, the role the reading must report)
+        let rows: Vec<(&str, String, Option<&str>)> = vec![
+            (
+                "a session of this account",
+                format!("arn:aws:sts::{account}:assumed-role/reader/session-1"),
+                Some("reader"),
+            ),
+            (
+                // The session name is the caller's `RoleSessionName`, which admits more
+                // segments; the role is still the first one.
+                "a session name carrying a slash",
+                format!("arn:aws:sts::{account}:assumed-role/reader/one/two"),
+                Some("reader"),
+            ),
+            (
+                "another partition",
+                format!("arn:aws-cn:sts::{account}:assumed-role/reader/session-1"),
+                Some("reader"),
+            ),
+            (
+                "a session ARN carrying no account",
+                "arn:aws:sts:::assumed-role/reader/session-1".to_string(),
+                Some("reader"),
+            ),
+            (
+                "a role name holding the characters IAM admits in one",
+                format!("arn:aws:sts::{account}:assumed-role/a_b-1+2=3,4.5@6/session-1"),
+                Some("a_b-1+2=3,4.5@6"),
+            ),
+            (
+                "another account",
+                "arn:aws:sts::123456789012:assumed-role/reader/session-1".to_string(),
+                None,
+            ),
+            (
+                "a session with no session name",
+                format!("arn:aws:sts::{account}:assumed-role/reader"),
+                None,
+            ),
+            (
+                "an empty role name",
+                format!("arn:aws:sts::{account}:assumed-role//session-1"),
+                None,
+            ),
+            (
+                "a Region, which an STS session ARN does not carry",
+                format!("arn:aws:sts:us-east-1:{account}:assumed-role/reader/session-1"),
+                None,
+            ),
+            (
+                "the same resource under the IAM vendor",
+                format!("arn:aws:iam::{account}:assumed-role/reader/session-1"),
+                None,
+            ),
+            (
+                "a federated user, the other temporary identity",
+                format!("arn:aws:sts::{account}:federated-user/reader"),
+                None,
+            ),
+            (
+                "an IAM role, whose policies a session's are read from",
+                format!("arn:aws:iam::{account}:role/reader"),
+                None,
+            ),
+            ("not an ARN at all", "reader".to_string(), None),
+            ("the empty string", String::new(), None),
+        ];
+
+        for (case, value, expected) in rows {
+            let read = assumed_role_session_role_name(&value);
+            assert_eq!(
+                read, expected,
+                "case {case:?}: expected {expected:?}, got {read:?}"
+            );
+            // A session ARN names no IAM entity directly: the readings do not cross.
+            assert!(
+                read.is_none() || (role_name(&value).is_none() && user_name(&value).is_none()),
+                "case {case:?}: a session ARN must not read as an IAM role or user ARN"
+            );
+        }
+    }
 
     /// The name is read from the resource field of an IAM role ARN of this account,
     /// whatever path the role lives under — and from nothing else.

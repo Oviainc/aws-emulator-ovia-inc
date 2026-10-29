@@ -114,7 +114,11 @@ pub(crate) fn render(lines: &[&str], paper: Paper) -> GrayImage {
 }
 
 /// Encode a page in one of the raster formats Textract accepts.
-fn encode(page: &GrayImage, format: ImageFormat) -> Vec<u8> {
+///
+/// `pub(crate)`: the S3-sourced suite (`crate::s3_sourced_documents`) stages these very
+/// bytes as an object of the emulator's own Amazon S3, so both suites submit pages
+/// rendered and encoded the one way.
+pub(crate) fn encode(page: &GrayImage, format: ImageFormat) -> Vec<u8> {
     let mut out = Cursor::new(Vec::new());
     page.write_to(&mut out, format)
         .expect("the page encodes in a format Textract accepts");
@@ -125,7 +129,7 @@ pub(crate) fn raster_document(page: &GrayImage, format: ImageFormat) -> Value {
     json!({ "Bytes": aws_smithy_types::base64::encode(encode(page, format)) })
 }
 
-fn texts_of(blocks: &[Value], kind: &str) -> Vec<String> {
+pub(crate) fn texts_of(blocks: &[Value], kind: &str) -> Vec<String> {
     of_type(blocks, kind)
         .iter()
         .map(|block| {
