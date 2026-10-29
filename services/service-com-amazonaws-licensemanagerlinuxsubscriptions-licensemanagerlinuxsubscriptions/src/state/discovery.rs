@@ -39,7 +39,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
 
-use crate::state::{DiscoveredInstanceRecord, DISCOVERY_ENABLED};
+use crate::state::DiscoveredInstanceRecord;
 
 /// The `Subscription$Type` of a subscription whose licensing comes WITH Amazon EC2.
 ///
@@ -188,6 +188,12 @@ pub async fn materialize_for_report<Eng: Send + Sync + 'static>(
 /// One hop per configured source Region (the modelled `SourceRegions` list bounds that at
 /// 100 entries), plus the AMI hops the instances found there need, all bounded by the
 /// constants above — and the store's lock is never held across any of them.
+///
+/// The settings are therefore re-read from the store at every point the pass needs them —
+/// before each Region's hop and under the lock each write takes — rather than snapshotted
+/// once before the first hop: the pass awaits repeatedly, the settings singleton can be
+/// rewritten while it does, and what the store may hold is decided by the settings AT THE
+/// INSTANT of each hop and each write.
 async fn refresh_discovered_instances<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -195,36 +201,27 @@ async fn refresh_discovered_instances<Eng: Send + Sync + 'static>(
     let Some(state) = crate::state::service_state(engine) else {
         return;
     };
-    // The lock is taken and released HERE, before the first hop: what the pass needs from
-    // the store is the account's settings, and the store is never held across an await.
-    let settings = {
-        let store = state.lock();
-        store.service_settings.as_ref().map(|settings| {
-            (
-                settings.linux_subscriptions_discovery.clone(),
-                settings.discovery_settings.source_regions.clone(),
-            )
-        })
-    };
-    // The Regions this account discovers RIGHT NOW. A Region named twice is one Region, so
-    // the pass asks about each distinct source Region once, in a stable order — and an
-    // account whose `LinuxSubscriptionsDiscovery` is not enabled, or which has no settings
-    // at all, discovers NO Region, which is both why no hop is made for it and why nothing
-    // stays discovered for it below.
-    let discovered_regions: BTreeSet<String> = match settings {
-        Some((discovery, source_regions)) if discovery == DISCOVERY_ENABLED => {
-            source_regions.into_iter().collect()
-        }
-        _ => BTreeSet::new(),
-    };
+    // The Regions to ask about, read with the lock taken and released HERE — the store is
+    // never held across an await. This is the pass's PLAN and not its authority: each
+    // Region is checked against the settings again below, because they can be rewritten
+    // while the pass is reading another Region.
+    let planned: BTreeSet<String> = state.lock().discovered_regions();
 
     let mut budget = Budget {
         pages: MAX_INVENTORY_PAGES,
         records: MAX_DISCOVERED_INSTANCES,
     };
-    for region in &discovered_regions {
+    for region in &planned {
         if budget.spent() {
             break;
+        }
+        // Asked again right before the hop: an account does not discover a Region its
+        // settings have stopped naming — nor any Region at all once
+        // `LinuxSubscriptionsDiscovery` is no longer enabled — so no hop is made for one,
+        // exactly as none is made for an account that never asked for discovery.
+        let discovered_now = state.lock().discovers_region(region);
+        if !discovered_now {
+            continue;
         }
         let Some(pass) = discovered_in_region(ctx, region, &mut budget).await else {
             // EC2 could not be asked about this Region at all: that is evidence of
@@ -233,6 +230,10 @@ async fn refresh_discovered_instances<Eng: Send + Sync + 'static>(
             continue;
         };
         let now = SystemTime::now();
+        // Both writes settle against the settings under the lock they take
+        // (`record_discovery_pass` / `merge_discovery_pass`), so what this pass found in a
+        // Region the account stopped discovering while the pass was reading is dropped
+        // instead of recorded.
         match pass {
             // The Region's whole inventory was read, so these records are what it holds.
             RegionPass::Complete(found) => {
@@ -247,12 +248,10 @@ async fn refresh_discovered_instances<Eng: Send + Sync + 'static>(
     }
     // Discovery holds data for the Regions it discovers and no others, so a Region the
     // settings no longer name is dropped — including one dropped while this pass was
-    // reading another, and every Region at once for an account that discovers none.
-    let retained: Vec<&str> = discovered_regions
-        .iter()
-        .map(|region| region.as_str())
-        .collect();
-    state.lock().retain_discovered_regions(&retained);
+    // reading another, and every Region at once for an account that discovers none. The
+    // Regions kept are the ones the store's settings name when this write takes the lock,
+    // which is what lets it drop a Region this pass itself still had in its plan.
+    state.lock().retain_discovered_regions();
 }
 
 /// What ONE refresh may still spend: pages of the owner's inventory, and records it may

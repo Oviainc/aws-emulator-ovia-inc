@@ -16,7 +16,7 @@
 /// inventory, through the service that owns instances and AMIs.
 pub mod discovery;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -436,6 +436,11 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
     /// alone — each Region's inventory is read by its own pass. A pass that did not read
     /// that whole inventory records through [`Self::merge_discovery_pass`] instead.
     ///
+    /// Nothing is written for a Region this account does not discover AT THIS INSTANT
+    /// ([`Self::discovers_region`]): what the store holds is decided by the settings as they
+    /// are when the write lands, never by what they said when the pass that produced `found`
+    /// started reading.
+    ///
     /// `Instance$LastUpdatedTime` is "the time in which the last discovery updated the
     /// instance details", so it is written only for an instance this pass discovered for
     /// the first time or whose details it found CHANGED: a pass over an unchanged inventory
@@ -446,6 +451,9 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
         found: Vec<DiscoveredInstanceRecord>,
         now: SystemTime,
     ) {
+        if !self.discovers_region(region) {
+            return;
+        }
         let timestamped = self.timestamped(found, now);
         self.discovered_instances
             .retain(|_, record| record.region != region);
@@ -462,8 +470,15 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
     /// establish that the instances it did not reach are gone, so an earlier pass's records
     /// for them stay the best evidence there is — the same treatment a Region EC2 could not
     /// be asked about at all gets.
+    ///
+    /// A record of a Region this account does not discover at this instant is dropped rather
+    /// than merged, for the same reason [`Self::record_discovery_pass`] writes nothing for
+    /// one.
     pub fn merge_discovery_pass(&mut self, found: Vec<DiscoveredInstanceRecord>, now: SystemTime) {
         for record in self.timestamped(found, now) {
+            if !self.discovers_region(&record.region) {
+                continue;
+            }
             self.discovered_instances
                 .insert(record.instance_id.clone(), record);
         }
@@ -494,15 +509,53 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
 
     /// Drop what was discovered in a Region this account no longer discovers.
     ///
-    /// `discovered_regions` are the Regions the account discovers NOW, so discovery holds
-    /// data for exactly those: a Region taken out of `SourceRegions` — or every Region at
-    /// once, for an account whose discovery is no longer enabled and which therefore
-    /// discovers none — is one nothing reads any more, and the instances a previous pass
-    /// found there stop being reported rather than staying in the store as an inventory
-    /// nothing refreshes.
-    pub fn retain_discovered_regions(&mut self, discovered_regions: &[&str]) {
+    /// The Regions kept are the ones the account discovers NOW
+    /// ([`Self::discovered_regions`], read off the settings under the same lock this write
+    /// takes rather than handed in by a caller, so a set read before an await cannot decide
+    /// it), so discovery holds data for exactly those: a Region taken out of `SourceRegions`
+    /// — or every Region at once, for an account whose discovery is no longer enabled and
+    /// which therefore discovers none — is one nothing reads any more, and the instances a
+    /// previous pass found there stop being reported rather than staying in the store as an
+    /// inventory nothing refreshes.
+    pub fn retain_discovered_regions(&mut self) {
+        let discovered = self.discovered_regions();
         self.discovered_instances
-            .retain(|_, record| discovered_regions.contains(&record.region.as_str()));
+            .retain(|_, record| discovered.contains(&record.region));
+    }
+
+    /// The Regions this account discovers right now: the `SourceRegions` its settings name
+    /// while `LinuxSubscriptionsDiscovery` is [`DISCOVERY_ENABLED`], and NO Region while it
+    /// is not — nor while the account has no settings at all.
+    ///
+    /// A Region named twice is one Region, so the set is deduplicated and in a stable order,
+    /// which is also the order a pass asks about them in.
+    pub fn discovered_regions(&self) -> BTreeSet<String> {
+        match self.service_settings.as_ref() {
+            Some(settings) if settings.linux_subscriptions_discovery == DISCOVERY_ENABLED => {
+                settings
+                    .discovery_settings
+                    .source_regions
+                    .iter()
+                    .cloned()
+                    .collect()
+            }
+            _ => BTreeSet::new(),
+        }
+    }
+
+    /// Whether this account discovers `region` right now — the one question each hop of a
+    /// pass and each of its writes settles against the settings as they are then.
+    pub fn discovers_region(&self, region: &str) -> bool {
+        match self.service_settings.as_ref() {
+            Some(settings) if settings.linux_subscriptions_discovery == DISCOVERY_ENABLED => {
+                settings
+                    .discovery_settings
+                    .source_regions
+                    .iter()
+                    .any(|source| source == region)
+            }
+            _ => false,
+        }
     }
 
     /// The discovered subscriptions: one `Subscription` per distinct (name, type) pair

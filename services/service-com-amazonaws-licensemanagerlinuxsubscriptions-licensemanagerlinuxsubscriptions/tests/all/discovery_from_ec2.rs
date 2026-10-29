@@ -70,13 +70,13 @@ const PRODUCT_CODE_TYPE_MARKETPLACE: &str = "marketplace";
 
 /// The two values of the account's discovery switch
 /// (`smithy_query(query="shape",shape="LinuxSubscriptionsDiscovery")`: Enabled | Disabled).
-const ENABLED: &str = "Enabled";
-const DISABLED: &str = "Disabled";
+pub const ENABLED: &str = "Enabled";
+pub const DISABLED: &str = "Disabled";
 
 /// One AMI the account launches from, and the subscription discovering its instances must
 /// report.
 #[derive(Debug, Clone, Copy)]
-struct Ami {
+pub struct Ami {
     /// What this row is about, named in every assertion it drives.
     case: &'static str,
     /// The billing platform the AMI declares (`Image$PlatformDetails`). The Linux values
@@ -181,18 +181,22 @@ const AMIS: &[Ami] = &[
 ];
 
 /// The AMI row every case that needs just one Linux subscription launches from.
-const RHEL: &Ami = &AMIS[0];
+pub const RHEL: &Ami = &AMIS[0];
 
 /// This service and EC2 — the owner of the instances and the AMIs — over ONE shared engine,
 /// with an EC2 client per Region over the router's own in-process callback: the very seam
 /// this service's discovery reaches EC2 through.
-struct Fleet {
-    h: Harness,
+///
+/// `pub` so the suite whose rule is about a settings change landing WHILE a pass is in
+/// flight (`tests/all/discovery_pass_settings_change.rs`) drives the pass through this one
+/// fleet rather than assembling a second copy of the same two services.
+pub struct Fleet {
+    pub h: Harness,
     callback: EmbeddedEmulator,
 }
 
 impl Fleet {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The tests sign nothing; authentication is the framework's concern, not this
@@ -230,7 +234,7 @@ impl Fleet {
     /// The billing facts of an AMI are set when the image is created, and no operation of
     /// the EC2 emulator takes them from a request, so the image is placed through EC2's own
     /// store seam — the one its handlers read — rather than through a second copy of it.
-    fn publish_image(&self, row: &Ami) -> String {
+    pub fn publish_image(&self, row: &Ami) -> String {
         let store = ec2::state::service_state(&*self.h.engine).expect("EC2 holds its store");
         let mut store = store.lock();
         store.insert_image(ec2::state::ImageSpec {
@@ -257,6 +261,20 @@ impl Fleet {
     /// Launch `count` instances from `image_id` in `region`, through EC2 itself, and answer
     /// the ids it minted once EC2 reports every one of them `running`.
     async fn launch(&self, region: &str, image_id: &str, count: usize) -> Vec<String> {
+        let ids = self.launch_now(region, image_id, count).await;
+        for id in &ids {
+            self.settled_in(region, id, STATE_RUNNING).await;
+        }
+        ids
+    }
+
+    /// Launch `count` instances from `image_id` in `region` and answer the ids EC2 minted,
+    /// WITHOUT waiting for the state EC2's clock owes them.
+    ///
+    /// Discovery records an instance in whatever state EC2 reports it in short of
+    /// `terminated`, so a case whose rule is about WHICH instances a pass writes — not what
+    /// `Status` they report — does not have to wait that span out per Region.
+    pub async fn launch_now(&self, region: &str, image_id: &str, count: usize) -> Vec<String> {
         let requested = i32::try_from(count).expect("a small instance count");
         let launched = self
             .ec2(region)
@@ -279,9 +297,6 @@ impl Fleet {
             count,
             "setup: expected {count} launched instance ids, got {ids:?}"
         );
-        for id in &ids {
-            self.settled_in(region, id, STATE_RUNNING).await;
-        }
         ids
     }
 
@@ -369,7 +384,7 @@ impl Fleet {
     /// Persist `discovery` as this account's `LinuxSubscriptionsDiscovery`, with
     /// `source_regions` as the `SourceRegions` beside it: the one call a client onboards
     /// the account with and the one it later turns discovery off again with.
-    async fn set_discovery(&self, discovery: &str, source_regions: &[&str]) {
+    pub async fn set_discovery(&self, discovery: &str, source_regions: &[&str]) {
         let case = &format!("UpdateServiceSettings {discovery} for {source_regions:?}");
         let reply = call_in_region(
             &self.h,
@@ -400,7 +415,7 @@ impl Fleet {
     }
 
     /// `ListLinuxSubscriptionInstances` with `body`.
-    async fn instances(&self, body: &Value) -> Reply {
+    pub async fn instances(&self, body: &Value) -> Reply {
         call_in_region(&self.h, REGION, INSTANCES, body).await
     }
 }
