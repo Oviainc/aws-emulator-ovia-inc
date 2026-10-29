@@ -92,6 +92,17 @@ fn integration_identifier() -> Value {
     }}})
 }
 
+/// A Customer Profiles integration config whose `objectTypeNames` map is keyed by an
+/// event type the model's `EventType` catalog does not hold, which
+/// `PutConnectInstanceIntegration` refuses inside the handler — so the attempt is one
+/// this trail records.
+fn off_catalog_integration_body() -> Value {
+    json!({"integrationConfig": {"customerProfiles": {
+        "domainArn": "arn:aws:profile:us-east-1:000000000000:domains/audited-domain",
+        "objectTypeNames": {"Campaign-Fax": "object-type"},
+    }}})
+}
+
 /// The table: one row per (operation, outcome) pair this service can answer an
 /// instance-scoped call with, plus the reporting calls that must leave nothing.
 ///
@@ -179,6 +190,17 @@ fn rows() -> Vec<Row> {
             status: 404,
             error: Some("ResourceNotFoundException"),
             record: Some(("PutConnectInstanceIntegration", "ResourceNotFoundException")),
+        },
+        Row {
+            case: "integration refused: an object type key outside the modelled catalog",
+            instance: "audit-integration-bad-key",
+            setup: Setup::Onboarded,
+            method: "PUT",
+            path: "/integrations",
+            body: off_catalog_integration_body(),
+            status: 400,
+            error: Some("ValidationException"),
+            record: Some(("PutConnectInstanceIntegration", "ValidationException")),
         },
         Row {
             case: "integration delete refused: nothing under that identifier",

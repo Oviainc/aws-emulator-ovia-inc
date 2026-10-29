@@ -14,6 +14,14 @@
 //! stores nothing — the same two-halved gate `CreateCampaign` and
 //! `StartInstanceOnboardingJob` ask.
 //!
+//! A config whose ARN the shape it targets does not admit, or whose `objectTypeNames`
+//! map is keyed by anything outside the model's `EventType` catalog, is a bad request,
+//! refused with the modelled `ValidationException` (HTTP 400) before any of that is
+//! asked: everything inside the union — and a map key most of all, which no constraint
+//! walk reaches — is judged by the shared check in
+//! [`crate::state::integration_config_violation`], which is what keeps the store from
+//! holding a key the summary shape does not admit.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -174,14 +182,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The integration's ARN sits behind a union member, which the centralized
-        // constraint walk does not reach, so the shared check holds it to the
-        // `@length` and `@pattern` of the shape it targets — as a bad request, before
-        // the instance is looked up or anything is stored.
+        // Everything inside the `integrationConfig` union is judged before the
+        // instance is looked up or anything is stored: the ARN its member in force
+        // carries, against the `@length` and `@pattern` of the shape it targets, and
+        // the keys of a `customerProfiles` config's `objectTypeNames` map, against the
+        // model's `EventType` catalog — a map's KEY is the one thing the shared check's
+        // constraint walk cannot reach, since it captures an entry's key as the path
+        // segment of that entry's value rather than validating it as a leaf of its
+        // own. So the store never comes to hold a key `ListConnectInstanceIntegrations`
+        // would then report under a shape that does not admit it.
         if let Some(message) = crate::state::integration_config_violation(
             "integrationConfig",
             &input.integration_config,
         ) {
+            // The call attempted a change to what this service holds for the instance
+            // and was refused, so it leaves the same audit record every other exit of
+            // this handler does, named by the error it answers with.
+            crate::state::audit_onboarding_change(
+                ctx.parts(),
+                Self::NAME,
+                &input.connect_instance_id,
+                "ValidationException",
+            );
             return Err(
                 PutConnectInstanceIntegrationErrorModeled::ValidationException(
                     ValidationException {

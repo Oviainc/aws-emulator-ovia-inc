@@ -55,7 +55,7 @@ use crate::ops::types::{
     LambdaIntegrationConfig, LambdaIntegrationIdentifier, LambdaIntegrationSummary,
     OpenHours, QConnectIntegrationConfig, QConnectIntegrationIdentifier, QConnectIntegrationSummary,
     Schedule, SmsChannelSubtypeParameters, Source, TelephonyChannelSubtypeParameters, TimeWindow,
-    WhatsAppChannelSubtypeParameters, DAY_OF_WEEK_VALUES,
+    WhatsAppChannelSubtypeParameters, DAY_OF_WEEK_VALUES, EVENT_TYPE_VALUES,
 };
 
 /// The ARN namespace (and SigV4 signing name) this service's ARNs carry, as the
@@ -204,21 +204,21 @@ fn tag_key_violation_kind(key: &str) -> Option<::smithy_server_runtime::Violatio
     }
 }
 
-/// Why the tag keys of the MAP at `member` are a bad request, or `None` when every one
-/// of them is a key `TagKey` admits.
+/// Why the keys of the MAP at `member` are a bad request, each judged by
+/// `violation_kind`, or `None` when that finds nothing wrong with any of them.
 ///
-/// Tag keys reach a handler UNCHECKED, for two reasons that compound: the boundary
-/// walk captures a map's key as the path segment of that entry's value rather than
-/// validating it as a leaf of its own, and `TagKey`'s `@pattern` carries a leading
-/// negative lookahead the pattern engine cannot compile, which it then treats as
-/// matching. So this is the one place the key shape's `@length` and `@pattern` are
-/// enforced, shared by every operation that takes a tag map, and the sentence is built
-/// from the framework's own [`::smithy_server_runtime::Violation`] and rendered by
+/// A map's KEY never reaches the boundary walk: it captures an entry's key as the path
+/// segment of that entry's value rather than validating it as a leaf of its own. So
+/// every key shape this service has to weigh itself goes through here, which is the one
+/// place the shape of such a refusal is decided — which keys are reported, in which
+/// order, how an offending key is named and how much of it is echoed. The sentence is
+/// built from the framework's own [`::smithy_server_runtime::Violation`] and rendered by
 /// `aws_smithy_schema_server::constraints::envelope` — the one place that wording
 /// lives — so a handler refusal and a boundary refusal read identically.
-pub fn tag_keys_violation<'k>(
+fn map_keys_violation<'k>(
     member: &str,
     keys: impl IntoIterator<Item = &'k str>,
+    violation_kind: impl Fn(&str) -> Option<::smithy_server_runtime::ViolationKind>,
 ) -> Option<String> {
     // Sorted and deduplicated: a `HashMap` iterates in an arbitrary order, and the
     // same request must be refused with the same sentence every time.
@@ -229,25 +229,45 @@ pub fn tag_keys_violation<'k>(
     let violations: Vec<::smithy_server_runtime::Violation> = keys
         .into_iter()
         .filter_map(|key| {
-            let kind = tag_key_violation_kind(key)?;
+            let kind = violation_kind(key)?;
+            // The key embeds caller-supplied text, so it is elided BEFORE the path is
+            // composed from it: eliding the composed path instead would cut the
+            // trailing collection step off a path a huge key had filled.
+            let echoed = elided(key);
             Some(::smithy_server_runtime::Violation {
-                // The path names the offending key, which is what identifies it in a
-                // tag map as in a tag-key list. Elided like the value: it embeds
-                // caller-supplied text, so it is the same amplification vector.
-                path: elided(&format!(
+                // The path names the offending key, the spelling the boundary walk's
+                // own path builder gives a map entry.
+                path: format!(
                     "{member}.{}",
-                    ::aws_smithy_schema_server::constraints::path::entry(key)
-                )),
+                    ::aws_smithy_schema_server::constraints::path::entry(&echoed)
+                ),
                 kind,
                 // `Violation::value` must arrive ALREADY elided: the message
                 // interpolates it verbatim.
-                value: Some(elided(key)),
+                value: Some(echoed),
             })
         })
         .take(MAX_REPORTED_VIOLATIONS)
         .collect();
 
     ::aws_smithy_schema_server::constraints::envelope(&violations)
+}
+
+/// Why the tag keys of the MAP at `member` are a bad request, or `None` when every one
+/// of them is a key `TagKey` admits.
+///
+/// Tag keys reach a handler UNCHECKED, for two reasons that compound: the boundary
+/// walk captures a map's key as the path segment of that entry's value rather than
+/// validating it as a leaf of its own, and `TagKey`'s `@pattern` carries a leading
+/// negative lookahead the pattern engine cannot compile, which it then treats as
+/// matching. So this is the one place the key shape's `@length` and `@pattern` are
+/// enforced, shared by every operation that takes a tag map; [`map_keys_violation`]
+/// turns what it finds into the refusal.
+pub fn tag_keys_violation<'k>(
+    member: &str,
+    keys: impl IntoIterator<Item = &'k str>,
+) -> Option<String> {
+    map_keys_violation(member, keys, tag_key_violation_kind)
 }
 
 /// Why the tag keys of the LIST at `member` are a bad request, or `None` when every one
@@ -362,6 +382,26 @@ pub fn communication_limits_violation(
     })
 }
 
+/// Why the keys of the MAP at `member` are a bad request, or `None` when every one of
+/// them is a value the key shape's catalog (`allowed`) holds.
+///
+/// The one place an enum-keyed map's value set is enforced, shared by every operation
+/// that accepts such a map — a key the walk never validates, refused through
+/// [`map_keys_violation`] exactly as a tag key is.
+pub fn enum_map_keys_violation<'k>(
+    member: &str,
+    allowed: &[&str],
+    keys: impl IntoIterator<Item = &'k str>,
+) -> Option<String> {
+    map_keys_violation(member, keys, |key| {
+        (!allowed.contains(&key)).then(|| {
+            ::smithy_server_runtime::ViolationKind::EnumValue(
+                allowed.iter().map(|value| (*value).to_string()).collect(),
+            )
+        })
+    })
+}
+
 /// Why a communication-time config is a bad request, or `None` when every day its
 /// windows open is one the model's `DayOfWeek` catalog holds (`DAY_OF_WEEK_VALUES`
 /// in [`crate::ops::types`]).
@@ -369,10 +409,11 @@ pub fn communication_limits_violation(
 /// The one place this service checks a `CommunicationTimeConfig`'s `dailyHours`
 /// keys, so every operation that accepts one (`CreateCampaign`,
 /// `UpdateCampaignCommunicationTime`) refuses a day naming no weekday the same way.
-/// Those keys sit behind the `OpenHours` union, which the centralized constraint
-/// walk does not reach, so without this check a campaign could be stored opening a
-/// day the model does not model. `member` is the request path the refusal names, so
-/// the message is built from the request rather than fixed text.
+/// A map key is one the boundary walk never validates, so without this check a
+/// campaign could be stored opening a day the model does not model; the catalog
+/// itself is weighed by [`enum_map_keys_violation`], shared with every other
+/// enum-keyed map this service accepts. `member` is the request path the refusal
+/// names, so the message is built from the request rather than fixed text.
 pub fn communication_time_violation(
     member: &str,
     config: &CommunicationTimeConfig,
@@ -390,19 +431,12 @@ pub fn communication_time_violation(
             continue;
         };
         let OpenHours::dailyHours(daily_hours) = &window.open_hours;
-        // Sorted so a config carrying more than one unmodelled day is always refused
-        // for the same one, however the map happens to iterate.
-        let mut days: Vec<&str> = daily_hours.keys().map(String::as_str).collect();
-        days.sort_unstable();
-        if let Some(day) = days
-            .into_iter()
-            .find(|day| !DAY_OF_WEEK_VALUES.contains(day))
-        {
-            return Some(format!(
-                "Value '{day}' at '{member}.{channel}.openHours.dailyHours' failed to \
-                 satisfy constraint: Member must satisfy enum value set: [{}]",
-                DAY_OF_WEEK_VALUES.join(", ")
-            ));
+        if let Some(message) = enum_map_keys_violation(
+            &format!("{member}.{channel}.openHours.dailyHours"),
+            DAY_OF_WEEK_VALUES,
+            daily_hours.keys().map(String::as_str),
+        ) {
+            return Some(message);
         }
     }
     None
@@ -551,14 +585,28 @@ pub fn source_violation(member: &str, source: &Source) -> Option<String> {
 /// Why the `IntegrationConfig` at `member` is a bad request, or `None` when the
 /// structure the union member in force carries satisfies every constraint its shape
 /// declares — `Arn` for the Customer Profiles domain and the Q Connect knowledge
-/// base, `LambdaArn` for the Lambda function.
+/// base, `LambdaArn` for the Lambda function, and the `EventType` catalog for the keys
+/// of the Customer Profiles `objectTypeNames` map.
+///
+/// A structure's leaves are judged by the framework's own walk, which never validates
+/// a map's KEY, so the catalog an enum-keyed map is drawn from is weighed beside it
+/// through [`enum_map_keys_violation`] — without which an instance's integration could
+/// come to hold, and `ListConnectInstanceIntegrations` to report, a key the summary's
+/// own key shape does not admit.
 pub fn integration_config_violation(member: &str, config: &IntegrationConfig) -> Option<String> {
     match config {
         IntegrationConfig::customerProfiles(profiles) => structure_refusal(
             &format!("{member}.customerProfiles"),
             profiles,
             &CustomerProfilesIntegrationConfig::SCHEMA,
-        ),
+        )
+        .or_else(|| {
+            enum_map_keys_violation(
+                &format!("{member}.customerProfiles.objectTypeNames"),
+                EVENT_TYPE_VALUES,
+                profiles.object_type_names.keys().map(String::as_str),
+            )
+        }),
         IntegrationConfig::qConnect(q_connect) => structure_refusal(
             &format!("{member}.qConnect"),
             q_connect,
