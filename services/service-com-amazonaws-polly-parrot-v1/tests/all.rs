@@ -35,6 +35,8 @@ mod pls_replacement_whitespace;
 // drive.
 #[path = "all/shared_pls_fixture.rs"]
 mod shared_pls_fixture;
+#[path = "all/speech_mark_stream_for_every_text_type.rs"]
+mod speech_mark_stream_for_every_text_type;
 #[path = "all/ssml_billed_characters.rs"]
 mod ssml_billed_characters;
 #[path = "all/ssml_vocabulary.rs"]

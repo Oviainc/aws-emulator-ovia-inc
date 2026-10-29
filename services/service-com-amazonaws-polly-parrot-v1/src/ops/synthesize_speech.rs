@@ -45,13 +45,13 @@
 //!   computed from the text itself — their `start`/`end` offsets and `value` come
 //!   straight out of `Text`, while each `time` is an estimate off the emulator's own
 //!   chosen timeline ([`CHARACTERS_PER_SECOND`]) rather than a measured one — and a
-//!   request naming no mark type gets an empty stream rather than a refusal Amazon
-//!   Polly does not declare;
+//!   request naming no mark type gets an empty stream, for every `TextType`, rather
+//!   than a refusal Amazon Polly does not declare;
 //!
 //! What it cannot compute faithfully it refuses rather than invents: `viseme` marks
 //! need the phoneme timeline a synthesiser produces, `ssml` marks need SSML `<mark>`
-//! resolution, marks over `ssml` input would need text-content offsets that skip the
-//! markup, and `ogg_vorbis` needs a Vorbis encoder's codebooks (there is no pure-Rust
+//! resolution, a sentence or word mark asked for over `ssml` input would need
+//! text-content offsets that skip the markup, and `ogg_vorbis` needs a Vorbis encoder's codebooks (there is no pure-Rust
 //! Vorbis encoder and no external process available), so all four answer the
 //! scaffold's 501 rather than a response that looks like success.
 //!
@@ -1331,22 +1331,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ));
                     }
                 }
+                let want_sentences = marks.iter().any(|mark| mark == "sentence");
+                let want_words = marks.iter().any(|mark| mark == "word");
                 // A mark's `start`/`end` are offsets into `Text` and its `value` is
                 // the text it covers, so marks over SSML would have to be computed
                 // from the document's text content with offsets that skip the markup.
                 // That is not implemented, and answering with marks whose values are
                 // tag names would be a wrong answer dressed as success, so SSML input
-                // is refused here rather than mis-answered.
-                if text_type == "ssml" {
+                // is refused rather than mis-answered — but ONLY when a mark the
+                // request named has to be computed. A request that names no mark type
+                // needs no offsets at all, so there is nothing about it this emulator
+                // cannot serve and `TextType` does not change that.
+                if text_type == "ssml" && (want_sentences || want_words) {
                     return Err(crate::scaffolded::Scaffolded::not_implemented(
                         "SynthesizeSpeech speech marks over ssml input",
                     ));
                 }
-                let computed = speech_marks(
-                    &input.text,
-                    marks.iter().any(|mark| mark == "sentence"),
-                    marks.iter().any(|mark| mark == "word"),
-                );
+                let computed = speech_marks(&input.text, want_sentences, want_words);
                 // A request that names no mark type asks for no marks, so the stream
                 // is empty. `json` output IS the speech-mark stream, and Amazon Polly
                 // declares no error for an empty one, so an empty stream is the
