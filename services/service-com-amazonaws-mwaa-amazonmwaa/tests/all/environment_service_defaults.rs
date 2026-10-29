@@ -45,6 +45,13 @@ const ENVIRONMENT_CLASSES: [&str; 6] = [
 /// `smithy_query(query="shape", shape="WebserverAccessMode")`.
 const WEBSERVER_ACCESS_MODES: [&str; 3] = ["PRIVATE_ONLY", "PUBLIC_AND_PRIVATE", "PUBLIC_ONLY"];
 
+/// The one mode of [`WEBSERVER_ACCESS_MODES`] no row of this table can name: its own doc
+/// makes it available only "for Apache Airflow version 3.2 and later", a later release than
+/// any version Amazon MWAA runs an environment on, so a create naming it is refused instead
+/// of being given the defaults this table asserts — the rule
+/// `environment_webserver_access_mode_version_floor.rs` asserts over its own table.
+const FLOORED_ACCESS_MODE: &str = "PUBLIC_AND_PRIVATE";
+
 /// Every `EndpointManagement` value, from
 /// `smithy_query(query="shape", shape="EndpointManagement")`.
 const ENDPOINT_MANAGEMENT_MODES: [&str; 2] = ["CUSTOMER", "SERVICE"];
@@ -249,7 +256,11 @@ fn cases() -> Vec<Case> {
     }
     // One access mode / endpoint-management value at a time: a named value is kept, and
     // every other defaulted member still gets its default.
-    for (index, mode) in WEBSERVER_ACCESS_MODES.iter().enumerate() {
+    for (index, mode) in WEBSERVER_ACCESS_MODES
+        .iter()
+        .filter(|mode| **mode != FLOORED_ACCESS_MODE)
+        .enumerate()
+    {
         cases.push(Case {
             webserver_access_mode: Some(mode),
             ..Case::bare(ACCESS_MODE_CASE_NAMES[index])
@@ -296,7 +307,7 @@ const CLASS_CASE_NAMES: [&str; 6] = [
     "Class2xlarge",
 ];
 /// See [`CLASS_CASE_NAMES`].
-const ACCESS_MODE_CASE_NAMES: [&str; 3] = ["AccessPrivate", "AccessBoth", "AccessPublic"];
+const ACCESS_MODE_CASE_NAMES: [&str; 2] = ["AccessPrivate", "AccessPublic"];
 /// See [`CLASS_CASE_NAMES`].
 const ENDPOINT_CASE_NAMES: [&str; 2] = ["EndpointCustomer", "EndpointService"];
 /// See [`CLASS_CASE_NAMES`].

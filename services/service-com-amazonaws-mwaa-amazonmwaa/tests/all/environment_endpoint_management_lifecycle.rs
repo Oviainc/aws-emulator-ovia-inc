@@ -248,7 +248,10 @@ fn cases() -> Vec<Case> {
             name: "ServiceLargeBare",
             endpoint_management: Some("SERVICE"),
             environment_class: Some("mw1.2xlarge"),
-            webserver_access_mode: Some("PUBLIC_AND_PRIVATE"),
+            // A mode every Apache Airflow version this service runs offers: the
+            // both-public-and-private mode's own doc floors it to a later release than any
+            // of them, which `environment_webserver_access_mode_version_floor.rs` asserts.
+            webserver_access_mode: Some("PUBLIC_ONLY"),
             tags: &[],
             logging: &[],
         },

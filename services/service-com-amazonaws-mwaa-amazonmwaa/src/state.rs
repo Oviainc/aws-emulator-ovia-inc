@@ -6,6 +6,7 @@
 //! implemented operation computes its answer from the records below: nothing is canned,
 //! and nothing is echoed straight back out of a request without being stored first.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::RangeInclusive;
 use std::time::{Duration, SystemTime};
@@ -273,6 +274,55 @@ pub const DEFAULT_MAX_WORKERS: i32 = 10;
 /// an environment that asked for no VPC-only web server gets the public one.
 pub const DEFAULT_WEBSERVER_ACCESS_MODE: &str = "PUBLIC_ONLY";
 
+/// The `WebserverAccessMode` that puts the Apache Airflow web server behind both a public
+/// load balancer and a private VPC endpoint, and the only value in this service's model
+/// whose own doc states an Apache Airflow release floor — see
+/// [`PUBLIC_AND_PRIVATE_MIN_AIRFLOW_VERSION`] and [`EnvironmentSpec::validate`].
+pub const WEBSERVER_ACCESS_MODE_PUBLIC_AND_PRIVATE: &str = "PUBLIC_AND_PRIVATE";
+
+/// The oldest Apache Airflow release that offers
+/// [`WEBSERVER_ACCESS_MODE_PUBLIC_AND_PRIVATE`], from the member's own doc: "If set to
+/// PUBLIC_AND_PRIVATE, creates both a public network load balancer (NLB) for browser access
+/// and a private VPC endpoint (VPCE) for worker-to-webserver communication. This mode is
+/// only available for Apache Airflow version 3.2 and later."
+/// (`smithy_query(query="doc", shape="CreateEnvironmentInput",
+/// member="WebserverAccessMode")`).
+///
+/// The model states the member's VALUE SET (an enum of its three modes) but not the release
+/// a value needs, so the floor is a business rule [`EnvironmentSpec::validate`] enforces
+/// rather than one the boundary validator can. The one other version-dependent sentence in
+/// this model, `Schedulers`'s "v1 - Accepts 1", selects the Apache Airflow 1.x line that
+/// [`SUPPORTED_AIRFLOW_VERSIONS`] does not carry, so no supported version reaches it (see
+/// [`unit_count_range`]).
+pub const PUBLIC_AND_PRIVATE_MIN_AIRFLOW_VERSION: &str = "3.2";
+
+/// Whether `version` names an Apache Airflow release at or above `floor`.
+///
+/// Both are dotted release numbers, compared component by component as NUMBERS rather than
+/// as text — a text comparison puts a two-digit component below a one-digit one — and a
+/// version with fewer components than the other is read as zero in the components it omits,
+/// so a bare `3.2` is the same release as `3.2.0`. A component that is not a number is read
+/// as zero: `AirflowVersion`'s pattern (`^[0-9a-z.]+$`) admits such a component, and
+/// [`EnvironmentSpec::validate`] compares only a version already in
+/// [`SUPPORTED_AIRFLOW_VERSIONS`], every component of which is a number.
+pub fn airflow_version_at_least(version: &str, floor: &str) -> bool {
+    let number = |component: Option<&str>| component.unwrap_or("0").parse::<u64>().unwrap_or(0);
+    let mut running = version.split('.');
+    let mut required = floor.split('.');
+    loop {
+        let (running, required) = (running.next(), required.next());
+        if running.is_none() && required.is_none() {
+            // The same release, component for component.
+            return true;
+        }
+        match number(running).cmp(&number(required)) {
+            Ordering::Greater => return true,
+            Ordering::Less => return false,
+            Ordering::Equal => {}
+        }
+    }
+}
+
 /// Who manages an environment's VPC endpoints when the create named nobody.
 ///
 /// The `EndpointManagement` doc gives the two modes: "If set to SERVICE, Amazon MWAA will
@@ -533,10 +583,10 @@ pub struct EnvironmentSpec {
 
 impl EnvironmentSpec {
     /// Every rule the RESOLVED environment configuration must satisfy that the Smithy
-    /// model cannot state — a value set the member's doc fixes, the per-class count range
-    /// a sizing member's doc fixes, and a bound one member places on another — as one
-    /// check both `CreateEnvironment` and `UpdateEnvironment` run before anything is
-    /// stored.
+    /// model cannot state — a value set the member's doc fixes, the Apache Airflow release
+    /// a value the member's doc floors needs, the per-class count range a sizing member's
+    /// doc fixes, and a bound one member places on another — as one check both
+    /// `CreateEnvironment` and `UpdateEnvironment` run before anything is stored.
     ///
     /// It is run on the configuration the request WOULD store: for an update that is the
     /// stored record with the request's members merged in, so a patch naming only one side
@@ -561,6 +611,27 @@ impl EnvironmentSpec {
                 return Err(format!(
                     "{value} is not a supported {member}. Valid values: {}.",
                     valid.join(", ")
+                ));
+            }
+        }
+        // A value whose own doc makes it available only from a given Apache Airflow release
+        // is accepted only on an environment running that release or a later one: on an
+        // older release the service does not offer it, so the configuration describes an
+        // environment it cannot provision. Judged on the RESOLVED version, so a request
+        // that moves the version is judged by the version it moves to, and AFTER the
+        // catalog check above, so only a version the service runs reaches the comparison.
+        for (member, value, floored_value, floor) in [(
+            "WebserverAccessMode",
+            self.webserver_access_mode.as_str(),
+            WEBSERVER_ACCESS_MODE_PUBLIC_AND_PRIVATE,
+            PUBLIC_AND_PRIVATE_MIN_AIRFLOW_VERSION,
+        )] {
+            if value == floored_value && !airflow_version_at_least(&self.airflow_version, floor) {
+                return Err(format!(
+                    "{floored_value} is not a valid {member} for an environment running \
+                     Apache Airflow version {}. {floored_value} is only available for \
+                     Apache Airflow version {floor} and later.",
+                    self.airflow_version
                 ));
             }
         }

@@ -39,6 +39,8 @@ mod environment_unit_count_ranges;
 mod environment_update_apply_phase;
 #[path = "all/environment_update_status_sequence.rs"]
 mod environment_update_status_sequence;
+#[path = "all/environment_webserver_access_mode_version_floor.rs"]
+mod environment_webserver_access_mode_version_floor;
 #[path = "all/list_environments_cursor_scope.rs"]
 mod list_environments_cursor_scope;
 #[path = "all/rejection_contract.rs"]

@@ -441,7 +441,11 @@ fn cases() -> Vec<EnvCase> {
                 ("PluginsS3Path", "lib/plugins.zip"),
                 ("PluginsS3ObjectVersion", "Lm3kQ9pR2sT"),
             ],
-            webserver_access_mode: Some("PUBLIC_AND_PRIVATE"),
+            // A mode every Apache Airflow version this service runs offers: the
+            // both-public-and-private mode's own doc floors it to a later release than any
+            // of them, which `environment_webserver_access_mode_version_floor.rs` asserts
+            // over its own table.
+            webserver_access_mode: Some("PUBLIC_ONLY"),
             endpoint_management: Some("SERVICE"),
             weekly_window: Some("FRI:23:30"),
             kms_key: None,
