@@ -541,7 +541,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::Stage {
                     stage_name: crate::state::DEFAULT_STAGE_NAME.to_string(),
                     description: ::std::option::Option::None,
-                    auto_deploy: true,
+                    // Quick create SETS it: the $default stage it mints is "configured to
+                    // automatically deploy changes", so the member is configured here and
+                    // the stage reports it.
+                    auto_deploy: Some(true),
                     // The stage is the service's, so nothing tagged it; the api's own
                     // tags belong to the api.
                     tags: ::std::collections::BTreeMap::new(),

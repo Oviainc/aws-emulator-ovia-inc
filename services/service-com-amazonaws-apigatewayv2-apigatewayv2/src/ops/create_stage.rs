@@ -299,13 +299,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        // "Specifies whether updates to an API automatically trigger a new deployment.
-        // The default value is false" (`CreateStage$AutoDeploy`).
-        let auto_deploy = input.auto_deploy.unwrap_or(false);
+        // What the request CONFIGURED, kept as it came: `AutoDeploy` is reported only once
+        // a request has set it (see `crate::state::Stage::auto_deploy`), so nothing is
+        // defaulted into the record here. Its documented default ("The default value is
+        // false", `CreateStage$AutoDeploy`) decides only how the stage BEHAVES.
+        let auto_deploy = input.auto_deploy;
 
         let mut deployment_id = input.deployment_id;
         let mut last_deployment_status_message = ::std::option::Option::None;
-        if auto_deploy && deployment_id.is_none() {
+        if crate::state::auto_deploys(auto_deploy) && deployment_id.is_none() {
             // An auto-deploying stage has its deployments RELEASED BY THE SERVICE
             // ("Specifies whether a deployment was automatically released",
             // `Deployment$AutoDeployed`), so creating one releases the api's current

@@ -1093,11 +1093,15 @@ impl Api {
     /// mints none at all. Every writer of this api's routes and integrations calls this
     /// once it has written, so no two of them release differently.
     pub fn redeploy_auto_deploying_stages(&mut self, now: SystemTime) {
-        if !self.stages.values().any(|stage| stage.auto_deploy) {
+        if !self.stages.values().any(Stage::auto_deploys) {
             return;
         }
         let (released, status_message) = self.release_auto_deployment(now);
-        for stage in self.stages.values_mut().filter(|stage| stage.auto_deploy) {
+        for stage in self
+            .stages
+            .values_mut()
+            .filter(|stage| stage.auto_deploys())
+        {
             // A release the deployment quota refused leaves the stage on the deployment it
             // already serves, reporting why the last one did not happen.
             if released.is_some() {
@@ -2315,7 +2319,17 @@ pub const INVALID_MODEL_SCHEMA_MESSAGE: &str = "Invalid model specified: Validat
 pub struct Stage {
     pub stage_name: String,
     pub description: Option<String>,
-    pub auto_deploy: bool,
+    /// Whether the caller CONFIGURED auto-deploy on this stage, and what they set it to —
+    /// `None` until a request supplies a value.
+    ///
+    /// `Stage$AutoDeploy` is neither `@required` nor `@default` (`smithy_query(query="shape",
+    /// shape="Stage")`), so the stage reports it only once a request has set it: the
+    /// presence of the member is what tells "auto-deploy was never configured here" from
+    /// "it was configured and turned off", and a round-trip that echoes a read back into
+    /// `UpdateStage` must not write a setting the caller never made. Its documented default
+    /// ("The default value is false", `CreateStage$AutoDeploy`) governs BEHAVIOUR only —
+    /// see [`Stage::auto_deploys`] — never what is stored or reported.
+    pub auto_deploy: Option<bool>,
     pub tags: BTreeMap<String, String>,
     /// The `DeploymentId` this stage serves, set by the create that deployed to it:
     /// "A Deployment must be associated with a Stage for it to be callable over the
@@ -2345,12 +2359,18 @@ pub struct Stage {
 }
 
 impl Stage {
+    /// Whether this stage auto-deploys, which is what the stored value MEANS to the rest
+    /// of the service — [`auto_deploys`] applied to this record's own setting.
+    pub fn auto_deploys(&self) -> bool {
+        auto_deploys(self.auto_deploy)
+    }
+
     /// Project the record onto the modelled `Stage` shape.
     pub fn to_wire(&self) -> wire::Stage {
         wire::Stage {
             access_log_settings: self.access_log_settings.clone(),
             api_gateway_managed: Some(self.api_gateway_managed),
-            auto_deploy: Some(self.auto_deploy),
+            auto_deploy: self.auto_deploy,
             client_certificate_id: self.client_certificate_id.clone(),
             created_date: Some(to_timestamp(self.created_date)),
             default_route_settings: self.default_route_settings.clone(),
@@ -2379,6 +2399,18 @@ impl Stage {
 /// The most stages one api may hold, after which CreateStage is refused. AWS's
 /// published API Gateway quota is 10 stages per API.
 pub const MAX_STAGES_PER_API: usize = 10;
+
+/// Whether a stage whose `AutoDeploy` is `configured` auto-deploys — the ONE place the
+/// documented default of that member lives.
+///
+/// "Specifies whether updates to an API automatically trigger a new deployment. The
+/// default value is false" (`CreateStage$AutoDeploy`): a stage no request configured
+/// behaves as one that does not auto-deploy, without the record claiming the caller said
+/// so. Every decision that turns on auto-deploy reads this, so the default governs
+/// behaviour in one spelling and never reaches what is stored or reported.
+pub fn auto_deploys(configured: Option<bool>) -> bool {
+    configured.unwrap_or(false)
+}
 
 /// The `LoggingLevel` of a route that pushes no entries to CloudWatch Logs, from
 /// `LOGGING_LEVEL_VALUES` (`ERROR | INFO | OFF`): "Specifies the logging level for this

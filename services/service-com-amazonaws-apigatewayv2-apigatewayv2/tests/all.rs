@@ -151,6 +151,8 @@ mod routing_rule_update;
 mod server_applied_defaults;
 #[path = "all/service_claim.rs"]
 mod service_claim;
+#[path = "all/stage_auto_deploy_presence.rs"]
+mod stage_auto_deploy_presence;
 #[path = "all/stage_deletion.rs"]
 mod stage_deletion;
 #[path = "all/stage_lifecycle.rs"]

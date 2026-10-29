@@ -286,7 +286,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated.description = Some(description);
         }
         if let Some(auto_deploy) = input.auto_deploy {
-            updated.auto_deploy = auto_deploy;
+            updated.auto_deploy = Some(auto_deploy);
         }
         if let Some(client_certificate_id) = input.client_certificate_id {
             updated.client_certificate_id = Some(client_certificate_id);
@@ -310,7 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // deployments the SERVICE releases cannot be moved onto one the caller
             // picked. The MERGED record decides, so one request may switch auto-deploy
             // off and name a deployment at the same time.
-            if updated.auto_deploy {
+            if updated.auto_deploys() {
                 return Err(bad_request(
                     "Invalid value for DeploymentId: the DeploymentId of a stage can't \
                      be updated if autoDeploy is enabled."
@@ -332,7 +332,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        if updated.auto_deploy && updated.deployment_id.is_none() {
+        if updated.auto_deploys() && updated.deployment_id.is_none() {
             // An auto-deploying stage has its deployments RELEASED BY THE SERVICE
             // ("Specifies whether a deployment was automatically released",
             // `Deployment$AutoDeployed`), so a patch that leaves the stage auto-deploying

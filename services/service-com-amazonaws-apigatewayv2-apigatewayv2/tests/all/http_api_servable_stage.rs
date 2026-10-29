@@ -70,9 +70,10 @@ struct Row {
     stage: Value,
     /// The `StageName` the stored stage is keyed by and reports.
     stage_name: String,
-    /// The `AutoDeploy` the stored stage must report — defaulted to false when the
-    /// request names none ("The default value is false", `CreateStage$AutoDeploy`).
-    auto_deploy: bool,
+    /// The `AutoDeploy` the stored stage must report — absent when the request configured
+    /// none (the member is reported only once a request sets it; its documented default,
+    /// "The default value is false" (`CreateStage$AutoDeploy`), governs behaviour only).
+    auto_deploy: Option<bool>,
 }
 
 fn http_api(name: &str) -> Value {
@@ -103,7 +104,7 @@ fn rows() -> Vec<Row> {
             route_key: "ANY /{proxy+}",
             stage: json!({ "stageName": "$default", "autoDeploy": true }),
             stage_name: "$default".to_string(),
-            auto_deploy: true,
+            auto_deploy: Some(true),
         },
         Row {
             case: "a named stage over a Lambda-backed route, asking for no auto-deploy",
@@ -116,7 +117,7 @@ fn rows() -> Vec<Row> {
             route_key: "GET /orders",
             stage: json!({ "stageName": "prod", "description": "the live stage" }),
             stage_name: "prod".to_string(),
-            auto_deploy: false,
+            auto_deploy: None,
         },
         Row {
             case: "an HTTP_PROXY upstream behind a stage whose name is at the upper \
@@ -135,7 +136,7 @@ fn rows() -> Vec<Row> {
                 "stageVariables": { "upstream": "https://example.com/path" }
             }),
             stage_name: "s".repeat(MAX_STAGE_NAME_LEN),
-            auto_deploy: true,
+            auto_deploy: Some(true),
         },
         Row {
             case: "a WebSocket api whose $default route fronts a MOCK integration",
@@ -144,7 +145,7 @@ fn rows() -> Vec<Row> {
             route_key: "$default",
             stage: json!({ "stageName": "sockets", "autoDeploy": true }),
             stage_name: "sockets".to_string(),
-            auto_deploy: true,
+            auto_deploy: Some(true),
         },
     ]
 }
@@ -236,8 +237,8 @@ async fn the_sequence_that_makes_an_api_servable_completes_and_reads_back() {
         );
         assert_eq!(
             stage.get("autoDeploy"),
-            Some(&json!(row.auto_deploy)),
-            "case {case:?}: expected AutoDeploy {}, got {stage}",
+            row.auto_deploy.map(|flag| json!(flag)).as_ref(),
+            "case {case:?}: expected AutoDeploy {:?}, got {stage}",
             row.auto_deploy
         );
         // "If you created an API using quick create, the $default stage is managed by
@@ -254,7 +255,7 @@ async fn the_sequence_that_makes_an_api_servable_completes_and_reads_back() {
         // makes the api callable on the endpoint above; one that asked for none serves
         // none until a `CreateDeployment` releases one.
         let deployment_id = stage.get("deploymentId").and_then(Value::as_str);
-        if row.auto_deploy {
+        if row.auto_deploy == Some(true) {
             let deployment_id = deployment_id.unwrap_or_else(|| {
                 panic!("case {case:?}: an auto-deploying stage must report a DeploymentId, got {stage}")
             });

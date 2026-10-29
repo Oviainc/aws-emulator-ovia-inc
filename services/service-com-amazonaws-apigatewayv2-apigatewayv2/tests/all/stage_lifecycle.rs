@@ -6,10 +6,12 @@
 //!
 //! * **`CreateStage` persists a stage under its api, keyed by the `StageName` the
 //!   request named, and answers 201 with the stored stage document** — the members the
-//!   request supplied, the documented defaults for the ones it omitted (`AutoDeploy`
-//!   false, `ApiGatewayManaged` false), and the instants it was created and last
-//!   updated at. `GetStage` reports that same record, member for member: nothing is
-//!   echoed from the request without going through the store.
+//!   request supplied, whether API Gateway manages the stage, and the instants it was
+//!   created and last updated at. A member the request CONFIGURES and left out is
+//!   absent, not defaulted into the record (`AutoDeploy` — see
+//!   `stage_auto_deploy_presence`, the table for that rule). `GetStage` reports that
+//!   same record, member for member: nothing is echoed from the request without going
+//!   through the store.
 //! * A stage of an api whose `AutoDeploy` is on has a deployment **released by the
 //!   service** ("Specifies whether a deployment was automatically released",
 //!   `Deployment$AutoDeployed`), so it reports a `DeploymentId` of its own api whose
@@ -81,8 +83,9 @@ struct Row {
     request: Value,
     /// The `StageName` the stage is keyed by and reports.
     stage_name: String,
-    /// The `AutoDeploy` the stored stage must report.
-    auto_deploy: bool,
+    /// The `AutoDeploy` the stored stage must report — absent when the request
+    /// configured none.
+    auto_deploy: Option<bool>,
     /// The `Description` the stored stage must report.
     description: Option<String>,
     deployment: Deployment,
@@ -108,7 +111,7 @@ fn rows() -> Vec<Row> {
             routes: &["GET /x"],
             request: json!({ "stageName": "$default", "autoDeploy": true }),
             stage_name: "$default".to_string(),
-            auto_deploy: true,
+            auto_deploy: Some(true),
             description: None,
             deployment: Deployment::AutoReleased,
         },
@@ -118,7 +121,7 @@ fn rows() -> Vec<Row> {
             routes: &["GET /items"],
             request: json!({ "stageName": "prod" }),
             stage_name: "prod".to_string(),
-            auto_deploy: false,
+            auto_deploy: None,
             description: None,
             deployment: Deployment::None,
         },
@@ -128,7 +131,7 @@ fn rows() -> Vec<Row> {
             routes: &[],
             request: json!({ "stageName": "pre-prod_v2", "autoDeploy": false }),
             stage_name: "pre-prod_v2".to_string(),
-            auto_deploy: false,
+            auto_deploy: Some(false),
             description: None,
             deployment: Deployment::None,
         },
@@ -138,7 +141,7 @@ fn rows() -> Vec<Row> {
             routes: &[],
             request: json!({ "stageName": "s".repeat(MAX_STAGE_NAME_LEN) }),
             stage_name: "s".repeat(MAX_STAGE_NAME_LEN),
-            auto_deploy: false,
+            auto_deploy: None,
             description: None,
             deployment: Deployment::None,
         },
@@ -170,7 +173,7 @@ fn rows() -> Vec<Row> {
                 "tags": { "team": "platform", "env": "test" }
             }),
             stage_name: "observed".to_string(),
-            auto_deploy: true,
+            auto_deploy: Some(true),
             description: Some("detailed metrics and a throttle".to_string()),
             deployment: Deployment::AutoReleased,
         },
@@ -193,7 +196,7 @@ fn rows() -> Vec<Row> {
                 }
             }),
             stage_name: "sockets".to_string(),
-            auto_deploy: false,
+            auto_deploy: None,
             description: None,
             deployment: Deployment::None,
         },
@@ -203,7 +206,7 @@ fn rows() -> Vec<Row> {
             routes: &[],
             request: json!({ "stageName": "blank", "description": "" }),
             stage_name: "blank".to_string(),
-            auto_deploy: false,
+            auto_deploy: None,
             description: Some(String::new()),
             deployment: Deployment::None,
         },
@@ -216,7 +219,7 @@ fn rows() -> Vec<Row> {
                 "description": "d".repeat(MAX_DESCRIPTION_LEN)
             }),
             stage_name: "wordy".to_string(),
-            auto_deploy: false,
+            auto_deploy: None,
             description: Some("d".repeat(MAX_DESCRIPTION_LEN)),
             deployment: Deployment::None,
         },
@@ -226,7 +229,7 @@ fn rows() -> Vec<Row> {
             routes: &["ANY /{proxy+}"],
             request: json!({ "stageName": "canary" }),
             stage_name: "canary".to_string(),
-            auto_deploy: false,
+            auto_deploy: None,
             description: None,
             deployment: Deployment::Named,
         },
@@ -236,7 +239,7 @@ fn rows() -> Vec<Row> {
             routes: &[],
             request: json!({ "stageName": "early", "autoDeploy": true }),
             stage_name: "early".to_string(),
-            auto_deploy: true,
+            auto_deploy: Some(true),
             description: None,
             deployment: Deployment::AutoReleased,
         },
@@ -311,8 +314,8 @@ fn assert_stage(case: &str, row: &Row, body: &Value, named_deployment: Option<&S
     );
     assert_eq!(
         body.get("autoDeploy"),
-        Some(&json!(row.auto_deploy)),
-        "case {case:?}: expected AutoDeploy {}, got {body}",
+        row.auto_deploy.map(|flag| json!(flag)).as_ref(),
+        "case {case:?}: expected AutoDeploy {:?}, got {body}",
         row.auto_deploy
     );
     assert_eq!(
