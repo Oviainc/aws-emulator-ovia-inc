@@ -28,6 +28,9 @@ mod refused_sampling_leaves_no_trajectory;
 #[path = "all/rejected_value_echo.rs"]
 mod rejected_value_echo;
 
+#[path = "all/reward_resolution_precedes_its_own_checks.rs"]
+mod reward_resolution_precedes_its_own_checks;
+
 #[path = "all/rollout_operations_resolve_the_job.rs"]
 mod rollout_operations_resolve_the_job;
 
