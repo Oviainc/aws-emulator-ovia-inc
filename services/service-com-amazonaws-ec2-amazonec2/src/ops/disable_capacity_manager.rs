@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableCapacityManager
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableCapacityManager`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableCapacityManager::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! MUTATING, as the spec says: this operation "disables EC2 Capacity Manager for your
+//! account", so it turns the account's setting off through
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::disable_capacity_manager`] and answers
+//! "the current status of Capacity Manager after the disable operation"
+//! (`DisableCapacityManagerResult$CapacityManagerStatus`) read back out of the store.
+//! Idempotent: disabling an account it is already off for changes nothing at all.
+//!
+//! The disable also "stops data ingestion", so the ingestion an earlier enable started is
+//! dropped with the setting: `GetCapacityManagerAttributes` then reports no
+//! `IngestionStatus`, and an enable that comes later starts a fresh one. The cross-account
+//! aggregation flag goes off with it, as the output member documents: "this will be false
+//! after disabling Capacity Manager"
+//! (`DisableCapacityManagerResult$OrganizationsAccess`).
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +144,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableCapacityManager` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableCapacityManagerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableCapacityManager"))
+        use crate::state;
+        use std::time::Instant;
+
+        // `ctx` carries request metadata only, and this operation reads none of it:
+        // "disables EC2 Capacity Manager for your account" names no Region, so the setting
+        // is a fact of the account rather than of the Region the request was signed for.
+        let _ = ctx;
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`DisableCapacityManagerRequest$ClientToken`), held to the published
+        // constraint every client token of this crate is held to
+        // ([`state::MAX_CLIENT_TOKEN_CHARS`]). Nothing is stored for it, and nothing needs
+        // to be: this disable mints no resource and is already idempotent in the settings it
+        // asks for, so no caller-chosen bytes are added to the store.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {} characters",
+                state::MAX_CLIENT_TOKEN_CHARS
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the write: the
+        // flag asks whether the request WOULD have worked, so one that would have succeeded
+        // leaves the settings untouched. "If you have the required permissions, the error
+        // response is DryRunOperation" (`DisableCapacityManagerRequest$DryRun`).
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        let store = state::require_service_state(&*self.engine)?;
+        let mut store = store.lock();
+        // Answer the settings read back OUT of the store, so the caller sees what a later
+        // `GetCapacityManagerAttributes` will see rather than what this handler assumed.
+        let settings = store.disable_capacity_manager(Instant::now());
+        Ok(DisableCapacityManagerOutput {
+            capacity_manager_status: Some(settings.status.to_string()),
+            organizations_access: Some(settings.organizations_access),
+        })
     }
 }

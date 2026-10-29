@@ -303,6 +303,10 @@ mod capacity_blocks;
 // starts.
 #[path = "all/capacity_manager.rs"]
 mod capacity_manager;
+// What `DisableCapacityManager` records: the account's status and Organizations access
+// going off, the ingestion it stops, and what an enable after one starts.
+#[path = "all/capacity_manager_disable.rs"]
+mod capacity_manager_disable;
 // What `GetCapacityManagerAttributes` reports about those settings: every member of the
 // result, over the account histories behind it and the Regions it is asked for in.
 #[path = "all/capacity_manager_attributes.rs"]

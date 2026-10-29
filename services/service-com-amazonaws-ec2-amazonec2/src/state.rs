@@ -1344,7 +1344,8 @@
 //! `OrganizationsAccess` carries. So it is stored as one private
 //! [`CapacityManagerSettings`] of [`ComAmazonawsEc2Amazonec2State`] — not keyed by Region,
 //! because nothing in its documentation scopes it to one — written through
-//! [`ComAmazonawsEc2Amazonec2State::enable_capacity_manager`] and read through
+//! [`ComAmazonawsEc2Amazonec2State::enable_capacity_manager`] and
+//! [`ComAmazonawsEc2Amazonec2State::disable_capacity_manager`], and read through
 //! [`ComAmazonawsEc2Amazonec2State::capacity_manager_at`], so the operation that reports
 //! the settings and the operations that change them cannot disagree.
 //!
@@ -1355,7 +1356,9 @@
 //! `initial-ingestion-in-progress` or `ingestion-complete` from that instant — on the same
 //! monotonic clock and the same [`TRANSITION_DELAY`] as an instance's
 //! [`PendingTransition`] — so a reader never writes and a caller asking straight after the
-//! enable still sees the transient status.
+//! enable still sees the transient status. The DISABLE "stops data ingestion", so it drops
+//! that instant rather than moving it: there is then no ingestion to report a status for,
+//! and a later enable starts a fresh one.
 //!
 //! ## Scheduled event notification tag keys are a fact of a REGION
 //!
@@ -32693,6 +32696,31 @@ impl ComAmazonawsEc2Amazonec2State {
             self.capacity_manager.ingestion_complete_at = Some(now + TRANSITION_DELAY);
         }
         self.capacity_manager.organizations_access = organizations_access;
+        self.capacity_manager.view_at(now)
+    }
+
+    /// Turn Capacity Manager OFF for the account, and answer the settings as they now stand
+    /// as of `now`.
+    ///
+    /// The one writer of the disable, so what a later report answers is always what this
+    /// left here. Three things change together, each one documented by the operation:
+    ///
+    /// * the status goes to [`CAPACITY_MANAGER_DISABLED`] — "disables EC2 Capacity Manager
+    ///   for your account";
+    /// * the cross-account aggregation flag goes off — "indicates whether Organizations
+    ///   access is enabled. This will be false after disabling Capacity Manager"
+    ///   (`DisableCapacityManagerResult$OrganizationsAccess`);
+    /// * the ingestion is dropped — "this stops data ingestion ... no new data will be
+    ///   processed", so there is no ingestion left to report an `IngestionStatus` for, and
+    ///   an enable that comes later starts a fresh one rather than inheriting the stopped
+    ///   one's instant.
+    ///
+    /// Idempotent: an account that is already off is left exactly where it was, since each
+    /// of those three is already in the state a disable puts it in.
+    pub fn disable_capacity_manager(&mut self, now: Instant) -> CapacityManagerView {
+        self.capacity_manager.status = CAPACITY_MANAGER_DISABLED;
+        self.capacity_manager.organizations_access = false;
+        self.capacity_manager.ingestion_complete_at = None;
         self.capacity_manager.view_at(now)
     }
 }
