@@ -23,9 +23,11 @@ use crate::ops::types::{
     Application, AutoScalingPolicy, AutoScalingPolicyDescription, AutoScalingPolicyStatus,
     BlockPublicAccessConfiguration, BlockPublicAccessConfigurationMetadata, BootstrapActionConfig,
     Cluster, ClusterStateChangeReason, ClusterStatus, ClusterSummary, ClusterTimeline,
-    Configuration, EbsBlockDevice, Ec2InstanceAttributes, HadoopStepConfig, InstanceFleetConfig,
-    InstanceGroup, InstanceGroupConfig, InstanceGroupStateChangeReason, InstanceGroupStatus,
-    InstanceGroupTimeline, InvalidRequestException, JobFlowInstancesConfig, KerberosAttributes,
+    Configuration, EbsBlockDevice, EbsConfiguration, Ec2InstanceAttributes, HadoopStepConfig,
+    InstanceFleet, InstanceFleetConfig, InstanceFleetStateChangeReason, InstanceFleetStatus,
+    InstanceFleetTimeline, InstanceGroup, InstanceGroupConfig, InstanceGroupStateChangeReason,
+    InstanceGroupStatus, InstanceGroupTimeline, InstanceTypeConfig, InstanceTypeSpecification,
+    InvalidRequestException, JobFlowInstancesConfig, KerberosAttributes,
     ManagedScalingPolicy, MonitoringConfiguration, NotebookExecution, NotebookExecutionSummary,
     NotebookS3LocationForOutput, OSRelease, OutputNotebookS3LocationForOutput, PersistentAppUI,
     PlacementGroupConfig, PortRange, Session, SessionMappingDetail, ShrinkPolicy,
@@ -66,10 +68,21 @@ pub mod instance_collection_type {
     pub const INSTANCE_GROUP: &str = "INSTANCE_GROUP";
 }
 
-/// `com.amazonaws.emr#InstanceFleetState`, as the wire carries it.
+/// `com.amazonaws.emr#InstanceFleetState`, for the states this emulator sets
+/// (`smithy_query(query="shape", shape="InstanceFleetState")`).
 pub mod instance_fleet_state {
+    /// The fleet is provisioning its Amazon EC2 resources and is not ready to run jobs.
     pub const PROVISIONING: &str = "PROVISIONING";
+    /// The fleet's Amazon EC2 instances and other resources are running.
     pub const RUNNING: &str = "RUNNING";
+    /// The fleet is no longer active, because its cluster is gone.
+    pub const TERMINATED: &str = "TERMINATED";
+}
+
+/// `com.amazonaws.emr#InstanceFleetStateChangeReasonCode`, for the codes this emulator
+/// sets (`smithy_query(query="shape", shape="InstanceFleetStateChangeReasonCode")`).
+pub mod instance_fleet_state_change_reason_code {
+    pub const CLUSTER_TERMINATED: &str = "CLUSTER_TERMINATED";
 }
 
 /// `com.amazonaws.emr#InstanceGroupState`, for the states this emulator sets
@@ -764,6 +777,14 @@ pub const MAX_INSTANCE_GROUPS_PER_CLUSTER: usize = 50;
 /// `Marker` that resumes the listing where the page stopped — is reachable rather than
 /// dead.
 pub const LIST_INSTANCE_GROUPS_PAGE_SIZE: usize = 20;
+
+/// `ListInstanceFleets` page size.
+///
+/// CHOSEN, not documented, for the same reason [`LIST_INSTANCE_GROUPS_PAGE_SIZE`] is: the
+/// operation paginates on `Marker` but AWS publishes no page size for it, and it is
+/// deliberately below [`MAX_INSTANCE_FLEETS_PER_CLUSTER`] so the pagination contract is
+/// reachable rather than dead.
+pub const LIST_INSTANCE_FLEETS_PAGE_SIZE: usize = 20;
 
 /// How many scaling rules one automatic scaling policy may name.
 ///
@@ -2052,6 +2073,31 @@ pub struct InstancesRecord {
     pub unhealthy_node_replacement: bool,
 }
 
+/// The ONE placement a cluster's instances were launched in, out of what its
+/// `JobFlowInstancesConfig` asked for.
+///
+/// A cluster states its placement either as a single value (`Ec2SubnetId`,
+/// `Placement$AvailabilityZone`) or — the instance-fleets form — as a LIST of candidates
+/// (`Ec2SubnetIds`, `Placement$AvailabilityZones`). A list is a request for a choice, not a
+/// placement: "Amazon EMR chooses the Amazon EC2 subnet with the best fit from among the
+/// list of `RequestedEc2SubnetIds`, and then launches all cluster instances within that
+/// Subnet" (`Ec2InstanceAttributes$RequestedEc2SubnetIds`), and the same for the zones
+/// ("chooses the Availability Zone with the best fit from among the list of
+/// `RequestedEc2AvailabilityZones`"). So a cluster configured with a candidate list is
+/// still running in exactly one subnet and one zone, and the singular member reports that
+/// one while the plural member keeps the candidates the caller named.
+///
+/// There is no capacity here to rank candidates by fit, so the choice is the FIRST
+/// candidate the request lists: a value the caller supplied, decided once when the cluster
+/// is created and recorded, so every later read reports the same placement. A single value
+/// already IS the placement and wins over the list, and a cluster that named neither is
+/// reported with no placement rather than one invented for it.
+fn launched_in(single: Option<&str>, candidates: &[String]) -> Option<String> {
+    single
+        .map(str::to_string)
+        .or_else(|| candidates.first().cloned())
+}
+
 impl InstancesRecord {
     /// Derive the summary from the `Instances` member of a `RunJobFlow` request.
     pub fn from_config(config: &JobFlowInstancesConfig) -> Self {
@@ -2070,9 +2116,17 @@ impl InstancesRecord {
             slave_instance_type: config.slave_instance_type.clone(),
             instance_count: config.instance_count,
             ec2_key_name: config.ec2_key_name.clone(),
-            ec2_subnet_id: config.ec2_subnet_id.clone(),
+            ec2_subnet_id: launched_in(
+                config.ec2_subnet_id.as_deref(),
+                config.ec2_subnet_ids.as_deref().unwrap_or_default(),
+            ),
             requested_ec2_subnet_ids: config.ec2_subnet_ids.clone().unwrap_or_default(),
-            ec2_availability_zone: placement.and_then(|p| p.availability_zone.clone()),
+            ec2_availability_zone: launched_in(
+                placement.and_then(|p| p.availability_zone.as_deref()),
+                placement
+                    .and_then(|p| p.availability_zones.as_deref())
+                    .unwrap_or_default(),
+            ),
             requested_ec2_availability_zones: placement
                 .and_then(|p| p.availability_zones.clone())
                 .unwrap_or_default(),
@@ -2201,11 +2255,14 @@ impl ClusterRecord {
                     self.status.state = cluster_state::TERMINATED.to_string();
                     self.status.end_date_time = Some(due);
                     self.status.terminated_due_at = None;
-                    // A group outlives its cluster by nothing: once the cluster is gone
-                    // its groups have ENDED, for the modelled reason
-                    // `CLUSTER_TERMINATED`.
+                    // A group or a fleet outlives its cluster by nothing: once the
+                    // cluster is gone its collections have ended, for the modelled
+                    // reason `CLUSTER_TERMINATED`.
                     for group in &mut self.groups {
                         group.end_at(due);
+                    }
+                    for fleet in &mut self.fleets {
+                        fleet.end_at(due);
                     }
                 }
             }
@@ -2406,15 +2463,19 @@ impl ClusterRecord {
 
 /// One persisted instance fleet, built from a submitted `InstanceFleetConfig`.
 ///
-/// `ListInstanceFleets` — still a scaffold stub, its own issue — is what projects this
-/// to the modelled `InstanceFleet` shape; what is held here is the submitted
-/// configuration plus the id EMR minted for it and the state the clock moves.
+/// [`InstanceFleetRecord::to_instance_fleet`] projects this to the modelled
+/// `InstanceFleet` shape, so `ListInstanceFleets` reports what was persisted rather than
+/// anything built from its own input; what is held here is the submitted configuration
+/// plus the id EMR minted for it and the lifecycle the clock moves.
 #[derive(Debug, Clone)]
 pub struct InstanceFleetRecord {
     pub id: String,
     pub config: InstanceFleetConfig,
     pub state: String,
+    pub state_change_reason: Option<StateChangeReasonRecord>,
     pub creation_date_time: SystemTime,
+    pub ready_date_time: Option<SystemTime>,
+    pub end_date_time: Option<SystemTime>,
     /// When the `PROVISIONING` -> `RUNNING` transition the clock owes comes due.
     pub ready_due_at: Option<SystemTime>,
 }
@@ -2430,7 +2491,12 @@ impl InstanceFleetRecord {
             id,
             config,
             state: instance_fleet_state::PROVISIONING.to_string(),
+            // Nothing has moved this fleet's state by request or by failure, so there is
+            // no reason to report beside it.
+            state_change_reason: None,
             creation_date_time: now,
+            ready_date_time: None,
+            end_date_time: None,
             ready_due_at: Some(now + TRANSITION_SPAN),
         }
     }
@@ -2445,9 +2511,133 @@ impl InstanceFleetRecord {
         if let Some(due) = self.ready_due_at {
             if now >= due {
                 self.state = instance_fleet_state::RUNNING.to_string();
+                // "The time and date the instance fleet was ready to run jobs."
+                // (`InstanceFleetTimeline$ReadyDateTime` doc.) The instant the move came
+                // DUE is when it happened, not the instant somebody looked.
+                self.ready_date_time = Some(due);
                 self.ready_due_at = None;
             }
         }
+    }
+
+    /// End this fleet because its cluster has terminated, at the instant the cluster's
+    /// own termination came due.
+    ///
+    /// "TERMINATED—The instance fleet is no longer active, and all Amazon EC2 instances
+    /// have been terminated." (`InstanceFleetStatus$State` doc.) A fleet outlives its
+    /// cluster by nothing, and the modelled reason for it is `CLUSTER_TERMINATED` — the
+    /// same end an instance group of a terminated cluster reaches
+    /// ([`InstanceGroupRecord::end_at`]).
+    pub fn end_at(&mut self, at: SystemTime) {
+        if self.state == instance_fleet_state::TERMINATED {
+            return;
+        }
+        self.state = instance_fleet_state::TERMINATED.to_string();
+        self.state_change_reason = Some(StateChangeReasonRecord {
+            code: instance_fleet_state_change_reason_code::CLUSTER_TERMINATED.to_string(),
+            message: Some("The cluster was terminated.".to_string()),
+        });
+        self.ready_due_at = None;
+        self.end_date_time = Some(at);
+    }
+
+    /// The wire `InstanceFleetStatus` for this record.
+    pub fn to_status(&self) -> InstanceFleetStatus {
+        InstanceFleetStatus {
+            state: Some(self.state.clone()),
+            state_change_reason: self.state_change_reason.as_ref().map(|reason| {
+                InstanceFleetStateChangeReason {
+                    code: Some(reason.code.clone()),
+                    message: reason.message.clone(),
+                }
+            }),
+            timeline: Some(InstanceFleetTimeline {
+                creation_date_time: Some(timestamp(self.creation_date_time)),
+                ready_date_time: self.ready_date_time.map(timestamp),
+                end_date_time: self.end_date_time.map(timestamp),
+            }),
+        }
+    }
+
+    /// The wire `InstanceFleet` for this record — what `ListInstanceFleets` reports.
+    ///
+    /// The targets, the launch and resize specifications and the per-instance-type
+    /// configurations are the ones that were SUBMITTED; the status is where the clock has
+    /// got to, and the provisioned capacities are what that status implies
+    /// ([`InstanceFleetRecord::provisioned_capacity`]).
+    pub fn to_instance_fleet(&self) -> InstanceFleet {
+        InstanceFleet {
+            id: Some(self.id.clone()),
+            name: self.config.name.clone(),
+            status: Some(self.to_status()),
+            // "The node type that the instance fleet hosts" is required on the
+            // configuration, so a persisted fleet always reports one.
+            instance_fleet_type: Some(self.config.instance_fleet_type.clone()),
+            target_on_demand_capacity: self.config.target_on_demand_capacity,
+            target_spot_capacity: self.config.target_spot_capacity,
+            provisioned_on_demand_capacity: self
+                .provisioned_capacity(self.config.target_on_demand_capacity),
+            provisioned_spot_capacity: self.provisioned_capacity(self.config.target_spot_capacity),
+            instance_type_specifications: self
+                .config
+                .instance_type_configs
+                .as_deref()
+                .map(|configs| {
+                    configs
+                        .iter()
+                        .map(instance_type_specification)
+                        .collect::<Vec<_>>()
+                })
+                .as_deref()
+                .and_then(optional_list),
+            launch_specifications: self.config.launch_specifications.clone(),
+            resize_specifications: self.config.resize_specifications.clone(),
+            context: self.config.context.clone(),
+        }
+    }
+
+    /// "The number of On-Demand units that have been provisioned for the instance fleet
+    /// to fulfill `TargetOnDemandCapacity`" (`InstanceFleet$ProvisionedOnDemandCapacity`
+    /// doc), and the same for the Spot units.
+    ///
+    /// A fleet still acquiring its instances has provisioned none of them, and one that
+    /// has terminated holds none any more; a fleet that is up has provisioned the target
+    /// it asked for. A fleet that asked for no units of a market reports none for it
+    /// rather than a zero it never requested.
+    fn provisioned_capacity(&self, target: Option<i32>) -> Option<i32> {
+        let target = target?;
+        if self.state == instance_fleet_state::RUNNING {
+            Some(target.max(0))
+        } else {
+            Some(0)
+        }
+    }
+}
+
+/// One `InstanceTypeConfig` a fleet was configured with, as the
+/// `InstanceTypeSpecification` that fleet reports it back as.
+///
+/// "The configuration specification for each instance type in an instance fleet"
+/// (`InstanceTypeSpecification` doc): the two shapes carry the same facts, so every
+/// member common to both passes through. The one difference is EBS — the configuration
+/// states it as an `EbsConfiguration` (block-device configurations plus the optimized
+/// flag) where the specification states it as the `EbsBlockDevice` list those
+/// configurations produce, mapped exactly as an instance group's are
+/// ([`ebs_device_name`]) — so one rule names the devices for both collection types.
+fn instance_type_specification(config: &InstanceTypeConfig) -> InstanceTypeSpecification {
+    InstanceTypeSpecification {
+        instance_type: Some(config.instance_type.clone()),
+        weighted_capacity: config.weighted_capacity,
+        bid_price: config.bid_price.clone(),
+        bid_price_as_percentage_of_on_demand_price: config.bid_price_as_percentage_of_on_demand_price,
+        configurations: config.configurations.as_deref().and_then(optional_list),
+        ebs_block_devices: optional_list(&ebs_block_devices(config.ebs_configuration.as_ref())),
+        ebs_optimized: config
+            .ebs_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.ebs_optimized),
+        custom_ami_id: config.custom_ami_id.clone(),
+        priority: config.priority,
     }
 }
 
@@ -2703,43 +2893,6 @@ impl InstanceGroupRecord {
             .max(0)
     }
 
-    /// "The EBS block devices that are mapped to this instance group."
-    /// (`InstanceGroup$EbsBlockDevices` doc.) One device per volume the group's
-    /// `EbsConfiguration` requested — `VolumesPerInstance` of each block device
-    /// configuration — in configuration order.
-    ///
-    /// Both the number of configurations walked and the number of devices produced are
-    /// capped at the bounds [`validate_instance_group_config`] refuses a request past, so
-    /// a record this emulator should never have persisted still cannot amplify a read.
-    fn ebs_block_devices(&self) -> Vec<EbsBlockDevice> {
-        let Some(configuration) = self.config.ebs_configuration.as_ref() else {
-            return Vec::new();
-        };
-        let total_cap = MAX_EBS_VOLUMES_PER_INSTANCE as usize;
-        let mut devices = Vec::new();
-        for block_device in configuration
-            .ebs_block_device_configs
-            .iter()
-            .flatten()
-            .take(MAX_EBS_BLOCK_DEVICE_CONFIGS)
-        {
-            let volumes = block_device
-                .volumes_per_instance
-                .unwrap_or(DEFAULT_VOLUMES_PER_INSTANCE)
-                .clamp(0, MAX_EBS_VOLUMES_PER_INSTANCE);
-            for _ in 0..volumes {
-                if devices.len() >= total_cap {
-                    return devices;
-                }
-                devices.push(EbsBlockDevice {
-                    volume_specification: Some(block_device.volume_specification.clone()),
-                    device: Some(ebs_device_name(devices.len())),
-                });
-            }
-        }
-        devices
-    }
-
     /// The wire `AutoScalingPolicyDescription` for the automatic scaling policy this
     /// group carries — the one its configuration was given, or the one the last
     /// `PutAutoScalingPolicy` attached — and `None` when it carries none.
@@ -2816,7 +2969,9 @@ impl InstanceGroupRecord {
                 .and_then(optional_list),
             last_successfully_applied_configurations_version: self
                 .last_successfully_applied_configurations_version,
-            ebs_block_devices: optional_list(&self.ebs_block_devices()),
+            ebs_block_devices: optional_list(&ebs_block_devices(
+                self.config.ebs_configuration.as_ref(),
+            )),
             ebs_optimized: self
                 .config
                 .ebs_configuration
@@ -2829,6 +2984,47 @@ impl InstanceGroupRecord {
             custom_ami_id: self.config.custom_ami_id.clone(),
         }
     }
+}
+
+/// The Amazon EBS block devices an `EbsConfiguration` maps onto each of a collection's
+/// instances.
+///
+/// "The EBS block devices that are mapped to this instance group."
+/// (`InstanceGroup$EbsBlockDevices` doc; `InstanceTypeSpecification$EbsBlockDevices` is
+/// the same list for a fleet's instance type.) One device per volume the configuration
+/// requested — `VolumesPerInstance` of each block device configuration — in configuration
+/// order, which is why instance groups and instance fleets share this one rule.
+///
+/// Both the number of configurations walked and the number of devices produced are capped
+/// at the bounds [`validate_instance_group_config`] refuses a request past, so a record
+/// this emulator should never have persisted still cannot amplify a read.
+fn ebs_block_devices(configuration: Option<&EbsConfiguration>) -> Vec<EbsBlockDevice> {
+    let Some(configuration) = configuration else {
+        return Vec::new();
+    };
+    let total_cap = MAX_EBS_VOLUMES_PER_INSTANCE as usize;
+    let mut devices = Vec::new();
+    for block_device in configuration
+        .ebs_block_device_configs
+        .iter()
+        .flatten()
+        .take(MAX_EBS_BLOCK_DEVICE_CONFIGS)
+    {
+        let volumes = block_device
+            .volumes_per_instance
+            .unwrap_or(DEFAULT_VOLUMES_PER_INSTANCE)
+            .clamp(0, MAX_EBS_VOLUMES_PER_INSTANCE);
+        for _ in 0..volumes {
+            if devices.len() >= total_cap {
+                return devices;
+            }
+            devices.push(EbsBlockDevice {
+                volume_specification: Some(block_device.volume_specification.clone()),
+                device: Some(ebs_device_name(devices.len())),
+            });
+        }
+    }
+    devices
 }
 
 /// The device name Amazon EMR exposes an instance group's `index`-th requested EBS

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInstanceFleets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInstanceFleets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInstanceFleets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the instance fleets a cluster carries — the ones `RunJobFlow` was given and
+//! every `AddInstanceFleet` since, in that order — paginated on `Marker`. Every fleet is
+//! projected from the [`crate::state::InstanceFleetRecord`] those operations persisted, so
+//! nothing here is built from this request.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +140,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInstanceFleets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInstanceFleetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::LIST_INSTANCE_FLEETS_PAGE_SIZE;
+
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListInstanceFleetsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR cluster store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // A listing reports fleet state, so every transition the clock already made due
+        // is materialised first: a fleet whose provisioning span has passed is RUNNING,
+        // and the fleets of a cluster whose termination came due have TERMINATED.
+        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+            return Err(ListInstanceFleetsErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(crate::state::unknown_cluster_message(&input.cluster_id)),
+                },
+            )
+            .into());
+        };
+
+        // The marker is the id of the first fleet the previous page did not report, so a
+        // page boundary survives fleets being added between calls.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInstanceFleets"))
+        // The page's records are taken under the lock and PROJECTED after it is released:
+        // building the wire shapes is caller-driven work that no other request should
+        // wait on.
+        let (page, marker) = {
+            let start = match input.marker.as_ref() {
+                Some(marker) => match cluster.fleets.iter().position(|fleet| fleet.id == *marker) {
+                    Some(at) => at,
+                    None => {
+                        return Err(ListInstanceFleetsErrorModeled::InvalidRequestException(
+                            InvalidRequestException {
+                                error_code: None,
+                                message: Some(format!("Marker '{marker}' is not valid.")),
+                            },
+                        )
+                        .into())
+                    }
+                },
+                None => 0,
+            };
+            let end = cluster
+                .fleets
+                .len()
+                .min(start + LIST_INSTANCE_FLEETS_PAGE_SIZE);
+            (
+                cluster.fleets[start..end].to_vec(),
+                cluster.fleets.get(end).map(|fleet| fleet.id.clone()),
+            )
+        };
+        drop(store);
+
+        let instance_fleets: Vec<InstanceFleet> = page
+            .iter()
+            .map(crate::state::InstanceFleetRecord::to_instance_fleet)
+            .collect();
+
+        Ok(ListInstanceFleetsOutput {
+            instance_fleets: Some(instance_fleets),
+            marker,
+        })
     }
 }

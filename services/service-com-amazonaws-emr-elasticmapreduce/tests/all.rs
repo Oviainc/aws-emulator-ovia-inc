@@ -15,12 +15,16 @@
 mod auto_scaling_policy;
 #[path = "all/block_public_access.rs"]
 mod block_public_access;
+#[path = "all/cluster_placement.rs"]
+mod cluster_placement;
 #[path = "all/emr_control_plane.rs"]
 mod emr_control_plane;
 #[path = "all/enum_refusal_identity.rs"]
 mod enum_refusal_identity;
 #[path = "all/input_refusals.rs"]
 mod input_refusals;
+#[path = "all/instance_fleets.rs"]
+mod instance_fleets;
 #[path = "all/instance_groups.rs"]
 mod instance_groups;
 #[path = "all/instance_store_catalog.rs"]
