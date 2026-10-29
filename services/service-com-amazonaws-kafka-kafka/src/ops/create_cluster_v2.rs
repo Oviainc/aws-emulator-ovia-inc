@@ -20,6 +20,14 @@
 //! and the `Tags` the request carries go through the same admission check a later
 //! `TagResource` uses ([`crate::state::tag_write_violation`]).
 //!
+//! Both kinds are PLACED in the subnets the body names — the provisioned body's
+//! `BrokerNodeGroupInfo$ClientSubnets`, the serverless body's `VpcConfig$SubnetIds`
+//! — and those subnets are EC2's, not this service's, so each list is resolved
+//! against the account's EC2 inventory
+//! ([`crate::state::network::placement_subnet_refusal`]) before any ARN is minted:
+//! a subnet the account does not have is a `BadRequestException` and no cluster
+//! record is written.
+//!
 //! Authentication and authorization are NOT this handler's business: the emulator
 //! verifies every request signature centrally (see `AGENTS.md`), so the modelled
 //! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
@@ -233,6 +241,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request("Tags", reason));
         }
 
+        // Both cluster kinds are PLACED in the subnets the request names — the
+        // provisioned body's `BrokerNodeGroupInfo$ClientSubnets` and the
+        // serverless body's one `VpcConfig$SubnetIds` per VPC configuration — and
+        // the account's subnets are EC2's, so each list is resolved against the
+        // EC2 inventory before anything is minted. One list per call, so a
+        // serverless body's configurations keep the per-configuration ceiling
+        // `violation` above already held them to. Resolved before the registry
+        // lock is taken, because the calls are made over the in-process callback
+        // and no mutex is held across them; a refused create registers nothing, so
+        // no ARN is minted and no cluster is enumerable.
+        for (subnet_parameter, subnet_ids) in body.placement_subnets() {
+            if let Some(reason) =
+                crate::state::network::placement_subnet_refusal(ctx, &region, &subnet_ids).await
+            {
+                return Err(bad_request(subnet_parameter, reason));
+            }
+        }
+
         let mut state = state.lock();
 
         // A cluster name identifies a cluster within an account and region —
@@ -415,6 +441,27 @@ impl ClusterBody {
                 }
                 None
             }
+        }
+    }
+
+    /// The subnet lists this body would place the cluster in, each with the member
+    /// that names it: a provisioned cluster's brokers go in the one
+    /// `BrokerNodeGroupInfo$ClientSubnets`, while a serverless cluster is reached
+    /// through the `SubnetIds` of EACH of its VPC configurations — one list per
+    /// configuration, which is the granularity [`Self::violation`] bounds them at.
+    /// One reading for both kinds, so neither can be minted on a subnet the account
+    /// does not have.
+    fn placement_subnets(&self) -> Vec<(&'static str, Vec<String>)> {
+        match self {
+            Self::Provisioned(request) => vec![(
+                "Provisioned.BrokerNodeGroupInfo.ClientSubnets",
+                request.broker_node_group_info.client_subnets.clone(),
+            )],
+            Self::Serverless(request) => request
+                .vpc_configs
+                .iter()
+                .map(|config| ("Serverless.VpcConfigs.SubnetIds", config.subnet_ids.clone()))
+                .collect(),
         }
     }
 }

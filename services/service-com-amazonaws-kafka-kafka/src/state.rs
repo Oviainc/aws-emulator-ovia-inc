@@ -120,6 +120,12 @@
 //! [`VpcConnection::to_client_vpc_connection`], so a cluster's client
 //! connections are that same one record seen from the cluster's side.
 
+/// The account's EC2 subnets, which the creates that place a resource in a client
+/// VPC resolve what they are given against. They are not this service's resources,
+/// so they are not held here — they are resolved, which is why that module sits
+/// beside this one rather than in it.
+pub mod network;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};
@@ -5647,6 +5653,27 @@ fn uuid_v4_shaped_from_digest(digest: &[u8; 32]) -> String {
         let _ = write!(rendered, "{byte:02x}");
     }
     rendered
+}
+
+/// The id of the call this service made to ANOTHER service on the caller's behalf,
+/// as it is reported back to that caller ([`network`]).
+///
+/// A request identifier is generated per call — it is what correlates one answer
+/// with the call behind it — so it is drawn afresh rather than derived from
+/// anything in the request: the seed is the system clock in nanoseconds together
+/// with the OS-seeded randomness a `RandomState` draws, and it is rendered by the
+/// one minter behind every identifier this module gives that shape to
+/// ([`uuid_v4_shaped_from_digest`]).
+fn new_peer_request_id() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or_default();
+    let entropy = RandomState::new().hash_one(nanos);
+    uuid_v4_shaped_from_digest(&stable_digest(&format!("{nanos}#{entropy}")))
 }
 
 /// An MSK `CurrentVersion` token: `K` followed by 13 upper-case alphanumerics,

@@ -13,6 +13,14 @@
 //! reports the replicator `CREATING` whether or not the Kafka clusters it points
 //! at are reachable — only the replicator's own identity is validated here.
 //!
+//! The SUBNETS each `KafkaClusters` entry names
+//! (`KafkaClusterClientVpcConfig$SubnetIds`) are a different matter: the
+//! replicator's own client interfaces are created in them, and they are EC2's
+//! resources rather than this service's, so they are resolved against the account's
+//! EC2 inventory ([`crate::state::network::placement_subnet_refusal`]) before any
+//! ARN is minted — a subnet the account does not have is a `BadRequestException`
+//! and no replicator record is written.
+//!
 //! Authentication and authorization are NOT this handler's business: the emulator
 //! verifies every request signature centrally (see `AGENTS.md`), so the modelled
 //! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
@@ -322,6 +330,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             reason.member
                         )),
                         message: Some(reason.message),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Each `KafkaClusters` entry names the subnets the replicator's own client
+        // interfaces to that cluster are created in
+        // (`KafkaClusterClientVpcConfig$SubnetIds`), and the account's subnets are
+        // EC2's, not this service's: they are resolved against the EC2 inventory
+        // before anything is minted, so a replicator cannot be created against a
+        // subnet the account does not have. Resolved before the registry lock is
+        // taken, because the call is made over the in-process callback and no mutex
+        // is held across it.
+        for (index, cluster) in input.kafka_clusters.iter().enumerate() {
+            let subnet_ids = cluster
+                .vpc_config
+                .as_ref()
+                .map(|config| config.subnet_ids.clone())
+                .unwrap_or_default();
+            if let Some(reason) =
+                crate::state::network::placement_subnet_refusal(ctx, &region, &subnet_ids).await
+            {
+                return Err(CreateReplicatorErrorModeled::BadRequestException(
+                    BadRequestException {
+                        invalid_parameter: Some(format!(
+                            "KafkaClusters[{index}].VpcConfig.SubnetIds"
+                        )),
+                        message: Some(reason),
                     },
                 )
                 .into());

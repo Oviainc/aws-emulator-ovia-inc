@@ -63,6 +63,8 @@ mod kafka_versions;
 mod list_clusters_v2;
 #[path = "all/node_listing.rs"]
 mod node_listing;
+#[path = "all/placement_subnet_resolution.rs"]
+mod placement_subnet_resolution;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/replication_info_update.rs"]

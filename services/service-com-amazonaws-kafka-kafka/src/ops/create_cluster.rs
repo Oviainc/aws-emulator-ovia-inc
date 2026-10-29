@@ -11,6 +11,13 @@
 //! or value outside the documented rules, or more tags than a resource may carry,
 //! is a `BadRequestException` and the cluster is not created.
 //!
+//! `BrokerNodeGroupInfo$ClientSubnets` names the subnets the brokers' elastic
+//! network interfaces are created in. Those subnets are EC2's, not this service's,
+//! so they are resolved against the account's EC2 inventory
+//! ([`crate::state::network::placement_subnet_refusal`]) before any ARN is minted:
+//! a subnet the account does not have is a `BadRequestException` and no cluster
+//! record is written.
+//!
 //! Authentication and authorization are NOT this handler's business: the emulator
 //! verifies every request signature centrally (see `AGENTS.md`), so the modelled
 //! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
@@ -228,6 +235,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateClusterErrorModeled::BadRequestException(BadRequestException {
                     invalid_parameter: Some("Tags".to_string()),
+                    message: Some(reason),
+                })
+                .into(),
+            );
+        }
+
+        // "The list of subnets to connect to in the client virtual private cloud
+        // (VPC). AWS creates elastic network interfaces inside these subnets"
+        // (`BrokerNodeGroupInfo$ClientSubnets`): the brokers are PLACED in those
+        // subnets, so they are resolved against the account's EC2 inventory
+        // before anything is minted — a subnet the account does not have is a
+        // network no broker can be placed in. Resolved before the registry lock
+        // is taken, because the call is made over the in-process callback and no
+        // mutex is held across it; a refused create registers nothing, so no ARN
+        // is minted and no cluster is enumerable.
+        if let Some(reason) = crate::state::network::placement_subnet_refusal(
+            ctx,
+            &region,
+            &input.broker_node_group_info.client_subnets,
+        )
+        .await
+        {
+            return Err(
+                CreateClusterErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("BrokerNodeGroupInfo.ClientSubnets".to_string()),
                     message: Some(reason),
                 })
                 .into(),

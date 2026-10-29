@@ -7,6 +7,13 @@
 //! [`crate::state::VpcConnection`]; this handler validates the request and
 //! mints it.
 //!
+//! `ClientSubnets` names the subnets the connection's elastic network interfaces
+//! are created in. Those subnets are EC2's, not this service's, so they are
+//! resolved against the account's EC2 inventory
+//! ([`crate::state::network::placement_subnet_refusal`]) before any ARN is minted:
+//! a subnet the account does not have is a `BadRequestException` and no connection
+//! record is written.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -226,6 +233,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "SecurityGroups",
                 format!("'{group}' is not a valid security group id."),
             ));
+        }
+
+        // A VPC connection is REACHED through the subnets `ClientSubnets` names,
+        // and the account's subnets are EC2's, not this service's: they are
+        // resolved against the EC2 inventory before anything is minted, so a
+        // connection cannot be created in a subnet the account does not have.
+        // Resolved before the registry lock is taken, because the call is made
+        // over the in-process callback and no mutex is held across it.
+        if let Some(reason) =
+            crate::state::network::placement_subnet_refusal(ctx, &region, &input.client_subnets)
+                .await
+        {
+            return Err(bad_request("ClientSubnets", reason));
         }
 
         let mut state = state.lock();

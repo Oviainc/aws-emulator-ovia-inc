@@ -24,6 +24,15 @@ tracing = { workspace = true }
 # Matches a replication flow's TopicsToReplicate / TopicsToExclude patterns, which
 # the model documents as regular expressions, against a source cluster's topics.
 regex = "1.13"
+# The AWS SDK for EC2, driven over the in-process callback
+# (`OperationContext::callback`): the account's subnets are EC2's resources, so every
+# create that places a resource in a client VPC resolves the subnets it is given against
+# EC2 (`src/state/network.rs`) before it mints anything. Only the generated client is
+# needed — the emulator supplies the transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
+# `arn::region_label`: the ONE reading of a caller-supplied Region as a Region LABEL,
+# which is what the endpoint the EC2 call above is made at is built from.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
