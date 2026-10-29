@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateResolverQueryLogConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateResolverQueryLogConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateResolverQueryLogConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +151,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateResolverQueryLogConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateResolverQueryLogConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateResolverQueryLogConfig"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DisassociateResolverQueryLogConfigErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+
+        // "Disassociates a VPC from a query logging configuration": the
+        // configuration named is what the association hangs off, so an id this
+        // service holds no configuration under is "the specified resource
+        // doesn't exist" whatever VPC the request carries, and nothing is
+        // written. The VPC id is NOT resolved against the account's Amazon EC2
+        // inventory: here it SELECTS an association the service already holds
+        // rather than making one, so a VPC that has since been deleted still
+        // names the association that was made in it.
+        let Some(config) = store
+            .resolver_query_log_configs
+            .get_mut(&input.resolver_query_log_config_id)
+        else {
+            return Err(
+                DisassociateResolverQueryLogConfigErrorModeled::ResourceNotFoundException(
+                    crate::state::resolver_query_log_config_not_found(
+                        &input.resolver_query_log_config_id,
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        // This call addresses an association by the PAIR it was made from, so a
+        // VPC this configuration was never associated with, and a second
+        // disassociate of the same pair, are both "the specified resource
+        // doesn't exist". The record leaves the configuration it was kept on, so
+        // the `AssociationCount` every later read of that configuration reports
+        // no longer counts it, and the configuration can be deleted once the
+        // last VPC has been disassociated from it.
+        let Some(record) = config.remove_association_for_vpc(&input.resource_id) else {
+            return Err(
+                DisassociateResolverQueryLogConfigErrorModeled::ResourceNotFoundException(
+                    crate::state::resolver_query_log_config_vpc_association_not_found(
+                        &input.resolver_query_log_config_id,
+                        &input.resource_id,
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        let mut association = record.to_association(::std::time::Instant::now());
+        // "A complex type that contains settings for the association that you
+        // deleted": the association is on its way out, so it reports `DELETING`
+        // ("Resolver is deleting this query logging association") rather than
+        // the status it had while it was in force.
+        association.status =
+            Some(crate::state::QUERY_LOG_CONFIG_ASSOCIATION_STATUS_DELETING.to_string());
+
+        Ok(DisassociateResolverQueryLogConfigOutput {
+            resolver_query_log_config_association: Some(association),
+        })
     }
 }

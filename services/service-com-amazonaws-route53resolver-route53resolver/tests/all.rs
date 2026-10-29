@@ -69,6 +69,8 @@ mod resolver_endpoint_ip_address_association;
 mod resolver_endpoints;
 #[path = "all/resolver_query_log_config_associations.rs"]
 mod resolver_query_log_config_associations;
+#[path = "all/resolver_query_log_config_disassociation.rs"]
+mod resolver_query_log_config_disassociation;
 #[path = "all/resolver_query_log_config_listing.rs"]
 mod resolver_query_log_config_listing;
 #[path = "all/resolver_query_log_config_policies.rs"]

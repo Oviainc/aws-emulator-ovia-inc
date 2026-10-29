@@ -3355,13 +3355,19 @@ pub const RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG: &str = "ResolverQueryLogConfi
 /// a query logging configuration", which is what an associate answers with, and
 /// `ACTIVE` is "the association ... was successfully created": the move between
 /// them is the one the clock owes, [`PROVISIONING_DELAY`] after the call that
-/// started it. `DELETING`, `ACTION_NEEDED` and `FAILED` describe an association
-/// a disassociate has been accepted for, or one Resolver could not create or
-/// delete, neither of which an associate produces.
+/// started it. `DELETING` is "Resolver is deleting this query logging
+/// association", which is what the association a disassociate has just taken
+/// out of its configuration reports, as that call's answer about "the
+/// association that you deleted". `ACTION_NEEDED` and `FAILED` describe an
+/// association Resolver could not create or delete, which this slice never
+/// leaves outstanding.
 pub const QUERY_LOG_CONFIG_ASSOCIATION_STATUS_CREATING: &str = "CREATING";
 
 /// See [`QUERY_LOG_CONFIG_ASSOCIATION_STATUS_CREATING`].
 pub const QUERY_LOG_CONFIG_ASSOCIATION_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// See [`QUERY_LOG_CONFIG_ASSOCIATION_STATUS_CREATING`].
+pub const QUERY_LOG_CONFIG_ASSOCIATION_STATUS_DELETING: &str = "DELETING";
 
 /// `ResourceNotFoundException$ResourceType` for one association between a VPC
 /// and a query logging configuration: the modelled shape name of the resource,
@@ -3533,6 +3539,26 @@ pub fn resolver_query_log_config_association_not_found(
     }
 }
 
+/// The `ResourceNotFoundException` `DisassociateResolverQueryLogConfig` answers
+/// when the store holds no association of that CONFIGURATION with that VPC —
+/// the pair that call addresses an association by, rather than the
+/// association's own id, the same way
+/// [`resolver_rule_vpc_association_not_found`] reports the rule-and-VPC pair.
+///
+/// The missing resource the sentence names is the ASSOCIATION itself, and its
+/// two variable parts are the configuration and the VPC the request named.
+pub fn resolver_query_log_config_vpc_association_not_found(
+    resolver_query_log_config_id: &str,
+    resource_id: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            r#"Resolver query log config association between Resolver query log config "{resolver_query_log_config_id}" and VPC "{resource_id}" does not exist."#
+        )),
+        resource_type: Some(RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG_ASSOCIATION.to_string()),
+    }
+}
+
 /// One association between a VPC and a Resolver query logging configuration, as
 /// stored. It lives on the configuration it belongs to, so the configuration's
 /// `AssociationCount` and the associations it holds cannot disagree.
@@ -3668,6 +3694,26 @@ impl ResolverQueryLogConfigRecord {
     /// nothing.
     pub fn can_hold_another_association(&self) -> bool {
         self.associations.len() < MAX_QUERY_LOG_CONFIG_ASSOCIATIONS
+    }
+
+    /// Take this configuration's association with the VPC `resource_id` out of
+    /// it, answering the record that was removed, or `None` when it holds no
+    /// association with that VPC.
+    ///
+    /// The counterpart of [`Self::association_for_vpc`], for the write side:
+    /// `DisassociateResolverQueryLogConfig` addresses an association by the
+    /// configuration-and-VPC pair it was made from, so the removal is keyed on
+    /// that pair. The remaining associations keep their association order, and
+    /// the configuration's `AssociationCount`, derived from them, drops by one.
+    pub fn remove_association_for_vpc(
+        &mut self,
+        resource_id: &str,
+    ) -> Option<ResolverQueryLogConfigAssociationRecord> {
+        let at = self
+            .associations
+            .iter()
+            .position(|record| record.resource_id == resource_id)?;
+        Some(self.associations.remove(at))
     }
 
     /// This configuration's `ResolverQueryLogConfigStatus` as of `now`: the

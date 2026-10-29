@@ -21,7 +21,7 @@ use super::harness::{
 };
 
 /// The `ResolverQueryLogConfigAssociation` of an associate/get response.
-fn association(body: &Value) -> &Value {
+pub fn association(body: &Value) -> &Value {
     body.get("ResolverQueryLogConfigAssociation").unwrap_or_else(|| {
         panic!("the response carries a ResolverQueryLogConfigAssociation, got {body}")
     })
@@ -35,7 +35,7 @@ async fn settle() {
 
 /// Create a query logging configuration to associate VPCs with, and answer its
 /// `Id`.
-async fn config_id(router: &MultiServiceRouter, name: &str) -> String {
+pub async fn config_id(router: &MultiServiceRouter, name: &str) -> String {
     let created = ok(
         router,
         "CreateResolverQueryLogConfig",
@@ -55,7 +55,7 @@ async fn config_id(router: &MultiServiceRouter, name: &str) -> String {
 }
 
 /// The `AssociationCount` `GetResolverQueryLogConfig` reports for `id`.
-async fn association_count(router: &MultiServiceRouter, id: &str) -> i64 {
+pub async fn association_count(router: &MultiServiceRouter, id: &str) -> i64 {
     let fetched = ok(
         router,
         "GetResolverQueryLogConfig",
