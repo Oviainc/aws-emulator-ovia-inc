@@ -186,6 +186,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The document this request would attach has to be one this service may
+        // hold: it has to parse, and unless the caller accepts the risk itself it
+        // may not leave nobody able to replace it. The check is the one every
+        // operation that writes a cluster's policy shares, read against the ARN of
+        // the cluster the document would be attached to, and nothing is attached
+        // when it refuses.
+        //
+        // Decided ahead of the idempotency ledger below, which decides what to do
+        // with a request whose input is valid in the first place: a `clientToken`
+        // another request already used does not turn this refusal into a conflict,
+        // and the verdict on a document belongs to the document rather than to the
+        // tokens the caller happened to spend — so both entry points that write a
+        // cluster's policy answer the same document identically.
+        if let Err(invalid) = crate::state::validate_cluster_policy(
+            &input.policy,
+            &cluster_arn,
+            input.bypass_policy_lockout_safety_check,
+        ) {
+            return Err(PutClusterPolicyErrorModeled::ValidationException(invalid).into());
+        }
+
         // `@idempotencyToken`: a repeat of the SAME request answers with the
         // version the first call ISSUED — kept with the token, because the
         // cluster's policy need not still be that one — and attaches nothing
@@ -235,20 +256,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 crate::state::TokenVerdict::Unused => {}
             }
-        }
-
-        // The document this request would attach has to be one this service may
-        // hold: it has to parse, and unless the caller accepts the risk itself it
-        // may not leave nobody able to replace it. The check is the one every
-        // operation that writes a cluster's policy shares, read against the ARN of
-        // the cluster the document would be attached to, and nothing is attached
-        // when it refuses.
-        if let Err(invalid) = crate::state::validate_cluster_policy(
-            &input.policy,
-            &cluster_arn,
-            input.bypass_policy_lockout_safety_check,
-        ) {
-            return Err(PutClusterPolicyErrorModeled::ValidationException(invalid).into());
         }
 
         let Some(cluster) = state.clusters.get_mut(&input.identifier) else {
