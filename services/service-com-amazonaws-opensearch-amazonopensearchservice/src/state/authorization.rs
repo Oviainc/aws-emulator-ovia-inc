@@ -148,10 +148,44 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     }
 }
 
+/// The identity-based policy documents in force on the IAM ROLE `role_arn` names, or
+/// `None` when this emulator holds none for it: an engine carrying no IAM store, a value
+/// that is not a role ARN, or a role the IAM store does not hold.
+///
+/// The same lookup [`identity_policies`] performs for a request's own principal, reached
+/// by a caller that does not hold the request — a producer OUTSIDE this service writing to
+/// a domain as the role it was configured with ([`super::ingest`]), where the principal is
+/// the configured role rather than whoever signed. `None` is "no evidence", not "no
+/// permissions": a caller decides what to do with that, the way this module's own gate
+/// does for a grant it cannot read.
+pub fn role_identity_documents<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    role_arn: &str,
+) -> Option<Vec<String>> {
+    let iam = iam_store::service_state(engine)?;
+    let role_name = ::service_common::arn::parse(role_arn)
+        .filter(|parsed| parsed.vendor == IAM_ARN_NAMESPACE)
+        .and_then(|parsed| {
+            parsed
+                .resource
+                .strip_prefix("role/")
+                .and_then(|path| path.split('/').next_back())
+                .filter(|name| !name.is_empty())
+                .map(::std::string::ToString::to_string)
+        })?;
+    let iam = iam.lock();
+    // A role the store does not hold carries no policy this emulator can read, which is
+    // not the same as a role that carries none.
+    if !iam.roles.contains_key(&iam_store::name_key(&role_name)) {
+        return None;
+    }
+    Some(identity_policies(&iam, NamedIdentity::Role(&role_name)).documents)
+}
+
 /// The refusal IAM states an authorization failure with: who was refused, which action,
 /// on which resource, and which of IAM's two rules refused it. Every value in it comes
 /// from the request and from the stored policies.
-fn not_authorized(
+pub(crate) fn not_authorized(
     principal: &str,
     action: &str,
     resource: &str,

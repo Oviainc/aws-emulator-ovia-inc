@@ -29,6 +29,7 @@ use std::time::{Duration, SystemTime};
 /// Whether IAM lets a request perform the action it asks for — the authorization step
 /// an index operation takes before it reads or writes the index the request names.
 pub mod authorization;
+pub mod ingest;
 
 /// Whether the Amazon Cognito authentication a request asks a domain's Dashboards to be
 /// reached through is a configuration the service can provision — the check the create
@@ -2141,6 +2142,11 @@ pub struct Index {
     /// document it carried and `UpdateIndex` merges each later change onto it
     /// ([`merged_index_schema`]).
     pub schema: ::aws_smithy_types::Document,
+    /// The documents this index holds, keyed by their `_id` — unique within the index,
+    /// so the id IS the key. Written by [`ingest::index_document`], the one data-plane
+    /// write into an index, and bounded by [`ingest::INDEX_DOCUMENT_QUOTA`]; deleting
+    /// the index or its domain releases them.
+    pub documents: BTreeMap<String, ingest::IndexedDocument>,
 }
 
 /// The `IndexSchema` section an index's field mappings live in: `UpdateIndex`

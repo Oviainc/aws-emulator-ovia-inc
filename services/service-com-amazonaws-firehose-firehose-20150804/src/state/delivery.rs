@@ -534,6 +534,9 @@ pub struct PendingDelivery {
     pub targets: Vec<S3Target>,
     /// Every HTTP endpoint this buffer is POSTed to.
     pub endpoints: Vec<HttpEndpointTarget>,
+    /// Every Amazon OpenSearch Service index this buffer's records are indexed into as
+    /// documents.
+    pub searches: Vec<SearchTarget>,
 }
 
 /// One object a delivery writes.
@@ -810,12 +813,180 @@ fn stream_endpoints(stream: &DeliveryStream) -> Vec<HttpEndpointTarget> {
         .collect()
 }
 
+/// One Amazon OpenSearch Service domain index a stream's buffer is delivered to, with
+/// everything the write needs, read off the destination configuration in force at the
+/// moment of the flush.
+///
+/// The `Elasticsearch` and `Amazonopensearchservice` destination kinds are the same
+/// offering under its old and its current name, so one target serves both.
+#[derive(Debug, Clone)]
+pub struct SearchTarget {
+    /// `DomainARN` — "the ARN of the Amazon OpenSearch Service domain" — or, for a
+    /// configuration naming only `ClusterEndpoint` ("specify either this ClusterEndpoint
+    /// or the DomainARN field"), that endpoint's host. Either addresses the domain the
+    /// documents are indexed into.
+    pub domain: String,
+    /// `IndexName`, before the rotation suffix [`rotated_index`] appends.
+    pub index_name: String,
+    /// An `IndexRotationPeriod` value, or `None` for the documented default of no
+    /// rotation.
+    pub index_rotation_period: Option<String>,
+    /// `RoleARN` — "the IAM role to be assumed by Firehose … for indexing documents" —
+    /// which is the principal the write is authorized as.
+    pub role_arn: String,
+    /// Whether Firehose names each document itself, which `DocumentIdOptions` decides.
+    pub mints_document_id: bool,
+    /// `BufferingHints`, which decide when this destination's buffer is due. The same two
+    /// parameters as every other destination's, so one window rule serves them all
+    /// ([`delivery_window`]).
+    pub hints: Option<BufferingHints>,
+    /// How long the delivery of one buffer is retried before its documents are parked in
+    /// [`Self::backup`] — `RetryOptions$DurationInSeconds`, or
+    /// [`DEFAULT_SEARCH_RETRY_DURATION`].
+    pub retry_duration: Duration,
+    /// The Amazon S3 location the destination's required `S3Configuration` names, where a
+    /// document the domain did not index is written.
+    pub backup: Option<S3Target>,
+}
+
+/// What the `firehose:error-output-type` namespace expands to for a document an Amazon
+/// OpenSearch Service destination did not index, and the folder those documents are
+/// written under when the backup configures no `ErrorOutputPrefix` of its own:
+/// "Firehose writes any documents that could not be indexed to the configured Amazon S3
+/// destination, with `AmazonOpenSearchService-failed/` appended to the key prefix"
+/// (`S3BackupMode`).
+const SEARCH_FAILED_OUTPUT_TYPE: &str = "AmazonOpenSearchService-failed";
+
+/// `RetryOptions$DurationInSeconds` when the configuration names none: "The retry behavior
+/// in case Firehose is unable to deliver documents to Amazon OpenSearch Service. The
+/// default value is 300 (5 minutes)" (`AmazonopensearchserviceDestinationConfiguration$RetryOptions`).
+const DEFAULT_SEARCH_RETRY_DURATION: Duration = Duration::from_secs(300);
+
+/// The `DefaultDocumentIdFormat` value under which the delivery request carries NO document
+/// id: "Firehose does not include any document IDs in the requests it sends to the Amazon
+/// OpenSearch Service. This causes the Amazon OpenSearch Service domain to generate document
+/// IDs" (`DocumentIdOptions$DefaultDocumentIdFormat`). Under the other value,
+/// `FIREHOSE_DEFAULT`, "Firehose generates a unique document ID for each record based on a
+/// unique internal identifier … stable across multiple delivery attempts", which is the
+/// record's own id.
+const NO_DOCUMENT_ID: &str = "NO_DOCUMENT_ID";
+
+/// Every Amazon OpenSearch Service index a destination configuration indexes its documents
+/// into — one for an `Elasticsearch` or `Amazonopensearchservice` destination, none for a
+/// destination of any other kind.
+///
+/// The Serverless offering is NOT one of them: its documents go to a collection
+/// (`AmazonOpenSearchServerlessDestinationConfiguration$CollectionEndpoint`), which is a
+/// resource of the OpenSearch Serverless service and not a domain of this one, so this
+/// emulator has no index to write them into.
+#[must_use]
+pub fn search_targets(config: &DestinationConfigKind) -> Vec<SearchTarget> {
+    let target = match config {
+        DestinationConfigKind::Elasticsearch(config) => search_target(
+            config.domain_arn.as_deref(),
+            config.cluster_endpoint.as_deref(),
+            &config.index_name,
+            config.index_rotation_period.as_deref(),
+            &config.role_arn,
+            config
+                .document_id_options
+                .as_ref()
+                .map(|options| options.default_document_id_format.as_str()),
+            config.buffering_hints.as_ref().map(|hints| BufferingHints {
+                size_in_m_bs: hints.size_in_m_bs,
+                interval_in_seconds: hints.interval_in_seconds,
+            }),
+            config
+                .retry_options
+                .as_ref()
+                .and_then(|options| options.duration_in_seconds),
+            &config.s3_configuration,
+        ),
+        DestinationConfigKind::AmazonOpenSearchService(config) => search_target(
+            config.domain_arn.as_deref(),
+            config.cluster_endpoint.as_deref(),
+            &config.index_name,
+            config.index_rotation_period.as_deref(),
+            &config.role_arn,
+            config
+                .document_id_options
+                .as_ref()
+                .map(|options| options.default_document_id_format.as_str()),
+            config.buffering_hints.as_ref().map(|hints| BufferingHints {
+                size_in_m_bs: hints.size_in_m_bs,
+                interval_in_seconds: hints.interval_in_seconds,
+            }),
+            config
+                .retry_options
+                .as_ref()
+                .and_then(|options| options.duration_in_seconds),
+            &config.s3_configuration,
+        ),
+        _ => None,
+    };
+    target.into_iter().collect()
+}
+
+/// The one search target a destination configuration of either Amazon OpenSearch Service
+/// kind names, built from the members the two kinds carry alike.
+///
+/// `None` when the configuration addresses no domain at all (neither `DomainARN` nor
+/// `ClusterEndpoint`) or names no index, in which case there is nothing to index into.
+#[allow(clippy::too_many_arguments)]
+fn search_target(
+    domain_arn: Option<&str>,
+    cluster_endpoint: Option<&str>,
+    index_name: &str,
+    index_rotation_period: Option<&str>,
+    role_arn: &str,
+    document_id_format: Option<&str>,
+    hints: Option<BufferingHints>,
+    retry_duration_in_seconds: Option<i32>,
+    s3_configuration: &S3DestinationConfiguration,
+) -> Option<SearchTarget> {
+    let domain = domain_arn
+        .map(str::to_string)
+        .filter(|arn| !arn.is_empty())
+        .or_else(|| {
+            cluster_endpoint
+                .and_then(authority_of)
+                .filter(|host| !host.is_empty())
+        })?;
+    if index_name.is_empty() {
+        return None;
+    }
+    Some(SearchTarget {
+        domain,
+        index_name: index_name.to_string(),
+        index_rotation_period: index_rotation_period
+            .filter(|period| !period.is_empty())
+            .map(str::to_string),
+        role_arn: role_arn.to_string(),
+        mints_document_id: document_id_format != Some(NO_DOCUMENT_ID),
+        hints,
+        retry_duration: retry_duration_in_seconds
+            .and_then(|seconds| u64::try_from(seconds).ok())
+            .map_or(DEFAULT_SEARCH_RETRY_DURATION, Duration::from_secs),
+        backup: plain_target(s3_configuration),
+    })
+}
+
+/// Every Amazon OpenSearch Service index this stream's destinations deliver to right now.
+fn stream_searches(stream: &DeliveryStream) -> Vec<SearchTarget> {
+    stream
+        .destinations
+        .iter()
+        .flat_map(|destination| search_targets(&destination.config))
+        .collect()
+}
+
 /// When this stream's buffer comes due for delivery, or `None` when nothing is owed — an
-/// empty buffer, or a destination with no location and no endpoint to deliver to.
+/// empty buffer, or a destination with no location, no endpoint and no index to deliver
+/// to.
 #[must_use]
 pub fn due_at(stream: &DeliveryStream) -> Option<SystemTime> {
     let opened_at = stream.records.first()?.received_at;
-    // The destinations are two kinds with one buffering rule between them, and the FIRST
+    // The destinations are a few kinds with one buffering rule between them, and the FIRST
     // buffer to come due decides when the flush happens.
     let window = stream_targets(stream)
         .iter()
@@ -824,6 +995,11 @@ pub fn due_at(stream: &DeliveryStream) -> Option<SystemTime> {
             stream_endpoints(stream)
                 .iter()
                 .map(|endpoint| delivery_window(endpoint.hints.as_ref(), stream.buffered_bytes)),
+        )
+        .chain(
+            stream_searches(stream)
+                .iter()
+                .map(|search| delivery_window(search.hints.as_ref(), stream.buffered_bytes)),
         )
         .min()?;
     let due = opened_at + window;
@@ -875,7 +1051,8 @@ pub fn take_due(
         }
         let targets = stream_targets(stream);
         let endpoints = stream_endpoints(stream);
-        if targets.is_empty() && endpoints.is_empty() {
+        let searches = stream_searches(stream);
+        if targets.is_empty() && endpoints.is_empty() && searches.is_empty() {
             continue;
         }
         if extractions == Extractions::LeaveToThePump
@@ -897,6 +1074,7 @@ pub fn take_due(
             records,
             targets,
             endpoints,
+            searches,
         });
     }
     store.buffered_bytes = store.buffered_bytes.saturating_sub(freed);
@@ -960,7 +1138,7 @@ pub async fn deliver_due<Eng: Send + Sync + 'static>(
             let Err(failure) = post_to_endpoint(transport, &delivery, endpoint, now).await else {
                 continue;
             };
-            if !retries_spent(&delivery, endpoint, now) {
+            if !retries_spent(&delivery, endpoint.hints.as_ref(), endpoint.retry_duration, now) {
                 owed = true;
                 continue;
             }
@@ -971,6 +1149,52 @@ pub async fn deliver_due<Eng: Send + Sync + 'static>(
             match backup_object(&delivery, endpoint, failure, now, ordinal) {
                 Some(object) => parked.push(object),
                 None => owed = true,
+            }
+        }
+        if owed {
+            let mut store = state.lock();
+            restore(&mut store, delivery, now);
+            continue;
+        }
+        // Then the Amazon OpenSearch Service destinations: each record of the buffer is
+        // one document, and the documents the domain did not take are parked in the
+        // destination's Amazon S3 backup beside whatever the Amazon S3 locations get.
+        for (ordinal, search) in delivery.searches.iter().enumerate() {
+            match index_documents(engine, &delivery, search, now) {
+                Delivered::Indexed(failures) if failures.is_empty() => {}
+                Delivered::Indexed(failures) => {
+                    match search_backup_object(&delivery, search, &failures, now, ordinal) {
+                        Some(object) => parked.push(object),
+                        None => owed = true,
+                    }
+                }
+                // The domain answered nothing — it is not provisioned, or no domain of
+                // this emulator carries that address — so the whole buffer is owed again
+                // for as long as the destination's retry window allows, and parked once
+                // that window is spent. Firehose keeps a document it could not deliver
+                // ("After this time has passed, the failed documents are written to
+                // Amazon S3" — `RetryOptions$DurationInSeconds`).
+                Delivered::Unavailable(failure) => {
+                    if retries_spent(&delivery, search.hints.as_ref(), search.retry_duration, now) {
+                        let failures: Vec<SearchDocumentFailure> = delivery
+                            .records
+                            .iter()
+                            .map(|record| SearchDocumentFailure {
+                                record_id: record.record_id.clone(),
+                                index_name: failure.index_name.clone(),
+                                document_id: document_id(search, record),
+                                error_code: failure.error_code.clone(),
+                                error_message: failure.error_message.clone(),
+                            })
+                            .collect();
+                        match search_backup_object(&delivery, search, &failures, now, ordinal) {
+                            Some(object) => parked.push(object),
+                            None => owed = true,
+                        }
+                    } else {
+                        owed = true;
+                    }
+                }
             }
         }
         if owed {
@@ -1196,25 +1420,29 @@ fn authority_of(url: &str) -> Option<String> {
     uri.authority().map(::std::string::ToString::to_string)
 }
 
-/// Whether the retry window `endpoint` allows has been spent, so this buffer's records are
-/// parked in the destination's backup rather than attempted again.
+/// Whether the retry window a destination allows has been spent, so this buffer's records
+/// are parked in the destination's backup rather than attempted again.
 ///
 /// "The total amount of time that Firehose spends on retries. This duration starts after
 /// the initial attempt to send data to the custom destination via HTTPS endpoint fails"
 /// (`HttpEndpointRetryOptions$DurationInSeconds`) — and the initial attempt is the one made
 /// when the buffer came due, so the window closes that long after it. A configured ZERO is
-/// a destination that is not retried at all, which its own range (`min: 0`) admits.
+/// a destination that is not retried at all, which its own range (`min: 0`) admits. The
+/// rule is the destination's `RetryOptions` whichever kind carries it, so the window is
+/// computed from the two values every kind states: its buffering hints and its retry
+/// duration.
 fn retries_spent(
     delivery: &PendingDelivery,
-    endpoint: &HttpEndpointTarget,
+    hints: Option<&BufferingHints>,
+    retry_duration: Duration,
     now: SystemTime,
 ) -> bool {
     let Some(opened_at) = delivery.records.first().map(|record| record.received_at) else {
         return true;
     };
     let buffered: usize = delivery.records.iter().map(|record| record.data.len()).sum();
-    let first_attempt = opened_at + delivery_window(endpoint.hints.as_ref(), buffered);
-    now >= first_attempt + endpoint.retry_duration
+    let first_attempt = opened_at + delivery_window(hints, buffered);
+    now >= first_attempt + retry_duration
 }
 
 /// The object that parks the records this endpoint never took in the destination's Amazon
@@ -1240,6 +1468,254 @@ fn backup_object(
         bucket: target.bucket.clone(),
         key: format!("{prefix}{}{extension}", object_name(delivery, now, ordinal)),
         body,
+    })
+}
+
+/// The `errorCode` the error output names for a buffer whose destination domain answered
+/// NOTHING — it is not provisioned, or this emulator holds no domain at that address — so
+/// no cluster ever judged the documents. Written in the same form as the other
+/// destinations' codes here (`<destination>.<failure>`), because it names the destination
+/// rather than a document's own refusal, whose code is the engine's own error type.
+const SEARCH_DESTINATION_UNAVAILABLE: &str = "AmazonOpenSearchService.ServiceUnavailable";
+
+/// How ONE document of a buffer failed to be indexed, as the error-output document names
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchDocumentFailure {
+    /// The record the document was made from, which names the record in the buffer this
+    /// failure belongs to.
+    record_id: String,
+    /// The index the document was written to, rotation suffix and all.
+    index_name: String,
+    /// The id the document was written under, empty where the delivery named none.
+    document_id: String,
+    /// The engine's own error type, which is what a consumer of the error output keys
+    /// off.
+    error_code: String,
+    /// The engine's reason for refusing the document.
+    error_message: String,
+}
+
+/// What a delivery to one Amazon OpenSearch Service destination did.
+#[derive(Debug, Clone)]
+enum Delivered {
+    /// The domain answered: every record was offered to it, and these are the documents
+    /// it did not take (empty when it took them all).
+    Indexed(Vec<SearchDocumentFailure>),
+    /// The domain answered NOTHING — it is not provisioned, or this emulator holds no
+    /// domain at that address — so the buffer has not been delivered at all.
+    Unavailable(SearchDocumentFailure),
+}
+
+/// Index every record of `delivery` into `search`'s index as one document.
+///
+/// Each record is one document: "Firehose buffers records before delivering them to the
+/// destination" (`PutRecord`), and for a destination in Amazon OpenSearch Service the
+/// delivery is the indexing of those records. The write goes through the OpenSearch
+/// Service's OWN store ([`::service_com_amazonaws_opensearch_amazonopensearchservice::state::ingest`]),
+/// which is the one place that decides whether the destination's role may write, which
+/// index the document lands in and whether that index's mappings accept it — so a document
+/// this emulator indexes is readable from the domain that holds it, and a document the
+/// domain refuses comes back with the engine's own error type for the backup to carry.
+///
+/// A document is offered to the domain ONCE per flush, and a buffer whose backup could not
+/// be written is owed again as a whole: a document that was already indexed is then
+/// written again under the SAME id ([`document_id`]), which is why Firehose's own id is
+/// "stable across multiple delivery attempts" — the second write replaces the first rather
+/// than adding a copy.
+fn index_documents<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    delivery: &PendingDelivery,
+    search: &SearchTarget,
+    now: SystemTime,
+) -> Delivered {
+    use ::service_com_amazonaws_opensearch_amazonopensearchservice::state::ingest;
+
+    let index_name = rotated_index(search, now);
+    let mut failures = Vec::new();
+    for record in &delivery.records {
+        let document_id = document_id(search, record);
+        let write = ingest::DocumentWrite {
+            domain: &search.domain,
+            index_name: &index_name,
+            document_id: (!document_id.is_empty()).then_some(document_id.as_str()),
+            document: &record.data,
+            principal_arn: &search.role_arn,
+            now,
+        };
+        match ingest::index_document(engine, &write) {
+            Ok(_) => {}
+            Err(ingest::WriteRefusal::Rejected {
+                error_type,
+                message,
+            }) => failures.push(SearchDocumentFailure {
+                record_id: record.record_id.clone(),
+                index_name: index_name.clone(),
+                document_id,
+                error_code: error_type.to_string(),
+                error_message: message,
+            }),
+            // The domain answered nothing, which is a verdict on the DESTINATION and not
+            // on this document: the whole buffer is owed again.
+            Err(ingest::WriteRefusal::Unavailable { message }) => {
+                ::tracing::warn!(
+                    stream = %delivery.stream,
+                    error = %message,
+                    "the Amazon OpenSearch Service destination could not be reached, so this \
+                     delivery was left for a later one"
+                );
+                return Delivered::Unavailable(SearchDocumentFailure {
+                    record_id: record.record_id.clone(),
+                    index_name,
+                    document_id,
+                    error_code: SEARCH_DESTINATION_UNAVAILABLE.to_string(),
+                    error_message: message,
+                });
+            }
+        }
+    }
+    Delivered::Indexed(failures)
+}
+
+/// The id one record's document is written under: the record's own id where Firehose names
+/// the document itself, and none where `DocumentIdOptions` leaves the naming to the domain.
+///
+/// "Firehose generates a unique document ID for each record based on a unique internal
+/// identifier. The generated document ID is stable across multiple delivery attempts, which
+/// helps prevent the same record from being indexed multiple times with different document
+/// IDs" (`DocumentIdOptions$DefaultDocumentIdFormat`) — and the record's `RecordId`, which
+/// the put answered with, is exactly such an identifier.
+fn document_id(search: &SearchTarget, record: &StoredRecord) -> String {
+    if search.mints_document_id {
+        record.record_id.clone()
+    } else {
+        String::new()
+    }
+}
+
+/// The index one document of this flush is written into: `IndexName` with the rotation
+/// suffix its `IndexRotationPeriod` appends.
+///
+/// "The Amazon OpenSearch Service index rotation period. Index rotation appends a timestamp
+/// to the IndexName to facilitate the expiration of old data" (`IndexRotationPeriod`), and
+/// the timestamp is the period the rotation is over: the hour, the day, the ISO week or the
+/// month of the delivery, each as the UTC calendar names it. `NoRotation` — the value a
+/// configuration naming none gets — appends nothing, and so does an instant the calendar
+/// cannot place, which leaves the delivery writing the index the configuration named rather
+/// than one named for nothing. The calendar fields come from the maintained date library
+/// rather than from arithmetic here.
+fn rotated_index(search: &SearchTarget, now: SystemTime) -> String {
+    let Some(period) = search.index_rotation_period.as_deref() else {
+        return search.index_name.clone();
+    };
+    // The instant as the calendar's own type, fallibly: `SystemTime` reaches further than
+    // the calendar does, so an instant outside it is answered with no suffix instead of
+    // panicking inside the conversion.
+    let at = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|since_epoch| i64::try_from(since_epoch.as_secs()).ok())
+        .and_then(|seconds| ::chrono::DateTime::from_timestamp(seconds, 0));
+    let stamped = |pattern: &str| {
+        at.map(|at| at.format(pattern).to_string())
+            .unwrap_or_default()
+    };
+    let suffix = match period {
+        "OneHour" => stamped("-%Y-%m-%d-%H"),
+        "OneDay" => stamped("-%Y-%m-%d"),
+        // The ISO week, with the week-based year it belongs to: `%G-w%V`, the pair that
+        // keeps a week spanning a year boundary in one index.
+        "OneWeek" => stamped("-%G-w%V"),
+        "OneMonth" => stamped("-%Y-%m"),
+        // `NoRotation`, and any value this emulator does not know: the index is the one
+        // the configuration named.
+        _ => String::new(),
+    };
+    format!("{}{suffix}", search.index_name)
+}
+
+/// The object that parks the documents the domain did not index in the destination's
+/// Amazon S3 backup: "Firehose writes any documents that could not be indexed to the
+/// configured Amazon S3 destination" (`S3BackupMode`), which it does under both of that
+/// member's modes.
+///
+/// Written as the error-output document of each failed document ([`search_error_envelope`]),
+/// so a consumer of the backup learns which index refused it and why, and still holds the
+/// record's own bytes. `None` when the backup cannot be worked out at all, in which case
+/// the records stay owed rather than being dropped.
+fn search_backup_object(
+    delivery: &PendingDelivery,
+    search: &SearchTarget,
+    failures: &[SearchDocumentFailure],
+    now: SystemTime,
+    ordinal: usize,
+) -> Option<DeliveredObject> {
+    let target = search.backup.as_ref()?;
+    let prefix = search_error_prefix(target, now).ok()?;
+    let documents: Vec<String> = failures
+        .iter()
+        .map(|failure| {
+            let record = delivery
+                .records
+                .iter()
+                .find(|record| record.record_id == failure.record_id);
+            search_error_envelope(record, failure, now).to_string()
+        })
+        .collect();
+    let (body, extension) = compressed(documents.join("\n").into_bytes(), target)?;
+    Some(DeliveredObject {
+        bucket: target.bucket.clone(),
+        key: format!(
+            "{prefix}{}{extension}",
+            object_name(delivery, now, ordinal)
+        ),
+        body,
+    })
+}
+
+/// The prefix a document the domain did not index is written under.
+///
+/// `ErrorOutputPrefix` where the backup configures one — "a prefix that Firehose evaluates
+/// and adds to failed records before writing them to S3" — and otherwise the backup's own
+/// `Prefix` with [`SEARCH_FAILED_OUTPUT_TYPE`] appended, which is what the mode documents:
+/// "with `AmazonOpenSearchService-failed/` appended to the key prefix" (`S3BackupMode`).
+fn search_error_prefix(target: &S3Target, now: SystemTime) -> Result<String, DeliveryFailure> {
+    let configured = if target.error_output_prefix.is_empty() {
+        format!("{}{SEARCH_FAILED_OUTPUT_TYPE}/", target.prefix)
+    } else {
+        target.error_output_prefix.clone()
+    };
+    expand_prefix(
+        &configured,
+        &BTreeMap::new(),
+        Some(SEARCH_FAILED_OUTPUT_TYPE),
+        now,
+    )
+}
+
+/// The error-output document of one document the domain did not index: how the indexing
+/// failed, when it was attempted, which index and document id it was attempted under, and
+/// the record's own data.
+///
+/// The common members are the ones every Firehose error output carries (`errorCode`,
+/// `errorMessage`, `attemptsMade`, `arrivalTimestamp`, `attemptEndingTimestamp`,
+/// `rawData`), and the three `es…` members are the ones the error output of an Amazon
+/// OpenSearch Service destination adds: the index and the document id the delivery used.
+/// `errorCode` is the engine's own error type, which is what the domain's answer carried.
+fn search_error_envelope(
+    record: Option<&StoredRecord>,
+    failure: &SearchDocumentFailure,
+    now: SystemTime,
+) -> ::serde_json::Value {
+    ::serde_json::json!({
+        "attemptsMade": 1,
+        "arrivalTimestamp": record.map_or_else(|| epoch_millis(now), |record| epoch_millis(record.received_at)),
+        "errorCode": failure.error_code,
+        "errorMessage": failure.error_message,
+        "attemptEndingTimestamp": epoch_millis(now),
+        "rawData": record.map(|record| ::aws_smithy_types::base64::encode(&record.data)).unwrap_or_default(),
+        "esDocumentId": failure.document_id,
+        "esIndexName": failure.index_name,
     })
 }
 
@@ -1709,19 +2185,18 @@ fn admissible_program(query: &str) -> Result<(), &'static str> {
         }
         let preceding = previous;
         previous = character;
-        if character == '#' {
-            in_comment = true;
-            continue;
-        }
-        if character == '"' {
-            in_string = true;
-            tokens += 1;
-            continue;
-        }
         if character.is_alphanumeric() || character == '_' {
             word.push(character);
             continue;
         }
+        // Every word ENDS here, whatever ended it — a `#` comment and a `"` string
+        // literal end one as surely as an operator does, so the word is flushed before
+        // either is entered. A word carried across one would be concatenated with the
+        // identifier characters that follow it and charged as a single unknown identifier:
+        // `inadmissible_word` would no longer recognise the keyword it hides, and because
+        // an identifier is indexable where a keyword is not, the `[` after it would be
+        // charged as an index rather than as the construction it is — which is the
+        // accounting `MAX_PROGRAM_CONSTRUCTIONS` bounds the value of one run with.
         if !word.is_empty() {
             if let Some(refusal) = inadmissible_word(&word) {
                 return Err(refusal);
@@ -1732,6 +2207,15 @@ fn admissible_program(query: &str) -> Result<(), &'static str> {
             indexable = !is_keyword(&word);
             word.clear();
             tokens += 1;
+        }
+        if character == '#' {
+            in_comment = true;
+            continue;
+        }
+        if character == '"' {
+            in_string = true;
+            tokens += 1;
+            continue;
         }
         match character {
             '(' | '[' | '{' => {
@@ -2514,11 +2998,38 @@ mod tests {
             "[if . then [.,.] else . end,.]",
             ". | [.,.] | [.,.]",
             "{a:[.,.]}",
+            // A keyword a STRING LITERAL ends is still a keyword, so the construction
+            // after it is still a construction: the word is flushed before the literal is
+            // entered, and `then"x"else` is two keywords rather than one identifier.
+            "[if .a then\"x\"else[.,.,.,.] end,.]",
+            // The same where a COMMENT ends the word, which runs to the end of its line.
+            "[if .a then # chosen\n[.,.,.,.] else . end,.]",
+            "[try\"a\"catch[.,.],.]",
         ] {
             assert_eq!(
                 admissible_program(two),
                 Err("it constructs more containers than this emulator runs"),
                 "case {two:?}: a second construction is past the cap"
+            );
+        }
+    }
+
+    /// RULE: a word is read as the word it is whatever ENDS it — an operator, a string
+    /// literal or a comment — so neither can hide a refused word by merging it with the
+    /// characters that follow.
+    #[test]
+    fn a_word_a_string_or_a_comment_ends_is_still_that_word() {
+        // (the program, the refusal the word in it earns)
+        for (program, refusal) in [
+            ("def\"x\"f: .; f", "it defines a function"),
+            ("def# a comment\nf: .; f", "it defines a function"),
+            ("reduce\"x\" .items[] as $i (.; $i)", "it loops over a value"),
+            ("foreach# a comment\n.items[] as $i (.; $i)", "it loops over a value"),
+        ] {
+            assert_eq!(
+                admissible_program(program),
+                Err(refusal),
+                "case {program:?}: expected the program to be refused as {refusal:?}"
             );
         }
     }

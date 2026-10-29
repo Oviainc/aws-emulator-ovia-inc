@@ -53,6 +53,9 @@ pub(crate) struct Answer {
 /// sibling suite needing BOTH services reuses it instead of standing up a second one.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The ONE engine every mounted service is built from, kept so a suite can read the
+    /// store of a service whose own read path for what it holds is not served yet.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -66,9 +69,22 @@ impl Emulator {
             )),
         );
         router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
-            engine,
+            Arc::clone(&engine),
         ));
-        Self { router }
+        // An Amazon OpenSearch Service destination indexes its documents into a domain of
+        // that service, so the suite that drives such a destination needs it mounted on
+        // the same engine.
+        router.register_service(
+            service_com_amazonaws_opensearch_amazonopensearchservice::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
+        Self { router, engine }
+    }
+
+    /// The shared engine, for a read of a service's own store.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     /// Call one Firehose operation; answer its HTTP status and JSON body.
@@ -103,11 +119,22 @@ impl Emulator {
 
     /// One path-style Amazon S3 request, with `body` as the request's own bytes.
     async fn s3_with_body(&self, method: &str, path: &str, body: &[u8]) -> Answer {
+        self.signed("s3", method, path, body).await
+    }
+
+    /// One request to the service `service` signs as, with `body` as its own bytes.
+    pub(crate) async fn signed(
+        &self,
+        service: &str,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Answer {
         let request = http::Request::builder()
             .method(method)
             .uri(format!("https://{HOST}{path}"))
             .header("host", HOST)
-            .header("authorization", authorization("s3"))
+            .header("authorization", authorization(service))
             .body(bytes::Bytes::copy_from_slice(body))
             .expect("the request builds");
         let response = self.router.dispatch(request).await;
@@ -156,7 +183,7 @@ impl Emulator {
     }
 
     /// The bytes `bucket` holds at `key`, read through `GetObject`.
-    async fn object(&self, bucket: &str, key: &str) -> Vec<u8> {
+    pub(crate) async fn object(&self, bucket: &str, key: &str) -> Vec<u8> {
         let answer = self.s3("GET", &format!("/{bucket}/{key}")).await;
         assert_eq!(
             answer.status,
@@ -195,7 +222,7 @@ impl Emulator {
     }
 
     /// `PutRecordBatch` with one record per entry of `records`.
-    async fn put_batch(&self, stream: &str, records: &[Vec<u8>]) -> (u16, Value) {
+    pub(crate) async fn put_batch(&self, stream: &str, records: &[Vec<u8>]) -> (u16, Value) {
         let entries: Vec<Value> = records
             .iter()
             .map(|data| json!({ "Data": base64(data) }))
@@ -223,7 +250,7 @@ impl Emulator {
     /// Every key under `prefix`, read through a `ListObjectsV2` that names NO delimiter —
     /// the recursive read a client makes for a prefix whose objects sit under further
     /// segments of their own. An empty `prefix` lists the whole bucket.
-    async fn keys_under(&self, bucket: &str, prefix: &str) -> Vec<String> {
+    pub(crate) async fn keys_under(&self, bucket: &str, prefix: &str) -> Vec<String> {
         let answer = self
             .s3(
                 "GET",
@@ -331,7 +358,7 @@ fn query_value(value: &str) -> &str {
 }
 
 /// `data` as the base64 the `awsJson1_1` wire carries a blob as.
-fn base64(data: &[u8]) -> String {
+pub(crate) fn base64(data: &[u8]) -> String {
     aws_smithy_types::base64::encode(data)
 }
 

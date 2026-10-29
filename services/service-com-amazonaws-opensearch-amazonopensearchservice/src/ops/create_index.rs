@@ -287,6 +287,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Stored VERBATIM: the semantic-enrichment configuration is part of
                 // the schema the caller sent, and `GetIndex` reports that schema.
                 schema: input.index_schema,
+                // A fresh index holds no document: the data-plane write into it is what
+                // puts one there (`crate::state::ingest`).
+                documents: ::std::collections::BTreeMap::new(),
             },
         );
 

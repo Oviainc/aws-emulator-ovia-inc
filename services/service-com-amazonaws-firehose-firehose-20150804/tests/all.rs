@@ -47,6 +47,8 @@ mod encryption_conflict_messages;
 mod http_endpoint_delivery;
 #[path = "all/kms_key_resolution.rs"]
 mod kms_key_resolution;
+#[path = "all/opensearch_destination_delivery.rs"]
+mod opensearch_destination_delivery;
 #[path = "all/processor_parameters.rs"]
 mod processor_parameters;
 #[path = "all/refusal_messages.rs"]
