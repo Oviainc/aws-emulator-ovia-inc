@@ -53,6 +53,9 @@ mod channel_pipeline_restart;
 #[path = "all/channel_placement_group_deletion.rs"]
 mod channel_placement_group_deletion;
 
+#[path = "all/channel_placement_group_idempotency_after_delete.rs"]
+mod channel_placement_group_idempotency_after_delete;
+
 #[path = "all/channel_placement_group_listing.rs"]
 mod channel_placement_group_listing;
 

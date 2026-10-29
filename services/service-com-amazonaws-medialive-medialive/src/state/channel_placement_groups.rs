@@ -261,7 +261,8 @@ impl ChannelPlacementGroupRecord {
         self.state == channel_placement_group_state::DELETED
     }
 
-    /// Materialise the transition the clock has already made due as of `now`.
+    /// Materialise the transition the clock has already made due as of `now`,
+    /// answering whether THIS call is the one that settled the deletion.
     ///
     /// A group created with a node is `ASSIGNING` and becomes `ASSIGNED` once
     /// [`TRANSIENT_STATE_SPAN`] has passed, and a group whose delete has been
@@ -270,15 +271,16 @@ impl ChannelPlacementGroupRecord {
     /// running this on a read never changes what a later caller would otherwise
     /// have seen. An update that changed the node set owes the same kind of
     /// step, into whichever state the new set implies.
-    fn settle(&mut self, now: SystemTime) {
+    fn settle(&mut self, now: SystemTime) -> bool {
         let Some(pending) = self.pending else {
-            return;
+            return false;
         };
         if now < pending.due {
-            return;
+            return false;
         }
         self.state = pending.settled.to_string();
         self.pending = None;
+        self.is_deleted()
     }
 
     /// Accept a delete for this group: it enters the transient `DELETING` state
@@ -392,8 +394,22 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// [`ComAmazonawsMedialiveMedialiveState::settle`], beside the other
     /// resources' clock-owed work.
     pub(super) fn settle_channel_placement_groups(&mut self, now: SystemTime) {
-        for group in self.channel_placement_groups.values_mut() {
-            group.settle(now);
+        // Only a group that settles into the terminal `DELETED` on THIS call is
+        // collected, so the work here does not grow with the number of groups
+        // that have already reached that state.
+        let mut just_deleted: Vec<String> = Vec::new();
+        for (id, group) in &mut self.channel_placement_groups {
+            if group.settle(now) {
+                just_deleted.push(id.clone());
+            }
+        }
+        // A token never outlives the group it minted: once that group has
+        // reached the terminal `DELETED` state its idempotency window is over,
+        // so a retried create mints a new group rather than answering with a
+        // deleted one — the rule the cluster, channel and network tokens follow
+        // too.
+        for id in just_deleted {
+            self.channel_placement_group_tokens.forget(&id);
         }
     }
 
@@ -795,10 +811,21 @@ impl ComAmazonawsMedialiveMedialiveState {
     }
 
     /// The group a `RequestId` presented for `cluster_id` created, if that group
-    /// still exists in that cluster.
+    /// is still one a caller may use.
     ///
     /// The cluster is part of the key AND re-checked on the record, so a token
     /// can only ever surface a group of the cluster the request named.
+    ///
+    /// LIVENESS is part of the lookup, through the same
+    /// [`ChannelPlacementGroupRecord::is_delete_accepted`] a mutation of a group
+    /// resolves against: a delete keeps the record readable, but a token's
+    /// idempotency window is over once this service has accepted the delete of
+    /// the group the token minted, so the retried create mints a new group
+    /// rather than answering with one the caller could neither use nor change —
+    /// a group whose name the slice has already freed for a new one. The token
+    /// itself is dropped as soon as that delete comes due
+    /// ([`Self::settle_channel_placement_groups`]), so the entry does not
+    /// outlive the group either.
     pub fn channel_placement_group_for_token(
         &self,
         cluster_id: &str,
@@ -808,6 +835,7 @@ impl ComAmazonawsMedialiveMedialiveState {
             .channel_placement_group_tokens
             .created(&channel_placement_group_token_key(cluster_id, request_id))?;
         self.channel_placement_group(cluster_id, id)
+            .filter(|group| !group.is_delete_accepted())
     }
 }
 

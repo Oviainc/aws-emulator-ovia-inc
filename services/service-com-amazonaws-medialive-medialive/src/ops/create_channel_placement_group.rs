@@ -201,7 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A retried create (same `@idempotencyToken` `RequestId` for the same
         // cluster) must answer with the group that one created, not a second
-        // group.
+        // group — while a token spent on a group this service has since
+        // accepted the delete of has no window left to replay, so the lookup
+        // resolves nothing and the request below mints the group it describes.
         if let Some(existing) = input
             .request_id
             .as_deref()
@@ -237,7 +239,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if let Some(token) = input.request_id {
             // Bounded, evicting write: a caller-chosen token can neither
-            // accumulate past the cap nor name a group of another cluster.
+            // accumulate past the cap nor name a group of another cluster, and
+            // it names this group only for as long as the group is one a caller
+            // may use (see
+            // [`crate::state::ComAmazonawsMedialiveMedialiveState::channel_placement_group_for_token`]).
             state.record_channel_placement_group_token(&input.cluster_id, &token, &id);
         }
 
