@@ -8,7 +8,8 @@
 //! record. Nothing is echoed straight from a request.
 //!
 //! Helpers several operations share (id minting, ARN building, the opaque pagination
-//! cursor, and every response projection — `SubscriptionDescription`,
+//! cursor, the one status step a `Subscription` transition takes, and every response
+//! projection — `SubscriptionDescription`,
 //! `WebAppConfiguration`, `EncryptionContext`, and the recorded `accountId` /
 //! `onboardingGeneration` pair) live here rather than being copied
 //! into each `src/ops/*.rs`: `src/lib.rs` is generated, so this module is the crate's
@@ -748,6 +749,32 @@ impl Subscription {
     /// is gone as far as every reader and every transition is concerned.
     pub fn is_live(&self) -> bool {
         self.status != SubscriptionStatus::Deleted
+    }
+
+    /// Move this record to `target`, as of `now` — the ONE status step every
+    /// `Subscription` transition takes, single-homed here beside [`Self::is_live`] and
+    /// [`Self::description`] rather than written out in each handler that transitions a
+    /// subscription.
+    ///
+    /// The step writes the status, stamps the instant of the transition on the member
+    /// that status owns — `activated_at` for `ACTIVE`, `deactivated_at` for `INACTIVE`,
+    /// and no stamp for `DELETED`, which this record keeps no instant of its own for —
+    /// and moves `last_updated_at` to that same instant. The OPPOSITE status's stamp is
+    /// never cleared: the stamps are a history of the transitions that ran (see this
+    /// type's own documentation), so both boundaries of a billing interval stay readable.
+    ///
+    /// The step itself is UNCONDITIONAL. Whether a call that finds the record already in
+    /// `target` takes it is the operation's own rule, not this record's: the transition
+    /// the model declares `@idempotent` writes nothing on a repeat, while one it does not
+    /// records that this call ran.
+    pub fn transition_to(&mut self, target: SubscriptionStatus, now: SystemTime) {
+        self.status = target;
+        match target {
+            SubscriptionStatus::Active => self.activated_at = Some(now),
+            SubscriptionStatus::Inactive => self.deactivated_at = Some(now),
+            SubscriptionStatus::Deleted => {}
+        }
+        self.last_updated_at = now;
     }
 
     /// This record as the modelled `SubscriptionDescription` four operations return.

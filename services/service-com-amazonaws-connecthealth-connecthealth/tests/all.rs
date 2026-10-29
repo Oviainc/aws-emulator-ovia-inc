@@ -65,6 +65,8 @@ mod state_roundtrip;
 mod store_unreachable_channel;
 #[path = "all/subscription_activation_stamp.rs"]
 mod subscription_activation_stamp;
+#[path = "all/subscription_transition_step.rs"]
+mod subscription_transition_step;
 #[path = "all/tag_bound_precedence.rs"]
 mod tag_bound_precedence;
 #[path = "all/tag_bound_unit.rs"]

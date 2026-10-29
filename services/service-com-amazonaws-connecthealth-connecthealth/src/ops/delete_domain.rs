@@ -391,10 +391,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             domain.status = status;
             domain.purge_due_at = Some(purge_due_at);
-            // The subscriptions go with the domain ("and all associated resources").
+            // The subscriptions go with the domain ("and all associated resources"),
+            // through the same shared status step the explicit transitions take
+            // (`crate::state::Subscription::transition_to`).
             for subscription in domain.subscriptions.values_mut() {
-                subscription.status = crate::state::SubscriptionStatus::Deleted;
-                subscription.last_updated_at = now;
+                subscription.transition_to(crate::state::SubscriptionStatus::Deleted, now);
             }
         }
 

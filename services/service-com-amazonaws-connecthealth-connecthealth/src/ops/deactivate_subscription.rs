@@ -175,14 +175,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `@idempotent`, which the model declares for THIS operation: deactivating an
         // already-inactive subscription is a no-op, so the stamps it already carries
-        // stay put rather than being rewritten per call.
-        //
-        // `activated_at` is deliberately NOT cleared here: each stamp records that its
-        // transition happened, so both boundaries of the billing interval stay readable.
+        // stay put rather than being rewritten per call. The guard is this operation's
+        // own rule; the step it guards — the status, this transition's own stamp and
+        // `lastUpdatedAt`, with `activated_at` retained so both boundaries of the
+        // billing interval stay readable — is the record's one shared rule,
+        // `crate::state::Subscription::transition_to`.
         if subscription.status != crate::state::SubscriptionStatus::Inactive {
-            subscription.status = crate::state::SubscriptionStatus::Inactive;
-            subscription.deactivated_at = Some(now);
-            subscription.last_updated_at = now;
+            subscription.transition_to(crate::state::SubscriptionStatus::Inactive, now);
         }
 
         Ok(DeactivateSubscriptionOutput {

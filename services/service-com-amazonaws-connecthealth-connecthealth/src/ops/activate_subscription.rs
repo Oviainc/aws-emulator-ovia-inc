@@ -182,12 +182,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is no reason to write nothing. A subscription is created `ACTIVE` without
         // having been activated, so the status alone cannot tell the two apart.
         //
-        // `deactivated_at` is deliberately NOT cleared here: each stamp records that its
-        // transition happened, so re-activating keeps the previous deactivation boundary
-        // readable and a caller can still reconstruct the inactive interval.
-        subscription.status = crate::state::SubscriptionStatus::Active;
-        subscription.activated_at = Some(now);
-        subscription.last_updated_at = now;
+        // The step itself — the status, this transition's own stamp and `lastUpdatedAt`,
+        // with the opposite transition's stamp retained — is the record's one shared
+        // rule: `crate::state::Subscription::transition_to`.
+        subscription.transition_to(crate::state::SubscriptionStatus::Active, now);
 
         Ok(ActivateSubscriptionOutput {
             subscription: Some(subscription.description()),
