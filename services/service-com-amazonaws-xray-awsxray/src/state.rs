@@ -351,20 +351,12 @@ fn segment_member_code(prefix: &str, member: &str) -> String {
 /// form `PutTraceSegments` documents for a segment's `trace_id` and the only
 /// form a stored trace is indexed under (`TraceId` is 1..=35 characters, which
 /// this form occupies exactly).
+///
+/// The form itself is read through the ONE shared reading of it
+/// (`service_common::xray_trace`), which a service that merely CARRIES a trace
+/// header asks as well, so no two services judge one id differently.
 pub fn is_trace_id(value: &str) -> bool {
-    let mut fields = value.split('-');
-    let (Some("1"), Some(epoch), Some(unique), None) = (
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-    ) else {
-        return false;
-    };
-    let hex = |field: &str, width: usize| {
-        field.len() == width && field.chars().all(|c| c.is_ascii_hexdigit())
-    };
-    hex(epoch, 8) && hex(unique, 24)
+    ::service_common::xray_trace::is_trace_id(value)
 }
 
 /// What a READ asked for a trace id that is not of [`is_trace_id`]'s form is

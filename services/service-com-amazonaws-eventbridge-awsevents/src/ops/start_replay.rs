@@ -426,6 +426,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             rule_arn: &rule_arn,
                             target,
                             rendered: &rendered,
+                            // A replayed event carries the envelope the archive
+                            // kept, and an archived envelope holds no trace
+                            // header: `TraceHeader` is a property of the
+                            // PUBLICATION, not of the event.
+                            trace_header: None,
                         },
                         &mut budget,
                     )

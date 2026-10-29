@@ -295,8 +295,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut deliveries: Vec<crate::state::DeliveredEvent> = Vec::new();
         // What routing decided to deliver, and the text to deliver: the event a
         // target receives is the whole envelope, rendered ONCE per event rather
-        // than per target.
-        let mut dispatches: Vec<Dispatch> = Vec::new();
+        // than per target. A QUEUE rather than a list, because an event-bus
+        // target re-publishes the event onto the bus it names and that copy is
+        // matched and delivered by this same pass (see [`republish`]).
+        let mut dispatches: ::std::collections::VecDeque<Dispatch> =
+            ::std::collections::VecDeque::new();
         // What each archive of the entry's bus captured, appended to the archives
         // in the next pass under the lock.
         let mut captures: Vec<Capture> = Vec::new();
@@ -351,10 +354,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .collect(),
                     });
                     if let Some(rendered) = rendered {
-                        dispatches.push(Dispatch {
+                        dispatches.push_back(Dispatch {
                             event_id: accepted.event_id.clone(),
                             bus: accepted.bus,
+                            region: region.clone(),
                             rendered,
+                            trace_header: accepted.trace_header,
+                            hops: 0,
                             matched,
                         });
                     }
@@ -399,38 +405,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rule"), so it happens here rather than being left as a recorded
         // intention. ONE budget for the whole request caps the fan-out's
         // (entries x rules x targets x bytes) product.
+        //
+        // An event-bus target re-publishes the event onto the bus it names,
+        // whose own rules match the copy and deliver it, so the queue this pass
+        // works from GROWS as such a target is reached ([`republish`]); every
+        // copy spends the same request budget, and the chain is bounded by
+        // [`MAX_BUS_HOPS`].
         let iam = crate::state::iam_state(&*self.engine);
         let cloudwatch = crate::state::cloudwatch_state(&*self.engine);
         let mut budget = DeliveryBudget::new();
         let mut clients = Clients::default();
         let mut invocations: Vec<crate::state::TargetInvocation> = Vec::new();
-        'dispatch: for dispatch in dispatches {
-            let rendered = dispatch.rendered;
+        let mut republished: Vec<crate::state::DeliveredEvent> = Vec::new();
+        // ONE matching budget for every copy this request re-publishes, spent
+        // across them: that is what caps the (copies x rules x bytes) product,
+        // the same shape as the per-entry budget the routing pass above spends.
+        let mut republished_matching =
+            crate::state::event_pattern::Budget::new(crate::state::MAX_MATCH_BYTES_PER_ENTRY);
+        'dispatch: while let Some(dispatch) = dispatches.pop_front() {
             for rule in &dispatch.matched {
-                let rule_arn = crate::state::rule_arn(&region, &dispatch.bus, &rule.name);
+                let rule_arn = crate::state::rule_arn(&dispatch.region, &dispatch.bus, &rule.name);
                 for target in &rule.targets {
-                    let Some(outcome) = deliver(
-                        ctx,
-                        &region,
-                        &mut clients,
-                        iam.as_ref(),
-                        cloudwatch.as_ref(),
-                        &Handover {
-                            event_id: &dispatch.event_id,
-                            bus: &dispatch.bus,
-                            rule: &rule.name,
-                            rule_arn: &rule_arn,
-                            target,
-                            rendered: &rendered,
-                        },
-                        &mut budget,
-                    )
-                    .await
-                    else {
-                        // The request's delivery budget is spent: the remaining
-                        // targets are not handed anything, and nothing is
-                        // recorded for them either.
-                        break 'dispatch;
+                    let handover = Handover {
+                        event_id: &dispatch.event_id,
+                        bus: &dispatch.bus,
+                        rule: &rule.name,
+                        rule_arn: &rule_arn,
+                        target,
+                        rendered: &dispatch.rendered,
+                        trace_header: dispatch.trace_header.as_deref(),
+                    };
+                    // A bus target is reached by re-publishing onto that bus
+                    // rather than by an API call to another service, so it is
+                    // served here, from the store, instead of through a client.
+                    let outcome = if let Some(bus) = event_bus_target(&target.arn) {
+                        republish(
+                            &state,
+                            &bus,
+                            &dispatch,
+                            &handover,
+                            iam.as_ref(),
+                            now,
+                            &mut dispatches,
+                            &mut republished,
+                            &mut budget,
+                            &mut republished_matching,
+                        )
+                        .await
+                    } else {
+                        let Some(outcome) = deliver(
+                            ctx,
+                            &dispatch.region,
+                            &mut clients,
+                            iam.as_ref(),
+                            cloudwatch.as_ref(),
+                            &handover,
+                            &mut budget,
+                        )
+                        .await
+                        else {
+                            // The request's delivery budget is spent: the
+                            // remaining targets are not handed anything, and
+                            // nothing is recorded for them either.
+                            break 'dispatch;
+                        };
+                        outcome
                     };
                     invocations.push(crate::state::TargetInvocation {
                         event_id: dispatch.event_id.clone(),
@@ -446,8 +485,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // PASS 6 — under the lock once more, to append what came of each
         // handover: the invocation log is how a client observes a delivery that
         // happened outside the target's own service.
-        if !invocations.is_empty() {
+        if !invocations.is_empty() || !republished.is_empty() {
             let mut store = state.lock();
+            for delivery in republished {
+                store.record_delivery(delivery);
+            }
             for invocation in invocations {
                 store.record_invocation(invocation);
             }
@@ -520,6 +562,10 @@ struct Accepted {
     detail: Option<String>,
     resources: Vec<String>,
     time: ::std::time::SystemTime,
+    /// `PutEventsRequestEntry$TraceHeader`: "an X-Ray trace header, which is an
+    /// http header (`X-Amzn-Trace-Id`) that contains the trace-id associated
+    /// with the event" — carried with the event to the targets it reaches.
+    trace_header: Option<String>,
     /// Minted for every accepted entry, whatever bus it names; empty until
     /// the store that owns the counter is reached.
     event_id: String,
@@ -685,6 +731,14 @@ fn screen(
     // the entry still owes this screen is its resource list, which routing
     // carries into the event envelope.
     let resources = entry.resources.unwrap_or_default();
+    // A `TraceHeader` is carried to the entry's targets only when it IS a trace
+    // header: text naming no trace is not one, and nothing is carried in its
+    // place (see [`crate::state::published_trace_header`]).
+    let trace_header = entry
+        .trace_header
+        .as_deref()
+        .and_then(crate::state::published_trace_header)
+        .map(str::to_string);
 
     Screened::Accepted(Accepted {
         bus: crate::state::effective_bus_name(entry.event_bus_name.as_deref()),
@@ -692,6 +746,7 @@ fn screen(
         detail_type: entry.detail_type,
         detail: entry.detail,
         resources,
+        trace_header,
         // The entry's own `Time` is the event's time when it carries one;
         // otherwise the event is timestamped as it is ingested.
         time: entry
@@ -797,9 +852,21 @@ pub(crate) fn route(
     // than each factor on its own.
     let mut budget =
         crate::state::event_pattern::Budget::new(crate::state::MAX_MATCH_BYTES_PER_ENTRY);
+    route_within(envelope, rules, &mut budget)
+}
+
+/// [`route`] spending a budget the CALLER owns, for matching that is part of a
+/// larger whole: the copies one request re-publishes onto other buses share one
+/// budget between them, so the (copies x rules x bytes) product is capped the
+/// way the (entries x rules x bytes) one is rather than per copy.
+pub(crate) fn route_within(
+    envelope: &::serde_json::Value,
+    rules: &[CompiledRule],
+    budget: &mut crate::state::event_pattern::Budget,
+) -> Option<Vec<MatchedRule>> {
     let mut matched: Vec<MatchedRule> = Vec::new();
     for rule in rules {
-        if crate::state::event_pattern::matches_parsed(&rule.pattern, envelope, &mut budget) {
+        if crate::state::event_pattern::matches_parsed(&rule.pattern, envelope, budget) {
             matched.push(MatchedRule {
                 name: rule.name.clone(),
                 targets: rule.targets.clone(),
@@ -823,9 +890,19 @@ pub(crate) struct MatchedRule {
 struct Dispatch {
     event_id: String,
     bus: String,
+    /// The Region whose rules matched the event, which is the Region their ARNs
+    /// and their targets are read in — not necessarily the Region the envelope
+    /// carries, because an event re-published onto a bus of another Region keeps
+    /// the SOURCE Region in `region` (see [`republish`]).
+    region: String,
     /// The whole event envelope, rendered when the event was routed (see
     /// [`evaluate`]) rather than carried as a parse tree into this pass.
     rendered: String,
+    /// The entry's `TraceHeader`, carried to each target this event reaches.
+    trace_header: Option<String>,
+    /// How many event-bus targets this event has already been re-published
+    /// through, which is what bounds a chain of bus-to-bus targets.
+    hops: usize,
     matched: Vec<MatchedRule>,
 }
 
@@ -842,6 +919,9 @@ pub(crate) struct Handover<'a> {
     pub(crate) target: &'a CompiledTarget,
     /// The whole event envelope, rendered ONCE per event rather than per target.
     pub(crate) rendered: &'a str,
+    /// The event's `TraceHeader`, when the publication carried one: an X-Ray
+    /// trace header travels WITH the event to the targets it reaches.
+    pub(crate) trace_header: Option<&'a str>,
 }
 
 /// One rule of a bus, ready to route: its name, its parsed `EventPattern`, and
@@ -934,10 +1014,15 @@ pub(crate) struct CompiledTarget {
     /// `Target$Input`: "Valid JSON text passed to the target", which replaces
     /// the event entirely when it is set.
     input: Option<String>,
-    /// Whether the target asks for a TRANSFORMATION of the event
-    /// (`Target$InputPath` or `Target$InputTransformer`). See [`deliver`] for why
-    /// such a target is not delivered to here.
-    transforms_input: bool,
+    /// `Target$InputPath`: "the value of the JSONPath that is used for
+    /// extracting part of the matched event when passing it to the target" — so
+    /// the target receives that part rather than the whole envelope (see
+    /// [`crate::state::input_transform`]).
+    input_path: Option<String>,
+    /// `Target$InputTransformer`: the paths to extract from the event and the
+    /// template they are rendered into, which is what the target receives (see
+    /// [`crate::state::input_transform`]).
+    transformer: Option<Transformer>,
     /// `Target$DeadLetterConfig`: "the queue to use as the dead-letter queue",
     /// where an event that could not be delivered to this target is sent.
     dead_letter_arn: Option<String>,
@@ -958,6 +1043,34 @@ pub(crate) struct CompiledTarget {
     partition_key_path: Option<String>,
 }
 
+/// What a target's `InputTransformer` renders with: the paths to extract from
+/// the event, keyed by the placeholder that carries them, and the template they
+/// are rendered into.
+///
+/// Read off the stored target once, where the rule is compiled, for the reason
+/// [`CompiledRule`] gives. The paths are held in key order so one rendering of
+/// one event is reproducible whatever order the map arrived in.
+#[derive(Clone)]
+struct Transformer {
+    paths: ::std::collections::BTreeMap<String, String>,
+    template: String,
+}
+
+impl Transformer {
+    /// The compiled form of a stored `InputTransformer`.
+    fn of(transformer: &InputTransformer) -> Self {
+        Self {
+            paths: transformer
+                .input_paths_map
+                .iter()
+                .flatten()
+                .map(|(key, path)| (key.clone(), path.clone()))
+                .collect(),
+            template: transformer.input_template.clone(),
+        }
+    }
+}
+
 /// What an API-destination target's invocation is made of: the endpoint and
 /// method the STORED destination carries, and whether that destination is in a
 /// state EventBridge invokes.
@@ -969,7 +1082,9 @@ pub(crate) struct CompiledTarget {
 struct ApiDestination {
     name: String,
     /// `ApiDestinationRecord::invocation_endpoint`, the URL the invocation is
-    /// made against.
+    /// made against — addressed through the IN-PROCESS emulator transport, so it
+    /// names a service this emulator serves and never a host on a network (see
+    /// [`invoke_api_destination`]).
     endpoint: String,
     /// One of `ApiDestinationHttpMethod`'s values, the method the invocation
     /// uses.
@@ -1007,8 +1122,12 @@ impl CompiledRule {
                     arn: target.arn.clone(),
                     role_arn: target.role_arn.clone(),
                     input: target.input.clone(),
-                    transforms_input: target.input_path.is_some()
-                        || target.raw.input_transformer.is_some(),
+                    input_path: target.input_path.clone(),
+                    transformer: target
+                        .raw
+                        .input_transformer
+                        .as_ref()
+                        .map(Transformer::of),
                     dead_letter_arn: target
                         .raw
                         .dead_letter_config
@@ -1184,21 +1303,21 @@ pub(crate) async fn deliver(
             ::service_common::arn::vendor(&target.arn).unwrap_or("an unknown service")
         )));
     };
-    if target.transforms_input {
-        // `InputPath` and `InputTransformer` reshape the event before it is
-        // delivered. That transformation is not implemented here, and a target
-        // asking for one must NOT be handed the untransformed event instead —
-        // that would deliver something the target never asked for — so the
-        // delivery does not happen and says so.
-        return Some(crate::state::InvocationOutcome::NotAttempted(
-            "the target asks for an input transformation, which this emulator does not apply"
-                .to_string(),
-        ));
-    }
-    // "Input: valid JSON text passed to the target. In this case, nothing from
-    // the event itself is passed to the target" — so the target's own constant
-    // replaces the envelope when it carries one.
-    let body: &str = target.input.as_deref().unwrap_or(handover.rendered);
+    // WHAT the target receives: the whole event envelope, unless the target asks
+    // for something else. "Input: valid JSON text passed to the target. In this
+    // case, nothing from the event itself is passed to the target" — so the
+    // target's own constant replaces the envelope when it carries one — and
+    // `InputPath` or an `InputTransformer` reshapes the event into what that
+    // target asked for ([`transformed`]).
+    let reshaped = match transformed(handover) {
+        Ok(reshaped) => reshaped,
+        Err(refusal) => return Some(crate::state::InvocationOutcome::NotAttempted(refusal)),
+    };
+    let body: &str = target
+        .input
+        .as_deref()
+        .or(reshaped.as_deref())
+        .unwrap_or(handover.rendered);
     if !budget.charge(body.len()) {
         ::tracing::warn!(
             target = %target.arn,
@@ -1280,6 +1399,270 @@ pub(crate) async fn deliver(
     // as observable as one that is failing.
     count_invocation(cloudwatch, handover, &outcome);
     Some(outcome)
+}
+
+/// What a target that asks for the event to be RESHAPED receives, or `Ok(None)`
+/// for one that takes the event as published.
+///
+/// The rule AWS follows: a target carrying `InputPath` is handed the part of the
+/// event that path selects, and one carrying an `InputTransformer` is handed its
+/// template rendered with what its paths select — the two forms of the same
+/// decision, stated once in [`crate::state::input_transform`] so every target
+/// kind reshapes the same way. A target carrying both is handed the
+/// transformation, which is the one the paths of its own map are evaluated
+/// against the event for.
+///
+/// The envelope is read back as a document HERE rather than carried into this
+/// pass as a parse tree, and only for a target that asked for a transformation:
+/// the cost of the parse is paid by the delivery that needs it. Text that is not
+/// one JSON document selects nothing, so every placeholder renders as JSON's
+/// empty value.
+///
+/// `Err` is a transformation this emulator will not build — a path it does not
+/// evaluate, or a rendering past
+/// [`crate::state::input_transform::MAX_RENDERED_BYTES`] — which is a delivery
+/// that does not happen rather than one the target is handed something else for.
+fn transformed(handover: &Handover<'_>) -> Result<Option<String>, String> {
+    let target = handover.target;
+    if target.input_path.is_none() && target.transformer.is_none() {
+        return Ok(None);
+    }
+    let event = crate::state::parse_delivered_event(handover.rendered)
+        .unwrap_or(::serde_json::Value::Null);
+    if let Some(transformer) = &target.transformer {
+        let delivery = crate::state::input_transform::Delivery {
+            rule: handover.rule,
+            rule_arn: handover.rule_arn,
+            ingestion_time: event
+                .get("time")
+                .and_then(::serde_json::Value::as_str)
+                .unwrap_or_default(),
+        };
+        return crate::state::input_transform::render(
+            &transformer.template,
+            &transformer.paths,
+            &event,
+            &delivery,
+        )
+        .map(Some);
+    }
+    match target.input_path.as_deref() {
+        None => Ok(None),
+        Some(path) => crate::state::input_transform::by_input_path(path, &event).map(Some),
+    }
+}
+
+/// The IAM action re-publishing an event onto another bus performs, which is
+/// what the target's role has to be allowed to do.
+const PUT_EVENTS_ACTION: &str = "events:PutEvents";
+
+/// How many event-bus targets ONE published event may be re-published through.
+///
+/// This operation's OWN bound, not a limit AWS publishes. A bus whose target is
+/// another bus can be chained, and two buses that name each other would
+/// otherwise re-publish for ever; a copy that has already crossed this many
+/// buses is not re-published again and says so in the log.
+const MAX_BUS_HOPS: usize = 2;
+
+/// The event bus a target's ARN names: the Region it lives in and its name —
+/// `None` when the ARN names anything else.
+///
+/// An event bus can be configured as the target of a rule, including one in
+/// another Region, and such a target is not an API call to another service at
+/// all: the copy is published onto that bus, so it is read here rather than
+/// through [`TargetKind`]. The Region is the ARN's OWN, because the bus a target
+/// names is not necessarily in the publisher's Region.
+struct BusTarget {
+    region: String,
+    name: String,
+}
+
+/// The event bus `arn` names, read through the ONE shared parse of a resource
+/// ARN (`service_common::arn`) so this crate does not split a caller's ARN its
+/// own way.
+fn event_bus_target(arn: &str) -> Option<BusTarget> {
+    let parsed = ::service_common::arn::parse(arn)?;
+    if parsed.vendor != crate::state::ARN_NAMESPACE {
+        return None;
+    }
+    let name = crate::state::event_bus_name_in_arn(arn)?;
+    Some(BusTarget {
+        region: parsed.region.to_string(),
+        name: name.to_string(),
+    })
+}
+
+/// Re-publish one routed event onto the event bus a target names, and answer
+/// what came of that handover.
+///
+/// The rule AWS follows: a rule whose target is an event bus publishes the event
+/// onto that bus, where it is matched by THAT bus's rules and delivered to their
+/// targets — the bus is reached by publishing, not by an API call to another
+/// service. The copy is the SAME event with a NEW event id: every other member
+/// of the envelope is carried over, the `region` it was published in included,
+/// so a rule of the other Region sees where the event came from.
+///
+/// The re-publication spends the request's own delivery budget, and the copies
+/// one request makes share ONE matching budget ([`route_within`]), so a bus
+/// target cannot route an event in a way a direct publication could not and
+/// cannot spend more matching work than one entry may. The copy is appended to
+/// `pending` rather than delivered here, so the chain is one loop with one
+/// budget rather than a recursion.
+#[allow(clippy::too_many_arguments)]
+async fn republish(
+    state: &::engine::ServiceState<crate::state::ComAmazonawsEventbridgeAwseventsState>,
+    bus: &BusTarget,
+    dispatch: &Dispatch,
+    handover: &Handover<'_>,
+    iam: Option<&::engine::ServiceState<crate::state::IamState>>,
+    now: ::std::time::SystemTime,
+    pending: &mut ::std::collections::VecDeque<Dispatch>,
+    delivered: &mut Vec<crate::state::DeliveredEvent>,
+    budget: &mut DeliveryBudget,
+    matching: &mut crate::state::event_pattern::Budget,
+) -> crate::state::InvocationOutcome {
+    let target = handover.target;
+    // EventBridge publishes onto the other bus ACTING AS the role the target
+    // names, so a role it cannot assume or whose policies withhold the
+    // publication is a delivery that fails before anything is published.
+    let attempt = crate::state::DeliveryAttempt {
+        rule: handover.rule,
+        target_id: &target.id,
+        action: PUT_EVENTS_ACTION,
+        resource: &target.arn,
+    };
+    if let Some((code, message)) = role_refusal(iam, target.role_arn.as_deref(), &attempt) {
+        return crate::state::InvocationOutcome::Failed { code, message };
+    }
+    if dispatch.hops >= MAX_BUS_HOPS {
+        return crate::state::InvocationOutcome::NotAttempted(format!(
+            "this event has already been re-published through {MAX_BUS_HOPS} event-bus \
+             target(s), which is this emulator's bound on such a chain"
+        ));
+    }
+    if !budget.charge(handover.rendered.len()) {
+        return crate::state::InvocationOutcome::NotAttempted(format!(
+            "this request reached the emulator's delivery budget of \
+             {MAX_DELIVERIES_PER_REQUEST} deliveries and {MAX_DELIVERED_BYTES_PER_REQUEST} bytes"
+        ));
+    }
+    let mut envelope = match crate::state::parse_delivered_event(handover.rendered) {
+        Some(::serde_json::Value::Object(fields)) => fields,
+        _ => {
+            return crate::state::InvocationOutcome::NotAttempted(
+                "the event is not an envelope that can be re-published".to_string(),
+            )
+        }
+    };
+    // An ARN carrying no Region label names a bus of the Region the event was
+    // published in.
+    let bus_region = if bus.region.is_empty() {
+        dispatch.region.clone()
+    } else {
+        bus.region.clone()
+    };
+    let (rules, event_id) = {
+        let mut store = state.lock();
+        let Some(record) = store.bus(&bus_region, &bus.name) else {
+            return crate::state::InvocationOutcome::NotAttempted(format!(
+                "the target ARN names no event bus {} of this account in {bus_region}",
+                bus.name
+            ));
+        };
+        let rules: Vec<CompiledRule> = record
+            .rules
+            .values()
+            .filter_map(|rule| CompiledRule::of(rule, &store))
+            .collect();
+        (rules, store.next_event_id(now))
+    };
+    envelope.insert(
+        EVENT_ID_FIELD.to_string(),
+        ::serde_json::Value::String(event_id.clone()),
+    );
+    let envelope = ::serde_json::Value::Object(envelope);
+    // Matching the copy against the other bus's rules is CPU-bound and runs with
+    // no lock held: yielding first gives a cancellation or a shutdown signal
+    // somewhere to land before the work starts, as the routing pass above does.
+    ::tokio::task::yield_now().await;
+    let Some(matched) = route_within(&envelope, &rules, matching) else {
+        return crate::state::InvocationOutcome::NotAttempted(format!(
+            "the copies re-published by this request reached its matching budget of {} bytes, \
+             so this one was not matched against the rules of event bus {}",
+            crate::state::MAX_MATCH_BYTES_PER_ENTRY, bus.name
+        ));
+    };
+    delivered.push(republished_delivery(
+        &event_id, &bus.name, &envelope, &matched,
+    ));
+    if matched.iter().any(|rule| !rule.targets.is_empty()) {
+        pending.push_back(Dispatch {
+            event_id,
+            bus: bus.name.clone(),
+            region: bus_region,
+            rendered: envelope.to_string(),
+            trace_header: dispatch.trace_header.clone(),
+            hops: dispatch.hops + 1,
+            matched,
+        });
+    }
+    crate::state::InvocationOutcome::Invoked
+}
+
+/// The member of an event envelope that carries the event's id.
+const EVENT_ID_FIELD: &str = "id";
+
+/// The routing-log record of one re-published copy: which rules of the bus it
+/// was published onto it reached, and which targets it was handed to.
+///
+/// Read off the envelope that was re-published, so the log says what was
+/// actually published rather than what the original entry asked for. The field
+/// names are the event envelope's own ([`crate::state::event_envelope`]).
+fn republished_delivery(
+    event_id: &str,
+    bus: &str,
+    envelope: &::serde_json::Value,
+    matched: &[MatchedRule],
+) -> crate::state::DeliveredEvent {
+    let text = |field: &str| {
+        envelope
+            .get(field)
+            .and_then(::serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    crate::state::DeliveredEvent {
+        event_id: event_id.to_string(),
+        bus: bus.to_string(),
+        source: text("source"),
+        detail_type: text("detail-type"),
+        detail: envelope.get("detail").map(::serde_json::Value::to_string),
+        resources: envelope
+            .get("resources")
+            .and_then(::serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        // The event's OWN time, which the copy carries over unchanged.
+        time: text("time")
+            .and_then(|at| {
+                ::aws_smithy_types::DateTime::from_str(
+                    &at,
+                    ::aws_smithy_types::date_time::Format::DateTime,
+                )
+                .ok()
+            })
+            .and_then(|at| ::std::time::SystemTime::try_from(at).ok())
+            .unwrap_or(::std::time::SystemTime::UNIX_EPOCH),
+        matched_rules: matched.iter().map(|rule| rule.name.clone()).collect(),
+        target_arns: matched
+            .iter()
+            .flat_map(|rule| rule.targets.iter().map(|target| target.arn.clone()))
+            .collect(),
+    }
 }
 
 /// Why EventBridge may not make `attempt` under `role_arn`, as the account's IAM
@@ -1433,15 +1816,35 @@ impl TargetKind {
                         "the target ARN names no queue".to_string(),
                     );
                 };
-                outcome(
-                    clients
-                        .sqs(ctx, region)
-                        .send_message()
-                        .queue_url(queue)
-                        .message_body(body)
-                        .send()
-                        .await,
-                )
+                let mut request = clients
+                    .sqs(ctx, region)
+                    .send_message()
+                    .queue_url(queue)
+                    .message_body(body);
+                // "An X-Ray trace header … that contains the trace-id
+                // associated with the event" travels WITH the event: a queue
+                // carries it as the one message system attribute Amazon SQS
+                // takes on a send, under the name that attribute publishes, so
+                // a consumer of the queue reads the trace the publisher named.
+                if let Some(trace_header) = handover.trace_header {
+                    match ::aws_sdk_sqs::types::MessageSystemAttributeValue::builder()
+                        .data_type(STRING_ATTRIBUTE_TYPE)
+                        .string_value(trace_header)
+                        .build()
+                    {
+                        Ok(attribute) => {
+                            request = request.message_system_attributes(
+                                ::aws_sdk_sqs::types::MessageSystemAttributeNameForSends::AwsTraceHeader,
+                                attribute,
+                            );
+                        }
+                        Err(error) => ::tracing::warn!(
+                            error = %error,
+                            "an event's trace header could not be carried to its queue target"
+                        ),
+                    }
+                }
+                outcome(request.send().await)
             }
             Self::Function => outcome(
                 clients
@@ -1470,9 +1873,15 @@ impl TargetKind {
                     .sfn(ctx, region)
                     .start_execution()
                     .state_machine_arn(arn)
-                    // The execution's input is the whole event envelope; the
-                    // execution's NAME is left to Step Functions, which mints
-                    // one when the request names none.
+                    // The execution's input is the whole event envelope, and the
+                    // execution is NAMED after the event that started it: an
+                    // execution name "must be unique for your Amazon Web
+                    // Services account, Region, and state machine"
+                    // (`StartExecution$name`), and the event id is the one
+                    // identifier of this delivery that is unique already — so
+                    // one event delivered twice is one execution rather than
+                    // two, which is what makes the delivery idempotent.
+                    .name(handover.event_id)
                     .input(body)
                     .send()
                     .await,
@@ -1503,6 +1912,15 @@ impl TargetKind {
                 )
             }
             Self::ApiDestination => {
+                // The stored `InvocationEndpoint` is a caller's text, and it is
+                // NOT a host this process connects to: the invocation is made
+                // over the in-process emulator transport
+                // (`OperationContext::callback().http_connector()`, see
+                // [`invoke_api_destination`]), which routes the request to a
+                // service this emulator serves itself. No socket is opened, no
+                // name is resolved and nothing outside this process can be
+                // reached, so the endpoint's host, scheme and address range
+                // decide nothing but which emulated service claims it.
                 invoke_api_destination(ctx, target, body, retries, budget).await
             }
         }
@@ -1832,6 +2250,11 @@ enum Attempt {
 }
 
 /// Make one attempt, bounded by [`API_DESTINATION_TIMEOUT`], and classify it.
+///
+/// `transport` is the in-process emulator connector and the ONLY thing this
+/// request is handed to: the endpoint text decides which emulated service
+/// receives it, and a URL naming anything this emulator does not serve is
+/// answered by the transport's own refusal rather than by a connection.
 async fn attempt_api_destination(
     transport: &::aws_smithy_runtime_api::client::http::SharedHttpConnector,
     destination: &ApiDestination,
@@ -1909,6 +2332,10 @@ async fn attempt_api_destination(
     }
 }
 
+/// The `DataType` a message attribute carrying text declares
+/// (`MessageAttributeValue$DataType`: "String").
+const STRING_ATTRIBUTE_TYPE: &str = "String";
+
 /// Send one undeliverable event to the target's dead-letter queue.
 ///
 /// "EventBridge adds the following custom attributes to the dead-letter
@@ -1951,7 +2378,7 @@ async fn dead_letter(
         .message_body(body);
     for (name, value) in attributes {
         match ::aws_sdk_sqs::types::MessageAttributeValue::builder()
-            .data_type("String")
+            .data_type(STRING_ATTRIBUTE_TYPE)
             .string_value(value)
             .build()
         {

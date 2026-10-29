@@ -27,6 +27,8 @@ mod connection_authorization;
 mod connection_lifecycle;
 #[path = "all/connection_refusal_wording.rs"]
 mod connection_refusal_wording;
+#[path = "all/cross_region_bus_target.rs"]
+mod cross_region_bus_target;
 #[path = "all/dead_letter_error_code.rs"]
 mod dead_letter_error_code;
 #[path = "all/entry_level_semantics.rs"]
@@ -47,6 +49,8 @@ mod global_endpoint_deletion;
 mod global_endpoint_identity;
 #[path = "all/implicit_default_bus.rs"]
 mod implicit_default_bus;
+#[path = "all/input_transformation.rs"]
+mod input_transformation;
 #[path = "all/input_validation.rs"]
 mod input_validation;
 #[path = "all/kinesis_partition_key_json_text.rs"]
@@ -85,12 +89,16 @@ mod replay_name_opt_out;
 mod reserved_event_source;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/rule_fan_out_and_target_repointing.rs"]
+mod rule_fan_out_and_target_repointing;
 #[path = "all/rule_invocation_metrics.rs"]
 mod rule_invocation_metrics;
 #[path = "all/rule_lifecycle.rs"]
 mod rule_lifecycle;
 #[path = "all/rule_state_control.rs"]
 mod rule_state_control;
+#[path = "all/state_machine_execution_naming.rs"]
+mod state_machine_execution_naming;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/target_delivery.rs"]
@@ -99,3 +107,5 @@ mod target_delivery;
 mod target_dispatch;
 #[path = "all/target_response_members.rs"]
 mod target_response_members;
+#[path = "all/trace_header_propagation.rs"]
+mod trace_header_propagation;

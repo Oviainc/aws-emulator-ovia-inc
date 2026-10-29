@@ -304,6 +304,10 @@ pub mod validation_message;
 /// The web identity tokens this emulator itself issued: the registry a redeemer of one
 /// reads, written by the service that issued it.
 pub mod web_identity_tokens;
+/// The ONE reading of an AWS X-Ray trace id and tracing header, for every service that
+/// takes one as a caller-supplied string — so X-Ray and a service that merely carries a
+/// trace header cannot disagree about what counts as one.
+pub mod xray_trace;
 
 pub use validation_message::aws_validation_refusal;
 

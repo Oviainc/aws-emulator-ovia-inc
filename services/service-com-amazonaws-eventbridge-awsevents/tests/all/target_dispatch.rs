@@ -147,7 +147,7 @@ pub(crate) async fn events(
     rpc(emulator, "events", "AWSEvents", "1.1", operation, body).await
 }
 
-async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
     rpc(emulator, "sqs", "AmazonSQS", "1.0", operation, body).await
 }
 

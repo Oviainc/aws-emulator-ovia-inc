@@ -10,25 +10,22 @@
 //! `EventPattern` matches, each of its SQS queue targets receives one message
 //! whose body is the WHOLE event envelope (`version`, `id`, `detail-type`,
 //! `source`, `account`, `time`, `region`, `resources`, `detail`) — or, when the
-//! target carries `Input`, exactly that constant text instead ("Valid JSON text
-//! passed to the target. In this case, nothing from the event itself is passed
-//! to the target", `Target$Input`). A rule that does not match, and a rule that
-//! is `DISABLED`, deliver nothing.
+//! target asks for something else, exactly what it asked for: the constant text
+//! of `Input` ("Valid JSON text passed to the target. In this case, nothing from
+//! the event itself is passed to the target", `Target$Input`), the part of the
+//! event `InputPath` selects, or the rendering of an `InputTransformer`'s
+//! template. A rule that does not match, and a rule that is `DISABLED`, deliver
+//! nothing.
 //!
 //! Each test spans a TABLE whose rows differ along what decides the delivery:
 //! the target's input configuration, how many targets a rule has, the target's
 //! service, and whether the rule matches at all.
 //!
-//! Two target configurations are deliberately asserted to deliver NOTHING rather
-//! than to deliver the untransformed event: `InputPath` and `InputTransformer`
-//! ask for the event to be reshaped before it is handed over, and that
-//! transformation is not implemented in this emulator yet, so handing the target
-//! the whole envelope instead would deliver something it never asked for.
-//!
 //! The other target kinds a rule may carry are invoked too, each through its own
 //! service's API; `tests/all/target_dispatch.rs` is the suite for that rule, and
 //! this one keeps the queue case because a queue is where a delivery is easiest
-//! to read back.
+//! to read back. `tests/all/input_transformation.rs` is the suite for WHAT a
+//! transformed target receives, over the forms a path and a template may take.
 
 use std::sync::Arc;
 
@@ -222,8 +219,6 @@ enum Expect {
     WholeEvent,
     /// One message carrying exactly this text.
     Constant(&'static str),
-    /// No message at all.
-    Nothing,
 }
 
 /// The envelope members every delivered event carries, with the values this
@@ -269,22 +264,24 @@ async fn a_matched_event_reaches_the_rules_sqs_target() {
             Expect::Constant("{\"fixed\":true}"),
         ),
         (
-            // `InputPath` selects part of the event; that selection is not
-            // implemented here, so nothing — not the whole event — is delivered.
-            "an InputPath the emulator does not apply",
-            json!({ "InputPath": "$.detail" }),
-            Expect::Nothing,
+            // `InputPath` selects part of the event, and the JSON text of that
+            // part is what the target receives.
+            "an InputPath selecting part of the event",
+            json!({ "InputPath": "$.detail.orderId" }),
+            Expect::Constant("\"A-1\""),
         ),
         (
-            // Likewise an `InputTransformer`'s template.
-            "an InputTransformer the emulator does not apply",
+            // An `InputTransformer`'s template is rendered with what its paths
+            // select; a template that is not a JSON object is text, so the
+            // quotes it writes around the placeholder are its own.
+            "an InputTransformer rendering its template",
             json!({
                 "InputTransformer": {
                     "InputPathsMap": { "order": "$.detail.orderId" },
                     "InputTemplate": "\"<order>\"",
                 },
             }),
-            Expect::Nothing,
+            Expect::Constant("\"A-1\""),
         ),
     ];
 
@@ -319,14 +316,7 @@ async fn a_matched_event_reaches_the_rules_sqs_target() {
                 assert_eq!(
                     bodies,
                     vec![text.to_string()],
-                    "case {case}: expected the target's own Input delivered, got {bodies:?}"
-                );
-            }
-            Expect::Nothing => {
-                assert!(
-                    bodies.is_empty(),
-                    "case {case}: expected no delivery rather than an untransformed event, \
-                     got {bodies:?}"
+                    "case {case}: expected the text the target asked for, got {bodies:?}"
                 );
             }
         }
