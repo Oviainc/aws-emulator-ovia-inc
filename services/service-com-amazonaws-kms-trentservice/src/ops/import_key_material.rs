@@ -306,10 +306,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Specify the key ID or key ARN of the KMS key" (the `KeyId` member's
         // documentation): an alias is not an identifier this operation accepts, which is
-        // what its modelled `InvalidArnException` reports — as it does for an ARN that
-        // is not a KMS ARN at all.
+        // what its modelled `InvalidArnException` reports — judged on the identifier's
+        // own grammar, before any lookup, so the refusal reports the KIND of identifier
+        // and never whether this endpoint holds such an alias.
         if crate::state::names_an_alias(&input.key_id) {
-            return Err(invalid_arn(&input.key_id));
+            return Err(aliases_not_supported());
         }
         // Everything about the key this request is judged against: read once, so the
         // checks below do not hold a borrow of the store while it is being written.
@@ -436,30 +437,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let expires = expiration_model == crate::state::EXPIRATION_MODEL_EXPIRES;
         let valid_to = match (expires, input.valid_to) {
             (true, Some(requested)) => {
-                // Every step from the request's timestamp to an instant is CHECKED: a
-                // caller-chosen millisecond count can be negative or far past anything
-                // `SystemTime` can represent, and `SystemTime`'s `+` panics on
-                // overflow. A value that is not an instant at most the documented
-                // window ahead is refused, which is the same answer as one outside the
-                // window.
-                let millis = u64::try_from(requested.to_millis().unwrap_or_default()).ok();
-                let valid_to = millis
-                    .map(::std::time::Duration::from_millis)
+                // Which of the two rules a value breaks is decided on the SECOND the
+                // request carried, before anything is turned into an instant: a
+                // caller-chosen timestamp can be negative or far past anything
+                // `SystemTime` can represent, and one that is not representable is
+                // still on one side of "now" or the other. Both rules are therefore
+                // judged to the whole second — the window is 365 days wide, so a
+                // sub-second part of a timestamp cannot decide either of them. Every
+                // later step is checked, because `SystemTime`'s `+` panics on overflow.
+                let requested_secs = requested.secs();
+                let now = ::std::time::SystemTime::now();
+                let now_secs = now
+                    .duration_since(::std::time::SystemTime::UNIX_EPOCH)
+                    .map_or(0, |since| {
+                        i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+                    });
+                // The two sentences of that documentation are two separate rules, and
+                // each refusal states only the rule the request broke: a caller whose
+                // expiry has already passed is not told about a window it was nowhere
+                // near, and one past the window is not told its value is in the past.
+                // Neither sentence carries the rejected timestamp — the caller sent it.
+                if requested_secs <= now_secs {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "ValidTo must be in the future",
+                    ));
+                }
+                let valid_to = u64::try_from(requested_secs)
+                    .ok()
+                    .map(::std::time::Duration::from_secs)
                     .and_then(|since_epoch| {
                         ::std::time::SystemTime::UNIX_EPOCH.checked_add(since_epoch)
                     });
-                let now = ::std::time::SystemTime::now();
                 let longest = now.checked_add(::std::time::Duration::from_secs(
                     crate::state::MAX_IMPORTED_MATERIAL_VALIDITY_DAYS * 24 * 60 * 60,
                 ));
                 let within = match (valid_to, longest) {
-                    (Some(valid_to), Some(longest)) => valid_to > now && valid_to <= longest,
+                    (Some(valid_to), Some(longest)) => valid_to <= longest,
                     _ => false,
                 };
                 if !within {
                     return Err(crate::scaffolded::Scaffolded::validation(format!(
-                        "ValidTo must be a future date and time, at most {} days from the \
-                         request date.",
+                        "ValidTo must be at most {} days from the request date",
                         crate::state::MAX_IMPORTED_MATERIAL_VALIDITY_DAYS
                     )));
                 }
@@ -668,6 +686,15 @@ struct KeyFacts {
 fn invalid_arn(requested: &str) -> ImportKeyMaterialError {
     ImportKeyMaterialErrorModeled::InvalidArnException(InvalidArnException {
         message: Some(crate::state::invalid_arn_message(requested)),
+    })
+    .into()
+}
+
+/// Refuse an identifier that names an ALIAS, which this operation's `KeyId` does not
+/// accept ([`crate::state::ALIASES_NOT_SUPPORTED_MESSAGE`]).
+fn aliases_not_supported() -> ImportKeyMaterialError {
+    ImportKeyMaterialErrorModeled::InvalidArnException(InvalidArnException {
+        message: Some(crate::state::ALIASES_NOT_SUPPORTED_MESSAGE.to_string()),
     })
     .into()
 }

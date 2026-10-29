@@ -491,24 +491,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT.to_string()
                 });
 
-            for (key, algorithm, verb, asymmetric) in [
+            for (key, algorithm, asymmetric) in [
                 (
                     source_key,
                     source_algorithm.as_str(),
-                    "decrypt",
                     "ReEncrypt with an asymmetric source KMS key",
                 ),
                 (
                     destination_key,
                     destination_algorithm.as_str(),
-                    "encrypt",
                     "ReEncrypt with an asymmetric destination KMS key",
                 ),
             ] {
                 if let Some(refusal) = key_state_refusal(key) {
                     return Err(refusal);
                 }
-                if let Some(refusal) = capability_refusal(key, algorithm, verb, asymmetric) {
+                if let Some(refusal) =
+                    capability_refusal(key, algorithm, Self::NAME, asymmetric)
+                {
                     return Err(refusal);
                 }
             }
@@ -660,10 +660,13 @@ fn key_state_refusal(key: &crate::state::Cmk) -> Option<ReEncryptError> {
     )
 }
 
-/// Refuse a key that cannot perform `verb`, or an algorithm its key spec does not
-/// support: "for encrypting, decrypting, re-encrypting, and generating data keys, the
-/// KeyUsage must be ENCRYPT_DECRYPT"
-/// (`smithy_query(query="doc",shape="InvalidKeyUsageException")`).
+/// Refuse a key whose usage does not permit `operation`, or an algorithm its key spec
+/// does not support: "for encrypting, decrypting, re-encrypting, and generating data
+/// keys, the KeyUsage must be ENCRYPT_DECRYPT"
+/// (`smithy_query(query="doc",shape="InvalidKeyUsageException")`). Both halves of this
+/// operation are refused under the OPERATION's name, which is what a KeyUsage refusal
+/// names ([`crate::state::wrong_key_usage_message`]) — the caller called one operation,
+/// whichever of its two keys cannot serve it.
 ///
 /// An asymmetric ENCRYPT_DECRYPT key is a valid key for this operation, but it has no
 /// key pair here and the RSAES-OAEP / SM2PKE scheme it calls for is not implemented, so
@@ -672,28 +675,21 @@ fn key_state_refusal(key: &crate::state::Cmk) -> Option<ReEncryptError> {
 fn capability_refusal(
     key: &crate::state::Cmk,
     algorithm: &str,
-    verb: &str,
+    operation: &str,
     asymmetric: &str,
 ) -> Option<ReEncryptError> {
     if key.key_usage != crate::state::KEY_USAGE_ENCRYPT_DECRYPT {
-        return Some(invalid_key_usage(format!(
-            "{} has KeyUsage {}, which cannot be used to {verb}; it must be {}.",
-            key.arn,
-            key.key_usage,
-            crate::state::KEY_USAGE_ENCRYPT_DECRYPT
+        return Some(invalid_key_usage(crate::state::wrong_key_usage_message(
+            key, operation,
         )));
     }
     if key.key_spec != crate::state::KEY_SPEC_SYMMETRIC_DEFAULT {
         return Some(crate::scaffolded::Scaffolded::not_implemented(asymmetric));
     }
     if algorithm != crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT {
-        return Some(invalid_key_usage(format!(
-            "The encryption algorithm {algorithm} is incompatible with the key spec {} of \
-             {}; it must be {}.",
-            key.key_spec,
-            key.arn,
-            crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT
-        )));
+        return Some(invalid_key_usage(
+            crate::state::incompatible_algorithm_message(algorithm, &key.key_spec),
+        ));
     }
     None
 }

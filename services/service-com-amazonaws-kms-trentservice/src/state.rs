@@ -1363,35 +1363,76 @@ pub fn is_predefined_aws_alias(alias_name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
+/// Why an alias name is not one a caller may create.
+///
+/// Three rules, all from the member's own documentation
+/// (`smithy_query(query="doc",shape="CreateAliasRequest",member="AliasName")`): the
+/// value "must begin with alias/ followed by a name", so the prefix is required and
+/// what follows it may not be empty; and "the alias name cannot begin with
+/// alias/aws/", which is reserved for AWS managed keys.
+///
+/// They are kept APART because KMS answers them differently: a name that is not an
+/// alias name at all is a malformed request, while a name under the reserved
+/// namespace is a well-formed name that is not the caller's to take. A caller
+/// branching on the error code is what that distinction is for, so the classification
+/// lives here and each operation maps it onto its own error channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasNameRefusal {
+    /// The name does not begin with `alias/`, so it is not an alias name.
+    MissingPrefix,
+    /// The name is the prefix with no name after it.
+    EmptyName,
+    /// The name is under the `alias/aws/` namespace, which is reserved.
+    Reserved,
+}
+
+impl AliasNameRefusal {
+    /// How KMS words this refusal.
+    ///
+    /// Every sentence is FIXED text: what the request got wrong is the name as a
+    /// whole, which the caller already holds, so none of the three interpolates the
+    /// rejected value.
+    pub fn message(self) -> String {
+        match self {
+            Self::MissingPrefix => format!(
+                "Alias must start with the prefix \"{ALIAS_PREFIX}\". Please see \
+                 {ALIAS_GUIDE_URL}"
+            ),
+            Self::EmptyName => {
+                format!("Alias must have a name after the prefix \"{ALIAS_PREFIX}\".")
+            }
+            // Fixed text, naming neither the alias nor the key: the namespace is the
+            // whole of what the request got wrong.
+            Self::Reserved => {
+                "The alias name for a customer managed CMK cannot begin with alias/aws/."
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// Where KMS points a caller whose alias name is not an alias name: the aliases page
+/// of the Key Management Service Developer Guide, which the `AliasName` member's own
+/// documentation names as the reference for the rule.
+const ALIAS_GUIDE_URL: &str = "https://docs.aws.amazon.com/kms/latest/developerguide/kms-alias.html";
+
 /// Whether `alias_name` is a name a caller may create, and why not when it is not.
 ///
-/// Two rules, both from the member's own documentation
-/// (`smithy_query(query="doc",shape="CreateAliasRequest",member="AliasName")`):
-/// the value "must begin with alias/ followed by a name", so the prefix is required
-/// and what follows it may not be empty; and "the alias name cannot begin with
-/// alias/aws/", which is reserved for AWS managed keys. The character set and the
-/// 1..256 length are modelled, so the boundary validator has already refused
-/// anything outside them before this is reached.
+/// The character set and the 1..256 length are modelled, so the boundary validator has
+/// already refused anything outside them before this is reached; what is left are the
+/// rules of [`AliasNameRefusal`].
 ///
-/// One function for the whole service, so no two alias operations judge the same
-/// name differently. The sentences are examples of KMS's; what this pins is WHICH
-/// names are refused, and the refusal names the value the request gave.
-pub fn validate_alias_name(alias_name: &str) -> Result<(), String> {
+/// One function for the whole service, so no two alias operations judge the same name
+/// differently.
+pub fn validate_alias_name(alias_name: &str) -> Result<(), AliasNameRefusal> {
     let Some(name) = alias_name.strip_prefix(ALIAS_PREFIX) else {
-        return Err(format!(
-            "Alias must start with the prefix \"{ALIAS_PREFIX}\". Found: {alias_name}"
-        ));
+        return Err(AliasNameRefusal::MissingPrefix);
     };
     if name.is_empty() {
-        return Err(format!(
-            "Alias must have a name after the prefix \"{ALIAS_PREFIX}\". Found: {alias_name}"
-        ));
+        return Err(AliasNameRefusal::EmptyName);
     }
     if alias_name.starts_with(ALIAS_PREFIX_AWS_MANAGED) {
-        return Err(format!(
-            "Aliases beginning with \"{ALIAS_PREFIX_AWS_MANAGED}\" are reserved for Amazon Web \
-             Services managed keys. Found: {alias_name}"
-        ));
+        return Err(AliasNameRefusal::Reserved);
     }
     Ok(())
 }
@@ -4222,6 +4263,52 @@ pub fn date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
 /// identifier differently.
 pub fn invalid_arn_message(requested: &str) -> String {
     format!("The specified ARN is not valid: {requested}.")
+}
+
+/// How an identifier that names an ALIAS is refused by an operation whose `KeyId`
+/// takes a key id or key ARN only.
+///
+/// The KIND of identifier is what is wrong with such a request, which KMS judges from
+/// the identifier's grammar BEFORE it looks anything up — so the sentence is fixed and
+/// names neither the alias nor whether this endpoint holds one. Ordering it before the
+/// lookup is what keeps the refusal from reporting the existence of an alias to a
+/// caller this operation would never serve one to.
+///
+/// One constant for the whole service, so no two operations word the same refusal
+/// differently.
+pub const ALIASES_NOT_SUPPORTED_MESSAGE: &str = "Key Aliases are not supported for this operation.";
+
+/// How KMS refuses an operation on a key whose `KeyUsage` does not permit it: "the
+/// KeyUsage value of the KMS key is incompatible with the API operation"
+/// (`smithy_query(query="doc",shape="InvalidKeyUsageException")`).
+///
+/// The sentence names the key by its ARN, the usage the key carries and the operation
+/// that refused it — the three facts a caller needs to see which of the two is wrong,
+/// the key or the call — and nothing else.
+///
+/// One function for the whole service, so no two cryptographic operations word this
+/// refusal differently.
+pub fn wrong_key_usage_message(key: &Cmk, operation: &str) -> String {
+    format!(
+        "{} key usage is {} which is not valid for {operation}.",
+        key.arn, key.key_usage
+    )
+}
+
+/// How KMS refuses an algorithm the key's own key spec does not support: the
+/// algorithm "specified for the operation is incompatible with the type of key
+/// material in the KMS key (KeySpec)"
+/// (`smithy_query(query="doc",shape="InvalidKeyUsageException")`).
+///
+/// The sentence names the algorithm the request asked for and the key spec it is
+/// incompatible with — the pair that is in conflict — and not the key: a caller who
+/// named the key already holds its identifier, and which algorithms a key spec
+/// supports is what `DescribeKey` reports.
+///
+/// One function for the whole service, so an encryption algorithm, a signing
+/// algorithm and a MAC algorithm are all refused in the same words.
+pub fn incompatible_algorithm_message(algorithm: &str, key_spec: &str) -> String {
+    format!("Algorithm {algorithm} is incompatible with key spec {key_spec}.")
 }
 
 /// How a refusal caused by the key's own key state is worded.

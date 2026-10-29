@@ -365,11 +365,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // key spec supports
         // (`smithy_query(query="doc",shape="InvalidKeyUsageException")`).
         if key.key_usage != crate::state::KEY_USAGE_ENCRYPT_DECRYPT {
-            return Err(invalid_key_usage(format!(
-                "{} has KeyUsage {}, which cannot be used to encrypt; it must be {}.",
-                key.arn,
-                key.key_usage,
-                crate::state::KEY_USAGE_ENCRYPT_DECRYPT
+            return Err(invalid_key_usage(crate::state::wrong_key_usage_message(
+                key,
+                Self::NAME,
             )));
         }
         // The AES-GCM encryption this service performs is what a `SYMMETRIC_DEFAULT`
@@ -388,13 +386,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .unwrap_or_else(|| crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT.to_string());
         if algorithm != crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT {
-            return Err(invalid_key_usage(format!(
-                "The encryption algorithm {algorithm} is incompatible with the key spec {} \
-                 of {}; it must be {}.",
-                key.key_spec,
-                key.arn,
-                crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT
-            )));
+            return Err(invalid_key_usage(
+                crate::state::incompatible_algorithm_message(&algorithm, &key.key_spec),
+            ));
         }
 
         // "The request was rejected because the DryRun parameter was specified"

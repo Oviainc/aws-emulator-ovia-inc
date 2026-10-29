@@ -596,24 +596,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // data keys, the KeyUsage must be ENCRYPT_DECRYPT"
         // (`smithy_query(query="doc",shape="InvalidKeyUsageException")`).
         let Some(supported) = key.algorithms_under(crate::state::KEY_USAGE_ENCRYPT_DECRYPT) else {
-            return Err(invalid_key_usage(format!(
-                "{} has KeyUsage {}, which cannot be used to decrypt; it must be {}.",
-                key.arn,
-                key.key_usage,
-                crate::state::KEY_USAGE_ENCRYPT_DECRYPT
+            return Err(invalid_key_usage(crate::state::wrong_key_usage_message(
+                key,
+                Self::NAME,
             )));
         };
         if !supported.contains(&algorithm) {
-            let requirement = if let [only] = supported.as_slice() {
-                format!("it must be {only}")
-            } else {
-                format!("it must be one of {}", supported.join(", "))
-            };
-            return Err(invalid_key_usage(format!(
-                "The encryption algorithm {algorithm} is incompatible with the key spec {} \
-                 of {}; {requirement}.",
-                key.key_spec, key.arn
-            )));
+            return Err(invalid_key_usage(
+                crate::state::incompatible_algorithm_message(&algorithm, &key.key_spec),
+            ));
         }
 
         if input.dry_run == Some(true) {

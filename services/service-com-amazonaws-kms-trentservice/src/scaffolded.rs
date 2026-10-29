@@ -238,6 +238,69 @@ impl SerializableStruct for AccessDeniedException {
     }
 }
 
+/// The `message` member of the synthetic `NotAuthorizedException` error shape.
+static NOT_AUTHORIZED_EXCEPTION_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#NotAuthorizedException$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `NotAuthorizedException` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the
+/// shape is not in any service's model, so it must not collide with a modeled one.
+/// KMS answers a request for a NAMESPACE that is not the caller's — a name only the
+/// service itself may hold — with `NotAuthorizedException`, which its model declares
+/// nowhere, so an operation that must refuse one has no modeled error to reach for.
+/// It is distinct from [`AccessDeniedException`], which is what a caller holding no
+/// permission for a resource is refused with.
+pub static NOT_AUTHORIZED_EXCEPTION_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#NotAuthorizedException",
+        "smithy.framework",
+        "NotAuthorizedException",
+    ),
+    ShapeType::Structure,
+    &[&NOT_AUTHORIZED_EXCEPTION_MESSAGE],
+);
+
+/// The payload of a `NotAuthorizedException`: why the request is not one this caller
+/// may make.
+#[derive(Debug, Clone)]
+pub struct NotAuthorizedException {
+    pub message: String,
+}
+
+impl NotAuthorizedException {
+    /// A `NotAuthorizedException` carrying `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for NotAuthorizedException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NotAuthorizedException: {}", self.message)
+    }
+}
+
+impl std::error::Error for NotAuthorizedException {}
+
+impl SerializableStruct for NotAuthorizedException {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&NOT_AUTHORIZED_EXCEPTION_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -262,6 +325,9 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// The request asks for something only the service itself may do. Renders as HTTP
+    /// 400 with the error code `NotAuthorizedException`.
+    NotAuthorizedException(NotAuthorizedException),
 }
 
 impl<E> Scaffolded<E> {
@@ -299,6 +365,19 @@ impl<E> Scaffolded<E> {
     /// error.
     pub fn access_denied(message: impl Into<String>) -> Self {
         Self::AccessDeniedException(AccessDeniedException::new(message))
+    }
+
+    /// Refuse the request as one only the service itself may make, with HTTP 400
+    /// `NotAuthorizedException`.
+    ///
+    /// Reach for this where the request is well formed and names a resource whose
+    /// NAMESPACE belongs to the service rather than to any caller, and the model
+    /// declares no error for it. It is not a substitute for [`Self::validation`] — a
+    /// value that is not a legal value at all is a bad request, not an authorization
+    /// decision — nor for [`Self::access_denied`], which answers a caller whose
+    /// permission for a resource of their own does not cover the call.
+    pub fn not_authorized(message: impl Into<String>) -> Self {
+        Self::NotAuthorizedException(NotAuthorizedException::new(message))
     }
 }
 
@@ -341,6 +420,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::Modeled(e) => write!(f, "{e}"),
             Self::AccessDeniedException(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::NotAuthorizedException(e) => write!(f, "{e}"),
         }
     }
 }
@@ -354,6 +434,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::Modeled(e) => e.source(),
             Self::AccessDeniedException(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::NotAuthorizedException(e) => e.source(),
         }
     }
 }
@@ -369,6 +450,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.as_serializable(),
             Self::AccessDeniedException(e) => e,
             Self::ValidationException(e) => e,
+            Self::NotAuthorizedException(e) => e,
         }
     }
 
@@ -378,6 +460,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.variant_schema(),
             Self::AccessDeniedException(_) => &ACCESS_DENIED_EXCEPTION_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::NotAuthorizedException(_) => &NOT_AUTHORIZED_EXCEPTION_SCHEMA,
         }
     }
 
@@ -391,6 +474,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.shape_name(),
             Self::AccessDeniedException(_) => "AccessDeniedException",
             Self::ValidationException(_) => "ValidationException",
+            Self::NotAuthorizedException(_) => "NotAuthorizedException",
         }
     }
 
@@ -404,7 +488,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => wire_status(e.http_status()),
-            Self::AccessDeniedException(_) | Self::ValidationException(_) => 400,
+            Self::AccessDeniedException(_)
+            | Self::ValidationException(_)
+            | Self::NotAuthorizedException(_) => 400,
         }
     }
 
@@ -416,7 +502,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shapes carry no `awsQueryError` trait.
-            Self::AccessDeniedException(_) | Self::ValidationException(_) => None,
+            Self::AccessDeniedException(_)
+            | Self::ValidationException(_)
+            | Self::NotAuthorizedException(_) => None,
         }
     }
 }

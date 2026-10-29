@@ -328,21 +328,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // does no MACing at all is refused for being the wrong kind of key rather than
         // for the algorithm the request happened to name.
         if key.key_usage != crate::state::KEY_USAGE_GENERATE_VERIFY_MAC {
-            return Err(invalid_key_usage(format!(
-                "{} key usage is {} which is not valid for {}.",
-                key.arn,
-                key.key_usage,
-                Self::NAME
+            return Err(invalid_key_usage(crate::state::wrong_key_usage_message(
+                key,
+                Self::NAME,
             )));
         }
         let algorithms = key
             .algorithms_under(crate::state::KEY_USAGE_GENERATE_VERIFY_MAC)
             .unwrap_or_default();
         if !algorithms.contains(&input.mac_algorithm) {
-            return Err(invalid_key_usage(format!(
-                "Algorithm {} is incompatible with key spec {}.",
-                input.mac_algorithm, key.key_spec
-            )));
+            return Err(invalid_key_usage(
+                crate::state::incompatible_algorithm_message(
+                    &input.mac_algorithm,
+                    &key.key_spec,
+                ),
+            ));
         }
 
         // "The request was rejected because the DryRun parameter was specified"

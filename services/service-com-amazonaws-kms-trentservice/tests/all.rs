@@ -101,6 +101,8 @@ mod random_bytes;
 mod re_encrypt;
 #[path = "all/refusal_and_rotation_contracts.rs"]
 mod refusal_and_rotation_contracts;
+#[path = "all/refusal_fidelity.rs"]
+mod refusal_fidelity;
 #[path = "all/replicate_key.rs"]
 mod replicate_key;
 #[path = "all/resource_tags.rs"]

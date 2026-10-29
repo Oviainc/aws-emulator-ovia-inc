@@ -487,7 +487,8 @@ async fn get_key_last_usage_refuses_the_identifiers_it_cannot_resolve() {
     }
 
     // "Alias names are not supported": an alias is well formed, and is not an
-    // identifier this operation accepts.
+    // identifier this operation accepts — a judgement on the identifier's KIND, which
+    // is why the refusal states the rule and names nothing of this endpoint.
     for identifier in [
         "alias/aliases-are-not-supported".to_string(),
         format!("arn:aws:kms:{REGION}:{account}:alias/aliases-are-not-supported"),
@@ -508,9 +509,8 @@ async fn get_key_last_usage_refuses_the_identifiers_it_cannot_resolve() {
             "case {identifier:?}: expected InvalidArnException for an alias, got {code:?}"
         );
         assert_eq!(
-            message,
-            format!("The specified ARN is not valid: {identifier}."),
-            "case {identifier:?}: expected the refusal to name the identifier, got {message:?}"
+            message, "Key Aliases are not supported for this operation.",
+            "case {identifier:?}: expected the refusal to state the rule, got {message:?}"
         );
     }
 

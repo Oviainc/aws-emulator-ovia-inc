@@ -269,16 +269,13 @@ async fn an_identifier_that_names_no_importable_key_is_refused_and_mints_nothing
             "an alias name",
             "alias/importable".to_string(),
             "InvalidArnException",
-            "The specified ARN is not valid: alias/importable.".to_string(),
+            "Key Aliases are not supported for this operation.".to_string(),
         ),
         (
             "an alias ARN",
             alias_arn(REGION, "alias/importable"),
             "InvalidArnException",
-            format!(
-                "The specified ARN is not valid: {}.",
-                alias_arn(REGION, "alias/importable")
-            ),
+            "Key Aliases are not supported for this operation.".to_string(),
         ),
         (
             "an ARN that is no KMS key ARN",

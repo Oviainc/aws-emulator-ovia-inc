@@ -205,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::names_an_alias(&input.key_id) {
             return Err(GetKeyLastUsageErrorModeled::InvalidArnException(
                 InvalidArnException {
-                    message: Some(crate::state::invalid_arn_message(&input.key_id)),
+                    message: Some(crate::state::ALIASES_NOT_SUPPORTED_MESSAGE.to_string()),
                 },
             )
             .into());

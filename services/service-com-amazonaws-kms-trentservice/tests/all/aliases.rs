@@ -19,8 +19,8 @@
 use serde_json::{json, Value};
 
 use super::harness::{
-    alias_arn, call, create_alias, create_alias_in, create_key, describe, error_code, failure,
-    failure_in, ok, ok_in, router, text, REGION,
+    alias_arn, call, create_alias, create_alias_in, create_key, describe, error_code,
+    error_message, failure, failure_in, ok, ok_in, router, text, REGION,
 };
 
 /// One row of the "which key states accept alias management" table: the case name,
@@ -250,50 +250,88 @@ async fn a_key_may_have_many_aliases_but_a_name_names_one_key() {
     );
 }
 
-/// A name a caller may not create is refused with `InvalidAliasNameException`, and
-/// nothing is persisted under it.
+/// A name a caller may not create is refused — each rule with the error code and the
+/// sentence KMS answers it with — and nothing is persisted under it.
 ///
-/// The rows are the two rules the model cannot express
+/// The rows are the three rules the model cannot express
 /// (`smithy_query(query="doc",shape="CreateAliasRequest",member="AliasName")`): the
 /// value "must begin with alias/ followed by a name", and "the alias name cannot
-/// begin with alias/aws/". Each row also says whether the refused name is a
-/// PREDEFINED Amazon Web Services alias (`aws/<service-name>`), which `DescribeKey`
-/// associates with an Amazon Web Services managed key of its own — never with the
-/// caller's target key.
+/// begin with alias/aws/". KMS tells them apart by the error CODE: a value that is not
+/// an alias name at all is a malformed request (`ValidationException`), a prefix with
+/// no name after it is `InvalidAliasNameException` ("the specified alias name is not
+/// valid"), and the reserved namespace is not the caller's to take at all
+/// (`NotAuthorizedException`). No sentence carries the rejected name: the caller sent
+/// it.
+///
+/// Each row also says whether the refused name is a PREDEFINED Amazon Web Services
+/// alias (`aws/<service-name>`), which `DescribeKey` associates with an Amazon Web
+/// Services managed key of its own — never with the caller's target key.
 #[tokio::test]
 async fn an_alias_name_outside_the_documented_rules_is_refused() {
     let router = router();
     let metadata = create_key(&router, &json!({"Description": "target"})).await;
     let key_id = text("setup", &metadata, "KeyId");
 
-    let names: Vec<(&str, String, bool)> = vec![
-        ("no prefix at all", "plain-name".to_string(), false),
-        ("prefix in the middle", "my/alias/name".to_string(), false),
-        ("prefix without its slash", "alias".to_string(), false),
-        ("prefix with nothing after it", "alias/".to_string(), false),
-        ("prefix in the wrong case", "ALIAS/name".to_string(), false),
-        ("reserved AWS-managed prefix", "alias/aws/elasticache".to_string(), true),
-        ("reserved prefix with nothing after it", "alias/aws/".to_string(), false),
+    let missing_prefix = (
+        "ValidationException",
+        "Alias must start with the prefix \"alias/\". Please see \
+         https://docs.aws.amazon.com/kms/latest/developerguide/kms-alias.html",
+    );
+    let empty_name = (
+        "InvalidAliasNameException",
+        "Alias must have a name after the prefix \"alias/\".",
+    );
+    let reserved = (
+        "NotAuthorizedException",
+        "The alias name for a customer managed CMK cannot begin with alias/aws/.",
+    );
+
+    let names: Vec<(&str, String, bool, (&str, &str))> = vec![
+        ("no prefix at all", "plain-name".to_string(), false, missing_prefix),
+        ("prefix in the middle", "my/alias/name".to_string(), false, missing_prefix),
+        ("prefix without its slash", "alias".to_string(), false, missing_prefix),
+        ("prefix in the wrong case", "ALIAS/name".to_string(), false, missing_prefix),
+        ("prefix with nothing after it", "alias/".to_string(), false, empty_name),
+        (
+            "reserved AWS-managed prefix",
+            "alias/aws/elasticache".to_string(),
+            true,
+            reserved,
+        ),
+        (
+            "reserved prefix with nothing after it",
+            "alias/aws/".to_string(),
+            false,
+            reserved,
+        ),
         (
             "reserved prefix, deeper name",
             "alias/aws/team/project".to_string(),
             false,
+            reserved,
         ),
     ];
-    for (case, alias, predefined) in names {
-        let (status, code) = failure(
+    for (case, alias, predefined, (expected_code, expected_message)) in names {
+        let (status, payload) = call(
             &router,
+            REGION,
             "CreateAlias",
             &json!({"AliasName": alias, "TargetKeyId": key_id}),
         )
         .await;
         assert_eq!(
             status, 400,
-            "case {case}: expected HTTP 400, got {status} ({code})"
+            "case {case}: expected HTTP 400, got {status} with {payload}"
         );
         assert_eq!(
-            code, "InvalidAliasNameException",
-            "case {case}: expected InvalidAliasNameException, got {code}"
+            error_code(&payload),
+            expected_code,
+            "case {case}: expected {expected_code}, got {payload}"
+        );
+        assert_eq!(
+            error_message(&payload),
+            expected_message,
+            "case {case}: expected {expected_message:?}, got {payload}"
         );
         let (status, payload) = call(&router, REGION, "DescribeKey", &json!({"KeyId": alias})).await;
         if predefined {

@@ -45,6 +45,9 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Which members of this service a refusal states no value for, read from the model.
+pub mod sensitive_members;
+
 /// The `com-amazonaws-kms-trentservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -105,8 +108,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // for the rest. Replace BOTH the code and the message: a client branches
         // on the code, so a message without its matching code is worse than
         // leaving both alone.
-        let _ = refusal;
-        None
+        //
+        // One rewording is wired in here: a constraint refusal is stated the way AWS
+        // states it by the shared renderer every service on this protocol uses
+        // (`service_common::validation_message`), with the clause for a member this
+        // service does not disclose the value of stating no value at all. WHICH members
+        // those are is this service's own model's `@sensitive`, read by
+        // [`sensitive_members`]; the code, the envelope, the member paths and every
+        // requirement stay the shared renderer's and the framework's.
+        //
+        // A `@pattern` requirement is quoted as the MODEL writes it, anchors included:
+        // that is what this service's recorded refusal of an alias name outside
+        // `AliasNameType`'s pattern carries, so the expression passes through unchanged
+        // rather than through the unanchoring other services' recordings show.
+        ::service_common::validation_message::aws_validation_refusal_withholding_with(
+            refusal,
+            |pattern: &str| pattern.to_string(),
+            sensitive_members::withholds_value,
+        )
     }
 
     fn override_routing_error(

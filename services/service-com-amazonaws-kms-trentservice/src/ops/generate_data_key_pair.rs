@@ -539,12 +539,9 @@ fn sealing_key<'a>(
     // KeyUsage must be ENCRYPT_DECRYPT"
     // (`smithy_query(query="doc",shape="InvalidKeyUsageException")`).
     if key.key_usage != crate::state::KEY_USAGE_ENCRYPT_DECRYPT {
-        return Err(invalid_key_usage(format!(
-            "{} has KeyUsage {}, which cannot be used to generate a data key pair; it must \
-             be {}.",
-            key.arn,
-            key.key_usage,
-            crate::state::KEY_USAGE_ENCRYPT_DECRYPT
+        return Err(invalid_key_usage(crate::state::wrong_key_usage_message(
+            key,
+            OPERATION_NAME,
         )));
     }
     // "To generate a data key pair, you must specify a symmetric encryption KMS key to

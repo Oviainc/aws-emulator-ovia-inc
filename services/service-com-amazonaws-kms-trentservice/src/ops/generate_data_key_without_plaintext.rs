@@ -368,12 +368,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // KeyUsage must be ENCRYPT_DECRYPT"
         // (`smithy_query(query="doc",shape="InvalidKeyUsageException")`).
         if key.key_usage != crate::state::KEY_USAGE_ENCRYPT_DECRYPT {
-            return Err(invalid_key_usage(format!(
-                "{} has KeyUsage {}, which cannot be used to generate a data key; it must \
-                 be {}.",
-                key.arn,
-                key.key_usage,
-                crate::state::KEY_USAGE_ENCRYPT_DECRYPT
+            return Err(invalid_key_usage(crate::state::wrong_key_usage_message(
+                key,
+                Self::NAME,
             )));
         }
         // "To generate a data key, you must specify the symmetric encryption KMS key

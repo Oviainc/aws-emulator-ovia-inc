@@ -510,7 +510,7 @@ async fn replicate_key_refuses_what_it_cannot_replicate() {
             REGION,
             json!({"KeyId": "alias/single-region", "ReplicaRegion": "ap-south-1"}),
             400,
-            "UnsupportedOperationException",
+            "InvalidArnException",
         ),
         (
             "a replica key is not the primary key of its set",
@@ -699,12 +699,15 @@ async fn the_refusals_name_what_they_refuse() {
     }
 
     // A key that is not part of a multi-Region set at all is refused by the ARN the
-    // identifier resolved to, in every form a `KeyId` member accepts for it.
+    // identifier resolved to, in each form of identifier this operation accepts for it:
+    // a key id and a key ARN. An ALIAS is not one of them ("specify the key ID or key
+    // ARN of a multi-Region primary key"), and is refused for its KIND before anything
+    // is resolved — asserted by `an_alias_is_not_an_identifier_this_operation_accepts`.
     let single = create_key(&router, &json!({"Description": "single"})).await;
     let key_id = text("setup", &single, "KeyId");
     let arn = text("setup", &single, "Arn");
     create_alias(&router, "setup", "alias/not-in-a-set", &key_id).await;
-    for identifier in [key_id.clone(), arn.clone(), "alias/not-in-a-set".to_string()] {
+    for identifier in [key_id.clone(), arn.clone()] {
         let (status, payload) = call(
             &router,
             REGION,

@@ -370,12 +370,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !PUBLIC_KEY_USAGES.contains(&key.key_usage.as_str()) {
             return Err(GetPublicKeyErrorModeled::InvalidKeyUsageException(
                 InvalidKeyUsageException {
-                    message: Some(format!(
-                        "{} has KeyUsage {}, which has no public key; it must be {}.",
-                        key.arn,
-                        key.key_usage,
-                        PUBLIC_KEY_USAGES.join(" or ")
-                    )),
+                    message: Some(crate::state::wrong_key_usage_message(key, Self::NAME)),
                 },
             )
             .into());

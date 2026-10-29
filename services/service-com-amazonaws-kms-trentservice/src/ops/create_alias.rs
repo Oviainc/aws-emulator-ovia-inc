@@ -214,15 +214,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The alias name's character set and its 1..256 length are modelled, so what
-        // is left to judge is the two rules the model cannot express: the required
-        // `alias/` prefix, and the `alias/aws/` prefix reserved for AWS managed keys.
-        if let Err(reason) = crate::state::validate_alias_name(&input.alias_name) {
-            return Err(CreateAliasErrorModeled::InvalidAliasNameException(
-                InvalidAliasNameException {
-                    message: Some(reason),
-                },
-            )
-            .into());
+        // is left to judge is the three rules the model cannot express: the required
+        // `alias/` prefix, a name after it, and the `alias/aws/` prefix reserved for
+        // AWS managed keys. KMS answers each with its own error code, because they are
+        // different kinds of refusal: a value that is not an alias name at all is a
+        // malformed request (`ValidationException`, the synthetic 400 — this operation
+        // models no client-input error), a prefix with no name after it is the
+        // modelled `InvalidAliasNameException` ("the specified alias name is not
+        // valid"), and the reserved namespace is not the caller's to take at all,
+        // which KMS reports as an authorization fault (`NotAuthorizedException`, a
+        // code this model declares nowhere). A client telling a reserved-namespace
+        // attempt from a malformed name branches on exactly that code.
+        if let Err(refusal) = crate::state::validate_alias_name(&input.alias_name) {
+            let message = refusal.message();
+            return Err(match refusal {
+                crate::state::AliasNameRefusal::MissingPrefix => {
+                    crate::scaffolded::Scaffolded::validation(message)
+                }
+                crate::state::AliasNameRefusal::EmptyName => {
+                    CreateAliasErrorModeled::InvalidAliasNameException(InvalidAliasNameException {
+                        message: Some(message),
+                    })
+                    .into()
+                }
+                crate::state::AliasNameRefusal::Reserved => {
+                    crate::scaffolded::Scaffolded::not_authorized(message)
+                }
+            });
         }
 
         // "Specify the key ID or key ARN of the KMS key"

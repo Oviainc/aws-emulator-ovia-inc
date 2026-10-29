@@ -235,10 +235,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Specify the key ID or key ARN of the KMS key"
         // (`smithy_query(query="doc",shape="GetParametersForImportRequest",member="KeyId")`):
         // an alias is not an identifier this operation accepts, which is what its
-        // modelled `InvalidArnException` reports — as it does for an ARN that is not a
-        // KMS ARN at all.
+        // modelled `InvalidArnException` reports — judged on the identifier's own
+        // grammar, before any lookup, so the refusal reports the KIND of identifier and
+        // never whether this endpoint holds such an alias.
         if crate::state::names_an_alias(&input.key_id) {
-            return Err(invalid_arn(&input.key_id));
+            return Err(aliases_not_supported());
         }
 
         // Every check is made against the store BEFORE the key pair is generated, and
@@ -387,6 +388,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn invalid_arn(requested: &str) -> GetParametersForImportError {
     GetParametersForImportErrorModeled::InvalidArnException(InvalidArnException {
         message: Some(crate::state::invalid_arn_message(requested)),
+    })
+    .into()
+}
+
+/// Refuse an identifier that names an ALIAS, which this operation's `KeyId` does not
+/// accept ([`crate::state::ALIASES_NOT_SUPPORTED_MESSAGE`]).
+fn aliases_not_supported() -> GetParametersForImportError {
+    GetParametersForImportErrorModeled::InvalidArnException(InvalidArnException {
+        message: Some(crate::state::ALIASES_NOT_SUPPORTED_MESSAGE.to_string()),
     })
     .into()
 }

@@ -220,6 +220,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
+
+        // "Specify the key ID or key ARN of a multi-Region primary key"
+        // (`smithy_query(query="doc",shape="UpdatePrimaryRegionRequest",member="KeyId")`)
+        // — an identifier that names an ALIAS is not one this operation accepts, judged
+        // on the identifier's own grammar before anything is looked up, exactly as
+        // `ReplicateKey` judges the same member.
+        if crate::state::names_an_alias(&input.key_id) {
+            return Err(UpdatePrimaryRegionErrorModeled::InvalidArnException(
+                InvalidArnException {
+                    message: Some(crate::state::ALIASES_NOT_SUPPORTED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
         let key = match state.resolve(&region, &input.key_id) {
             crate::state::KeyRef::Found(key) => key,
             crate::state::KeyRef::UnauthorizedAccount => {

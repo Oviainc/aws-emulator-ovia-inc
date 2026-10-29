@@ -267,8 +267,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Specify the key ID or key ARN of a multi-Region primary key"
         // (`smithy_query(query="doc",shape="ReplicateKeyRequest",member="KeyId")`) —
-        // resolved against the Region the request was signed for, since the primary
-        // key is replicated from its OWN Region's endpoint.
+        // so an identifier that names an ALIAS is not an identifier this operation
+        // accepts, whatever it points at. That is a judgement on the identifier's own
+        // grammar, which is why it is made BEFORE anything is looked up: a caller is
+        // told the identifier kind is wrong (never retry, fix the call) rather than
+        // that a resource is missing (create it, or retry), and the refusal discloses
+        // nothing about whether this endpoint holds such an alias.
+        if crate::state::names_an_alias(&input.key_id) {
+            return Err(ReplicateKeyErrorModeled::InvalidArnException(
+                InvalidArnException {
+                    message: Some(crate::state::ALIASES_NOT_SUPPORTED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The primary key is resolved against the Region the request was signed for,
+        // since the primary key is replicated from its OWN Region's endpoint.
         let key = match state.resolve(&region, &input.key_id) {
             crate::state::KeyRef::Found(key) => key,
             crate::state::KeyRef::UnauthorizedAccount => {

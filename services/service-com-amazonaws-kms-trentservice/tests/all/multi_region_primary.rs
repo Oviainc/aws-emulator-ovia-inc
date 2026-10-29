@@ -323,7 +323,7 @@ async fn update_primary_region_refuses_what_it_cannot_promote() {
             "alias/single-region".to_string(),
             REPLICA_REGIONS[2],
             400,
-            "UnsupportedOperationException",
+            "InvalidArnException",
         ),
         (
             "a key id no key of this Region has",
@@ -453,8 +453,12 @@ async fn the_refusal_of_a_single_region_key_names_it_by_its_arn() {
         let alias = format!("alias/single-{index}");
         create_alias(&router, case, &alias, &key_id).await;
 
-        // Each identifier form a `KeyId` member accepts for this key.
-        for identifier in [key_id.clone(), arn.clone(), alias.clone()] {
+        // Each identifier form this operation accepts for a key: "specify the key ID or
+        // key ARN of a multi-Region primary key". An alias is not one of them, and is
+        // refused for its KIND before anything is resolved (see the alias row of
+        // `update_primary_region_refuses_what_it_cannot_promote`), so the alias created
+        // above is what proves the key is reachable by one, not an input of this rule.
+        for identifier in [key_id.clone(), arn.clone()] {
             let (status, payload) = call(
                 &router,
                 REGION,

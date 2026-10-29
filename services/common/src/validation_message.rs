@@ -402,6 +402,22 @@ pub fn aws_validation_refusal_withholding(
     stated_refusal(refusal, unanchored, withholds_value)
 }
 
+/// [`aws_validation_refusal_withholding`], with the `@pattern` rendering chosen by the
+/// caller too — the one entry point that takes BOTH of the choices a service makes here.
+///
+/// A service needs it when its recordings show a `@pattern` requirement quoted other than
+/// [`unanchored`] — as the model writes it, anchors included, is one such rendering, which
+/// `|pattern: &str| pattern.to_string()` states — AND its model marks members `@sensitive`.
+/// Everything neither choice covers is the same [`stated_refusal`] body every other entry
+/// point here runs, so no combination of the two can drift into a second envelope.
+pub fn aws_validation_refusal_withholding_with(
+    refusal: &Refusal,
+    quote_pattern: impl Fn(&str) -> String,
+    withholds_value: impl Fn(&str) -> bool,
+) -> Option<Refused> {
+    stated_refusal(refusal, quote_pattern, withholds_value)
+}
+
 /// [`aws_validation_refusal`], with the `@pattern` rendering CHOSEN by the caller.
 ///
 /// Everything a service does not choose — which refusals are restated, which violations are
@@ -468,8 +484,8 @@ fn stated_refusal(
 mod tests {
     use super::{
         aws_validation_refusal, aws_validation_refusal_with, aws_validation_refusal_withholding,
-        enum_value_not_found, map_key_refusal, pattern_mismatch, property_count_refusal,
-        string_too_long, string_too_short,
+        aws_validation_refusal_withholding_with, enum_value_not_found, map_key_refusal,
+        pattern_mismatch, property_count_refusal, string_too_long, string_too_short,
     };
     use crate::validation::unanchored_grouping_alternation;
     use aws_smithy_schema_server::{Violation, ViolationKind};
@@ -796,6 +812,77 @@ mod tests {
             "expected {expected:?}, got {:?}",
             stated.message
         );
+    }
+
+    /// RULE: the entry point that takes BOTH choices applies both — the caller's
+    /// `@pattern` rendering and its withholding — over the one envelope every other entry
+    /// point here renders.
+    ///
+    /// The rows differ in which of the two choices each clause exercises: a withheld
+    /// member outside its pattern loses its value half AND keeps the expression as the
+    /// caller quotes it, while a member neither choice touches keeps both halves.
+    #[test]
+    fn both_choices_apply_over_the_one_envelope() {
+        // The rendering a service whose recordings quote the model's expression verbatim
+        // passes, anchors included.
+        let as_written = |pattern: &str| pattern.to_owned();
+        // (case, the violations, the message stated)
+        let rows: [(&str, Vec<Violation>, &str); 3] = [
+            (
+                "a withheld member outside its pattern",
+                vec![violation(
+                    "secret",
+                    ViolationKind::Pattern("^[a-z]+$".to_owned()),
+                    "A B",
+                )],
+                "1 validation error detected: Value at 'secret' failed to satisfy constraint: \
+                 Member must satisfy regular expression pattern: ^[a-z]+$",
+            ),
+            (
+                "a member neither choice touches",
+                vec![violation(
+                    "name",
+                    ViolationKind::Pattern("^[a-z]+$".to_owned()),
+                    "A B",
+                )],
+                "1 validation error detected: Value 'A B' at 'name' failed to satisfy \
+                 constraint: Member must satisfy regular expression pattern: ^[a-z]+$",
+            ),
+            (
+                "both in one envelope",
+                vec![
+                    violation("secret", ViolationKind::MinLength(4), "ab"),
+                    violation(
+                        "name",
+                        ViolationKind::Pattern("^[a-z]+$".to_owned()),
+                        "A B",
+                    ),
+                ],
+                "2 validation errors detected: Value at 'secret' failed to satisfy constraint: \
+                 Member must have length greater than or equal to 4; Value 'A B' at 'name' \
+                 failed to satisfy constraint: Member must satisfy regular expression pattern: \
+                 ^[a-z]+$",
+            ),
+        ];
+
+        for (case, violations, expected) in rows {
+            let stated = aws_validation_refusal_withholding_with(
+                &Refusal::Invalid(violations),
+                as_written,
+                |path| path == "secret",
+            )
+            .expect("a constraint refusal is stated");
+            assert_eq!(
+                stated.code, "ValidationException",
+                "case {case:?}: expected the JSON protocols' own refusal code, got {:?}",
+                stated.code
+            );
+            assert_eq!(
+                stated.message, expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                stated.message
+            );
+        }
     }
 
     #[test]

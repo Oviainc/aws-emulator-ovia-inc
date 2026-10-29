@@ -361,26 +361,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // usage is not SIGN_VERIFY supports no signing algorithm at all, so the usage is
         // judged first and the algorithm list it selects is the key's.
         if key.key_usage != crate::state::KEY_USAGE_SIGN_VERIFY {
-            return Err(invalid_key_usage(format!(
-                "The KeyUsage value of the KMS key is incompatible with the API operation. {} \
-                 has KeyUsage {}; for signing and verifying messages, the KeyUsage must be {}.",
-                key.arn,
-                key.key_usage,
-                crate::state::KEY_USAGE_SIGN_VERIFY
+            return Err(invalid_key_usage(crate::state::wrong_key_usage_message(
+                key,
+                Self::NAME,
             )));
         }
         let algorithms = key
             .algorithms_under(crate::state::KEY_USAGE_SIGN_VERIFY)
             .unwrap_or_default();
         if !algorithms.contains(&input.signing_algorithm) {
-            return Err(invalid_key_usage(format!(
-                "The signing algorithm specified for the operation is incompatible with the \
-                 type of key material in the KMS key (KeySpec). {} has KeySpec {}, which \
-                 supports {}.",
-                key.arn,
-                key.key_spec,
-                algorithms.join(", ")
-            )));
+            return Err(invalid_key_usage(
+                crate::state::incompatible_algorithm_message(
+                    &input.signing_algorithm,
+                    &key.key_spec,
+                ),
+            ));
         }
 
         // "The message type does not need to be the same as the one used for signing,
