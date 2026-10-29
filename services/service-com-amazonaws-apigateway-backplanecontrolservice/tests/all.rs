@@ -23,6 +23,9 @@ mod documentation_part_creation;
 // Declared here, at the head, for the reason the entry above records.
 #[path = "all/passed_through_integration.rs"]
 mod passed_through_integration;
+// Declared here, at the head, for the reason the entry above records.
+#[path = "all/stage_web_acl_edge.rs"]
+mod stage_web_acl_edge;
 
 #[path = "all/account_settings.rs"]
 mod account_settings;

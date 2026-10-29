@@ -54,6 +54,11 @@ mime = "0.3"
 # (`service::invoke::NoSchemasBeyondTheApi`) — so a stored schema cannot name a file, a
 # host or a URL for this emulator to read.
 boon = "0.6"
+# The WAFv2 web ACL in front of a deployed stage, and the evaluation of it: a web ACL is
+# associated with a stage through `AssociateWebACL`, so the records and the semantics are
+# that service's, and the data plane here asks it for the decision rather than keeping a
+# second reading of a rule tree (`service::invoke::web_acl_decision`).
+service-com-amazonaws-wafv2-awswaf-20190729 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -61,6 +66,10 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Base64 for the `Blob` member a web ACL's `ByteMatchStatement$SearchString` is, which an
+# awsJson body carries encoded: the maintained coder every other service in this tree
+# uses, rather than a hand-written copy in a test helper.
+base64 = "0.22"
 # Percent-encoding for the `resourceArn` @httpLabel a tag call puts in its URI path: the
 # encoding itself is the crate's, as the sibling medialive/codeartifact suites do it,
 # rather than a tenth hand-written copy of RFC 3986.

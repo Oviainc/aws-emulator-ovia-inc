@@ -158,6 +158,8 @@ use crate::ops::put_method_response::METHOD_RESPONSE_HEADER_PREFIX;
 use crate::ops::types::{GetIntegrationOutput, GetIntegrationResponseOutput};
 use crate::state::{ApiKeyEntry, DeploymentEntry, MethodEntry, RestApiEntry};
 
+use ::service_com_amazonaws_wafv2_awswaf_20190729::service::edge as waf_edge;
+
 use super::resource_policy;
 
 /// The second label of every `execute-api` endpoint host: `{api-id}.execute-api.…`.
@@ -543,6 +545,23 @@ fn access_denied(message: String) -> GatewayRefusal {
         message_member: AUTHORIZATION_MESSAGE_MEMBER,
     }
 }
+
+/// The request was refused by the WAFv2 web ACL in front of the stage: `403` through
+/// `WAF_FILTERED`, the gateway response type API Gateway answers a request its web ACL
+/// blocked with ([`crate::state::default_gateway_status_code`] gives that type's own
+/// status).
+///
+/// Answered through a gateway response, so a developer's `PutGatewayResponse`
+/// customization of `WAF_FILTERED` reaches a blocked caller — and so a `BlockAction`
+/// that configures its OWN `CustomResponse` bypasses this entirely, because then WAF
+/// serves the response itself ([`EdgeOutcome`]).
+const WAF_FILTERED: GatewayRefusal = GatewayRefusal {
+    response_type: "WAF_FILTERED",
+    message: Cow::Borrowed("Forbidden"),
+    error_type: None,
+    validation_detail: Cow::Borrowed(""),
+    message_member: MESSAGE_MEMBER,
+};
 
 /// The header API Gateway names the error shape of a refused request in, which is what an
 /// SDK reads a restJson1 error code out of.
@@ -936,10 +955,33 @@ fn serve_resolved<Eng: Send + Sync + 'static>(
     req: &RtRequest,
     hop: u8,
 ) -> RtResponse {
-    let addressed = Addressed::of_request(req);
     let Some(state) = crate::state::service_state(engine) else {
         return refusal_response(None, API_CONFIGURATION_ERROR);
     };
+    // The WAFv2 WEB ACL in front of the stage decides before the stage does. A web ACL
+    // is "a set of rules that defines the strategy that WAF uses to inspect and handle
+    // web requests" and it sits in FRONT of the resource it is associated with, so it
+    // is asked ahead of everything the api itself declares about the request — the
+    // route, the authorization, the api key, the validator and the integration, none of
+    // which a request it blocks ever reaches. A stage with no web ACL associated is
+    // served exactly as it was before web ACLs were read at all.
+    let with_inserted_headers;
+    let req = match web_acl_decision(engine, &state, req) {
+        EdgeOutcome::Refused(response) => return *response,
+        EdgeOutcome::Unchanged => req,
+        // An `AllowAction`'s (or a `CountAction`'s) `CustomRequestHandling` inserts
+        // headers "into the web request", so the request the stage goes on to serve —
+        // and the one a proxy integration passes to the origin — is the request
+        // carrying them.
+        EdgeOutcome::Allowed(inserted) => match request_with_headers(req, &inserted) {
+            Some(rebuilt) => {
+                with_inserted_headers = rebuilt;
+                &with_inserted_headers
+            }
+            None => req,
+        },
+    };
+    let addressed = Addressed::of_request(req);
     // What this request RESOLVES to: the integration that is to answer it, what VALIDATING
     // its payload needs, and what METERING it is subject to. All three are read under a
     // shared read of the store, which is RELEASED before any of them runs: validating a
@@ -1141,7 +1183,7 @@ fn serve_resolved<Eng: Send + Sync + 'static>(
         .method
         .as_ref()
         .and_then(|method| method.integration.as_ref())
-        .and_then(|record| passed_through(record, req));
+        .and_then(|record| passed_through(record, req, hop));
     if let Some(passed_on) = passed_on {
         if let Some(reason) = integration.unusable_connection.clone() {
             return refuse(UnservedIntegration {
@@ -1151,16 +1193,6 @@ fn serve_resolved<Eng: Send + Sync + 'static>(
         }
         return match passed_on {
             PassedThrough::Unserved(unserved) => refuse(unserved),
-            PassedThrough::Request(_) if hop >= MAX_PASSED_THROUGH_HOPS => {
-                refuse(UnservedIntegration {
-                    refusal: API_CONFIGURATION_ERROR,
-                    reason: format!(
-                        "the request has been passed through {MAX_PASSED_THROUGH_HOPS} \
-                         integrations of this emulator's own endpoints and this one passes \
-                         it on again, so it is not followed further"
-                    ),
-                })
-            }
             PassedThrough::Request(onward) => serve_resolved(engine, &onward, hop + 1),
         };
     }
@@ -1169,6 +1201,214 @@ fn serve_resolved<Eng: Send + Sync + 'static>(
         Ok(served) => served_response(served),
         Err(unserved) => refuse(unserved),
     }
+}
+
+/// What the WAFv2 web ACL in front of the addressed stage made of the request.
+#[derive(Debug)]
+enum EdgeOutcome {
+    /// No web ACL is associated with the stage, or the one that is allowed the request
+    /// and inserted nothing into it: the stage serves the request as it arrived.
+    Unchanged,
+    /// The web ACL allowed the request and a `CustomRequestHandling` on the way
+    /// inserted these headers, which the origin is to see.
+    Allowed(Vec<(String, String)>),
+    /// The web ACL refused the request at the edge: this is the response to serve, and
+    /// nothing of the api is reached.
+    ///
+    /// Boxed: a whole response is far larger than the other two variants, which is what
+    /// the sibling [`PassedThrough`] boxes a request for.
+    Refused(Box<RtResponse>),
+}
+
+/// Apply the WAFv2 web ACL in front of the stage this request addresses.
+///
+/// A web ACL is bound to a stage by `AssociateWebACL` over the stage's own ARN, so the
+/// stage is resolved from THIS service's records, its ARN is built the one way this
+/// service builds it ([`crate::state::tagged_resource_arn`]), and the decision itself
+/// is WAFv2's ([`waf_edge::decide`]) — this module holds no second reading of a rule
+/// tree. A request addressing no stage of this account resolves no ARN and so no web
+/// ACL: it is refused by the api's own records further down.
+///
+/// The two stores are locked one after the other and never at the same time, and the
+/// wafv2 side locks nothing of this service's, so the two cannot deadlock.
+fn web_acl_decision<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    state: &::engine::ServiceState<crate::state::ComAmazonawsApigatewayBackplanecontrolserviceState>,
+    req: &RtRequest,
+) -> EdgeOutcome {
+    let addressed = Addressed::of_request(req);
+    let region = region_of_host(addressed.host)
+        .unwrap_or(crate::state::DEFAULT_REGION)
+        .to_string();
+    // The stage's ARN, and the invoke path WITHIN the api — which is the path AWS's
+    // edge inspects, `/{stage}/{resource-path}`, whichever addressing the client
+    // reached this emulator by.
+    let (stage_arn, invoke_path) = {
+        let store = state.lock();
+        let Some(resolved) = resolve(&store, &addressed) else {
+            return EdgeOutcome::Unchanged;
+        };
+        let Some((stage_name, _)) = split_stage(resolved.invoke_path) else {
+            return EdgeOutcome::Unchanged;
+        };
+        if !resolved.api.stages.contains_key(stage_name) {
+            return EdgeOutcome::Unchanged;
+        }
+        (
+            crate::state::tagged_resource_arn(
+                &region,
+                &crate::state::TaggedResource::Stage {
+                    rest_api_id: resolved.api.id.clone(),
+                    stage_name: stage_name.to_string(),
+                },
+            ),
+            resolved.invoke_path.to_string(),
+        )
+    };
+
+    let Some(waf) = ::service_com_amazonaws_wafv2_awswaf_20190729::state::service_state(engine)
+    else {
+        return EdgeOutcome::Unchanged;
+    };
+    let inspected = inspected_request(req, &invoke_path);
+    // The decision, and the lock discipline it needs, are wafv2's own: `decide` reads
+    // the records under a shared lock, evaluates the web ACL with the lock RELEASED and
+    // writes the data plane's own bookkeeping under an exclusive one. This service's own
+    // store is not held across the call, and the wafv2 side locks nothing of this
+    // service's, so the two cannot deadlock.
+    let Some(decision) = waf_edge::decide(&waf, &stage_arn, &inspected) else {
+        // No web ACL in front of this stage.
+        return EdgeOutcome::Unchanged;
+    };
+    if decision.action.is_allow() {
+        if decision.inserted_headers.is_empty() {
+            return EdgeOutcome::Unchanged;
+        }
+        return EdgeOutcome::Allowed(decision.inserted_headers);
+    }
+    tracing::info!(
+        stage_arn = %stage_arn,
+        rule = decision.rule_name.as_deref().unwrap_or("<default action>"),
+        "the web acl in front of this stage does not let the request through"
+    );
+    // A terminating action that configures its own `CustomResponse` is served BY WAF:
+    // the status, the headers and the body are the web ACL's own, and the api's gateway
+    // responses are not consulted, because API Gateway never produced the response.
+    if let Some(custom) = decision.custom_response {
+        return EdgeOutcome::Refused(Box::new(edge_response(custom)));
+    }
+    match decision.action {
+        waf_edge::EdgeAction::Block => {
+            // Answered through the api's own `WAF_FILTERED` gateway response, so a
+            // developer's customization of that type reaches the blocked caller.
+            let store = state.lock();
+            let api = resolve(&store, &addressed).map(|resolved| resolved.api);
+            EdgeOutcome::Refused(Box::new(refusal_response(api, WAF_FILTERED)))
+        }
+        // A `Captcha` or `Challenge` action with no custom response is answered with
+        // the status WAF serves its interstitial under. The interstitial ITSELF is a
+        // script WAF serves from its own endpoint, which this emulator serves none of,
+        // so the response carries the status and no body rather than a page nothing
+        // produced.
+        action => EdgeOutcome::Refused(Box::new(response_with(
+            action.default_status().unwrap_or(403),
+            JSON_CONTENT_TYPE,
+            Vec::new(),
+        ))),
+    }
+}
+
+/// The request as WAFv2 inspects it: every component a `FieldToMatch` can name.
+///
+/// `invoke_path` is the path WITHIN the api rather than the path this request arrived
+/// on, because that is the path a client addressing AWS would have sent and so the one
+/// a web ACL's criteria are written against; the emulator's own addressing prefix is
+/// how the request reached this process, not part of the request the stage serves.
+fn inspected_request(req: &RtRequest, invoke_path: &str) -> waf_edge::InspectedRequest {
+    let headers: Vec<(String, String)> = req
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    // The address the request came from. A request served in process crossed no socket
+    // from a remote peer, so there is no connection address; one that traversed a proxy
+    // still states where it came from, in its forwarded-for header.
+    let client_ip = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(waf_edge::FORWARDED_FOR_HEADER))
+        .and_then(|(_, value)| value.split(',').next())
+        .map(str::trim)
+        .filter(|address| address.parse::<std::net::IpAddr>().is_ok())
+        .unwrap_or(waf_edge::IN_PROCESS_CLIENT_IP)
+        .to_string();
+    waf_edge::InspectedRequest {
+        method: req.method().to_string(),
+        uri_path: invoke_path.to_string(),
+        query_string: query_of(req.uri()).to_string(),
+        headers,
+        body: request_payload(req),
+        client_ip,
+    }
+}
+
+/// `req` with `inserted` added to its headers, or `None` when the request cannot be
+/// rebuilt at all.
+///
+/// Every other part travels unchanged — the method, the URI and the body — because the
+/// only thing a `CustomRequestHandling` changes about a request is which headers it
+/// carries. An inserted header REPLACES one the client sent under the same name: the
+/// prefix WAF gives it is there so the origin can trust it came from WAF.
+fn request_with_headers(req: &RtRequest, inserted: &[(String, String)]) -> Option<RtRequest> {
+    let mut rebuilt = RtRequest::new(SdkBody::from(request_payload(req)));
+    rebuilt.set_uri(req.uri()).ok()?;
+    rebuilt.set_method(req.method()).ok()?;
+    for (name, value) in req.headers().iter() {
+        if let Err(refused) = rebuilt
+            .headers_mut()
+            .try_append(name.to_string(), value.to_string())
+        {
+            tracing::warn!(
+                header = %name,
+                error = %refused,
+                "the caller's header cannot be carried onto the request the web acl \
+                 allowed, and is left off it"
+            );
+        }
+    }
+    for (name, value) in inserted {
+        if let Err(refused) = rebuilt.headers_mut().try_insert(name.clone(), value.clone()) {
+            tracing::warn!(
+                header = %name,
+                error = %refused,
+                "the header the web acl's custom request handling inserts is not one a \
+                 header can carry, and is left off the request"
+            );
+        }
+    }
+    Some(rebuilt)
+}
+
+/// The response a web ACL's own `CustomResponse` serves, as it leaves the edge.
+fn edge_response(custom: waf_edge::EdgeResponse) -> RtResponse {
+    let mut response = response_with(
+        custom.status,
+        custom
+            .content_type
+            .as_deref()
+            .unwrap_or(JSON_CONTENT_TYPE),
+        custom.body,
+    );
+    for (name, value) in custom.headers {
+        if let Err(refused) = response.headers_mut().try_insert(name.clone(), value) {
+            tracing::warn!(
+                header = %name,
+                error = %refused,
+                "the header the web acl's custom response configures is not one a header \
+                 can carry, and is left off the response"
+            );
+        }
+    }
+    response
 }
 
 /// The integration a resolved call is to be performed through, carried OUT of the store
@@ -1827,9 +2067,30 @@ enum PassedThrough {
 /// silently dropped. A mapping whose SOURCE the request simply does not carry is a different
 /// thing from one written in a form that is not read: the header is left off, and the
 /// request is still passed on ([`MappedParameter`]).
-fn passed_through(integration: &GetIntegrationOutput, req: &RtRequest) -> Option<PassedThrough> {
+///
+/// `hop` is how many integrations of this emulator's own endpoints this request has already
+/// been passed through, and it is checked HERE, before any onward request is built: an
+/// integration whose `uri` names the very endpoint it is reached at — or two that name each
+/// other — would otherwise re-enter the serving path for ever, so the chain is refused once
+/// it reaches [`MAX_PASSED_THROUGH_HOPS`]. The bound sits at the construction site because
+/// that is where the loop would be made: nothing can pass a request on without passing it.
+fn passed_through(
+    integration: &GetIntegrationOutput,
+    req: &RtRequest,
+    hop: u8,
+) -> Option<PassedThrough> {
     if integration.r#type.as_deref() != Some(HTTP_PROXY_INTEGRATION_TYPE) {
         return None;
+    }
+    if hop >= MAX_PASSED_THROUGH_HOPS {
+        return Some(PassedThrough::Unserved(UnservedIntegration {
+            refusal: API_CONFIGURATION_ERROR,
+            reason: format!(
+                "the request has been passed through {MAX_PASSED_THROUGH_HOPS} integrations \
+                 of this emulator's own endpoints and this one passes it on again, so it is \
+                 not followed further"
+            ),
+        }));
     }
     let uri = integration.uri.as_deref().unwrap_or_default();
     // The host the request is passed on to. A `uri` with no authority at all addresses

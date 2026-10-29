@@ -3181,6 +3181,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "html-escape"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9356095b4b41197bba32173600e1582792cda618f65d12f68e2e77d273413c5"
+
+[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5802,6 +5808,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
+ "base64 0.22.1",
  "boon",
  "bytes",
  "csv",
@@ -5811,6 +5818,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_json",
+ "service-com-amazonaws-wafv2-awswaf-20190729",
  "service-common",
  "sha2 0.10.9",
  "tokio",
@@ -15822,9 +15830,14 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
+ "base64 0.22.1",
  "bytes",
  "hex",
+ "html-escape",
  "http",
+ "ipnet",
+ "percent-encoding",
+ "regex",
  "serde_json",
  "sha2 0.10.9",
  "tokio",

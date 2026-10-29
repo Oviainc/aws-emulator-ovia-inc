@@ -25,6 +25,25 @@ tracing = { workspace = true }
 # UUIDv4-shaped `EntityId` and `LockToken` values WAFv2 mints (`state::new_uuid`).
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The regular expressions a `Regex$RegexString` carries, matched with the maintained
+# crate rather than a hand-written matcher: its automaton does not backtrack, so a
+# caller-stored pattern cannot blow up the time one request's evaluation takes.
+regex = "1.13"
+# CIDR containment for an `IPSet`'s `Addresses`, the same version the sibling
+# elasticloadbalancingv2/ses services declare it at: one parse of a CIDR range and one
+# definition of which addresses it holds.
+ipnet = "2"
+# Percent-decoding a query argument's value and the `URL_DECODE` text transformation —
+# the encoding itself is the crate's, as the sibling s3/apigateway suites do it, rather
+# than another hand-written copy of RFC 3986.
+percent-encoding = "2"
+# The `BASE64_DECODE` text transformation, through the maintained coder every other
+# service in this tree decodes base64 with (ec2, lambda, secretsmanager).
+base64 = "0.22"
+# The `HTML_ENTITY_DECODE` text transformation: the maintained decoder for HTML character
+# references, so a named, decimal or hexadecimal reference is decoded the way a browser
+# decodes it rather than by a hand-written table.
+html-escape = "0.2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

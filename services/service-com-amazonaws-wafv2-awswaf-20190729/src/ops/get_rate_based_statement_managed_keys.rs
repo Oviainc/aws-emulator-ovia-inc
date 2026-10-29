@@ -159,6 +159,15 @@ impl From<GetRateBasedStatementManagedKeysErrorModeled> for GetRateBasedStatemen
     }
 }
 
+/// The most addresses one rate-based rule instance blocks at once.
+///
+/// Source: this operation's own documentation — "the maximum number of addresses that
+/// can be blocked for a single rate-based rule instance is 10,000. If more than 10,000
+/// addresses exceed the rate limit, those with the highest rates are blocked". A
+/// documented service limit, so it keeps the documented value, and it is what makes the
+/// selection a RANKING by rate rather than a plain collection.
+const MAX_MANAGED_KEYS: usize = 10_000;
+
 /// The rate-based statement of the rule named `rule_name` in `rules`, or `None`
 /// when that rule list holds no rate-based rule of that name.
 ///
@@ -322,25 +331,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The managed keys are "the IP addresses that are currently blocked by a
         // rate-based rule instance": the addresses whose request rate, as WAF counted
-        // it over this instance's evaluation window, went over the rule's limit. This
-        // emulator serves WAF's CONTROL plane — no web request is ever routed through
-        // a web ACL here — so no address has a rate at all and neither family's list
-        // holds one, which is also what WAF answers for a rate-based rule that is
-        // currently rate limiting nothing. Synthesising addresses nothing ever sent a
-        // request from would be fabrication, not emulation.
+        // it over this instance's evaluation window, is already over the rule's
+        // limit. Those counts are what the DATA plane recorded for this rule
+        // (`crate::service::edge::decide`), so the report is computed from them and
+        // from the clock — an address whose window has emptied is no longer blocked
+        // and is no longer reported, which is how a rate-limited caller recovers.
         //
         // Both halves are reported, each tagged with the family it is "the keys that
         // are of": one answer per `IPAddressVersion` the model declares, so a caller
         // reading either member finds the list and its version rather than a missing
         // member it has to interpret.
+        let rule_path = crate::service::edge::rule_path(
+            input.rule_group_rule_name.as_deref(),
+            &input.rule_name,
+        );
+        let window = crate::service::edge::evaluation_window_millis(rate_based.evaluation_window_sec);
+        let now = crate::state::now_millis();
+        let limit = rate_based.limit.max(0) as u64;
+        // Every instance of this rule that is over the limit, with the count that put
+        // it there: the count is what decides WHICH are reported when there are more
+        // of them than one instance can block (see [`MAX_MANAGED_KEYS`]).
+        let mut over_limit: Vec<(u64, ::std::net::IpAddr)> = Vec::new();
+        for (key, buckets) in &state.rate_based_counts {
+            if key.scope != input.scope
+                || key.web_acl_id != input.web_acl_id
+                || key.rule_path != rule_path
+            {
+                continue;
+            }
+            let counted = crate::service::edge::count_within(buckets, now, window);
+            if counted <= limit {
+                continue;
+            }
+            // The aggregation instance of an IP-aggregating rule IS an address; an
+            // instance that is not one belongs to another aggregation and is no
+            // managed key.
+            if let Ok(address) = key.aggregate_key.parse::<::std::net::IpAddr>() {
+                over_limit.push((counted, address));
+            }
+        }
+        // "The maximum number of addresses that can be blocked for a single
+        // rate-based rule instance is 10,000. If more than 10,000 addresses exceed the
+        // rate limit, those with the highest rates are blocked"
+        // (`GetRateBasedStatementManagedKeys`'s own doc), so the selection is by RATE,
+        // descending, and the address only orders ties so one state answers one way.
+        over_limit.sort_by(|left, right| {
+            right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1))
+        });
+        over_limit.truncate(MAX_MANAGED_KEYS);
+        // `RateBasedStatementManagedKeysIPSet$Addresses` reports addresses in CIDR
+        // notation, so each one is reported as the single-address range it is, under
+        // the family it belongs to.
+        let mut ipv4: Vec<String> = Vec::new();
+        let mut ipv6: Vec<String> = Vec::new();
+        for (_, address) in over_limit {
+            match address {
+                ::std::net::IpAddr::V4(address) => ipv4.push(format!("{address}/32")),
+                ::std::net::IpAddr::V6(address) => ipv6.push(format!("{address}/128")),
+            }
+        }
+        ipv4.sort_unstable();
+        ipv6.sort_unstable();
+
         Ok(GetRateBasedStatementManagedKeysOutput {
             managed_keys_ipv4: Some(RateBasedStatementManagedKeysIPSet {
                 ip_address_version: Some(IP_ADDRESS_VERSION_V4.to_string()),
-                addresses: Some(Vec::new()),
+                addresses: Some(ipv4),
             }),
             managed_keys_ipv6: Some(RateBasedStatementManagedKeysIPSet {
                 ip_address_version: Some(IP_ADDRESS_VERSION_V6.to_string()),
-                addresses: Some(Vec::new()),
+                addresses: Some(ipv6),
             }),
         })
     }

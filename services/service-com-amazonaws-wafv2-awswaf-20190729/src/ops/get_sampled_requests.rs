@@ -14,11 +14,10 @@
 //! * the SAMPLE. WAF draws it "from among the first 5,000 requests that your Amazon
 //!   Web Services resource received during the time range", capped at `MaxItems`, and
 //!   `PopulationSize` is the size of the population it drew from. The population is
-//!   the requests this service inspected for the named rule dimension inside the
-//!   reported window: this emulator serves WAF's CONTROL plane only — no web request
-//!   is ever routed through a web ACL here — so no window has a request in it, and
-//!   both the sample and the population it is drawn from are empty. Synthesising web
-//!   requests nothing ever sent would be fabrication, not emulation.
+//!   the requests this service's DATA plane inspected for the named rule dimension
+//!   inside the reported window ([`crate::service::edge::decide`] records them), so a
+//!   web ACL that has decided no request in the window reports an empty sample and a
+//!   population of zero.
 //!
 //! The web ACL is resolved from the store, so a `WebAclArn` that is malformed is
 //! `WAFInvalidParameterException` and one that names no web ACL in the requested
@@ -307,14 +306,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `RuleMetricName` dimension inside that window — "the first 5,000 requests
         // that your Amazon Web Services resource received during the time range" —
         // and answers at most `MaxItems` of them beside the size of that population.
-        // This emulator serves WAF's CONTROL plane: no web request is ever routed
-        // through a web ACL here, so no window holds one. The population is therefore
-        // zero and the sample drawn from it is empty, which is also what WAF answers
-        // for a window in which the web ACL received nothing. Synthesising web
-        // requests nothing ever sent would be fabrication, not emulation.
+        // The population is what the DATA plane recorded for this web ACL
+        // (`crate::service::edge::decide`), selected by the dimension the request
+        // names and by the window: a web ACL that has decided no request, or whose
+        // deciding dimensions store no samples (`SampledRequestsEnabled` turned off),
+        // has an empty population, which is also what WAF answers for a window in
+        // which the web ACL received nothing.
+        let (scope, id) = match state.arn_index.get(arn) {
+            Some(crate::state::ResourceRef::WebAcl { scope, id }) => (scope.clone(), id.clone()),
+            _ => (input.scope.clone(), String::new()),
+        };
+        let from_millis = (window.start_time.as_secs_f64() * 1_000.0) as i64;
+        let to_millis = (window.end_time.as_secs_f64() * 1_000.0) as i64;
+        let population: Vec<&crate::service::edge::SampledRequestRecord> = state
+            .sampled_requests
+            .get(&(scope, id))
+            .map(|records| {
+                records
+                    .iter()
+                    .filter(|record| record.metric_name == input.rule_metric_name)
+                    .filter(|record| {
+                        record.observed_at_millis >= from_millis
+                            && record.observed_at_millis <= to_millis
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let max_items = usize::try_from(input.max_items.max(0)).unwrap_or(usize::MAX);
         Ok(GetSampledRequestsOutput {
-            sampled_requests: Some(Vec::new()),
-            population_size: 0,
+            sampled_requests: Some(
+                population
+                    .iter()
+                    .take(max_items)
+                    .map(|record| record.sample.clone())
+                    .collect(),
+            ),
+            population_size: population.len() as i64,
             time_window: Some(window),
         })
     }

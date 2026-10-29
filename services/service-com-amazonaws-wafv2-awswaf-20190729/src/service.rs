@@ -40,6 +40,20 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+//! ## This service's other edited seam: the DATA plane a web ACL decides
+//!
+//! A web ACL is a decision about web requests, and the requests it decides reach the
+//! PROTECTED RESOURCE's own endpoint rather than this service's. [`edge`] is that
+//! decision — the one evaluation of a web ACL against one request — called by the
+//! service that owns the resource (an API Gateway stage, say) when it serves a
+//! request. It lives here, with this service, because the semantics are WAFv2's:
+//! the rule order, the actions, the labels, the rate counts and the samples.
+//! [`sqli`] is the injection detection the SQL and cross-site-scripting statements
+//! inspect with.
+
+pub mod edge;
+pub mod sqli;
+
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };

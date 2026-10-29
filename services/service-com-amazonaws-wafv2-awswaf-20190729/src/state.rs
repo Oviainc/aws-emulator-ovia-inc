@@ -1039,6 +1039,29 @@ pub struct ComAmazonawsWafv2Awswaf20190729State {
     /// resource: it belongs to another service (see [`PROTECTED_RESOURCE_FORMS`]),
     /// so it is held by ARN and is not in [`Self::arn_index`].
     pub web_acl_associations: HashMap<String, String>,
+    /// The requests each web ACL has EVALUATED at the edge, by `(Scope, Id)`: the
+    /// population `GetSampledRequests` draws its sample from.
+    ///
+    /// Written by the data plane
+    /// ([`crate::service::edge::decide`]) for every request a web ACL decided whose
+    /// deciding dimension has `SampledRequestsEnabled`, and bounded at
+    /// [`crate::service::edge::SAMPLE_POPULATION_CAP`] records per web ACL — the
+    /// figure `GetSampledRequests` documents its population as ("the first 5,000
+    /// requests that your Amazon Web Services resource received"). A web ACL that
+    /// has decided nothing holds none, which is what a sample over a quiet window
+    /// answers.
+    pub sampled_requests: HashMap<(String, String), Vec<crate::service::edge::SampledRequestRecord>>,
+    /// How many requests each rate-based aggregation instance was sent, by the second
+    /// they arrived in and oldest first.
+    ///
+    /// Written by the data plane for every request a rate-based statement counted,
+    /// and read by it and by `GetRateBasedStatementManagedKeys` to answer which
+    /// instances are over their rule's `Limit` across its `EvaluationWindowSec`. See
+    /// [`crate::service::edge::RateInstanceKey`] for why the key is the whole
+    /// (web ACL, rule, aggregation instance) triple, and
+    /// [`crate::service::edge::RateBucket`] for why the counts are kept per second.
+    pub rate_based_counts:
+        HashMap<crate::service::edge::RateInstanceKey, Vec<crate::service::edge::RateBucket>>,
 }
 
 impl ComAmazonawsWafv2Awswaf20190729State {
@@ -3997,6 +4020,14 @@ pub const DEFAULT_ALB_LOW_REPUTATION_MODE: &str = "ACTIVE_UNDER_DDOS";
 /// that omits it arrives here as `0` and WAF's documented default is what gets
 /// stored.
 pub const DEFAULT_EVALUATION_WINDOW_SEC: i64 = 300;
+
+/// The longest evaluation window a rate-based statement can carry, in seconds.
+///
+/// The last of the four settings `RateBasedStatement$EvaluationWindowSec` documents
+/// ("Valid settings are 60, 120, 300, and 600"), so no rate count has to be kept over
+/// a longer span than this — which is what bounds the per-second buckets one
+/// aggregation instance holds (`crate::service::edge::RateBucket`).
+pub const MAX_EVALUATION_WINDOW_SEC: i64 = 600;
 
 /// The smallest `ImmunityTime` WAF accepts for a CHALLENGE immunity, in seconds.
 ///

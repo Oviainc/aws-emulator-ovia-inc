@@ -111,5 +111,7 @@ mod top_path_statistics;
 mod web_acl_association_fanout;
 #[path = "all/web_acl_associations.rs"]
 mod web_acl_associations;
+#[path = "all/web_acl_edge_reports.rs"]
+mod web_acl_edge_reports;
 #[path = "all/web_acl_lifecycle.rs"]
 mod web_acl_lifecycle;
