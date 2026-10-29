@@ -5100,118 +5100,75 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .map(|link| link.id.clone())
             .collect()
     }
-
-    /// The stored tag list of the resource `arn` names, or `None` when this service holds
-    /// no resource under that ARN.
-    ///
-    /// Tags live on the resource record itself, so every reader of a resource
-    /// (`DescribeGlobalNetworks`, `GetSites`, `GetLinks`, `GetDevices`,
-    /// `ListTagsForResource`) answers from the one stored list.
-    pub fn tags_of(&self, arn: &str) -> Option<&Vec<Tag>> {
-        let parts = parse_resource_arn(arn)?;
-        match parts.kind {
-            GLOBAL_NETWORK_KIND => self
-                .global_networks
-                .get(parts.id)
-                .filter(|record| record.arn == arn)
-                .map(|record| &record.tags),
-            SITE_KIND => self
-                .sites
-                .get(parts.id)
-                .filter(|record| record.arn == arn)
-                .map(|record| &record.tags),
-            LINK_KIND => self
-                .links
-                .get(parts.id)
-                .filter(|record| record.arn == arn)
-                .map(|record| &record.tags),
-            DEVICE_KIND => self
-                .devices
-                .get(parts.id)
-                .filter(|record| record.arn == arn)
-                .map(|record| &record.tags),
-            CONNECTION_KIND => self
-                .connections
-                .get(parts.id)
-                .filter(|record| record.arn == arn)
-                .map(|record| &record.tags),
-            CORE_NETWORK_KIND => self
-                .core_networks
-                .get(parts.id)
-                .filter(|record| record.arn == arn)
-                .map(|record| &record.tags),
-            ATTACHMENT_KIND => self
-                .attachments
-                .get(parts.id)
-                .filter(|record| record.arn == arn)
-                .map(|record| &record.tags),
-            PEERING_KIND => self
-                .peerings
-                .get(parts.id)
-                .filter(|record| record.arn == arn)
-                .map(|record| &record.tags),
-            CONNECT_PEER_KIND => self
-                .connect_peers
-                .get(parts.id)
-                .filter(|record| record.arn == arn)
-                .map(|record| &record.tags),
-            _ => None,
-        }
-    }
-
-    /// The stored tag list of the resource `arn` names, for writing. See [`Self::tags_of`].
-    pub fn tags_of_mut(&mut self, arn: &str) -> Option<&mut Vec<Tag>> {
-        let parts = parse_resource_arn(arn)?;
-        match parts.kind {
-            GLOBAL_NETWORK_KIND => self
-                .global_networks
-                .get_mut(parts.id)
-                .filter(|record| record.arn == arn)
-                .map(|record| &mut record.tags),
-            SITE_KIND => self
-                .sites
-                .get_mut(parts.id)
-                .filter(|record| record.arn == arn)
-                .map(|record| &mut record.tags),
-            LINK_KIND => self
-                .links
-                .get_mut(parts.id)
-                .filter(|record| record.arn == arn)
-                .map(|record| &mut record.tags),
-            DEVICE_KIND => self
-                .devices
-                .get_mut(parts.id)
-                .filter(|record| record.arn == arn)
-                .map(|record| &mut record.tags),
-            CONNECTION_KIND => self
-                .connections
-                .get_mut(parts.id)
-                .filter(|record| record.arn == arn)
-                .map(|record| &mut record.tags),
-            CORE_NETWORK_KIND => self
-                .core_networks
-                .get_mut(parts.id)
-                .filter(|record| record.arn == arn)
-                .map(|record| &mut record.tags),
-            ATTACHMENT_KIND => self
-                .attachments
-                .get_mut(parts.id)
-                .filter(|record| record.arn == arn)
-                .map(|record| &mut record.tags),
-            PEERING_KIND => self
-                .peerings
-                .get_mut(parts.id)
-                .filter(|record| record.arn == arn)
-                .map(|record| &mut record.tags),
-            CONNECT_PEER_KIND => self
-                .connect_peers
-                .get_mut(parts.id)
-                .filter(|record| record.arn == arn)
-                .map(|record| &mut record.tags),
-            _ => None,
-        }
-    }
 }
+
+/// The ARN -> stored-tag-list dispatch of this service, stated ONCE: every taggable kind
+/// paired with the map whose records carry that kind's tags.
+///
+/// Both halves of the dispatch are generated from this one mapping — the reader
+/// [`ComAmazonawsNetworkmanagerNetworkmanagerState::tags_of`] behind
+/// `ListTagsForResource` (and behind the "does this ARN still name a stored resource"
+/// probe of [`ComAmazonawsNetworkmanagerNetworkmanagerState::put_network_resource_metadata`])
+/// and the writer [`ComAmazonawsNetworkmanagerNetworkmanagerState::tags_of_mut`] behind
+/// `TagResource` / `UntagResource` — so the two cannot answer different records for the
+/// same ARN: a kind is added, and the identity re-check of a scoped ARN changed, in one
+/// place for both.
+macro_rules! taggable_records {
+    ($($kind:ident => $records:ident),+ $(,)?) => {
+        impl ComAmazonawsNetworkmanagerNetworkmanagerState {
+            /// The stored tag list of the resource `arn` names, or `None` when this service
+            /// holds no resource under that ARN.
+            ///
+            /// Tags live on the resource record itself, so every reader of a resource
+            /// (`DescribeGlobalNetworks`, `GetSites`, `GetLinks`, `GetDevices`,
+            /// `ListTagsForResource`) answers from the one stored list. The record's own ARN
+            /// is re-checked against `arn`, so an ARN carrying a stored id under the wrong
+            /// parent names no resource.
+            pub fn tags_of(&self, arn: &str) -> Option<&Vec<Tag>> {
+                let parts = parse_resource_arn(arn)?;
+                match parts.kind {
+                    $(
+                        $kind => self
+                            .$records
+                            .get(parts.id)
+                            .filter(|record| record.arn == arn)
+                            .map(|record| &record.tags),
+                    )+
+                    _ => None,
+                }
+            }
+
+            /// The stored tag list of the resource `arn` names, for writing: the SAME
+            /// mapping [`Self::tags_of`] reads through, so a write and a read resolve the
+            /// same record for the same ARN.
+            pub fn tags_of_mut(&mut self, arn: &str) -> Option<&mut Vec<Tag>> {
+                let parts = parse_resource_arn(arn)?;
+                match parts.kind {
+                    $(
+                        $kind => self
+                            .$records
+                            .get_mut(parts.id)
+                            .filter(|record| record.arn == arn)
+                            .map(|record| &mut record.tags),
+                    )+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+taggable_records!(
+    GLOBAL_NETWORK_KIND => global_networks,
+    SITE_KIND => sites,
+    LINK_KIND => links,
+    DEVICE_KIND => devices,
+    CONNECTION_KIND => connections,
+    CORE_NETWORK_KIND => core_networks,
+    ATTACHMENT_KIND => attachments,
+    PEERING_KIND => peerings,
+    CONNECT_PEER_KIND => connect_peers,
+);
 
 /// The key one network resource is listed under: its resource TYPE, then its id.
 ///

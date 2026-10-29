@@ -169,6 +169,8 @@ mod site_ids_filter_maximum;
 mod site_to_site_vpn_attachment_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_dispatch_agreement.rs"]
+mod tag_dispatch_agreement;
 #[path = "all/transit_gateway_connect_peer_association_lifecycle.rs"]
 mod transit_gateway_connect_peer_association_lifecycle;
 #[path = "all/transit_gateway_connect_peer_association_quota.rs"]
