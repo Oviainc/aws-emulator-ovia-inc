@@ -17,6 +17,8 @@ mod absent_group_refusal_messages;
 mod auto_scaling_group_lifecycle;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/instance_refresh_lifecycle.rs"]
+mod instance_refresh_lifecycle;
 #[path = "all/launch_configurations_are_unavailable.rs"]
 mod launch_configurations_are_unavailable;
 #[path = "all/metric_collection_catalog.rs"]

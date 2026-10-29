@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartInstanceRefresh
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartInstanceRefresh`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartInstanceRefresh::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts an instance refresh on an Auto Scaling group: the refresh is stored under a
+//! unique id, and the clock replaces the group's instances one at a time until it has
+//! replaced every instance it set out to ([`crate::state::StoredInstanceRefresh`]).
+//! Each replacement launches and terminates the account's own Amazon EC2 instances
+//! through the group's single launch path, so the ids the group reports while a
+//! refresh runs are ids Amazon EC2 resolves. A group may have only one active refresh
+//! at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +181,181 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartInstanceRefresh` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartInstanceRefreshErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartInstanceRefresh"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartInstanceRefreshErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.auto_scaling_group_name;
+        // The model documents `Rolling` as the strategy a request that names none
+        // asks for.
+        let strategy = input
+            .strategy
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_REFRESH_STRATEGY.to_string());
+        if !REFRESH_STRATEGY_VALUES.contains(&strategy.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The Strategy value {strategy} is not valid: it must be one of {}",
+                join_values(REFRESH_STRATEGY_VALUES.iter().map(|value| (*value).to_string()))
+            )));
+        }
+        if let Some(preferences) = input.preferences.as_ref() {
+            check_preferences(preferences)?;
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, now);
+
+        let Some(group) = state.groups.get(&name) else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::absent_group_message(&name),
+            ));
+        };
+        // One refresh per group: a second one cannot be started while the first is
+        // still replacing instances.
+        if state.active_instance_refresh(&name).is_some() {
+            return Err(
+                StartInstanceRefreshErrorModeled::InstanceRefreshInProgressFault(
+                    InstanceRefreshInProgressFault {
+                        message: Some(IN_PROGRESS_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The instances the refresh sets out to replace: the ones the group holds,
+        // except — with `SkipMatching` asked for — those already launched from the
+        // configuration the refresh would give them, which need no replacing.
+        let skip_matching = input
+            .preferences
+            .as_ref()
+            .and_then(|preferences| preferences.skip_matching)
+            .unwrap_or(false);
+        let target_template = match input.desired_configuration.as_ref() {
+            Some(desired) => crate::state::launch_template_of(
+                desired.launch_template.as_ref(),
+                desired.mixed_instances_policy.as_ref(),
+            ),
+            None => crate::state::launch_template_of(
+                group.launch_template.as_ref(),
+                group.mixed_instances_policy.as_ref(),
+            ),
+        };
+        let pending_instance_ids: Vec<String> = group
+            .active_instances()
+            .filter(|instance| {
+                !(skip_matching
+                    && crate::state::same_launch_template(
+                        instance.launch_template.as_ref(),
+                        target_template,
+                    ))
+            })
+            .map(|instance| instance.instance_id.clone())
+            .collect();
+        let instances_at_start = i32::try_from(pending_instance_ids.len()).unwrap_or(i32::MAX);
+
+        let instance_refresh_id =
+            state.push_instance_refresh(crate::state::StoredInstanceRefresh {
+                instance_refresh_id: String::new(),
+                auto_scaling_group_name: name.clone(),
+                // The request has been created and nothing has been replaced yet,
+                // which is what the model's `Pending` status reports.
+                status: crate::state::REFRESH_PENDING.to_string(),
+                status_reason: None,
+                start_time: now,
+                end_time: None,
+                strategy,
+                preferences: input.preferences.clone(),
+                desired_configuration: input.desired_configuration.clone(),
+                instances_at_start,
+                pending_instance_ids,
+                percentage_complete: 0,
+                instances_to_update: instances_at_start,
+                next_step_due: Some(now + crate::state::INSTANCE_REFRESH_REPLACEMENT),
+            });
+
+        crate::state::audit(
+            ctx.parts(),
+            "StartInstanceRefresh",
+            &name,
+            "instance refresh started",
+        );
+        Ok(StartInstanceRefreshOutput {
+            instance_refresh_id: Some(instance_refresh_id),
+        })
     }
+}
+
+/// The sentence Amazon EC2 Auto Scaling refuses a second instance refresh on one
+/// group with. It has NO variable part: the error class says that a refresh is
+/// already running, not which one.
+const IN_PROGRESS_MESSAGE: &str =
+    "An Instance Refresh is already in progress and blocks the execution of this Instance Refresh.";
+
+/// Refuse a set of preferences the service does not accept together.
+///
+/// Every rule here is the model's own documentation for the member it bounds
+/// (`smithy_query(query="doc",shape="RefreshPreferences",member="MaxHealthyPercentage")`
+/// and `…member="CheckpointPercentages"`): `MinHealthyPercentage`'s "value range is 0
+/// to 100" and `MaxHealthyPercentage`'s "value range is 100 to 200", a
+/// `MaxHealthyPercentage` that requires `MinHealthyPercentage` and may not exceed it
+/// by more than 100, and checkpoint thresholds that are "threshold values for each
+/// checkpoint in ascending order. Each number must be unique."
+fn check_preferences(preferences: &RefreshPreferences) -> Result<(), StartInstanceRefreshError> {
+    if let Some(min_healthy) = preferences.min_healthy_percentage {
+        if !(0..=100).contains(&min_healthy) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The MinHealthyPercentage value {min_healthy} is not valid: it must be between 0 \
+                 and 100"
+            )));
+        }
+    }
+    if let Some(max_healthy) = preferences.max_healthy_percentage {
+        if !(100..=200).contains(&max_healthy) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The MaxHealthyPercentage value {max_healthy} is not valid: it must be between \
+                 100 and 200"
+            )));
+        }
+        let Some(min_healthy) = preferences.min_healthy_percentage else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "If you specify MaxHealthyPercentage, you must also specify \
+                 MinHealthyPercentage",
+            ));
+        };
+        // Both operands are inside the ranges checked above, and the subtraction
+        // saturates rather than wrapping, so no request can reach the comparison with
+        // a difference this arithmetic cannot represent.
+        if max_healthy.saturating_sub(min_healthy) > 100 {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The difference between MinHealthyPercentage and MaxHealthyPercentage cannot be \
+                 greater than 100, but MinHealthyPercentage is {min_healthy} and \
+                 MaxHealthyPercentage is {max_healthy}"
+            )));
+        }
+    }
+    if let Some(checkpoints) = preferences.checkpoint_percentages.as_ref() {
+        if checkpoints.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The CheckpointPercentages values {} are not valid: they must be unique and in \
+                 ascending order",
+                join_values(checkpoints.iter().map(i32::to_string))
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Join the values a refusal names into the comma-separated list a service message
+/// carries, so no refusal shows a caller Rust's own debug formatting.
+fn join_values(values: impl Iterator<Item = String>) -> String {
+    values.collect::<Vec<String>>().join(", ")
 }

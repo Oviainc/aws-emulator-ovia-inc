@@ -4,13 +4,13 @@
 //!
 //! The Auto Scaling control plane keeps two named collections — launch
 //! configurations and Auto Scaling groups — plus the scaling activities the
-//! capacity changes of those groups produce. Every handler in `src/ops/` reads and
-//! writes THIS struct through [`service_state`]; nothing in this crate holds a
-//! second copy of a resource.
+//! capacity changes of those groups produce and the instance refreshes started on
+//! them. Every handler in `src/ops/` reads and writes THIS struct through
+//! [`service_state`]; nothing in this crate holds a second copy of a resource.
 //!
 //! # The clock this service owes
 //!
-//! Two changes are owed by the clock rather than by a later request, so they are
+//! These changes are owed by the clock rather than by a later request, so they are
 //! stored as a DUE INSTANT and materialised by [`AutoScalingState::materialize_due`]
 //! (called by every handler, including the reporting ones, which may only
 //! materialise what the clock already made due):
@@ -19,7 +19,10 @@
 //!   becomes `InService`; one it is scaling in is reported `Terminating` and then
 //!   leaves the group ([`LIFECYCLE_TRANSITION`]);
 //! * a capacity change that asked to honour the group's cooldown waits for that
-//!   cooldown to elapse before it is applied (`HonorCooldown`).
+//!   cooldown to elapse before it is applied (`HonorCooldown`);
+//! * a running instance refresh replaces one instance of its group per
+//!   [`INSTANCE_REFRESH_REPLACEMENT`] and succeeds once it has replaced them all
+//!   ([`StoredInstanceRefresh`]).
 //!
 //! # The instances a group holds
 //!
@@ -34,9 +37,9 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AvailabilityZoneDistribution, AvailabilityZoneImpairmentPolicy, BlockDeviceMapping,
-    CapacityReservationSpecification, InstanceLifecyclePolicy, InstanceMaintenancePolicy,
-    InstanceMetadataOptions, LaunchTemplateSpecification, MixedInstancesPolicy, Operator, Tag,
-    TrafficSourceIdentifier,
+    CapacityReservationSpecification, DesiredConfiguration, InstanceLifecyclePolicy,
+    InstanceMaintenancePolicy, InstanceMetadataOptions, LaunchTemplateSpecification,
+    MixedInstancesPolicy, Operator, RefreshPreferences, Tag, TrafficSourceIdentifier,
 };
 
 /// The Availability Zones of the subnets a request's `VPCZoneIdentifier` names, read
@@ -92,6 +95,44 @@ pub const LIFECYCLE_TERMINATING: &str = "Terminating";
 
 /// The `HealthStatus` of an instance the service has no failed health check for.
 pub const HEALTH_STATUS_HEALTHY: &str = "Healthy";
+
+/// How long ONE instance replacement of an instance refresh takes to come due.
+///
+/// A replacement is a termination and a launch, so it is owed on the same transient
+/// span as any other lifecycle transition this service owes ([`LIFECYCLE_TRANSITION`]):
+/// chosen, not documented, and never slept for. A refresh of a group holding several
+/// instances therefore takes one span per instance, which is what lets a caller that
+/// reads it straight after starting it still see it running.
+pub const INSTANCE_REFRESH_REPLACEMENT: Duration = LIFECYCLE_TRANSITION;
+
+// The `InstanceRefreshStatus` values this slice moves an instance refresh through,
+// spelled exactly as the model's `com.amazonaws.autoscaling#InstanceRefreshStatus`
+// enum does (smithy_query(query="shape",shape="InstanceRefreshStatus")).
+/// A refresh whose request was created but which has not started replacing yet.
+pub const REFRESH_PENDING: &str = "Pending";
+/// A refresh that is replacing the group's instances.
+pub const REFRESH_IN_PROGRESS: &str = "InProgress";
+/// A refresh that replaced every instance it set out to replace.
+pub const REFRESH_SUCCESSFUL: &str = "Successful";
+/// A refresh that could not finish.
+pub const REFRESH_FAILED: &str = "Failed";
+
+/// `Strategy` when a `StartInstanceRefresh` request omits it.
+///
+/// From the model's own documentation for `StartInstanceRefreshType$Strategy`: "The
+/// default value is Rolling."
+pub const DEFAULT_REFRESH_STRATEGY: &str = "Rolling";
+
+/// The most instance refreshes this service retains; appending past it drops the
+/// oldest.
+///
+/// A bound on this process, for the same reason as [`MAX_RETAINED_ACTIVITIES`]: a
+/// group may be refreshed again and again and nothing removes a finished refresh, so
+/// an unbounded log would grow for the life of the process. Amazon EC2 Auto Scaling
+/// itself reports the refreshes "from the previous six weeks"
+/// (`smithy_query(query="operation",operation="DescribeInstanceRefreshes")`), so a
+/// retention bound is the shape of the real behaviour too.
+pub const MAX_RETAINED_INSTANCE_REFRESHES: usize = 1_000;
 
 // The `ScalingActivityStatusCode` values an activity this slice records moves
 // through, from the model's `com.amazonaws.autoscaling#ScalingActivityStatusCode`.
@@ -311,6 +352,48 @@ pub struct StoredActivity {
     pub completes_at: Option<SystemTime>,
 }
 
+/// A stored instance refresh — the `InstanceRefresh` resource `StartInstanceRefresh`
+/// creates and `DescribeInstanceRefreshes` reports.
+///
+/// A refresh replaces the instances of ONE group, one at a time: the instances it has
+/// still to replace are [`Self::pending_instance_ids`], and the clock brings the next
+/// replacement due at [`Self::next_step_due`]
+/// ([`AutoScalingState::advance_instance_refreshes`]). The progress a reader sees is
+/// what those replacements have actually done.
+#[derive(Debug, Clone)]
+pub struct StoredInstanceRefresh {
+    pub instance_refresh_id: String,
+    pub auto_scaling_group_name: String,
+    pub status: String,
+    pub status_reason: Option<String>,
+    pub start_time: SystemTime,
+    pub end_time: Option<SystemTime>,
+    /// `RefreshStrategy`, as requested or [`DEFAULT_REFRESH_STRATEGY`].
+    pub strategy: String,
+    pub preferences: Option<RefreshPreferences>,
+    pub desired_configuration: Option<DesiredConfiguration>,
+    /// How many instances the refresh set out to replace, which is what its
+    /// percentage complete is a percentage OF.
+    pub instances_at_start: i32,
+    /// The instances it has still to replace, in the order it replaces them.
+    pub pending_instance_ids: Vec<String>,
+    /// `PercentageComplete`.
+    pub percentage_complete: i32,
+    /// `InstancesToUpdate`.
+    pub instances_to_update: i32,
+    /// When the next replacement — or the refresh's own completion — comes due;
+    /// `None` once it has reached a terminal status.
+    pub next_step_due: Option<SystemTime>,
+}
+
+impl StoredInstanceRefresh {
+    /// Whether this refresh is still running, which is what makes it the group's
+    /// ACTIVE refresh: a group may have only one at a time.
+    pub fn is_active(&self) -> bool {
+        self.status == REFRESH_PENDING || self.status == REFRESH_IN_PROGRESS
+    }
+}
+
 /// Per-service state for com-amazonaws-autoscaling-autoscaling-2011-01-01. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAutoscalingAutoscaling20110101State {
@@ -327,6 +410,8 @@ pub struct ComAmazonawsAutoscalingAutoscaling20110101State {
     pub groups: BTreeMap<String, StoredGroup>,
     /// Every scaling activity this service has recorded, oldest first.
     pub activities: Vec<StoredActivity>,
+    /// Every instance refresh this service has recorded, oldest first.
+    pub instance_refreshes: Vec<StoredInstanceRefresh>,
     /// Source of activity ids.
     pub next_activity_seq: u64,
     /// Source of the opaque id segment of a resource ARN.
@@ -350,10 +435,39 @@ impl AutoScalingState {
         uuid_shaped(self.next_activity_seq)
     }
 
-    /// Mint the opaque id segment an Auto Scaling ARN carries.
+    /// Mint an opaque resource id: the segment an Auto Scaling ARN carries, and the
+    /// id an instance refresh is tracked by. ONE sequence, so no two resources of
+    /// this service are ever minted the same id.
     pub fn mint_resource_id(&mut self) -> String {
         self.next_resource_seq += 1;
         uuid_shaped(self.next_resource_seq)
+    }
+
+    /// Store one instance refresh under a freshly minted id and answer that id,
+    /// keeping the log bounded.
+    ///
+    /// The ONE writer of [`Self::instance_refreshes`], so every refresh's id comes
+    /// from one minter and [`MAX_RETAINED_INSTANCE_REFRESHES`] is applied in one
+    /// place: `instance_refresh_id` on the way in is ignored.
+    pub fn push_instance_refresh(&mut self, refresh: StoredInstanceRefresh) -> String {
+        let instance_refresh_id = self.mint_resource_id();
+        self.instance_refreshes.push(StoredInstanceRefresh {
+            instance_refresh_id: instance_refresh_id.clone(),
+            ..refresh
+        });
+        // Keep the log bounded: the oldest refresh is the first to go.
+        if self.instance_refreshes.len() > MAX_RETAINED_INSTANCE_REFRESHES {
+            let excess = self.instance_refreshes.len() - MAX_RETAINED_INSTANCE_REFRESHES;
+            self.instance_refreshes.drain(..excess);
+        }
+        instance_refresh_id
+    }
+
+    /// The group's ACTIVE instance refresh, if it has one: the one still running.
+    pub fn active_instance_refresh(&self, group_name: &str) -> Option<&StoredInstanceRefresh> {
+        self.instance_refreshes
+            .iter()
+            .find(|refresh| refresh.auto_scaling_group_name == group_name && refresh.is_active())
     }
 
     /// Append a scaling activity that finishes at `completes_at`.
@@ -438,8 +552,9 @@ impl AutoScalingState {
     }
 
     /// Materialise everything the clock has already made due at `now`: deferred
-    /// capacity changes whose cooldown has elapsed, instance lifecycle
-    /// transitions, and activity completions.
+    /// capacity changes whose cooldown has elapsed, the replacements a running
+    /// instance refresh owes, instance lifecycle transitions, and activity
+    /// completions.
     ///
     /// Every handler calls this first — including the reporting ones, which may
     /// write exactly this much and nothing else, because each of these changes was
@@ -480,6 +595,9 @@ impl AutoScalingState {
         for (name, desired_capacity, cause, due) in due_changes {
             self.apply_capacity(engine, &name, desired_capacity, &cause, due);
         }
+        // Before the lifecycle pass below, so an instance a replacement launched at
+        // an instant already past leaves its transient state in this same call.
+        self.advance_instance_refreshes(engine, now);
 
         for group in self.groups.values_mut() {
             for instance in &mut group.instances {
@@ -535,24 +653,12 @@ impl AutoScalingState {
             return;
         };
         let arn = group.arn.clone();
-        let region = group.region.clone();
-        let zones = group.availability_zones.clone();
-        let vpc_zone_identifier = group.vpc_zone_identifier.clone();
-        let launch_configuration_name = group.launch_configuration_name.clone();
-        let launch_template = group.launch_template.clone();
-        let mixed_instances_policy = group.mixed_instances_policy.clone();
-        let tags = group.tags.clone();
-        let protected = group.new_instances_protected_from_scale_in;
+        let zoneless = group.availability_zones.is_empty();
         let cooldown = group.default_cooldown.max(0);
         let previous = group.active_instance_count();
-        let placed = group.instances.len();
         let headroom = group.launch_headroom();
-        let launch_configuration = launch_configuration_name
-            .as_ref()
-            .and_then(|name| self.launch_configurations.get(name))
-            .cloned();
 
-        let to_launch = if zones.is_empty() {
+        let to_launch = if zoneless {
             // Without a zone to place an instance in, nothing can be launched; the
             // handlers refuse such a request before reaching here.
             0
@@ -569,41 +675,16 @@ impl AutoScalingState {
         let due = now + LIFECYCLE_TRANSITION;
 
         let wanted = usize::try_from(to_launch).unwrap_or(0);
-        let launched = ec2_instances::launch(
+        let (launched_ids, unplaced) = self.launch_into_group(
             engine,
-            &ec2_instances::LaunchRequest {
-                region: &region,
+            &GroupLaunch {
                 group_name,
                 count: wanted,
-                placed,
-                zones: &zones,
-                vpc_zone_identifier: vpc_zone_identifier.as_deref(),
-                launch_configuration: launch_configuration.as_ref(),
-                launch_template: launch_template.as_ref(),
-                mixed_instances_policy: mixed_instances_policy.as_ref(),
-                tags: &tags,
+                due,
+                // A capacity change launches from the group's own launch source.
+                desired_configuration: None,
             },
         );
-        // A unit of capacity Amazon EC2 did not place is a launch that failed, so the
-        // group is given no instance for it: an id it reported would resolve nowhere.
-        let unplaced = wanted.saturating_sub(launched.len());
-        let launched: Vec<StoredInstance> = launched
-            .into_iter()
-            .map(|instance| StoredInstance {
-                instance_id: instance.instance_id,
-                availability_zone: instance.availability_zone,
-                lifecycle_state: LIFECYCLE_PENDING.to_string(),
-                health_status: HEALTH_STATUS_HEALTHY.to_string(),
-                launch_configuration_name: launch_configuration_name.clone(),
-                launch_template: launch_template.clone(),
-                // What Amazon EC2 launched it as, so the two services report one
-                // instance the same way.
-                instance_type: instance.instance_type,
-                image_id: instance.image_id,
-                protected_from_scale_in: protected,
-                transition_due: Some(due),
-            })
-            .collect();
 
         let group = self
             .groups
@@ -612,38 +693,9 @@ impl AutoScalingState {
         group.desired_capacity = desired_capacity;
         group.pending_capacity = None;
         group.cooldown_until = Some(now + Duration::from_secs(u64::from(cooldown.unsigned_abs())));
-        let launched_ids: Vec<String> = launched
-            .iter()
-            .map(|instance| instance.instance_id.clone())
-            .collect();
-        group.instances.extend(launched);
 
-        // Scale in the most recently launched instances first. The group's
-        // `TerminationPolicies` are persisted and reported as configured, but the
-        // `Default` policy's own inputs (Availability Zone rebalancing, billing
-        // hour, launch template age) are not modelled here, so selection is by
-        // launch order. An instance protected from scale-in is never chosen: that
-        // is what the protection means.
-        let mut terminated_ids = Vec::new();
-        let mut remaining = to_terminate;
-        for instance in group.instances.iter_mut().rev() {
-            if remaining == 0 {
-                break;
-            }
-            if instance.lifecycle_state == LIFECYCLE_TERMINATING || instance.protected_from_scale_in
-            {
-                continue;
-            }
-            instance.lifecycle_state = LIFECYCLE_TERMINATING.to_string();
-            instance.transition_due = Some(due);
-            terminated_ids.push(instance.instance_id.clone());
-            remaining -= 1;
-        }
-
-        // The instances leaving the group are terminated where they live: the same
-        // Amazon EC2 instances the launch minted, so the account sees them shut down
-        // rather than vanish from one service's view alone.
-        ec2_instances::terminate(engine, &terminated_ids);
+        let terminated_ids = self.scale_in_selection(group_name, to_terminate);
+        self.terminate_group_instances(engine, group_name, &terminated_ids, due);
 
         for instance_id in launched_ids {
             self.record_activity(
@@ -679,11 +731,389 @@ impl AutoScalingState {
         }
     }
 
+    /// Launch instances into the group through the account's own Amazon EC2 store and
+    /// give the group its own view of each, answering the ids launched and how many
+    /// of the ones asked for Amazon EC2 could not place.
+    ///
+    /// THE ONE launch path: a capacity change and an instance refresh's replacement
+    /// both reach Amazon EC2 through here, so one group's instances are launched from
+    /// one resolution of its launch source however the launch was asked for. A launch
+    /// Amazon EC2 could not place gives the group no instance — an id it reported
+    /// would resolve nowhere — and is counted for the caller to record.
+    fn launch_into_group<Eng: Send + Sync + 'static>(
+        &mut self,
+        engine: &Eng,
+        request: &GroupLaunch<'_>,
+    ) -> (Vec<String>, usize) {
+        let Some(group) = self.groups.get(request.group_name) else {
+            return (Vec::new(), request.count);
+        };
+        let region = group.region.clone();
+        let zones = group.availability_zones.clone();
+        let vpc_zone_identifier = group.vpc_zone_identifier.clone();
+        let tags = group.tags.clone();
+        let protected = group.new_instances_protected_from_scale_in;
+        let placed = group.instances.len();
+        let headroom = usize::try_from(group.launch_headroom()).unwrap_or(0);
+        // What the instances run: the desired configuration of the instance refresh
+        // that asked for them, when one did — its replacements run the new
+        // configuration — and otherwise the group's own launch source.
+        let (launch_configuration_name, launch_template, mixed_instances_policy) =
+            match request.desired_configuration {
+                Some(desired) => (
+                    None,
+                    desired.launch_template.clone(),
+                    desired.mixed_instances_policy.clone(),
+                ),
+                None => (
+                    group.launch_configuration_name.clone(),
+                    group.launch_template.clone(),
+                    group.mixed_instances_policy.clone(),
+                ),
+            };
+        let launch_configuration = launch_configuration_name
+            .as_ref()
+            .and_then(|name| self.launch_configurations.get(name))
+            .cloned();
+
+        // Never more than the group can still hold, so neither one request nor a run
+        // of them can grow the stored instances past MAX_GROUP_CAPACITY.
+        let wanted = request.count.min(headroom);
+        let launched = ec2_instances::launch(
+            engine,
+            &ec2_instances::LaunchRequest {
+                region: &region,
+                group_name: request.group_name,
+                count: wanted,
+                placed,
+                zones: &zones,
+                vpc_zone_identifier: vpc_zone_identifier.as_deref(),
+                launch_configuration: launch_configuration.as_ref(),
+                launch_template: launch_template.as_ref(),
+                mixed_instances_policy: mixed_instances_policy.as_ref(),
+                tags: &tags,
+            },
+        );
+        let unplaced = request.count.saturating_sub(launched.len());
+        let launched: Vec<StoredInstance> = launched
+            .into_iter()
+            .map(|instance| StoredInstance {
+                instance_id: instance.instance_id,
+                availability_zone: instance.availability_zone,
+                lifecycle_state: LIFECYCLE_PENDING.to_string(),
+                health_status: HEALTH_STATUS_HEALTHY.to_string(),
+                launch_configuration_name: launch_configuration_name.clone(),
+                launch_template: launch_template.clone(),
+                // What Amazon EC2 launched it as, so the two services report one
+                // instance the same way.
+                instance_type: instance.instance_type,
+                image_id: instance.image_id,
+                protected_from_scale_in: protected,
+                transition_due: Some(request.due),
+            })
+            .collect();
+        let launched_ids: Vec<String> = launched
+            .iter()
+            .map(|instance| instance.instance_id.clone())
+            .collect();
+        if let Some(group) = self.groups.get_mut(request.group_name) {
+            group.instances.extend(launched);
+        }
+        (launched_ids, unplaced)
+    }
+
+    /// The instances a scale-in of `count` takes out of the group.
+    ///
+    /// The most recently launched instances go first. The group's
+    /// `TerminationPolicies` are persisted and reported as configured, but the
+    /// `Default` policy's own inputs (Availability Zone rebalancing, billing hour,
+    /// launch template age) are not modelled here, so selection is by launch order.
+    /// An instance protected from scale-in is never chosen: that is what the
+    /// protection means.
+    fn scale_in_selection(&self, group_name: &str, count: i32) -> Vec<String> {
+        let Some(group) = self.groups.get(group_name) else {
+            return Vec::new();
+        };
+        let mut ids = Vec::new();
+        let mut remaining = count;
+        for instance in group.instances.iter().rev() {
+            if remaining == 0 {
+                break;
+            }
+            if instance.lifecycle_state == LIFECYCLE_TERMINATING || instance.protected_from_scale_in
+            {
+                continue;
+            }
+            ids.push(instance.instance_id.clone());
+            remaining -= 1;
+        }
+        ids
+    }
+
+    /// Take the instances `instance_ids` names out of the group: each is reported
+    /// `Terminating` until `due`, and the same Amazon EC2 instance is terminated
+    /// where it lives, so the account sees it shut down rather than vanish from one
+    /// service's view alone.
+    ///
+    /// An id the group does not hold, or one already on its way out, changes nothing.
+    fn terminate_group_instances<Eng: Send + Sync + 'static>(
+        &mut self,
+        engine: &Eng,
+        group_name: &str,
+        instance_ids: &[String],
+        due: SystemTime,
+    ) {
+        if let Some(group) = self.groups.get_mut(group_name) {
+            for instance in &mut group.instances {
+                if instance_ids.contains(&instance.instance_id)
+                    && instance.lifecycle_state != LIFECYCLE_TERMINATING
+                {
+                    instance.lifecycle_state = LIFECYCLE_TERMINATING.to_string();
+                    instance.transition_due = Some(due);
+                }
+            }
+        }
+        ec2_instances::terminate(engine, instance_ids);
+    }
+
+    /// Materialise every instance-refresh replacement the clock has made due at
+    /// `now`, and finish each refresh that has none left.
+    ///
+    /// A refresh replaces ONE instance per [`INSTANCE_REFRESH_REPLACEMENT`], so a
+    /// refresh nobody has read for a while catches up over the steps it was owed,
+    /// each anchored at the instant it came due rather than at the instant somebody
+    /// looked. The loop therefore terminates: every pass either retires a pending
+    /// replacement or brings a refresh to a terminal status, which clears its due
+    /// instant.
+    pub fn advance_instance_refreshes<Eng: Send + Sync + 'static>(
+        &mut self,
+        engine: &Eng,
+        now: SystemTime,
+    ) {
+        loop {
+            let due: Vec<(usize, SystemTime)> = self
+                .instance_refreshes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, refresh)| {
+                    refresh
+                        .next_step_due
+                        .filter(|due| *due <= now)
+                        .map(|due| (index, due))
+                })
+                .collect();
+            if due.is_empty() {
+                return;
+            }
+            for (index, due) in due {
+                self.advance_one_instance_refresh(engine, index, due);
+            }
+        }
+    }
+
+    /// Retire the one step the refresh at `index` owes at `due`: replace its next
+    /// instance, or — with none left to replace — finish it.
+    fn advance_one_instance_refresh<Eng: Send + Sync + 'static>(
+        &mut self,
+        engine: &Eng,
+        index: usize,
+        due: SystemTime,
+    ) {
+        let Some(refresh) = self.instance_refreshes.get(index) else {
+            return;
+        };
+        let group_name = refresh.auto_scaling_group_name.clone();
+        let instance_refresh_id = refresh.instance_refresh_id.clone();
+        let desired_configuration = refresh.desired_configuration.clone();
+        let next_instance_id = refresh.pending_instance_ids.first().cloned();
+
+        // A refresh whose group is gone has no instances left to replace and cannot
+        // finish: the group it was started for no longer exists.
+        if !self.groups.contains_key(&group_name) {
+            if let Some(refresh) = self.instance_refreshes.get_mut(index) {
+                refresh.status = REFRESH_FAILED.to_string();
+                refresh.status_reason = Some(
+                    "The Auto Scaling group was deleted while the instance refresh was in \
+                     progress."
+                        .to_string(),
+                );
+                refresh.end_time = Some(due);
+                refresh.next_step_due = None;
+            }
+            return;
+        }
+
+        let Some(instance_id) = next_instance_id else {
+            // Every instance the refresh set out to replace has been replaced, so the
+            // refresh has succeeded — and the model documents that the group's own
+            // settings then reflect the desired configuration it ran with.
+            if let Some(desired) = desired_configuration {
+                if let Some(group) = self.groups.get_mut(&group_name) {
+                    if desired.launch_template.is_some() {
+                        group.launch_template = desired.launch_template.clone();
+                        group.launch_configuration_name = None;
+                    }
+                    if desired.mixed_instances_policy.is_some() {
+                        group.mixed_instances_policy = desired.mixed_instances_policy.clone();
+                        group.launch_configuration_name = None;
+                    }
+                }
+            }
+            if let Some(refresh) = self.instance_refreshes.get_mut(index) {
+                refresh.status = REFRESH_SUCCESSFUL.to_string();
+                refresh.percentage_complete = 100;
+                refresh.instances_to_update = 0;
+                refresh.end_time = Some(due);
+                refresh.next_step_due = None;
+            }
+            return;
+        };
+
+        let replaced_instance = self.replace_group_instance(
+            engine,
+            &group_name,
+            &instance_id,
+            desired_configuration.as_ref(),
+            &instance_refresh_id,
+            due,
+        );
+
+        let Some(refresh) = self.instance_refreshes.get_mut(index) else {
+            return;
+        };
+        // A replacement Amazon EC2 could not place is a launch failure, and the model
+        // documents that "an instance refresh might fail for several reasons, such as
+        // EC2 launch failures": the instance stays pending, unreplaced, and the
+        // refresh fails rather than reporting progress nothing made.
+        if !replaced_instance {
+            refresh.status = REFRESH_FAILED.to_string();
+            refresh.status_reason = Some(
+                "The instance refresh failed because a replacement instance could not be \
+                 launched."
+                    .to_string(),
+            );
+            refresh.end_time = Some(due);
+            refresh.next_step_due = None;
+            return;
+        }
+        if !refresh.pending_instance_ids.is_empty() {
+            refresh.pending_instance_ids.remove(0);
+        }
+        refresh.status = REFRESH_IN_PROGRESS.to_string();
+        refresh.instances_to_update =
+            i32::try_from(refresh.pending_instance_ids.len()).unwrap_or(i32::MAX);
+        let replaced = (refresh.instances_at_start - refresh.instances_to_update).max(0);
+        refresh.percentage_complete = if refresh.instances_at_start > 0 {
+            (replaced.saturating_mul(100) / refresh.instances_at_start).clamp(0, 100)
+        } else {
+            100
+        };
+        refresh.next_step_due = Some(due + INSTANCE_REFRESH_REPLACEMENT);
+    }
+
+    /// Replace ONE instance of a group: launch its replacement from the refresh's
+    /// desired configuration (or the group's own launch source) and terminate the
+    /// instance it replaces, recording the scaling activity each of those changes
+    /// produces.
+    ///
+    /// The instance being replaced is taken out only once its replacement exists, so
+    /// a replacement Amazon EC2 could not place leaves the group's instances alone and
+    /// records the failed launch instead. Answers whether the instance WAS replaced,
+    /// which is what the caller reports progress from.
+    fn replace_group_instance<Eng: Send + Sync + 'static>(
+        &mut self,
+        engine: &Eng,
+        group_name: &str,
+        instance_id: &str,
+        desired_configuration: Option<&DesiredConfiguration>,
+        instance_refresh_id: &str,
+        now: SystemTime,
+    ) -> bool {
+        let Some(arn) = self.groups.get(group_name).map(|group| group.arn.clone()) else {
+            return false;
+        };
+        let due = now + LIFECYCLE_TRANSITION;
+        let cause = Self::instance_refresh_cause(instance_refresh_id);
+        let (launched_ids, unplaced) = self.launch_into_group(
+            engine,
+            &GroupLaunch {
+                group_name,
+                count: 1,
+                due,
+                desired_configuration,
+            },
+        );
+        let replaced = if launched_ids.is_empty() {
+            Vec::new()
+        } else {
+            vec![instance_id.to_string()]
+        };
+        self.terminate_group_instances(engine, group_name, &replaced, due);
+
+        for launched_id in launched_ids {
+            self.record_activity(
+                group_name,
+                &arn,
+                format!("Launching a new EC2 instance: {launched_id}"),
+                cause.clone(),
+                GROUP_STATE_IN_SERVICE,
+                now,
+                Some(due),
+            );
+        }
+        for replaced_id in &replaced {
+            self.record_activity(
+                group_name,
+                &arn,
+                format!("Terminating EC2 instance: {replaced_id}"),
+                cause.clone(),
+                GROUP_STATE_IN_SERVICE,
+                now,
+                Some(due),
+            );
+        }
+        for _ in 0..unplaced {
+            self.record_failed_activity(
+                group_name,
+                &arn,
+                "Launching a new EC2 instance failed: the account could not place it".to_string(),
+                cause.clone(),
+                now,
+            );
+        }
+        !replaced.is_empty()
+    }
+
     /// The cause an Auto Scaling capacity change records: what asked for it, and
     /// the capacities it moved between.
     pub fn capacity_change_cause(reason: &str, from: i32, to: i32) -> String {
         format!("{reason}: changing the desired capacity from {from} to {to}.")
     }
+
+    /// The cause the replacements of an instance refresh record: which refresh asked
+    /// for them.
+    pub fn instance_refresh_cause(instance_refresh_id: &str) -> String {
+        format!(
+            "an instance refresh is replacing the instances of the group: instance refresh \
+             {instance_refresh_id}."
+        )
+    }
+}
+
+/// What a group is asked to launch: how many instances, when their transient state
+/// comes due, and the configuration they run when it is not the group's own.
+#[derive(Debug)]
+struct GroupLaunch<'a> {
+    /// The group the instances belong to.
+    group_name: &'a str,
+    /// How many instances to launch.
+    count: usize,
+    /// When the `Pending` state each launched instance is reported in comes due.
+    due: SystemTime,
+    /// The desired configuration of the instance refresh that asked for the launch,
+    /// when one did: its replacements run the new configuration before the group's
+    /// own settings are updated to it.
+    desired_configuration: Option<&'a DesiredConfiguration>,
 }
 
 /// The values a `HealthCheckType` may name, from the model's own documentation
@@ -980,6 +1410,43 @@ pub fn group_arn(region: &str, resource_id: &str, name: &str) -> String {
         region,
         &format!("autoScalingGroup:{resource_id}:autoScalingGroupName/{name}"),
     )
+}
+
+/// The message Amazon EC2 Auto Scaling refuses a request naming a group it does not
+/// hold with, whose detail field names the group that was asked for.
+pub fn absent_group_message(name: &str) -> String {
+    format!("AutoScalingGroup name not found - AutoScalingGroup: {name} not found")
+}
+
+/// The launch template specification a launch source names: the one it carries
+/// directly, or the one its mixed instances policy carries.
+pub fn launch_template_of<'a>(
+    launch_template: Option<&'a LaunchTemplateSpecification>,
+    mixed_instances_policy: Option<&'a MixedInstancesPolicy>,
+) -> Option<&'a LaunchTemplateSpecification> {
+    launch_template.or_else(|| {
+        mixed_instances_policy
+            .and_then(|policy| policy.launch_template.as_ref())
+            .and_then(|template| template.launch_template_specification.as_ref())
+    })
+}
+
+/// Whether two specifications name the same launch template and version, which is
+/// what makes an instance launched from one of them already up to date with respect
+/// to the other.
+pub fn same_launch_template(
+    left: Option<&LaunchTemplateSpecification>,
+    right: Option<&LaunchTemplateSpecification>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            left.launch_template_id == right.launch_template_id
+                && left.launch_template_name == right.launch_template_name
+                && left.version == right.version
+        }
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// Decode a `NextToken` into the offset it names, or `None` when the token is not

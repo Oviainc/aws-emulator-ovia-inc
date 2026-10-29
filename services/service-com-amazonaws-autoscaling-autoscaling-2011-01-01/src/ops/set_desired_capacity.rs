@@ -185,9 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize_due(&*self.engine, now);
 
         let Some(group) = state.groups.get(&name) else {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "AutoScalingGroup name not found - AutoScalingGroup: {name} not found"
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::absent_group_message(&name),
+            ));
         };
         let (min_size, max_size, current) = (group.min_size, group.max_size, group.desired_capacity);
         let cooldown_until = group.cooldown_until;

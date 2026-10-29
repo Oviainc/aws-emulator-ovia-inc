@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstanceRefreshes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstanceRefreshes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstanceRefreshes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the instance refreshes started on one Auto Scaling group, newest first,
+//! with the progress each has actually made: its status, the percentage of the
+//! instances it has replaced and how many it has still to replace
+//! ([`crate::state::StoredInstanceRefresh`]). A REPORTING operation — it writes only
+//! what the clock had already made due, through
+//! [`crate::state::AutoScalingState::materialize_due`].
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +160,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstanceRefreshes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstanceRefreshesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstanceRefreshes"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeInstanceRefreshesErrorModeled::ResourceContentionFault(
+                    ResourceContentionFault {
+                        message: Some(
+                            "the Auto Scaling store is not mounted on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The requested cursor: the offset it decodes to, and the token itself, kept so
+        // a later refusal can name the token the caller actually submitted.
+        let (offset, token) = match input.next_token.clone() {
+            None => (0, String::new()),
+            Some(token) => match crate::state::decode_next_token(&token) {
+                Some(offset) => (offset, token),
+                None => {
+                    return Err(DescribeInstanceRefreshesErrorModeled::InvalidNextToken(
+                        InvalidNextToken {
+                            message: Some(crate::state::invalid_next_token_message(&token)),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+        // `MaxRecords` has a documented range; a page size outside it is refused,
+        // not quietly reshaped.
+        if let Some(max_records) = crate::state::max_records_out_of_range(input.max_records) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The MaxRecords value {max_records} is not valid: it must be between 1 and {}",
+                crate::state::MAX_MAX_RECORDS
+            )));
+        }
+
+        let name = input.auto_scaling_group_name;
+        let wanted = input.instance_refresh_ids.unwrap_or_default();
+
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
+
+        if !state.groups.contains_key(&name) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::absent_group_message(&name),
+            ));
+        }
+
+        // "sorted by creation timestamp in descending order"
+        // (smithy_query(query="doc",shape="DescribeInstanceRefreshesAnswer",
+        // member="InstanceRefreshes")): the store holds them oldest first, so the
+        // newest refresh is reported first.
+        let matching: Vec<InstanceRefresh> = state
+            .instance_refreshes
+            .iter()
+            .rev()
+            .filter(|refresh| refresh.auto_scaling_group_name == name)
+            .filter(|refresh| wanted.is_empty() || wanted.contains(&refresh.instance_refresh_id))
+            .map(refresh_view)
+            .collect();
+        // A token this service issued always points inside the list it was issued for;
+        // one that points past the end was not issued for this list. Only a decoded
+        // token reaches a non-zero offset, so `token` is the one submitted.
+        if offset > 0 && offset >= matching.len() {
+            return Err(DescribeInstanceRefreshesErrorModeled::InvalidNextToken(
+                InvalidNextToken {
+                    message: Some(crate::state::invalid_next_token_message(&token)),
+                },
+            )
+            .into());
+        }
+        let (instance_refreshes, next_token) =
+            crate::state::page(&matching, offset, input.max_records);
+
+        Ok(DescribeInstanceRefreshesOutput {
+            instance_refreshes: Some(instance_refreshes),
+            next_token,
+        })
+    }
+}
+
+/// The `InstanceRefresh` the service reports for a stored refresh.
+fn refresh_view(refresh: &crate::state::StoredInstanceRefresh) -> InstanceRefresh {
+    InstanceRefresh {
+        instance_refresh_id: Some(refresh.instance_refresh_id.clone()),
+        auto_scaling_group_name: Some(refresh.auto_scaling_group_name.clone()),
+        status: Some(refresh.status.clone()),
+        status_reason: refresh.status_reason.clone(),
+        start_time: Some(crate::state::to_date_time(refresh.start_time)),
+        end_time: refresh.end_time.map(crate::state::to_date_time),
+        percentage_complete: Some(refresh.percentage_complete),
+        instances_to_update: Some(refresh.instances_to_update),
+        // "Additional progress details for an Auto Scaling group that has a warm pool"
+        // (smithy_query(query="doc",shape="InstanceRefresh",member="ProgressDetails")).
+        // No group holds a warm pool: `PutWarmPool` is still scaffolded, so there is no
+        // warm-pool progress to report beside the group's own.
+        progress_details: None,
+        preferences: refresh.preferences.clone(),
+        desired_configuration: refresh.desired_configuration.clone(),
+        // The rollback details of a refresh nothing has rolled back:
+        // `RollbackInstanceRefresh` is still scaffolded, so no refresh has any.
+        rollback_details: None,
+        strategy: Some(refresh.strategy.clone()),
     }
 }

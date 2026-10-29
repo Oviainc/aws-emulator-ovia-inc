@@ -194,9 +194,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &name,
                 "refused: no such group",
             );
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "AutoScalingGroup name not found - AutoScalingGroup: {name} not found"
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::absent_group_message(&name),
+            ));
         };
         let arn = group.arn.clone();
         let instance_count = group.instances.len();
