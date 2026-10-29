@@ -2403,26 +2403,29 @@ pub fn invalid_token() -> ValidationException {
     }
 }
 
-/// The modelled `ValidationException` for a tag write that would leave a resource holding
-/// more tags than [`TAGS_PER_RESOURCE_LIMIT`].
+/// The requirement a tag write that would leave a resource holding more tags than
+/// [`TAGS_PER_RESOURCE_LIMIT`] failed.
 ///
-/// `ValidationExceptionReason`'s `fieldValidationFailed`, naming `tags` in the field list:
-/// the member the service refused is the one the request carried the tags in, and the
-/// clause states the requirement — the limit, and the count the write would have left
-/// behind — rather than echoing the tags back at the caller.
-pub fn too_many_tags(total: usize) -> ValidationException {
-    let message = format!(
-        "a resource holds at most {TAGS_PER_RESOURCE_LIMIT} tags; this request would leave it \
-         with {total}"
-    );
-    ValidationException {
-        message: message.clone(),
-        reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
-        field_list: Some(vec![ValidationExceptionField {
-            name: "tags".to_string(),
-            message,
-        }]),
-    }
+/// The bound is `TagsMap`'s own modelled `@length(max: 50)` measured over the resource's
+/// whole tag set ([`TAGS_PER_RESOURCE_LIMIT`]), so the requirement is that constraint
+/// stated in the words a length ceiling is stated in — the same clause the boundary
+/// validator renders for the same constraint, so one refusal of this bound cannot be
+/// worded unlike the other.
+pub fn tags_per_resource_requirement() -> String {
+    format!("Member must have length less than or equal to {TAGS_PER_RESOURCE_LIMIT}")
+}
+
+/// The modelled `ValidationException` for a tag write that would leave a resource holding
+/// more tags than [`TAGS_PER_RESOURCE_LIMIT`], stated against `member` — the member of
+/// THAT request which carried the tags.
+///
+/// The same validation envelope every other service-decided refusal here is stated in
+/// ([`field_validation_failed`]): the clause names the member and the requirement its
+/// value failed, and neither the tags nor the count the write would have left behind is
+/// echoed back — the request already carried the tags, and the resource's own count is
+/// what `ListTagsForResource` reports.
+pub fn too_many_tags(member: &str) -> ValidationException {
+    field_validation_failed(member, &tags_per_resource_requirement())
 }
 
 /// The requirement a tag key in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace failed

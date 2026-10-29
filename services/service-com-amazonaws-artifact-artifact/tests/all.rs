@@ -69,6 +69,8 @@ mod reserved_tag_keys;
 mod resource_tag_writes;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/service_stated_validation_envelope.rs"]
+mod service_stated_validation_envelope;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/timestamp_wire_form.rs"]

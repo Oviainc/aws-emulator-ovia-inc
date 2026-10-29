@@ -15,6 +15,12 @@
 //! with the modelled 400 `ValidationException` and writes nothing, so a caller-created tag
 //! set never carries one.
 //!
+//! A write that would leave the resource holding more tags than
+//! [`crate::state::TAGS_PER_RESOURCE_LIMIT`] is refused the same way
+//! ([`crate::state::too_many_tags`]) and writes nothing: both refusals this handler states
+//! are field-validation failures, so both are worded in the one validation envelope this
+//! service states such a refusal in.
+//!
 //! The resource is named by its ARN, and the only resource an account owns in this service
 //! is a compliance inquiry — see
 //! [`crate::state::ComAmazonawsArtifactArtifactState::tagged_resource`]. An ARN that
@@ -192,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         tags.extend(input.tags);
         if tags.len() > crate::state::TAGS_PER_RESOURCE_LIMIT {
             return Err(TagResourceErrorModeled::ValidationException(
-                crate::state::too_many_tags(tags.len()),
+                crate::state::too_many_tags("tags"),
             )
             .into());
         }
