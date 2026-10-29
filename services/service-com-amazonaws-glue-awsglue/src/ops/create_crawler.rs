@@ -6,6 +6,12 @@
 //! written, the server-set members (`State`, `Version`, `CreationTime`, `LastUpdated`)
 //! are filled here, and a later `GetCrawler` reports exactly what was stored.
 //!
+//! The crawl is performed BY this service acting as the crawler's `Role`, so that role is
+//! resolved FIRST — before any member of the request is judged — and a role this emulator's
+//! own IAM answers that Glue cannot assume (this account holds no such role, or its trust
+//! policy does not admit the Glue service principal) is refused with `InvalidInputException`
+//! with nothing persisted (see [`crate::state::crawler_role_is_unassumable`]).
+//!
 //! An S3 target that names an `EventQueueArn` (or the `DlqEventQueueArn` beside it) is
 //! crawled FROM that queue, and the crawl runs as the crawler's `Role`, so the create is
 //! refused with `InvalidInputException` when the policies in force on that role do not
@@ -179,7 +185,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This operation models no server fault, so an unreachable store is
             // reported as the operation's own timeout error rather than invented as a
@@ -191,6 +196,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The crawl is performed BY this service acting as the crawler's `Role`, so the
+        // role is resolved BEFORE any member of the request is judged: a role this
+        // service cannot assume backs no crawl at all, so the create is refused for the
+        // role whatever else the request gets wrong, and nothing is persisted. That
+        // precedence is the service's own — the role is the identity the resource would
+        // run under, and it is settled before the resource is described.
+        //
+        // The question is put to the emulator's OWN IAM over its OWN in-process callback
+        // (see [`crate::state::crawler_role_is_unassumable`]), and only what IAM ANSWERED
+        // is refused, so an emulator with no IAM to ask refuses nothing. Awaited before
+        // the store is locked.
+        let region = crate::state::request_region(ctx.parts());
+        if crate::state::crawler_role_is_unassumable(ctx, &region, &input.role).await {
+            return Err(CreateCrawlerErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::ROLE_NOT_ASSUMABLE.to_string()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
 
         // "At least one crawl target must be specified, in the s3Targets field, the
         // jdbcTargets field, or the DynamoDBTargets field." The rule is about naming a

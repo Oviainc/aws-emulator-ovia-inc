@@ -202,10 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // under that name.
         let (registry_name, schema_name) = match reference {
             crate::state::Reference::Local(names) => names,
-            crate::state::Reference::Elsewhere((_, schema_name)) => {
+            crate::state::Reference::Elsewhere(_) => {
                 return Err(GetSchemaErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
-                        message: Some(crate::state::messages::schema_not_found(&schema_name)),
+                        message: Some(crate::state::messages::SCHEMA_NOT_FOUND.to_string()),
                         from_federation_source: None,
                     },
                 )
@@ -217,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(schema) = store.schema(&registry_name, &schema_name) else {
             return Err(GetSchemaErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::schema_not_found(&schema_name)),
+                    message: Some(crate::state::messages::SCHEMA_NOT_FOUND.to_string()),
                     from_federation_source: None,
                 },
             )

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSchemaVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSchemaVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSchemaVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes versions from a schema set in this service's store: `Versions` names a single
+//! version number or an inclusive range of them, every named version the schema set holds
+//! is deleted from it, and a later `GetSchema` reports the latest version that is left.
+//!
+//! The member's own form is enforced HERE rather than at the framework boundary (`Versions`
+//! carries `skip_validation`, see [`super::types::delete_schema_versions_types`]): a value
+//! that spells no version number or range of them is refused with this operation's modelled
+//! `InvalidInputException` naming the parameter, the error class a Glue client matches, and
+//! never with the cross-service `ValidationException` this operation does not model.
+//!
+//! Two documented prohibitions refuse the WHOLE request, with nothing deleted: a span that
+//! contains the schema set's check-pointed version ("you have to remove the checkpoint first
+//! using the DeleteSchemaCheckpoint API"), and one that names the schema set's first version
+//! ("the first schema version can only be deleted by the DeleteSchema API"). A named version
+//! the schema set does not hold is not an error: it is already absent, so the delete is
+//! idempotent over it.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +166,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSchemaVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSchemaVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSchemaVersions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault. An unreachable store is a write that
+            // cannot be made right now, which is what its modelled
+            // `ConcurrentModificationException` describes, rather than a shape the model
+            // does not declare for it.
+            return Err(
+                DeleteSchemaVersionsErrorModeled::ConcurrentModificationException(
+                    ConcurrentModificationException {
+                        message: Some("the Glue schema registry store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // The schema set this request addresses is resolved first: `SchemaId` may name it
+        // by name or by ARN, and a reference that names neither is a bad parameter rather
+        // than a miss. The ONE resolution every schema-registry operation shares.
+        let reference = match crate::state::schema_reference(&input.schema_id, &region) {
+            Ok(reference) => reference,
+            Err(message) => return Err(invalid_input(message)),
+        };
+        // A schema ARN of another account or another Region names a schema of an estate
+        // this endpoint does not serve, so it names none here whatever this store holds
+        // under that name.
+        let (registry_name, schema_name) = match reference {
+            crate::state::Reference::Local(names) => names,
+            crate::state::Reference::Elsewhere(_) => return Err(schema_not_found()),
+        };
+
+        // "A version range may be supplied which may be of the format: a single version
+        // number, 5 a range, 5-8 : deletes versions 5, 6, 7, 8". A value outside that form
+        // names no version to delete, and the member it is wrong on is what the refusal
+        // names.
+        let Some((lowest, highest)) = crate::state::parse_version_span(&input.versions) else {
+            return Err(invalid_input(
+                crate::state::messages::parameter_value_not_valid(VERSIONS_MEMBER),
+            ));
+        };
+
+        let mut store = state.lock();
+        let Some(schema) = store.schema_mut(&registry_name, &schema_name) else {
+            return Err(schema_not_found());
+        };
+
+        // "When the range of version numbers contain check pointed version, the API will
+        // … not proceed with the deletion. You have to remove the checkpoint first using
+        // the DeleteSchemaCheckpoint API before using this API." So the whole request is
+        // refused and nothing is deleted.
+        let checkpoint = schema.checkpoint;
+        if checkpoint != crate::state::NO_SCHEMA_VERSION && (lowest..=highest).contains(&checkpoint)
+        {
+            return Err(
+                DeleteSchemaVersionsErrorModeled::ConcurrentModificationException(
+                    ConcurrentModificationException {
+                        message: Some(crate::state::messages::schema_version_is_checkpointed(
+                            checkpoint,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You cannot use the DeleteSchemaVersions API to delete the first schema version
+        // in the schema set. The first schema version can only be deleted by the
+        // DeleteSchema API." The first version is the lowest the set still holds, so a
+        // span reaching it refuses the whole request as well.
+        let first_held = schema
+            .versions
+            .iter()
+            .map(|version| version.version_number)
+            .min();
+        if let Some(first) = first_held {
+            if (lowest..=highest).contains(&first) {
+                return Err(invalid_input(
+                    crate::state::messages::first_schema_version_not_deletable(first),
+                ));
+            }
+        }
+
+        // Hard delete: "Hard deletes will be enforced on the database", so the versions
+        // the span names leave the schema set rather than being marked.
+        let held_before = schema.versions.len();
+        schema
+            .versions
+            .retain(|version| !(lowest..=highest).contains(&version.version_number));
+        let deleted = held_before - schema.versions.len();
+        if deleted > 0 {
+            schema.updated_time = ::std::time::SystemTime::now();
+        }
+        ::tracing::info!(
+            operation = "DeleteSchemaVersions",
+            registry = %registry_name,
+            schema = %schema_name,
+            versions = %input.versions,
+            deleted,
+            "deleted Glue schema versions"
+        );
+
+        // `SchemaVersionErrors` reports "the error details for an operation on a schema
+        // version". Every version the span named was either deleted or was already absent,
+        // and an absent version is nothing to report an error about, so this answer carries
+        // no per-version failure.
+        Ok(DeleteSchemaVersionsOutput {
+            schema_version_errors: None,
+        })
     }
+}
+
+/// The member a malformed version span is refused on, spelled as the model spells it.
+const VERSIONS_MEMBER: &str = "Versions";
+
+/// This operation's modelled refusal for a request member it cannot act on: "The input
+/// provided was not valid."
+fn invalid_input(message: String) -> DeleteSchemaVersionsError {
+    DeleteSchemaVersionsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
+}
+
+/// This operation's modelled refusal for a `SchemaId` that resolves to a schema set this
+/// endpoint holds none of — the same wording every schema-registry miss answers.
+fn schema_not_found() -> DeleteSchemaVersionsError {
+    DeleteSchemaVersionsErrorModeled::EntityNotFoundException(EntityNotFoundException {
+        message: Some(crate::state::messages::SCHEMA_NOT_FOUND.to_string()),
+        from_federation_source: None,
+    })
+    .into()
 }

@@ -176,7 +176,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This operation models no server fault, so an unreachable store is
             // reported as the operation's own timeout error rather than invented as a
@@ -192,32 +191,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The crawler this request addresses is resolved FIRST: a name no crawler in
         // this account has is a miss whatever else the request carries, so identity is
-        // settled before the members are judged.
-        let mut store = state.lock();
-        let Some(entry) = store.crawlers.get_mut(&input.name) else {
-            return Err(UpdateCrawlerErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::crawler_not_found(&input.name)),
-                    from_federation_source: None,
-                },
-            )
-            .into());
-        };
-
-        // "If a crawler is running, you must stop it using StopCrawler before updating
-        // it." `READY` is the one modelled `CrawlerState` with no run in progress, so
-        // every other state refuses the write.
-        if entry.state != crate::state::CRAWLER_STATE_READY {
-            return Err(UpdateCrawlerErrorModeled::CrawlerRunningException(
-                CrawlerRunningException {
-                    message: Some(crate::state::messages::crawler_running(&input.name)),
-                },
-            )
-            .into());
+        // settled before the members are judged. The guard is SCOPED, so the role
+        // resolution below — which asks this emulator's own IAM over its in-process
+        // callback — runs with no store lock held; both checks are made again under the
+        // guard that writes, because a crawler can have started running in between.
+        {
+            let store = state.lock();
+            let Some(entry) = store.crawlers.get(&input.name) else {
+                return Err(crawler_not_found(&input.name));
+            };
+            if entry.state != crate::state::CRAWLER_STATE_READY {
+                return Err(crawler_running(&input.name));
+            }
         }
 
         // Every check below is on the crawler this update would LEAVE BEHIND, so each
         // one looks at the member the request carries and ignores the ones it omits.
+
+        // The crawl is performed BY this service acting as the crawler's `Role`, so a
+        // request that REPLACES that role is held to the same resolution the create is:
+        // a role this service cannot assume backs no crawl, so it is refused before the
+        // rest of the request is judged and nothing is written. A request that names no
+        // `Role` keeps the stored one, which the create already resolved.
+        if let Some(role) = input.role.as_deref() {
+            let region = crate::state::request_region(ctx.parts());
+            if crate::state::crawler_role_is_unassumable(ctx, &region, role).await {
+                return Err(invalid_input(
+                    crate::state::messages::ROLE_NOT_ASSUMABLE.to_string(),
+                ));
+            }
+        }
 
         // "At least one crawl target must be specified, in the s3Targets field, the
         // jdbcTargets field, or the DynamoDBTargets field" (`CreateCrawler`): a crawler
@@ -276,7 +279,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A request that names no member to change asks for no change: nothing is
         // written, so the crawler's `Version` and `LastUpdated` are left where the last
-        // write that did change something put them.
+        // write that did change something put them. The store is locked again here,
+        // after the role resolution above, because the guard cannot be held across it —
+        // so the crawler's identity and its `READY` state are settled once more under
+        // the guard that actually writes, and a crawler whose crawl started during the
+        // resolution is refused rather than written to.
+        let mut store = state.lock();
+        let Some(entry) = store.crawlers.get_mut(&input.name) else {
+            return Err(crawler_not_found(&input.name));
+        };
+        if entry.state != crate::state::CRAWLER_STATE_READY {
+            return Err(crawler_running(&input.name));
+        }
         if crate::state::crawler_update_names_a_change(&input) {
             entry.apply_update(&input, catalog_id, ::std::time::SystemTime::now());
             ::tracing::info!(
@@ -297,6 +311,29 @@ fn invalid_input(message: String) -> UpdateCrawlerError {
     UpdateCrawlerErrorModeled::InvalidInputException(InvalidInputException {
         message: Some(message),
         from_federation_source: None,
+    })
+    .into()
+}
+
+/// This operation's modelled refusal for a `Name` no crawler in this account has. Built
+/// once here because the lookup happens twice: before the role resolution, which cannot
+/// hold the store guard, and again under the guard that writes.
+fn crawler_not_found(name: &str) -> UpdateCrawlerError {
+    UpdateCrawlerErrorModeled::EntityNotFoundException(EntityNotFoundException {
+        message: Some(crate::state::messages::crawler_not_found(name)),
+        from_federation_source: None,
+    })
+    .into()
+}
+
+/// This operation's modelled refusal for a crawler whose crawl is in progress: "if a
+/// crawler is running, you must stop it using `StopCrawler` before updating it". `READY` is
+/// the one modelled `CrawlerState` with no run in progress, so every other state refuses
+/// the write — judged both before the role resolution and again under the guard that
+/// writes, so a crawl that starts in between still refuses the update.
+fn crawler_running(name: &str) -> UpdateCrawlerError {
+    UpdateCrawlerErrorModeled::CrawlerRunningException(CrawlerRunningException {
+        message: Some(crate::state::messages::crawler_running(name)),
     })
     .into()
 }

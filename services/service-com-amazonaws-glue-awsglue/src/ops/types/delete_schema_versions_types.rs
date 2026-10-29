@@ -11,7 +11,17 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#DeleteSchemaVersionsInput")]
+// `Versions` carries `skip_validation`: the form this member admits is one this service
+// refuses in its OWN input error — `InvalidInputException` naming the offending parameter,
+// the error class a Glue client matches — and not with the cross-service
+// `ValidationException` the boundary walk answers with, which this operation does not model
+// at all. The handler decides what a version range may be
+// (`crate::ops::delete_schema_versions`, through `crate::state::parse_version_span`), so the
+// modelled `@length` and `@pattern` of `VersionsString` are enforced there rather than here.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.glue#DeleteSchemaVersionsInput",
+    skip_validation = ["Versions"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct DeleteSchemaVersionsInput {
     pub schema_id: SchemaId,

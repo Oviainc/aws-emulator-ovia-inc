@@ -2335,6 +2335,17 @@ impl ComAmazonawsGlueAwsglueState {
             .and_then(|registry| registry.schemas.get(schema_name))
     }
 
+    /// The stored schema set `schema_name` of registry `registry_name`, mutably.
+    pub fn schema_mut(
+        &mut self,
+        registry_name: &str,
+        schema_name: &str,
+    ) -> Option<&mut SchemaEntry> {
+        self.registries
+            .get_mut(registry_name)
+            .and_then(|registry| registry.schemas.get_mut(schema_name))
+    }
+
     /// How many schema sets the whole store holds. Bounded by [`MAX_REGISTRIES`], so this
     /// walk is over at most that many entries.
     pub fn stored_schemas(&self) -> usize {
@@ -9064,6 +9075,92 @@ pub fn iam_state<Eng: Send + Sync + 'static>(
     ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::service_state(engine)
 }
 
+/// The service principal a crawler's `Role` has to trust for this service to run the crawl
+/// as it. A crawl is performed BY Glue acting as that role, so the role's trust policy is
+/// what lets Glue assume it at all.
+pub const CRAWLER_SERVICE_PRINCIPAL: &str = "glue.amazonaws.com";
+
+/// The ONE reading of the form a crawler's `Role` may take: its role NAME and its role ARN.
+///
+/// `Role` is "the IAM role or Amazon Resource Name (ARN) of an IAM role used by the new
+/// crawler to access customer resources" (`CreateCrawler$Role`), so a value that reads as an
+/// ARN carries the name inside it ([`::service_common::iam_role::role_name`], the tree's one
+/// reading of an IAM ARN) and any other value IS the name. Stated once here so the two
+/// questions this crate asks about that member — the trust document
+/// ([`crawler_role_is_unassumable`]) and the identity policies in force on the role
+/// ([`role_policy_documents`]) — cannot read the member's form two different ways.
+pub fn crawler_role_reference(role: &str) -> CrawlerRole<'_> {
+    match ::service_common::iam_role::role_name(role) {
+        // A value that reads as this account's role ARN: the name is the one IAM holds it
+        // under, and the ARN is the value as sent.
+        Some(name) => CrawlerRole {
+            name,
+            arn: role.to_string(),
+        },
+        // Not this account's role ARN. Either it is a bare role name — in which case the
+        // ARN is the one this emulator mints for a role of that name — or it is an ARN of
+        // another account, which names no role this emulator's IAM can be asked about and
+        // so resolves to no local name either.
+        None if ::service_common::arn::parse(role).is_some() => CrawlerRole {
+            name: role,
+            arn: role.to_string(),
+        },
+        None => CrawlerRole {
+            name: role,
+            // An IAM ARN is partition-global, so it carries no Region.
+            arn: ::engine::emulator_arn(IAM_ARN_NAMESPACE, "", &format!("{ROLE_ARN_SEGMENT}/{role}")),
+        },
+    }
+}
+
+/// What a crawler's `Role` resolves to: the name IAM would hold the role under, and the ARN
+/// that addresses it. See [`crawler_role_reference`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrawlerRole<'a> {
+    /// The role name, for a lookup in the IAM store's own records.
+    pub name: &'a str,
+    /// The role ARN, for a reading that addresses the role by ARN.
+    pub arn: String,
+}
+
+/// The ARN vendor field of an IAM entity.
+const IAM_ARN_NAMESPACE: &str = "iam";
+
+/// The ARN resource-type segment of an IAM role.
+const ROLE_ARN_SEGMENT: &str = "role";
+
+/// Whether this emulator's own IAM ANSWERED that `role` is a role Glue cannot assume: this
+/// account holds no such role, or the trust policy the role carries does not admit
+/// [`CRAWLER_SERVICE_PRINCIPAL`].
+///
+/// A crawler RUNS AS its `Role`, so a role Glue cannot assume backs no crawl at all, and
+/// the service settles that before it stores anything. The whole question — which role of
+/// this account the value names, what IAM answers about it, and whether the trust document
+/// it carries admits a service principal — is the ONE reading every emulated service that
+/// resolves a caller-supplied execution role shares
+/// (`service_common::iam_role::role_is_unassumable`), so this crate states only WHICH
+/// principal has to be admitted and WHICH operations ask.
+///
+/// IAM is reached the way any emulated service reaches another: the AWS SDK over the
+/// emulator's OWN in-process callback ([`smithy_server_runtime::OperationContext::callback`]),
+/// so nothing here opens a socket or reads an ambient credential. `false` — do not refuse —
+/// for every case where nothing is KNOWN about the role, including an emulator with no IAM
+/// mounted to ask: a refusal has to be grounded in what IAM answered, never assumed. Awaited
+/// with NO store guard held.
+pub async fn crawler_role_is_unassumable(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role: &str,
+) -> bool {
+    ::service_common::iam_role::role_is_unassumable(
+        ctx,
+        region,
+        &crawler_role_reference(role).arn,
+        CRAWLER_SERVICE_PRINCIPAL,
+    )
+    .await
+}
+
 /// The Amazon SQS actions a crawler performs against the event queue of an S3 target it
 /// crawls in event mode: it RECEIVES the change messages, reads the queue's attributes to
 /// learn what is pending, and DELETES each message it has processed.
@@ -9095,8 +9192,9 @@ pub const MAX_CHECKED_EVENT_QUEUES: usize = 32;
 /// inline role policies plus the documents of the managed policies attached to it.
 ///
 /// `Role` is "the IAM role or Amazon Resource Name (ARN) of an IAM role"
-/// (`CreateCrawler$Role`), so a value that reads as this account's role ARN resolves to
-/// the name it carries and anything else is taken as the role name itself.
+/// (`CreateCrawler$Role`), whose form is read HERE by the crate's one reading of that
+/// member ([`crawler_role_reference`]), so this lookup and the trust-document reading
+/// beside it resolve the same value to the same role.
 ///
 /// `None` when nothing can be SHOWN about the role's permissions: this account holds no
 /// such role, it carries more documents than [`MAX_ROLE_DOCUMENTS`] (counted before any is
@@ -9106,7 +9204,7 @@ pub const MAX_CHECKED_EVENT_QUEUES: usize = 32;
 pub fn role_policy_documents(role: &str, iam: &IamState) -> Option<Vec<String>> {
     use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
 
-    let name = ::service_common::iam_role::role_name(role).unwrap_or(role);
+    let name = crawler_role_reference(role).name;
     let stored = iam.roles.get(&iam_store::name_key(name))?;
     let role_key = iam_store::name_key(&stored.role_name);
     let inline = iam.role_inline_policies.get(&role_key);
@@ -9871,6 +9969,41 @@ pub fn to_timestamp_string(at: SystemTime) -> String {
         .unwrap_or_default()
 }
 
+/// The inclusive span of schema version numbers a `Versions` string names, lowest first,
+/// or `None` when the value names no version at all.
+///
+/// Stated by the member: "A version range may be supplied which may be of the format: a
+/// single version number, 5 a range, 5-8 : deletes versions 5, 6, 7, 8"
+/// (`DeleteSchemaVersionsInput$Versions`), whose modelled form is a decimal counter with no
+/// leading zero, alone or as the two ends of a `<low>-<high>` range. A value outside that
+/// form names no version, and so does one whose ends do not spell a number this service can
+/// count with.
+///
+/// The span is NOT narrowed to the versions a schema set holds: which of the versions a
+/// request named exist is the caller's own schema set to answer, not this reading's.
+pub fn parse_version_span(versions: &str) -> Option<(i64, i64)> {
+    /// One end of the span: the modelled `[1-9][0-9]*`, i.e. a positive decimal counter
+    /// carrying no sign, no separator and no leading zero.
+    fn counter(text: &str) -> Option<i64> {
+        let mut characters = text.chars();
+        if !matches!(characters.next(), Some('1'..='9')) {
+            return None;
+        }
+        if !characters.all(|character| character.is_ascii_digit()) {
+            return None;
+        }
+        text.parse::<i64>().ok()
+    }
+
+    match versions.split_once('-') {
+        Some((low, high)) => Some((counter(low)?, counter(high)?)),
+        None => {
+            let one = counter(versions)?;
+            Some((one, one))
+        }
+    }
+}
+
 /// The counter a stored or requested `VersionId` spells, or `None` when it spells no
 /// version counter.
 ///
@@ -9928,9 +10061,11 @@ pub fn next_version_id(current: &str) -> String {
 ///
 /// The schema-registry misses ARE here, because every operation that resolves a
 /// `RegistryId` or a `SchemaId` resolves the same two references and so has to describe
-/// the same two misses. No recording or doc states their wording either: what is pinned
-/// is the behaviour — 400 with the operation's modelled `EntityNotFoundException` — and
-/// the sentence follows the per-resource template the catalog slice's recorded misses
+/// the same two misses. The SCHEMA miss is RECORDED: it is the fixed constant
+/// [`messages::SCHEMA_NOT_FOUND`], which names neither the schema the request addressed
+/// nor the registry it was addressed in. The registry miss is not recorded: what is pinned
+/// there is the behaviour — 400 with the operation's modelled `EntityNotFoundException` —
+/// and its sentence follows the per-resource template the catalog slice's recorded misses
 /// use.
 pub mod messages {
     /// A crawler lookup (`GetCrawler`, and the `UpdateCrawler` that addresses one the
@@ -9977,6 +10112,60 @@ pub mod messages {
     /// resource kind and withholds the name. What is pinned here is the behaviour — 400,
     /// `AlreadyExistsException`, and no disclosure of the requested name.
     pub const CRAWLER_ALREADY_EXISTS: &str = "Crawler already exists.";
+
+    /// `CreateCrawler` (and the `UpdateCrawler` that replaces a crawler's role) for a
+    /// `Role` this service cannot assume ([`super::crawler_role_is_unassumable`]).
+    ///
+    /// RECORDED constant, and the whole message: it is the service's fixed template for
+    /// this check, naming neither the role the request sent, the principal that has to be
+    /// admitted, nor the operation — so a client recognises the refusal by its wording
+    /// whichever crawler write reported it. No trailing period, as recorded.
+    pub const ROLE_NOT_ASSUMABLE: &str =
+        "Service is unable to assume provided role. Please verify role's TrustPolicy";
+
+    /// Any operation refusing a request member whose value is outside the form that member
+    /// admits — the `Versions` of `DeleteSchemaVersions` that spells no version number or
+    /// range of them ([`super::parse_version_span`]).
+    ///
+    /// RECORDED template: fixed text plus ONE variable part, the MEMBER's name as the model
+    /// spells it. The value the caller sent is withheld, so the refusal discloses nothing of
+    /// the request back to it.
+    pub fn parameter_value_not_valid(parameter: &str) -> String {
+        format!(
+            "The parameter value contains one or more characters that are not valid. \
+             Parameter Name: {parameter}"
+        )
+    }
+
+    /// `DeleteSchemaVersions` whose `Versions` names the schema set's check-pointed
+    /// version. Stated by the operation: "When the range of version numbers contain check
+    /// pointed version, the API will … not proceed with the deletion. You have to remove
+    /// the checkpoint first using the DeleteSchemaCheckpoint API before using this API."
+    ///
+    /// NOT recorded: what is pinned is the behaviour — the operation's modelled
+    /// `ConcurrentModificationException`, with nothing deleted — and a sentence stating that
+    /// documented requirement, carrying the check-pointed version the request collided with.
+    pub fn schema_version_is_checkpointed(version_number: i64) -> String {
+        format!(
+            "Schema version {version_number} is the checkpoint of this schema and cannot be \
+             deleted. Remove the checkpoint with DeleteSchemaCheckpoint first."
+        )
+    }
+
+    /// `DeleteSchemaVersions` whose `Versions` names the first version of the schema set.
+    /// Stated by the operation: "You cannot use the DeleteSchemaVersions API to delete the
+    /// first schema version in the schema set. The first schema version can only be deleted
+    /// by the DeleteSchema API."
+    ///
+    /// NOT recorded: what is pinned is the behaviour — the operation's modelled
+    /// `InvalidInputException`, with nothing deleted — and a sentence stating that
+    /// documented requirement, carrying the version the request named.
+    pub fn first_schema_version_not_deletable(version_number: i64) -> String {
+        format!(
+            "Schema version {version_number} is the first version of this schema and can only \
+             be deleted by the DeleteSchema API."
+        )
+    }
 
     /// A classifier lookup (`GetClassifier`, and the `UpdateClassifier` and
     /// `DeleteClassifier` that address one the same way) for a name no classifier in this
@@ -10471,12 +10660,14 @@ pub mod messages {
         "Unsupported source table properties are provided.";
 
     /// Any schema-registry operation whose `SchemaId` resolves to a schema set this
-    /// endpoint holds none of (`GetSchema`, and the parent-schema miss of every version
-    /// operation). Built from the resolved schema name alone — the registry the id
-    /// resolved to is the container, which this crate's refusals do not name.
-    pub fn schema_not_found(name: &str) -> String {
-        format!("Schema {name} not found.")
-    }
+    /// endpoint holds none of (`GetSchema`, `DeleteSchemaVersions`, and the parent-schema
+    /// miss of every version operation).
+    ///
+    /// RECORDED constant, and the whole message: the service states the miss in FIXED
+    /// words and echoes back neither the schema the request addressed nor the registry it
+    /// was addressed in — the same shape as the recorded `GetTable` miss. Shared by every
+    /// schema lookup, so one operation's miss cannot drift from another's.
+    pub const SCHEMA_NOT_FOUND: &str = "Schema is not found.";
 
     /// `CreateSchema` for a `SchemaName` its registry already holds. NOT recorded:
     /// inferred from the recorded `CreateDatabase` duplicate, like

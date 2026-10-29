@@ -75,6 +75,8 @@ mod connection_updates;
 mod crawler_event_queue;
 #[path = "all/crawler_listing.rs"]
 mod crawler_listing;
+#[path = "all/crawler_role_trust.rs"]
+mod crawler_role_trust;
 #[path = "all/crawler_schedule_suspension.rs"]
 mod crawler_schedule_suspension;
 #[path = "all/crawler_schedules.rs"]
@@ -183,6 +185,8 @@ mod resource_tagging;
 mod resource_untagging;
 #[path = "all/schema_registry.rs"]
 mod schema_registry;
+#[path = "all/schema_version_deletion.rs"]
+mod schema_version_deletion;
 #[path = "all/search_tables.rs"]
 mod search_tables;
 #[path = "all/security_configurations.rs"]
