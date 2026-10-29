@@ -25,7 +25,7 @@ use crate::data_sets::{
 
 /// A well-formed `Id` (`^[a-zA-Z0-9]{30,40}$`) for a resource this emulator does not
 /// hold, so the answer is about the resource rather than about the request.
-const ABSENT_ID: &str = "0123456789abcdef0123456789abcdef";
+pub(crate) const ABSENT_ID: &str = "0123456789abcdef0123456789abcdef";
 
 /// An `AssetId` a job's details may name. Assets are minted by a job that runs, which
 /// is `StartJob`'s business, so this is only a well-formed id for the detail member.
@@ -50,10 +50,10 @@ fn endpoint() -> String {
 /// the same names as `ResponseDetails`'
 /// (`smithy_query(query="shape", shape="Type,RequestDetails,ResponseDetails")`), and
 /// which the handler's own `DETAILS_MEMBER_FOR_TYPE` table mirrors.
-struct JobCase {
-    job_type: &'static str,
-    member: &'static str,
-    detail: Value,
+pub(crate) struct JobCase {
+    pub(crate) job_type: &'static str,
+    pub(crate) member: &'static str,
+    pub(crate) detail: Value,
     writes_assets: bool,
 }
 
@@ -63,7 +63,7 @@ struct JobCase {
 /// every such request before a handler sees it. Kept out of [`job_cases`] for that
 /// reason and asserted on its own in
 /// `lake_formation_tag_policy_jobs_are_refused_by_the_models_own_pattern`.
-const LAKE_FORMATION_TYPE: &str = "IMPORT_ASSETS_FROM_LAKE_FORMATION_TAG_POLICY";
+pub(crate) const LAKE_FORMATION_TYPE: &str = "IMPORT_ASSETS_FROM_LAKE_FORMATION_TAG_POLICY";
 
 /// A `Details` body for [`LAKE_FORMATION_TYPE`] that is well formed in every respect
 /// the model can satisfy.
@@ -83,7 +83,7 @@ fn lake_formation_detail(data_set_id: &str, revision_id: &str) -> Value {
 /// Every `Type` the model admits and a request can carry, with the `Details` member
 /// it names, against the data set `data_set_id` and its revision `revision_id`.
 /// [`LAKE_FORMATION_TYPE`] is the one exception, and says why.
-fn job_cases(data_set_id: &str, revision_id: &str) -> Vec<JobCase> {
+pub(crate) fn job_cases(data_set_id: &str, revision_id: &str) -> Vec<JobCase> {
     vec![
         JobCase {
             job_type: "CREATE_S3_DATA_ACCESS_FROM_S3_BUCKET",
@@ -193,7 +193,10 @@ fn job_cases(data_set_id: &str, revision_id: &str) -> Vec<JobCase> {
 }
 
 /// A data set holding one revision, as every job in these tables names one.
-async fn data_set_with_revision(router: &MultiServiceRouter, name: &str) -> (String, String) {
+pub(crate) async fn data_set_with_revision(
+    router: &MultiServiceRouter,
+    name: &str,
+) -> (String, String) {
     let data_set = create_data_set(router, name, "for jobs", "S3_SNAPSHOT", None).await;
     assert_eq!(
         data_set.status, 201,
@@ -216,7 +219,7 @@ async fn data_set_with_revision(router: &MultiServiceRouter, name: &str) -> (Str
     (data_set_id, revision.string("Id"))
 }
 
-async fn create_job(
+pub(crate) async fn create_job(
     router: &MultiServiceRouter,
     job_type: &str,
     details: Value,

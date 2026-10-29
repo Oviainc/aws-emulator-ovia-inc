@@ -3,8 +3,10 @@
 //! @op GetJob
 //! IMPLEMENTED: reports one stored job — its `Id`, `Arn`, `Type`, `State`, details,
 //! asset configuration, errors and timestamps — exactly as state holds it, and
-//! answers 404 for a well-formed `JobId` that names none. A reporting operation: it
-//! writes nothing. This is the ONLY file to touch for this operation.
+//! answers 404 for a well-formed `JobId` that names none. A reporting operation: the
+//! only write it makes is materialising the terminal state a started job's execution
+//! was already owed at the instant of the read. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -163,8 +165,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `JobId` is `@httpLabel` with pattern ^[a-zA-Z0-9]{30,40}$, so an id of the
         // wrong shape was already refused as a 400 ValidationException before this
         // handler ran; reaching here, the id is well-formed but may name nothing.
-        // This operation is `@readonly`, so it only reads the record out of state.
-        let stored = state.lock().jobs.get(&input.job_id).cloned();
+        // This operation is `@readonly`: the one write it makes is materialising the
+        // terminal state a started job's execution was ALREADY owed at this instant,
+        // which is a change the clock had made due whether or not anybody polled.
+        let stored = {
+            let mut store = state.lock();
+            store.settle_jobs(crate::state::now());
+            store.jobs.get(&input.job_id).cloned()
+        };
         let Some(stored) = stored else {
             return Err(GetJobErrorModeled::ResourceNotFoundException(
                 crate::state::job_not_found(&input.job_id),

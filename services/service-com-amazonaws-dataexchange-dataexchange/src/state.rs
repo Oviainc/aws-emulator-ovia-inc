@@ -179,8 +179,62 @@ pub struct Job {
     pub data_set_id: String,
     /// The revision the job's details name, where the job type names exactly one.
     pub revision_id: Option<String>,
+    /// Where the execution a start call set going will leave this job, and when the
+    /// clock owes it. `None` on a job nothing has started and on one that has already
+    /// reached a terminal `State`.
+    pub pending_settlement: Option<JobSettlement>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+}
+
+/// The terminal state a started job's execution reaches, and the instant it comes
+/// due.
+///
+/// What the execution of a job does is fixed by the job's own `Type` and `Details`,
+/// so the outcome is resolved once, by the call that starts the job, and kept here
+/// until the clock makes it due. Nothing sleeps: the due instant is stored, and
+/// [`Job::settle`] materialises the outcome on the first call at or after it.
+#[derive(Debug, Clone)]
+pub struct JobSettlement {
+    /// When the execution finishes, so when the terminal `State` below is owed.
+    pub due_at: DateTime,
+    /// The terminal `State` the execution reaches: one of the model's `State`
+    /// values, enumerated by `crate::ops::types::STATE_VALUES`.
+    pub state: String,
+    /// What the execution reports about why it ended there — the `Errors` list a
+    /// reader answers with, empty for an execution that carried its work out.
+    pub errors: Vec<JobError>,
+}
+
+impl Job {
+    /// Materialise the terminal state this job's execution was already owed at `now`.
+    ///
+    /// This is the ONE write a reporting operation may make: the transition was due
+    /// at the stored instant whether or not anybody called, so `updated_at` moves to
+    /// that instant rather than to `now`.
+    pub fn settle(&mut self, now: DateTime) {
+        let due = self
+            .pending_settlement
+            .as_ref()
+            .is_some_and(|settlement| settlement.due_at.as_secs_f64() <= now.as_secs_f64());
+        if !due {
+            return;
+        }
+        let Some(settlement) = self.pending_settlement.take() else {
+            return;
+        };
+        self.state = settlement.state;
+        self.errors = settlement.errors;
+        if settlement.due_at.as_secs_f64() > self.updated_at.as_secs_f64() {
+            self.updated_at = settlement.due_at;
+        }
+    }
+
+    /// Whether this job is still waiting to be started — the one `State` from which a
+    /// start or a cancel is admitted, as both operations' documentation says.
+    pub fn is_waiting(&self) -> bool {
+        self.state == JOB_STATE_WAITING
+    }
 }
 
 /// One stored event action: which event fires it, what it does when it fires, and
@@ -221,6 +275,18 @@ pub struct ComAmazonawsDataexchangeDataexchangeState {
 }
 
 impl ComAmazonawsDataexchangeDataexchangeState {
+    /// Materialise the terminal state every started job was already owed at `now`.
+    ///
+    /// Called at the top of each job operation, the reporting ones included: a job
+    /// that was started finishes at an instant the start call fixed, so the move out
+    /// of `IN_PROGRESS` is owed at that instant whether or not anybody polls. The
+    /// scan is bounded by the store, which holds at most [`MAX_JOBS`] jobs.
+    pub fn settle_jobs(&mut self, now: DateTime) {
+        for job in self.jobs.values_mut() {
+            job.settle(now);
+        }
+    }
+
     /// The tags stored on the resource the tagging `ResourceArn` addresses, or `None`
     /// when this emulator holds no resource with that ARN.
     ///
@@ -347,6 +413,32 @@ pub const RESOURCE_TYPE_EVENT_ACTION: &str = "EVENT_ACTION";
 /// work until `StartJob` moves it on, so this is the state a created job carries.
 pub const JOB_STATE_WAITING: &str = "WAITING";
 
+/// The `State` a job carries while its execution runs: the one non-terminal state a
+/// started job passes through, from the same `State` value set.
+pub const JOB_STATE_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The terminal `State` of an execution that could not carry its work out, from the
+/// same `State` value set. A job in it reports why in its `Errors`.
+pub const JOB_STATE_ERROR: &str = "ERROR";
+
+/// The terminal `State` of a job a caller cancelled before it was started, from the
+/// same `State` value set.
+pub const JOB_STATE_CANCELLED: &str = "CANCELLED";
+
+/// How long a started job's execution runs before the clock owes it a terminal
+/// `State`, in seconds.
+///
+/// The model publishes no duration for a job's execution, so the span is this
+/// emulator's choice. It is deliberately non-zero: a caller that reads the job
+/// straight after starting it sees `IN_PROGRESS`, as it does against the real
+/// service, and the state errors of a running job still apply to it.
+pub const JOB_EXECUTION_SECONDS: f64 = 3.0;
+
+/// `instant` advanced by `seconds`, as a modelled `Timestamp`.
+pub fn later(instant: DateTime, seconds: f64) -> DateTime {
+    DateTime::from_secs_f64(instant.as_secs_f64() + seconds)
+}
+
 /// The 500 a handler answers with when the shared engine is not the one this
 /// service's store lives in. Never a fresh engine: that would drop the write.
 pub fn store_unavailable() -> InternalServerException {
@@ -419,6 +511,24 @@ pub fn revision_conflict(revision_id: &str, message: impl Into<String>) -> Confl
         message: message.into(),
         resource_id: Some(revision_id.to_string()),
         resource_type: Some(RESOURCE_TYPE_REVISION.to_string()),
+    }
+}
+
+/// The modelled 409 for a job operation the job's current `State` does not admit.
+///
+/// `state` is the `State` the job is actually in, so the caller can tell a job that
+/// has already run from one somebody else cancelled; `verb` is what was asked of it.
+/// Both `CancelJob` and `StartJob` act on a job that has not started yet — the
+/// model's `CancelJob` documentation says "Jobs can be cancelled only when they are
+/// in the WAITING state" — so this is the refusal for either in any other state.
+pub fn job_state_conflict(job_id: &str, state: &str, verb: &str) -> ConflictException {
+    ConflictException {
+        message: format!(
+            "The job {job_id} is in state {state} and can't be {verb}. \
+             Jobs can be {verb} only when they are in the {JOB_STATE_WAITING} state."
+        ),
+        resource_id: Some(job_id.to_string()),
+        resource_type: Some(RESOURCE_TYPE_JOB.to_string()),
     }
 }
 

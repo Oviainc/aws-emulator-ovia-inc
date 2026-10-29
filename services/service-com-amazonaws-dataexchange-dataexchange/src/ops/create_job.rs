@@ -266,6 +266,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     [only] => Some(only.clone()),
                     _ => None,
                 },
+                // Nothing has started the job, so no execution is owed an outcome.
+                pending_settlement: None,
                 created_at,
                 updated_at: created_at,
             };
@@ -377,11 +379,6 @@ fn wrong_details(job_type: &str, expected: &str, present: &[&str]) -> String {
     format!(
         "Details must carry exactly the {expected} member for a {job_type} job, got {carried}"
     )
-}
-
-/// `instant` advanced by `seconds`, as a modelled `Timestamp`.
-fn later(instant: ::aws_smithy_types::DateTime, seconds: f64) -> ::aws_smithy_types::DateTime {
-    ::aws_smithy_types::DateTime::from_secs_f64(instant.as_secs_f64() + seconds)
 }
 
 /// The endpoint THIS request arrived at, from its `Host` header or its URI's own
@@ -579,7 +576,7 @@ fn plan_job(
                             api_name: detail.api_name,
                             api_specification_md5_hash: detail.api_specification_md5_hash,
                             api_specification_upload_url: upload,
-                            api_specification_upload_url_expires_at: later(
+                            api_specification_upload_url_expires_at: crate::state::later(
                                 created_at,
                                 UPLOAD_URL_VALIDITY_SECONDS,
                             ),
@@ -606,9 +603,9 @@ fn plan_job(
                         data_set_id: detail.data_set_id,
                         md5_hash: Some(detail.md5_hash),
                         revision_id: detail.revision_id,
-                        signed_url_expires_at: signed_url
-                            .is_some()
-                            .then(|| later(created_at, UPLOAD_URL_VALIDITY_SECONDS)),
+                        signed_url_expires_at: signed_url.is_some().then(|| {
+                            crate::state::later(created_at, UPLOAD_URL_VALIDITY_SECONDS)
+                        }),
                         signed_url,
                     }),
                     ..ResponseDetails::default()

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: starts a job that has not been started — the stored job moves to
+//! `State` `IN_PROGRESS` and the execution it set going is owed a terminal `State`
+//! one execution span later, which any later read materialises — and refuses a job in
+//! any other state with the modelled 409. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -69,6 +65,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use ::aws_smithy_types::DateTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,18 +141,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartJob"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartJobErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+        // An earlier execution may already be owed its terminal state, so that is
+        // materialised before this call decides anything: otherwise a second start
+        // would be judged against a state the job had already left.
+        store.settle_jobs(now);
+
+        // `JobId` is `@httpLabel` with pattern ^[a-zA-Z0-9]{30,40}$, so an id of the
+        // wrong shape was already refused as a 400 before this handler ran; reaching
+        // here, the id is well-formed but may name nothing.
+        let Some(job) = store.jobs.get_mut(&input.job_id) else {
+            return Err(StartJobErrorModeled::ResourceNotFoundException(
+                crate::state::job_not_found(&input.job_id),
+            )
+            .into());
+        };
+        // A job runs once: one that is already running, and one that has reached a
+        // terminal state, both conflict with a start.
+        if !job.is_waiting() {
+            return Err(StartJobErrorModeled::ConflictException(
+                crate::state::job_state_conflict(&input.job_id, &job.state, STARTED_VERB),
+            )
+            .into());
+        }
+
+        let settlement = execution_outcome(&job.r#type, now);
+        job.state = crate::state::JOB_STATE_IN_PROGRESS.to_string();
+        job.updated_at = now;
+        // The execution does not run here and nothing sleeps: where it ends and when
+        // it is owed are recorded, and the first call at or past that instant
+        // materialises it.
+        job.pending_settlement = Some(settlement);
+
+        Ok(StartJobOutput {})
     }
+}
+
+/// What this operation asks of the job, for the wording of the 409 a job in a state
+/// that does not admit it is refused with.
+const STARTED_VERB: &str = "started";
+
+/// The `Code` of the job error an execution reports when the content it had to work
+/// on is not there: one of the model's `Code` values, enumerated by
+/// `crate::ops::types::CODE_VALUES`.
+const CODE_RESOURCE_NOT_FOUND: &str = "RESOURCE_NOT_FOUND_EXCEPTION";
+
+/// The source an export's content, and every import whose content is staged as an
+/// object, is read from — the Amazon S3 object behind a presigned URL, an asset
+/// source key, or an asset's own stored snapshot.
+const SOURCE_S3_OBJECT: &str = "Amazon S3 object";
+
+/// The source an import from Amazon Redshift reads, named as the model names that
+/// resource in its `JobErrorLimitName` value "Amazon Redshift datashare assets per
+/// revision".
+const SOURCE_REDSHIFT_DATASHARE: &str = "Amazon Redshift datashare";
+
+/// The source an import from a Lake Formation tag policy reads, named as the model
+/// names that resource in its `JobErrorLimitName` value "AWS Lake Formation data
+/// permission assets per revision".
+const SOURCE_LAKE_FORMATION_DATA_PERMISSION: &str = "AWS Lake Formation data permission";
+
+/// Where a job of each modelled `Type` takes the asset content it works on from.
+///
+/// Source: the model's `Type` enum (`crate::ops::types::TYPE_VALUES`) paired with the
+/// `Details` member each value names, which is what describes that job's source
+/// (`smithy_query(query="shape", shape="Type,RequestDetails")`); the same pairing
+/// `create_job`'s `DETAILS_MEMBER_FOR_TYPE` states. An export reads the content of
+/// the assets in the revision it names, which is an Amazon S3 object, as is the
+/// staged object every import but two takes its content from; the remaining two name
+/// a Redshift datashare and a Lake Formation data permission instead.
+const CONTENT_SOURCE_FOR_TYPE: &[(&str, &str)] = &[
+    ("CREATE_S3_DATA_ACCESS_FROM_S3_BUCKET", SOURCE_S3_OBJECT),
+    ("EXPORT_ASSETS_TO_S3", SOURCE_S3_OBJECT),
+    ("EXPORT_ASSET_TO_SIGNED_URL", SOURCE_S3_OBJECT),
+    ("EXPORT_REVISIONS_TO_S3", SOURCE_S3_OBJECT),
+    (
+        "IMPORT_ASSETS_FROM_LAKE_FORMATION_TAG_POLICY",
+        SOURCE_LAKE_FORMATION_DATA_PERMISSION,
+    ),
+    (
+        "IMPORT_ASSETS_FROM_REDSHIFT_DATA_SHARES",
+        SOURCE_REDSHIFT_DATASHARE,
+    ),
+    ("IMPORT_ASSETS_FROM_S3", SOURCE_S3_OBJECT),
+    ("IMPORT_ASSET_FROM_API_GATEWAY_API", SOURCE_S3_OBJECT),
+    ("IMPORT_ASSET_FROM_SIGNED_URL", SOURCE_S3_OBJECT),
+];
+
+/// Where the execution this call sets going ends, and when it is owed.
+///
+/// Every `Type` this service creates moves asset CONTENT: an import reads the source
+/// its details name into the revision, an export writes the content of that
+/// revision's assets out. This emulator serves no object data plane — the URL
+/// `CreateJob` hands out for an upload is a locator nothing serves, and a stored
+/// asset is a record with no bytes behind it — so the content a started job must read
+/// is not there, and the execution ends in the terminal state that reports exactly
+/// that: `ERROR`, carrying the job error for a source that could not be found, naming
+/// the source the job's own `Type` reads.
+fn execution_outcome(job_type: &str, started_at: DateTime) -> crate::state::JobSettlement {
+    crate::state::JobSettlement {
+        due_at: crate::state::later(started_at, crate::state::JOB_EXECUTION_SECONDS),
+        state: crate::state::JOB_STATE_ERROR.to_string(),
+        errors: vec![JobError {
+            code: CODE_RESOURCE_NOT_FOUND.to_string(),
+            message: format!("Resource not found. Unable to find source {}.", source_for(job_type)),
+            ..JobError::default()
+        }],
+    }
+}
+
+/// The source [`CONTENT_SOURCE_FOR_TYPE`] pairs with `job_type`.
+///
+/// The table is keyed by the model's own `Type` enum and the test suite pins that it
+/// covers every value of it, so the fallback is reached only if the model gains a
+/// value; an object source is the one every type but two carries.
+fn source_for(job_type: &str) -> &'static str {
+    CONTENT_SOURCE_FOR_TYPE
+        .iter()
+        .find(|(value, _)| *value == job_type)
+        .map_or(SOURCE_S3_OBJECT, |(_, source)| *source)
 }

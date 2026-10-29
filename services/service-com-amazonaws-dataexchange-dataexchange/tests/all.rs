@@ -17,6 +17,8 @@ mod data_set_notifications;
 mod data_sets;
 #[path = "all/event_actions.rs"]
 mod event_actions;
+#[path = "all/job_lifecycle.rs"]
+mod job_lifecycle;
 #[path = "all/jobs.rs"]
 mod jobs;
 #[path = "all/optional_page_size.rs"]
