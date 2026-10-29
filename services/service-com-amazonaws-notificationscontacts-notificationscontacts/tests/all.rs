@@ -19,6 +19,8 @@ mod activation_refusal_turns_on_the_token;
 mod activation_token_resource;
 #[path = "all/email_contact_name_pattern.rs"]
 mod email_contact_name_pattern;
+#[path = "all/email_contact_quota_refusal.rs"]
+mod email_contact_quota_refusal;
 #[path = "all/email_contact_timestamp_wire_form.rs"]
 mod email_contact_timestamp_wire_form;
 #[path = "all/email_contacts.rs"]

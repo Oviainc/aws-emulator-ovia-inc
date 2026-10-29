@@ -427,9 +427,11 @@ fn the_applied_expression_is_the_models_own() {
 /// implementation's own list.
 #[tokio::test]
 async fn every_ascii_character_is_admitted_exactly_when_the_class_admits_it() {
-    let em = emulator();
-
+    // One account per row: the published per-account email-contact quota bounds how
+    // many contacts one account may HOLD at a time, and this sweep is about the name a
+    // create carries rather than about that quota.
     for codepoint in 0u8..128 {
+        let em = emulator();
         let character = char::from(codepoint);
         let admitted =
             character.is_ascii_alphanumeric() || character == '_' || LITERALS.contains(character);

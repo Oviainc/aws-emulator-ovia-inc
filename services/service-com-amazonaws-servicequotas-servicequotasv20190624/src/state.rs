@@ -3301,6 +3301,29 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             vec![quota("Clusters", 40.0)],
         ),
         service(
+            "notifications-contacts",
+            "AWS User Notifications Contacts",
+            // The VALUE is the per-account email-contact quota AWS publishes for this
+            // service, which the notificationscontacts emulator refuses a create past.
+            // No cross-crate dependency links the two, so keep it in step with
+            // `MAX_EMAIL_CONTACTS` in
+            // `services/service-com-amazonaws-notificationscontacts-notificationscontacts/src/state.rs`
+            // (each side has a test pinning it).
+            //
+            // The CODE is the DESCRIPTIVE one of this quota's name
+            // (`EmailContactsPerAccount`, see [`descriptive_quota_code`]) rather than a
+            // code carried here: no `L-…` code for it is citable, and that is exactly
+            // the code the service's own `ServiceQuotaExceededException` reports, so a
+            // client that reads the refusal and then looks the limit up here finds it
+            // under the code the refusal named.
+            //
+            // The quota counts the contacts of an ACCOUNT, not of a Region: the
+            // service's email-contact ARNs carry an empty region field.
+            vec![quota("Email contacts per account", 10.0)
+                .global()
+                .describe("The maximum number of email contacts per account.")],
+        ),
+        service(
             "opsworks",
             "AWS OpsWorks",
             vec![quota("Stacks per Region", 40.0)],

@@ -187,7 +187,6 @@ fn merge_table() -> Vec<(
 
 #[tokio::test]
 async fn tag_resource_merges_the_request_into_the_persisted_tag_set() {
-    let em = emulator();
     let table = merge_table();
     assert!(
         table.len() >= 5,
@@ -195,7 +194,11 @@ async fn tag_resource_merges_the_request_into_the_persisted_tag_set() {
         table.len()
     );
 
+    // One account per row: the published per-account email-contact quota bounds how
+    // many contacts one account may HOLD at a time, and these rows are about the tag
+    // set a write persists rather than about that quota.
     for (index, (case, initial, request, expected)) in table.iter().enumerate() {
+        let em = emulator();
         let arn = create_tagged(&em, &format!("contact-{index}"), Some(initial)).await;
         let before = get_ok(&em, &arn).await;
 

@@ -179,20 +179,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // The store is finite: a create that would take it past its cap is refused
-        // rather than growing it, the way the service refuses one past its quota.
-        if store.contacts.len() >= crate::state::MAX_EMAIL_CONTACTS {
+        // A create that would take the account past the published per-account
+        // email-contact quota is refused rather than stored, with the quota vocabulary
+        // the modelled 402 carries — see `crate::state::email_contacts_quota_exceeded`.
+        let held = store.contacts.len();
+        if held >= crate::state::MAX_EMAIL_CONTACTS {
             return Err(CreateEmailContactErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: format!(
-                        "this account already holds the maximum of {} email contacts",
-                        crate::state::MAX_EMAIL_CONTACTS
-                    ),
-                    resource_id: String::new(),
-                    resource_type: crate::state::CONTACT_RESOURCE_TYPE.to_string(),
-                    service_code: crate::state::ARN_SERVICE.to_string(),
-                    quota_code: crate::state::EMAIL_CONTACTS_QUOTA_CODE.to_string(),
-                },
+                crate::state::email_contacts_quota_exceeded(held),
             )
             .into());
         }

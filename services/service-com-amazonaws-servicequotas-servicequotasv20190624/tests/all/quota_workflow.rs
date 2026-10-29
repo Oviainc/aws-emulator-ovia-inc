@@ -539,6 +539,65 @@ async fn the_b2bi_profile_quota_publishes_the_documented_limit() {
     );
 }
 
+/// RULE: the quota a client plans against for AWS User Notifications Contacts email
+/// contacts is the published ten per account, published under ServiceCode
+/// `notifications-contacts` with the `quotaCode` the notificationscontacts service's own
+/// `ServiceQuotaExceededException` names.
+#[tokio::test]
+async fn the_email_contact_quota_publishes_the_documented_limit() {
+    let engine = emulator();
+    let client = client(&engine, "us-east-1");
+
+    let quotas = walk_pages(
+        &client,
+        "ListServiceQuotas",
+        &json!({"ServiceCode": "notifications-contacts"}),
+        "Quotas",
+        None,
+    )
+    .await;
+
+    let contacts = quotas
+        .iter()
+        .find(|quota| quota["QuotaCode"] == json!("EmailContactsPerAccount"))
+        .unwrap_or_else(|| {
+            panic!("case notifications-contacts: expected an email-contact quota, got {quotas:?}")
+        });
+    assert_eq!(
+        contacts["Value"].as_f64(),
+        Some(10.0),
+        "case notifications-contacts/EmailContactsPerAccount: expected the published limit \
+         of ten email contacts, got {contacts}"
+    );
+    assert_eq!(
+        contacts["QuotaName"],
+        json!("Email contacts per account"),
+        "case notifications-contacts/EmailContactsPerAccount: the published name must be the \
+         one the code describes, got {contacts}"
+    );
+    assert_eq!(
+        contacts["ServiceName"],
+        json!("AWS User Notifications Contacts"),
+        "case notifications-contacts: the catalogue must name the service, got {contacts}"
+    );
+    // The quota counts an ACCOUNT's contacts, so it is global and its ARN carries no
+    // region whichever regional endpoint asked.
+    assert_eq!(
+        contacts["GlobalQuota"],
+        json!(true),
+        "case notifications-contacts/EmailContactsPerAccount: an account-wide quota must be \
+         published as global, got {contacts}"
+    );
+    assert_eq!(
+        contacts["QuotaArn"],
+        json!(format!(
+            "arn:aws:servicequotas::{ACCOUNT}:notifications-contacts/EmailContactsPerAccount"
+        )),
+        "case notifications-contacts/EmailContactsPerAccount: the ARN must name the pair, \
+         got {contacts}"
+    );
+}
+
 /// `QuotaAppliedAtLevel` keeps the quotas applied at that level, and `ALL` keeps
 /// every one.
 #[tokio::test]

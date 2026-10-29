@@ -218,7 +218,6 @@ fn assert_refused(case: &Case, operation: &str, status: u16, body: &Value) {
 
 #[tokio::test]
 async fn create_email_contact_applies_the_modelled_tag_key_pattern() {
-    let em = emulator();
     let table = tag_key_table();
     assert!(
         table.len() >= 5,
@@ -226,7 +225,11 @@ async fn create_email_contact_applies_the_modelled_tag_key_pattern() {
         table.len()
     );
 
+    // One account per row: the published per-account email-contact quota bounds how
+    // many contacts one account may HOLD at a time, and these rows are about the tag
+    // key a request carries rather than about that quota.
     for (index, case) in table.iter().enumerate() {
+        let em = emulator();
         let before = contact_count(&em).await;
         let name = format!("contact-{index}");
         let (status, body) = create_with_tag(&em, &name, &case.key, "v").await;
@@ -275,10 +278,11 @@ async fn create_email_contact_applies_the_modelled_tag_key_pattern() {
 
 #[tokio::test]
 async fn tag_resource_applies_the_modelled_tag_key_pattern() {
-    let em = emulator();
     let start = tag_map([pair("keep", "me")]);
 
+    // One account per row, for the reason the create suite above states.
     for (index, case) in tag_key_table().iter().enumerate() {
+        let em = emulator();
         let arn = create_tagged(&em, &format!("contact-{index}"), Some(&start)).await;
         let request: BTreeMap<String, String> = tag_map([pair(&case.key, "v")]);
         let (status, body) = tag(&em, &arn, &request).await;
@@ -313,9 +317,9 @@ async fn tag_resource_applies_the_modelled_tag_key_pattern() {
 
 #[tokio::test]
 async fn untag_resource_applies_the_modelled_tag_key_pattern() {
-    let em = emulator();
-
+    // One account per row, for the reason the create suite above states.
     for (index, case) in tag_key_table().iter().enumerate() {
+        let em = emulator();
         let name = format!("contact-{index}");
         // A key the pattern admits is stored first, so the removal has something to
         // remove; a key it refuses can never have been stored, so that contact starts
@@ -539,10 +543,11 @@ async fn a_create_mixing_a_refused_key_with_legal_ones_persists_no_contact() {
 
 #[tokio::test]
 async fn a_key_the_pattern_admits_round_trips_through_every_tag_operation() {
-    let em = emulator();
     // One pass over the admitted rows through create -> read -> tag -> read -> untag ->
-    // read, so a key is not merely accepted but stored and reported verbatim.
+    // read, so a key is not merely accepted but stored and reported verbatim. One
+    // account per row, for the reason the create suite above states.
     for (index, case) in tag_key_table().iter().filter(|c| c.admitted).enumerate() {
+        let em = emulator();
         let arn = create_tagged(
             &em,
             &format!("round-{index}"),

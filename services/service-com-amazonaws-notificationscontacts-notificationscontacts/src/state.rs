@@ -17,8 +17,8 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    ConflictException, EmailContact, ResourceNotFoundException, ValidationException,
-    ValidationExceptionField,
+    ConflictException, EmailContact, ResourceNotFoundException, ServiceQuotaExceededException,
+    ValidationException, ValidationExceptionField,
 };
 
 /// Characters an email-contact id is built from.
@@ -252,16 +252,63 @@ pub fn check_email_contact_name(member: &str, name: &str) -> Result<(), Validati
     ))
 }
 
-/// The most email contacts this emulator will hold.
+/// The most email contacts one account may hold: the service's PUBLISHED per-account
+/// email-contact quota.
 ///
-/// Emulator resource guard, NOT a published AWS quota: every record is created by a
-/// caller and reclaimed only by an explicit `DeleteEmailContact`, so the one growth
-/// site carries a cap and the store stays finite. A create that would exceed it is
-/// refused with the modelled `ServiceQuotaExceededException` (HTTP 402).
-pub const MAX_EMAIL_CONTACTS: usize = 500;
+/// SOURCE: the quota AWS User Notifications Contacts publishes per account for email
+/// contacts (10), which the Service Quotas emulator publishes for [`ARN_SERVICE`] under
+/// [`EMAIL_CONTACTS_QUOTA_NAME`]. No cross-crate dependency links the two, so keep this
+/// in step with the `notifications-contacts` row of `seed_quota_catalog` in
+/// `services/service-com-amazonaws-servicequotas-servicequotasv20190624/src/state.rs`
+/// (each side has a test pinning it).
+///
+/// The ceiling a create is refused at is the quota the service publishes, so the
+/// eleventh contact an account asks for is the modelled
+/// `ServiceQuotaExceededException` (HTTP 402) rather than a stored record. Because that
+/// quota bounds the one growth site — a record is created only by a caller and
+/// reclaimed only by an explicit `DeleteEmailContact` — the store stays finite for the
+/// same reason the service's own does.
+pub const MAX_EMAIL_CONTACTS: usize = 10;
 
-/// The quota code this service reports when [`MAX_EMAIL_CONTACTS`] is reached.
-pub const EMAIL_CONTACTS_QUOTA_CODE: &str = "L-EMAILCONTACTS";
+/// The name Service Quotas publishes the [`MAX_EMAIL_CONTACTS`] quota under.
+pub const EMAIL_CONTACTS_QUOTA_NAME: &str = "Email contacts per account";
+
+/// The quota the email-contact count is charged against, as
+/// `ServiceQuotaExceededException$quotaCode` names it and as the Service Quotas emulator
+/// publishes it for [`ARN_SERVICE`].
+///
+/// Service Quotas also mints an opaque `L-` code of its own for every quota AWS
+/// publishes, and that namespace is AWS's ALONE to mint into: a code of that form this
+/// emulator made up would name a quota AWS never published and resolve nothing. Where
+/// no AWS-minted code is citable, a service's own refusal therefore reports the
+/// DESCRIPTIVE code — [`EMAIL_CONTACTS_QUOTA_NAME`]'s words joined as one identifier —
+/// which is the code the Service Quotas catalog publishes the same quota under, so a
+/// client that reads this refusal finds the quota under the code the refusal named.
+pub const EMAIL_CONTACTS_QUOTA_CODE: &str = "EmailContactsPerAccount";
+
+/// The modelled 402 for a create an account holding `held` contacts may not make,
+/// [`MAX_EMAIL_CONTACTS`] being what it may hold.
+///
+/// Every member the model marks `@required` carries the identity its documentation
+/// names. The quota counts the email contacts of ONE account and the refused create
+/// stored nothing, so `resourceId` — "the ID of the resource that exceeds the service
+/// quota" — names the account whose holding exceeds it rather than a contact that does
+/// not exist, and `serviceCode`/`quotaCode` name the pair Service Quotas publishes this
+/// quota under. The sentence states what the shape itself documents — "Request would
+/// cause a service quota to be exceeded" — naming the quota that stands in the way and
+/// the value this account is held to.
+pub fn email_contacts_quota_exceeded(held: usize) -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: format!(
+            "The request would cause the {EMAIL_CONTACTS_QUOTA_NAME} quota of \
+             {MAX_EMAIL_CONTACTS} to be exceeded; this account holds {held}"
+        ),
+        resource_id: ::engine::emulator_account_id().to_string(),
+        resource_type: CONTACT_RESOURCE_TYPE.to_string(),
+        service_code: ARN_SERVICE.to_string(),
+        quota_code: EMAIL_CONTACTS_QUOTA_CODE.to_string(),
+    }
+}
 
 /// The activation token outstanding for one email contact: the code the last
 /// `SendActivationCode` minted, the instant it was minted, and how much of its

@@ -252,7 +252,6 @@ fn surviving(
 
 #[tokio::test]
 async fn every_tag_keys_element_is_judged_against_the_modelled_pattern() {
-    let em = emulator();
     let table = tag_keys_table();
     assert!(
         table.len() >= 5,
@@ -260,7 +259,11 @@ async fn every_tag_keys_element_is_judged_against_the_modelled_pattern() {
         table.len()
     );
 
+    // One account per row: the published per-account email-contact quota bounds how
+    // many contacts one account may HOLD at a time, and these rows are about the keys a
+    // removal names rather than about that quota.
     for (index, case) in table.iter().enumerate() {
+        let em = emulator();
         let start = starting_tags();
         let arn = create_tagged(&em, &format!("contact-{index}"), Some(&start)).await;
         let before = get_ok(&em, &arn).await;
@@ -432,10 +435,11 @@ async fn a_refused_element_is_judged_before_the_contact_is_resolved() {
 /// caller asked.
 #[tokio::test]
 async fn repeating_a_request_answers_the_same_way() {
-    let em = emulator();
     let start = starting_tags();
 
+    // One account per row, for the reason the suite's first test states.
     for (index, case) in tag_keys_table().iter().enumerate() {
+        let em = emulator();
         let arn = create_tagged(&em, &format!("repeat-{index}"), Some(&start)).await;
         let expected = surviving(&start, &case.keys, case.admitted);
         let wanted_status = if case.admitted { 200 } else { 400 };
