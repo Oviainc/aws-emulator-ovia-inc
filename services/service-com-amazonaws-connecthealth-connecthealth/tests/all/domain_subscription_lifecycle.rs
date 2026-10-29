@@ -542,14 +542,16 @@ async fn minted_ids_and_arns_match_the_model_patterns_in_every_signed_region() {
 
 #[tokio::test]
 async fn subscription_status_transitions_are_persisted_and_idempotent() {
-    // The rows differ along the sequence of transitions applied — including repeats,
-    // which `@idempotent` says must not error or change the stored record. A new
-    // subscription is already ACTIVE, so an `activate` applied to one is the idempotent
-    // no-op and stamps nothing; `deactivate` is the first transition it can make.
+    // The rows differ along the sequence of transitions applied — including repeats.
+    // `DeactivateSubscription` is the one of the two the model declares `@idempotent`,
+    // so a repeat of it must neither error nor change the stored record;
+    // `ActivateSubscription` carries no such trait, so every call of it runs the
+    // transition and stamps `activatedAt`, including on a new subscription (which is
+    // created ACTIVE without ever having been activated).
     let cases: [(&str, &[&str], &str, bool, bool); 7] = [
         ("no transition", &[], "ACTIVE", false, false),
-        ("activate a new subscription", &["activate"], "ACTIVE", false, false),
-        ("activate twice", &["activate", "activate"], "ACTIVE", false, false),
+        ("activate a new subscription", &["activate"], "ACTIVE", true, false),
+        ("activate twice", &["activate", "activate"], "ACTIVE", true, false),
         ("deactivate first", &["deactivate"], "INACTIVE", false, true),
         (
             "deactivate twice",
@@ -612,9 +614,10 @@ async fn subscription_status_transitions_are_persisted_and_idempotent() {
                 "activate" => ("activatedAt", "deactivatedAt"),
                 _ => ("deactivatedAt", "activatedAt"),
             };
-            if before.get("status") == last.get("status") {
-                // `@idempotent`: a call that does not move the status changes NOTHING,
-                // so nothing is restamped and the whole record comes back identical.
+            if *transition == "deactivate" && before.get("status") == last.get("status") {
+                // `@idempotent`, which the model declares for `DeactivateSubscription`:
+                // a call that does not move the status changes NOTHING, so nothing is
+                // restamped and the whole record comes back identical.
                 assert_eq!(
                     last, before,
                     "case {case:?}: a {transition} that does not move the status must \

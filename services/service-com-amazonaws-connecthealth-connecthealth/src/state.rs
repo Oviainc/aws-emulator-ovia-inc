@@ -647,9 +647,10 @@ impl PatientInsightsJob {
 ///
 /// `activated_at` / `deactivated_at` are a HISTORY of the explicit
 /// `ActivateSubscription` / `DeactivateSubscription` transitions, not a view of
-/// `status`: each is stamped when its transition happens and is never cleared, so both
-/// boundaries of a billing interval remain readable after the opposite transition. A
-/// freshly created subscription has made neither transition, so it carries neither.
+/// `status`: each is stamped when its transition runs and is never cleared, so both
+/// boundaries of a billing interval remain readable after the opposite transition. Each
+/// holds the MOST RECENT run of its own transition. A freshly created subscription has
+/// made neither transition, so it carries neither, whatever `status` it was created in.
 #[derive(Debug, Clone)]
 pub struct Subscription {
     pub domain_id: String,
