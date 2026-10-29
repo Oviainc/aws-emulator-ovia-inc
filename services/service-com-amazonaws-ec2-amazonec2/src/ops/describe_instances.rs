@@ -193,10 +193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         // Documented on `MaxResults`: "You cannot specify this parameter and the
-        // instance IDs parameter in the same request."
+        // instance IDs parameter in the same request", refused through the one template
+        // this service words that pair with
+        // ([`crate::state::parameters_cannot_be_combined`]).
         if !requested_ids.is_empty() && input.max_results.is_some() {
-            return Err(Scaffolded::invalid_parameter_combination(
-                "MaxResults cannot be specified together with InstanceIds",
+            return Err(crate::state::parameters_cannot_be_combined(
+                "InstanceIds",
+                "MaxResults",
             ));
         }
         if input.max_results.is_some_and(|max_results| max_results < 1) {

@@ -304,7 +304,7 @@ fn extension_cases() -> Vec<ExtensionCase> {
         ExtensionCase {
             case: "a block of any instance type, extended by the longest term there is",
             region: "eu-central-1",
-            search: vec![field("CapacityDurationHours", 504)],
+            search: vec![field("CapacityDurationHours", 504), field("InstanceCount", 2)],
             platform: "RHEL with HA and SQL Server Standard",
             extension_hours: MAX_TERM_HOURS,
         },

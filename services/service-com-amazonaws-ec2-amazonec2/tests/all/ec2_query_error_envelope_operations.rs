@@ -77,9 +77,11 @@ const ALLOCATION_ID_PREFIX: &str = "eipalloc";
 /// The instance id prefix, for the same reason.
 const INSTANCE_ID_PREFIX: &str = "i";
 
-/// An AMI id of the published form (`ami-` plus 17 hexadecimal digits) — enough for the
-/// launch rows, each of which is refused before any image is resolved.
-const IMAGE_ID: &str = "ami-00000000000000000";
+/// An AMI id of the form EC2 ISSUES (`ami-` plus 17 hexadecimal digits under a leading
+/// `0`) — enough for the launch rows, each of which is refused before any image is
+/// resolved, and inside the form `RunInstances` reads an `ImageId` for before it looks one
+/// up (`ec2::state::issued_image_id_is_well_formed`).
+const IMAGE_ID: &str = "ami-0123456789abcdef0";
 
 /// A target capacity inside the member's published `@range` (1..2000000000, from
 /// `smithy_query(query="operation",operation="GetSpotPlacementScores")`), so the rows below

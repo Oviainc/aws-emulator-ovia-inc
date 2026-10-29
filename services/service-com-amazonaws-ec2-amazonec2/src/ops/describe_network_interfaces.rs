@@ -189,12 +189,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "You cannot specify this parameter and the network interface IDs parameter in
-        // the same request" (`DescribeNetworkInterfacesRequest$MaxResults`).
+        // the same request" (`DescribeNetworkInterfacesRequest$MaxResults`), refused through
+        // the one template this service words that pair with
+        // ([`crate::state::parameters_cannot_be_combined`]).
         let requested: &[String] = input.network_interface_ids.as_deref().unwrap_or_default();
         if input.max_results.is_some() && !requested.is_empty() {
-            return Err(crate::state::invalid_parameter_combination(
-                "The parameter MaxResults cannot be used with the parameter \
-                 NetworkInterfaceId",
+            return Err(crate::state::parameters_cannot_be_combined(
+                "MaxResults",
+                "NetworkInterfaceId",
             ));
         }
         // The id list is caller-sized and each entry is resolved against the store, so it

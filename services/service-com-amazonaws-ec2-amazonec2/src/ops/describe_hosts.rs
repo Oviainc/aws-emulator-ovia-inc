@@ -170,10 +170,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "You cannot specify this parameter and the host IDs parameter in the same
-        // request" (`DescribeHostsRequest$MaxResults`).
+        // request" (`DescribeHostsRequest$MaxResults`), refused through the one template
+        // this service words that pair with ([`crate::state::parameters_cannot_be_combined`]).
         if input.max_results.is_some() && !requested_ids.is_empty() {
-            return Err(Scaffolded::invalid_parameter_combination(
-                "The parameter maxResults cannot be used with the parameter hostId",
+            return Err(crate::state::parameters_cannot_be_combined(
+                "maxResults", "hostId",
             ));
         }
 

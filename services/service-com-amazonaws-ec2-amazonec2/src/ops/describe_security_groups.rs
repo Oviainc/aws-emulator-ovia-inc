@@ -255,6 +255,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // A page size and an explicit id selection cannot be given together: a request that
+        // NAMES the groups it wants is not walking the account's groups, so EC2 refuses the
+        // pair rather than paging a fixed set — the same refusal `DescribeInstances`,
+        // `DescribeNetworkInterfaces` and `DescribeHosts` answer, through the one template
+        // `crate::state::parameters_cannot_be_combined` holds. This operation's recorded
+        // refusal names the ids by their WIRE set name, so that is the name it carries here.
+        if !requested_ids.is_empty() && input.max_results.is_some() {
+            return Err(crate::state::parameters_cannot_be_combined(
+                "securityGroupIdSet",
+                "maxResults",
+            ));
+        }
+
         let mut store = state.lock();
 
         // The ambient default network of the Region this request is signed for: a VPC

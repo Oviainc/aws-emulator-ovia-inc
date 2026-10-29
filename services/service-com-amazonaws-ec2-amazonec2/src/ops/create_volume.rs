@@ -476,6 +476,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .and_then(|token| store.volume_client_tokens.get(token).cloned());
 
+        // A token is idempotent only for the REQUEST it was first given with: replayed with
+        // any different parameter it names a volume the caller did not ask for, so EC2
+        // refuses it with `IdempotentParameterMismatch` instead of answering with that
+        // volume or minting a second one — the same contract every other create in this
+        // crate that reads a client token keeps. Compared on the members THIS request
+        // decides ([`RequestedVolume`]); the ones the service derives follow from them.
+        if let Some(volume_id) = replayed.as_deref() {
+            let stored = store.volumes.get(volume_id).ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "a client token names volume '{volume_id}', which is not stored"
+                ))
+            })?;
+            let requested = RequestedVolume {
+                availability_zone: Some(zone.zone_name.clone()),
+                size: Some(size),
+                volume_type: Some(volume_type.clone()),
+                iops,
+                throughput,
+                multi_attach_enabled: Some(multi_attach_enabled),
+                encrypted: Some(encrypted),
+                kms_key_id: input.kms_key_id.clone(),
+                tags: tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            };
+            if RequestedVolume::of(&stored.view) != requested {
+                return Err(crate::state::idempotent_parameter_mismatch());
+            }
+        }
+
         if replayed.is_none() && store.volumes.len() >= MAX_STORED_VOLUMES {
             return Err(volume_limit_exceeded(format!(
                 "This emulator holds {MAX_STORED_VOLUMES} EBS volumes, \
@@ -591,5 +622,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "the newly created volume '{volume_id}' could not be read back"
                 ))
             })
+    }
+}
+
+/// The members of a stored volume that a `CreateVolume` REQUEST decides.
+///
+/// What two calls carrying one `ClientToken` must agree on for the token to name one
+/// volume: anything else makes the second call a different request, which EC2 refuses with
+/// `IdempotentParameterMismatch` ([`crate::state::idempotent_parameter_mismatch`]). The
+/// members the SERVICE derives — the id, the ARN, the owning account, the creation instant,
+/// the attachments and the state the clock moves — are deliberately absent: they follow
+/// from the ones here, so comparing them would make a replay differ from itself.
+///
+/// `encrypted` holds the EFFECTIVE state the volume was created in rather than the member
+/// the request sent, so a token replayed while the Region's EBS encryption-by-default
+/// setting is unchanged still matches, and the `availability_zone` is the resolved zone's
+/// name, so naming one zone by its name and then by its id is not a difference.
+#[derive(Debug, PartialEq, Eq)]
+struct RequestedVolume {
+    availability_zone: Option<String>,
+    size: Option<i32>,
+    volume_type: Option<String>,
+    iops: Option<i32>,
+    throughput: Option<i32>,
+    multi_attach_enabled: Option<bool>,
+    encrypted: Option<bool>,
+    kms_key_id: Option<String>,
+    /// The volume's tags as a SET — sorted key/value pairs — because the order a request
+    /// names its tags in is not a difference between two requests.
+    tags: Vec<(String, String)>,
+}
+
+impl RequestedVolume {
+    /// The same members, read back off a volume this store already holds.
+    fn of(view: &crate::state::VolumeView) -> Self {
+        let mut tags: Vec<(String, String)> = view
+            .tags
+            .iter()
+            .flatten()
+            .map(|tag| {
+                (
+                    tag.key.clone().unwrap_or_default(),
+                    tag.value.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        tags.sort();
+        Self {
+            availability_zone: view.availability_zone.clone(),
+            size: view.size,
+            volume_type: view.volume_type.clone(),
+            iops: view.iops,
+            throughput: view.throughput,
+            multi_attach_enabled: view.multi_attach_enabled,
+            encrypted: view.encrypted,
+            kms_key_id: view.kms_key_id.clone(),
+            tags,
+        }
     }
 }

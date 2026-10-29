@@ -324,7 +324,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             architecture_for, availability_zones_in_region,
-            iam_instance_profile_association_payload_bytes, private_dns_name, request_region,
+            iam_instance_profile_association_payload_bytes, invalid_ami_id_malformed_expecting_ami,
+            issued_image_id_is_well_formed, private_dns_name, request_region,
             require_service_state, resolve_iam_instance_profile, validate_kernel_or_ramdisk_id,
             validate_tag_size,
             IamInstanceProfileAssociationSpec, InstanceRecord, InstanceStateName,
@@ -384,6 +385,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "The request must contain the parameter ImageId",
             ));
         };
+        // "An AMI ID is required to launch an instance" (`RunInstancesRequest$ImageId`), and
+        // the id's FORM is read before anything is looked up under it: a value EC2 could not
+        // have issued an AMI id names no image that could ever exist, so the launch is
+        // refused as malformed rather than started from an id with no image behind it. A
+        // client that cannot tell a mistyped id from a missing image goes on polling for an
+        // instance that can never appear.
+        if !issued_image_id_is_well_formed(&image_id) {
+            return Err(invalid_ami_id_malformed_expecting_ami(&image_id));
+        }
         if input.min_count < 1 {
             return Err(Scaffolded::invalid_parameter_value(format!(
                 "Invalid value '{}' for minCount. Minimum count must be at least 1",

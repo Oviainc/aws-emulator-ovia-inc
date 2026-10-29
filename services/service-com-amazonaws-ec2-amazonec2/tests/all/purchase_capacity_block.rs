@@ -295,7 +295,7 @@ fn purchase_cases() -> Vec<PurchaseCase> {
         PurchaseCase {
             case: "a search that names no instance type",
             region: "eu-central-1",
-            search: vec![field("CapacityDurationHours", 504)],
+            search: vec![field("CapacityDurationHours", 504), field("InstanceCount", 2)],
             platform: "RHEL with HA and SQL Server Standard",
             tags: vec![("Name", "any type")],
         },

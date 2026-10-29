@@ -186,6 +186,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
+        // A page size and an explicit id selection cannot be given together: a request that
+        // NAMES the subnets it wants is not walking the account's subnets, so EC2 refuses
+        // the pair rather than paging a fixed set — the same refusal `DescribeInstances`,
+        // `DescribeNetworkInterfaces` and `DescribeHosts` answer, through the one template
+        // `crate::state::parameters_cannot_be_combined` holds. This operation's recorded
+        // refusal names both parameters by their public member names, so those are the names
+        // it carries here.
+        if input.subnet_ids.as_deref().is_some_and(|ids| !ids.is_empty())
+            && input.max_results.is_some()
+        {
+            return Err(crate::state::parameters_cannot_be_combined(
+                "SubnetIds",
+                "MaxResults",
+            ));
+        }
+
         // A filter name this operation does not document is refused whether or not any
         // subnet would have matched it, so an unsupported filter can never read as "no
         // results". The documented alternative spellings are resolved to one name here, so

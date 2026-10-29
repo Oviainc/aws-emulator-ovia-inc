@@ -17,6 +17,13 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What EC2 refuses about a REQUEST before it reads any state: a page size beside an id
+// selection, a Capacity Block search that names both dimensions or neither, an idempotency
+// token replayed with different parameters, and an AMI id a launch could not have been
+// issued. Declared beside `prefix_lists` for the reason the note above gives: the sorted
+// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/request_validation_before_state.rs"]
+mod request_validation_before_state;
 // What `DeleteCapacityManagerDataExport` takes out of the account's Capacity Manager data
 // export configurations, what the reader then counts, and what the delete refuses. Declared
 // beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood and

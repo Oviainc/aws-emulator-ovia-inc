@@ -263,6 +263,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A Capacity Block is priced on EITHER the UltraServer dimension or the instance
+        // dimension, and a search has to name ONE of them: the request says what it wants
+        // reserved, and this operation answers an offering OF that. A search that names
+        // members of both dimensions, or neither, names no block to price, so EC2 refuses
+        // both of those with the one sentence below rather than picking a dimension for it.
+        // Read here, after the per-member checks above, because each member is valid on its
+        // own.
+        let names_ultraservers =
+            input.ultraserver_type.is_some() || input.ultraserver_count.is_some();
+        let names_instances = input.instance_type.is_some() || input.instance_count.is_some();
+        if names_ultraservers == names_instances {
+            return Err(Scaffolded::invalid_parameter_value(
+                "Invalid inputs, either ultraserver-type and ultraserver-count, or \
+                 instance-type and instance-count needs to be set, not both",
+            ));
+        }
+
         // DryRun sits AFTER every parameter has been validated: the flag asks whether the
         // request WOULD have succeeded, so one that would have been refused is refused with
         // that reason instead.
@@ -306,9 +323,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (start_date_secs, end_date_secs) = window.unwrap_or((now_secs, now_secs));
 
         // What the offering reserves. An offering must say what it holds, and the smallest
-        // Capacity Block a search can be answered with is one unit, so a search that names no
-        // count is answered with one instance — or one UltraServer, when it is UltraServers
-        // the search is for.
+        // Capacity Block a search can be answered with is one unit, so a search that names
+        // its dimension by type alone is answered with one instance — or one UltraServer,
+        // when it is UltraServers the search is for.
         let (instance_count, ultraserver_count) = match input.ultraserver_type.as_deref() {
             Some(_) => (
                 input.instance_count,
@@ -328,7 +345,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // The instance types the search covers: the one it names, none at all for a search
-        // for UltraServers, and otherwise every type the model declares.
+        // for UltraServers, and otherwise — an instance search that named its count and no
+        // type — every type the model declares.
         let instance_types: Vec<Option<&str>> = match input.instance_type.as_deref() {
             Some(instance_type) => vec![Some(instance_type)],
             None if input.ultraserver_type.is_some() => vec![None],

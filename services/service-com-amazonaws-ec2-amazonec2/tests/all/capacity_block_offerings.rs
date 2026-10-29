@@ -587,14 +587,15 @@ async fn an_ultraserver_search_reports_ultraserver_offerings() {
     }
 }
 
-/// A search that names no type at all is answered from the modelled instance-type catalog,
-/// in the stable order a `NextToken` walk resumes in.
+/// A search that names its instance count but no instance TYPE is answered from the
+/// modelled instance-type catalog, in the stable order a `NextToken` walk resumes in.
 #[tokio::test]
 async fn a_search_that_names_no_type_is_answered_from_the_modelled_catalog() {
     let (router, _engine) = super::ec2_query::emulator();
     let page_size = 6;
     let params = vec![
         field("CapacityDurationHours", 24),
+        field("InstanceCount", 2),
         field("MaxResults", page_size),
     ];
 
@@ -890,8 +891,13 @@ async fn max_results_and_next_token_page_one_search() {
     let region = "us-east-1";
 
     // A search that covers the whole catalog in every zone, so there is more than one page to
-    // walk whatever page size is asked for.
-    let base = vec![field("CapacityDurationHours", 24), field("MaxResults", 100)];
+    // walk whatever page size is asked for. It names the count it wants and no instance type,
+    // which is the instance dimension named and so a search this operation answers.
+    let base = vec![
+        field("CapacityDurationHours", 24),
+        field("InstanceCount", 2),
+        field("MaxResults", 100),
+    ];
     let full = search(&router, region, "one page of 100", &base).await;
     assert_eq!(
         full.len(),
@@ -911,6 +917,7 @@ async fn max_results_and_next_token_page_one_search() {
         while seen.len() < wanted {
             let mut params = vec![
                 field("CapacityDurationHours", 24),
+                field("InstanceCount", 2),
                 field("MaxResults", page_size),
             ];
             if let Some(token) = &token {

@@ -2183,10 +2183,12 @@ pub const IDEMPOTENT_PARAMETER_MISMATCH: &str = "IdempotentParameterMismatch";
 ///
 /// FIXED text: it states the condition and names nothing of the request — not the token, not
 /// the member that differs — so it is the whole rule rather than one run's sample of a
-/// varying text. Named here so the refusal and the suites that assert it cannot drift apart.
+/// varying text. Named here so the refusal and the suites that assert it cannot drift apart,
+/// and worded as the recorded refusal of a reused `CreateVolume` token words it, which is
+/// this one sentence for the whole error class.
 pub const IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE: &str =
-    "The request has the same client token as a previous request, but the request parameters \
-     are not the same.";
+    "Parameters on this idempotent request are inconsistent with parameters used in \
+     previous request(s)";
 
 /// EC2's error code for a request that leaves out a member the action requires.
 pub const MISSING_PARAMETER: &str = "MissingParameter";
@@ -16102,6 +16104,24 @@ pub fn invalid_parameter_combination<E>(message: impl Into<String>) -> Scaffolde
     Scaffolded::service_error(INVALID_PARAMETER_COMBINATION, 400, message)
 }
 
+/// Refuse two parameters that cannot be given in one request: HTTP 400
+/// `InvalidParameterCombination`, worded with the ONE sentence EC2 refuses such a pair with
+/// — the fixed `The parameter … cannot be used with the parameter …` with the two
+/// parameters' own names in it.
+///
+/// The pair every paged describe of this crate reads it for is a page size beside an
+/// explicit selection: a request that NAMES the resources it wants is not walking a
+/// collection, so `MaxResults` and a resource-id list select mutually exclusively and EC2
+/// refuses them together rather than serving one and ignoring the other. Each caller names
+/// the two parameters as its OWN refusal spells them — EC2 words the same refusal with the
+/// public member name on some operations and with the wire set name on others, and in either
+/// order — so the template lives here and the names stay with the operation.
+pub fn parameters_cannot_be_combined<E>(first: &str, second: &str) -> Scaffolded<E> {
+    invalid_parameter_combination(format!(
+        "The parameter {first} cannot be used with the parameter {second}"
+    ))
+}
+
 /// Refuse a create that would take the store past [`MAX_VPCS`]: HTTP 400
 /// `VpcLimitExceeded`.
 pub fn vpc_limit_exceeded<E>() -> Scaffolded<E> {
@@ -16374,6 +16394,40 @@ pub fn invalid_ami_id_not_found<E>(image_id: &str) -> Scaffolded<E> {
 /// this crate uses, so one code reads one way across every operation that answers it.
 pub fn invalid_ami_id_malformed<E>(image_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(INVALID_AMI_ID_MALFORMED, 400, invalid_id_message(image_id))
+}
+
+/// Whether `id` is an AMI id EC2 could have ISSUED: `ami-` followed by the long id form
+/// ([`issued_long_id_is_well_formed`]) — 17 lowercase hexadecimal digits under a leading
+/// `0`, not all of them `0`.
+///
+/// The stricter reading of [`image_id_is_well_formed`], for the validator that resolves an
+/// `ImageId` a LAUNCH is to run: a value inside the generic id form but outside the one EC2
+/// issues — the `ami-1234567890abcdef0` shape documentation examples and hand-written probes
+/// reach for — is answered `InvalidAMIID.Malformed` before any image is looked up, which is
+/// what the recorded `RunInstances` refusal of that shape shows and what
+/// [`instance_id_is_well_formed`] already reads an instance id the same way for. The
+/// describes of the account's images keep the wider [`image_id_is_well_formed`] on their own
+/// recorded evidence (a short-form id there is answered `InvalidAMIID.NotFound`), so which
+/// reading an operation uses is a fact of that operation's validator.
+pub fn issued_image_id_is_well_formed(id: &str) -> bool {
+    issued_long_id_is_well_formed("ami", id)
+}
+
+/// Refuse an AMI id the launch validator cannot read: HTTP 400 `InvalidAMIID.Malformed`,
+/// worded the way EC2's id parser words it there — [`invalid_id_message`]'s sentence
+/// followed by the id form it expected, `Invalid id: "<id>" (expecting "ami-...")`.
+///
+/// The fixed text is the parser's; the one variable part is the value the REQUEST sent,
+/// bounded the way [`invalid_id_message`] bounds every echoed id. Kept beside
+/// [`invalid_ami_id_malformed`] rather than replacing it, because the shared template is
+/// what the describes of this service's images were recorded answering and this longer
+/// sentence is what the launch path was.
+pub fn invalid_ami_id_malformed_expecting_ami<E>(image_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_AMI_ID_MALFORMED,
+        400,
+        format!("{} (expecting \"ami-...\")", invalid_id_message(image_id)),
+    )
 }
 
 /// Refuse an owner or executable-by term that names no account and no alias: HTTP 400
