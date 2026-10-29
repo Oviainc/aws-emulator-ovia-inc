@@ -801,9 +801,17 @@ pub fn encode_next_token(seq: u64) -> String {
 
 /// The creation sequence a `nextToken` resumes after, or `None` when the token
 /// was not minted by [`encode_next_token`].
+///
+/// Parsing the suffix is not enough to decide that: `u64::from_str_radix` also
+/// accepts any other digit count and either letter case, neither of which
+/// [`encode_next_token`] can emit. So the parsed sequence is re-encoded and the
+/// result compared with what arrived: only a token identical to its own
+/// canonical rendering names a position in a listing, and every other string —
+/// truncated, re-cased, over-padded or hand-written — is foreign.
 pub fn decode_next_token(token: &str) -> Option<u64> {
     let digits = token.strip_prefix(NEXT_TOKEN_PREFIX)?;
-    u64::from_str_radix(digits, 16).ok()
+    let seq = u64::from_str_radix(digits, 16).ok()?;
+    (encode_next_token(seq) == token).then_some(seq)
 }
 
 /// `max_lifetime_timeout_minutes` as a duration, for computing a tunnel's

@@ -19,6 +19,8 @@ mod closed_tunnel_shape;
 mod destination_service_limit;
 #[path = "all/limit_refusals.rs"]
 mod limit_refusals;
+#[path = "all/list_tunnels_next_token_form.rs"]
+mod list_tunnels_next_token_form;
 #[path = "all/member_update_stamp.rs"]
 mod member_update_stamp;
 #[path = "all/owed_close_settled_by_every_entry_point.rs"]
