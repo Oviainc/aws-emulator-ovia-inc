@@ -47,5 +47,7 @@ mod region_scoping;
 mod shared_endpoint_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/subnet_vpc_region_scope.rs"]
+mod subnet_vpc_region_scope;
 #[path = "all/unprovisioned_account.rs"]
 mod unprovisioned_account;

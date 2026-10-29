@@ -246,7 +246,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let endpoint_id = store.mint_endpoint_id();
-        let vpc_id = store.vpc_for_subnet(&input.subnet_id);
+        // The VPC reported for the subnet is the one THIS Region knows for it: a
+        // subnet, like the VPC it belongs to, is a resource of one Region, so the
+        // same `SubnetId` named in another Region is another subnet carrying its
+        // own VPC id. The Region is the endpoint's own — its parent Outpost's home
+        // Region, which this request resolved that Outpost in.
+        let vpc_id = store.vpc_for_subnet(&home_region, &input.subnet_id);
         let network_interface_id = store.mint_network_interface_id();
         let endpoint = crate::state::EndpointRecord {
             endpoint_id: endpoint_id.clone(),

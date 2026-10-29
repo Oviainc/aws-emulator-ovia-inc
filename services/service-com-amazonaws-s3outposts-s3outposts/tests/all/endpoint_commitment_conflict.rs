@@ -35,6 +35,7 @@ use service_com_amazonaws_s3outposts_s3outposts::ComAmazonawsS3outpostsS3outpost
 
 use crate::endpoint_lifecycle::{
     create, emulator_with_engine, owned_outposts, shared_outpost, string_at, SHARING_ACCOUNT_ID,
+    REGION,
 };
 
 /// A third synthetic account: one that is neither the account this emulator serves nor the
@@ -92,7 +93,9 @@ fn place_endpoint_of(
     let state = engine.state::<ComAmazonawsS3outpostsS3outpostsState>();
     let mut store = state.lock();
     let endpoint_id = store.mint_endpoint_id();
-    let vpc_id = store.vpc_for_subnet(subnet_id);
+    // The fixture's Outposts are all installed in `REGION`, so that is the Region the
+    // subnet this record sits in belongs to.
+    let vpc_id = store.vpc_for_subnet(REGION, subnet_id);
     let network_interface_id = store.mint_network_interface_id();
     let cidr_block = store
         .allocate_cidr_block()

@@ -163,13 +163,19 @@ async fn place_endpoint(
 /// still knows a VPC for.
 ///
 /// These two are what the crate's own bounded invariants are about, and no response
-/// reports the absence of a record, so this case reads the store for them.
+/// reports the absence of a record, so this case reads the store for them. A subnet
+/// mapping is keyed by the Region the subnet belongs to as well; these rows all place
+/// their endpoints in one Region, so the subnet half is what they look at.
 fn stored(emulator: &Emulator) -> (BTreeSet<(String, String)>, BTreeSet<String>) {
     let store = emulator.s3_store();
     let store = store.lock();
     (
         store.endpoints.keys().cloned().collect(),
-        store.subnet_vpcs.keys().cloned().collect(),
+        store
+            .subnet_vpcs
+            .keys()
+            .map(|(_, subnet_id)| subnet_id.clone())
+            .collect(),
     )
 }
 

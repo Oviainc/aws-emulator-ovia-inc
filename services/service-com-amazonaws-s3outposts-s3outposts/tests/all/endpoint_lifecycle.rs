@@ -20,8 +20,8 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_s3outposts_s3outposts::state::{
-    EndpointRecord, OutpostRecord, ACCESS_TYPE_PRIVATE, ENDPOINT_STATUS_AVAILABLE,
-    ENDPOINT_TRANSITION, PAGE_LIMIT,
+    outpost_inventory, EndpointRecord, OutpostRecord, ACCESS_TYPE_PRIVATE,
+    ENDPOINT_STATUS_AVAILABLE, ENDPOINT_TRANSITION, PAGE_LIMIT,
 };
 use service_com_amazonaws_s3outposts_s3outposts::ComAmazonawsS3outpostsS3outpostsState;
 use service_com_amazonaws_s3outposts_s3outposts::EmulatedService;
@@ -163,7 +163,7 @@ pub(crate) fn emulator_in_region_with_engine(
     // owes it nothing.
     let endpoint_id = store.mint_endpoint_id();
     let subnet_id = "subnet-0a1b2c3d4e5f60718".to_string();
-    let vpc_id = store.vpc_for_subnet(&subnet_id);
+    let vpc_id = store.vpc_for_subnet(region, &subnet_id);
     let network_interface_id = store.mint_network_interface_id();
     let cidr_block = store
         .allocate_cidr_block()
@@ -1906,10 +1906,16 @@ async fn a_create_delete_sequence_leaves_no_subnet_mapping_behind() {
             // What an endpoint holds is released when its teardown completes, not when
             // the delete is accepted. This case looks at the store directly, so it
             // settles the store past the teardown span rather than sleeping for it: the
-            // instant is an argument, and the change is owed at it either way.
+            // instant is an argument, and the change is owed at it either way. The
+            // inventory is what an endpoint's Region is read from, which is the Region a
+            // released subnet mapping belongs to.
+            let inventory = {
+                let store = store.lock();
+                outpost_inventory(&*engine, &store)
+            };
             store
                 .lock()
-                .settle_all(SystemTime::now() + ENDPOINT_TRANSITION);
+                .settle_all(&inventory, SystemTime::now() + ENDPOINT_TRANSITION);
             let expected = seeded_mappings + usize::from(index + 1 < live.len());
             assert_eq!(
                 store.lock().subnet_vpcs.len(),

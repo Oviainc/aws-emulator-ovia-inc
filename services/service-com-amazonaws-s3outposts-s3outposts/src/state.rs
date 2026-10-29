@@ -63,7 +63,11 @@
 //! and every lookup and listing resolves inside the Region the request was signed
 //! for alone ([`request_region`]) — so a resource of another Region is reported by
 //! no listing and resolves to the modelled 404, exactly as if the store held one
-//! set of resources per Region.
+//! set of resources per Region. That holds of the EC2 resources an endpoint's
+//! members are derived from too, since a subnet and the VPC it belongs to are a
+//! Region's own: the subnet a client names in one Region is a different subnet
+//! from the one it names under the same id in another
+//! ([`ComAmazonawsS3outpostsS3outpostsState::subnet_vpcs`]).
 //!
 //! Every ARN this service reports (`Outpost$OutpostArn`, `Outpost$S3OutpostArn`,
 //! `Endpoint$EndpointArn`, `CreateEndpointResult$EndpointArn`) is therefore built
@@ -489,19 +493,27 @@ pub struct ComAmazonawsS3outpostsS3outpostsState {
     /// reserves, so the map never holds more than that many records and a create
     /// past the bound is refused rather than stored.
     pub endpoints: BTreeMap<(String, String), EndpointRecord>,
-    /// The VPC the emulator has associated with a subnet. `Endpoint$VpcId` is
-    /// "the ID of the VPC used for the endpoint" and a subnet belongs to exactly
-    /// one VPC; this emulator models no EC2 subnets, so it mints one VPC id the
-    /// first time a subnet is used and reports that same id for every later
-    /// endpoint in the same subnet.
+    /// The VPC the emulator has associated with a subnet, keyed by `(Region,
+    /// SubnetId)`. `Endpoint$VpcId` is "the ID of the VPC used for the endpoint"
+    /// and a subnet belongs to exactly one VPC; this emulator models no EC2
+    /// subnets, so it mints one VPC id the first time a subnet is used and
+    /// reports that same id for every later endpoint in the same subnet.
+    ///
+    /// A subnet, like the VPC it belongs to, is a resource of ONE Region, so the
+    /// Region is half of the key here exactly as it qualifies every other lookup
+    /// in this store: the same `SubnetId` named in two Regions names two
+    /// different subnets, which carry their own VPC ids, and the endpoints of one
+    /// Region never decide what the other's report. The Region of an entry is the
+    /// endpoint's own — the home Region of the Outpost it is on
+    /// ([`outpost_region`]).
     ///
     /// BOUNDED by [`Self::endpoints`]: an entry exists only for a subnet a
-    /// stored endpoint sits in. [`Self::remove_endpoint`] drops the entry with
-    /// the last endpoint in that subnet, so a create/delete sequence cannot grow
-    /// this map — and a subnet that no endpoint is left in is simply one this
-    /// emulator no longer knows a VPC for, which the next endpoint there mints
-    /// afresh.
-    pub subnet_vpcs: BTreeMap<String, String>,
+    /// stored endpoint of that Region sits in. [`Self::remove_endpoint`] drops
+    /// the entry with the last endpoint of that Region in that subnet, so a
+    /// create/delete sequence cannot grow this map — and a subnet that no
+    /// endpoint is left in is simply one this emulator no longer knows a VPC for,
+    /// which the next endpoint there mints afresh.
+    pub subnet_vpcs: BTreeMap<(String, String), String>,
     /// The counter endpoint ids are minted from.
     pub endpoint_id_seq: u64,
     /// The counter VPC ids are minted from.
@@ -571,16 +583,23 @@ impl ComAmazonawsS3outpostsS3outpostsState {
         }
     }
 
-    /// The VPC id this emulator reports for `subnet_id`, minting one the first
-    /// time that subnet is used.
-    pub fn vpc_for_subnet(&mut self, subnet_id: &str) -> String {
-        if let Some(vpc_id) = self.subnet_vpcs.get(subnet_id) {
+    /// The VPC id this emulator reports for the subnet `subnet_id` of `region`,
+    /// minting one the first time that subnet is used there.
+    ///
+    /// `region` is the Region the subnet — and so the endpoint committing a range
+    /// of it — belongs to: the home Region of the Outpost the endpoint is on
+    /// ([`outpost_region`]). A subnet is a Region's own resource
+    /// ([`Self::subnet_vpcs`]), so what one Region reports for an id is resolved
+    /// from that Region's entries alone and an id named in another Region mints
+    /// its own.
+    pub fn vpc_for_subnet(&mut self, region: &str, subnet_id: &str) -> String {
+        let key = (region.to_string(), subnet_id.to_string());
+        if let Some(vpc_id) = self.subnet_vpcs.get(&key) {
             return vpc_id.clone();
         }
         self.vpc_id_seq = self.vpc_id_seq.wrapping_add(1);
         let vpc_id = format!("vpc-{:017x}", self.vpc_id_seq);
-        self.subnet_vpcs
-            .insert(subnet_id.to_string(), vpc_id.clone());
+        self.subnet_vpcs.insert(key, vpc_id.clone());
         vpc_id
     }
 
@@ -650,7 +669,11 @@ impl ComAmazonawsS3outpostsS3outpostsState {
     /// Nothing here depends on being called: each change was already owed at
     /// `now` whether or not anybody asked, so two callers reading at the same
     /// instant see the same endpoints.
-    pub fn settle_all(&mut self, now: SystemTime) {
+    ///
+    /// `inventory` is what an endpoint's Region is read from ([`outpost_region`]),
+    /// which is what releasing the Region-scoped VPC mapping of a removed record
+    /// resolves in ([`Self::remove_endpoint`]).
+    pub fn settle_all(&mut self, inventory: &OutpostInventory, now: SystemTime) {
         let completed: Vec<(String, String)> = self
             .endpoints
             .iter()
@@ -658,7 +681,7 @@ impl ComAmazonawsS3outpostsS3outpostsState {
             .map(|(key, _)| key.clone())
             .collect();
         for key in &completed {
-            self.remove_endpoint(key);
+            self.remove_endpoint(inventory, key);
         }
         for endpoint in self.endpoints.values_mut() {
             endpoint.settle(now);
@@ -680,16 +703,35 @@ impl ComAmazonawsS3outpostsS3outpostsState {
     /// Releasing the mapping is what keeps [`Self::subnet_vpcs`] bounded by
     /// [`Self::endpoints`]: no sequence of creates and deletes can leave an
     /// entry behind for a subnet nothing is stored in.
-    pub fn remove_endpoint(&mut self, key: &(String, String)) -> Option<EndpointRecord> {
+    pub fn remove_endpoint(
+        &mut self,
+        inventory: &OutpostInventory,
+        key: &(String, String),
+    ) -> Option<EndpointRecord> {
         let removed = self.endpoints.remove(key)?;
-        if !self
-            .endpoints
-            .values()
-            .any(|endpoint| endpoint.subnet_id == removed.subnet_id)
-        {
-            self.subnet_vpcs.remove(&removed.subnet_id);
-        }
+        self.release_subnet_vpcs(inventory, &removed.subnet_id);
         Some(removed)
+    }
+
+    /// Drop the VPC mapping of `subnet_id` in every Region that has no reachable
+    /// endpoint left in it.
+    ///
+    /// The mapping belongs to one Region ([`Self::subnet_vpcs`]), so it is
+    /// released per Region: an entry survives exactly while an endpoint of that
+    /// same Region sits in the subnet, and the endpoints of another Region keep
+    /// no entry of this one alive. An endpoint whose Outpost `inventory` no
+    /// longer holds is in no Region at all ([`outpost_region`]) — no listing
+    /// reports it and no reference resolves it — so it keeps no entry alive
+    /// either.
+    fn release_subnet_vpcs(&mut self, inventory: &OutpostInventory, subnet_id: &str) {
+        let endpoints = &self.endpoints;
+        self.subnet_vpcs.retain(|(region, subnet), _| {
+            subnet != subnet_id
+                || endpoints.values().any(|endpoint| {
+                    &endpoint.subnet_id == subnet
+                        && outpost_region(inventory, &endpoint.outpost_id) == Some(region.as_str())
+                })
+        });
     }
 
     /// Release every endpoint whose parent Outpost `inventory` no longer holds,
@@ -722,7 +764,7 @@ impl ComAmazonawsS3outpostsS3outpostsState {
             .cloned()
             .collect();
         for key in &orphaned {
-            self.remove_endpoint(key);
+            self.remove_endpoint(inventory, key);
         }
         orphaned
     }
@@ -782,7 +824,7 @@ pub fn settled_inventory<Eng: Send + Sync + 'static>(
     now: SystemTime,
 ) -> OutpostInventory {
     let inventory = outpost_inventory(engine, store);
-    store.settle_all(now);
+    store.settle_all(&inventory, now);
     store.release_endpoints_of_absent_outposts(&inventory);
     inventory
 }
@@ -1335,7 +1377,7 @@ pub fn endpoint_page(
 ) -> ListPage<Endpoint> {
     // A listing reports every endpoint it serves, so every status change the clock
     // already owes is materialised before the page is taken.
-    store.settle_all(now);
+    store.settle_all(inventory, now);
 
     // The endpoint records the walk pages over are read beside the inventory the
     // Outposts they hang off live in, which is where their Region comes from.
