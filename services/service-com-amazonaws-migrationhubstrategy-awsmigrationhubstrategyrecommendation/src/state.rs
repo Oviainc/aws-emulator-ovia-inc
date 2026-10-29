@@ -63,8 +63,9 @@
 //!
 //! Last, the account's **recommendation report generation tasks**
 //! ([`RecommendationReport`]): what `StartRecommendationReportGeneration` mints — one at
-//! a time, a start call made while one is running being refused with the modelled
-//! conflict ([`ongoing_task_conflict`]) — and `GetRecommendationReportDetails` reports.
+//! a time, a start call made while one is still in flight coalescing onto that task and
+//! answering its id ([`RegionState::ongoing_report_generation`]) rather than minting a
+//! second — and `GetRecommendationReportDetails` reports.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
@@ -2140,13 +2141,13 @@ impl RegionState {
         Some(report)
     }
 
-    /// The report generation task of this portfolio still running at `now`, if there is
+    /// The report generation task of this portfolio still in flight at `now`, if there is
     /// one.
     ///
     /// Every stored task gets the terminal status the clock already owed it first, so a
-    /// task whose span has passed is not reported as running. At most one task is ever in
-    /// progress, because a start call made while this answers `Some` is refused with the
-    /// modelled conflict ([`ongoing_task_conflict`]) instead of minting another.
+    /// task whose span has passed is not reported as in flight. At most one task is ever
+    /// in progress, because a start call made while this answers `Some` coalesces onto
+    /// that task — it is answered with the task's own id and mints nothing.
     pub fn ongoing_report_generation(&mut self, now: SystemTime) -> Option<OngoingTask> {
         for report in self.recommendation_reports.values_mut() {
             report.settle(now);

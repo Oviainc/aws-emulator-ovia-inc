@@ -72,11 +72,16 @@
 //!
 //! * A start call mints ONE report generation task, `IN_PROGRESS`, and answers with its
 //!   `RecommendationTaskId`; `GetRecommendationReportDetails` reports that record.
-//! * Only one report generation task runs at a time: a start call made while one is still
-//!   in progress is refused with the modelled `ConflictException` (HTTP 409) naming the
-//!   task already running, and mints nothing — so exactly one of several concurrent starts
-//!   succeeds, and a start carrying its own `outputFormat` or `groupIdFilter` is never
-//!   answered with a task generated from another call's parameters.
+//! * That task is the portfolio's single report generation task, and the start is
+//!   IDEMPOTENT over its span: a start call made while the task has not reached a terminal
+//!   status mints nothing and answers HTTP 200 with the id of the task already in flight,
+//!   so a duplicate, a retried or a concurrent start COALESCES onto the one task the
+//!   caller then polls to its terminal status instead of being refused. Once the clock has
+//!   given that task its terminal status, the next start mints a new task of its own. The
+//!   task keeps the `outputFormat` and the scope of the call that minted it, because a
+//!   coalesced start writes nothing. Repeating this start is therefore never answered with
+//!   the modelled `ConflictException`: the service's recorded behaviour shows a start
+//!   issued inside the first one's span answering that first task's id with HTTP 200.
 //! * The task's terminal status is `SUCCESS`, the status the service's recorded behaviour
 //!   shows a started task settling on, with a `statusMessage` reporting what was in scope
 //!   and that no report FILE was written: the report is an Excel or JSON file uploaded to
@@ -214,17 +219,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         // The task is minted in the portfolio of the Region this request was signed for,
-        // and everything below — the conflict, the quota, the inventory it counts — is
-        // that Region's.
+        // and everything below — the task a repeat coalesces onto, the quota, the inventory
+        // it counts — is that Region's.
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
-        // One report generation task runs at a time: while one is in progress a start
-        // call mints nothing and is refused with the modelled conflict naming the task
-        // already running, which is what lets the caller tell its own request was not
-        // acted on. The conflict is decided from the STORE (is a task still owed its
-        // terminal status?), never from what this request carries, so a call of any
-        // parameters inside one task's span is refused the same way.
+        // The portfolio runs one report generation task, and the start is idempotent over
+        // that task's span: while a task is still owed its terminal status a further start
+        // mints nothing and answers that task's own id, so a duplicate, a retried or a
+        // concurrent start coalesces onto the task the caller polls rather than being told
+        // its request was not acted on. WHICH task that is comes from the STORE (is one
+        // still owed its terminal status?), never from what this request carries, so a
+        // call of any parameters inside one task's span is answered with that task's id
+        // and the running task keeps the parameters of the call that minted it.
         // Both of the things this call reads out of the portfolio — the task already
         // running and the inventory the new task's scope is counted from — are read with
         // every completion the clock already owed this portfolio materialised first
@@ -232,17 +239,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // called, so what the call answers and stores does not depend on whether some
         // unrelated read happened to materialise them first. A Region nothing was
         // imported in holds nothing to settle and gets no partition minted for it.
-        let ongoing = store.region_mut(&region).and_then(|portfolio| {
+        let in_flight = store.region_mut(&region).and_then(|portfolio| {
             portfolio.settle_all(now);
             portfolio.ongoing_report_generation(now)
         });
-        if let Some(ongoing) = ongoing {
-            return Err(
-                StartRecommendationReportGenerationErrorModeled::ConflictException(
-                    crate::state::ongoing_task_conflict(&ongoing),
-                )
-                .into(),
-            );
+        if let Some(in_flight) = in_flight {
+            return Ok(StartRecommendationReportGenerationOutput {
+                id: Some(in_flight.id),
+            });
         }
 
         // The store is bounded: past its quota no further task is minted, so the state

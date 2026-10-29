@@ -1,23 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Starting a recommendation report generation while one is already running, end to end
+//! Starting a recommendation report generation while one is already in flight, end to end
 //! over HTTP.
 //!
-//! The rule under test is the one the service states for a task it runs at most one of at
-//! a time, not for one pair of calls: a `StartRecommendationReportGeneration` issued while
-//! a report generation task of that Region's portfolio has not reached a terminal status
-//! is REFUSED with the modelled `ConflictException` (HTTP 409) naming the task already
-//! running — it mints nothing, answers no id, and leaves the running task exactly as it
-//! was — so of N overlapping starts exactly ONE succeeds and the others are told their own
-//! request was not acted on. The conflict is lifted by the task reaching its terminal
-//! status, not by anything a caller sends.
+//! The rule under test is the one the service states for the report generation task it
+//! runs one of at a time, not for one pair of calls: a
+//! `StartRecommendationReportGeneration` issued while a report generation task of that
+//! Region's portfolio has not reached a terminal status COALESCES onto that task — it is
+//! answered with HTTP 200 and the id of the task already in flight, mints no second
+//! record, and leaves that task exactly as it was — so N overlapping starts all answer the
+//! ONE id the caller then polls to its terminal status, and none of them is answered with
+//! the modelled `ConflictException`. The window is closed by the task reaching its terminal
+//! status and by nothing a caller sends: a start made after that mints a task of its own.
 //!
 //! The tables therefore span what the rule generalises over: how MANY starts overlap (two,
 //! three and five), what parameters each of them carries (every `OutputFormat` value, an
 //! absent one, and filters of none, one and two groups), and the generation the burst falls
-//! in (a second burst after the clock has settled the first task is refused the same way).
-//! The refusal turns on the STORE, so no row of it may depend on what a request holds — and
-//! the task that DID get minted keeps the parameters of the call that minted it, which is
+//! in (a second burst, after the clock has settled the first task, coalesces onto its own
+//! task). The answer turns on the STORE, so no row of it may depend on what a request
+//! holds — and the task in flight keeps the parameters of the call that minted it, which is
 //! read back off the store rather than inferred from the answer.
 
 use std::sync::Arc;
@@ -39,9 +40,9 @@ use crate::recommendation_report::{
 /// a caller vary: whether `outputFormat` is named at all and which value it carries, and
 /// how many groups the filter names.
 ///
-/// A burst of N takes the first N of these, so the row that succeeds and the rows that are
-/// refused carry DIFFERENT parameters — which is what makes "the second caller cannot tell
-/// its request was never acted on" observable.
+/// A burst of N takes the first N of these, so the row that minted the task and the rows
+/// that coalesce onto it carry DIFFERENT parameters — which is what makes "the answer is
+/// decided by the store, not by what the request holds" observable.
 fn burst_requests() -> Vec<(&'static str, Value)> {
     vec![
         (
@@ -108,12 +109,12 @@ fn asked_format(request: &Value) -> String {
     }
 }
 
-/// Of N starts issued inside one task's span exactly one succeeds: the first. Every later
-/// one is refused with 409 `ConflictException` naming the task that first call minted,
-/// mints nothing, and carries no id of its own — and the stored task keeps the parameters
-/// of the call that minted it, not a later caller's.
+/// Of N starts issued inside one task's span every one answers the SAME id: the first
+/// mints the task, each later one coalesces onto it with HTTP 200, mints nothing and
+/// disturbs nothing — and the task keeps the parameters of the call that minted it, not a
+/// later caller's. The one task the burst coalesced onto then reaches its terminal status.
 #[tokio::test]
-async fn exactly_one_of_several_overlapping_starts_succeeds() {
+async fn overlapping_starts_coalesce_onto_the_task_in_flight() {
     let mut observed = 0usize;
     for burst in [2usize, 3, 5] {
         let rows = burst_requests();
@@ -144,94 +145,131 @@ async fn exactly_one_of_several_overlapping_starts_succeeds() {
                 // asserted wrongly.
                 break;
             }
-            let refused = start_report(&router, request).await;
+            let again = start_report(&router, request).await;
             assert_eq!(
-                refused.status, CONFLICT_STATUS,
-                "case {case:?}: expected HTTP {CONFLICT_STATUS}, got {} with {:?}",
-                refused.status, refused.body
+                again.status, 200,
+                "case {case:?}: a start made while a task is in flight is accepted (HTTP 200, \
+                 never HTTP {CONFLICT_STATUS}), got {} with {:?}",
+                again.status, again.body
             );
             assert_eq!(
-                refused.error_code(),
-                CONFLICT_EXCEPTION,
-                "case {case:?}: expected {CONFLICT_EXCEPTION}, got {:?}",
-                refused.body
-            );
-            let message = refused.string("/message");
-            assert!(
-                message.contains(&first_id) && message.contains(REPORT_IN_PROGRESS),
-                "case {case:?}: the refusal must name the running task {first_id:?} and the \
-                 {REPORT_IN_PROGRESS} status it holds, got {message:?}"
+                again.error_code(),
+                "",
+                "case {case:?}: a repeat of the start is not answered with \
+                 {CONFLICT_EXCEPTION}, got {:?}",
+                again.body
             );
             assert_eq!(
-                at(&refused.body, "/id"),
-                Value::Null,
-                "case {case:?}: a refused start answers no task id, got {:?}",
-                refused.body
+                again.string("/id"),
+                first_id,
+                "case {case:?}: expected the id of the task already in flight ({first_id:?}), \
+                 got {:?}",
+                again.body
             );
             assert_eq!(
                 stored_task_count(&engine),
                 1,
-                "case {case:?}: a refused start must mint nothing, but the store holds {} tasks",
+                "case {case:?}: a coalesced start must mint nothing, but the store holds {} tasks",
                 stored_task_count(&engine)
             );
             assert_eq!(
                 stored_output_format(&engine),
                 expected_format,
-                "case {case:?}: the running task keeps the format the call that minted it asked \
+                "case {case:?}: the task in flight keeps the format the call that minted it asked \
                  for ({expected_format:?}), got {:?}",
                 stored_output_format(&engine)
             );
+            // And the task is left exactly as it was: still the one the first call minted,
+            // still in progress, reported once.
+            let running = report_details(&router, &first_id).await;
+            assert_eq!(
+                (
+                    running.status,
+                    running.string("/recommendationReportDetails/status")
+                ),
+                (200, REPORT_IN_PROGRESS.to_string()),
+                "case {case:?}: the coalesced start disturbed the task in flight, got {:?}",
+                running.body
+            );
             observed += 1;
         }
+
+        // Nothing is done here but wait: no call drives the transition.
+        std::thread::sleep(COMPLETION_SPAN + Duration::from_millis(200));
+
+        let settled = report_details(&router, &first_id).await;
+        assert_eq!(
+            settled.string("/recommendationReportDetails/status"),
+            REPORT_SETTLED,
+            "case {burst} overlapping starts: the id every call answered settles on \
+             {REPORT_SETTLED}, got {:?}",
+            settled.body
+        );
+        assert_eq!(
+            stored_task_count(&engine),
+            1,
+            "case {burst} overlapping starts: the burst is one task in all, but the store holds \
+             {} tasks",
+            stored_task_count(&engine)
+        );
     }
     assert!(
         observed > 0,
-        "no row observed the conflict at all: expected at least one overlapping start to be \
+        "no row observed a coalesced start at all: expected at least one overlapping start to be \
          asserted inside the completion span"
     );
 }
 
-/// The conflict is lifted by the task reaching its terminal status and by nothing else: a
-/// burst issued once the clock has settled the first task mints one new task and refuses
-/// the rest, exactly as the first burst was treated.
+/// The window is closed by the task reaching its terminal status and by nothing else: a
+/// start issued once the clock has settled the previous task mints a task of its own with a
+/// fresh id, and a start issued inside that new task's span coalesces onto it exactly as
+/// the first generation's did.
 #[tokio::test]
-async fn the_conflict_is_lifted_by_the_clock_and_then_holds_again() {
+async fn the_coalescing_window_is_closed_by_the_clock_and_then_opens_again() {
     let (router, engine) = emulator_with_engine();
+    let mut minted: Vec<String> = Vec::new();
 
     for (generation, format) in OUTPUT_FORMATS.iter().enumerate() {
         let started_at = Instant::now();
         let started = start_report(&router, json!({"outputFormat": format})).await;
         assert_eq!(
             started.status, 200,
-            "generation {generation}: with nothing running the start is accepted, got {} with \
+            "generation {generation}: with nothing in flight the start is accepted, got {} with \
              {:?}",
             started.status, started.body
         );
         let id = started.string("/id");
+        assert!(
+            !minted.contains(&id),
+            "generation {generation}: a start made once the earlier task settled mints a task of \
+             its own, but it answered {id:?} again ({minted:?})"
+        );
         assert_eq!(
             stored_task_count(&engine),
             generation + 1,
-            "generation {generation}: each accepted start mints one task, but the store holds {}",
+            "generation {generation}: each start made with nothing in flight mints one task, but \
+             the store holds {}",
             stored_task_count(&engine)
         );
 
         if started_at.elapsed() < COMPLETION_SPAN {
-            let refused = start_report(&router, json!({})).await;
+            let again = start_report(&router, json!({})).await;
             assert_eq!(
-                (refused.status, refused.error_code()),
-                (CONFLICT_STATUS, CONFLICT_EXCEPTION),
-                "generation {generation}: a start inside the span is refused with \
-                 {CONFLICT_STATUS} {CONFLICT_EXCEPTION}, got {} with {:?}",
-                refused.status,
-                refused.body
+                (again.status, again.string("/id")),
+                (200, id.clone()),
+                "generation {generation}: a start inside the span coalesces onto {id:?} with HTTP \
+                 200, got {} with {:?}",
+                again.status,
+                again.body
             );
             assert_eq!(
                 stored_task_count(&engine),
                 generation + 1,
-                "generation {generation}: the refused start minted a task, the store holds {}",
+                "generation {generation}: the coalesced start minted a task, the store holds {}",
                 stored_task_count(&engine)
             );
         }
+        minted.push(id.clone());
 
         // Nothing is done here but wait: no call drives the transition.
         std::thread::sleep(COMPLETION_SPAN + Duration::from_millis(200));

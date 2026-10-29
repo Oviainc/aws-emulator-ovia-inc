@@ -20,12 +20,13 @@
 //! another Region's portfolio fails here.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::state::{
     ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState, ServerRecord,
-    MAX_REGIONS,
+    COMPLETION_SPAN, MAX_REGIONS,
 };
 use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -487,12 +488,13 @@ async fn a_region_nothing_was_created_in_reads_as_an_empty_account() {
 }
 
 /// The one-report-at-a-time rule is per Region: a start call made in another Region while
-/// a task is running is NOT refused for it, it mints that Region's own task — while a
-/// second start in the Region the task is running in is refused with the modelled 409
-/// `ConflictException` naming that Region's task.
+/// a task is in flight mints that Region's own task, and a second start in the Region the
+/// task is in flight in coalesces onto THAT Region's task — answering its id, not another
+/// Region's.
 #[tokio::test]
 async fn the_running_report_task_is_per_region() {
     let router = emulator();
+    let started_at = Instant::now();
     let mut ids: Vec<(&str, String)> = Vec::new();
     for region in REGIONS {
         let started = call_in(
@@ -512,30 +514,33 @@ async fn the_running_report_task_is_per_region() {
     }
 
     for (region, id) in &ids {
-        // Inside the same Region a second start is refused for the task already running
-        // there, and the refusal names THAT Region's task.
-        let again = call_in(
-            &router,
-            region,
-            "POST",
-            "/start-recommendation-report-generation",
-            Some(json!({"outputFormat": "Json"})),
-        )
-        .await;
-        assert_eq!(
-            (again.status, again.error_code()),
-            (409, "ConflictException"),
-            "case {region:?}: a start inside one Region's running task is refused with 409 \
-             ConflictException, got {} with {:?}",
-            again.status,
-            again.body
-        );
-        assert!(
-            again.string("/message").contains(id),
-            "case {region:?}: the refusal must name that Region's own running task {id:?}, got \
-             {:?}",
-            again.string("/message")
-        );
+        // Inside the same Region a second start coalesces onto the task already in flight
+        // there, and answers THAT Region's task id. A task the clock has already settled
+        // is no longer in flight, so the row would prove nothing and is skipped rather
+        // than asserted wrongly.
+        if started_at.elapsed() < COMPLETION_SPAN {
+            let again = call_in(
+                &router,
+                region,
+                "POST",
+                "/start-recommendation-report-generation",
+                Some(json!({"outputFormat": "Json"})),
+            )
+            .await;
+            assert_eq!(
+                again.status, 200,
+                "case {region:?}: a start inside one Region's in-flight task is accepted, got {} \
+                 with {:?}",
+                again.status, again.body
+            );
+            assert_eq!(
+                &again.string("/id"),
+                id,
+                "case {region:?}: the call must answer that Region's own in-flight task {id:?}, \
+                 got {:?}",
+                again.body
+            );
+        }
         // Across Regions the tasks are distinct records.
         for (other, other_id) in ids.iter().filter(|(other, _)| other != region) {
             assert_ne!(

@@ -319,10 +319,11 @@ async fn an_undeclared_enum_value_is_refused_on_every_other_enum_member() {
 ///
 /// A FRESH emulator per ROW, because what one row leaves behind is not part of the next
 /// row's case: a `StartRecommendationReportGeneration` row puts a report generation task
-/// in flight, and both `StartRecommendationReportGeneration` (only one report generation
-/// runs at a time, `recommendation_report.rs`) and `PutPortfolioPreferences` (no save
-/// while a task of the account is running, `preferences_conflict.rs`) refuse a call made
-/// while that task is still running — which has nothing to do with the enum value under
+/// in flight, and both `StartRecommendationReportGeneration` (a start made while one is in
+/// flight coalesces onto that task instead of minting, `recommendation_report.rs`) and
+/// `PutPortfolioPreferences` (no save while a task of the account is running,
+/// `preferences_conflict.rs`) answer a call made while that task is still running from the
+/// task rather than from the request — which has nothing to do with the enum value under
 /// test here.
 #[tokio::test]
 async fn every_value_these_enumerations_declare_is_accepted() {
