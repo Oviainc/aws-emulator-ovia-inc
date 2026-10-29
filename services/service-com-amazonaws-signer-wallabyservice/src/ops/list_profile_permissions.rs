@@ -124,10 +124,16 @@ fn profile_not_found(profile_name: &str) -> ListProfilePermissionsError {
 /// The modelled 400 for a `nextToken` that is not one this service handed out.
 ///
 /// `code` names the condition a paginating client resets on, as the service's
-/// other paginated list words it.
-fn invalid_next_token(token: &str) -> ListProfilePermissionsError {
+/// other paginated reads word it. The refused value is not echoed: the token is
+/// this service's OWN opaque cursor, so a client learns only that the cursor is
+/// not one this read resumes, and nothing of what it carries — or of the bytes
+/// the caller sent in its place — is reported back. The member carries no size
+/// bound (`nextToken` is a bare `String` bound to the query string), so quoting
+/// it would let one oversized query parameter become an equally large error
+/// body.
+fn invalid_next_token() -> ListProfilePermissionsError {
     ListProfilePermissionsErrorModeled::ValidationException(ValidationException {
-        message: Some(format!("Invalid next token provided: {token}")),
+        message: Some("Invalid next token provided".to_string()),
         code: Some(crate::state::ERROR_CODE_INVALID_NEXT_TOKEN.to_string()),
     })
     .into()
@@ -194,8 +200,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // 0 — there is no document to measure. A page of it can only be the first
         // one, so a token against it is a token this service never handed out.
         let Some(policy) = store.profile_policy(&region, &input.profile_name) else {
-            if let Some(token) = input.next_token.as_deref() {
-                return Err(invalid_next_token(token));
+            if input.next_token.is_some() {
+                return Err(invalid_next_token());
             }
             return Ok(ListProfilePermissionsOutput {
                 revision_id: None,
@@ -213,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // arbitrary suffix of the order.
         if let Some(token) = input.next_token.as_deref() {
             if !policy.statements.contains_key(token) {
-                return Err(invalid_next_token(token));
+                return Err(invalid_next_token());
             }
         }
 

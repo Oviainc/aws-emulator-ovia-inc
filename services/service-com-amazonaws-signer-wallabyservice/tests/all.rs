@@ -23,6 +23,9 @@ mod error_responses;
 #[path = "all/job_listing.rs"]
 mod job_listing;
 
+#[path = "all/next_token_refusal_wording.rs"]
+mod next_token_refusal_wording;
+
 #[path = "all/paginated_page_size.rs"]
 mod paginated_page_size;
 
