@@ -1360,6 +1360,14 @@
 //! that instant rather than moving it: there is then no ingestion to report a status for,
 //! and a later enable starts a fresh one.
 //!
+//! A DATA EXPORT configuration, unlike the setting above, IS a resource with an id of its
+//! own, so [`ComAmazonawsEc2Amazonec2State::capacity_manager_data_exports`] holds the
+//! account's exports keyed by `CapacityManagerDataExportId`, as the modelled
+//! [`CapacityManagerDataExportResponse`] shape itself — the way every other stored resource
+//! of this module is held. The operation that deletes one takes it OUT of that map, and the
+//! count of configurations `GetCapacityManagerAttributes` reports is the size of that map,
+//! so the reader and the delete cannot disagree about what the account holds.
+//!
 //! ## Scheduled event notification tag keys are a fact of a REGION
 //!
 //! [`ComAmazonawsEc2Amazonec2State::instance_event_tag_registrations`] holds, per Region, the tag
@@ -1484,6 +1492,7 @@ use crate::ops::types::{
     Byoasn, ByoipCidr, ConnectionNotification,
     DhcpConfiguration, DhcpOptions,
     CapacityBlock, CapacityReservation, CapacityReservationBillingRequest,
+    CapacityManagerDataExportResponse,
     CapacityReservationCancellationQuote, CapacityReservationConfiguration, CancellationTerms,
     CapacityReservationCommitmentInfo, CapacityReservationInfo, CustomerGateway, ExportTask,
     FpgaImage,
@@ -3912,6 +3921,13 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// the operations that change them cannot disagree. PRIVATE, like the other
     /// account-level settings above, so those accessors are the only way in.
     capacity_manager: CapacityManagerSettings,
+    /// Every Capacity Manager data export configuration the account holds, by
+    /// `CapacityManagerDataExportId`, as the modelled [`CapacityManagerDataExportResponse`]
+    /// shape the describe reports — see the module docs.
+    /// `CreateCapacityManagerDataExport` is the operation that adds one and
+    /// `DeleteCapacityManagerDataExport` the one that removes it. Ordered by id, which is
+    /// the order a report of them pages over.
+    pub capacity_manager_data_exports: BTreeMap<String, CapacityManagerDataExportResponse>,
     /// The longer-ID (17-character ID) preference each principal has EXPLICITLY set, by
     /// principal ARN and then by resource type — see the module docs.
     ///
@@ -4200,6 +4216,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // Manager `disabled`, no Organizations access and no ingestion at all, which
             // is what `CapacityManagerSettings::default()` is.
             capacity_manager: CapacityManagerSettings::default(),
+            // A fresh account holds no Capacity Manager data export configuration until
+            // `CreateCapacityManagerDataExport` makes one.
+            capacity_manager_data_exports: BTreeMap::new(),
             // No principal has overridden its ID format settings yet, so every one of
             // them follows the root user, which follows `DEFAULT_USE_LONG_IDS`.
             id_format_overrides: BTreeMap::new(),
@@ -32741,6 +32760,113 @@ impl ComAmazonawsEc2Amazonec2State {
         self.capacity_manager.organizations_access = false;
         self.capacity_manager.ingestion_complete_at = None;
         self.capacity_manager.view_at(now)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Capacity Manager DATA EXPORT configurations (a resource with an id)
+// ---------------------------------------------------------------------------
+
+/// The code EC2 answers for a data export id the account holds no export configuration for.
+///
+/// The recorded refusal behind
+/// `issues/.../20261023T102725Z-ec2-deletecapacitymanagerdataexport-stub.md` is where this
+/// code's spelling comes from: AWS answered `DeleteCapacityManagerDataExport` for an id no
+/// configuration of the account carries with `InvalidCapacityManagerDataExportId.NotFound`
+/// (HTTP 400), the `Invalid<Resource>Id.NotFound` form
+/// [`INVALID_IMAGE_USAGE_REPORT_ID_NOT_FOUND`] takes as well.
+pub const INVALID_CAPACITY_MANAGER_DATA_EXPORT_ID_NOT_FOUND: &str =
+    "InvalidCapacityManagerDataExportId.NotFound";
+
+/// The code EC2 answers for something that is not a data export id at all.
+///
+/// EC2 separates "not an id of this kind" from "no such resource" with the resource's own
+/// `Invalid<Kind>.Malformed` code, refused BEFORE any lookup — the split
+/// [`prefixed_id_is_well_formed`] documents and [`INVALID_IMAGE_USAGE_REPORT_ID_MALFORMED`]
+/// spells for another resource of this crate — so the kind name of the `.NotFound` code
+/// above carries it.
+pub const INVALID_CAPACITY_MANAGER_DATA_EXPORT_ID_MALFORMED: &str =
+    "InvalidCapacityManagerDataExportId.Malformed";
+
+/// The id prefix every Capacity Manager data export id carries: `cmde-`.
+///
+/// `CapacityManagerDataExportId` is a plain `String` in the model
+/// (`smithy_query(query="shape",shape="CapacityManagerDataExportId")`), so the prefix is
+/// taken from the id AWS itself read as a "capacity-manager-data-export ID" in the recorded
+/// refusal behind this resource's issue. It is the prefix an export id is minted under as
+/// well ([`ComAmazonawsEc2Amazonec2State::next_id`]), so one id form serves the mint and the
+/// readers.
+pub const CAPACITY_MANAGER_DATA_EXPORT_ID_PREFIX: &str = "cmde";
+
+/// Whether `id` is a well-formed Capacity Manager data export id — one EC2 could have
+/// ISSUED: [`CAPACITY_MANAGER_DATA_EXPORT_ID_PREFIX`] followed by 8 or 17 lowercase
+/// hexadecimal digits ([`prefixed_id_is_well_formed`]).
+///
+/// No null-id clause, unlike [`image_usage_report_id_is_well_formed`]: the recorded refusal
+/// behind this resource's issue shows AWS answering the all-zero long id
+/// `InvalidCapacityManagerDataExportId.NotFound` rather than `.Malformed`, so that id is
+/// one this reader admits and the lookup then finds nothing for.
+pub fn capacity_manager_data_export_id_is_well_formed(id: &str) -> bool {
+    prefixed_id_is_well_formed(CAPACITY_MANAGER_DATA_EXPORT_ID_PREFIX, id)
+}
+
+/// Refuse a request that named a data export id the account holds no configuration for:
+/// HTTP 400 [`INVALID_CAPACITY_MANAGER_DATA_EXPORT_ID_NOT_FOUND`].
+///
+/// The wording is AWS's own for this resource — "The capacity-manager-data-export ID
+/// '<id>' does not exist" — built from the id the REQUEST carried, bounded by
+/// [`echoed_resource_id`] the way every refusal of this crate that quotes a value the
+/// caller chose is.
+pub fn invalid_capacity_manager_data_export_id_not_found<E>(export_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_CAPACITY_MANAGER_DATA_EXPORT_ID_NOT_FOUND,
+        400,
+        format!(
+            "The capacity-manager-data-export ID '{}' does not exist",
+            echoed_resource_id(export_id)
+        ),
+    )
+}
+
+/// Refuse a data export id the request named that is not an export id at all: HTTP 400
+/// [`INVALID_CAPACITY_MANAGER_DATA_EXPORT_ID_MALFORMED`], which EC2 answers BEFORE it looks
+/// the id up.
+///
+/// The message is [`invalid_id_message`] — the ONE sentence this service words an unreadable
+/// resource id with, whatever kind of id it is.
+pub fn invalid_capacity_manager_data_export_id_malformed<E>(export_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_CAPACITY_MANAGER_DATA_EXPORT_ID_MALFORMED,
+        400,
+        invalid_id_message(export_id),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// How many data export configurations the account holds — "the number of active data
+    /// export configurations for this account"
+    /// (`GetCapacityManagerAttributesResult$DataExportCount`).
+    ///
+    /// Reporting only, and the one count every operation that answers it reads, so the
+    /// report and the store cannot disagree. Saturating rather than wrapping, because the
+    /// member is an `i32` and the map is not bounded by one.
+    pub fn capacity_manager_data_export_count(&self) -> i32 {
+        i32::try_from(self.capacity_manager_data_exports.len()).unwrap_or(i32::MAX)
+    }
+
+    /// Take the data export configuration `export_id` names out of the store, answering it
+    /// when one was there and `None` when the account holds none under that id.
+    ///
+    /// The one remover, so "the export is gone" is a fact of this map rather than of a
+    /// handler's own bookkeeping: a later read of that id finds nothing and the count above
+    /// drops by one. "This stops future scheduled exports but does not delete previously
+    /// exported files from S3" (`DeleteCapacityManagerDataExport`) — nothing in this
+    /// emulator holds those files, so removing the configuration is the whole of the delete.
+    pub fn remove_capacity_manager_data_export(
+        &mut self,
+        export_id: &str,
+    ) -> Option<CapacityManagerDataExportResponse> {
+        self.capacity_manager_data_exports.remove(export_id)
     }
 }
 

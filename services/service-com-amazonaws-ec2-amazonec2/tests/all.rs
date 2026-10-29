@@ -17,6 +17,12 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `DeleteCapacityManagerDataExport` takes out of the account's Capacity Manager data
+// export configurations, what the reader then counts, and what the delete refuses. Declared
+// beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood and
+// the tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/capacity_manager_data_exports.rs"]
+mod capacity_manager_data_exports;
 // The form an Amazon FPGA Image id is read in before any lookup, and the two answers an id
 // outside and inside it gets. Declared beside `prefix_lists` for the reason the note above
 // gives: the sorted neighbourhood and the tail of this file are where every new ec2 suite

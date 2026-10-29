@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCapacityManagerDataExport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCapacityManagerDataExport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes the Capacity Manager data export configuration the request names out
+//! of [`crate::state`] and answers the id of the configuration it removed. This is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCapacityManagerDataExport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `CapacityManagerDataExportId` carries no modelled pattern, so the id form comes from this
+//! service's own id space ([`crate::state::capacity_manager_data_export_id_is_well_formed`]):
+//! an id EC2 could never have ISSUED is refused
+//! `InvalidCapacityManagerDataExportId.Malformed` BEFORE anything is looked up, and only a
+//! well-formed id the account holds no configuration for is
+//! `InvalidCapacityManagerDataExportId.NotFound` — the split that lets a caller tell a typo
+//! from a configuration that is gone. `DryRun` is answered between the two, because the flag
+//! asks whether the CALLER MAY make the request — "checks whether you have the required
+//! permissions for the action, without actually making the request" — which is a question
+//! about the caller and not about the resource, while a value that is not an id at all is
+//! not a request whose permissions can be checked.
+//!
+//! The delete removes the CONFIGURATION and nothing else: "this stops future scheduled
+//! exports but does not delete previously exported files from S3".
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +145,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCapacityManagerDataExport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCapacityManagerDataExportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCapacityManagerDataExport"))
+        use crate::state::{
+            capacity_manager_data_export_id_is_well_formed, dry_run_operation,
+            invalid_capacity_manager_data_export_id_malformed,
+            invalid_capacity_manager_data_export_id_not_found, require_service_state,
+        };
+
+        // A data export configuration carries no Region member of its own — it is a
+        // configuration of the account's Capacity Manager — so nothing here depends on the
+        // Region the request was signed for.
+        let _ = ctx;
+
+        let export_id = input.capacity_manager_data_export_id;
+
+        // Something that is not an export id at all is refused as malformed, before there
+        // is anything to look up (see the module docs).
+        if !capacity_manager_data_export_id_is_well_formed(&export_id) {
+            return Err(invalid_capacity_manager_data_export_id_malformed(
+                &export_id,
+            ));
+        }
+
+        // The permission question, answered before the resource one and before the write
+        // (see the module docs).
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // The delete is what takes the configuration out of the store, so the answer reports
+        // a removal that happened rather than one this handler assumed: an id the account
+        // holds no configuration for is refused instead of answered as a no-op.
+        let removed = store
+            .remove_capacity_manager_data_export(&export_id)
+            .ok_or_else(|| invalid_capacity_manager_data_export_id_not_found(&export_id))?;
+
+        Ok(DeleteCapacityManagerDataExportOutput {
+            // "The unique identifier of the deleted data export configuration"
+            // (`DeleteCapacityManagerDataExportResult$CapacityManagerDataExportId`): the id
+            // the configuration that was removed was stored under, so what is answered is
+            // the configuration that went away rather than the request's own text.
+            capacity_manager_data_export_id: removed
+                .capacity_manager_data_export_id
+                .or(Some(export_id)),
+        })
     }
 }

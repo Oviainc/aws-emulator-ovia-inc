@@ -175,10 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             capacity_manager_status: Some(settings.status.to_string()),
             organizations_access: Some(settings.organizations_access),
             // "The number of active data export configurations for this account": the
-            // account holds the data exports `CreateCapacityManagerDataExport` made, and
-            // that operation is still a scaffold in this emulator, so there is nothing for
-            // it to have made and the count is zero.
-            data_export_count: Some(0),
+            // account holds the data exports `CreateCapacityManagerDataExport` made, so the
+            // count is the size of that store rather than a number this handler chose.
+            data_export_count: Some(store.capacity_manager_data_export_count()),
             // "Initial ingestion may take several hours after enabling Capacity Manager"
             // (`GetCapacityManagerAttributesResult$IngestionStatus`): the status is the one
             // the enable's clock-owed move has reached, and is absent until an enable
