@@ -4096,6 +4096,17 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .insert(arn.to_string(), document.to_string());
     }
 
+    /// Remove the resource policy attached to the resource `arn` names, answering whether
+    /// that resource carried one.
+    ///
+    /// `false` is the whole "there was nothing to remove" answer, which is what lets the
+    /// delete tell an accepted ARN carrying no policy apart from one it removed a policy
+    /// from; nothing else in the store is touched either way, since a policy is keyed by the
+    /// ARN it was attached to alone.
+    pub fn delete_resource_policy(&mut self, arn: &str) -> bool {
+        self.resource_policies.remove(arn).is_some()
+    }
+
     /// The origin access identity `id` names, or `None` when the store holds none.
     pub fn origin_access_identity(&self, id: &str) -> Option<&StoredOriginAccessIdentity> {
         self.origin_access_identities.get(id)
@@ -6993,14 +7004,18 @@ pub fn resource_policy_resource(arn: &str) -> Option<&str> {
     (!id.is_empty()).then_some(id)
 }
 
-/// The sentence a resource-policy WRITE refuses a `ResourceArn` naming anything but a VPC
-/// origin with: the whole text is fixed, so nothing of the request — neither the ARN nor the
-/// type it names — reaches it. Recorded behaviour.
+/// The sentence either resource-policy WRITE — the one that attaches a policy and the one
+/// that removes it — refuses a `ResourceArn` naming anything but a VPC origin with: the
+/// whole text is fixed, so nothing of the request — neither the ARN nor the type it names —
+/// reaches it. Recorded behaviour.
 pub const INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE: &str =
     "The specified resource type isn't valid. Specify a VPC origin and try again.";
 
 /// The modelled `InvalidArgument` (HTTP 400) a resource-policy WRITE naming a resource the
 /// surface does not attach policies to is refused with — "An argument is invalid."
+///
+/// Both writes of the surface word the condition this way: what a caller has to fix is the
+/// resource type it named, whether it was attaching a policy or removing one.
 ///
 /// Decided BEFORE any policy lookup: a `ResourceArn` the surface cannot attach a policy to
 /// is a parameter the caller has to fix, whether or not a policy or a resource exists,

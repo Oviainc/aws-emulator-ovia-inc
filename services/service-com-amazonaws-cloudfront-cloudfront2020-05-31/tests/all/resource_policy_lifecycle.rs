@@ -53,7 +53,7 @@ use crate::distribution_tenant_lifecycle::escape;
 /// `/2020-05-31/origin-access-control/{Id}` and
 /// `/2020-05-31/continuous-deployment-policy/{Id}`), so its ARN spells that type the same
 /// way (`smithy_query(query="operation", operation="GetCachePolicy,…")`).
-const OTHER_RESOURCE_TYPES: [&str; 6] = [
+pub(crate) const OTHER_RESOURCE_TYPES: [&str; 6] = [
     "cache-policy",
     "continuous-deployment-policy",
     "origin-access-control",
@@ -63,12 +63,12 @@ const OTHER_RESOURCE_TYPES: [&str; 6] = [
 ];
 
 /// The error message the answer states.
-fn message(answer: &Answer) -> &str {
+pub(crate) fn message(answer: &Answer) -> &str {
     answer.root().find_text("Message").unwrap_or_default()
 }
 
 /// The policy document the answer reports, or `""` when it carries none.
-fn reported_document(answer: &Answer) -> &str {
+pub(crate) fn reported_document(answer: &Answer) -> &str {
     answer.root().find_text("PolicyDocument").unwrap_or_default()
 }
 
@@ -82,7 +82,11 @@ fn reported_arn(answer: &Answer) -> &str {
 // ---------------------------------------------------------------------------
 
 /// `POST /2020-05-31/put-resource-policy`, attaching `document` to `arn`.
-async fn put_resource_policy(router: &MultiServiceRouter, arn: &str, document: &str) -> Answer {
+pub(crate) async fn put_resource_policy(
+    router: &MultiServiceRouter,
+    arn: &str,
+    document: &str,
+) -> Answer {
     let body = format!(
         "<PutResourcePolicyRequest \
          xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
@@ -103,7 +107,7 @@ async fn put_resource_policy(router: &MultiServiceRouter, arn: &str, document: &
 }
 
 /// `POST /2020-05-31/get-resource-policy`, asking about `arn`.
-async fn get_resource_policy(router: &MultiServiceRouter, arn: &str) -> Answer {
+pub(crate) async fn get_resource_policy(router: &MultiServiceRouter, arn: &str) -> Answer {
     let body = format!(
         "<GetResourcePolicyRequest \
          xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
@@ -137,7 +141,7 @@ fn distribution_config(reference: &str) -> String {
 }
 
 /// A resource policy document, as a caller would write one.
-fn policy(statement: &str) -> String {
+pub(crate) fn policy(statement: &str) -> String {
     format!(
         "{{\"Version\":\"2008-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
          \"Principal\":{{\"AWS\":\"arn:aws:iam::111122223333:root\"}},\

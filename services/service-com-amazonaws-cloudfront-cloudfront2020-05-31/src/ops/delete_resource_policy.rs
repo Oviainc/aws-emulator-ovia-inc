@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the resource policy attached to the CloudFront resource `ResourceArn` names,
+//! from [`crate::state`]'s resource-policy slice — the one a `PutResourcePolicy` wrote. A
+//! MUTATION the spec states this call makes: after it, the resource carries no policy, so a
+//! `GetResourcePolicy` on that ARN answers not-found until another write attaches one.
+//!
+//! The surface attaches policies to ONE resource type
+//! ([`crate::state::RESOURCE_POLICY_RESOURCE_TYPE`]), so a `ResourceArn` naming anything
+//! else is a bad PARAMETER, refused 400 `InvalidArgument` before anything is removed
+//! ([`crate::state::resource_policy_arn_refusal`]): a value that is no ARN at all is
+//! refused on its form, and an ARN of another service or of another CloudFront resource
+//! type on the resource type it names — which this WRITE words as the resource type it
+//! demands, as the surface's other write does
+//! ([`crate::state::INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE`]).
+//! An ARN the surface does accept, carrying no policy, is 404 `EntityNotFound`: there is
+//! nothing to remove, so the store is left exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +174,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourcePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // The PARAMETER gate, decided before anything is removed: a value that is no ARN at
+        // all is refused on its form and an ARN naming any other resource on the type it
+        // names, each with the sentence this operation words that condition in, and the
+        // store is left exactly as it was.
+        if let Some(refusal) = crate::state::resource_policy_arn_refusal(&input.resource_arn) {
+            return Err(DeleteResourcePolicyErrorModeled::InvalidArgument(match refusal {
+                crate::state::ResourceArnRefusal::Malformed => crate::state::malformed_arn(),
+                crate::state::ResourceArnRefusal::WrongType => {
+                    crate::state::invalid_resource_policy_resource_type()
+                }
+            })
+            .into());
+        }
+
+        // The EXISTENCE answer, which is what the parameter gate above leaves it for: an ARN
+        // the surface does accept, carrying no policy, has nothing for this call to remove.
+        let mut store = state.lock();
+        if !store.delete_resource_policy(&input.resource_arn) {
+            return Err(DeleteResourcePolicyErrorModeled::EntityNotFound(
+                crate::state::resource_policy_not_found(),
+            )
+            .into());
+        }
+
+        Ok(DeleteResourcePolicyOutput)
     }
 }
