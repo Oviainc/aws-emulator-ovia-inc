@@ -3082,6 +3082,31 @@ pub fn validate_names(
     Ok(())
 }
 
+/// The registry a POLICY request names, or why it names none this service accepts.
+///
+/// The three resource-policy operations — the put, the get and the delete — all bind
+/// `RegistryName` as an OPTIONAL query parameter, and all three take the same two steps
+/// before they reach the store: a resource-based policy is a property of ONE registry,
+/// so a request carrying no name names no resource to read, write or remove
+/// ([`registry_name_required`]), and a name the service does not accept names no
+/// registry anywhere, so it is refused on its form rather than answered as if the
+/// registry merely did not exist yet ([`validate_names`]). Requiring and checking
+/// together is what keeps the second step from being forgotten by a handler that
+/// remembers the first — the reason
+/// [`ComAmazonawsSchemasSchemasState::writable_registry`] and
+/// [`ComAmazonawsSchemasSchemasState::readable_schema_version`] resolve and refuse in
+/// one place too, and what a fourth policy-scoped operation would inherit by calling
+/// this.
+///
+/// The refusal is RETURNED rather than worded at the call site, because each operation
+/// answers it through its own modelled error enum; both sentences are the service's
+/// constants, so every call site words them alike.
+pub fn policy_registry_name(registry: Option<String>) -> Result<String, BadRequestException> {
+    let registry = registry.ok_or_else(registry_name_required)?;
+    validate_names(Some(&registry), None)?;
+    Ok(registry)
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

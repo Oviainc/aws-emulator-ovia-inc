@@ -184,20 +184,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             revision_id,
         } = input;
 
-        // A resource policy belongs to ONE registry, so a request that names no
-        // registry names no resource to write. Refused as a client error rather than
-        // applied to some default resource the service does not model.
-        let registry_name = registry_name.ok_or_else(|| {
-            PutResourcePolicyError::from(PutResourcePolicyErrorModeled::BadRequestException(
-                crate::state::registry_name_required(),
-            ))
-        })?;
-
-        // And the registry it names is checked against the service's own constraint for
-        // a registry name: a name outside it names no registry anywhere, so the request
-        // is refused on its form rather than answered as if the registry merely did not
-        // exist yet. See `crate::state::validate_names`.
-        crate::state::validate_names(Some(&registry_name), None).map_err(|refusal| {
+        // The registry this policy request names, through the one resolution every
+        // policy-scoped operation makes: a request that names no registry names no
+        // resource to write, and a name outside the service's own constraint for a
+        // registry name names no registry anywhere. Both refusals are this operation's
+        // `BadRequestException`. See `crate::state::policy_registry_name`.
+        let registry_name = crate::state::policy_registry_name(registry_name).map_err(|refusal| {
             PutResourcePolicyError::from(PutResourcePolicyErrorModeled::BadRequestException(
                 refusal,
             ))

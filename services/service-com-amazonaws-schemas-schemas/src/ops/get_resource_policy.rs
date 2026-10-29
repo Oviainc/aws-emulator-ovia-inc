@@ -144,24 +144,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored policy, so it needs nothing from the request metadata `ctx` carries.
         let _ = ctx;
 
-        // A resource policy belongs to ONE registry, so a request that names no
-        // registry names no resource to read. Same refusal as `PutResourcePolicy`.
-        let registry_name = input.registry_name.as_deref().ok_or_else(|| {
-            GetResourcePolicyError::from(GetResourcePolicyErrorModeled::BadRequestException(
-                crate::state::registry_name_required(),
-            ))
-        })?;
-
-        // The registry this request names is checked against the service's own
-        // constraint for a registry name before the store is reached: a name outside it
-        // names no registry anywhere, so the request is refused on its form rather than
-        // answered as if the registry merely did not exist yet. See
-        // `crate::state::validate_names`.
-        crate::state::validate_names(Some(registry_name), None).map_err(|refusal| {
-            GetResourcePolicyError::from(GetResourcePolicyErrorModeled::BadRequestException(
-                refusal,
-            ))
-        })?;
+        // The registry this policy request names, through the one resolution every
+        // policy-scoped operation makes: a request that names no registry names no
+        // resource to read, and a name outside the service's own constraint for a
+        // registry name names no registry anywhere. Both refusals are this operation's
+        // `BadRequestException`. See `crate::state::policy_registry_name`.
+        let registry_name =
+            crate::state::policy_registry_name(input.registry_name).map_err(|refusal| {
+                GetResourcePolicyError::from(GetResourcePolicyErrorModeled::BadRequestException(
+                    refusal,
+                ))
+            })?;
 
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetResourcePolicyError::from(
@@ -175,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The registry step of the one read resolution; the policy this operation reads
         // is a property of the registry it resolves. See
         // `crate::state::readable_registry`.
-        let registry = state.readable_registry(registry_name).map_err(|refusal| {
+        let registry = state.readable_registry(&registry_name).map_err(|refusal| {
             GetResourcePolicyError::from(GetResourcePolicyErrorModeled::NotFoundException(
                 refusal.not_found(),
             ))
@@ -185,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource this operation reads, and it does not exist.
         let policy = registry.policy.as_ref().ok_or_else(|| {
             GetResourcePolicyError::from(GetResourcePolicyErrorModeled::NotFoundException(
-                crate::state::policy_not_found(registry_name),
+                crate::state::policy_not_found(&registry_name),
             ))
         })?;
 

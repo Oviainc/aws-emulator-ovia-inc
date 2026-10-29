@@ -182,25 +182,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing from the request metadata `ctx` carries.
         let _ = ctx;
 
-        // A resource policy belongs to ONE registry, so a request that names no
-        // registry names no resource to delete. Same refusal as `PutResourcePolicy`
-        // and `GetResourcePolicy`.
-        let registry_name = input.registry_name.ok_or_else(|| {
-            DeleteResourcePolicyError::from(DeleteResourcePolicyErrorModeled::BadRequestException(
-                crate::state::registry_name_required(),
-            ))
-        })?;
-
-        // The registry this request names is checked against the service's own
-        // constraint for a registry name before the store is reached: a name outside it
-        // names no registry anywhere, so the request is refused on its form rather than
-        // answered as if the registry merely did not exist yet. See
-        // `crate::state::validate_names`.
-        crate::state::validate_names(Some(&registry_name), None).map_err(|refusal| {
-            DeleteResourcePolicyError::from(DeleteResourcePolicyErrorModeled::BadRequestException(
-                refusal,
-            ))
-        })?;
+        // The registry this policy request names, through the one resolution every
+        // policy-scoped operation makes: a request that names no registry names no
+        // resource to delete, and a name outside the service's own constraint for a
+        // registry name names no registry anywhere. Both refusals are this operation's
+        // `BadRequestException`. See `crate::state::policy_registry_name`.
+        let registry_name =
+            crate::state::policy_registry_name(input.registry_name).map_err(|refusal| {
+                DeleteResourcePolicyError::from(
+                    DeleteResourcePolicyErrorModeled::BadRequestException(refusal),
+                )
+            })?;
 
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteResourcePolicyError::from(
