@@ -20,6 +20,10 @@
 #[path = "all/kinesisvideo_signing_name_routing.rs"]
 mod kinesisvideo_signing_name_routing;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
+// the sorted `t…` span are both regions concurrently landing suites add their line to.
+#[path = "all/tagged_hosted_zone_selects_a_sending_domain.rs"]
+mod tagged_hosted_zone_selects_a_sending_domain;
+// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `c…` span (where every codeartifact and cloudformation suite would land) are
 // both regions concurrently landing suites add their line to.
 #[path = "all/codeartifact_package_version_events.rs"]
