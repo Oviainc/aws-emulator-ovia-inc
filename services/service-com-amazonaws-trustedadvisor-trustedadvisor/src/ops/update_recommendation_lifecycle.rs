@@ -9,7 +9,12 @@
 //! and sets `resolvedAt` when (and only when) the new stage is `resolved`. A
 //! following `GetRecommendation` / `ListRecommendations` reports the new values.
 //!
-//! Refusals: a well-formed ARN naming nothing in the store is a
+//! Refusals: an identifier naming a recommendation owned by ANOTHER account is
+//! answered for that resource first — 403 `AccessDeniedException`
+//! ([`crate::state::foreign_resource_refusal`]), ahead of the support-level gate,
+//! of the lookup and of the write, since the identifier's account segment is the
+//! caller's to write (`^arn:[\w-]+:trustedadvisor::\d{12}:recommendation\/[\w-]+$`).
+//! A well-formed ARN in the caller's own account naming nothing in the store is a
 //! `ResourceNotFoundException` (404); a recommendation whose `type` is not
 //! `priority` is a `ConflictException` (409), because that sentence makes the
 //! operation inapplicable to it. `lifecycleStage` outside
@@ -193,6 +198,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries only request metadata; this operation reads nothing from it.
         let _ = ctx;
+        // This operation's input names a recommendation by an ARN whose ACCOUNT
+        // segment the caller writes, so the resource it targets is authorized
+        // FIRST: an identifier naming another account's recommendation is
+        // refused for that resource — ahead of the support-level gate, of the
+        // lookup and of the write — because no plan grants an account access to
+        // another account's resources. See
+        // [`crate::state::foreign_resource_refusal`].
+        if let Some(denied) =
+            crate::state::foreign_resource_refusal(&input.recommendation_identifier)
+        {
+            return Err(
+                UpdateRecommendationLifecycleErrorModeled::AccessDeniedException(denied).into(),
+            );
+        }
         // The support-level gate, ahead of everything else this handler does —
         // ahead of resolving the identifier and of the lifecycle write, so a
         // request this account may not make changes nothing. See

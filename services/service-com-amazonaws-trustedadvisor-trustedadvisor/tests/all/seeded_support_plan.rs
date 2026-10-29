@@ -171,8 +171,11 @@ async fn every_operation_refuses_a_freshly_booted_emulator() {
 /// the 404 that would tell an unsubscribed caller which recommendations exist.
 ///
 /// The rows differ along what makes the ARN name nothing — an all-zeros id, an id
-/// no seed produced, another partition, another account — crossed with every
-/// operation that takes a recommendation identifier.
+/// no seed produced, another partition, a seeded id with a suffix — crossed with
+/// every operation that takes a recommendation identifier. Every row names the
+/// CALLING account: an identifier naming another account's recommendation is
+/// answered for that resource ahead of this gate, which
+/// `tests/all/account_scoped_recommendation_identifier.rs` pins.
 #[tokio::test]
 async fn a_booted_emulator_refuses_before_it_resolves_an_identifier() {
     let account = engine::EMULATOR_ACCOUNT_ID;
@@ -194,11 +197,11 @@ async fn a_booted_emulator_refuses_before_it_resolves_an_identifier() {
             ),
         ),
         (
-            "a seeded id in another account",
+            "a seeded id with one character appended",
             recommendation_arn_of(
                 "aws",
-                "123456789012",
-                "low-utilization-ec2-instances-recommendation",
+                account,
+                "low-utilization-ec2-instances-recommendation-2",
             ),
         ),
     ];

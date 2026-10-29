@@ -6,8 +6,15 @@
 //! `Recommendation`, with `resourcesAggregates` counted from that
 //! recommendation's own resources.
 //!
-//! A well-formed ARN that names nothing in the store is a
-//! `ResourceNotFoundException` (404); an identifier outside the modelled
+//! The identifier carries the OWNING ACCOUNT of the recommendation it names
+//! (`AccountRecommendationIdentifier`:
+//! `^arn:[\w-]+:trustedadvisor::\d{12}:recommendation\/[\w-]+$`), so one naming
+//! another account's recommendation is answered for that resource first — 403
+//! `AccessDeniedException` ([`crate::state::foreign_resource_refusal`]), ahead
+//! of the support-level gate and of the lookup.
+//!
+//! A well-formed ARN in the caller's own account that names nothing in the store
+//! is a `ResourceNotFoundException` (404); an identifier outside the modelled
 //! `length`/`pattern` never reaches this handler — the framework refuses it as a
 //! `ValidationException` (400) before `handle` runs.
 //!
@@ -207,6 +214,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries only request metadata; this operation reads nothing from it.
         let _ = ctx;
+        // This operation's input names a recommendation by an ARN whose ACCOUNT
+        // segment the caller writes, so the resource it targets is authorized
+        // FIRST: an identifier naming another account's recommendation is
+        // refused for that resource, whatever the caller's support plan,
+        // because no plan grants an account access to another account's
+        // resources. See [`crate::state::foreign_resource_refusal`].
+        if let Some(denied) =
+            crate::state::foreign_resource_refusal(&input.recommendation_identifier)
+        {
+            return Err(GetRecommendationErrorModeled::AccessDeniedException(denied).into());
+        }
         // The support-level gate, ahead of everything else this handler does —
         // ahead of resolving the identifier in particular, so an unentitled
         // caller is never told whether a recommendation exists. See

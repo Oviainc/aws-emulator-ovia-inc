@@ -1728,23 +1728,32 @@ pub fn arn_account_id(arn: &str) -> Option<String> {
 ///   such a list reports the calling account's own resources, and the
 ///   cross-account view of the same resources is the organization surface;
 /// * an operation whose INPUT names such a resource answers for it first, with
-///   the refusal [`foreign_resource_refusal`] builds.
+///   the refusal [`foreign_resource_refusal`] builds — an arbitrary AWS resource
+///   ARN and one of this service's own account-level identifiers alike.
 pub fn is_foreign_resource(arn: &str) -> bool {
     arn_account_id(arn).is_some_and(|account| account != ::engine::emulator_account_id())
 }
 
-/// The resource-authorization refusal: `Some(..)` when `aws_resource_arn` names a
-/// resource in an account other than the caller's ([`is_foreign_resource`]), so
-/// the request is refused for THAT resource — 403 `AccessDeniedException`,
-/// whatever the caller's support plan, because no support plan grants an account
-/// access to another account's resources.
+/// The resource-authorization refusal: `Some(..)` when `arn` names a resource in
+/// an account other than the caller's ([`is_foreign_resource`]), so the request is
+/// refused for THAT resource — 403 `AccessDeniedException`, whatever the caller's
+/// support plan, because no support plan grants an account access to another
+/// account's resources.
+///
+/// `arn` is ANY ARN a request names a resource by: an arbitrary AWS resource
+/// (`ListRecommendationsForResource`) as much as one of this service's own
+/// account-level identifiers, whose account segment the caller writes
+/// (`AccountRecommendationIdentifier`, `RecommendationResourceArn`). Every
+/// operation that takes one applies this before it resolves the identifier and
+/// before it writes anything, so a request for another account's resource learns
+/// only that it was denied.
 ///
 /// The message is built from the request: it names the resource that was refused,
 /// which is the only thing the service knows about the refusal and the only way a
 /// caller passing several ARNs learns which one was denied.
-pub fn foreign_resource_refusal(aws_resource_arn: &str) -> Option<AccessDeniedException> {
-    is_foreign_resource(aws_resource_arn).then(|| AccessDeniedException {
-        message: format!("Access denied to resource: {aws_resource_arn}"),
+pub fn foreign_resource_refusal(arn: &str) -> Option<AccessDeniedException> {
+    is_foreign_resource(arn).then(|| AccessDeniedException {
+        message: format!("Access denied to resource: {arn}"),
     })
 }
 

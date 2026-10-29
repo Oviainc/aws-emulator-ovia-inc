@@ -385,7 +385,11 @@ async fn shape_validation_precedes_the_gate() {
 async fn the_gate_precedes_identifier_resolution() {
     let account = engine::EMULATOR_ACCOUNT_ID;
     // Rows differ along what makes the ARN name nothing: the recorded all-zeros id, an
-    // id no seed produced, another partition, and another account.
+    // id no seed produced, another partition, and a seeded id with a one-character
+    // suffix. Every row names the CALLING account, because an identifier naming another
+    // account's recommendation is answered for that resource ahead of this gate and of
+    // the lookup (403, not 404) — that stage is pinned in
+    // `tests/all/account_scoped_recommendation_identifier.rs`.
     let unknown = [
         (
             "the recorded all-zeros recommendation id",
@@ -408,11 +412,11 @@ async fn the_gate_precedes_identifier_resolution() {
             ),
         ),
         (
-            "a seeded id in another account",
+            "a seeded id with one character appended",
             recommendation_arn_of(
                 "aws",
-                "123456789012",
-                "low-utilization-ec2-instances-recommendation",
+                account,
+                "low-utilization-ec2-instances-recommendation-2",
             ),
         ),
     ];

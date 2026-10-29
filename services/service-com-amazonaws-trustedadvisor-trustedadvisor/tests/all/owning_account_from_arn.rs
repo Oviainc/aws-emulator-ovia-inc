@@ -100,7 +100,7 @@ pub(crate) fn member_recommendation_arn(account_id: &str, check_id: &str) -> Str
 /// `arn:aws:trustedadvisor::<account>:recommendation-resource/<rec>/<resource>`
 /// — the ARN pattern `RecommendationResourceArn` declares, for any member
 /// account of the organization.
-fn member_resource_arn(account_id: &str, check_id: &str, resource_id: &str) -> String {
+pub(crate) fn member_resource_arn(account_id: &str, check_id: &str, resource_id: &str) -> String {
     format!(
         "arn:aws:trustedadvisor::{account_id}:recommendation-resource/\
          {check_id}-recommendation/{resource_id}"
