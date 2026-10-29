@@ -22,6 +22,15 @@
 //! `ListInstanceTypeDetails` rather than restated here, so a row's premise cannot drift from
 //! the service it is asserted against.
 //!
+//! Its second rule is about what a created domain's attributes then CARRY:
+//! **`Fn::GetAtt` on a resource the owning service created answers that service's OWN
+//! report of the attribute the type publishes, including an attribute whose published value
+//! is a MAP, whose entries are read one at a time through a dotted path — so every output of
+//! a completed stack over an address the service published carries an `OutputValue`.** A
+//! domain reached inside a VPC has no public `DomainStatus$Endpoint` at all and publishes
+//! its hosts in `DomainStatus$Endpoints` instead, so the outputs a client addresses such a
+//! domain through are exactly the entries of that map.
+//!
 //! This suite needs THREE services on one engine — CloudFormation reaches Amazon OpenSearch
 //! Service and Amazon SNS through the in-process callback — which is why it lives here
 //! rather than in any one service's crate.
@@ -37,6 +46,9 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::query_wire::{elements, form_encode, opt_element, outputs_of};
 use service_com_amazonaws_cloudformation_cloudformation::state::{
     failed_action, resource_failure_summary,
+};
+use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
+    ENDPOINTS_KEY_VPC, ENDPOINTS_KEY_VPC_DUALSTACK, IP_ADDRESS_TYPE_DUALSTACK,
 };
 
 /// The region every request here is signed for, and so the region the stack's resources and
@@ -868,5 +880,280 @@ async fn a_domain_whose_storage_exceeds_a_published_limit_reports_the_service_li
             String::new(),
             "case {case:?}: the rollback must delete the topic the domain depended on"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What a created domain's published attributes carry: the addresses a client
+// reaches it on, read back out of the stack's Outputs
+// ---------------------------------------------------------------------------
+
+/// The resource type the rows below declare.
+const OPENSEARCH_DOMAIN_TYPE: &str = "AWS::OpenSearchService::Domain";
+
+/// The attribute `AWS::OpenSearchService::Domain` publishes the hosts of a domain reached
+/// inside a VPC under, from that type's "Return values" section: a MAP, keyed as the owning
+/// service keys `DomainStatus$Endpoints`.
+const DOMAIN_ENDPOINTS: &str = "DomainEndpoints";
+
+/// The engine release and cluster every endpoint row declares: the pairing
+/// [`the_published_catalog_agrees_about_every_row`] already asserts the owning service
+/// offers, so no row here can fail on the cluster instead of on the addresses it is about.
+const ENDPOINT_ENGINE: &str = "OpenSearch_2.19";
+const ENDPOINT_CLUSTER: &str = r#"{"InstanceType":"or1.medium.search","InstanceCount":2}"#;
+
+/// The `VPCOptions` a row declares to place the domain inside a VPC — the property whose
+/// PRESENCE is what makes a domain VPC-access, so the ids themselves are only well-formed
+/// Amazon EC2 ones.
+const VPC_OPTIONS: &str = r#""VPCOptions":{"SubnetIds":["subnet-0fff0000000000001"],"SecurityGroupIds":["sg-0fff0000000000001"]}"#;
+
+/// Where a row's domain is reachable, which is what decides the addresses the owning service
+/// publishes for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// No `VPCOptions`: the domain has a public endpoint and no endpoint map.
+    Public,
+    /// Inside a VPC, over IPv4 only.
+    Vpc,
+    /// Inside a VPC, with `IPAddressType` `dualstack`, which gives it a second host.
+    VpcDualStack,
+}
+
+/// Both keys the owning service publishes a VPC-access domain's hosts under, from its own
+/// constants rather than spelled again here.
+fn vpc_keys() -> [&'static str; 2] {
+    [ENDPOINTS_KEY_VPC, ENDPOINTS_KEY_VPC_DUALSTACK]
+}
+
+/// The keys a domain of this reachability is published under.
+fn published_keys(reach: Reach) -> Vec<&'static str> {
+    match reach {
+        Reach::Public => Vec::new(),
+        Reach::Vpc => vec![ENDPOINTS_KEY_VPC],
+        Reach::VpcDualStack => vec![ENDPOINTS_KEY_VPC, ENDPOINTS_KEY_VPC_DUALSTACK],
+    }
+}
+
+/// The output key one entry of the endpoint map is published under.
+fn output_key(endpoints_key: &str) -> String {
+    format!("Host{endpoints_key}")
+}
+
+/// One row: how the template declares the domain's reachability, and how its outputs spell
+/// the path into the endpoint map.
+struct EndpointRow {
+    case: &'static str,
+    stack: &'static str,
+    /// Inside `DomainName`'s own `^[a-z][a-z0-9\-]+$` and 3..28 characters.
+    domain: &'static str,
+    reach: Reach,
+    /// Whether the outputs name the map entry as ONE dotted attribute
+    /// (`["Domain","DomainEndpoints.vpc"]`) or as the attribute and its key in separate
+    /// `Fn::GetAtt` arguments — the two spellings of the same attribute path.
+    dotted_path: bool,
+}
+
+/// The rows differ along what the rule generalises over: the reachability the declaration
+/// asks for (and so WHICH addresses that service publishes, from none through one to two),
+/// and the spelling the output reaches a map entry through. Every row declares an output for
+/// every key, so each also asserts the other half of the rule — an entry the service
+/// publishes NO host under resolves to nothing.
+fn endpoint_rows() -> Vec<EndpointRow> {
+    vec![
+        EndpointRow {
+            case: "a domain on its public endpoint",
+            stack: "sim-osep-public",
+            domain: "sim-osep-public",
+            reach: Reach::Public,
+            dotted_path: true,
+        },
+        EndpointRow {
+            case: "a domain reached inside a VPC over IPv4",
+            stack: "sim-osep-vpc",
+            domain: "sim-osep-vpc",
+            reach: Reach::Vpc,
+            dotted_path: true,
+        },
+        EndpointRow {
+            case: "a dual-stack domain reached inside a VPC, read through separate arguments",
+            stack: "sim-osep-vpc-dual",
+            domain: "sim-osep-vpc-dual",
+            reach: Reach::VpcDualStack,
+            dotted_path: false,
+        },
+    ]
+}
+
+/// The template one endpoint row deploys: the domain, and an output for `Ref`, for the
+/// public endpoint and for each key of the endpoint map.
+fn endpoint_template(row: &EndpointRow) -> String {
+    let mut properties = format!(
+        r#""DomainName":"{domain}","EngineVersion":"{ENDPOINT_ENGINE}","ClusterConfig":{ENDPOINT_CLUSTER}"#,
+        domain = row.domain
+    );
+    if row.reach != Reach::Public {
+        properties.push(',');
+        properties.push_str(VPC_OPTIONS);
+    }
+    if row.reach == Reach::VpcDualStack {
+        properties.push_str(&format!(
+            r#","IPAddressType":"{IP_ADDRESS_TYPE_DUALSTACK}""#
+        ));
+    }
+    let mut outputs = String::from(
+        r#""DomainRef":{"Value":{"Ref":"Domain"}},"DomainEndpoint":{"Value":{"Fn::GetAtt":["Domain","DomainEndpoint"]}}"#,
+    );
+    for key in vpc_keys() {
+        let path = if row.dotted_path {
+            format!(r#""{DOMAIN_ENDPOINTS}.{key}""#)
+        } else {
+            format!(r#""{DOMAIN_ENDPOINTS}","{key}""#)
+        };
+        outputs.push_str(&format!(
+            r#","{published}":{{"Value":{{"Fn::GetAtt":["Domain",{path}]}}}}"#,
+            published = output_key(key)
+        ));
+    }
+    format!(
+        r#"{{"Resources":{{"Domain":{{"Type":"{OPENSEARCH_DOMAIN_TYPE}","Properties":{{{properties}}}}}}},"Outputs":{{{outputs}}}}}"#
+    )
+}
+
+/// The `DomainStatus$Endpoints` the owning service reports for a domain, as the map a client
+/// reads it as.
+fn reported_endpoints(reported: &Value) -> BTreeMap<String, String> {
+    reported
+        .get("Endpoints")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(key, host)| Some((key.clone(), host.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_domains_published_addresses_resolve_in_its_stacks_outputs() {
+    let router = build_router();
+
+    for row in endpoint_rows() {
+        let case = row.case;
+        let (status, body) = cloudformation(
+            &router,
+            "CreateStack",
+            &[
+                ("StackName", row.stack),
+                ("TemplateBody", &endpoint_template(&row)),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from CreateStack, got {status} with {body}"
+        );
+
+        let described = settle_stack(&router, case, row.stack).await;
+        assert_eq!(
+            xml_text(&described, "StackStatus"),
+            "CREATE_COMPLETE",
+            "case {case:?}: the declared domain must deploy, got {described}"
+        );
+        let outputs: BTreeMap<String, String> = outputs_of(&described);
+
+        // What the OWNING service publishes for the domain, which every expected value
+        // below is read from rather than spelled here.
+        let (status, reported) = describe_domain(&router, row.domain).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the created domain to read back, got {status} with \
+             {reported}"
+        );
+        let published = reported_endpoints(&reported);
+        let expected_keys: Vec<String> = published_keys(row.reach)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            published.keys().cloned().collect::<Vec<String>>(),
+            expected_keys,
+            "case {case:?}: the row's premise is that the service publishes {expected_keys:?}, \
+             got {published:?}"
+        );
+
+        // Each entry of the published map is readable through its own dotted path, and an
+        // entry the service publishes nothing under resolves to nothing.
+        for key in vpc_keys() {
+            let name = output_key(key);
+            let reported_output = outputs.get(&name).cloned();
+            match published.get(key) {
+                Some(host) => {
+                    assert!(
+                        !host.is_empty(),
+                        "case {case:?}: the service must publish a host under {key:?}, got \
+                         {published:?}"
+                    );
+                    assert_eq!(
+                        reported_output.as_deref(),
+                        Some(host.as_str()),
+                        "case {case:?}: expected the output {name:?} to be the service's own \
+                         {key:?} host {host:?}, got {reported_output:?}"
+                    );
+                }
+                None => assert_eq!(
+                    reported_output, None,
+                    "case {case:?}: the service publishes no {key:?} host, so {name:?} must \
+                     carry no OutputValue, got {reported_output:?}"
+                ),
+            }
+        }
+        // The two hosts of a dual-stack domain are different addresses, so neither output
+        // can be the other's.
+        if row.reach == Reach::VpcDualStack {
+            assert_ne!(
+                published.get(ENDPOINTS_KEY_VPC),
+                published.get(ENDPOINTS_KEY_VPC_DUALSTACK),
+                "case {case:?}: expected two distinct hosts, got {published:?}"
+            );
+        }
+
+        // The public endpoint half: present for the domain that has one, absent — rather
+        // than guessed — for a domain the service reports none for.
+        let public = reported.get("Endpoint").and_then(Value::as_str);
+        assert_eq!(
+            public.is_some(),
+            row.reach == Reach::Public,
+            "case {case:?}: expected a public endpoint only for a domain outside a VPC, got \
+             {reported}"
+        );
+        assert_eq!(
+            outputs.get("DomainEndpoint").map(String::as_str),
+            public,
+            "case {case:?}: expected DomainEndpoint to be the service's own Endpoint \
+             ({public:?}), got {outputs:?}"
+        );
+
+        // "Ref returns the domain name", whatever the domain is reached on.
+        assert_eq!(
+            outputs.get("DomainRef").map(String::as_str),
+            Some(row.domain),
+            "case {case:?}: Ref returns the domain name, got {outputs:?}"
+        );
+
+        // And the symptom itself, over the whole answer: the stack publishes an address for
+        // every output whose expression names one the service reported.
+        let addressable: Vec<String> = published_keys(row.reach)
+            .into_iter()
+            .map(output_key)
+            .chain(public.map(|_| "DomainEndpoint".to_string()))
+            .collect();
+        for name in &addressable {
+            assert!(
+                outputs.get(name).is_some_and(|value| !value.is_empty()),
+                "case {case:?}: every Output naming an address the service published must \
+                 carry it; {name:?} carries {:?}",
+                outputs.get(name)
+            );
+        }
     }
 }

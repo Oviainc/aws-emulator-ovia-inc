@@ -3470,6 +3470,11 @@ const OPENSEARCH_DOMAIN_URI: &str = "/2021-01-01/opensearch/domain";
 /// ([`DOMAIN_DOCUMENT_PROPERTIES`]).
 const DOMAIN_NON_CREATE_PROPERTIES: &[&str] = &["DomainName", "Tags", "SkipShardMigrationWait"];
 
+/// The attribute `AWS::OpenSearchService::Domain` publishes the hosts of a domain reached
+/// inside a VPC under: a MAP, keyed as the owning service keys `DomainStatus$Endpoints`, whose
+/// entries `Fn::GetAtt` reads one at a time through `DomainEndpoints.<key>`.
+const DOMAIN_ENDPOINTS_ATTRIBUTE: &str = "DomainEndpoints";
+
 /// The properties of an `AWS::OpenSearchService::Domain` whose `CreateDomain` member is
 /// modelled a STRING carrying a JSON document, so the property's value is sent as that
 /// document's TEXT and not as the JSON the template spelled it with
@@ -3548,6 +3553,17 @@ async fn create_domain(
 /// data upload requests", which is this type's `DomainEndpoint`. A member the answer does not
 /// carry — the public endpoint of a domain reached inside a VPC — leaves its attribute unset
 /// rather than guessed.
+///
+/// A domain reached inside a VPC publishes its hosts in `DomainStatus$Endpoints` instead,
+/// "the key-value pair that exists if the OpenSearch Service domain uses VPC endpoints",
+/// which is this type's [`DOMAIN_ENDPOINTS_ATTRIBUTE`] return value. `Fn::GetAtt` reads one
+/// entry of a map-valued attribute through a dotted path, so each host that service reported
+/// is recorded under `DomainEndpoints.<key>` — the address a client reaches such a domain on,
+/// which no naming rule here could compute, and the only one it has. The map is whatever that
+/// service reported rather than a key list restated here, so it is the one open-ended part of
+/// the attribute set and is recorded LAST, under the same ceiling as every other attribute of
+/// a resource ([`super::template::MAX_ATTRIBUTES_PER_RESOURCE`]) — the fixed members above are
+/// the identity of the resource and are never the ones a ceiling drops.
 fn domain_created(resource_type: &str, status: &Value) -> Created {
     let mut attributes: BTreeMap<String, String> = BTreeMap::new();
     if let Some(arn) = status.get("ARN").and_then(Value::as_str) {
@@ -3561,6 +3577,22 @@ fn domain_created(resource_type: &str, status: &Value) -> Created {
     }
     if let Some(endpoint) = status.get("Endpoint").and_then(Value::as_str) {
         attributes.insert("DomainEndpoint".to_string(), endpoint.to_string());
+    }
+    for (key, host) in status
+        .get("Endpoints")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+    {
+        if attributes.len() >= super::template::MAX_ATTRIBUTES_PER_RESOURCE {
+            break;
+        }
+        if let Some(host) = host.as_str() {
+            attributes.insert(
+                format!("{DOMAIN_ENDPOINTS_ATTRIBUTE}.{key}"),
+                host.to_string(),
+            );
+        }
     }
     Created::attributes(attributes)
 }

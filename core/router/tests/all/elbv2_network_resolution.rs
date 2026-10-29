@@ -17,7 +17,9 @@
 //!   subnet that put it there — both read off EC2's subnets rather than invented.
 //! * ITS SECURITY GROUPS. A security group governs traffic to network interfaces in those
 //!   subnets, so a group of another VPC can never apply: `CreateLoadBalancer` refuses it
-//!   with `InvalidConfigurationRequest` (HTTP 400) and creates nothing.
+//!   with `InvalidConfigurationRequest` (HTTP 400) and creates nothing — through either
+//!   name a client addresses this model by ([`ELBV2_DOORS`]), since what the placement is
+//!   judged on is the network and not the front door the request arrived at.
 //! * AN `ip` TARGET. `RegisterTargets` accepts an address in a subnet of the target
 //!   group's VPC — and reports that subnet's zone for it, whatever the request said — and
 //!   refuses an address in the VPC's CIDR that no subnet holds, a publicly routable
@@ -54,6 +56,12 @@ pub(crate) const EC2_API_VERSION: &str = "2016-11-15";
 
 /// The API version an awsQuery request naming the ELBv2 model carries.
 pub(crate) const ELB_VERSION: &str = "2015-12-01";
+
+/// The two names a client addresses the ELBv2 model by: this emulator's own route key for
+/// it, and the shared signing name AWS publishes both Elastic Load Balancing APIs under,
+/// which is the one every AWS SDK ELBv2 client signs for. A request carrying the ELBv2 API
+/// version is served out of this model through either.
+const ELBV2_DOORS: [&str; 2] = ["elasticloadbalancingv2", "elasticloadbalancing"];
 
 /// An AMI id a launch names; `RunInstances` only has to accept it, and this suite asserts
 /// nothing about the image.
@@ -423,44 +431,62 @@ fn elbv2_resolves_the_account_network_against_ec2() {
                     false,
                 ),
             ];
-            for (index, (case, groups, accepted)) in security_group_rows.iter().enumerate() {
-                let name = format!("sg-alb-{index}");
-                let mut params = vec![
-                    ("Name", name.as_str()),
-                    ("Scheme", "internal"),
-                    ("Subnets.member.1", network.subnets[0].0.as_str()),
-                    ("Subnets.member.2", network.subnets[1].0.as_str()),
-                ];
-                let keys = ["SecurityGroups.member.1", "SecurityGroups.member.2"];
-                for (key, group) in keys.iter().zip(groups) {
-                    params.push((key, group));
-                }
-                let answer = elbv2(&router, &runtime, "CreateLoadBalancer", &params);
-                if *accepted {
-                    assert_eq!(
-                        answer.status, 200,
-                        "case {case:?}: expected the create to be accepted, got {answer:?}"
-                    );
-                } else {
-                    assert_eq!(
-                        (answer.status, answer.code()),
-                        (400, "InvalidConfigurationRequest".to_string()),
-                        "case {case:?}: expected 400 InvalidConfigurationRequest, got \
-                         {answer:?}"
-                    );
-                    // Nothing was created: the name is still free.
-                    let read = elbv2(
+            for (index, (row, groups, accepted)) in security_group_rows.iter().enumerate() {
+                // Both doors a client reaches this model through: the emulator's own ELBv2
+                // route key, and the shared `elasticloadbalancing` signing name every AWS
+                // SDK ELBv2 client signs for. The request is the same, so the answer is —
+                // a placement an SDK client makes is judged on its network, never on which
+                // front door claims the name it signed for.
+                for (door_index, door) in ELBV2_DOORS.iter().enumerate() {
+                    let case = format!("{row}, addressed as {door}");
+                    let name = format!("sg-alb-{index}-{door_index}");
+                    let mut params = vec![
+                        ("Name", name.as_str()),
+                        ("Scheme", "internal"),
+                        ("Type", "application"),
+                        ("Subnets.member.1", network.subnets[0].0.as_str()),
+                        ("Subnets.member.2", network.subnets[1].0.as_str()),
+                    ];
+                    let keys = ["SecurityGroups.member.1", "SecurityGroups.member.2"];
+                    for (key, group) in keys.iter().zip(groups) {
+                        params.push((key, group));
+                    }
+                    let answer = send(
                         &router,
                         &runtime,
-                        "DescribeLoadBalancers",
-                        &[("Names.member.1", name.as_str())],
+                        door,
+                        form("CreateLoadBalancer", ELB_VERSION, &params),
                     );
-                    assert_eq!(
-                        (read.status, read.code()),
-                        (400, "LoadBalancerNotFound".to_string()),
-                        "case {case:?}: a refused create must store no load balancer, \
-                         got {read:?}"
-                    );
+                    if *accepted {
+                        assert_eq!(
+                            answer.status, 200,
+                            "case {case:?}: expected the create to be accepted, got {answer:?}"
+                        );
+                    } else {
+                        assert_eq!(
+                            (answer.status, answer.code()),
+                            (400, "InvalidConfigurationRequest".to_string()),
+                            "case {case:?}: expected 400 InvalidConfigurationRequest, got \
+                             {answer:?}"
+                        );
+                        // Nothing was created: the name is still free.
+                        let read = send(
+                            &router,
+                            &runtime,
+                            door,
+                            form(
+                                "DescribeLoadBalancers",
+                                ELB_VERSION,
+                                &[("Names.member.1", name.as_str())],
+                            ),
+                        );
+                        assert_eq!(
+                            (read.status, read.code()),
+                            (400, "LoadBalancerNotFound".to_string()),
+                            "case {case:?}: a refused create must store no load balancer, \
+                             got {read:?}"
+                        );
+                    }
                 }
             }
 
