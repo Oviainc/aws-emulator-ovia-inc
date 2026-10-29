@@ -29,7 +29,10 @@
 //!   inside those caps, and no request path removes or re-seeds them: `UpdateJobTemplate`
 //!   and `DeleteJobTemplate` refuse a `SYSTEM` template, and `UpdatePreset` and
 //!   `DeletePreset` a `SYSTEM` preset, with the modelled
-//!   `ForbiddenException`. `idempotency` holds at most one entry per stored job, so it is
+//!   `ForbiddenException`, and so do `TagResource` and `UntagResource`, which write a
+//!   record's own tag set (see
+//!   [`ComAmazonawsMediaconvertMediaconvertState::tags_for_write`]).
+//!   `idempotency` holds at most one entry per stored job, so it is
 //!   bounded by `MAX_JOBS` too, and `endpoints` (one account endpoint per region a request
 //!   was signed for) is capped at [`MAX_ENDPOINTS`] the same way. `certificates` — the ACM
 //!   certificate ARNs `AssociateCertificate` has added to the account and
@@ -650,6 +653,11 @@ pub fn blank_member_problem(member: &str, value: Option<&str>) -> Option<String>
 /// reference is one member of a graph the service was asked to validate rather than the
 /// resource the request addressed: one sentence for a reference that resolves to nothing,
 /// whichever modelled error carries it.
+///
+/// Its scope is a reference a NAMED member carries. The three doors that address their
+/// resource by ARN state the value instead, through
+/// [`resource_not_found_message`] — one sentence there too, and the only other wording
+/// this crate gives a resource that is not there.
 pub fn not_found_message(member: &str) -> String {
     format!("The resource you specified in {member} was not found.")
 }
@@ -1595,6 +1603,65 @@ pub trait TagRefusalError: Sized {
             TagRefusal::PastCap => Self::quota_exceeded(message),
         }
     }
+}
+
+/// Why a request that would WRITE the tag set of the resource its `Arn` names cannot be
+/// served (see [`ComAmazonawsMediaconvertMediaconvertState::tags_for_write`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagWriteRefusal {
+    /// This store holds no resource under that ARN, which a handler answers with its
+    /// modelled `NotFoundException` (HTTP 404).
+    NotFound,
+    /// A BUILT-IN ([`TYPE_SYSTEM`]) resource holds that ARN. Tags live ON the record they
+    /// belong to, so writing them MODIFIES a resource no caller created — which is the
+    /// refusal every other door that would modify one gives, the modelled
+    /// `ForbiddenException` (HTTP 403).
+    SystemResource,
+}
+
+/// What a [`TagWriteRefusal`] needs of ONE operation's modelled error enum: how that
+/// operation states the two errors the refusals map onto.
+///
+/// As [`TagRefusalError`] does for the tag SET a call asks a record to carry, this keeps
+/// the CLASSIFICATION of a refused tag WRITE in one place, so the two doors that write a
+/// record's tag set — `TagResource` and `UntagResource` — cannot answer the same resource
+/// differently.
+pub trait TagWriteRefusalError: Sized {
+    /// This operation's modelled `NotFoundException` (HTTP 404), stating `message`.
+    fn not_found(message: String) -> Self;
+
+    /// This operation's modelled `ForbiddenException` (HTTP 403), stating `message`.
+    fn forbidden(message: String) -> Self;
+
+    /// The modelled error a door answers `refusal` with, stated ONCE for every door: an
+    /// ARN naming nothing this store holds is [`resource_not_found_message`] on the
+    /// operation's `NotFoundException`, and an ARN naming a built-in resource is the
+    /// modification refusal [`system_resource_modify_message`] words on its
+    /// `ForbiddenException`. `member` is the request member the ARN arrived in, named in
+    /// the refusal the way every other member-naming refusal here names it, and `arn` the
+    /// value it carried.
+    fn of_tag_write_refusal(refusal: TagWriteRefusal, member: &str, arn: &str) -> Self {
+        match refusal {
+            TagWriteRefusal::NotFound => Self::not_found(resource_not_found_message(arn)),
+            TagWriteRefusal::SystemResource => {
+                Self::forbidden(system_resource_modify_message(member))
+            }
+        }
+    }
+}
+
+/// How the tagging doors word an `Arn` that names no resource this store holds, built from
+/// the value the request carried: one sentence for all three of them, so a client cannot
+/// tell the same missing resource apart by which door it asked.
+///
+/// These three doors address their resource by ARN rather than by a name the request
+/// member carries, so the sentence states the value that resolved to nothing; the doors
+/// that resolve a reference out of a NAMED member word theirs with
+/// [`not_found_message`], which names that member instead. Two wordings because the two
+/// kinds of request say what is missing differently, not because any door is free to
+/// choose.
+pub fn resource_not_found_message(arn: &str) -> String {
+    format!("Resource {arn} not found.")
 }
 
 /// How this service words the refusal of a tag whose key carries no characters.
@@ -4081,6 +4148,25 @@ fn delete_named<R: NamedRecord>(
     }
 }
 
+/// The tag set of a stored record that may be WRITTEN, or the refusal the write earns.
+///
+/// ONE rule for every named record whose tags a caller writes, decided the way
+/// [`delete_named`] decides a delete: a name nothing holds is
+/// [`TagWriteRefusal::NotFound`], a name a built-in record holds is
+/// [`TagWriteRefusal::SystemResource`], and anything else hands back the record's own tag
+/// map. `tags` says where that map lives on the record, since each kind of record owns its
+/// own.
+fn writable_tags<'record, R: NamedRecord>(
+    record: Option<&'record mut R>,
+    tags: impl FnOnce(&'record mut R) -> &'record mut BTreeMap<String, String>,
+) -> Result<&'record mut BTreeMap<String, String>, TagWriteRefusal> {
+    match record {
+        None => Err(TagWriteRefusal::NotFound),
+        Some(record) if record.is_system() => Err(TagWriteRefusal::SystemResource),
+        Some(record) => Ok(tags(record)),
+    }
+}
+
 /// What the store did when asked to create a resource whose `Name` is its identity — a
 /// queue, a job template or a preset.
 ///
@@ -5107,20 +5193,35 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         }
     }
 
-    /// The tag set of the resource an ARN named, for writing. See [`Self::tags`].
-    pub fn tags_mut(
+    /// The tag set of the resource an ARN named, for WRITING — or the refusal the write
+    /// earns. See [`Self::tags`] for where a record's tags live.
+    ///
+    /// A record's tags are part of the record, so writing them MODIFIES the resource the
+    /// ARN names: a built-in resource is refused here exactly as the update and delete
+    /// doors refuse one, and only the resources a caller created are writable. The decision
+    /// comes from the record itself ([`NamedRecord::is_system`]), so no door onto a tag set
+    /// can carry a different rule. A job has no built-in form — every job in this store was
+    /// submitted by a caller — so only its existence is in question.
+    pub fn tags_for_write(
         &mut self,
         resource: &TaggedResource,
-    ) -> Option<&mut BTreeMap<String, String>> {
+    ) -> Result<&mut BTreeMap<String, String>, TagWriteRefusal> {
         match resource {
-            TaggedResource::Queue(name) => self.queues.get_mut(name).map(|queue| &mut queue.tags),
-            TaggedResource::Job(id) => self.jobs.get_mut(id).map(|job| &mut job.tags),
-            TaggedResource::JobTemplate(name) => self
-                .job_templates
-                .get_mut(name)
-                .map(|template| &mut template.tags),
+            TaggedResource::Queue(name) => {
+                writable_tags(self.queues.get_mut(name), |queue| &mut queue.tags)
+            }
+            TaggedResource::Job(id) => self
+                .jobs
+                .get_mut(id)
+                .map(|job| &mut job.tags)
+                .ok_or(TagWriteRefusal::NotFound),
+            TaggedResource::JobTemplate(name) => {
+                writable_tags(self.job_templates.get_mut(name), |template| {
+                    &mut template.tags
+                })
+            }
             TaggedResource::Preset(name) => {
-                self.presets.get_mut(name).map(|preset| &mut preset.tags)
+                writable_tags(self.presets.get_mut(name), |preset| &mut preset.tags)
             }
         }
     }

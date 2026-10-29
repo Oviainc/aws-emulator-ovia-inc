@@ -7,6 +7,11 @@
 //! changes nothing and is not an error, so the call is idempotent; a request that names
 //! no key at all removes nothing, since `TagKeys` is what says which tags to remove.
 //!
+//! The tags live ON the record they belong to, so a call that would remove one is a
+//! MODIFICATION of the resource the `Arn` names: one naming a built-in resource — the
+//! account's system queue, or a system preset or job template — is refused with the
+//! modelled `ForbiddenException`, exactly as `TagResource` and the update doors refuse it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -74,6 +79,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+// Which modelled error a refused tag WRITE is, and the sentence it states, live once for
+// every door onto a record's tag set (`crate::state::TagWriteRefusal`); the impl at the
+// foot of this module states only how THIS operation's errors are built.
+use crate::state::TagWriteRefusalError;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -189,11 +199,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // set, which the job lifecycle's clock never owes anything — settling is that
         // lifecycle's business.
 
-        let Some(tags) = state.tags_mut(&resource) else {
-            return Err(UntagResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Resource {} not found.", input.arn)),
-            })
-            .into());
+        // Removing a key MODIFIES the record the tags live on, so this door takes the
+        // store's one write door for a tag set: it answers both the ARN that names nothing
+        // and the one that names a resource no caller created.
+        let tags = match state.tags_for_write(&resource) {
+            Ok(tags) => tags,
+            Err(refusal) => {
+                return Err(
+                    UntagResourceErrorModeled::of_tag_write_refusal(refusal, "arn", &input.arn)
+                        .into(),
+                );
+            }
         };
         for key in input.tag_keys.unwrap_or_default() {
             // A key the resource never carried is simply not there afterwards either.
@@ -201,5 +217,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         Ok(UntagResourceOutput {})
+    }
+}
+
+/// How this operation's modelled errors state a refused tag write. Which refusal is which
+/// error, and the sentence each states, belong to [`crate::state::TagWriteRefusal`] and
+/// its [`TagWriteRefusalError::of_tag_write_refusal`], so both doors onto a record's tag
+/// set refuse alike.
+impl TagWriteRefusalError for UntagResourceErrorModeled {
+    fn not_found(message: String) -> Self {
+        Self::NotFoundException(NotFoundException {
+            message: Some(message),
+        })
+    }
+
+    fn forbidden(message: String) -> Self {
+        Self::ForbiddenException(ForbiddenException {
+            message: Some(message),
+        })
     }
 }

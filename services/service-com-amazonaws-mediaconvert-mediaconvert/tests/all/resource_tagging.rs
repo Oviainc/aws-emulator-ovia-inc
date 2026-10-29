@@ -16,6 +16,11 @@
 //! stores only a set whose keys carry characters and whose size is within the
 //! per-resource cap, and refuses anything else with the same modelled error.
 //!
+//! And because the tags are part of the record, a call that writes them MODIFIES the
+//! resource the `Arn` names: a built-in one is refused the modification with the modelled
+//! `ForbiddenException` (403), the way every other door that would modify such a record
+//! refuses it, while reporting its tags is still served.
+//!
 //! Every case drives the real restJson1 wire path — the router picks the service from
 //! the request's SigV4 scope, the framework deserializes and validates, the handler
 //! runs, and the response is serialized — so what is asserted is the bytes a client
@@ -26,6 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_mediaconvert_mediaconvert::state::system_resource_modify_message;
 use service_com_amazonaws_mediaconvert_mediaconvert::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -232,27 +238,60 @@ impl Emulator {
         arn(&format!("queues/{name}"))
     }
 
-    /// The ARN of a job template this store holds: the built-in SYSTEM templates, read
-    /// back through `ListJobTemplates` (`listBy=SYSTEM`, the value that lists them)
-    /// rather than hard-coded, so the case uses a name the service itself reports.
-    /// `CreateJobTemplate` is still a scaffold, so these are the only templates that
-    /// exist.
-    async fn first_job_template(&self) -> String {
-        let listed = self
-            .send("GET", "/2017-08-29/jobTemplates?listBy=SYSTEM", None)
+    /// A job template created with `tags`, and its ARN. The settings are the shape
+    /// `CreateJobTemplate` requires, from the fixture the job-template suite publishes.
+    /// A CALLER-created template, because the tags of a resource the account created are
+    /// the caller's to write — the built-in `SYSTEM` templates this store seeds are not
+    /// (see `a_built_in_resource_is_not_the_callers_to_tag_or_untag`).
+    async fn job_template(&self, name: &str, tags: Value) -> String {
+        let reply = self
+            .send(
+                "POST",
+                "/2017-08-29/jobTemplates",
+                Some(json!({
+                    "name": name,
+                    "settings": crate::job_template_crud::settings(1, 1),
+                    "tags": tags
+                })),
+            )
             .await;
         assert_eq!(
-            listed.status, 200,
-            "fixture job template: expected HTTP 200 from ListJobTemplates, got {} with body {}",
-            listed.status, listed.body
-        );
-        let name = listed.string("/jobTemplates/0/name");
-        assert!(
-            !name.is_empty(),
-            "fixture job template: expected at least one built-in template, got {}",
-            listed.body
+            reply.status, 201,
+            "fixture job template {name:?}: expected HTTP 201, got {} with body {}",
+            reply.status, reply.body
         );
         arn(&format!("jobTemplates/{name}"))
+    }
+
+    /// The ARN of a BUILT-IN resource of each kind the store seeds one of, read back
+    /// through the listing that reports them rather than hard-coded, so a case names a
+    /// resource the service itself reports as built in.
+    async fn built_in(&self, kind: BuiltIn) -> String {
+        let listed = self.send("GET", kind.listing(), None).await;
+        assert_eq!(
+            listed.status, 200,
+            "fixture {kind:?}: expected HTTP 200 from its listing, got {} with body {}",
+            listed.status, listed.body
+        );
+        // The first entry the service reports as built in: `Queue$Type`, `Preset$Type` and
+        // `JobTemplate$Type` each report `SYSTEM` for one.
+        let name = listed
+            .at(&format!("/{}", kind.member()))
+            .as_array()
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry.get("type").and_then(Value::as_str) == Some("SYSTEM"))
+            })
+            .and_then(|entry| entry.get("name").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !name.is_empty(),
+            "fixture {kind:?}: expected the store to seed a built-in resource, got {}",
+            listed.body
+        );
+        arn(&format!("{}/{name}", kind.member()))
     }
 
     /// A preset created with `tags`, and its ARN. The settings are the minimal shape
@@ -382,6 +421,54 @@ impl CreateDoor {
             Self::Job => arn(&format!("jobs/{}", reply.string("/job/id"))),
             Self::Preset => arn(&format!("presets/{name}")),
             Self::JobTemplate => arn(&format!("jobTemplates/{name}")),
+        }
+    }
+}
+
+/// A kind of BUILT-IN resource this store seeds: the account's system queue, the system
+/// output presets and the system job templates. A job has no built-in form — every job in
+/// the store was submitted by a caller — so it is not one of these.
+#[derive(Clone, Copy, Debug)]
+enum BuiltIn {
+    Queue,
+    Preset,
+    JobTemplate,
+}
+
+impl BuiltIn {
+    /// Every kind the store seeds a built-in resource of, so a case is stated once and run
+    /// against each.
+    const ALL: [Self; 3] = [Self::Queue, Self::Preset, Self::JobTemplate];
+
+    /// The listing that reports this kind's built-in resources. The two listings that take
+    /// a `listBy` report the built-in records under its `SYSTEM` value and the account's
+    /// own under every other, so a built-in preset or template is asked for by name there;
+    /// `ListQueues` reports every queue the account has, the system one included.
+    fn listing(self) -> &'static str {
+        match self {
+            Self::Queue => "/2017-08-29/queues",
+            Self::Preset => "/2017-08-29/presets?listBy=SYSTEM",
+            Self::JobTemplate => "/2017-08-29/jobTemplates?listBy=SYSTEM",
+        }
+    }
+
+    /// The output member the listing reports the records in — which is also the resource
+    /// type the ARN of one carries, the pairing `TagResource`'s `Arn` is resolved through.
+    fn member(self) -> &'static str {
+        match self {
+            Self::Queue => "queues",
+            Self::Preset => "presets",
+            Self::JobTemplate => "jobTemplates",
+        }
+    }
+
+    /// The collection URI a modification of one of these records addresses, so a case can
+    /// ask the UPDATE door for the same resource the tagging doors were asked for.
+    fn collection(self) -> &'static str {
+        match self {
+            Self::Queue => "/2017-08-29/queues",
+            Self::Preset => "/2017-08-29/presets",
+            Self::JobTemplate => "/2017-08-29/jobTemplates",
         }
     }
 }
@@ -716,7 +803,7 @@ async fn tagging_merges_into_the_stored_set_and_reads_back() {
         let resource_arn = match kind {
             "queue" => emulator.queue("tagged", json!({})).await,
             "job" => emulator.job(json!({})).await,
-            "jobTemplate" => emulator.first_job_template().await,
+            "jobTemplate" => emulator.job_template("tagged", json!({})).await,
             _ => emulator.preset("tagged", json!({})).await,
         };
 
@@ -874,7 +961,7 @@ async fn untagging_removes_only_the_keys_it_names() {
         let resource_arn = match kind {
             "queue" => emulator.queue("untagged", json!({})).await,
             "job" => emulator.job(json!({})).await,
-            "jobTemplate" => emulator.first_job_template().await,
+            "jobTemplate" => emulator.job_template("untagged", json!({})).await,
             _ => emulator.preset("untagged", json!({})).await,
         };
         let tagged = emulator
@@ -1148,4 +1235,157 @@ async fn the_reported_arn_follows_the_reading_region() {
         "the default-region ARN must name the same resource, got {}",
         listed.body
     );
+}
+
+/// A record's tags are part of the record, so a call that WRITES them MODIFIES the
+/// resource the `Arn` names — and a built-in resource is not the caller's to modify. Both
+/// writing doors (`TagResource` and `UntagResource`) refuse one with the modelled
+/// `ForbiddenException` (403) stating the one sentence the state module words a refused
+/// modification with, exactly as the `Update*` door for the same record does, while
+/// reporting its tags stays a 200 and the resources the caller created take the same
+/// writes.
+///
+/// The table spans the class: every kind of resource the store seeds a built-in one of
+/// (the account's system queue, a system preset, a system job template — each read back
+/// from the listing that reports it, so no name here is hand-written), crossed with every
+/// shape of write (a merge of no pairs, of one, of several; a removal naming no `TagKeys`
+/// at all, an empty key list, one key, two keys one of which is absent). Each row runs
+/// again against a resource the caller created of the same kind, and against a job, which
+/// has no built-in form at all — so what the refusal turns on is the RESOURCE, not the
+/// shape of the request.
+#[tokio::test]
+async fn a_built_in_resource_is_not_the_callers_to_tag_or_untag() {
+    /// One write a row asks for.
+    #[derive(Clone, Copy, Debug)]
+    enum Write {
+        /// `TagResource` merging this many pairs.
+        Merge(usize),
+        /// `UntagResource` naming these keys, or none at all.
+        Remove(Option<&'static [&'static str]>),
+    }
+
+    /// Ask `write` of the resource `resource_arn` names, over the wire.
+    async fn ask(emulator: &Emulator, write: Write, resource_arn: &str) -> Reply {
+        match write {
+            Write::Merge(pairs) => emulator.tag(resource_arn, tag_map(pairs)).await,
+            Write::Remove(keys) => emulator.untag(resource_arn, keys).await,
+        }
+    }
+
+    let writes = [
+        Write::Merge(0),
+        Write::Merge(1),
+        Write::Merge(5),
+        Write::Remove(None),
+        Write::Remove(Some(&[])),
+        Write::Remove(Some(&["key-0"])),
+        Write::Remove(Some(&["key-0", "absent"])),
+    ];
+    // The sentence comes from the state module that owns it, never a second copy here.
+    let refusal = system_resource_modify_message("arn");
+
+    for kind in BuiltIn::ALL {
+        for write in writes {
+            // A store of its own per row, so what a refused write left behind is exactly
+            // what is asserted below.
+            let emulator = Emulator::new();
+            let built_in_arn = emulator.built_in(kind).await;
+
+            // Reporting a built-in resource's tags is not a write, so it is served.
+            let before = emulator.list_tags(&built_in_arn).await;
+            assert_eq!(
+                before.status, 200,
+                "case {kind:?}/{write:?}: expected HTTP 200 from ListTagsForResource, got {} \
+                 with body {}",
+                before.status, before.body
+            );
+
+            let refused = ask(&emulator, write, &built_in_arn).await;
+            assert_eq!(
+                refused.status, 403,
+                "case {kind:?}/{write:?}: expected HTTP 403, got {} with body {}",
+                refused.status, refused.body
+            );
+            assert_eq!(
+                refused.error_type.as_deref(),
+                Some("ForbiddenException"),
+                "case {kind:?}/{write:?}: expected ForbiddenException, got {:?} with body {}",
+                refused.error_type,
+                refused.body
+            );
+            assert_eq!(
+                refused.string("/message"),
+                refusal,
+                "case {kind:?}/{write:?}: expected the refusal sentence {refusal:?}, got {}",
+                refused.body
+            );
+
+            // The record is exactly as it was: nothing the call carried reached it.
+            let after = emulator.list_tags(&built_in_arn).await;
+            assert_eq!(
+                after.reported_tags(),
+                before.reported_tags(),
+                "case {kind:?}/{write:?}: expected the built-in resource's tags to be \
+                 unchanged at {:?}, got {}",
+                before.reported_tags(),
+                after.body
+            );
+
+            // The sibling door that modifies the same record answers the same way, which
+            // is the rule this case is one half of. Each refusal names the request member
+            // that identified the resource — `arn` for a tagging door, `name` for the
+            // `Update*` one — so the sentence differs only in that member.
+            let name = built_in_arn
+                .rsplit('/')
+                .next()
+                .expect("the built-in resource's name")
+                .to_string();
+            let updated = emulator
+                .send(
+                    "PUT",
+                    &format!("{}/{}", kind.collection(), encode_label(&name)),
+                    Some(json!({ "description": "mine now" })),
+                )
+                .await;
+            assert_eq!(
+                updated.status, 403,
+                "case {kind:?}/{write:?}: the Update door must refuse the same record, got {} \
+                 with body {}",
+                updated.status, updated.body
+            );
+            let by_name = system_resource_modify_message("name");
+            assert_eq!(
+                updated.string("/message"),
+                by_name,
+                "case {kind:?}/{write:?}: expected the Update door's own sentence \
+                 {by_name:?}, got {}",
+                updated.body
+            );
+        }
+    }
+
+    // The other side of the rule: the resources the CALLER created take every one of those
+    // writes, so the refusal above is about the resource and not about the call.
+    for write in writes {
+        let emulator = Emulator::new();
+        let born_with = json!({ "key-0": "0" });
+        let created: Vec<(&str, String)> = vec![
+            ("queue", emulator.queue("mine", born_with.clone()).await),
+            ("preset", emulator.preset("mine", born_with.clone()).await),
+            (
+                "jobTemplate",
+                emulator.job_template("mine", born_with.clone()).await,
+            ),
+            ("job", emulator.job(born_with.clone()).await),
+        ];
+        for (kind, resource_arn) in &created {
+            let served = ask(&emulator, write, resource_arn).await;
+            assert_eq!(
+                served.status, 200,
+                "case {kind}/{write:?}: a resource the caller created takes the write, got {} \
+                 with body {}",
+                served.status, served.body
+            );
+        }
+    }
 }

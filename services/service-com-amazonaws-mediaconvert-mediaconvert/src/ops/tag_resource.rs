@@ -10,6 +10,11 @@
 //! `ListTagsForResource` reports exactly what this call persisted and deleting the
 //! resource takes its tags with it.
 //!
+//! Because the tags are part of the record, a call that would write them is a
+//! MODIFICATION of the resource the `Arn` names, so one naming a built-in resource — the
+//! account's system queue, or a system preset or job template — is refused with the
+//! modelled `ForbiddenException`, exactly as a call that would update such a record is.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -81,7 +86,7 @@ use super::types::*;
 // The classification of a tag-set refusal — which modelled error it is — lives once in
 // this trait's `of_tag_refusal`, for every door onto a record's tag set; the impl at the
 // foot of this module states only how THIS operation's errors are built.
-use crate::state::TagRefusalError;
+use crate::state::{TagRefusalError, TagWriteRefusalError};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -208,11 +213,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // set, which the job lifecycle's clock never owes anything — settling is that
         // lifecycle's business.
 
-        let Some(tags) = state.tags_mut(&resource) else {
-            return Err(TagResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Resource {} not found.", input.arn)),
-            })
-            .into());
+        // A record's tags live ON the record, so merging into them MODIFIES the resource
+        // the `Arn` names: the store's one write door for a tag set answers both the ARN
+        // that names nothing and the one that names a resource no caller created, which is
+        // refused here exactly as the update doors refuse a modification of such a record.
+        let tags = match state.tags_for_write(&resource) {
+            Ok(tags) => tags,
+            Err(refusal) => {
+                return Err(
+                    TagResourceErrorModeled::of_tag_write_refusal(refusal, "arn", &input.arn)
+                        .into(),
+                );
+            }
         };
 
         // The merge is computed before anything is written, so a call refused for growing
@@ -241,6 +253,24 @@ impl TagRefusalError for TagResourceErrorModeled {
 
     fn quota_exceeded(message: String) -> Self {
         Self::ServiceQuotaExceededException(ServiceQuotaExceededException {
+            message: Some(message),
+        })
+    }
+}
+
+/// How this operation's modelled errors state a refused tag WRITE. Which refusal is which
+/// error, and the sentence each states, belong to [`crate::state::TagWriteRefusal`] and
+/// its [`TagWriteRefusalError::of_tag_write_refusal`], so `UntagResource` cannot answer
+/// the same resource differently.
+impl TagWriteRefusalError for TagResourceErrorModeled {
+    fn not_found(message: String) -> Self {
+        Self::NotFoundException(NotFoundException {
+            message: Some(message),
+        })
+    }
+
+    fn forbidden(message: String) -> Self {
+        Self::ForbiddenException(ForbiddenException {
             message: Some(message),
         })
     }
