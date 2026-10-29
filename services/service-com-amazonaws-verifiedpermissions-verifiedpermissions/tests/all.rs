@@ -71,6 +71,8 @@ mod response_fidelity;
 mod schema;
 #[path = "all/schema_lifecycle.rs"]
 mod schema_lifecycle;
+#[path = "all/scope_entity_type_immutability.rs"]
+mod scope_entity_type_immutability;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/store_validation_settings.rs"]

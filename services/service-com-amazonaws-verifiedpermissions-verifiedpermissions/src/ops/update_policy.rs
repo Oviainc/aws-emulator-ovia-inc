@@ -6,8 +6,10 @@
 //! the real Cedar parser ([`crate::state::cedar::parse_static_policy`]) and the
 //! elements the API documents as immutable — the effect, the principal and the
 //! resource of the policy's scope, and the kind of policy it is — are compared
-//! against what the stored policy holds: a replacement that changes one of them
-//! is refused with the model's own `ValidationException` and nothing is stored.
+//! against the scope of the text the stored policy holds: a replacement that
+//! changes one of them is refused with the model's own `ValidationException` and
+//! nothing is stored. Each scope position is compared as the whole reference it
+//! carries, the entity type it restricts to as much as the entity it names.
 //! What may change is what the docs name: the action the policy references and
 //! its condition clauses.
 //!
@@ -199,6 +201,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "the service state store is unavailable".to_string(),
             })
         };
+        let fault = |message: String| -> UpdatePolicyError {
+            UpdatePolicyErrorModeled::InternalServerException(InternalServerException {
+                message,
+            })
+            .into()
+        };
         let refuse = |invalid: Vec<crate::ops::InvalidInput>| -> UpdatePolicyError {
             UpdatePolicyErrorModeled::ValidationException(crate::ops::validation_exception(
                 invalid,
@@ -278,6 +286,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let scope = crate::state::cedar::parse_static_policy(&def.statement)
                     .map_err(invalid)?;
 
+                // The stored policy's own scope, read out of the text it holds.
+                // What the immutability rule is stated over is the scope Cedar
+                // reports, and only the parsed form carries all of it — the
+                // entity type a position is restricted to as well as the entity
+                // it names — while persisted state keeps just the entity the API
+                // reports. The text is text this service already accepted, so
+                // text it can no longer read is service-side state and not
+                // something the caller can fix from this request.
+                let stored_scope = crate::state::cedar::parse_static_policy(
+                    policy.statement.as_deref().ok_or_else(|| {
+                        fault(
+                            "the stored static policy holds no statement, so a replacement \
+                             cannot be checked against it"
+                                .to_string(),
+                        )
+                    })?,
+                )
+                .map_err(|e| {
+                    fault(format!(
+                        "the stored policy's scope could not be read, so a replacement cannot \
+                         be checked against it: {}",
+                        e.reason
+                    ))
+                })?;
+
                 // The elements the operation documents as unchangeable: "You
                 // can't change these elements of a static policy: ... Changing
                 // the effect of a static policy from permit or forbid. The
@@ -285,7 +318,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // referenced by a static policy." Each one that the replacement
                 // would change is reported as its own `fieldList` entry, naming
                 // the member that carries the change.
-                let immutable = immutable_changes(policy, &scope);
+                let immutable = immutable_changes(&stored_scope, &scope);
                 if !immutable.is_empty() {
                     return Err(refuse(immutable));
                 }
@@ -432,12 +465,19 @@ const TEMPLATE_LINKED_IS_NOT_UPDATABLE: &str =
 /// referenced by a static policy. The resource referenced by a static policy."
 /// An element the stored policy does not name is unchanged only by a replacement
 /// that does not name it either, which is what comparing the parsed scopes says.
+///
+/// A scope position is compared as the WHOLE reference Cedar reports for it
+/// ([`crate::state::cedar::ScopeReference`]): the entity type an `is T`
+/// constraint restricts the position to is part of the principal (or the
+/// resource) the policy references, so a replacement that keeps the form and
+/// changes the type changes that element and is refused like any other change to
+/// it.
 fn immutable_changes(
-    stored: &crate::state::Policy,
+    stored: &crate::state::cedar::StaticScope,
     replacement: &crate::state::cedar::StaticScope,
 ) -> Vec<crate::ops::InvalidInput> {
     let mut changes = Vec::new();
-    if stored.effect.as_deref() != Some(replacement.effect.as_str()) {
+    if stored.effect != replacement.effect {
         changes.push(crate::ops::InvalidInput::new(
             crate::ops::paths::STATIC_STATEMENT,
             "You can't change the effect of an existing policy.",

@@ -278,18 +278,50 @@ pub const MAX_BATCH_REQUESTS: usize = 30;
 /// AWS-published quota, and sized well above any hand-written schema.
 pub const MAX_SCHEMA_BYTES: usize = 100_000;
 
+/// Everything ONE scope position of a Cedar policy references, as the parser
+/// reports its constraint: the entity type the position is restricted to and the
+/// entity it names, each present only when the constraint carries it.
+///
+/// Both members are needed because a position can reference a type without
+/// naming an entity (`principal is T`) and name an entity without restricting
+/// the type (`principal == E`, `principal in E`), and `principal is T in E`
+/// references both. Two positions are therefore the same reference only when
+/// they agree on BOTH — which is what the update operations hold a replacement
+/// to, since the entity type is part of the principal (or resource) a policy
+/// references and not a detail below it.
+///
+/// What the API REPORTS of a position is narrower: only the entity
+/// ([`ScopeReference::entity`]), because `GetPolicyOutput$principal` "isn't
+/// included in the response when Principal isn't present in the policy content".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopeReference {
+    /// The entity type the position is restricted to — `T` of `is T` and of
+    /// `is T in E`; `None` for a position that restricts no type (`principal`,
+    /// `principal == E`, `principal in E`).
+    pub entity_type: Option<String>,
+    /// The entity the position names — `E` of `== E`, `in E` and `is T in E`;
+    /// `None` for a position that names none (`principal`, `principal is T`).
+    pub entity: Option<ScopeEntity>,
+}
+
+impl ScopeReference {
+    /// The entity this position names, which is the part of the reference the
+    /// API reports and persists — `None` for a position that names no entity.
+    pub fn entity(&self) -> Option<&ScopeEntity> {
+        self.entity.as_ref()
+    }
+}
+
 /// What the Cedar parser says a static policy's scope is: the pieces
 /// `CreatePolicy`, `GetPolicy` and `ListPolicies` report back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticScope {
     /// `Permit` or `Forbid`.
     pub effect: String,
-    /// Present only when the scope names a principal entity (`principal ==`,
-    /// `principal in`, `principal is T in`); absent for `principal` and
-    /// `principal is T`, which name no entity.
-    pub principal: Option<ScopeEntity>,
-    /// Same rule as `principal`.
-    pub resource: Option<ScopeEntity>,
+    /// Everything the scope's principal position references.
+    pub principal: ScopeReference,
+    /// Same rule as `principal`, for the resource position.
+    pub resource: ScopeReference,
     /// Every action the scope names; empty when the scope is a bare `action`.
     pub actions: Vec<ScopeEntity>,
 }
@@ -335,6 +367,11 @@ pub fn parse_static_policy(statement: &str) -> Result<StaticScope, InvalidInput>
 /// parsed from a static policy's text, or LINKED from a template
 /// ([`link_template`]). Both report the same members, so they read them off the
 /// parsed form through this one function.
+///
+/// Each scope position is reported in FULL ([`ScopeReference`]): the entity type
+/// an `is T` constraint restricts the position to is part of what that position
+/// references, so it is read off the constraint rather than dropped, and the
+/// entity the position names is reported beside it.
 fn scope_of(policy: &cedar_policy::Policy) -> StaticScope {
     let effect = match policy.effect() {
         cedar_policy::Effect::Permit => "Permit",
@@ -343,16 +380,36 @@ fn scope_of(policy: &cedar_policy::Policy) -> StaticScope {
     .to_string();
 
     let principal = match policy.principal_constraint() {
-        cedar_policy::PrincipalConstraint::Any | cedar_policy::PrincipalConstraint::Is(_) => None,
+        cedar_policy::PrincipalConstraint::Any => ScopeReference::default(),
+        cedar_policy::PrincipalConstraint::Is(entity_type) => ScopeReference {
+            entity_type: Some(entity_type.to_string()),
+            entity: None,
+        },
         cedar_policy::PrincipalConstraint::Eq(uid)
-        | cedar_policy::PrincipalConstraint::In(uid)
-        | cedar_policy::PrincipalConstraint::IsIn(_, uid) => Some(scope_entity(&uid)),
+        | cedar_policy::PrincipalConstraint::In(uid) => ScopeReference {
+            entity_type: None,
+            entity: Some(scope_entity(&uid)),
+        },
+        cedar_policy::PrincipalConstraint::IsIn(entity_type, uid) => ScopeReference {
+            entity_type: Some(entity_type.to_string()),
+            entity: Some(scope_entity(&uid)),
+        },
     };
     let resource = match policy.resource_constraint() {
-        cedar_policy::ResourceConstraint::Any | cedar_policy::ResourceConstraint::Is(_) => None,
+        cedar_policy::ResourceConstraint::Any => ScopeReference::default(),
+        cedar_policy::ResourceConstraint::Is(entity_type) => ScopeReference {
+            entity_type: Some(entity_type.to_string()),
+            entity: None,
+        },
         cedar_policy::ResourceConstraint::Eq(uid)
-        | cedar_policy::ResourceConstraint::In(uid)
-        | cedar_policy::ResourceConstraint::IsIn(_, uid) => Some(scope_entity(&uid)),
+        | cedar_policy::ResourceConstraint::In(uid) => ScopeReference {
+            entity_type: None,
+            entity: Some(scope_entity(&uid)),
+        },
+        cedar_policy::ResourceConstraint::IsIn(entity_type, uid) => ScopeReference {
+            entity_type: Some(entity_type.to_string()),
+            entity: Some(scope_entity(&uid)),
+        },
     };
     let actions = match policy.action_constraint() {
         cedar_policy::ActionConstraint::Any => Vec::new(),

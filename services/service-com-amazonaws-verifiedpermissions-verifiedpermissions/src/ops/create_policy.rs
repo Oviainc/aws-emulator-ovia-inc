@@ -438,8 +438,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description,
             template_link,
             effect: Some(scope.effect),
-            principal: scope.principal,
-            resource: scope.resource,
+            // What the API reports of a scope position is the ENTITY it names —
+            // `GetPolicyOutput$principal` "isn't included in the response when
+            // Principal isn't present in the policy content" — so that is the
+            // part of the parsed reference this policy persists.
+            principal: scope.principal.entity().cloned(),
+            resource: scope.resource.entity().cloned(),
             actions: scope.actions,
             created_date: created,
             last_updated_date: created,

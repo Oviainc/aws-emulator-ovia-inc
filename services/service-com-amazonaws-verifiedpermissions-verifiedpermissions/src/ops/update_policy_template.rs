@@ -20,7 +20,9 @@
 //! The principal referenced by the policy template. The resource referenced by
 //! the policy template." Those are compared as Cedar SCOPES
 //! ([`crate::state::cedar::template_scope`]), not as text, so reformatting or a
-//! changed condition clause is accepted while a changed scope is refused.
+//! changed condition clause is accepted while a changed scope is refused — each
+//! scope position compared as the whole reference it carries, the entity type it
+//! restricts to as much as the entity it names.
 //!
 //! A refused request stores nothing: every check runs before anything is
 //! written. The policies linked to the template follow it without any per-link
@@ -328,12 +330,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every policy linked to this template follows it, and the ONLY part of
         // such a policy's reported scope a replacement can change is the actions
         // the template's scope names: its effect, its principal and its resource
-        // cannot differ from the stored template's (the check above refused a
-        // replacement that changed one), and Cedar has no placeholder in the
-        // action position, so one template gives every policy linked to it the
-        // same actions. They therefore come from the replacement's scope, parsed
-        // ONCE above — the work this loop does per linked policy is a clone of
-        // that list, never another Cedar parse or link.
+        // cannot differ from the stored template's — the check above refused a
+        // replacement that changed one, comparing each scope position as the
+        // whole reference it is, entity type included — and Cedar has no
+        // placeholder in the action position, so one template gives every policy
+        // linked to it the same actions. They therefore come from the
+        // replacement's scope, parsed ONCE above — the work this loop does per
+        // linked policy is a clone of that list, never another Cedar parse or
+        // link.
         //
         // A linked policy's own `lastUpdatedDate` is left alone: what this call
         // updated is the template, and a linked policy holds no content of its
@@ -378,6 +382,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// entity only compares equal to the same entity. The elements the operation
 /// does allow to change — "The action referenced by the policy template. Any
 /// conditional clauses" — are deliberately not compared.
+///
+/// A scope position is compared as the WHOLE reference Cedar reports for it
+/// ([`crate::state::cedar::ScopeReference`]): the entity type an `is T`
+/// constraint restricts the position to is part of the principal (or the
+/// resource) the template references, so a replacement that keeps the form and
+/// changes the type changes that element and is refused like any other change
+/// to it.
 fn immutable_changes(
     stored: &crate::state::cedar::StaticScope,
     replacement: &crate::state::cedar::StaticScope,
