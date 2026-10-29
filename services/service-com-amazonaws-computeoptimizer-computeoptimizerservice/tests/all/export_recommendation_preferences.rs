@@ -31,7 +31,7 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, cell, create_bucket, csv_rows, emulator, export_destination, get_object, opt_in,
+    call, cell, create_bucket, csv_rows, emulator, export_destination, get_object, opt_in, strings,
 };
 
 /// The destination bucket these fixtures export to. Compute Optimizer does not create it, so
@@ -208,19 +208,6 @@ async fn reported(
             (arn, (architectures, options))
         })
         .collect()
-}
-
-/// A list-valued member as the strings it holds; the empty list for a member reporting none.
-fn strings(reported: &Value) -> Vec<String> {
-    reported
-        .as_array()
-        .map(|values| {
-            values
-                .iter()
-                .map(|value| value.as_str().unwrap_or_default().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Export `surface`'s recommendations under `preference`, answering the job id and the

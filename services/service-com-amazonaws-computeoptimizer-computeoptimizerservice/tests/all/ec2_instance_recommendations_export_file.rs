@@ -30,7 +30,8 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, cell, create_bucket, csv_rows, emulator, export_destination, get_object, opt_in,
+    assert_figure, call, cell, create_bucket, csv_rows, emulator, export_destination, get_object,
+    metrics, opt_in, strings,
 };
 
 /// The operation under test, and the reader that is the oracle for it.
@@ -159,36 +160,6 @@ async fn analysed_emulator() -> MultiServiceRouter {
     opt_in(&router).await;
     tokio::time::sleep(ANALYSIS_DELAY + SLACK).await;
     router
-}
-
-/// A list-valued member as the strings it holds; the empty list for a member reporting none.
-fn strings(reported: &Value) -> Vec<String> {
-    reported
-        .as_array()
-        .map(|values| {
-            values
-                .iter()
-                .map(|value| value.as_str().unwrap_or_default().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// The utilization metrics of `reported` under the `Maximum` statistic, by metric name.
-fn metrics(reported: &Value) -> BTreeMap<String, f64> {
-    reported
-        .as_array()
-        .map(|values| {
-            values
-                .iter()
-                .filter(|metric| metric["statistic"].as_str() == Some("Maximum"))
-                .filter_map(|metric| {
-                    let name = metric["name"].as_str()?.to_string();
-                    Some((name, metric["value"].as_f64().unwrap_or_default()))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// What the reader reports for every analysed instance under `preference`, keyed by ARN.
@@ -330,19 +301,6 @@ async fn exported_rows(
     let document = String::from_utf8(object)
         .unwrap_or_else(|error| panic!("case {case:?}: the export file is text: {error}"));
     csv_rows(&document)
-}
-
-/// Assert `column` of `row` holds `expected`, as the figure every export cell is rounded to.
-fn assert_figure(case: &str, header: &[String], row: &[String], column: &str, expected: f64) {
-    let held = cell(header, row, column);
-    let actual: f64 = held
-        .parse()
-        .unwrap_or_else(|_| panic!("case {case:?}: {column} holds a figure, got {held:?} in {row:?}"));
-    assert!(
-        (actual - expected).abs() < 1e-6,
-        "case {case:?}: {column} must hold the figure the reader reports ({expected}), got \
-         {actual} in {row:?}"
-    );
 }
 
 /// The export file holds one row per recommendation option the request's preference admits, and

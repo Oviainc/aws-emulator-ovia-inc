@@ -16,13 +16,15 @@
 //! this emulator holds, so an export suite CREATES its destination bucket over S3's own wire
 //! ([`create_bucket`]) and reads the exported objects back over it ([`get_object`]).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::RESOURCE_TYPE_VALUES;
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    RESOURCE_TYPE_AUTO_SCALING_GROUP, SCOPE_ACCOUNT_ID, SCOPE_RESOURCE_ARN,
+    METRIC_STATISTIC_MAXIMUM, RESOURCE_TYPE_AUTO_SCALING_GROUP, SCOPE_ACCOUNT_ID,
+    SCOPE_RESOURCE_ARN,
 };
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -336,6 +338,62 @@ pub(crate) fn cell<'a>(header: &[String], row: &'a [String], column: &str) -> &'
         .position(|held| held == column)
         .and_then(|at| row.get(at))
         .map_or("", String::as_str)
+}
+
+/// A list-valued member of a reported recommendation as the strings it holds; the empty list
+/// for a member reporting none, so a suite reads a member the response omits the same way it
+/// reads an empty one.
+pub(crate) fn strings(reported: &Value) -> Vec<String> {
+    reported
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| value.as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The utilization metrics a reported member carries, by metric name, under the ONE statistic
+/// this API reports them with ([`METRIC_STATISTIC_MAXIMUM`]): "the Compute Optimizer API,
+/// Command Line Interface (CLI), and SDKs return utilization metrics using only the `Maximum`
+/// statistic".
+pub(crate) fn metrics(reported: &Value) -> BTreeMap<String, f64> {
+    reported
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter(|metric| metric["statistic"].as_str() == Some(METRIC_STATISTIC_MAXIMUM))
+                .filter_map(|metric| {
+                    let name = metric["name"].as_str()?.to_string();
+                    Some((name, metric["value"].as_f64().unwrap_or_default()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Assert the cell of `row` under `column` holds `expected`, as the figure every export cell is
+/// rounded to — so an export suite compares a cell against a figure a recommendation reader
+/// reported rather than against its text.
+pub(crate) fn assert_figure(
+    case: &str,
+    header: &[String],
+    row: &[String],
+    column: &str,
+    expected: f64,
+) {
+    let held = cell(header, row, column);
+    let actual: f64 = held.parse().unwrap_or_else(|_| {
+        panic!("case {case:?}: {column} holds a figure, got {held:?} in {row:?}")
+    });
+    assert!(
+        (actual - expected).abs() < 1e-6,
+        "case {case:?}: {column} must hold the figure the reader reports ({expected}), got \
+         {actual} in {row:?}"
+    );
 }
 
 /// Opt the account in, which every preference operation requires.
