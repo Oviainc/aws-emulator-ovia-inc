@@ -178,20 +178,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // `actionGroup` targets the closed `ActionGroup` enum, so the boundary
-        // validator already refuses anything outside it; this refusal keeps the stored
-        // policy to action groups whose permissions the service can name, rather than
-        // persisting a statement no reader can interpret.
-        if crate::state::action_group_actions(&input.action_group).is_empty() {
-            return Err(PutPermissionErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "actionGroup must be one of {}, got {}",
-                        ACTION_GROUP_VALUES.join(", "),
-                        input.action_group
-                    ),
-                },
-            )
-            .into());
+        // validator already refuses anything outside it; the action-group rule itself is
+        // stated ONCE in `crate::state` for both policy writes, and lifted here into this
+        // operation's own modelled error.
+        if let Err(message) = crate::state::validate_action_group(&input.action_group) {
+            return Err(
+                PutPermissionErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
         }
 
         // The `principals` doc: "A list ARNs for the roles and users you want to grant

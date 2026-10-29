@@ -169,18 +169,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // The same closed-enum refusal `PutPermission` makes: an action group whose
-        // permissions the service cannot name is not one it can hold a statement for,
-        // so it can name none to remove either.
-        if crate::state::action_group_actions(&input.action_group).is_empty() {
+        // The same action-group rule `PutPermission` applies, from the one place
+        // `crate::state` states it: an action group whose permissions the service cannot
+        // name is not one it can hold a statement for, so it can name none to remove
+        // either. Lifted here into this operation's own modelled error.
+        if let Err(message) = crate::state::validate_action_group(&input.action_group) {
             return Err(RemovePermissionErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "actionGroup must be one of {}, got {}",
-                        ACTION_GROUP_VALUES.join(", "),
-                        input.action_group
-                    ),
-                },
+                ValidationException { message },
             )
             .into());
         }

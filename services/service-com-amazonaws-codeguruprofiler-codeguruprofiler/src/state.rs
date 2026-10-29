@@ -453,6 +453,40 @@ pub fn action_group_actions(action_group: &str) -> Vec<String> {
     }
 }
 
+/// Every action group a resource-based policy can hold a statement for, as ONE list for
+/// both the predicate and the sentence below: the values the model's `ActionGroup` enum
+/// declares ([`crate::ops::types::ACTION_GROUP_VALUES`]), kept to those whose permissions
+/// this service can name ([`action_group_actions`]). Derived from those two, so the set a
+/// write is checked against and the set its refusal advertises can never disagree.
+pub fn grantable_action_groups() -> Vec<&'static str> {
+    crate::ops::types::ACTION_GROUP_VALUES
+        .iter()
+        .copied()
+        .filter(|action_group| !action_group_actions(action_group).is_empty())
+        .collect()
+}
+
+/// This service's ACTION-GROUP rule, in one place for every operation that writes a
+/// resource-based policy — the way [`validate_interval`] holds the interval rule and
+/// [`validate_tags`] the tag rules: a policy holds a statement only for an action group
+/// whose permissions the service can name ([`grantable_action_groups`]), so a write
+/// naming any other is refused before anything is stored, rather than persisting a
+/// statement no reader can interpret.
+///
+/// `Ok(())` for a grantable action group; otherwise the sentence this refusal states,
+/// which names the allowed set and the value the request carried, for each handler to
+/// lift into its own modelled `ValidationException` (HTTP 400).
+pub fn validate_action_group(action_group: &str) -> Result<(), String> {
+    let grantable = grantable_action_groups();
+    if grantable.contains(&action_group) {
+        return Ok(());
+    }
+    Err(format!(
+        "actionGroup must be one of {}, got {action_group}",
+        grantable.join(", ")
+    ))
+}
+
 /// A profiling group's resource-based policy: which principals hold which action
 /// group, and the revision that identifies the policy's current content.
 ///
