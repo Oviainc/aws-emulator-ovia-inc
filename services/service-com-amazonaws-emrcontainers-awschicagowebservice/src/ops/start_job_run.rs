@@ -277,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .map_err(|message| {
                         StartJobRunErrorModeled::ValidationException(ValidationException {
-                            message: Some(message),
+                            message: Some(crate::state::bounded_message(message)),
                         })
                     })?,
                 )
@@ -387,7 +387,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 super::types::START_JOB_RUN_INPUT_SCHEMA,
             ) {
                 return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
-                    message: Some(message),
+                    message: Some(crate::state::bounded_message(message)),
                 })
                 .into());
             }
@@ -843,9 +843,13 @@ fn apply_job_template(
         .filter(|name| !declared.contains_key(*name))
         .collect();
     if !undeclared.is_empty() {
-        return Err(format!(
-            "Job template {template_id} declares no parameter named [{}].",
-            undeclared.into_iter().collect::<Vec<&str>>().join(", ")
+        // The names are the request's, up to a hundred of them at up to 512 characters
+        // each, so the list gives up what the message has no room for and the wording
+        // around it survives ([`crate::state::message_about`]).
+        return Err(crate::state::message_about(
+            &format!("Job template {template_id} declares no parameter named ["),
+            &undeclared.into_iter().collect::<Vec<&str>>().join(", "),
+            "].",
         ));
     }
 
@@ -868,8 +872,15 @@ fn apply_job_template(
         if configuration.r#type.as_deref() == Some(PARAMETER_TYPE_NUMBER)
             && !value.parse::<f64>().is_ok_and(f64::is_finite)
         {
-            return Err(format!(
-                "Job template parameter {name} is declared as {PARAMETER_TYPE_NUMBER}, so {value} is not a valid value for it."
+            // The value is the request's, up to the 1024 characters a
+            // `TemplateParameterInputMap` value takes — the message bound itself — so it
+            // is what gives up the characters there is no room for.
+            return Err(crate::state::message_about(
+                &format!(
+                    "Job template parameter {name} is declared as {PARAMETER_TYPE_NUMBER}, so "
+                ),
+                value,
+                " is not a valid value for it.",
             ));
         }
         values.insert(name.clone(), value.clone());
@@ -913,14 +924,15 @@ fn apply_job_template(
     // Reported before anything rendered is judged: a value built around a reference
     // nothing resolved is not a value to judge, it is a parameter the caller still owes.
     if !substitution.unresolved.is_empty() {
-        return Err(format!(
-            "Job template {template_id} references parameter(s) [{}] that have no value: specify them in jobTemplateParameters or declare a defaultValue for them.",
-            substitution
+        return Err(crate::state::message_about(
+            &format!("Job template {template_id} references parameter(s) ["),
+            &substitution
                 .unresolved
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<&str>>()
-                .join(", ")
+                .join(", "),
+            "] that have no value: specify them in jobTemplateParameters or declare a defaultValue for them.",
         ));
     }
 

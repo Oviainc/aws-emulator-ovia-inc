@@ -39,6 +39,8 @@ mod managed_endpoint_wire_form;
 mod not_found_message;
 #[path = "all/paginated_page_bounds.rs"]
 mod paginated_page_bounds;
+#[path = "all/refusal_message_bound.rs"]
+mod refusal_message_bound;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
 #[path = "all/resource_tag_listing.rs"]

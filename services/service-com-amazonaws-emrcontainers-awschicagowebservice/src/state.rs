@@ -651,6 +651,47 @@ pub fn managed_endpoint_arn(region: &str, virtual_cluster_id: &str, id: &str) ->
     )
 }
 
+/// How many characters a refusal of this service carries in its `message`.
+///
+/// Every error the model declares here targets `String1024` (len 1..1024) for that member,
+/// whichever operation raises it — `ResourceNotFoundException`, `ValidationException`,
+/// `InternalServerException` and `RequestThrottledException` alike (smithy_query: shape
+/// `ResourceNotFoundException`) — so ONE bound holds for every message this service words.
+pub const MESSAGE_MAX_CHARACTERS: usize = 1024;
+
+/// `message`, held to the characters the member that carries it can hold.
+///
+/// A refusal is worded from the request, and a request may carry a single value longer
+/// than the whole message bound — `GetManagedEndpointSessionCredentials` names its
+/// resources with `String2048` identifiers, a job template parameter takes a `String1024`
+/// value — so a message built around one is clipped here rather than serialized at a
+/// length the shape it is declared as cannot hold. Clipping counts CHARACTERS, the unit
+/// every modelled `@length` is in, so a multi-byte value is never cut mid-character.
+pub fn bounded_message(message: String) -> String {
+    if message.chars().count() <= MESSAGE_MAX_CHARACTERS {
+        return message;
+    }
+    message.chars().take(MESSAGE_MAX_CHARACTERS).collect()
+}
+
+/// A refusal worded AROUND the value it reports, held to that same bound: the wording
+/// stays whole and the VALUE gives up the characters there is no room for, so a message
+/// about a very long value still says what it is about rather than ending mid-sentence.
+pub fn message_about(prefix: &str, value: &str, suffix: &str) -> String {
+    let wording = prefix.chars().count() + suffix.chars().count();
+    let mut message = String::new();
+    message.push_str(prefix);
+    message.extend(
+        value
+            .chars()
+            .take(MESSAGE_MAX_CHARACTERS.saturating_sub(wording)),
+    );
+    message.push_str(suffix);
+    // The wording on its own could be longer than the bound, which no clipping of the
+    // value it surrounds can bring back inside it.
+    bounded_message(message)
+}
+
 /// A resource kind this service refuses a request for when the request names one that is
 /// not there.
 ///
@@ -691,9 +732,15 @@ impl ResourceKind {
 
     /// The `message` a refusal carries for an `identifier` that names no such resource of
     /// this region: `<Resource type> <identifier> doesn't exist.`, with the identifier as
-    /// the request spelled it.
+    /// the request spelled it, held to what the member carrying the message can hold
+    /// ([`message_about`]) — an identifier a request names a resource by is itself allowed
+    /// to be longer than the message.
     pub fn not_found_message(self, identifier: &str) -> String {
-        format!("{} {identifier} doesn't exist.", self.resource_type())
+        message_about(
+            &format!("{} ", self.resource_type()),
+            identifier,
+            " doesn't exist.",
+        )
     }
 }
 

@@ -1,0 +1,310 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! How LONG a refusal this service words may be, end to end.
+//!
+//! Every call here goes through the production path: the service is mounted in the real
+//! `MultiServiceRouter` (the harness [`crate::virtual_cluster_job_run_loop`] owns) and
+//! driven with restJson1 HTTP requests, so routing, deserialization, constraint
+//! validation, the handler and serialization all run exactly as they do for an AWS SDK
+//! client.
+//!
+//! The rule under test: a modelled error's `message` never runs past the maximum the
+//! member's own shape declares for it — every error of this service carries its `message`
+//! as a `String1024`, len 1..1024 (smithy_query: shape `ResourceNotFoundException`) —
+//! however long the request value the refusal reports is, and the wording AROUND that
+//! value stays whole, so the value is what gives up the characters there is no room for.
+//!
+//! The tables span what the rule generalises over: which request value the refusal
+//! reports (an `@httpLabel` identifier a `String2048` admits 2048 characters of, a job
+//! template parameter value a `String1024` admits 1024 of, a list of up to a hundred
+//! 512-character parameter names), which operation issues it, which modelled error
+//! carries it, and the LENGTH of that value — the lengths on both sides of the longest one
+//! the message still holds whole, the model's own maximum, and a multi-byte value, because
+//! the bound counts characters rather than bytes.
+
+use serde_json::{json, Value};
+use service_com_amazonaws_emrcontainers_awschicagowebservice::state::{
+    self, MESSAGE_MAX_CHARACTERS,
+};
+
+use crate::resource_tag_removal::encoded;
+use crate::virtual_cluster_job_run_loop::{text, Emr};
+
+/// The errors the operations below carry their refusal in (smithy_query: operations
+/// `GetManagedEndpointSessionCredentials`, `StartJobRun`).
+const NOT_FOUND: &str = "ResourceNotFoundException";
+const INVALID_REQUEST: &str = "ValidationException";
+
+/// The fixed tail of the one not-found wording of this service, which the suite
+/// [`crate::not_found_message`] pins the whole of.
+const NOT_FOUND_TAIL: &str = " doesn't exist.";
+
+/// How this service spells the two resource types the calls below report missing.
+const VIRTUAL_CLUSTER: &str = "Virtual cluster";
+const ENDPOINT: &str = "Endpoint";
+
+/// The characters a message has left for the value it reports, beside `wording` characters
+/// of fixed text: the rule's arithmetic, written here from the modelled bound.
+fn room_for_the_value(wording: usize) -> usize {
+    MESSAGE_MAX_CHARACTERS - wording
+}
+
+/// Hold one refused call's `message` to the rule: inside the modelled bound, the wording
+/// whole, and the reported value exactly as much of the request's as there was room for —
+/// no less, so a refusal is not clipped further than the bound asks.
+fn assert_bounded(
+    case: &str,
+    message: &str,
+    prefix: &str,
+    suffix: &str,
+    sent_value: &str,
+) {
+    let characters = message.chars().count();
+    assert!(
+        characters <= MESSAGE_MAX_CHARACTERS,
+        "case {case:?}: the message must hold at most {MESSAGE_MAX_CHARACTERS} characters, \
+         got {characters} ({message:?})"
+    );
+    assert!(
+        message.starts_with(prefix) && message.ends_with(suffix),
+        "case {case:?}: expected the wording {prefix:?} … {suffix:?} to stay whole, got \
+         {message:?}"
+    );
+    let reported = &message[prefix.len()..message.len() - suffix.len()];
+    let room = room_for_the_value(prefix.chars().count() + suffix.chars().count());
+    let expected: String = sent_value.chars().take(room).collect();
+    assert_eq!(
+        reported,
+        expected,
+        "case {case:?}: expected the refusal to report the first {} characters of the value \
+         it is about, got {} of them ({reported:?})",
+        expected.chars().count(),
+        reported.chars().count()
+    );
+}
+
+/// One acceptable `GetManagedEndpointSessionCredentials` body: the two members the model
+/// marks `@required` beside the two `@httpLabel` identifiers (smithy_query: operation
+/// `GetManagedEndpointSessionCredentials`).
+fn session_body() -> Value {
+    json!({
+        "executionRoleArn": "arn:aws:iam::000000000000:role/EMRStudioRole",
+        "credentialType": state::SESSION_CREDENTIAL_TYPE_TOKEN,
+    })
+}
+
+/// Identifier lengths spanning the class the rule generalises over, for a refusal whose
+/// fixed wording is `wording` characters long: the shortest a `String2048` admits, a
+/// `ResourceIdString`'s own maximum (len 1..64 — smithy_query: shape `ResourceIdString`),
+/// the three lengths around the longest identifier the message still holds whole, the
+/// 2048 characters `String2048` admits (smithy_query: shape `String2048`), and a
+/// multi-byte identifier.
+fn identifier_lengths(wording: usize) -> Vec<(String, String)> {
+    let room = room_for_the_value(wording);
+    vec![
+        (
+            "the shortest identifier the model admits".to_string(),
+            "a".to_string(),
+        ),
+        (
+            "a ResourceIdString's own maximum".to_string(),
+            "z".repeat(64),
+        ),
+        (
+            format!("{} characters, one inside the longest the message holds", room - 1),
+            "b".repeat(room - 1),
+        ),
+        (
+            format!("{room} characters, exactly the longest the message holds"),
+            "c".repeat(room),
+        ),
+        (
+            format!("{} characters, one past it", room + 1),
+            "d".repeat(room + 1),
+        ),
+        ("1500 characters".to_string(), "e".repeat(1500)),
+        (
+            "the longest identifier the model admits".to_string(),
+            "f".repeat(2048),
+        ),
+        (
+            "1024 multi-byte characters".to_string(),
+            // 1024 characters at two bytes each: the longest multi-byte identifier that
+            // is inside `String2048` however the boundary counts a length.
+            "é".repeat(1024),
+        ),
+    ]
+}
+
+/// THE RULE for the `String2048` identifiers of `GetManagedEndpointSessionCredentials` —
+/// the one operation of this service whose resource identifiers may be longer than the
+/// message that reports them missing: the not-found refusal stays inside the modelled
+/// bound and still reads as the not-found refusal it is.
+#[tokio::test]
+async fn a_not_found_refusal_stays_inside_the_modelled_message_bound() {
+    let emr = Emr::new();
+    // A cluster that really exists, so a call aimed at an absent ENDPOINT is refused for
+    // the endpoint rather than for its cluster.
+    let host = emr.cluster("bound-host", "tok-bound-host").await;
+
+    let cluster_prefix = format!("{VIRTUAL_CLUSTER} ");
+    let endpoint_prefix = format!("{ENDPOINT} ");
+    let wordings = [
+        (VIRTUAL_CLUSTER, cluster_prefix.clone()),
+        (ENDPOINT, endpoint_prefix.clone()),
+    ];
+
+    for (resource_type, prefix) in &wordings {
+        let wording = prefix.chars().count() + NOT_FOUND_TAIL.chars().count();
+        for (label, identifier) in identifier_lengths(wording) {
+            let case = format!("{resource_type} named by {label}");
+            let path = if *resource_type == VIRTUAL_CLUSTER {
+                format!(
+                    "/virtualclusters/{}/endpoints/someendpoint/credentials",
+                    encoded(&identifier)
+                )
+            } else {
+                format!(
+                    "/virtualclusters/{host}/endpoints/{}/credentials",
+                    encoded(&identifier)
+                )
+            };
+            let answer = emr.send("POST", &path, Some(session_body())).await;
+            answer.refused(&case, 400, NOT_FOUND);
+            let message = text(&answer.body, "/message", &case);
+            assert_bounded(&case, &message, prefix, NOT_FOUND_TAIL, &identifier);
+        }
+    }
+}
+
+/// THE SAME RULE at another operation, another modelled error and another class of
+/// reported value: `StartJobRun`'s refusals of a job template application report values
+/// the request chose — one parameter value of up to the 1024 characters a
+/// `TemplateParameterInputMap` value admits, and up to a hundred 512-character parameter
+/// names at once (smithy_query: shape `TemplateParameterInputMap`) — and are held to the
+/// same bound.
+#[tokio::test]
+async fn a_job_template_refusal_reporting_a_long_value_stays_inside_the_bound() {
+    let emr = Emr::new();
+    let cluster = emr.cluster("bound-template-host", "tok-bound-template").await;
+    let role = "arn:aws:iam::000000000000:role/EMRJobRole";
+    let driver = json!({"sparkSubmitJobDriver": {"entryPoint": "s3://bucket/j.py"}});
+
+    // A template that declares one NUMBER parameter, so a value that is not a number is
+    // refused with the value reported.
+    let numeric_template = text(
+        emr.send(
+            "POST",
+            "/jobtemplates",
+            Some(json!({
+                "name": "bound-numeric",
+                "clientToken": "tok-bound-numeric",
+                "jobTemplateData": {
+                    "executionRoleArn": role,
+                    "releaseLabel": "emr-6.15.0-latest",
+                    "jobDriver": driver,
+                    "parameterConfiguration": {"scale": {"type": "NUMBER"}},
+                },
+            })),
+        )
+        .await
+        .ok("a template declaring a NUMBER parameter"),
+        "/id",
+        "a template declaring a NUMBER parameter",
+    );
+    // A template that declares NO parameter, so every parameter a request supplies for it
+    // is undeclared and the whole list of them is reported.
+    let plain_template = text(
+        emr.send(
+            "POST",
+            "/jobtemplates",
+            Some(json!({
+                "name": "bound-plain",
+                "clientToken": "tok-bound-plain",
+                "jobTemplateData": {
+                    "executionRoleArn": role,
+                    "releaseLabel": "emr-6.15.0-latest",
+                    "jobDriver": driver,
+                },
+            })),
+        )
+        .await
+        .ok("a template declaring no parameter"),
+        "/id",
+        "a template declaring no parameter",
+    );
+
+    // The longest value a `TemplateParameterInputMap` admits, which is the message bound
+    // itself, so no wording at all fits beside the whole of it.
+    let long_value = "9x".repeat(512);
+    let case = "a NUMBER parameter given 1024 characters that are not a number";
+    let answer = emr
+        .send(
+            "POST",
+            &format!("/virtualclusters/{cluster}/jobruns"),
+            Some(json!({
+                "clientToken": "tok-bound-number",
+                "jobTemplateId": numeric_template,
+                "jobTemplateParameters": {"scale": long_value.clone()},
+            })),
+        )
+        .await;
+    answer.refused(case, 400, INVALID_REQUEST);
+    let message = text(&answer.body, "/message", case);
+    assert_bounded(
+        case,
+        &message,
+        "Job template parameter scale is declared as NUMBER, so ",
+        " is not a valid value for it.",
+        &long_value,
+    );
+
+    // A hundred parameters at the 512 characters `TemplateParameterName` admits, none of
+    // them declared: the list the refusal reports is far longer than the message.
+    let mut names: Vec<String> = (0..100)
+        .map(|index| format!("p{index:0>3}{}", "x".repeat(508)))
+        .collect();
+    names.sort();
+    let supplied: Value = Value::Object(
+        names
+            .iter()
+            .map(|name| (name.clone(), json!("1")))
+            .collect(),
+    );
+    let case = "a hundred undeclared parameters of 512 characters each";
+    let answer = emr
+        .send(
+            "POST",
+            &format!("/virtualclusters/{cluster}/jobruns"),
+            Some(json!({
+                "clientToken": "tok-bound-undeclared",
+                "jobTemplateId": plain_template,
+                "jobTemplateParameters": supplied,
+            })),
+        )
+        .await;
+    answer.refused(case, 400, INVALID_REQUEST);
+    let message = text(&answer.body, "/message", case);
+    assert_bounded(
+        case,
+        &message,
+        &format!("Job template {plain_template} declares no parameter named ["),
+        "].",
+        &names.join(", "),
+    );
+
+    // The control: the refusals above started nothing, so the bound is about the wording
+    // of a refusal and nothing else.
+    let runs = emr
+        .send("GET", &format!("/virtualclusters/{cluster}/jobruns"), None)
+        .await;
+    assert_eq!(
+        runs.ok("the cluster's job runs")
+            .pointer("/jobRuns")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0),
+        "a refused StartJobRun must have started nothing, got {}",
+        runs.body
+    );
+}

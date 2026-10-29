@@ -363,7 +363,9 @@ fn server_error(message: &str) -> GetManagedEndpointSessionCredentialsError {
 /// The modelled refusal for a `virtualClusterIdentifier` that names no virtual cluster of
 /// this region, worded the way every read of a virtual cluster in this service words it
 /// ([`crate::state::ResourceKind`]). The identifier is reported as the request spelled it,
-/// an id or the cluster's own ARN.
+/// an id or the cluster's own ARN, clipped to what the modelled `message` holds where the
+/// request spelled it longer than that ([`crate::state::message_about`]): this operation's
+/// identifiers are `String2048`s, twice the `String1024` the message itself is.
 fn cluster_not_found(identifier: &str) -> GetManagedEndpointSessionCredentialsError {
     GetManagedEndpointSessionCredentialsErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
@@ -377,7 +379,8 @@ fn cluster_not_found(identifier: &str) -> GetManagedEndpointSessionCredentialsEr
 
 /// The modelled refusal for an `endpointIdentifier` that names no managed endpoint of this
 /// cluster, worded the way `DescribeManagedEndpoint` words it
-/// ([`crate::state::ResourceKind`]). The identifier is reported as the request spelled it.
+/// ([`crate::state::ResourceKind`]). The identifier is reported as the request spelled it,
+/// on the same terms as [`cluster_not_found`].
 fn endpoint_not_found(identifier: &str) -> GetManagedEndpointSessionCredentialsError {
     GetManagedEndpointSessionCredentialsErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
