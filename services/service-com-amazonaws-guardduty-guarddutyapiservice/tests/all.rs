@@ -81,6 +81,8 @@ mod findings_feedback;
 mod findings_statistics;
 #[path = "all/free_trial_days.rs"]
 mod free_trial_days;
+#[path = "all/investigation_detector_timestamp.rs"]
+mod investigation_detector_timestamp;
 #[path = "all/investigation_lifecycle.rs"]
 mod investigation_lifecycle;
 #[path = "all/investigation_listing.rs"]

@@ -16,6 +16,10 @@
 //! * `ClientToken` is `@idempotencyToken`, so a replayed create returns the investigation
 //!   the first call initiated and initiates no second one.
 //!
+//! An accepted create also changes the DETECTOR: it holds one investigation more than it
+//! did, so the detector's own last-updated instant moves to the instant of the create,
+//! the way every other create of a sub-resource the detector holds moves it.
+//!
 //! An accepted investigation starts `RUNNING`. The ANALYSIS itself is produced by Amazon
 //! Bedrock models, which this emulator does not have, so it never synthesises a summary,
 //! risk level or confidence: the run it cannot perform ends in the modelled `FAILED`
@@ -267,6 +271,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 now,
             ),
         );
+        // The detector itself changed: it holds one more sub-resource than before,
+        // which is the change `UpdatedAt` — "the last-updated timestamp for the
+        // detector" (`smithy_query(operation="GetDetector")`) — records, the same way
+        // every other create of a sub-resource the detector holds records it. A
+        // refused create, and a replay that initiates nothing, return above and so
+        // move nothing.
+        detector.updated_at_millis = now;
 
         Ok(CreateInvestigationOutput {
             investigation_id: id,

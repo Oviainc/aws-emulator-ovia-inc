@@ -14,6 +14,10 @@
 //! refused request, a read) moves it nowhere. The two halves of one sub-resource
 //! lifecycle therefore agree: the create and the delete both move it.
 //!
+//! This suite covers the families whose create takes a `Format` and a `Location`;
+//! `filter_detector_timestamp` and `investigation_detector_timestamp` assert the same
+//! rule over the two families whose creates carry other members.
+//!
 //! `UpdatedAt` is an ISO-8601 string with a fixed-width millisecond field
 //! (`smithy_query(operation="GetDetector")` models it as a String), so these
 //! assertions order the instants as text, which is all a client has.
@@ -43,8 +47,11 @@ struct Family {
     refused: Value,
 }
 
-/// Every sub-resource family whose create is implemented, so the rule is asserted on
-/// the whole class and not on the one family a recorded call cited. The rows differ
+/// Every sub-resource family whose create takes a `Format` and a `Location`, so the
+/// rule is asserted on the whole class and not on the one family a recorded call
+/// cited. The detector's other families, whose creates carry other members, are
+/// asserted by `filter_detector_timestamp` and `investigation_detector_timestamp`
+/// against the same rule. The rows differ
 /// along what the rule generalises over: the family, the `Format` (four members of
 /// the six-value enum — `smithy_query(shape="IpSetFormat")` and its three siblings
 /// declare TXT | STIX | OTX_CSV | ALIEN_VAULT | PROOF_POINT | FIRE_EYE), whether the
