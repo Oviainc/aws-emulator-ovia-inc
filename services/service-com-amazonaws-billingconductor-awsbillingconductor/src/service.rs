@@ -333,7 +333,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: VALIDATION_EXCEPTION.to_string(),
-                message: refusal_message(violations, &HashMap::new())?,
+                // No modelled operation means no input shape to read a violation's member
+                // path against, so the clause states its constraint without a value (see
+                // `validation::is_sensitive`).
+                message: refusal_message(violations, &HashMap::new(), None)?,
             }),
             // `Refusal` is `#[non_exhaustive]`: a refusal this service has no name of
             // its own for keeps the framework's wording.
@@ -586,7 +589,12 @@ fn modelled_refusal<Op: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &aws_smithy_runtime_api::http::Request,
 ) -> Option<crate::ops::types::ValidationException> {
-    let input = {
+    // The shape the request is read into, named as the model names it: it is what a
+    // violation's member path is read as a position in the model, which is how a clause
+    // knows whether the value it is about is one the model marks `@sensitive`.
+    let input_shape = Op::INPUT_SCHEMA.shape_id().to_string();
+    let input = Some(input_shape.as_str());
+    let input_value = {
         let mut deserializer = protocol.deserialize_input(req, Op::INPUT_SCHEMA).ok()?;
         match <Op::Input as DeserializableStruct>::deserialize(&mut *deserializer) {
             Ok(input) => input,
@@ -604,17 +612,23 @@ fn modelled_refusal<Op: Operation>(
                     value: None,
                 };
                 // Nothing was read, so there is no list value to render.
-                return refusal_message(&[absent], &HashMap::new()).map(validation_exception);
+                return refusal_message(&[absent], &HashMap::new(), input)
+                    .map(validation_exception);
             }
             // Any other codec failure is not a refusal this service rewords.
             Err(_) => return None,
         }
     };
-    let violations = constraints::validate(&input, Op::INPUT_SCHEMA);
+    let violations = constraints::validate(&input_value, Op::INPUT_SCHEMA);
     if violations.is_empty() {
         return None;
     }
-    refusal_message(&violations, &list_values(&input, Op::INPUT_SCHEMA)).map(validation_exception)
+    refusal_message(
+        &violations,
+        &list_values(&input_value, Op::INPUT_SCHEMA),
+        input,
+    )
+    .map(validation_exception)
 }
 
 /// This service's modelled refusal carrying `message` — the one place the boundary's

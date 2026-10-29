@@ -15,13 +15,14 @@
 //! 1. the envelope is AWS's `<N> validation error(s) detected: ` over one clause per
 //!    failing member, joined with `; ` ([`refusal_message`]);
 //! 2. a clause states the submitted value, the member's dotted path and the requirement it
-//!    failed — except on a member the model marks `@sensitive`, whose value is never
-//!    echoed ([`SENSITIVE_MEMBERS`], [`subject`]);
+//!    failed — except where the MODEL marks the value's shape, the member declaring it, or
+//!    (for a collection, whose rendering states what it holds) its elements `@sensitive`,
+//!    whose value is never echoed ([`is_sensitive`], [`subject`]);
 //! 3. a reported `@pattern` is the expression without the `^`/`$` anchors a model writes
 //!    to demand a whole-string match ([`unanchored`]);
 //! 4. a violation on the ELEMENTS of a list member is stated once, at that member, with
-//!    the element's requirement nested and the list itself as the value
-//!    ([`list_element_path`], [`list_values`]);
+//!    the element's requirement nested and, where the elements have a rendering of their
+//!    own, the list itself as the value ([`list_element_path`], [`list_values`]);
 //! 5. the clauses come out in the reverse of the order the walk found them — the order
 //!    this service's recorded multi-violation answers show (see [`refusal_message`]).
 //!
@@ -31,32 +32,58 @@
 //! the staged home for exactly those clause rules; as its header asks, this is the note
 //! rather than a silent further copy — migrating them re-words services whose recorded
 //! behaviour their own suites pin, so it is one change of its own. What is genuinely this
-//! service's own and would stay here is [`SENSITIVE_MEMBERS`] and the clause order.
+//! service's own and would stay here is the clause order.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::constraints::{self, Violation, ViolationKind};
 use aws_smithy_types::{BigDecimal, BigInteger, DateTime, Document};
+use serde_json::{Map, Value};
 
-/// The lowerCamel member names this service's model targets at a `@sensitive` shape, so
-/// a clause about one of them states the constraint WITHOUT echoing the value back.
+/// This service's Smithy model, read at compile time from the SAME file this crate's
+/// shapes are generated from.
 ///
-/// Source (`smithy_query` query="shape"): `BillingGroupName`, `CustomLineItemName`,
-/// `PricingPlanName`, `PricingRuleName`, `BillingGroupDescription`,
-/// `CustomLineItemDescription`, `PricingPlanDescription` and `PricingRuleDescription`
-/// all carry `sensitive: true`, and every input member that targets one of them (or a
-/// list of one — `ListCustomLineItemsFilter$Names` targets `CustomLineItemNameList`) is
-/// named `Name`, `Names` or `Description`. The two `@sensitive` shapes that are NOT
-/// listed here, `AccountName` and `AccountEmail`, carry no constraint and appear only in
-/// output, so no violation can ever name them.
-///
-/// Matched on the deepest NAMED segment of the violation path, which is why
-/// `ListBillingGroupsFilter$Names` — a list of `StringSearch`, whose constrained member
-/// is the non-sensitive `SearchValue` — correctly keeps its value: that path ends at
-/// `searchValue`, not at `names`.
-const SENSITIVE_MEMBERS: &[&str] = &["name", "names", "description"];
+/// Which values a clause withholds is the model's own `@sensitive`, so it is read off the
+/// model rather than restated here as a list of member NAMES: a name is not the trait —
+/// two filters of this service spell a member `Names`, one targeting a list of a
+/// `@sensitive` string and the other a list of a plain structure — and a restated list
+/// goes stale the moment the model changes.
+const MODEL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/smithy-model/com-amazonaws-billingconductor-awsbillingconductor.json"
+));
+
+/// The trait a model writes on a shape, or on the member declaring it, whose value is
+/// never echoed back.
+const SENSITIVE_TRAIT: &str = "smithy.api#sensitive";
+
+/// The Smithy member name a violation path carries for the step into a collection
+/// (`<list>.<1-based position>.member`, `<map>.<key>.member`), as
+/// [`constraints::path`] spells it. It names a position, not a member of the collection.
+const COLLECTION_STEP: &str = "member";
+
+/// How many collection levels deep a sensitivity test follows a value's shape before it
+/// stops. Nothing in a Smithy model nests collections anywhere near this far; the bound
+/// is what keeps the descent finite for any model at all.
+const MAX_COLLECTION_DEPTH: usize = 8;
+
+/// The model's shapes, by absolute shape id, parsed ONCE — on the first refusal this
+/// service words, and never for a request it serves.
+static SHAPES: LazyLock<Map<String, Value>> = LazyLock::new(|| {
+    match serde_json::from_str::<Value>(MODEL) {
+        Ok(Value::Object(mut model)) => match model.remove("shapes") {
+            Some(Value::Object(shapes)) => shapes,
+            _ => Map::new(),
+        },
+        // A model this crate's own shapes were generated from parses; a model that did
+        // not places no path, which [`is_sensitive`] answers in the direction that
+        // cannot leak.
+        _ => Map::new(),
+    }
+});
 
 /// Ceiling on a value rendered INTO a message, in bytes.
 ///
@@ -98,11 +125,17 @@ const LIST_BRACKETS: usize = 2;
 /// walk reports one violation per failing ELEMENT: rendering it here would rebuild the
 /// whole list for each of them, which is quadratic in a length the caller chooses.
 ///
+/// `input` is the absolute shape id of the input shape the violations were found against,
+/// and is what a member path is read as a position in the MODEL ([`is_sensitive`]); it is
+/// `None` for a refusal that named no modelled operation, where there is no input shape to
+/// read a path against.
+///
 /// `None` declines the whole refusal — a violation class this service has no wording for
 /// ([`ViolationKind`] is `#[non_exhaustive]`) keeps the framework's own.
 pub(super) fn refusal_message(
     violations: &[Violation],
     lists: &HashMap<String, String>,
+    input: Option<&str>,
 ) -> Option<String> {
     // One clause per (member path, requirement): the several element violations a list
     // member can carry fold into the one clause stated at that member, while a member that
@@ -124,7 +157,7 @@ pub(super) fn refusal_message(
         if !stated.insert((path.clone(), requirement.clone())) {
             continue;
         }
-        let subject = subject(&path, violation, lists);
+        let subject = subject(input, &path, violation, lists);
         clauses.push(format!(
             "{subject} at '{path}' failed to satisfy constraint: {requirement}"
         ));
@@ -178,16 +211,21 @@ fn requirement_of(kind: &ViolationKind) -> Option<String> {
 /// The value half of a clause: what the member held.
 ///
 /// * an ABSENT member has no value at all and is reported as the null it was;
-/// * a `@sensitive` member names no value — the constraint it broke is the whole of what
-///   a caller needs, and the value belongs in nobody's logs;
+/// * a value the model marks `@sensitive` names no value — the constraint it broke is the
+///   whole of what a caller needs, and the value belongs in nobody's logs;
 /// * a LIST member is reported as the list the caller sent, bracketed and already bounded
 ///   by [`rendered_list`];
 /// * everything else echoes the value the framework stored, already elided.
-fn subject(path: &str, violation: &Violation, lists: &HashMap<String, String>) -> String {
+fn subject(
+    input: Option<&str>,
+    path: &str,
+    violation: &Violation,
+    lists: &HashMap<String, String>,
+) -> String {
     if violation.value.is_none() {
         return "Value null".to_string();
     }
-    if is_sensitive(path) {
+    if is_sensitive(input, path) {
         return "Value".to_string();
     }
     if let Some(rendered) = lists.get(path) {
@@ -227,16 +265,118 @@ fn list_element_path(path: &str) -> Option<&str> {
     indexed.then_some(list)
 }
 
-/// Does `path` name a member this service's model targets at a `@sensitive` shape?
+/// Does the value `path` names hold something the MODEL marks `@sensitive`, so the clause
+/// about it states the constraint and no value?
 ///
-/// Read off the deepest NAMED segment — the index and collection steps a path carries
-/// (`1`, `member`) name a position, not a member.
-fn is_sensitive(path: &str) -> bool {
-    path.split('.')
-        .rfind(|segment| {
-            *segment != "member" && !segment.bytes().all(|byte| byte.is_ascii_digit())
+/// Decided from the model, never from how a member is SPELLED: `path` is walked through
+/// the model's own declarations from `input`, the input shape the violations were found
+/// against, and the value it lands on is sensitive when that declaration — the member, the
+/// shape it targets, or, where that shape is a collection, the elements (or keys and
+/// values) a rendering of it would state — carries the trait. So the two members this
+/// service spells `names` are answered differently, as the model declares them: one
+/// targets a list of a `@sensitive` string and keeps its value out of the message, the
+/// other a list of a plain structure and states what was sent.
+///
+/// A path the model cannot place — and every path when the refusal named no modelled
+/// operation, so there is no input shape to read it against — is treated as sensitive: a
+/// value whose declaration cannot be found is one whose sensitivity is unknown, and
+/// stating no value is the only direction that cannot put a secret in a response.
+fn is_sensitive(input: Option<&str>, path: &str) -> bool {
+    let shapes = &*SHAPES;
+    let Some((member, shape)) = input.and_then(|input| declared_at(shapes, input, path)) else {
+        return true;
+    };
+    marked_sensitive(member) || sensitive_value(shapes, shape, MAX_COLLECTION_DEPTH)
+}
+
+/// The model declarations a violation path names: the MEMBER it ends at and the shape
+/// that member targets, or `None` for a path the model cannot place.
+///
+/// Each segment is read against the shape reached so far. A named segment is a member of
+/// that shape, compared in the one lowerCamel spelling every violation path is written in
+/// ([`constraints::path::member`], the same call the walk that produced the path makes). A
+/// segment that steps INTO a collection — a list element's 1-based position or a map
+/// entry's caller-chosen key, each followed by [`COLLECTION_STEP`] when the path descends
+/// through it — names a position rather than a member, so the collection's element (or
+/// value) declaration is what the rest of the path is read against.
+fn declared_at<'m>(
+    shapes: &'m Map<String, Value>,
+    input: &str,
+    path: &str,
+) -> Option<(&'m Value, &'m Value)> {
+    let mut shape = shapes.get(input)?;
+    let mut member: Option<&Value> = None;
+    let mut segments = path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        let declaration = match shape_type(shape) {
+            Some(collection @ ("list" | "map")) => {
+                if segments.peek() == Some(&COLLECTION_STEP) {
+                    segments.next();
+                }
+                let slot = if collection == "list" { "member" } else { "value" };
+                shape.get(slot)?
+            }
+            _ => members_of(shape)?
+                .iter()
+                .find(|(name, _)| constraints::path::member(name) == segment)
+                .map(|(_, declaration)| declaration)?,
+        };
+        shape = target_of(shapes, declaration)?;
+        member = Some(declaration);
+    }
+    Some((member?, shape))
+}
+
+/// A shape's `type`, as the model spells it.
+fn shape_type(shape: &Value) -> Option<&str> {
+    shape.get("type")?.as_str()
+}
+
+/// The members a structure or union shape declares.
+fn members_of(shape: &Value) -> Option<&Map<String, Value>> {
+    shape.get("members")?.as_object()
+}
+
+/// The shape a member declaration targets.
+fn target_of<'m>(shapes: &'m Map<String, Value>, declaration: &Value) -> Option<&'m Value> {
+    shapes.get(declaration.get("target")?.as_str()?)
+}
+
+/// Does this declaration — a shape, or the member declaring one — carry `@sensitive`?
+fn marked_sensitive(declaration: &Value) -> bool {
+    declaration
+        .get("traits")
+        .and_then(|traits| traits.get(SENSITIVE_TRAIT))
+        .is_some()
+}
+
+/// Is a value of `shape` one the model keeps out of a message: the shape itself marked
+/// `@sensitive`, or — where it is a collection, whose rendering states what it holds — its
+/// elements, or a map's keys and values, declared or targeted at one that is?
+///
+/// A STRUCTURE is not descended into: a clause states a structure member only as the null
+/// it was when absent, so no member of one is ever rendered into a message.
+fn sensitive_value(shapes: &Map<String, Value>, shape: &Value, depth: usize) -> bool {
+    if marked_sensitive(shape) {
+        return true;
+    }
+    // Past the bound the shape of the value is no longer known here, which is the same
+    // unknown [`is_sensitive`] answers by stating no value.
+    if depth == 0 {
+        return true;
+    }
+    let slots: &[&str] = match shape_type(shape) {
+        Some("list") => &["member"],
+        Some("map") => &["key", "value"],
+        _ => return false,
+    };
+    slots.iter().any(|slot| {
+        shape.get(*slot).is_some_and(|declaration| {
+            marked_sensitive(declaration)
+                || target_of(shapes, declaration)
+                    .is_some_and(|target| sensitive_value(shapes, target, depth - 1))
         })
-        .is_some_and(|segment| SENSITIVE_MEMBERS.contains(&segment))
+    })
 }
 
 /// One list member as a clause states it: the elements the caller sent, joined and
@@ -274,14 +414,20 @@ fn rendered_list(elements: &[String], total: usize) -> String {
     format!("{}... [{total} bytes]", &rendered[..end])
 }
 
-/// Every LIST member of a request, keyed by the lowerCamel member path the validating
-/// walk reports it under, and rendered ONCE (see [`rendered_list`]).
+/// Every LIST member of a request whose elements a clause can state, keyed by the
+/// lowerCamel member path the validating walk reports it under, and rendered ONCE (see
+/// [`rendered_list`]).
 ///
 /// A constraint on a list's element shape is violated by ONE element, and the framework
 /// reports it at that element (`accountIds.1.member`); AWS reports it at the list member
 /// and states the value that member holds — the whole list, not the element. That value
 /// is not on the violation, so it is read off the request here, through the same
 /// `SerializableStruct` walk the validator uses.
+///
+/// A list is collected only when EVERY element it holds rendered (see
+/// [`ListValues::write_list`]): the rendering states the elements, so a list whose
+/// elements have no rendering of their own — a list of structures — would otherwise be
+/// stated as a shorter list than the caller sent.
 pub(super) fn list_values(
     input: &dyn SerializableStruct,
     schema: &Schema,
@@ -304,6 +450,11 @@ enum Frame {
         /// [`MAX_ECHOED_VALUE`] bytes are in hand, so one request cannot make the server
         /// hold a copy of an arbitrarily long list.
         elements: Vec<String>,
+        /// How many elements rendered at all, kept or dropped for the budget — the
+        /// measure of whether this list can be stated as its elements.
+        rendered: usize,
+        /// How many elements the list holds, each one counted whether it rendered or not.
+        written: usize,
         /// The bytes `elements` would render as, the measure the budget above is spent
         /// against.
         kept: usize,
@@ -358,10 +509,14 @@ impl ListValues {
     fn record(&mut self, rendered: &str) {
         if let Some(Frame::List {
             elements,
+            rendered: count,
+            written,
             kept,
             total,
         }) = self.frames.last_mut()
         {
+            *count = count.saturating_add(1);
+            *written = written.saturating_add(1);
             // `, ` before every element but the first: the same shape `rendered_list`
             // builds.
             let separator: usize = if elements.is_empty() { 0 } else { 2 };
@@ -373,6 +528,15 @@ impl ListValues {
             }
         }
     }
+
+    /// Count one element of the innermost list that has no rendering of its own: a
+    /// structure, or a collection. It takes its place in the list's length without
+    /// contributing to the rendering, which is what makes that rendering incomplete.
+    fn note_unrendered(&mut self) {
+        if let Some(Frame::List { written, .. }) = self.frames.last_mut() {
+            *written = written.saturating_add(1);
+        }
+    }
 }
 
 impl ShapeSerializer for ListValues {
@@ -381,6 +545,7 @@ impl ShapeSerializer for ListValues {
         schema: &Schema,
         value: &dyn SerializableStruct,
     ) -> Result<(), SerdeError> {
+        self.note_unrendered();
         let pushed = self.push_segment(schema);
         self.frames.push(Frame::Opaque);
         let out = value.serialize_members(self);
@@ -394,19 +559,33 @@ impl ShapeSerializer for ListValues {
         schema: &Schema,
         write_elements: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
+        self.note_unrendered();
         let pushed = self.push_segment(schema);
         self.frames.push(Frame::List {
             elements: Vec::new(),
+            rendered: 0,
+            written: 0,
             kept: LIST_BRACKETS,
             total: LIST_BRACKETS,
         });
         let out = write_elements(self);
         if let Some(Frame::List {
-            elements, total, ..
+            elements,
+            rendered,
+            written,
+            total,
+            ..
         }) = self.frames.pop()
         {
-            self.values
-                .insert(self.path.join("."), rendered_list(&elements, total));
+            // The rendering STATES the elements, so it is only this member's value when
+            // every element the caller sent is in it: a list of structures renders no
+            // element at all, and stating it as the empty list would report a value the
+            // caller never sent. Such a member is left out, and its clause keeps the
+            // value the framework stored on the violation.
+            if rendered == written {
+                self.values
+                    .insert(self.path.join("."), rendered_list(&elements, total));
+            }
         }
         self.pop_segment(pushed);
         out
@@ -417,6 +596,7 @@ impl ShapeSerializer for ListValues {
         schema: &Schema,
         write_entries: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
+        self.note_unrendered();
         let pushed = self.push_segment(schema);
         // A map's keys and values are not list elements, and AWS states a violation
         // inside one at the entry rather than at the map, so nothing here collects.
@@ -497,6 +677,12 @@ impl ShapeSerializer for ListValues {
     }
 
     fn write_null(&mut self, _schema: &Schema) -> Result<(), SerdeError> {
+        // A null element of a list has no rendering, so it takes its place in the list's
+        // length without contributing one — the same incompleteness a structure element
+        // carries, and what keeps the member from being stated as a shorter list than was
+        // sent. An absent struct MEMBER reaches here too, and counts for nothing: the
+        // innermost frame is then the struct's, not a list's.
+        self.note_unrendered();
         Ok(())
     }
 }
