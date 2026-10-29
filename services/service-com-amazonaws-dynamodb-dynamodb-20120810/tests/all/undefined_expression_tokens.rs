@@ -29,7 +29,11 @@ use crate::table_items::create_active_table;
 const TABLE: &str = "UndefinedTokens";
 
 /// The clause AWS states for a `#name` token no `ExpressionAttributeNames` entry defines.
-fn undefined_name_clause(token: &str) -> String {
+///
+/// The four wording helpers below are this crate's ONE statement of the sentences these
+/// two diagnoses carry, shared with every suite that drives the same rule through another
+/// operation, so the expected wording cannot drift between them.
+pub(crate) fn undefined_name_clause(token: &str) -> String {
     format!(
         "An expression attribute name used in the document path is not defined; \
          attribute name: {token}"
@@ -38,14 +42,14 @@ fn undefined_name_clause(token: &str) -> String {
 
 /// The clause AWS states for a `:value` token no `ExpressionAttributeValues` entry
 /// defines.
-fn undefined_value_clause(token: &str) -> String {
+pub(crate) fn undefined_value_clause(token: &str) -> String {
     format!("An expression attribute value used in expression is not defined; attribute value: {token}")
 }
 
 /// The whole sentence for a clause the expression language raises, stated behind the
 /// member that carried it. The two members a write states its intent through are stated
 /// inside the validation envelope; the members a read narrows its result with are not.
-fn expression_refusal(member: &str, clause: &str) -> String {
+pub(crate) fn expression_refusal(member: &str, clause: &str) -> String {
     let stated = format!("Invalid {member}: {clause}");
     if member == "UpdateExpression" || member == "ConditionExpression" {
         return format!("1 validation error detected: {stated}");
@@ -54,7 +58,7 @@ fn expression_refusal(member: &str, clause: &str) -> String {
 }
 
 /// The sentence AWS states for entries of `member` that no expression referenced.
-fn unused_entries(member: &str, keys: &[&str]) -> String {
+pub(crate) fn unused_entries(member: &str, keys: &[&str]) -> String {
     format!(
         "Value provided in {member} unused in expressions: keys: {{{}}}",
         keys.join(", ")

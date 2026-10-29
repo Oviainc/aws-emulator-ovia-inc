@@ -158,6 +158,9 @@ mod tag_read_propagation;
 #[path = "all/time_to_live.rs"]
 mod time_to_live;
 
+#[path = "all/transactional_undefined_expression_tokens.rs"]
+mod transactional_undefined_expression_tokens;
+
 #[path = "all/undefined_expression_tokens.rs"]
 mod undefined_expression_tokens;
 
