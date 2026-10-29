@@ -47,6 +47,8 @@ mod policy_name_identity;
 mod predefined_metric_resource_label_identity;
 #[path = "all/predictive_scaling_predicate.rs"]
 mod predictive_scaling_predicate;
+#[path = "all/resource_label_format.rs"]
+mod resource_label_format;
 #[path = "all/scaling_instruction_validation.rs"]
 mod scaling_instruction_validation;
 #[path = "all/scaling_mode_conditional_members.rs"]

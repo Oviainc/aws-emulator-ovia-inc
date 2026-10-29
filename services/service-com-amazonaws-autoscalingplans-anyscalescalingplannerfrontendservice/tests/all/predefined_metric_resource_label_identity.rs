@@ -163,7 +163,7 @@ fn metric_pairs() -> Vec<MetricPair> {
         },
         MetricPair {
             case: "the same label text split differently by the separator",
-            first: alb("app/my-lb/abc123/targetgroup/tg-a/1/2".to_string()),
+            first: alb("app/my-lb/abc123/targetgroup/tg-a1/2".to_string()),
             second: alb("app/my-lb/abc123/targetgroup/tg-a/12".to_string()),
             same_metric: false,
         },

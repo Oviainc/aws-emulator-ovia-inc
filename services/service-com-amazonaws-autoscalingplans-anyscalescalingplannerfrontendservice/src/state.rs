@@ -946,6 +946,26 @@ pub const ALB_SCALING_METRIC_TYPE: &str = "ALBRequestCountPerTarget";
 /// specify a resource label unless the metric type is ALBTargetGroupRequestCount".
 pub const ALB_LOAD_METRIC_TYPE: &str = "ALBTargetGroupRequestCount";
 
+/// The format BOTH `ResourceLabel` members document for the value they carry, in their
+/// own words: "You create the resource label by appending the final portion of the load
+/// balancer ARN and the final portion of the target group ARN into a single value,
+/// separated by a forward slash (/). The format is
+/// app/<load-balancer-name>/<load-balancer-id>/targetgroup/<target-group-name>/<target-group-id>"
+/// (`smithy_query(query="doc",shape="PredefinedScalingMetricSpecification",member="ResourceLabel")`
+/// and the identical paragraph on `PredefinedLoadMetricSpecification$ResourceLabel`).
+///
+/// `pub` so the refusal and any caller that has to name the format spell it once.
+pub const RESOURCE_LABEL_FORMAT: &str =
+    "app/<load-balancer-name>/<load-balancer-id>/targetgroup/<target-group-name>/<target-group-id>";
+
+/// The marker the load balancer's portion of a resource label opens with — the first
+/// segment of an Application Load Balancer's ARN resource path, hence of its "final
+/// portion", as the format above spells it.
+const LOAD_BALANCER_MARKER: &str = "app";
+
+/// The marker the target group's portion opens with, from the same format.
+const TARGET_GROUP_MARKER: &str = "targetgroup";
+
 /// `CustomizedLoadMetricSpecification$Statistic`: "The only valid value is Sum."
 pub const LOAD_METRIC_STATISTIC: &str = "Sum";
 
@@ -1397,6 +1417,45 @@ fn metric_specification_required(at: &str) -> String {
     )
 }
 
+/// Whether `label` is a resource label, i.e. is in the format both `ResourceLabel`
+/// members document ([`RESOURCE_LABEL_FORMAT`]).
+///
+/// The value is "the final portion of the load balancer ARN and the final portion of the
+/// target group ARN" joined "by a forward slash (/)": the load balancer's portion is its
+/// `app/<name>/<id>` resource path and the target group's is its
+/// `targetgroup/<name>/<id>` one, so a label is exactly six slash-separated segments —
+/// the two markers in their documented places, each followed by a name and an id that
+/// name something. The modelled `length {min: 1, max: 1023}` is what bounds the value's
+/// SIZE, so nothing here repeats that.
+fn is_resource_label(label: &str) -> bool {
+    let segments: Vec<&str> = label.split('/').collect();
+    let [marker, lb_name, lb_id, group_marker, group_name, group_id] = segments.as_slice() else {
+        return false;
+    };
+    *marker == LOAD_BALANCER_MARKER
+        && *group_marker == TARGET_GROUP_MARKER
+        && [lb_name, lb_id, group_name, group_id]
+            .iter()
+            .all(|segment| !segment.is_empty())
+}
+
+/// Refuse a `ResourceLabel` a caller wrote that is not in the format the member's own
+/// documentation states; a label in that format, and a specification carrying none, are
+/// accepted.
+///
+/// Both members that carry a resource label document ONE format for it, so both write
+/// paths check it here and word the refusal the same way: `member` is the wire path of
+/// the specification the label sits in, as this crate's validation failures name it.
+fn check_resource_label(member: &str, label: Option<&str>) -> Result<(), String> {
+    match label {
+        Some(label) if !is_resource_label(label) => Err(format!(
+            "{member}.ResourceLabel: Value '{label}' failed to satisfy constraint: Member \
+             must be in the format {RESOURCE_LABEL_FORMAT}"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// A predefined scaling metric: a modelled metric type that measures the resource the
 /// instruction scales, and a resource label only where one is allowed.
 fn validate_predefined_scaling_metric(
@@ -1428,7 +1487,9 @@ fn validate_predefined_scaling_metric(
              type is {ALB_SCALING_METRIC_TYPE}"
         ));
     }
-    Ok(())
+    // A label that may be specified still has to BE a resource label: it identifies the
+    // target group the metric is measured on, and only the documented format does.
+    check_resource_label(&member, specification.resource_label.as_deref())
 }
 
 /// Whether this instruction configures predictive scaling.
@@ -1508,6 +1569,8 @@ fn validate_predictive_scaling(
                  metric type is {ALB_LOAD_METRIC_TYPE}"
             ));
         }
+        // The same documented format decides what a label on this member may be.
+        check_resource_label(&member, specification.resource_label.as_deref())?;
     }
     if let Some(specification) = customized {
         // "The statistic of the metric. The only valid value is Sum."
