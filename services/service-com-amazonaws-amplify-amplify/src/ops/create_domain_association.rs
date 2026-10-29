@@ -206,11 +206,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // Minted before the app lookup because minting reaches the store itself; the
-        // sequence behind it is monotonic, so a refused create simply leaves the
-        // value it minted unused.
-        let verification_dns_record = store.mint_certificate_verification_record(&input.domain_name);
-
         // A domain association only exists as part of an app, so an unknown `appId`
         // is a 404 rather than an app created on the way.
         let app = store.apps.get_mut(&input.app_id).ok_or_else(|| {
@@ -259,11 +254,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .sub_domain_settings
             .into_iter()
             .map(|setting| SubDomain {
-                dns_record: sub_domain_dns_record(
-                    &setting,
-                    &input.domain_name,
-                    &app.app.default_domain,
-                ),
+                // The record the caller must publish does not exist yet: at creation
+                // neither the certificate nor the address it would point at has been
+                // issued, so the association reports the unresolved placeholder.
+                dns_record: crate::state::pending_sub_domain_dns_record(&setting.prefix),
                 // Nothing is verified until the domain's DNS records are observed,
                 // which is what the association's own status waits for.
                 verified: false,
@@ -284,12 +278,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `updateStatus` reports "the domain update operation that is currently
             // in progress", and creating an association is not an update of one.
             update_status: None,
-            // The @required `statusReason` has no value while the association is
-            // simply proceeding; the status that waits on the caller states why.
-            status_reason: String::new(),
-            // The certificate has not been requested yet, so there is no
-            // verification record to publish; the clock reports it from the status
-            // that requests the certificate onwards.
+            // The reason the service gives for the status the association is in,
+            // which for a status it has nothing to add about is no reason at all;
+            // the wire projection leaves the member out of the body.
+            status_reason: crate::state::domain_status_reason(
+                crate::state::DOMAIN_STATUS_CREATING,
+            )
+            .to_string(),
+            // No certificate has been issued for this association, so there is no
+            // record any certificate authority would validate against: the member
+            // stays absent rather than carrying a record nothing issued.
             certificate_verification_dns_record: None,
             sub_domains,
             certificate: Some(Certificate {
@@ -301,31 +299,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         app.domains.insert(
             input.domain_name,
-            crate::state::AmplifyDomain::created(association.clone(), verification_dns_record),
+            crate::state::AmplifyDomain::created(association.clone()),
         );
 
         Ok(CreateDomainAssociationOutput {
-            domain_association: association,
+            // The record this call WROTE: its subdomain settings are the caller's own
+            // configuration, echoed with the members that configuration carries (see
+            // `DomainAssociationProjection`).
+            domain_association: DomainAssociationProjection::written(association),
         })
     }
-}
-
-/// The DNS record one subdomain of an association is served through.
-///
-/// A subdomain points the name the setting's `prefix` makes under the associated
-/// domain — the domain itself when the prefix is empty, which is the apex — at the
-/// branch's own Amplify-managed address, which is `branchName` under the app's
-/// `defaultDomain`. Every part of it comes from the request and from the app's own
-/// record, so a reader reports the record the association was created with.
-fn sub_domain_dns_record(
-    setting: &SubDomainSetting,
-    domain_name: &str,
-    app_default_domain: &str,
-) -> String {
-    let name = if setting.prefix.is_empty() {
-        domain_name.to_string()
-    } else {
-        format!("{}.{domain_name}", setting.prefix)
-    };
-    format!("{name} CNAME {}.{app_default_domain}", setting.branch_name)
 }

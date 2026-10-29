@@ -19,8 +19,8 @@ pub struct DeleteDomainAssociationInput {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.amplify#DeleteDomainAssociationResult")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DeleteDomainAssociationOutput {
-    pub domain_association: DomainAssociation,
+    pub domain_association: DomainAssociationProjection,
 }
 

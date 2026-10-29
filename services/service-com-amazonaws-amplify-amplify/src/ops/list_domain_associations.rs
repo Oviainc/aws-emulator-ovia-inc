@@ -195,9 +195,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let (domain_associations, next_token) = crate::state::page(
-            app.domains
-                .iter()
-                .map(|(domain_name, stored)| (domain_name.clone(), stored.association.clone())),
+            app.domains.iter().map(|(domain_name, stored)| {
+                (
+                    domain_name.clone(),
+                    DomainAssociationProjection::reported(stored.association.clone()),
+                )
+            }),
             input.next_token.as_deref(),
             crate::state::page_size(input.max_results, MAX_RESULTS),
         );

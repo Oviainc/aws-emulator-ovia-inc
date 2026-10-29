@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! How this service puts a persisted [`App`] or [`Branch`] on the wire.
+//! How this service puts a persisted [`App`], [`Branch`] or [`DomainAssociation`] on
+//! the wire.
 //!
-//! Amplify answers with a COMPLETE record. Three properties of that record cannot be
-//! expressed by the generated serializer alone, and all three are what this module
-//! adds:
+//! Amplify answers with a COMPLETE record for an app and a branch. Three properties
+//! of that record cannot be expressed by the generated serializer alone, and all
+//! three are what this module adds:
 //!
 //! * **Every modelled member reaches the wire.** The generated serializer skips an
 //!   `Option` member that holds `None`, so `Branch$buildSpec`,
@@ -40,6 +41,12 @@
 //! Every operation that answers with an app or a branch — single record or list
 //! element — answers through these two types, so a `ListBranches` element and a
 //! `GetBranch` body cannot disagree about the same branch.
+//!
+//! A DOMAIN ASSOCIATION is the opposite case, and [`DomainAssociationProjection`] is
+//! what it answers through: it is provisioned asynchronously, so its record is
+//! incomplete while that provisioning runs and Amplify sends only the members it
+//! already has a value for. That projection therefore DROPS a member with no value
+//! instead of completing it.
 
 use super::*;
 
@@ -194,6 +201,236 @@ impl DeserializableStruct for BranchProjection {
         Ok(Self(<Branch as DeserializableStruct>::deserialize(
             deserializer,
         )?))
+    }
+}
+
+/// A [`DomainAssociation`] as every operation that returns one writes it.
+///
+/// A domain association is provisioned ASYNCHRONOUSLY, so unlike an app or a branch
+/// its record is INCOMPLETE until the provisioning ends: Amplify sends only the
+/// members it already has a value for, and a member it does not is absent from the
+/// body rather than present and empty. The generated serializer skips an `Option`
+/// member holding `None` on its own; this projection extends that to the `@required`
+/// members whose "no value" can only be the empty string, wherever they sit in the
+/// record.
+///
+/// Which members those are depends on what the operation ANSWERS, exactly as it does
+/// for an app or a branch: the operation that wrote the association echoes the
+/// subdomain settings the request configured, while a REPORTING operation answers
+/// the service's own view of each subdomain. See [`Self::written`] and
+/// [`Self::reported`].
+#[derive(Debug, Clone)]
+pub struct DomainAssociationProjection {
+    /// The association record, as stored.
+    record: DomainAssociation,
+    /// The members this answer leaves out when they have no value.
+    unsent: &'static [&'static str],
+}
+
+impl DomainAssociationProjection {
+    /// The shape this projects is still `com.amazonaws.amplify#DomainAssociation`;
+    /// see [`AppProjection::SCHEMA`].
+    pub const SCHEMA: Schema = DomainAssociation::SCHEMA;
+
+    /// The association as the operation that WROTE the record answers it
+    /// (`CreateDomainAssociation`): the service has stated no reason for a status it
+    /// has nothing to add about, so `statusReason` is left out — but the subdomain
+    /// settings are the CALLER's configuration, echoed with the members that
+    /// configuration carries, including a `prefix` the request stated as empty.
+    pub fn written(association: DomainAssociation) -> Self {
+        Self {
+            record: association,
+            unsent: UNSENT_WHEN_WRITTEN,
+        }
+    }
+
+    /// The association as a REPORTING operation answers it (`GetDomainAssociation`,
+    /// `ListDomainAssociations`): the service's own view of the association, which
+    /// carries a member only where it has a value for it — so the subdomain that IS
+    /// the domain reports no prefix.
+    pub fn reported(association: DomainAssociation) -> Self {
+        Self {
+            record: association,
+            unsent: UNSENT_WHEN_REPORTED,
+        }
+    }
+}
+
+impl SerializableStruct for DomainAssociationProjection {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ShapeSerializer,
+    ) -> ::std::result::Result<(), SerdeError> {
+        ValuedMembers {
+            record: &self.record,
+            unsent: self.unsent,
+        }
+        .serialize_members(serializer)
+    }
+}
+
+impl DeserializableStruct for DomainAssociationProjection {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, SerdeError> {
+        Ok(Self::reported(<DomainAssociation as DeserializableStruct>::deserialize(
+            deserializer,
+        )?))
+    }
+}
+
+/// The member a domain-association record never carries without a value, whichever
+/// operation answers it.
+///
+/// `DomainAssociation$statusReason` ("additional information that describes why the
+/// domain association is in the current state") is `@required` with a `length`
+/// minimum of 0 (`smithy_query(query="shape",shape="DomainAssociation")`), so the
+/// generated record holds it as a bare `String` and the generated serializer writes
+/// that type's zero value, `""`. A client that tests whether the member is PRESENT —
+/// to decide whether the service has said anything about the association's state —
+/// draws the opposite conclusion from `""`, so a reason the service does not have is
+/// dropped from the body.
+const UNSENT_WHEN_WRITTEN: &[&str] = &["statusReason"];
+
+/// The members a REPORTED domain association leaves out: the one above, plus
+/// `SubDomainSetting$prefix` ("the prefix setting for the subdomain", `@required`,
+/// `length` minimum 0 — `smithy_query(query="shape",shape="SubDomainSetting")`),
+/// which the service reports only for a subdomain that HAS a prefix: the empty
+/// prefix is the apex, the associated domain itself.
+const UNSENT_WHEN_REPORTED: &[&str] = &["statusReason", "prefix"];
+
+/// `record`, written with every member of `unsent` it has no value for left out — at
+/// any depth, since the members concerned sit both on the record and inside the
+/// structures its `subDomains` list carries.
+struct ValuedMembers<'r> {
+    record: &'r dyn SerializableStruct,
+    unsent: &'static [&'static str],
+}
+
+impl SerializableStruct for ValuedMembers<'_> {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ShapeSerializer,
+    ) -> ::std::result::Result<(), SerdeError> {
+        self.record.serialize_members(&mut Valued {
+            inner: serializer,
+            unsent: self.unsent,
+        })
+    }
+}
+
+/// A [`ShapeSerializer`] that DROPS the write of a member with no value and passes
+/// every other write through, re-wrapping the structures, lists and maps below it so
+/// one rule holds for the whole record.
+struct Valued<'s> {
+    inner: &'s mut dyn ShapeSerializer,
+    unsent: &'static [&'static str],
+}
+
+impl Valued<'_> {
+    /// Is this write one the service has no value for, and so one Amplify does not
+    /// send? Decided from the VALUE as well as the member, because the same member —
+    /// a subdomain's `prefix` — is sent for one element of a list and not for
+    /// another.
+    fn unsent(&self, schema: &Schema, value: &str) -> bool {
+        value.is_empty()
+            && schema
+                .member_name()
+                .is_some_and(|name| self.unsent.contains(&name))
+    }
+}
+
+/// Emit the [`ShapeSerializer`] methods that write a member this projection never
+/// drops: a member of one of these types either has a value or is not one of the
+/// members with no value, so the write goes straight to the inner serializer.
+macro_rules! pass_through {
+    ($( fn $method:ident($($arg:ident: $ty:ty),*); )*) => {
+        $(
+            fn $method(
+                &mut self,
+                schema: &Schema,
+                $($arg: $ty),*
+            ) -> ::std::result::Result<(), SerdeError> {
+                self.inner.$method(schema, $($arg),*)
+            }
+        )*
+    };
+}
+
+impl ShapeSerializer for Valued<'_> {
+    pass_through! {
+        fn write_boolean(value: bool);
+        fn write_byte(value: i8);
+        fn write_short(value: i16);
+        fn write_integer(value: i32);
+        fn write_long(value: i64);
+        fn write_float(value: f32);
+        fn write_double(value: f64);
+        fn write_big_integer(value: &BigInteger);
+        fn write_big_decimal(value: &BigDecimal);
+        fn write_blob(value: &[u8]);
+        fn write_timestamp(value: &DateTime);
+        fn write_document(value: &Document);
+        fn write_null();
+    }
+
+    /// The one write that can be dropped: the members with no value are strings.
+    fn write_string(
+        &mut self,
+        schema: &Schema,
+        value: &str,
+    ) -> ::std::result::Result<(), SerdeError> {
+        if self.unsent(schema, value) {
+            return Ok(());
+        }
+        self.inner.write_string(schema, value)
+    }
+
+    /// A nested structure is written under the same rule as the record carrying it.
+    fn write_struct(
+        &mut self,
+        schema: &Schema,
+        value: &dyn SerializableStruct,
+    ) -> ::std::result::Result<(), SerdeError> {
+        let unsent = self.unsent;
+        self.inner.write_struct(
+            schema,
+            &ValuedMembers {
+                record: value,
+                unsent,
+            },
+        )
+    }
+
+    /// A list's elements are written to the serializer this hands the closure, so
+    /// the rule reaches the structures inside `subDomains`.
+    fn write_list(
+        &mut self,
+        schema: &Schema,
+        write_elements: &dyn Fn(&mut dyn ShapeSerializer) -> ::std::result::Result<(), SerdeError>,
+    ) -> ::std::result::Result<(), SerdeError> {
+        let unsent = self.unsent;
+        self.inner.write_list(schema, &|elements| {
+            write_elements(&mut Valued {
+                inner: elements,
+                unsent,
+            })
+        })
+    }
+
+    /// A map's entries, for the same reason as a list's elements.
+    fn write_map(
+        &mut self,
+        schema: &Schema,
+        write_entries: &dyn Fn(&mut dyn ShapeSerializer) -> ::std::result::Result<(), SerdeError>,
+    ) -> ::std::result::Result<(), SerdeError> {
+        let unsent = self.unsent;
+        self.inner.write_map(schema, &|entries| {
+            write_entries(&mut Valued {
+                inner: entries,
+                unsent,
+            })
+        })
     }
 }
 

@@ -21,7 +21,7 @@
 //! 3. Associating a domain is asynchronous: the association is created in the first
 //!    status of the modelled progression, the clock owes it the later ones, a read
 //!    materialises every step already due and never walks backwards, and the record
-//!    is the same on every read once the progression ends.
+//!    is the same on every read once the association reaches its TERMINAL status.
 //! 4. An association is addressed through its app, so an unknown app, an unknown
 //!    domain, or a domain associated with another app is the modelled 404, and a
 //!    second create under the same name is the modelled 400.
@@ -40,8 +40,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use service_com_amazonaws_amplify_amplify::state::{
-    DNS_UNVERIFIED_REASON, DOMAIN_NAME_PATTERN, DOMAIN_STATUS_SEQUENCE, DOMAIN_STATUS_STEP_MILLIS,
-    MAX_DOMAIN_ASSOCIATIONS_PER_APP,
+    CERTIFICATE_VERIFICATION_FAILED_REASON, DOMAIN_NAME_PATTERN, DOMAIN_STATUS_SEQUENCE,
+    DOMAIN_STATUS_STEP_MILLIS, MAX_DOMAIN_ASSOCIATIONS_PER_APP,
 };
 
 use crate::app_branch_lifecycle::{bool_member, list_member, string_member, Emulator, Reply};
@@ -49,13 +49,17 @@ use crate::app_branch_lifecycle::{bool_member, list_member, string_member, Emula
 /// The status a create answers with: the first of the modelled progression.
 const CREATING: &str = "CREATING";
 
-/// The status at which the certificate has been requested, and so the first one that
-/// reports a `certificateVerificationDNSRecord`.
+/// The status at which the association's certificate has been requested and not
+/// issued yet.
 const REQUESTING_CERTIFICATE: &str = "REQUESTING_CERTIFICATE";
 
-/// The last status the clock owes a new association: nothing here resolves DNS, so no
-/// record of the caller's is ever observed.
+/// The status at which the association waits for the domain's DNS records.
 const PENDING_VERIFICATION: &str = "PENDING_VERIFICATION";
+
+/// The TERMINAL status the clock drives a new association to: nothing here resolves
+/// DNS, so no record of the caller's is ever observed and the certificate cannot be
+/// issued.
+const FAILED: &str = "FAILED";
 
 /// The certificate types `CertificateType` models
 /// (`smithy_query(query="shape",shape="CertificateType")`).
@@ -112,9 +116,12 @@ fn optional_member(record: &Value, member: &str) -> Value {
     record.get(member).cloned().unwrap_or(Value::Null)
 }
 
-/// The record without the members the CLOCK owns — the status, the reason it carries
-/// and the certificate verification record, each of which changes as the association
-/// proceeds. What is left is what a create and every later read must agree on.
+/// The record without the members the CLOCK owns — the status and the reason it
+/// carries, the certificate verification record and the certificate — each of which
+/// changes as the association proceeds, and without the subdomain `prefix` the two
+/// views state differently: a create ECHOES the prefix the request configured,
+/// including the empty one, while a read reports a prefix only for a subdomain that
+/// has one. What is left is what a create and every later read must agree on.
 fn clock_independent(record: &Value) -> Value {
     let mut copy = record.clone();
     if let Some(members) = copy.as_object_mut() {
@@ -122,6 +129,16 @@ fn clock_independent(record: &Value) -> Value {
         members.remove("statusReason");
         members.remove("certificateVerificationDNSRecord");
         members.remove("certificate");
+        if let Some(sub_domains) = members.get_mut("subDomains").and_then(Value::as_array_mut) {
+            for sub_domain in sub_domains {
+                if let Some(setting) = sub_domain
+                    .get_mut("subDomainSetting")
+                    .and_then(Value::as_object_mut)
+                {
+                    setting.remove("prefix");
+                }
+            }
+        }
     }
     copy
 }
@@ -175,10 +192,10 @@ struct CreateCase {
     certificate_type: &'static str,
     /// The certificate's `customCertificateArn`, as a client sees it.
     custom_certificate_arn: Value,
-    /// `(prefix, branchName, dnsRecord-suffix-after-the-app-default-domain-less-part)`
-    /// for each subdomain, in the order the request stated them: the expected DNS
-    /// record is `<name> CNAME <branch>.<appId>.amplifyapp.com`, built below from the
-    /// app id the create was answered with.
+    /// `(prefix, branchName, dnsRecord)` for each subdomain, in the order the
+    /// request stated them: no certificate is issued for an association here, so the
+    /// record every subdomain reports is the unresolved placeholder — the subdomain's
+    /// own prefix, or the wildcard label for the prefix that is the apex.
     sub_domains: &'static [(&'static str, &'static str, &'static str)],
 }
 
@@ -200,7 +217,7 @@ fn create_cases() -> Vec<CreateCase> {
             auto_sub_domain_iam_role: Value::Null,
             certificate_type: AMPLIFY_MANAGED,
             custom_certificate_arn: Value::Null,
-            sub_domains: &[("www", "main", "www.example.com")],
+            sub_domains: &[("www", "main", "www CNAME <pending>")],
         },
         CreateCase {
             case: "apex subdomain (empty prefix) beside a labelled one",
@@ -220,8 +237,8 @@ fn create_cases() -> Vec<CreateCase> {
             certificate_type: AMPLIFY_MANAGED,
             custom_certificate_arn: Value::Null,
             sub_domains: &[
-                ("", "main", "roundtrip-site.io"),
-                ("beta", "release", "beta.roundtrip-site.io"),
+                ("", "main", "* CNAME <pending>"),
+                ("beta", "release", "beta CNAME <pending>"),
             ],
         },
         CreateCase {
@@ -256,7 +273,7 @@ fn create_cases() -> Vec<CreateCase> {
             auto_sub_domain_iam_role: Value::Null,
             certificate_type: AMPLIFY_MANAGED,
             custom_certificate_arn: Value::Null,
-            sub_domains: &[("docs", "main", "docs.rooted.example.net.")],
+            sub_domains: &[("docs", "main", "docs CNAME <pending>")],
         },
         CreateCase {
             case: "hyphenated and digit-leading labels, caller's own certificate",
@@ -275,7 +292,7 @@ fn create_cases() -> Vec<CreateCase> {
             auto_sub_domain_iam_role: Value::Null,
             certificate_type: CUSTOM,
             custom_certificate_arn: json!(CUSTOM_CERTIFICATE_ARN),
-            sub_domains: &[("app", "main", "app.9to5-app.my-team.example")],
+            sub_domains: &[("app", "main", "app CNAME <pending>")],
         },
     ]
 }
@@ -300,7 +317,6 @@ async fn a_created_domain_association_reads_back_through_get() {
         }
         let app = emulator.get_app(&app_id).await.member("app");
         let app_arn = string_member(&app, "appArn");
-        let default_domain = string_member(&app, "defaultDomain");
 
         let reply = create_domain(&emulator, &app_id, &expected.request).await;
         assert_eq!(
@@ -345,6 +361,12 @@ async fn a_created_domain_association_reads_back_through_get() {
             "case {case:?}: no certificate is requested yet, so there is no record to \
              verify, got {record:?}"
         );
+        assert_eq!(
+            optional_member(&record, "statusReason"),
+            Value::Null,
+            "case {case:?}: a created association is simply proceeding, so the service \
+             states no reason, got {record:?}"
+        );
         let certificate = record
             .get("certificate")
             .cloned()
@@ -367,7 +389,7 @@ async fn a_created_domain_association_reads_back_through_get() {
             "case {case:?}: expected {} subdomain(s), got {sub_domains:?}",
             expected.sub_domains.len()
         );
-        for (actual, (prefix, branch, name)) in sub_domains.iter().zip(expected.sub_domains) {
+        for (actual, (prefix, branch, dns_record)) in sub_domains.iter().zip(expected.sub_domains) {
             let setting = actual
                 .get("subDomainSetting")
                 .cloned()
@@ -378,12 +400,14 @@ async fn a_created_domain_association_reads_back_through_get() {
                     string_member(&setting, "branchName")
                 ),
                 ((*prefix).to_string(), (*branch).to_string()),
-                "case {case:?}: the subdomain setting must be echoed, got {actual:?}"
+                "case {case:?}: a create echoes the subdomain setting the request \
+                 configured, got {actual:?}"
             );
             assert_eq!(
                 string_member(actual, "dnsRecord"),
-                format!("{name} CNAME {branch}.{default_domain}"),
-                "case {case:?}: the subdomain must point at its branch, got {actual:?}"
+                *dns_record,
+                "case {case:?}: no record is published before the certificate exists, \
+                 got {actual:?}"
             );
             assert!(
                 !bool_member(actual, "verified"),
@@ -571,27 +595,26 @@ async fn the_clock_progresses_a_new_association_through_the_modelled_statuses() 
         sleep(past_the_status_steps(1));
     }
 
-    // Past the whole chain, the association rests in its last status: the certificate
-    // verification record is published, and the reason states what is being waited on.
+    // Past the whole chain, the association rests in its TERMINAL status, stating the
+    // reason the certificate could not be issued.
     let settled = get_domain(&emulator, &app_id, domain).await;
     let record = settled.member("domainAssociation");
     assert_eq!(
         string_member(&record, "domainStatus"),
-        PENDING_VERIFICATION,
-        "case \"settled\": the last status the clock owes, got {record:?}"
+        FAILED,
+        "case \"settled\": the clock drives the association to its terminal status, \
+         got {record:?}"
     );
     assert_eq!(
         string_member(&record, "statusReason"),
-        DNS_UNVERIFIED_REASON,
-        "case \"settled\": the resting status states why it rests, got {record:?}"
+        CERTIFICATE_VERIFICATION_FAILED_REASON,
+        "case \"settled\": the terminal status states why it failed, got {record:?}"
     );
-    let verification = string_member(&record, "certificateVerificationDNSRecord");
-    assert!(
-        verification.starts_with('_')
-            && verification.contains(&format!(".{domain}. CNAME "))
-            && verification.ends_with(".acm-validations.aws."),
-        "case \"settled\": the verification record must be publishable in the domain's \
-         zone, got {verification:?}"
+    assert_eq!(
+        optional_member(&record, "certificateVerificationDNSRecord"),
+        Value::Null,
+        "case \"settled\": no certificate was issued, so there is no record to verify, \
+         got {record:?}"
     );
     let certificate = record
         .get("certificate")
@@ -599,8 +622,9 @@ async fn the_clock_progresses_a_new_association_through_the_modelled_statuses() 
         .unwrap_or_else(|| panic!("case \"settled\": no certificate in {record:?}"));
     assert_eq!(
         optional_member(&certificate, "certificateVerificationDNSRecord"),
-        json!(verification.clone()),
-        "case \"settled\": the certificate carries the same record, got {certificate:?}"
+        Value::Null,
+        "case \"settled\": the certificate carries no verification record either, \
+         got {certificate:?}"
     );
     assert!(
         seen.iter().any(|status| status == REQUESTING_CERTIFICATE)
@@ -608,7 +632,7 @@ async fn the_clock_progresses_a_new_association_through_the_modelled_statuses() 
         "case \"settled\": the reads must have observed the association move on, saw {seen:?}"
     );
 
-    // A read after the progression ends changes nothing a later caller sees.
+    // A read after the terminal status changes nothing a later caller sees.
     let again = get_domain(&emulator, &app_id, domain).await;
     assert_eq!(
         again.member("domainAssociation"),
@@ -616,8 +640,7 @@ async fn the_clock_progresses_a_new_association_through_the_modelled_statuses() 
         "case \"re-read\": a settled association reads the same on every call"
     );
 
-    // The verification record is minted per association, so a second association of
-    // the same app carries a different one.
+    // Every association of the app reaches the same terminal status on its own clock.
     let other = create_domain(
         &emulator,
         &app_id,
@@ -628,18 +651,23 @@ async fn the_clock_progresses_a_new_association_through_the_modelled_statuses() 
         other.status, 200,
         "case \"second association\": expected HTTP 200, got {other:?}"
     );
-    sleep(past_the_status_steps(
-        i64::try_from(DOMAIN_STATUS_SEQUENCE.len()).unwrap_or(3),
-    ));
-    let other_verification = string_member(
-        &get_domain(&emulator, &app_id, "second.example.com")
-            .await
-            .member("domainAssociation"),
-        "certificateVerificationDNSRecord",
+    assert_eq!(
+        string_member(&other.member("domainAssociation"), "domainStatus"),
+        CREATING,
+        "case \"second association\": a create answers the first status, got {other:?}"
     );
-    assert_ne!(
-        other_verification, verification,
-        "case \"second association\": each association verifies through its own record"
+    sleep(past_the_status_steps(
+        i64::try_from(DOMAIN_STATUS_SEQUENCE.len()).unwrap_or(4),
+    ));
+    assert_eq!(
+        string_member(
+            &get_domain(&emulator, &app_id, "second.example.com")
+                .await
+                .member("domainAssociation"),
+            "domainStatus"
+        ),
+        FAILED,
+        "case \"second association\": every association reaches the terminal status"
     );
 }
 

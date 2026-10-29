@@ -22,7 +22,7 @@ pub struct ListDomainAssociationsInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.amplify#ListDomainAssociationsResult")]
 #[derive(Debug, Clone, Default)]
 pub struct ListDomainAssociationsOutput {
-    pub domain_associations: Vec<DomainAssociation>,
+    pub domain_associations: Vec<DomainAssociationProjection>,
     pub next_token: Option<String>,
 }
 

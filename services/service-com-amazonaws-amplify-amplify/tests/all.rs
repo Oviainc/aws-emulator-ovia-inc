@@ -31,6 +31,8 @@ mod branch_job_listing;
 mod branch_jobs;
 #[path = "all/branch_revision_echo.rs"]
 mod branch_revision_echo;
+#[path = "all/domain_association_certificate_lifecycle.rs"]
+mod domain_association_certificate_lifecycle;
 #[path = "all/domain_associations.rs"]
 mod domain_associations;
 #[path = "all/resource_tags.rs"]

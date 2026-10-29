@@ -493,9 +493,8 @@ pub const NO_BUILD_ENVIRONMENT_REASON: &str =
     "This emulator has no build environment, so the job's build was never executed.";
 
 /// One domain association as this service persists it: the modelled
-/// [`DomainAssociation`] record every reader returns, the DNS record that would
-/// verify its certificate, and the instant at which the clock owes the association
-/// its next status.
+/// [`DomainAssociation`] record every reader returns, and the instant at which the
+/// clock owes the association its next status.
 ///
 /// Associating a custom domain is ASYNCHRONOUS — the create call answers with a
 /// non-terminal `domainStatus` and the association moves on afterwards — so the
@@ -505,26 +504,18 @@ pub const NO_BUILD_ENVIRONMENT_REASON: &str =
 pub struct AmplifyDomain {
     /// The domain-association record, exactly as every reader returns it.
     pub association: DomainAssociation,
-    /// The DNS record a caller publishes to prove it controls the domain, minted
-    /// with the association and reported from the status at which the certificate
-    /// has been requested onwards.
-    ///
-    /// Held beside the record rather than inside it because a certificate that has
-    /// not been requested yet has no verification record to report, while the value
-    /// a later status reports has to be the same one on every read.
-    pub certificate_verification_dns_record: String,
     /// Epoch milliseconds at which this association's status is due to move on, or
-    /// `None` once it has reached the last status the clock owes it.
+    /// `None` once it has reached the TERMINAL status of
+    /// [`DOMAIN_STATUS_SEQUENCE`], after which nothing more is owed.
     pub settles_at: Option<i64>,
 }
 
 impl AmplifyDomain {
     /// A newly created association: the first status of [`DOMAIN_STATUS_SEQUENCE`],
     /// with the next one due [`DOMAIN_STATUS_STEP_MILLIS`] from now.
-    pub fn created(association: DomainAssociation, verification_dns_record: String) -> Self {
+    pub fn created(association: DomainAssociation) -> Self {
         Self {
             association,
-            certificate_verification_dns_record: verification_dns_record,
             settles_at: Some(now_millis().saturating_add(DOMAIN_STATUS_STEP_MILLIS)),
         }
     }
@@ -536,9 +527,10 @@ impl AmplifyDomain {
     /// reporting operation applies it before answering rather than reporting a
     /// status the clock left behind seconds ago. The loop walks as many steps as the
     /// elapsed time owes, so a reader that arrives late sees the status the
-    /// association would have reached while nobody was watching. Before the next due
-    /// instant this is a no-op, so a caller that reads straight after the create
-    /// still observes the first, non-terminal status.
+    /// association would have reached while nobody was watching — up to the TERMINAL
+    /// status, where the clock owes nothing and every later read answers the same
+    /// record. Before the next due instant this is a no-op, so a caller that reads
+    /// straight after the create still observes the first, non-terminal status.
     pub fn settle(&mut self) {
         while let Some(due) = self.settles_at {
             if now_millis() < due {
@@ -549,56 +541,55 @@ impl AmplifyDomain {
                 return;
             };
             self.association.domain_status = next.to_string();
-            // The certificate is requested on the way into this status, so this is
-            // the first status that has a verification record to report; it stays
-            // the same value for every later status and every later read.
-            if next == DOMAIN_STATUS_REQUESTING_CERTIFICATE {
-                self.association.certificate_verification_dns_record =
-                    Some(self.certificate_verification_dns_record.clone());
-                if let Some(certificate) = self.association.certificate.as_mut() {
-                    certificate.certificate_verification_dns_record =
-                        Some(self.certificate_verification_dns_record.clone());
-                }
-            }
-            if next == DOMAIN_STATUS_PENDING_VERIFICATION {
-                self.association.status_reason = DNS_UNVERIFIED_REASON.to_string();
-            }
-            self.settles_at = next_domain_status(next)
-                .map(|_| due.saturating_add(DOMAIN_STATUS_STEP_MILLIS));
+            // Each status carries the reason the service gives for being in it, so
+            // the reason a read reports can never belong to a status the
+            // association has left.
+            self.association.status_reason = domain_status_reason(next).to_string();
+            self.settles_at =
+                next_domain_status(next).map(|_| due.saturating_add(DOMAIN_STATUS_STEP_MILLIS));
         }
     }
 }
 
-/// The statuses the clock walks a new domain association through, in order.
+/// The statuses the clock walks a new domain association through, in order, ending in
+/// the TERMINAL one a polling client stops at.
 ///
 /// `DomainStatus` is modelled `PENDING_VERIFICATION | IN_PROGRESS | AVAILABLE |
 /// IMPORTING_CUSTOM_CERTIFICATE | PENDING_DEPLOYMENT | AWAITING_APP_CNAME | FAILED |
 /// CREATING | REQUESTING_CERTIFICATE | UPDATING`
 /// (`smithy_query(query="shape",shape="DomainStatus")`), and associating a custom
 /// domain is created, then has its certificate requested, and then waits for the
-/// domain's DNS records to prove the caller controls the domain — which is where it
-/// stops here: nothing in this emulator resolves DNS, so no record of the caller's
-/// is ever observed and no later status is owed. See [`DNS_UNVERIFIED_REASON`].
+/// domain's DNS records to prove the caller controls the domain. That proof never
+/// arrives here — nothing in this emulator resolves DNS, so no record of the
+/// caller's is ever observed — so the certificate cannot be issued and the
+/// association ends in [`DOMAIN_STATUS_FAILED`], carrying the reason the certificate
+/// service gives for that class of failure (see [`domain_status_reason`]).
 pub const DOMAIN_STATUS_SEQUENCE: &[&str] = &[
     DOMAIN_STATUS_CREATING,
     DOMAIN_STATUS_REQUESTING_CERTIFICATE,
     DOMAIN_STATUS_PENDING_VERIFICATION,
+    DOMAIN_STATUS_FAILED,
 ];
 
 /// The status a domain association carries from its create call until the clock moves
 /// it on: the association exists and nothing has been provisioned for it yet.
 pub const DOMAIN_STATUS_CREATING: &str = "CREATING";
 
-/// The status at which the association's certificate has been requested, and so the
-/// first one that reports a `certificateVerificationDNSRecord`.
+/// The status at which the association's certificate has been requested of the
+/// certificate service and not issued yet.
 pub const DOMAIN_STATUS_REQUESTING_CERTIFICATE: &str = "REQUESTING_CERTIFICATE";
 
-/// The status at which the association waits for the domain's DNS records, which is
-/// the last status the clock owes a new association here.
+/// The status at which the association waits for the domain's DNS records to prove
+/// the caller controls the domain.
 pub const DOMAIN_STATUS_PENDING_VERIFICATION: &str = "PENDING_VERIFICATION";
 
+/// The TERMINAL status of [`DOMAIN_STATUS_SEQUENCE`]: the domain's certificate could
+/// not be issued, so the association never serves the domain and the clock owes it
+/// nothing further.
+pub const DOMAIN_STATUS_FAILED: &str = "FAILED";
+
 /// The status after `current` in [`DOMAIN_STATUS_SEQUENCE`], or `None` when `current`
-/// is the last one (or a status the sequence does not name, which the clock owes
+/// is the terminal one (or a status the sequence does not name, which the clock owes
 /// nothing).
 pub fn next_domain_status(current: &str) -> Option<&'static str> {
     let at = DOMAIN_STATUS_SEQUENCE
@@ -607,6 +598,60 @@ pub fn next_domain_status(current: &str) -> Option<&'static str> {
     DOMAIN_STATUS_SEQUENCE.get(at + 1).copied()
 }
 
+/// The `statusReason` an association carries while its `domainStatus` is `status`.
+///
+/// `statusReason` is "additional information that describes why the domain
+/// association is in the current state"
+/// (`smithy_query(query="shape",shape="DomainAssociation")`): a status the service
+/// has nothing to add about carries NO reason — the empty value, which the wire
+/// projection leaves out of the body — and the terminal failure carries the message
+/// the certificate service gives when the domain names a certificate was requested
+/// for cannot be verified. That message is fixed text; it names no value of the
+/// request or of the association.
+pub fn domain_status_reason(status: &str) -> &'static str {
+    if status == DOMAIN_STATUS_FAILED {
+        return CERTIFICATE_VERIFICATION_FAILED_REASON;
+    }
+    ""
+}
+
+/// Why a certificate request that cannot be verified fails, worded as the
+/// certificate service words it — including the page it points the caller at, which
+/// is part of the message.
+pub const CERTIFICATE_VERIFICATION_FAILED_REASON: &str =
+    "We require additional verification to request a certificate for one or more \
+     domain names in this request. The following page describes this in more detail: \
+     https://docs.aws.amazon.com/acm/latest/userguide/troubleshooting-failed.html#failed-additional-verification-required";
+
+/// The DNS record a subdomain of an association reports while the service has
+/// published none for it.
+///
+/// A subdomain's `dnsRecord` is "the DNS record for the subdomain"
+/// (`smithy_query(query="shape",shape="SubDomain")`) — the record the CALLER
+/// publishes at its DNS provider — and it cannot exist before the association's
+/// certificate and the address it would point at do. Until then the service reports
+/// the UNRESOLVED form: the name the subdomain is served under, which is its
+/// `prefix` ([`APEX_SUBDOMAIN_PREFIX`] for the empty prefix, the domain itself),
+/// pointing at [`PENDING_DNS_TARGET`] rather than at a target no client could use.
+/// An association of this emulator never serves the domain (see
+/// [`DOMAIN_STATUS_SEQUENCE`]), so no record is ever published for it.
+pub fn pending_sub_domain_dns_record(prefix: &str) -> String {
+    let name = if prefix.is_empty() {
+        APEX_SUBDOMAIN_PREFIX
+    } else {
+        prefix
+    };
+    format!("{name} CNAME {PENDING_DNS_TARGET}")
+}
+
+/// The name a DNS record reports for the subdomain whose prefix is empty — the apex,
+/// which is the associated domain itself.
+pub const APEX_SUBDOMAIN_PREFIX: &str = "*";
+
+/// The target a subdomain's DNS record carries until the record itself exists: the
+/// marker that tells a caller to poll rather than publish.
+pub const PENDING_DNS_TARGET: &str = "<pending>";
+
 /// How long after a status the clock owes the next one.
 ///
 /// CHOSEN, not documented: AWS publishes no duration for a domain association's
@@ -614,12 +659,6 @@ pub fn next_domain_status(current: &str) -> Option<&'static str> {
 /// wait for. The span is non-zero so a caller that reads the association straight
 /// after creating it still sees the first status a real client has to poll through.
 pub const DOMAIN_STATUS_STEP_MILLIS: i64 = 500;
-
-/// Why a domain association of this emulator stops at
-/// [`DOMAIN_STATUS_PENDING_VERIFICATION`], carried on `statusReason`.
-pub const DNS_UNVERIFIED_REASON: &str =
-    "Waiting for the domain's DNS records. This emulator resolves no DNS, so the \
-     certificate verification record and the subdomain records are never observed.";
 
 /// The certificate type an association created without `certificateSettings`
 /// carries.
@@ -732,9 +771,6 @@ pub struct ComAmazonawsAmplifyAmplifyState {
     pub next_webhook_id_seq: u64,
     /// Monotonic counter feeding [`ComAmazonawsAmplifyAmplifyState::mint_upload_token`].
     pub next_upload_token_seq: u64,
-    /// Monotonic counter feeding
-    /// [`ComAmazonawsAmplifyAmplifyState::mint_certificate_verification_record`].
-    pub next_certificate_token_seq: u64,
 }
 
 impl ComAmazonawsAmplifyAmplifyState {
@@ -795,24 +831,6 @@ impl ComAmazonawsAmplifyAmplifyState {
         self.next_upload_token_seq = self.next_upload_token_seq.wrapping_add(1);
         let (high, low) = mixed_pair(self.next_upload_token_seq);
         format!("{high:016x}{low:016x}")
-    }
-
-    /// Mint the DNS record that verifies ONE domain association's certificate.
-    ///
-    /// A verification record proves the caller controls the domain, so neither half
-    /// of it can be something the caller already knows: both the record's own label
-    /// and the name it points at are 128 bits from the same mixer that mints an app
-    /// id, rendered as hexadecimal, minted once per association so no two
-    /// associations share a record. The domain name the record sits under is the one
-    /// the request named, because that is the zone the caller publishes it in.
-    pub fn mint_certificate_verification_record(&mut self, domain_name: &str) -> String {
-        self.next_certificate_token_seq = self.next_certificate_token_seq.wrapping_add(1);
-        let (label_high, label_low) = mixed_pair(self.next_certificate_token_seq);
-        let (value_high, value_low) = mixed_pair(label_low ^ label_high);
-        format!(
-            "_{label_high:016x}{label_low:016x}.{domain_name}. CNAME \
-             _{value_high:016x}{value_low:016x}.acm-validations.aws."
-        )
     }
 
     /// The webhook `webhook_id` names, whichever app holds it.

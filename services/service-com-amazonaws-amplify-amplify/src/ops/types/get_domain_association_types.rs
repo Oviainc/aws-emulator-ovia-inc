@@ -19,8 +19,8 @@ pub struct GetDomainAssociationInput {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.amplify#GetDomainAssociationResult")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GetDomainAssociationOutput {
-    pub domain_association: DomainAssociation,
+    pub domain_association: DomainAssociationProjection,
 }
 

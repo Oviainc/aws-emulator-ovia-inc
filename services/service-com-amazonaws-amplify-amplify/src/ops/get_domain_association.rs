@@ -182,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         stored.settle();
 
         Ok(GetDomainAssociationOutput {
-            domain_association: stored.association.clone(),
+            domain_association: DomainAssociationProjection::reported(stored.association.clone()),
         })
     }
 }

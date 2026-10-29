@@ -14,9 +14,9 @@
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
 //!
-//! `projection` is the one hand-written submodule: it holds the `App` / `Branch`
-//! wrappers that every operation returning one of those shapes puts in its output,
-//! so the record reaches the wire the way Amplify reports it.
+//! `projection` is the one hand-written submodule: it holds the `App` / `Branch` /
+//! `DomainAssociation` wrappers that every operation returning one of those shapes
+//! puts in its output, so the record reaches the wire the way Amplify reports it.
 
 pub mod create_app_types;
 pub mod create_backend_environment_types;
