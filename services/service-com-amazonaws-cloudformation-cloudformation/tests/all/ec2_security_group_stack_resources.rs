@@ -14,6 +14,15 @@
 //! A group id nothing was created for is refused with [`INVALID_GROUP_NOT_FOUND`], which is
 //! also what a deleted one is refused with — the other side of the same rule.
 //!
+//! The rules the group holds are part of that configuration, in BOTH directions: "when you
+//! create a security group, it has no inbound rules", so its inbound rules are the ones the
+//! declaration asked for; a new group carries the one all-traffic outbound rule EC2 gives it
+//! ("by default, a security group includes an outbound rule that allows all outbound
+//! traffic"), and a declaration that asks for outbound rules of its own asks for THOSE and
+//! no others — so a group whose declaration names any outbound rule no longer carries that
+//! one, and a declaration of the all-traffic rule itself leaves exactly one such rule rather
+//! than a duplicate of the rule the group already held.
+//!
 //! The rows differ along what the rule generalises over: whether the template NAMES the group
 //! or leaves CloudFormation to generate the name, whether it declares the VPC or leaves the
 //! group in the Region's default one, how many inline rules it declares and in which
@@ -64,12 +73,12 @@ struct GroupCase {
     /// leaves the group in the Region's default VPC.
     vpc: Option<&'static str>,
     inbound: ExpectedRules,
-    /// The outbound rules the declaration asks for. They are asserted as a SUBSET: a new
-    /// group carries the all-traffic outbound rule Amazon EC2 gives it ("by default, a
-    /// security group includes an outbound rule that allows all outbound traffic"), which a
-    /// declaration stating outbound rules of its own replaces with exactly those
-    /// (`core/router/tests/all/cloudformation_ec2_ebs_instance_estate.rs` holds that half),
-    /// so a row asserts the rules it declared are there rather than which others are not.
+    /// The outbound rules the group must hold. A declaration that names none leaves the
+    /// all-traffic rule Amazon EC2 gives a new group ([`THE_ALL_TRAFFIC_RULE`]); one that
+    /// names any asks for exactly those, since CloudFormation removes that default rule, so
+    /// the comparison is exact in both cases
+    /// (`core/router/tests/all/cloudformation_ec2_ebs_instance_estate.rs` holds the same half
+    /// across services).
     outbound: ExpectedRules,
 }
 
@@ -79,6 +88,19 @@ const NO_RULES: ExpectedRules = ExpectedRules {
     protocols: &[],
     ports: &[],
     ipv4_blocks: &[],
+    ipv6_blocks: &[],
+    referenced: &[],
+    descriptions: &[],
+};
+
+/// The one outbound rule Amazon EC2 gives every new security group: the all-protocols rule
+/// over every IPv4 address ("by default, a security group includes an outbound rule that
+/// allows all outbound traffic"). What a row expects outbound where its template declares
+/// no outbound rule of its own.
+const THE_ALL_TRAFFIC_RULE: ExpectedRules = ExpectedRules {
+    protocols: &["-1"],
+    ports: &[],
+    ipv4_blocks: &["0.0.0.0/0"],
     ipv6_blocks: &[],
     referenced: &[],
     descriptions: &[],
@@ -133,7 +155,7 @@ const GROUP_CASES: &[GroupCase] = &[
             referenced: &[],
             descriptions: &["ssh from the network"],
         },
-        outbound: NO_RULES,
+        outbound: THE_ALL_TRAFFIC_RULE,
     },
     GroupCase {
         case: "an unnamed group in the Region's default VPC whose inbound rule references \
@@ -162,7 +184,7 @@ const GROUP_CASES: &[GroupCase] = &[
             referenced: &["Primary"],
             descriptions: &["everything from the primary"],
         },
-        outbound: NO_RULES,
+        outbound: THE_ALL_TRAFFIC_RULE,
     },
     GroupCase {
         case: "an unnamed group in the stack's own VPC with an all-protocol IPv6 inbound \
@@ -234,7 +256,172 @@ const GROUP_CASES: &[GroupCase] = &[
         description: "no rules declared",
         vpc: None,
         inbound: NO_RULES,
-        outbound: NO_RULES,
+        outbound: THE_ALL_TRAFFIC_RULE,
+    },
+    GroupCase {
+        // The issue's own shape: the declaration asks for the very rule Amazon EC2 gives a
+        // new group, so the group ends up holding exactly one such rule — authorizing it
+        // beside the rule already there would be the duplicate that service refuses.
+        case: "a group whose only declared rule is the all-traffic outbound one, in YAML",
+        stack: "group-all-traffic-egress",
+        template: concat!(
+            "Resources:\n",
+            "  Net:\n",
+            "    Type: AWS::EC2::VPC\n",
+            "    Properties:\n",
+            "      CidrBlock: 10.40.0.0/16\n",
+            "  Instance:\n",
+            "    Type: AWS::EC2::SecurityGroup\n",
+            "    Properties:\n",
+            "      GroupDescription: Security group for EC2 instance\n",
+            "      VpcId: !Ref Net\n",
+            "      SecurityGroupEgress:\n",
+            "        - IpProtocol: \"-1\"\n",
+            "          CidrIp: 0.0.0.0/0\n",
+            "Outputs:\n",
+            "  GroupRef:\n",
+            "    Value: !Ref Instance\n",
+            "  GroupIdAttribute:\n",
+            "    Value: !GetAtt Instance.GroupId\n",
+            "  GroupVpcAttribute:\n",
+            "    Value: !GetAtt Instance.VpcId\n",
+            "  VpcId:\n",
+            "    Value: !Ref Net\n",
+        ),
+        logical_id: "Instance",
+        group_name: None,
+        description: "Security group for EC2 instance",
+        vpc: Some("Net"),
+        inbound: NO_RULES,
+        outbound: THE_ALL_TRAFFIC_RULE,
+    },
+    GroupCase {
+        // Two NARROW outbound rules: the all-traffic rule the group was given is gone, so
+        // the group lets out only what the template allowed.
+        case: "a group declaring two narrow outbound rules and one inbound rule, in JSON",
+        stack: "group-narrow-egress",
+        template: r#"{"Resources":{
+            "Net":{"Type":"AWS::EC2::VPC","Properties":{"CidrBlock":"10.50.0.0/16"}},
+            "Edge":{"Type":"AWS::EC2::SecurityGroup","Properties":{
+              "GroupDescription":"the egress-restricted group",
+              "VpcId":{"Ref":"Net"},
+              "SecurityGroupIngress":[{"IpProtocol":"tcp","FromPort":443,"ToPort":443,
+                "CidrIp":"10.50.0.0/16"}],
+              "SecurityGroupEgress":[
+                {"IpProtocol":"tcp","FromPort":443,"ToPort":443,"CidrIp":"10.51.0.0/16",
+                 "Description":"https out of the network"},
+                {"IpProtocol":"udp","FromPort":53,"ToPort":53,
+                 "CidrIpv6":"2001:db8:2::/48"}]}}},
+          "Outputs":{
+            "GroupRef":{"Value":{"Ref":"Edge"}},
+            "GroupIdAttribute":{"Value":{"Fn::GetAtt":["Edge","GroupId"]}},
+            "GroupVpcAttribute":{"Value":{"Fn::GetAtt":["Edge","VpcId"]}},
+            "VpcId":{"Value":{"Ref":"Net"}}}}"#,
+        logical_id: "Edge",
+        group_name: None,
+        description: "the egress-restricted group",
+        vpc: Some("Net"),
+        inbound: ExpectedRules {
+            protocols: &["tcp"],
+            ports: &["443", "443"],
+            ipv4_blocks: &["10.50.0.0/16"],
+            ipv6_blocks: &[],
+            referenced: &[],
+            descriptions: &[],
+        },
+        outbound: ExpectedRules {
+            protocols: &["tcp", "udp"],
+            ports: &["443", "443", "53", "53"],
+            ipv4_blocks: &["10.51.0.0/16"],
+            ipv6_blocks: &["2001:db8:2::/48"],
+            referenced: &[],
+            descriptions: &["https out of the network"],
+        },
+    },
+    GroupCase {
+        // The shape an end-to-end estate deploys: the group sits in a stack that also
+        // declares the network around it (an internet gateway, a route table, a route, a
+        // subnet association), an instance role and a volume, so the row pins that the
+        // group's own create is what the stack's completion depends on — and that the id it
+        // publishes resolves in Amazon EC2 for as long as the stack exists.
+        case: "a group in a whole network estate whose declaration asks for the all-traffic \
+               outbound rule, in YAML",
+        stack: "group-in-a-network-estate",
+        template: concat!(
+            "Resources:\n",
+            "  Net:\n",
+            "    Type: AWS::EC2::VPC\n",
+            "    Properties:\n",
+            "      CidrBlock: 10.60.0.0/16\n",
+            "      EnableDnsSupport: true\n",
+            "      EnableDnsHostnames: true\n",
+            "  Igw:\n",
+            "    Type: AWS::EC2::InternetGateway\n",
+            "  IgwAttachment:\n",
+            "    Type: AWS::EC2::VPCGatewayAttachment\n",
+            "    Properties:\n",
+            "      VpcId: !Ref Net\n",
+            "      InternetGatewayId: !Ref Igw\n",
+            "  PublicSubnet:\n",
+            "    Type: AWS::EC2::Subnet\n",
+            "    Properties:\n",
+            "      VpcId: !Ref Net\n",
+            "      CidrBlock: 10.60.0.0/24\n",
+            "      AvailabilityZone: us-east-1a\n",
+            "      MapPublicIpOnLaunch: true\n",
+            "  PublicRouteTable:\n",
+            "    Type: AWS::EC2::RouteTable\n",
+            "    Properties:\n",
+            "      VpcId: !Ref Net\n",
+            "  PublicDefaultRoute:\n",
+            "    Type: AWS::EC2::Route\n",
+            "    DependsOn: IgwAttachment\n",
+            "    Properties:\n",
+            "      RouteTableId: !Ref PublicRouteTable\n",
+            "      DestinationCidrBlock: 0.0.0.0/0\n",
+            "      GatewayId: !Ref Igw\n",
+            "  PublicSubnetAssociation:\n",
+            "    Type: AWS::EC2::SubnetRouteTableAssociation\n",
+            "    Properties:\n",
+            "      SubnetId: !Ref PublicSubnet\n",
+            "      RouteTableId: !Ref PublicRouteTable\n",
+            "  Instance:\n",
+            "    Type: AWS::EC2::SecurityGroup\n",
+            "    Properties:\n",
+            "      GroupDescription: Security group for EC2 instance\n",
+            "      VpcId: !Ref Net\n",
+            "      SecurityGroupEgress:\n",
+            "        - IpProtocol: \"-1\"\n",
+            "          CidrIp: 0.0.0.0/0\n",
+            "      Tags:\n",
+            "        - Key: Name\n",
+            "          Value: the instance group\n",
+            "  InstanceRole:\n",
+            "    Type: AWS::IAM::Role\n",
+            "    Properties:\n",
+            "      AssumeRolePolicyDocument:\n",
+            "        Version: '2012-10-17'\n",
+            "        Statement:\n",
+            "          - Effect: Allow\n",
+            "            Principal:\n",
+            "              Service: ec2.amazonaws.com\n",
+            "            Action: sts:AssumeRole\n",
+            "Outputs:\n",
+            "  GroupRef:\n",
+            "    Value: !Ref Instance\n",
+            "  GroupIdAttribute:\n",
+            "    Value: !GetAtt Instance.GroupId\n",
+            "  GroupVpcAttribute:\n",
+            "    Value: !GetAtt Instance.VpcId\n",
+            "  VpcId:\n",
+            "    Value: !Ref Net\n",
+        ),
+        logical_id: "Instance",
+        group_name: None,
+        description: "Security group for EC2 instance",
+        vpc: Some("Net"),
+        inbound: NO_RULES,
+        outbound: THE_ALL_TRAFFIC_RULE,
     },
 ];
 
@@ -486,24 +673,31 @@ async fn the_security_group_a_stack_declares_is_created_in_ec2() {
              got {described}"
         );
 
-        // An outbound rule is authorized BESIDE the all-traffic rule EC2 gives a new group,
-        // so each declared value has to be among the ones reported rather than all of them.
+        // The outbound rules are the group's whole outbound set: the all-traffic rule EC2
+        // gave the new group where the declaration asked for no outbound rule, and exactly
+        // the declared ones where it asked for any.
         for (member, expected) in [
             ("ipProtocol", row.outbound.protocols),
             ("cidrIp", row.outbound.ipv4_blocks),
             ("cidrIpv6", row.outbound.ipv6_blocks),
             ("description", row.outbound.descriptions),
-            ("fromPort", row.outbound.ports),
         ] {
-            let reported = rule_values(&described, "ipPermissionsEgress", member);
-            for value in expected {
-                assert!(
-                    reported.iter().any(|held| held == value),
-                    "case {case:?}: expected the outbound {member} {value:?} the declaration \
-                     asked for among {reported:?}, got {described}"
-                );
-            }
+            assert_eq!(
+                rule_values(&described, "ipPermissionsEgress", member),
+                sorted(expected),
+                "case {case:?}: expected the outbound {member} values the group must hold, \
+                 got {described}"
+            );
         }
+        let mut outbound_ports = rule_values(&described, "ipPermissionsEgress", "fromPort");
+        outbound_ports.extend(rule_values(&described, "ipPermissionsEgress", "toPort"));
+        outbound_ports.sort();
+        assert_eq!(
+            outbound_ports,
+            sorted(row.outbound.ports),
+            "case {case:?}: expected the outbound port bounds the group must hold, got \
+             {described}"
+        );
 
         // ...and deleting the stack takes the group away in EC2, which is what the stack
         // having created it means. An id nothing holds a group for is refused with
