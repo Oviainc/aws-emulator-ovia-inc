@@ -367,7 +367,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
 
-            let sequence = store.next_sequence();
+            let sequence = store.next_sequence(crate::state::SequencedFamily::Vocabularies);
             let record = crate::state::VocabularyRecord {
                 name: input.vocabulary_name.clone(),
                 sequence,

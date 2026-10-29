@@ -317,7 +317,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
 
-            let sequence = store.next_sequence();
+            let sequence = store.next_sequence(crate::state::SequencedFamily::MedicalVocabularies);
             let record = crate::state::MedicalVocabularyRecord::pending(
                 input.vocabulary_name.clone(),
                 sequence,

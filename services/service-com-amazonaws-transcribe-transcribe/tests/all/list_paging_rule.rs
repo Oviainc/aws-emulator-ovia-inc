@@ -176,12 +176,28 @@ impl Listing {
             .create_request(name, &[])
     }
 
-    /// Establish one record per name in [`CREATED_IN_ORDER`], in that order.
+    /// Establish one record per name in [`CREATED_IN_ORDER`], in that order, in the
+    /// Region this emulator serves a request carrying no SigV4 credential scope in.
     pub(crate) async fn create_the_records(&self, transcribe: &Transcribe) {
-        for name in CREATED_IN_ORDER {
+        self.create_records(transcribe, CREATED_IN_ORDER, None).await;
+    }
+
+    /// Establish one record per name in `names`, in that order, through the endpoint of
+    /// `region` when one is given.
+    ///
+    /// What [`Self::create_the_records`] is for every row of this suite; a suite that
+    /// drives one family over two Regions, or over a subset of the names, reaches the
+    /// same creates through this.
+    pub(crate) async fn create_records(
+        &self,
+        transcribe: &Transcribe,
+        names: &[&str],
+        region: Option<&str>,
+    ) {
+        for name in names {
             let case = format!("{} creates {name}", self.create);
             transcribe
-                .call(self.create, self.create_request(name))
+                .call_in_region(self.create, self.create_request(name), region)
                 .await
                 .ok(&case);
         }
@@ -189,7 +205,14 @@ impl Listing {
 
     /// Every created name in the order this listing reports them.
     pub(crate) fn expected_order(&self) -> Vec<String> {
-        let mut names: Vec<String> = CREATED_IN_ORDER.iter().map(|n| n.to_string()).collect();
+        self.order_of(CREATED_IN_ORDER)
+    }
+
+    /// `created`, in the order this listing reports the records created under those
+    /// names: the creation order reversed for a listing documented newest-first, and the
+    /// names ascending for the one listing paged by name.
+    pub(crate) fn order_of(&self, created: &[&str]) -> Vec<String> {
+        let mut names: Vec<String> = created.iter().map(|n| (*n).to_string()).collect();
         match self.order {
             // The reverse of the creation order.
             Order::NewestFirst => names.reverse(),
@@ -225,9 +248,22 @@ impl Listing {
             .collect()
     }
 
-    /// One call of this listing.
+    /// One call of this listing, through the endpoint of the Region this emulator serves
+    /// a request carrying no SigV4 credential scope in.
     pub(crate) async fn list(&self, transcribe: &Transcribe, request: Value) -> Reply {
-        transcribe.call(self.operation, request).await
+        self.list_in(transcribe, request, None).await
+    }
+
+    /// One call of this listing, through `region`'s endpoint when one is given.
+    pub(crate) async fn list_in(
+        &self,
+        transcribe: &Transcribe,
+        request: Value,
+        region: Option<&str>,
+    ) -> Reply {
+        transcribe
+            .call_in_region(self.operation, request, region)
+            .await
     }
 
     /// One page: the names on it and the cursor it handed out, if any.
@@ -237,7 +273,18 @@ impl Listing {
         request: Value,
         case: &str,
     ) -> (Vec<String>, Option<String>) {
-        let reply = self.list(transcribe, request).await;
+        self.page_in(transcribe, request, None, case).await
+    }
+
+    /// [`Self::page`] through `region`'s endpoint when one is given.
+    pub(crate) async fn page_in(
+        &self,
+        transcribe: &Transcribe,
+        request: Value,
+        region: Option<&str>,
+        case: &str,
+    ) -> (Vec<String>, Option<String>) {
+        let reply = self.list_in(transcribe, request, region).await;
         let body = reply.ok(case);
         (
             self.names_of(body, case),

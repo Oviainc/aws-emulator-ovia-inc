@@ -284,7 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let sequence = store.next_sequence();
+        let sequence = store.next_sequence(crate::state::SequencedFamily::LanguageModels);
         let record = crate::state::LanguageModelRecord::in_progress(
             input.model_name.clone(),
             sequence,

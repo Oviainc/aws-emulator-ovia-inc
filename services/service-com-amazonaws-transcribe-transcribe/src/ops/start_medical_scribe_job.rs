@@ -446,7 +446,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let sequence = store.next_sequence();
+        let sequence = store.next_sequence(crate::state::SequencedFamily::MedicalScribeJobs);
         let record = crate::state::MedicalScribeJobRecord {
             name: input.medical_scribe_job_name.clone(),
             sequence,

@@ -182,14 +182,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The Region this request is served in: a regional endpoint lists only the
+        // categories created through it, so it is also what this listing's cursors are
+        // scoped to.
+        let region = crate::state::request_region(ctx.parts());
+
         // A page cursor: the name of the last category of the previous page, read
         // through this service's own token codec (`state::resume_after_name`), so a
-        // token this service never handed out is refused — in the same words every
+        // token this listing never handed out is refused — in the same words every
         // other listing of this service refuses one with — rather than silently
-        // restarting from the top.
+        // restarting from the top. A cursor belongs to the listing that minted it:
+        // this operation over this Region's categories (`state::CursorScope`).
+        let scope = crate::state::CursorScope::new(Self::NAME, &region);
         let resume_after = crate::state::resume_after_name(
             input.next_token.as_deref(),
-            Self::NAME,
+            scope,
             |message| -> Self::Error {
                 ListCallAnalyticsCategoriesErrorModeled::BadRequestException(
                     BadRequestException {
@@ -208,9 +215,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::DEFAULT_CATEGORY_LIST_MAX_RESULTS,
         );
 
-        // The Region this request is served in: a regional endpoint lists only the
-        // categories created through it.
-        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
         // One past the page, so "is there a further category?" is answered by the
         // store rather than by counting the whole Region. The store yields a Region's
@@ -231,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             page.truncate(page_size);
             next_token = page
                 .last()
-                .map(|record| crate::state::name_page_cursor(&record.name));
+                .map(|record| crate::state::name_page_cursor(scope, &record.name));
         }
 
         Ok(ListCallAnalyticsCategoriesOutput {

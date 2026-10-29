@@ -580,7 +580,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let sequence = store.next_sequence();
+        let sequence = store.next_sequence(crate::state::SequencedFamily::TranscriptionJobs);
         // Only the ceiling puts a job in the queue: below it there is nothing to wait
         // for, so a start that deferred its execution is processing like any other.
         let lifecycle =

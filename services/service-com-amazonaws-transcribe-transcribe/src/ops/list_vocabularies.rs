@@ -184,15 +184,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
+        // The family this listing reports: the records it pages, and the counter the
+        // creation sequences its cursors carry are minted from.
+        const FAMILY: crate::state::SequencedFamily = crate::state::SequencedFamily::Vocabularies;
+
         // A page cursor: the creation sequence of the last vocabulary of the previous
         // page, read through this service's own token codec
         // (`state::resume_after_sequence`), so every listing pages the same way and
-        // refuses a cursor this service never handed out in the same words. What this
-        // store has minted is what makes that decidable.
+        // refuses a cursor it never handed out in the same words. A cursor belongs to
+        // the listing that minted it — this operation over this Region's records
+        // (`state::CursorScope`) — and what this store has minted for this family is
+        // what makes that decidable.
+        let scope = crate::state::CursorScope::of(FAMILY, &region);
         let resume_below = crate::state::resume_after_sequence(
             input.next_token.as_deref(),
-            Self::NAME,
-            store.minted_sequences(),
+            scope,
+            store.minted_sequences(FAMILY),
             |message| -> Self::Error {
                 ListVocabulariesErrorModeled::BadRequestException(BadRequestException {
                     message: Some(message),
@@ -210,6 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // further match exists past a full page.
         let page = crate::state::list_page(
             records,
+            scope,
             resume_below,
             page_size,
             crate::state::ListFilter {

@@ -33,6 +33,8 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_transcribe_transcribe::state::DEFAULT_REGION;
+
 use crate::call_analytics_categories::{
     interruption_rule, non_talk_time_rule, sentiment_rule, transcript_rule,
 };
@@ -346,29 +348,44 @@ async fn the_listing_reports_what_the_read_reports_and_changes_nothing() {
     );
 }
 
-/// `NextToken` values this service never handed out, one per form a client might send:
-/// a bare word, the `{sequence}|{name}` cursor the job and vocabulary listings hand
-/// out, this listing's own prefix with no name behind it, a category name with no
-/// prefix, the prefix in the wrong case, and a token at the modelled `NextToken`
-/// ceiling.
+/// `NextToken` values this listing never handed out, one per form a client might send:
+/// a bare word, the sequence cursor the job and vocabulary listings hand out, this
+/// listing's own scope with no name behind it, a category name with no scope, the scope
+/// of this listing in another Region, and a token at the modelled `NextToken` ceiling.
+///
+/// A cursor of this listing carries the scope it was minted in — the listing and the
+/// Region its endpoint serves — ahead of the name it resumes after
+/// (`crate::state::name_page_cursor`); these calls carry no SigV4 credential scope, so
+/// they are served in `DEFAULT_REGION`.
 fn foreign_tokens() -> Vec<(String, String)> {
     vec![
         ("a bare word".to_string(), "not-a-cursor".to_string()),
         (
             "the sequence cursor the other listings hand out".to_string(),
-            "3|cat.99".to_string(),
+            format!("ListVocabularies|{DEFAULT_REGION}|3|cat.99"),
         ),
         (
-            "this listing's prefix with no name behind it".to_string(),
+            "this listing's scope with no name behind it".to_string(),
+            format!("ListCallAnalyticsCategories|{DEFAULT_REGION}|"),
+        ),
+        (
+            "this listing's scope in another Region".to_string(),
+            format!("ListCallAnalyticsCategories|eu-west-2|{}", category_name(0)),
+        ),
+        (
+            "the cursor prefix other services spell a name cursor with".to_string(),
             "name|".to_string(),
         ),
         (
-            "a category name with no cursor prefix".to_string(),
+            "a category name with no cursor scope".to_string(),
             category_name(0),
         ),
         (
-            "the cursor prefix in the wrong case".to_string(),
-            format!("NAME|{}", category_name(0)),
+            "the cursor scope in the wrong case".to_string(),
+            format!(
+                "LISTCALLANALYTICSCATEGORIES|{DEFAULT_REGION}|{}",
+                category_name(0)
+            ),
         ),
         (
             format!("a token at the modelled ceiling of {NEXT_TOKEN_CEILING}"),

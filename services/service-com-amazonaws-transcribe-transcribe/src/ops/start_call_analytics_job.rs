@@ -453,7 +453,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let sequence = store.next_sequence();
+        let sequence = store.next_sequence(crate::state::SequencedFamily::CallAnalyticsJobs);
         // A job accepted into the documented queue is not processing yet: it has no
         // start time, and the clock owes it `QUEUED` -> `IN_PROGRESS` before the
         // completion every job gets — the same two spans a deferred batch

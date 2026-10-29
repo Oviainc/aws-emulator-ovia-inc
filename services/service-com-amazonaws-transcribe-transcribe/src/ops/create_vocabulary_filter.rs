@@ -356,7 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
 
-            let sequence = store.next_sequence();
+            let sequence = store.next_sequence(crate::state::SequencedFamily::VocabularyFilters);
             let record = crate::state::VocabularyFilterRecord {
                 name: input.vocabulary_filter_name.clone(),
                 sequence,

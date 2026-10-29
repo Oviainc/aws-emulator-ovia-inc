@@ -1570,6 +1570,53 @@ impl<R> RegionalStore<R> {
     }
 }
 
+/// One family of records this store mints creation sequences for, and so pages a
+/// listing of by that sequence.
+///
+/// Each family mints from its OWN counter
+/// ([`ComAmazonawsTranscribeTranscribeState::next_sequence`]) and exactly one listing
+/// reports it ([`Self::listing`]), which is what makes a page cursor belong to that one
+/// listing: the sequences a cursor of a listing can carry are the ones its own family
+/// has minted, so a cursor another listing handed out is not one of them (see
+/// [`CursorScope`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SequencedFamily {
+    /// [`ComAmazonawsTranscribeTranscribeState::transcription_jobs`].
+    TranscriptionJobs,
+    /// [`ComAmazonawsTranscribeTranscribeState::medical_transcription_jobs`].
+    MedicalTranscriptionJobs,
+    /// [`ComAmazonawsTranscribeTranscribeState::medical_scribe_jobs`].
+    MedicalScribeJobs,
+    /// [`ComAmazonawsTranscribeTranscribeState::call_analytics_jobs`].
+    CallAnalyticsJobs,
+    /// [`ComAmazonawsTranscribeTranscribeState::language_models`].
+    LanguageModels,
+    /// [`ComAmazonawsTranscribeTranscribeState::vocabularies`].
+    Vocabularies,
+    /// [`ComAmazonawsTranscribeTranscribeState::medical_vocabularies`].
+    MedicalVocabularies,
+    /// [`ComAmazonawsTranscribeTranscribeState::vocabulary_filters`].
+    VocabularyFilters,
+}
+
+impl SequencedFamily {
+    /// The one operation that lists this family: the listing whose pages carry a cursor
+    /// minted in it, and the operation its refusal of any other cursor names
+    /// ([`invalid_next_token_message`]).
+    pub const fn listing(self) -> &'static str {
+        match self {
+            Self::TranscriptionJobs => "ListTranscriptionJobs",
+            Self::MedicalTranscriptionJobs => "ListMedicalTranscriptionJobs",
+            Self::MedicalScribeJobs => "ListMedicalScribeJobs",
+            Self::CallAnalyticsJobs => "ListCallAnalyticsJobs",
+            Self::LanguageModels => "ListLanguageModels",
+            Self::Vocabularies => "ListVocabularies",
+            Self::MedicalVocabularies => "ListMedicalVocabularies",
+            Self::VocabularyFilters => "ListVocabularyFilters",
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-transcribe-transcribe. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsTranscribeTranscribeState {
@@ -1619,28 +1666,38 @@ pub struct ComAmazonawsTranscribeTranscribeState {
     /// [`Self::tags_mut`] under [`RESOURCE_TYPE_CALL_ANALYTICS_JOB`], like every other
     /// family this state holds records of.
     pub call_analytics_jobs: RegionalStore<CallAnalyticsJobRecord>,
-    /// Source of [`TranscriptionJobRecord::sequence`]: a monotonic counter, so
-    /// creation order is total even when two jobs start in the same clock tick.
-    next_sequence: u64,
+    /// Source of every family's record sequence (e.g.
+    /// [`TranscriptionJobRecord::sequence`]): one monotonic counter PER FAMILY, so
+    /// creation order is total within a family even when two of its records are
+    /// established in the same clock tick, and the sequences one family mints are
+    /// exactly `1..=`[`Self::minted_sequences`] of that family.
+    next_sequence: BTreeMap<SequencedFamily, u64>,
 }
 
 impl ComAmazonawsTranscribeTranscribeState {
-    /// The creation sequence number for the next job started.
-    pub fn next_sequence(&mut self) -> u64 {
-        self.next_sequence += 1;
-        self.next_sequence
+    /// The creation sequence number for the next record of `family`.
+    ///
+    /// Counted per family rather than once for the whole store: a page cursor carries
+    /// the creation sequence of the last record on the page it was handed out with
+    /// ([`page_cursor`]) and is only ever presented to the listing of ONE family, so
+    /// "a sequence that listing could have handed out" is decidable only when the
+    /// counter it was minted from is that family's own (see [`parse_page_cursor`]).
+    pub fn next_sequence(&mut self, family: SequencedFamily) -> u64 {
+        let minted = self.next_sequence.entry(family).or_default();
+        *minted += 1;
+        *minted
     }
 
-    /// The highest creation sequence this store has minted — 0 before the first record
-    /// of any family was created.
+    /// The highest creation sequence this store has minted for `family` — 0 before the
+    /// first record of it was created.
     ///
-    /// Every sequence page cursor this service hands out carries the sequence of a
-    /// record on the page it was handed out with ([`page_cursor`]), so a cursor naming
-    /// a sequence past this one is a token no listing of this store could have written
-    /// ([`parse_page_cursor`]). The counter only ever grows, so deleting a record
-    /// cannot invalidate a cursor already handed out.
-    pub fn minted_sequences(&self) -> u64 {
-        self.next_sequence
+    /// Every sequence page cursor a listing hands out carries the sequence of a record
+    /// on the page it was handed out with ([`page_cursor`]), so a cursor naming a
+    /// sequence past this one is a token that listing could not have written
+    /// ([`parse_page_cursor`]). A family's counter only ever grows, so deleting a
+    /// record cannot invalidate a cursor already handed out.
+    pub fn minted_sequences(&self, family: SequencedFamily) -> u64 {
+        self.next_sequence.get(&family).copied().unwrap_or_default()
     }
 
     /// The transcription job named `name`, through the shared lookup ([`record_mut`]),
@@ -3144,40 +3201,107 @@ pub fn content_bytes(terms: &[String]) -> usize {
     terms.iter().map(String::len).sum()
 }
 
-/// What separates the two halves of a sequence page cursor, which — like the prefix of
-/// the name-keyed cursor ([`NAME_CURSOR_PREFIX`]) — is part of what tells a token this
-/// service handed out from one it never wrote. No name this service keys a record by
-/// can hold it: every such name is modelled `pattern "^[0-9a-zA-Z._-]+$"`.
-const SEQUENCE_CURSOR_SEPARATOR: char = '|';
+/// What separates the parts of a page cursor: the scope it was minted in
+/// ([`CursorScope`]) from the position within that scope, and — for a sequence cursor
+/// — that position's own two halves. Part of what tells a token this service handed
+/// out from one it never wrote: no name this service keys a record by can hold it
+/// (every such name is modelled `pattern "^[0-9a-zA-Z._-]+$"`), and neither can the
+/// Region a cursor is scoped to ([`request_region`] answers a Region identifier or
+/// nothing).
+const CURSOR_SEPARATOR: char = '|';
 
-/// The `NextToken` a listing hands out to resume after the record with this creation
-/// sequence and name.
+/// The listing a page cursor was minted by and is valid for: ONE operation over ONE
+/// Region's records.
 ///
-/// The token is opaque to clients: this service writes `{sequence}|{name}` and reads
-/// back the sequence ([`parse_page_cursor`]). The name travels with it, which is what
-/// makes a token readable in a trace; only the sequence is interpreted, so a record
-/// deleted between pages does not stop the next page from resuming strictly past it.
-/// Single-homed so every listing of this service pages the same way.
-pub fn page_cursor(sequence: u64, name: &str) -> String {
-    format!("{sequence}{SEQUENCE_CURSOR_SEPARATOR}{name}")
+/// A `NextToken` names a position in a total order, and the orders this service pages
+/// are per listing: each sequence-paged listing reports the records of its own family,
+/// ordered by a sequence that family alone mints ([`SequencedFamily`]), and every
+/// listing reports only the Region its endpoint serves ([`RegionalStore`]). So a
+/// position one listing handed out names nothing in another listing's order: presented
+/// elsewhere it would resume below every record that listing holds (an empty page, the
+/// caller told the collection is exhausted) or above all of them (the FIRST page again,
+/// with a fresh cursor). Every cursor therefore carries the scope it was minted in and
+/// is read back only in that same scope ([`page_cursor`], [`name_page_cursor`]), which
+/// is what makes "a cursor THIS listing handed out" decidable; any other token is
+/// refused ([`invalid_next_token_message`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorScope<'a> {
+    /// The listing that mints and reads cursors of this scope.
+    listing: &'a str,
+    /// The Region whose records that listing is reporting.
+    region: &'a str,
 }
 
-/// The creation sequence a `NextToken` resumes after, or `None` for a token this
-/// service never handed out — which a listing refuses rather than silently restarting
-/// from the top.
+impl<'a> CursorScope<'a> {
+    /// The scope of the listing `listing` over `region`'s records.
+    pub fn new(listing: &'a str, region: &'a str) -> Self {
+        Self { listing, region }
+    }
+
+    /// The scope of the one listing that reports `family`, over `region`'s records —
+    /// so a sequence-paged listing names its family alone and the operation its cursors
+    /// belong to follows from it ([`SequencedFamily::listing`]).
+    pub fn of(family: SequencedFamily, region: &'a str) -> Self {
+        Self::new(family.listing(), region)
+    }
+
+    /// The operation whose previous answer a cursor of this scope came from — what a
+    /// refusal of any other token names ([`invalid_next_token_message`]).
+    pub fn listing(&self) -> &'a str {
+        self.listing
+    }
+
+    /// What every cursor minted in this scope begins with, and the only prefix a token
+    /// read back in it may carry.
+    fn prefix(&self) -> String {
+        format!(
+            "{listing}{CURSOR_SEPARATOR}{region}{CURSOR_SEPARATOR}",
+            listing = self.listing,
+            region = self.region,
+        )
+    }
+}
+
+/// The `NextToken` the listing `scope` hands out to resume after the record with this
+/// creation sequence and name.
 ///
-/// A token this service wrote carries the WHOLE of what [`page_cursor`] hands out: a
-/// creation sequence, the separator, and the non-empty name the cursor was minted with
-/// (every name this service keys a record by is modelled `@length(min: 1, ..)`), so a
-/// bare number carrying neither separator nor name is not one of this service's
-/// cursors. Creation sequences are minted from 1 upwards by
+/// The token is opaque to clients: this service writes
+/// `{listing}|{region}|{sequence}|{name}` and reads back the sequence
+/// ([`parse_page_cursor`]) in that same scope alone. The name travels with it, which is
+/// what makes a token readable in a trace; only the sequence is interpreted, so a
+/// record deleted between pages does not stop the next page from resuming strictly past
+/// it. Single-homed so every listing of this service pages the same way.
+pub fn page_cursor(scope: CursorScope<'_>, sequence: u64, name: &str) -> String {
+    format!(
+        "{prefix}{sequence}{CURSOR_SEPARATOR}{name}",
+        prefix = scope.prefix(),
+    )
+}
+
+/// The creation sequence a `NextToken` resumes after, or `None` for a token the listing
+/// `scope` never handed out — which that listing refuses rather than silently
+/// restarting from the top or answering an empty page.
+///
+/// A token this listing wrote carries the WHOLE of what [`page_cursor`] hands out: the
+/// scope that listing mints in, a creation sequence, the separator, and the non-empty
+/// name the cursor was minted with (every name this service keys a record by is
+/// modelled `@length(min: 1, ..)`), so neither a bare number carrying no name nor a
+/// cursor another listing (or another Region's endpoint) handed out is one of this
+/// listing's. Creation sequences are minted from 1 upwards, per family, by
 /// [`ComAmazonawsTranscribeTranscribeState::next_sequence`], so a cursor is only one
-/// this service could have handed out when its sequence has actually been minted:
-/// `minted_through` is the highest sequence this store has minted (0 before the first
-/// record), and a sequence of 0, or one past it, belongs to no record any page of this
-/// store ever reported.
-pub fn parse_page_cursor(token: &str, minted_through: u64) -> Option<u64> {
-    let (sequence, name) = token.split_once(SEQUENCE_CURSOR_SEPARATOR)?;
+/// this listing could have handed out when its sequence has actually been minted for
+/// the family that listing reports: `minted_through` is the highest sequence this store
+/// has minted for it ([`ComAmazonawsTranscribeTranscribeState::minted_sequences`]), and
+/// a sequence of 0, or one past it, belongs to no record any page of that listing ever
+/// reported.
+pub fn parse_page_cursor(
+    token: &str,
+    scope: CursorScope<'_>,
+    minted_through: u64,
+) -> Option<u64> {
+    let (sequence, name) = token
+        .strip_prefix(scope.prefix().as_str())?
+        .split_once(CURSOR_SEPARATOR)?;
     if name.is_empty() {
         return None;
     }
@@ -3187,34 +3311,34 @@ pub fn parse_page_cursor(token: &str, minted_through: u64) -> Option<u64> {
         .filter(|sequence| (1..=minted_through).contains(sequence))
 }
 
-/// The prefix a name-keyed page cursor carries, which is what tells a token this
-/// service handed out from one it never wrote. See [`name_page_cursor`].
-const NAME_CURSOR_PREFIX: &str = "name|";
-
 /// The `NextToken` a listing of records keyed by NAME ALONE hands out to resume
 /// strictly after `name`.
 ///
 /// The Call Analytics categories are stored without a creation sequence — their
 /// record holds no such member (see [`CallAnalyticsCategoryRecord`]) and their listing
 /// is documented with no order — so `ListCallAnalyticsCategories` pages over the
-/// store's own key order (the name, ascending) and its cursor is a name rather than a
-/// sequence ([`page_cursor`]). Resuming strictly past a NAME is what makes paging
-/// stable under concurrent writes: a category created or deleted between two pages
-/// cannot shift the position the next page resumes from. Single-homed here beside the
-/// sequence cursor so both token formats of this service live in one place.
-pub fn name_page_cursor(name: &str) -> String {
-    format!("{NAME_CURSOR_PREFIX}{name}")
+/// store's own key order (the name, ascending) and its cursor carries a name rather
+/// than a sequence ([`page_cursor`]). Resuming strictly past a NAME is what makes
+/// paging stable under concurrent writes: a category created or deleted between two
+/// pages cannot shift the position the next page resumes from. The scope it carries is
+/// the sequence cursor's own ([`CursorScope`]): the names of one Region's categories
+/// are the order THAT endpoint's listing pages, so a cursor minted over another
+/// Region's categories names a position in no order this one pages. Single-homed here
+/// beside the sequence cursor so both token formats of this service live in one place.
+pub fn name_page_cursor(scope: CursorScope<'_>, name: &str) -> String {
+    format!("{prefix}{name}", prefix = scope.prefix())
 }
 
-/// The record name a `NextToken` resumes after, or `None` for a token this service
-/// never handed out — which a listing refuses rather than silently restarting from the
-/// top.
+/// The record name a `NextToken` resumes after, or `None` for a token the listing
+/// `scope` never handed out — which that listing refuses rather than silently
+/// restarting from the top.
 ///
 /// Every name this service keys a record by is non-empty (`CategoryName` is modelled
-/// `@length(min: 1, max: 200)`), so a bare prefix is a token this service never wrote.
-pub fn parse_name_page_cursor(token: &str) -> Option<&str> {
+/// `@length(min: 1, max: 200)`), so a scope prefix with nothing behind it is a token
+/// this service never wrote.
+pub fn parse_name_page_cursor<'t>(token: &'t str, scope: CursorScope<'_>) -> Option<&'t str> {
     token
-        .strip_prefix(NAME_CURSOR_PREFIX)
+        .strip_prefix(scope.prefix().as_str())
         .filter(|name| !name.is_empty())
 }
 
@@ -3231,47 +3355,48 @@ pub fn invalid_next_token_message(operation: &str) -> String {
 }
 
 /// The creation sequence a listing's `NextToken` resumes after — `None` when the
-/// request carried no token — or `operation`'s own refusal for a token this service
-/// never handed out.
+/// request carried no token — or that listing's own refusal for a token it never
+/// handed out.
 ///
-/// `minted_through` is what the store has actually minted
-/// ([`ComAmazonawsTranscribeTranscribeState::minted_sequences`]), which is what makes
-/// "a cursor this service handed out" decidable rather than assumed; see
+/// `scope` is the listing reading the token ([`CursorScope`]) and `minted_through` what
+/// the store has actually minted for the family that listing reports
+/// ([`ComAmazonawsTranscribeTranscribeState::minted_sequences`]), which together make
+/// "a cursor THIS listing handed out" decidable rather than assumed; see
 /// [`parse_page_cursor`]. Generic over the error channel because each listing models
 /// its own: `refuse` is what lifts the single-homed refusal text
 /// ([`invalid_next_token_message`]) into it, so no handler spells that text or the
 /// token format itself.
 pub fn resume_after_sequence<E>(
     token: Option<&str>,
-    operation: &str,
+    scope: CursorScope<'_>,
     minted_through: u64,
     refuse: impl FnOnce(String) -> E,
 ) -> Result<Option<u64>, E> {
     match token {
         None => Ok(None),
-        Some(token) => match parse_page_cursor(token, minted_through) {
+        Some(token) => match parse_page_cursor(token, scope, minted_through) {
             Some(sequence) => Ok(Some(sequence)),
-            None => Err(refuse(invalid_next_token_message(operation))),
+            None => Err(refuse(invalid_next_token_message(scope.listing()))),
         },
     }
 }
 
 /// The record NAME a listing's `NextToken` resumes strictly after — `None` when the
-/// request carried no token — or `operation`'s own refusal for a token this service
-/// never handed out.
+/// request carried no token — or that listing's own refusal for a token it never handed
+/// out.
 ///
 /// The name-keyed counterpart of [`resume_after_sequence`], for the one listing of
 /// this service whose records carry no creation sequence (see [`name_page_cursor`]).
 pub fn resume_after_name<'t, E>(
     token: Option<&'t str>,
-    operation: &str,
+    scope: CursorScope<'_>,
     refuse: impl FnOnce(String) -> E,
 ) -> Result<Option<&'t str>, E> {
     match token {
         None => Ok(None),
-        Some(token) => match parse_name_page_cursor(token) {
+        Some(token) => match parse_name_page_cursor(token, scope) {
             Some(name) => Ok(Some(name)),
-            None => Err(refuse(invalid_next_token_message(operation))),
+            None => Err(refuse(invalid_next_token_message(scope.listing()))),
         },
     }
 }
@@ -3378,11 +3503,13 @@ pub struct ListPage<T> {
 /// service pages the same way: a record at or above the resumed cursor was on an
 /// earlier page and is skipped; the filters select what the page may hold; and a
 /// `NextToken` is emitted only when a FURTHER MATCHING record was found after the
-/// page filled, built from the last record placed ON the page rather than from the
-/// one that overflowed it — which is what makes the next page resume exactly where
-/// this one stopped.
+/// page filled, minted in the SCOPE of the listing handing it out ([`CursorScope`]) and
+/// built from the last record placed ON the page rather than from the one that
+/// overflowed it — which is what makes the next page resume exactly where this one
+/// stopped, and only for this listing.
 pub fn list_page<'r, R, T>(
     records: impl IntoIterator<Item = &'r R>,
+    scope: CursorScope<'_>,
     resume_below: Option<u64>,
     page_size: usize,
     filter: ListFilter<'_>,
@@ -3418,7 +3545,7 @@ where
             // A further match exists, so the caller gets a cursor to it.
             next_token = last_on_page
                 .as_ref()
-                .map(|(sequence, name)| page_cursor(*sequence, name));
+                .map(|(sequence, name)| page_cursor(scope, *sequence, name));
             break;
         }
         items.push(project(record));

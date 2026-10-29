@@ -3,22 +3,26 @@
 //! What a listing accepts as a page cursor, driven through every listing of this
 //! service in one table, end to end over the wire.
 //!
-//! THE RULE UNDER TEST: a listing resumes only from a `NextToken` this service itself
+//! THE RULE UNDER TEST: a listing resumes only from a `NextToken` THIS listing itself
 //! minted — the whole of what its cursor codec hands out (`crate::state::page_cursor`:
-//! a creation sequence this store has actually minted, the separator, and the
-//! non-empty record name it was minted with) — and refuses every other token with the
-//! modelled `BadRequestException` naming the listing that would have handed one out,
-//! instead of silently answering the FIRST page again. A client looping `while
-//! NextToken` with a stale, truncated or foreign cursor is told its cursor is invalid
-//! rather than re-reading page one forever.
+//! the scope that listing mints in, a creation sequence its own family has actually
+//! minted, the separator, and the non-empty record name it was minted with) — and
+//! refuses every other token with the modelled `BadRequestException` naming the listing
+//! that would have handed one out, instead of silently answering the FIRST page again.
+//! A client looping `while NextToken` with a stale, truncated or foreign cursor is told
+//! its cursor is invalid rather than re-reading page one forever.
 //!
 //! The rows differ along what the rule generalises over: the listing (so the record
 //! family, the cursor format it hands out and the operation its refusal must name),
-//! and the FORM the alien token takes — a bare number with neither separator nor name
-//! (in range and out of it), an in-format cursor whose sequence this store never
-//! minted, a sequence that is not a `u64` at all, a half of the format missing, and
-//! the other codec's format. The accepted side is swept over every minted sequence,
-//! the published ends of that range and one past it, and pins what the cursor skips.
+//! and the FORM the alien token takes — a bare number with neither scope, separator nor
+//! name (in range and out of it), the position without the scope, an in-scope cursor
+//! whose sequence this listing's family never minted, a sequence that is not a `u64` at
+//! all, a half of the position missing, and the other codec's format. The accepted side
+//! is swept over every minted sequence, the published ends of that range and one past
+//! it, and pins what the cursor skips.
+//!
+//! A cursor ANOTHER listing of the same store minted is the sibling rule, driven over
+//! every pair of listings in `crate::list_cursor_scope_rule`.
 //!
 //! The listings, their creates and the names created are
 //! `crate::list_paging_rule`'s own table, reused rather than copied; every call goes
@@ -27,15 +31,20 @@
 
 use serde_json::json;
 
+use service_com_amazonaws_transcribe_transcribe::state::DEFAULT_REGION;
+
 use crate::list_paging_rule::{listings, Listing, Order, CREATED_IN_ORDER};
 use crate::transcription_jobs::Transcribe;
 
 /// The modelled client error every listing of this service refuses an alien cursor
 /// with, and the status its awsJson1_1 wire protocol puts on a client error (both
 /// spanned by `crate::client_error_wire_status`).
-const REFUSAL_CODE: &str = "BadRequestException";
+///
+/// `pub(crate)`, with [`refusal`]: `crate::list_cursor_scope_rule` refuses the cursors
+/// of OTHER listings in the same words rather than writing a second copy of them.
+pub(crate) const REFUSAL_CODE: &str = "BadRequestException";
 /// See [`REFUSAL_CODE`].
-const CLIENT_ERROR_STATUS: u16 = 400;
+pub(crate) const CLIENT_ERROR_STATUS: u16 = 400;
 
 /// The listings paged by a creation sequence: every one but the Call Analytics
 /// categories, whose records carry no sequence and whose cursor is a name
@@ -49,7 +58,7 @@ fn sequence_paged() -> Vec<Listing> {
 
 /// The refusal text a listing owes an alien cursor, naming the operation whose
 /// previous answer the caller should have copied one from.
-fn refusal(operation: &str) -> String {
+pub(crate) fn refusal(operation: &str) -> String {
     format!(
         "The NextToken in your request is not valid. Use the NextToken returned by \
          your previous {operation} request."
@@ -62,12 +71,25 @@ struct Forged {
     token: String,
 }
 
-/// Every form of token this service never handed out, for a store that has minted
-/// `minted` sequences (1..=`minted`) and holds a record named `stored`.
-fn forged_tokens(minted: u64, stored: &str) -> Vec<Forged> {
+/// A token carrying `position` behind the scope `listing` mints its cursors in: that
+/// operation and the Region its endpoint serves (these calls carry no SigV4 credential
+/// scope, so they are served in `DEFAULT_REGION`).
+fn scoped(listing: &Listing, position: &str) -> String {
+    format!("{}|{DEFAULT_REGION}|{position}", listing.operation)
+}
+
+/// A cursor in the whole of the format `listing` hands one out in: its scope, the
+/// creation sequence to resume after, and the name that record was minted with.
+pub(crate) fn minted_cursor(listing: &Listing, sequence: u64, name: &str) -> String {
+    scoped(listing, &format!("{sequence}|{name}"))
+}
+
+/// Every form of token `listing` never handed out, for a store whose family of it has
+/// minted `minted` sequences (1..=`minted`) and holds a record named `stored`.
+fn forged_tokens(listing: &Listing, minted: u64, stored: &str) -> Vec<Forged> {
     vec![
         Forged {
-            form: "a bare sequence in range, carrying neither separator nor name",
+            form: "a bare sequence in range, carrying neither scope, separator nor name",
             token: "1".to_string(),
         },
         Forged {
@@ -79,32 +101,41 @@ fn forged_tokens(minted: u64, stored: &str) -> Vec<Forged> {
             token: "999999".to_string(),
         },
         Forged {
-            form: "a cursor one past the newest sequence minted",
-            token: format!("{}|{stored}", minted + 1),
+            form: "the position of a page of this very listing, without the scope it \
+                   mints its cursors in",
+            token: format!("{minted}|{stored}"),
         },
         Forged {
-            form: "a cursor far past every sequence minted",
-            token: format!("999999|{stored}"),
+            form: "an in-scope cursor one past the newest sequence minted",
+            token: minted_cursor(listing, minted + 1, stored),
         },
         Forged {
-            form: "a cursor of 0, which is before the first sequence minted",
-            token: format!("0|{stored}"),
+            form: "an in-scope cursor far past every sequence minted",
+            token: minted_cursor(listing, 999_999, stored),
         },
         Forged {
-            form: "a cursor whose sequence is negative",
-            token: format!("-1|{stored}"),
+            form: "an in-scope cursor of 0, which is before the first sequence minted",
+            token: minted_cursor(listing, 0, stored),
         },
         Forged {
-            form: "a cursor whose sequence overflows a u64",
-            token: format!("99999999999999999999999999|{stored}"),
+            form: "an in-scope cursor whose sequence is negative",
+            token: scoped(listing, &format!("-1|{stored}")),
         },
         Forged {
-            form: "a sequence with no name after the separator",
-            token: format!("{minted}|"),
+            form: "an in-scope cursor whose sequence overflows a u64",
+            token: scoped(listing, &format!("99999999999999999999999999|{stored}")),
         },
         Forged {
-            form: "a name with no sequence before the separator",
-            token: format!("|{stored}"),
+            form: "an in-scope sequence with no name after the separator",
+            token: scoped(listing, &format!("{minted}|")),
+        },
+        Forged {
+            form: "an in-scope name with no sequence before the separator",
+            token: scoped(listing, &format!("|{stored}")),
+        },
+        Forged {
+            form: "the scope with no position behind it",
+            token: scoped(listing, ""),
         },
         Forged {
             form: "the separator alone",
@@ -133,7 +164,7 @@ async fn every_sequence_paged_listing_refuses_a_cursor_it_never_minted() {
         let transcribe = Transcribe::new();
         listing.create_the_records(&transcribe).await;
 
-        for Forged { form, token } in forged_tokens(minted, CREATED_IN_ORDER[0]) {
+        for Forged { form, token } in forged_tokens(&listing, minted, CREATED_IN_ORDER[0]) {
             let case = format!("{} resumed with {form} ({token:?})", listing.operation);
             let reply = listing
                 .list(&transcribe, json!({"NextToken": token}))
@@ -166,7 +197,7 @@ async fn a_store_that_minted_nothing_refuses_every_cursor() {
         // In the format a cursor is handed out in, but naming sequences nothing has
         // minted yet.
         for sequence in [1_u64, 5] {
-            let token = format!("{sequence}|{}", CREATED_IN_ORDER[0]);
+            let token = minted_cursor(&listing, sequence, CREATED_IN_ORDER[0]);
             let case = format!("{case} resumed with {token:?}");
             let reply = listing
                 .list(&transcribe, json!({"NextToken": token}))
@@ -200,7 +231,7 @@ async fn a_cursor_this_store_minted_resumes_strictly_past_it() {
         // records created before it, newest first.
         for sequence in 1..=minted {
             let index = usize::try_from(sequence).expect("a sequence fits a usize") - 1;
-            let token = format!("{sequence}|{}", CREATED_IN_ORDER[index]);
+            let token = minted_cursor(&listing, sequence, CREATED_IN_ORDER[index]);
             let case = format!("{} resumed with {token:?}", listing.operation);
             let mut expected: Vec<String> = CREATED_IN_ORDER[..index]
                 .iter()
@@ -224,7 +255,7 @@ async fn a_cursor_this_store_minted_resumes_strictly_past_it() {
 
         // One past the newest sequence minted is a cursor this store cannot have
         // written, however well-formed it looks.
-        let token = format!("{}|{}", minted + 1, CREATED_IN_ORDER[0]);
+        let token = minted_cursor(&listing, minted + 1, CREATED_IN_ORDER[0]);
         let case = format!("{} resumed with {token:?}", listing.operation);
         let reply = listing
             .list(&transcribe, json!({"NextToken": token}))
