@@ -29,12 +29,16 @@ const REGION: &str = "us-west-2";
 
 /// Amazon Keyspaces and Application Auto Scaling over ONE engine — what `core/router`
 /// assembles — so a Keyspaces write and an Application Auto Scaling read see one store.
-struct Emulator {
+///
+/// Shared with the other suites of this test binary that drive both services
+/// (`tests/all/update_table_capacity_mode_re_set.rs`), so there is ONE two-service
+/// harness rather than a copy per file.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -52,7 +56,7 @@ impl Emulator {
     }
 
     /// Call an Amazon Keyspaces operation.
-    async fn keyspaces(&self, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn keyspaces(&self, operation: &str, body: Value) -> (u16, Value) {
         self.dispatch(
             "cassandra",
             "application/x-amz-json-1.0",
@@ -63,7 +67,7 @@ impl Emulator {
     }
 
     /// Call an Application Auto Scaling operation.
-    async fn auto_scaling(&self, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn auto_scaling(&self, operation: &str, body: Value) -> (u16, Value) {
         self.dispatch(
             "application-autoscaling",
             "application/x-amz-json-1.1",
@@ -110,7 +114,7 @@ impl Emulator {
 
     /// Every `cassandra` scalable target Application Auto Scaling holds, ordered by
     /// resource id and dimension.
-    async fn cassandra_targets(&self) -> Vec<Value> {
+    pub(crate) async fn cassandra_targets(&self) -> Vec<Value> {
         let (status, body) = self
             .auto_scaling(
                 "DescribeScalableTargets",
@@ -136,7 +140,7 @@ impl Emulator {
 
     /// Every `cassandra` scaling policy Application Auto Scaling holds, ordered by the
     /// dimension it steers.
-    async fn cassandra_policies(&self) -> Vec<Value> {
+    pub(crate) async fn cassandra_policies(&self) -> Vec<Value> {
         let (status, body) = self
             .auto_scaling(
                 "DescribeScalingPolicies",
@@ -201,7 +205,7 @@ impl Emulator {
 }
 
 /// The settings that turn a capacity's auto scaling ON, as a request carries them.
-fn enabled(minimum: i64, maximum: i64, target: f64) -> Value {
+pub(crate) fn enabled(minimum: i64, maximum: i64, target: f64) -> Value {
     json!({
         "autoScalingDisabled": false,
         "minimumUnits": minimum,
@@ -214,7 +218,7 @@ fn enabled(minimum: i64, maximum: i64, target: f64) -> Value {
 
 /// The `ResourceId` Application Auto Scaling documents for the `cassandra` namespace's
 /// table resource type: `keyspace/<keyspaceName>/table/<tableName>`.
-fn resource_id(keyspace: &str, table: &str) -> String {
+pub(crate) fn resource_id(keyspace: &str, table: &str) -> String {
     format!("keyspace/{keyspace}/table/{table}")
 }
 

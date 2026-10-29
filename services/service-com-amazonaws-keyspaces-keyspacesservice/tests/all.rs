@@ -83,6 +83,8 @@ mod update_keyspace;
 mod update_table;
 #[path = "all/update_table_add_columns_types.rs"]
 mod update_table_add_columns_types;
+#[path = "all/update_table_capacity_mode_re_set.rs"]
+mod update_table_capacity_mode_re_set;
 #[path = "all/update_table_capacity_mode_replica_settings.rs"]
 mod update_table_capacity_mode_replica_settings;
 #[path = "all/update_table_scaling_settings.rs"]

@@ -677,33 +677,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             schema.all_columns.extend(added);
         }
-        // Whether this update leaves the table with no provisioned capacity to scale, so
-        // the scalable targets its capacities were scaled on are retired below.
-        let mut leaves_provisioned_mode = false;
+        // Whether this update MOVED the table out of provisioned capacity mode, so the
+        // scalable targets its capacities were scaled on are retired below.
+        let mut moves_out_of_provisioned_mode = false;
         if let Some(capacity) = capacity_specification {
+            // The mode the table is in as this update arrives (`stored_capacity`, read
+            // under this same lock above). Every consequence below follows from the mode
+            // CHANGING, so each is decided from this mode and the requested one together:
+            // an update that re-sets the mode the table is already in changed no
+            // throughput capacity and therefore changes none of them.
+            let was_pay_per_request =
+                stored_capacity.throughput_mode == crate::state::PAY_PER_REQUEST_THROUGHPUT_MODE;
+            let was_provisioned =
+                stored_capacity.throughput_mode == crate::state::PROVISIONED_THROUGHPUT_MODE;
             // "The timestamp of the last operation that changed the provisioned
             // throughput capacity of a table": the summary member is named for a move TO
             // `PAY_PER_REQUEST`, so it is stamped only when this update is that move. An
             // update that re-sets the mode a table is ALREADY in changed no throughput
             // capacity, so it deliberately leaves the existing stamp where it is.
-            let was_pay_per_request = table
-                .capacity_specification
-                .as_ref()
-                .is_some_and(|existing| {
-                    existing.throughput_mode == crate::state::PAY_PER_REQUEST_THROUGHPUT_MODE
-                });
             if !was_pay_per_request
                 && capacity.throughput_mode == crate::state::PAY_PER_REQUEST_THROUGHPUT_MODE
             {
                 table.last_update_to_pay_per_request = Some(now);
             }
             // Auto scaling is "the optional auto scaling settings for a table in
-            // provisioned capacity mode", so a table moved OUT of that mode has no
+            // provisioned capacity mode", so a table MOVED OUT of that mode has no
             // provisioned throughput for a policy to move and therefore no auto scaling
             // settings at all: the settings go, here and in Application Auto Scaling.
-            leaves_provisioned_mode =
-                capacity.throughput_mode != crate::state::PROVISIONED_THROUGHPUT_MODE;
-            if leaves_provisioned_mode {
+            // Gated on the move itself, like the stamp above: a table that was never in
+            // provisioned mode is not moved out of it by an update that re-sets the mode
+            // it already holds, so that update leaves its settings — including the ones
+            // Application Auto Scaling holds, which is where a table's auto scaling
+            // settings live — exactly where they are.
+            moves_out_of_provisioned_mode = was_provisioned
+                && capacity.throughput_mode != crate::state::PROVISIONED_THROUGHPUT_MODE;
+            if moves_out_of_provisioned_mode {
                 table.auto_scaling_specification = None;
                 // The same rule reaches the per-Region settings: besides the Region it
                 // names, a `ReplicaSpecification` carries only that Region's
@@ -784,7 +792,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 specification,
             );
         }
-        if leaves_provisioned_mode {
+        if moves_out_of_provisioned_mode {
             crate::state::retire_auto_scaling(
                 &*self.engine,
                 &region,
