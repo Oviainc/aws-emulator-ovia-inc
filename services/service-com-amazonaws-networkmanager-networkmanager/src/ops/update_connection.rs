@@ -254,22 +254,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller removes the information it holds, which for a link REFERENCE means the
         // record names no link at all rather than naming the empty id. The two devices, the
         // ids, the ARN, `CreatedAt` and tags are never rewritten.
-        if input.description.is_some() {
-            record.description = input.description;
-        }
-        if let Some(link_id) = requested_link {
-            record.link_id = link_id.map(str::to_string);
-        }
-        if let Some(connected_link_id) = requested_connected_link {
-            record.connected_link_id = connected_link_id.map(str::to_string);
-        }
-        // An update is not applied instantly: AWS answers the reconfigured connection in
-        // the non-terminal `UPDATING` state, so the clock owes the `UPDATING` ->
-        // `AVAILABLE` transition and a caller reading straight after this call still
-        // observes it. The due instant is stored and compared against the clock; nothing
-        // sleeps for it.
         let now = ::std::time::SystemTime::now();
-        record.updating_until = Some(now + crate::state::SETTLE_DELAY);
+        let mut changed =
+            crate::state::write_supplied(&mut record.description, input.description.map(Some));
+        changed |= crate::state::write_supplied(
+            &mut record.link_id,
+            requested_link.map(|link_id| link_id.map(str::to_string)),
+        );
+        changed |= crate::state::write_supplied(
+            &mut record.connected_link_id,
+            requested_connected_link.map(|link_id| link_id.map(str::to_string)),
+        );
+
+        // An ACCEPTED change is not applied instantly: AWS answers the reconfigured
+        // connection in the non-terminal `UPDATING` state, so the clock owes the `UPDATING`
+        // -> `AVAILABLE` transition and a caller reading straight after this call still
+        // observes it. The due instant is stored and compared against the clock; nothing
+        // sleeps for it. A request that asks for the state the connection is already in
+        // changes nothing: it does not move the connection to `UPDATING` and writes nothing
+        // at all, because there is no change for the service to apply.
+        if changed {
+            record.updating_until = Some(now + crate::state::SETTLE_DELAY);
+        }
         let connection = record.to_shape(now);
 
         Ok(UpdateConnectionOutput {

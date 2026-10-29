@@ -59,12 +59,15 @@ fn base_segments() -> Value {
     json!([{ "Name": "shared", "EdgeLocations": ["us-west-2"], "SharedSegments": [] }])
 }
 
-/// One row of the update table: the request body, and the `Description` the stored record
-/// must hold afterwards (`Value::Null` standing for "the member is absent").
+/// One row of the update table: the request body, the `Description` the stored record
+/// must hold afterwards (`Value::Null` standing for "the member is absent"), and whether
+/// the request ASKS FOR A CHANGE — a request that asks for the state the core network is
+/// already in leaves the service nothing to apply.
 struct UpdateCase {
     case: &'static str,
     body: Value,
     description: Value,
+    changes: bool,
 }
 
 /// The rows of the update table. They differ along WHETHER the request carries the one
@@ -78,36 +81,43 @@ fn update_cases() -> Vec<UpdateCase> {
             case: "a new description replaces the stored one",
             body: json!({ "Description": "updated description" }),
             description: json!("updated description"),
+            changes: true,
         },
         UpdateCase {
             case: "no mutable member at all, so nothing changes",
             body: json!({}),
             description: json!(BASE_DESCRIPTION),
+            changes: false,
         },
         UpdateCase {
             case: "an empty Description removes the information it held",
             body: json!({ "Description": "" }),
             description: json!(""),
+            changes: true,
         },
         UpdateCase {
             case: "a single character",
             body: json!({ "Description": "x" }),
             description: json!("x"),
+            changes: true,
         },
         UpdateCase {
             case: "a value at the modelled maximum length of 256 characters",
             body: json!({ "Description": "d".repeat(256) }),
             description: json!("d".repeat(256)),
+            changes: true,
         },
         UpdateCase {
             case: "a multi-line and non-ascii value",
             body: json!({ "Description": "line one\nline two \u{1f310}" }),
             description: json!("line one\nline two \u{1f310}"),
+            changes: true,
         },
         UpdateCase {
             case: "the value the record already holds",
             body: json!({ "Description": BASE_DESCRIPTION }),
             description: json!(BASE_DESCRIPTION),
+            changes: false,
         },
     ]
 }
@@ -216,13 +226,16 @@ async fn update_core_network_writes_only_the_description_and_round_trips_through
             "case {}: Tags must not be rewritten, got {core_network}",
             row.case
         );
-        // Applying the change is not instant, so the reconfigured core network reports the
-        // transitional state its update is outstanding in — without losing the topology the
-        // policy in force configures, asserted below.
+        // Applying an accepted change is not instant, so the reconfigured core network
+        // reports the transitional state its update is outstanding in — without losing the
+        // topology the policy in force configures, asserted below. A request that asks for
+        // the state the core network is already in owes no transition, so it is answered in
+        // the state it found.
+        let expected_state = if row.changes { "UPDATING" } else { "AVAILABLE" };
         assert_eq!(
             core_network["State"],
-            json!("UPDATING"),
-            "case {}: an update answers the core network as UPDATING, got {core_network}",
+            json!(expected_state),
+            "case {}: expected State {expected_state}, got {core_network}",
             row.case
         );
         assert_eq!(
@@ -251,6 +264,15 @@ async fn update_core_network_writes_only_the_description_and_round_trips_through
             "case {}: GetCoreNetwork must answer the record the update returned, got {stored}",
             row.case
         );
+        if !row.changes {
+            // Nothing was asked for, so nothing was written: the whole record — its state
+            // included — is the one the update found.
+            assert_eq!(
+                stored, before,
+                "case {}: a change-free update must write nothing, got {stored}",
+                row.case
+            );
+        }
     }
 
     // No update reached a core network it did not name.
@@ -289,26 +311,31 @@ async fn successive_updates_accumulate_on_the_stored_record() {
             case: "step 1: an empty update of a record with no description",
             body: json!({}),
             description: Value::Null,
+            changes: false,
         },
         UpdateCase {
             case: "step 2: a Description where there was none",
             body: json!({ "Description": "first" }),
             description: json!("first"),
+            changes: true,
         },
         UpdateCase {
             case: "step 3: an empty update keeps what step 2 wrote",
             body: json!({}),
             description: json!("first"),
+            changes: false,
         },
         UpdateCase {
             case: "step 4: emptying the Description removes it",
             body: json!({ "Description": "" }),
             description: json!(""),
+            changes: true,
         },
         UpdateCase {
             case: "step 5: a value over the emptied one",
             body: json!({ "Description": "second" }),
             description: json!("second"),
+            changes: true,
         },
     ];
 

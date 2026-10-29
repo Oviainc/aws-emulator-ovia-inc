@@ -311,36 +311,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // removes the information it holds. The ids, the ARN, `CreatedAt` and the tags are
         // never rewritten, so the device keeps the identity and the history it was created
         // with.
-        if input.description.is_some() {
-            record.description = input.description;
+        let mut changed =
+            crate::state::write_supplied(&mut record.description, input.description.map(Some));
+        changed |= crate::state::write_supplied(&mut record.device_type, input.r#type.map(Some));
+        changed |= crate::state::write_supplied(&mut record.vendor, input.vendor.map(Some));
+        changed |= crate::state::write_supplied(&mut record.model, input.model.map(Some));
+        changed |= crate::state::write_supplied(
+            &mut record.serial_number,
+            input.serial_number.map(Some),
+        );
+        changed |= crate::state::write_supplied_by(
+            &mut record.aws_location,
+            input.aws_location.map(Some),
+            |supplied, held| crate::state::same_aws_location(supplied.as_ref(), held.as_ref()),
+        );
+        changed |= crate::state::write_supplied_by(
+            &mut record.location,
+            input.location.map(Some),
+            |supplied, held| crate::state::same_location(supplied.as_ref(), held.as_ref()),
+        );
+        changed |= crate::state::write_supplied(&mut record.site_id, requested_site);
+
+        // An ACCEPTED change is not applied instantly: the reconfigured device is answered
+        // in the non-terminal `UPDATING` state (`smithy_query shape="DeviceState"`), so the
+        // clock owes the `UPDATING` -> `AVAILABLE` transition and a caller reading straight
+        // after this call still observes it. The due instant is stored and compared against
+        // the clock; nothing sleeps for it. A request that asks for the state the device is
+        // already in changes nothing: it does not move the device to `UPDATING` and writes
+        // nothing at all, because there is no change for the service to apply.
+        if changed {
+            record.updating_until = Some(now + crate::state::SETTLE_DELAY);
         }
-        if input.r#type.is_some() {
-            record.device_type = input.r#type;
-        }
-        if input.vendor.is_some() {
-            record.vendor = input.vendor;
-        }
-        if input.model.is_some() {
-            record.model = input.model;
-        }
-        if input.serial_number.is_some() {
-            record.serial_number = input.serial_number;
-        }
-        if input.aws_location.is_some() {
-            record.aws_location = input.aws_location;
-        }
-        if input.location.is_some() {
-            record.location = input.location;
-        }
-        if let Some(site_id) = requested_site {
-            record.site_id = site_id;
-        }
-        // An update is not applied instantly: the reconfigured device is answered in the
-        // non-terminal `UPDATING` state (`smithy_query shape="DeviceState"`), so the clock
-        // owes the `UPDATING` -> `AVAILABLE` transition and a caller reading straight after
-        // this call still observes it. The due instant is stored and compared against the
-        // clock; nothing sleeps for it.
-        record.updating_until = Some(now + crate::state::SETTLE_DELAY);
         let device = record.to_shape(now);
 
         Ok(UpdateDeviceOutput {

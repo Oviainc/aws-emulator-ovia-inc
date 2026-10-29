@@ -8318,6 +8318,69 @@ pub fn same_vpc_options(left: Option<&VpcOptions>, right: Option<&VpcOptions>) -
     members(left) == members(right)
 }
 
+/// Whether two `Bandwidth` structures carry the same speeds. See [`same_connect_options`]:
+/// the shape is generated and carries no `PartialEq`, so the comparison goes through its
+/// members (`UploadSpeed` and `DownloadSpeed`: `smithy_query shape=Bandwidth`).
+pub fn same_bandwidth(left: &Bandwidth, right: &Bandwidth) -> bool {
+    (left.upload_speed, left.download_speed) == (right.upload_speed, right.download_speed)
+}
+
+/// Whether two `Location` structures carry the same members. See [`same_connect_options`];
+/// a structure that is absent altogether differs from one carrying no member, because the
+/// first names no location at all while the second names an empty one.
+pub fn same_location(left: Option<&Location>, right: Option<&Location>) -> bool {
+    let members = |location: Option<&Location>| {
+        location.map(|location| {
+            (
+                location.address.clone(),
+                location.latitude.clone(),
+                location.longitude.clone(),
+            )
+        })
+    };
+    members(left) == members(right)
+}
+
+/// Whether two `AWSLocation` structures carry the same members. See [`same_location`].
+pub fn same_aws_location(left: Option<&AWSLocation>, right: Option<&AWSLocation>) -> bool {
+    let members = |location: Option<&AWSLocation>| {
+        location.map(|location| (location.zone.clone(), location.subnet_arn.clone()))
+    };
+    members(left) == members(right)
+}
+
+/// Write the value an update SUPPLIED for one member over the value a record holds,
+/// answering whether that CHANGED the record.
+///
+/// An absent member (`None`) is one the request left out, so nothing is written for it;
+/// a supplied one replaces the stored value — the empty string included, which is how
+/// this service's updates document removing the information a member held — and counts as
+/// a change only where the stored value differs. Answering whether anything changed is
+/// what lets every updater of this service apply one rule, the one
+/// [`AttachmentRecord::set_edge_locations`] applies to an attachment: a request that asks
+/// for the state the resource is already in leaves the service no change to apply, so it
+/// writes nothing and owes no transition.
+pub fn write_supplied<T: PartialEq>(held: &mut T, supplied: Option<T>) -> bool {
+    write_supplied_by(held, supplied, |supplied, held| supplied == held)
+}
+
+/// [`write_supplied`] for a member whose type is a generated shape and therefore carries
+/// no `PartialEq` (see [`same_connect_options`]): `same` is what compares the supplied
+/// value against the stored one.
+pub fn write_supplied_by<T>(
+    held: &mut T,
+    supplied: Option<T>,
+    same: impl FnOnce(&T, &T) -> bool,
+) -> bool {
+    match supplied {
+        Some(value) if !same(&value, held) => {
+            *held = value;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// The Region of an EC2 resource ARN that must name a resource of type `resource_type`
 /// (`arn:<partition>:ec2:<region>:<account>:<resource_type>/<id>`), or `None` when the
 /// string is not such an ARN or names no Region.

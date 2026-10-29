@@ -458,20 +458,24 @@ async fn create_connection_refuses_a_reference_the_global_network_does_not_hold(
     );
 }
 
-/// One row of the update table: the request body, and the three mutable members the stored
-/// record must hold afterwards (`Value::Null` standing for "the member is absent").
+/// One row of the update table: the request body, the three mutable members the stored
+/// record must hold afterwards (`Value::Null` standing for "the member is absent"), and
+/// whether the request ASKS FOR A CHANGE — a request that asks for the state the
+/// connection is already in leaves the service nothing to apply.
 struct UpdateCase {
     case: &'static str,
     body: Value,
     description: Value,
     link: Value,
     connected_link: Value,
+    changes: bool,
 }
 
 /// The rows of the update table. They differ along WHICH mutable members the request
-/// carries (all three, each one alone, none) and along the value's form — another stored
+/// carries (all three, each one alone, none), along the value's form — another stored
 /// link, an empty string (the documented removal), the modelled maximum length of
-/// `ConstrainedString` (256), and a multi-line, non-ASCII value.
+/// `ConstrainedString` (256), and a multi-line, non-ASCII value — and along whether the
+/// value asked for DIFFERS from the one the record already holds.
 fn update_cases(seed: &Fixture) -> Vec<UpdateCase> {
     let link = &seed.link;
     let connected_link = &seed.connected_link;
@@ -486,6 +490,7 @@ fn update_cases(seed: &Fixture) -> Vec<UpdateCase> {
             description: json!("updated description"),
             link: json!(connected_link),
             connected_link: json!(link),
+            changes: true,
         },
         UpdateCase {
             case: "Description only, so both stored links are left alone",
@@ -493,6 +498,7 @@ fn update_cases(seed: &Fixture) -> Vec<UpdateCase> {
             description: json!("description only"),
             link: json!(link),
             connected_link: json!(connected_link),
+            changes: true,
         },
         UpdateCase {
             case: "LinkId only, so the Description and the other link are left alone",
@@ -500,6 +506,7 @@ fn update_cases(seed: &Fixture) -> Vec<UpdateCase> {
             description: json!(BASE_DESCRIPTION),
             link: json!(connected_link),
             connected_link: json!(connected_link),
+            changes: true,
         },
         UpdateCase {
             case: "ConnectedLinkId only",
@@ -507,6 +514,7 @@ fn update_cases(seed: &Fixture) -> Vec<UpdateCase> {
             description: json!(BASE_DESCRIPTION),
             link: json!(link),
             connected_link: json!(link),
+            changes: true,
         },
         UpdateCase {
             case: "no mutable member at all, so nothing changes",
@@ -514,6 +522,39 @@ fn update_cases(seed: &Fixture) -> Vec<UpdateCase> {
             description: json!(BASE_DESCRIPTION),
             link: json!(link),
             connected_link: json!(connected_link),
+            changes: false,
+        },
+        UpdateCase {
+            case: "all three members supplied, each the value the connection already holds",
+            body: json!({
+                "Description": BASE_DESCRIPTION,
+                "LinkId": link,
+                "ConnectedLinkId": connected_link,
+            }),
+            description: json!(BASE_DESCRIPTION),
+            link: json!(link),
+            connected_link: json!(connected_link),
+            changes: false,
+        },
+        UpdateCase {
+            case: "one reference, naming the link the connection already names",
+            body: json!({ "LinkId": link }),
+            description: json!(BASE_DESCRIPTION),
+            link: json!(link),
+            connected_link: json!(connected_link),
+            changes: false,
+        },
+        UpdateCase {
+            case: "the stored links beside a Description that differs",
+            body: json!({
+                "Description": "one member differs",
+                "LinkId": link,
+                "ConnectedLinkId": connected_link,
+            }),
+            description: json!("one member differs"),
+            link: json!(link),
+            connected_link: json!(connected_link),
+            changes: true,
         },
         UpdateCase {
             case: "an empty Description removes the information it held",
@@ -521,6 +562,7 @@ fn update_cases(seed: &Fixture) -> Vec<UpdateCase> {
             description: json!(""),
             link: json!(link),
             connected_link: json!(connected_link),
+            changes: true,
         },
         UpdateCase {
             // An emptied link REFERENCE names no link, so the member is absent from the
@@ -530,6 +572,7 @@ fn update_cases(seed: &Fixture) -> Vec<UpdateCase> {
             description: json!(BASE_DESCRIPTION),
             link: Value::Null,
             connected_link: json!(connected_link),
+            changes: true,
         },
         UpdateCase {
             case: "an empty ConnectedLinkId removes the link it held",
@@ -537,6 +580,7 @@ fn update_cases(seed: &Fixture) -> Vec<UpdateCase> {
             description: json!(BASE_DESCRIPTION),
             link: json!(link),
             connected_link: Value::Null,
+            changes: true,
         },
         UpdateCase {
             case: "both links removed at once",
@@ -544,6 +588,7 @@ fn update_cases(seed: &Fixture) -> Vec<UpdateCase> {
             description: json!(BASE_DESCRIPTION),
             link: Value::Null,
             connected_link: Value::Null,
+            changes: true,
         },
         UpdateCase {
             case: "a Description at the modelled maximum of 256 characters",
@@ -551,6 +596,7 @@ fn update_cases(seed: &Fixture) -> Vec<UpdateCase> {
             description: json!("d".repeat(256)),
             link: json!(link),
             connected_link: json!(connected_link),
+            changes: true,
         },
         UpdateCase {
             case: "a multi-line, non-ascii Description",
@@ -558,6 +604,7 @@ fn update_cases(seed: &Fixture) -> Vec<UpdateCase> {
             description: json!("zeile eins\nzeile zwei \u{1f310}"),
             link: json!(link),
             connected_link: json!(connected_link),
+            changes: true,
         },
     ]
 }
@@ -671,12 +718,15 @@ async fn update_connection_writes_only_the_supplied_members_and_round_trips_thro
             "case {}: Tags must not be rewritten, got {connection}",
             row.case
         );
-        // Applying the change is not instant, so the reconfigured connection reports the
-        // transitional state its update is outstanding in.
+        // Applying an accepted change is not instant, so the reconfigured connection
+        // reports the transitional state its update is outstanding in; a request that asks
+        // for the state the connection is already in owes no transition and is answered in
+        // the state it found.
+        let expected_state = if row.changes { "UPDATING" } else { "AVAILABLE" };
         assert_eq!(
             connection["State"],
-            json!("UPDATING"),
-            "case {}: an update answers the connection as UPDATING, got {connection}",
+            json!(expected_state),
+            "case {}: expected State {expected_state}, got {connection}",
             row.case
         );
 
@@ -687,6 +737,15 @@ async fn update_connection_writes_only_the_supplied_members_and_round_trips_thro
             "case {}: GetConnections must answer the record the update returned, got {stored}",
             row.case
         );
+        if !row.changes {
+            // Nothing was asked for, so nothing was written: the whole record — its state
+            // included — is the one the update found.
+            assert_eq!(
+                stored, before,
+                "case {}: a change-free update must write nothing, got {stored}",
+                row.case
+            );
+        }
     }
 
     // No update reached a connection it did not name.
@@ -725,6 +784,7 @@ async fn successive_updates_accumulate_on_the_stored_record() {
             description: Value::Null,
             link: Value::Null,
             connected_link: Value::Null,
+            changes: false,
         },
         UpdateCase {
             case: "step 2: a Description where there was none",
@@ -732,6 +792,7 @@ async fn successive_updates_accumulate_on_the_stored_record() {
             description: json!("first"),
             link: Value::Null,
             connected_link: Value::Null,
+            changes: true,
         },
         UpdateCase {
             case: "step 3: a LinkId where there was none, keeping the Description",
@@ -739,6 +800,7 @@ async fn successive_updates_accumulate_on_the_stored_record() {
             description: json!("first"),
             link: json!(seed.link),
             connected_link: Value::Null,
+            changes: true,
         },
         UpdateCase {
             case: "step 4: the other link, keeping the first",
@@ -746,6 +808,7 @@ async fn successive_updates_accumulate_on_the_stored_record() {
             description: json!("first"),
             link: json!(seed.link),
             connected_link: json!(seed.connected_link),
+            changes: true,
         },
         UpdateCase {
             case: "step 5: emptying the Description keeps both links",
@@ -753,6 +816,7 @@ async fn successive_updates_accumulate_on_the_stored_record() {
             description: json!(""),
             link: json!(seed.link),
             connected_link: json!(seed.connected_link),
+            changes: true,
         },
         UpdateCase {
             case: "step 6: a new LinkId replaces the one stored",
@@ -760,6 +824,7 @@ async fn successive_updates_accumulate_on_the_stored_record() {
             description: json!(""),
             link: json!(seed.connected_link),
             connected_link: json!(seed.connected_link),
+            changes: true,
         },
         UpdateCase {
             case: "step 7: every member at once",
@@ -771,6 +836,7 @@ async fn successive_updates_accumulate_on_the_stored_record() {
             description: json!("second"),
             link: json!(seed.link),
             connected_link: Value::Null,
+            changes: true,
         },
     ];
 

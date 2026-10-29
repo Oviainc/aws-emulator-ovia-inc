@@ -164,17 +164,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // included, which is how this service's updates document removing information. The
         // ids, the ARN, `CreatedAt`, the tags, the policy versions and the topology derived
         // from the policy in force are never rewritten.
-        if input.description.is_some() {
-            record.description = input.description;
-        }
-        // An update is not applied instantly: AWS answers the reconfigured core network in
-        // the non-terminal `UPDATING` state, so the clock owes the `UPDATING` ->
+        let now = ::std::time::SystemTime::now();
+        let changed =
+            crate::state::write_supplied(&mut record.description, input.description.map(Some));
+
+        // An ACCEPTED change is not applied instantly: AWS answers the reconfigured core
+        // network in the non-terminal `UPDATING` state, so the clock owes the `UPDATING` ->
         // `AVAILABLE` transition and a caller reading straight after this call still
         // observes it. The due instant is stored and compared against the clock; nothing
         // sleeps for it, and the policy in force stays in force throughout
-        // (`crate::state::CoreNetworkRecord::to_shape_with_state`).
-        let now = ::std::time::SystemTime::now();
-        record.updating_until = Some(now + crate::state::SETTLE_DELAY);
+        // (`crate::state::CoreNetworkRecord::to_shape_with_state`). A request that asks for
+        // the state the core network is already in changes nothing: it does not move it to
+        // `UPDATING` and writes nothing at all, because there is no change for the service
+        // to apply.
+        if changed {
+            record.updating_until = Some(now + crate::state::SETTLE_DELAY);
+        }
         let core_network = record.to_shape(now);
 
         Ok(UpdateCoreNetworkOutput {

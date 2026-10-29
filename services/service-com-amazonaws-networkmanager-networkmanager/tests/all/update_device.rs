@@ -98,8 +98,10 @@ fn seeded_device(site: &str) -> Value {
     })
 }
 
-/// One row of the update table: the request body, and the members the stored record must
-/// hold afterwards. `site` is `Value::Null` for a row that leaves the device unsited.
+/// One row of the update table: the request body, the members the stored record must
+/// hold afterwards, and whether the request ASKS FOR A CHANGE — a request that asks for
+/// the state the device is already in leaves the service nothing to apply. `site` is
+/// `Value::Null` for a row that leaves the device unsited.
 struct UpdateCase {
     case: &'static str,
     body: Value,
@@ -113,14 +115,16 @@ struct UpdateCase {
     /// `None` means "whatever site the row was seeded at"; `Some(value)` is the `SiteId`
     /// the record must answer (`Value::Null` for an unsited device).
     site: Option<Value>,
+    changes: bool,
 }
 
 /// The rows of the update table. They differ along WHICH mutable members the request
-/// carries (every one, a single one, none at all), and along the form of the value: an
+/// carries (every one, a single one, none at all), along the form of the value — an
 /// empty string (the documented removal), the published maximum lengths, a non-ASCII and
 /// multi-line value, a structure carrying one member, one carrying none, and the
-/// reference member `SiteId` both re-pointed and removed.
-fn update_cases(other_site: &str) -> Vec<UpdateCase> {
+/// reference member `SiteId` both re-pointed and removed — and along whether the value
+/// asked for DIFFERS from the one the record already holds.
+fn update_cases(site: &str, other_site: &str) -> Vec<UpdateCase> {
     vec![
         UpdateCase {
             case: "every mutable member supplied",
@@ -141,6 +145,7 @@ fn update_cases(other_site: &str) -> Vec<UpdateCase> {
             model: json!("EX-2000"),
             serial_number: json!("SN-9999"),
             site: None,
+            changes: true,
         },
         UpdateCase {
             case: "Description only, so the other members are left alone",
@@ -153,6 +158,7 @@ fn update_cases(other_site: &str) -> Vec<UpdateCase> {
             model: json!(BASE_MODEL),
             serial_number: json!(BASE_SERIAL_NUMBER),
             site: None,
+            changes: true,
         },
         UpdateCase {
             case: "no mutable member at all, so nothing changes",
@@ -165,6 +171,58 @@ fn update_cases(other_site: &str) -> Vec<UpdateCase> {
             model: json!(BASE_MODEL),
             serial_number: json!(BASE_SERIAL_NUMBER),
             site: None,
+            changes: false,
+        },
+        UpdateCase {
+            case: "every mutable member supplied, each the value the device already holds",
+            body: json!({
+                "AWSLocation": base_aws_location(),
+                "Location": base_location(),
+                "Description": BASE_DESCRIPTION,
+                "Type": BASE_TYPE,
+                "Vendor": BASE_VENDOR,
+                "Model": BASE_MODEL,
+                "SerialNumber": BASE_SERIAL_NUMBER,
+            }),
+            aws_location: base_aws_location(),
+            location: base_location(),
+            description: json!(BASE_DESCRIPTION),
+            device_type: json!(BASE_TYPE),
+            vendor: json!(BASE_VENDOR),
+            model: json!(BASE_MODEL),
+            serial_number: json!(BASE_SERIAL_NUMBER),
+            site: None,
+            changes: false,
+        },
+        UpdateCase {
+            case: "one structure, equal to the stored one member for member",
+            body: json!({ "Location": base_location() }),
+            aws_location: base_aws_location(),
+            location: base_location(),
+            description: json!(BASE_DESCRIPTION),
+            device_type: json!(BASE_TYPE),
+            vendor: json!(BASE_VENDOR),
+            model: json!(BASE_MODEL),
+            serial_number: json!(BASE_SERIAL_NUMBER),
+            site: None,
+            changes: false,
+        },
+        UpdateCase {
+            case: "the stored descriptors beside one that differs",
+            body: json!({
+                "Description": BASE_DESCRIPTION,
+                "Type": BASE_TYPE,
+                "Model": "EX-3000",
+            }),
+            aws_location: base_aws_location(),
+            location: base_location(),
+            description: json!(BASE_DESCRIPTION),
+            device_type: json!(BASE_TYPE),
+            vendor: json!(BASE_VENDOR),
+            model: json!("EX-3000"),
+            serial_number: json!(BASE_SERIAL_NUMBER),
+            site: None,
+            changes: true,
         },
         UpdateCase {
             case: "empty strings remove the information the descriptors held",
@@ -183,6 +241,7 @@ fn update_cases(other_site: &str) -> Vec<UpdateCase> {
             model: json!(""),
             serial_number: json!(""),
             site: None,
+            changes: true,
         },
         UpdateCase {
             case: "an AWSLocation carrying one member replaces the whole structure",
@@ -195,6 +254,7 @@ fn update_cases(other_site: &str) -> Vec<UpdateCase> {
             model: json!(BASE_MODEL),
             serial_number: json!(BASE_SERIAL_NUMBER),
             site: None,
+            changes: true,
         },
         UpdateCase {
             case: "an empty Location removes every member it held",
@@ -207,6 +267,7 @@ fn update_cases(other_site: &str) -> Vec<UpdateCase> {
             model: json!(BASE_MODEL),
             serial_number: json!(BASE_SERIAL_NUMBER),
             site: None,
+            changes: true,
         },
         UpdateCase {
             case: "descriptors at their published maximum lengths",
@@ -225,6 +286,7 @@ fn update_cases(other_site: &str) -> Vec<UpdateCase> {
             model: json!("m".repeat(MAX_DESCRIPTOR_CHARS)),
             serial_number: json!("s".repeat(MAX_DESCRIPTOR_CHARS)),
             site: None,
+            changes: true,
         },
         UpdateCase {
             case: "multi-line and non-ascii values",
@@ -243,6 +305,7 @@ fn update_cases(other_site: &str) -> Vec<UpdateCase> {
             model: json!("モデル-1"),
             serial_number: json!("SN-\u{1f310}"),
             site: None,
+            changes: true,
         },
         UpdateCase {
             case: "SiteId re-pointed to another site of the same global network",
@@ -255,6 +318,20 @@ fn update_cases(other_site: &str) -> Vec<UpdateCase> {
             model: json!(BASE_MODEL),
             serial_number: json!(BASE_SERIAL_NUMBER),
             site: Some(json!(other_site)),
+            changes: true,
+        },
+        UpdateCase {
+            case: "SiteId naming the site the device already sits at",
+            body: json!({ "SiteId": site }),
+            aws_location: base_aws_location(),
+            location: base_location(),
+            description: json!(BASE_DESCRIPTION),
+            device_type: json!(BASE_TYPE),
+            vendor: json!(BASE_VENDOR),
+            model: json!(BASE_MODEL),
+            serial_number: json!(BASE_SERIAL_NUMBER),
+            site: Some(json!(site)),
+            changes: false,
         },
         UpdateCase {
             case: "an empty SiteId leaves the device unsited",
@@ -267,6 +344,7 @@ fn update_cases(other_site: &str) -> Vec<UpdateCase> {
             model: json!(BASE_MODEL),
             serial_number: json!(BASE_SERIAL_NUMBER),
             site: Some(Value::Null),
+            changes: true,
         },
     ]
 }
@@ -324,7 +402,7 @@ async fn update_device_writes_only_the_supplied_members_and_round_trips_through_
     let network = emulator.create_global_network("update-device").await;
     let site = emulator.create_site(&network, "hq").await;
     let other_site = emulator.create_site(&network, "branch").await;
-    let rows = update_cases(&other_site);
+    let rows = update_cases(&site, &other_site);
 
     // One identically seeded device per row, plus a sibling no row names.
     let mut devices = Vec::new();
@@ -391,10 +469,14 @@ async fn update_device_writes_only_the_supplied_members_and_round_trips_through_
             base_tags(),
             "case {case}: the tags must not be rewritten, got {device}"
         );
+        // A request that asks for a change is answered in the transient state the clock
+        // owes the transition out of; a request that asks for the state the device is
+        // already in owes no transition and is answered in the state it found.
+        let expected_state = if row.changes { "UPDATING" } else { "AVAILABLE" };
         assert_eq!(
             device["State"],
-            json!("UPDATING"),
-            "case {case}: an update answers the device in its transient state, got {device}"
+            json!(expected_state),
+            "case {case}: expected State {expected_state}, got {device}"
         );
 
         // The answer is the stored record: GetDevices reports the same device, member for
@@ -406,10 +488,21 @@ async fn update_device_writes_only_the_supplied_members_and_round_trips_through_
             without_state(device),
             "case {case}: GetDevices must answer the updated record, got {stored}"
         );
+        if !row.changes {
+            // Nothing was asked for, so nothing was written: the whole record — its state
+            // included — is the one the update found.
+            assert_eq!(
+                stored, before,
+                "case {case}: a change-free update must write nothing, got {stored}"
+            );
+        }
 
-        // Once that transition is due, the device is settled again — and the members the
-        // update wrote are still what it wrote.
-        std::thread::sleep(PAST_SETTLE);
+        // Once the transition a change owes is due, the device is settled again — and the
+        // members the update wrote are still what it wrote. A change-free update owes no
+        // transition, so there is nothing to wait for.
+        if row.changes {
+            std::thread::sleep(PAST_SETTLE);
+        }
         let settled = read_device(&emulator, &network, device_id).await;
         assert_eq!(
             settled["State"],

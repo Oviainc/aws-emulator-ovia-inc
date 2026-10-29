@@ -213,24 +213,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // supplied one — empty string included — replaces it. The ids, the ARN,
         // `CreatedAt`, the tags and the clock-derived lifecycle state are never rewritten,
         // so the link keeps the identity and the history it was created with.
-        if input.description.is_some() {
-            record.description = input.description;
-        }
-        if input.r#type.is_some() {
-            record.link_type = input.r#type;
-        }
-        if input.provider.is_some() {
-            record.provider = input.provider;
-        }
-        if let Some(bandwidth) = input.bandwidth {
-            record.bandwidth = bandwidth;
-        }
-        // An update is not applied instantly: AWS answers the reconfigured link in the
-        // non-terminal `UPDATING` state, so the clock owes the `UPDATING` -> `AVAILABLE`
-        // transition and a caller reading straight after this call still observes it. The
-        // due instant is stored and compared against the clock; nothing sleeps for it.
         let now = ::std::time::SystemTime::now();
-        record.updating_until = Some(now + crate::state::SETTLE_DELAY);
+        let mut changed =
+            crate::state::write_supplied(&mut record.description, input.description.map(Some));
+        changed |= crate::state::write_supplied(&mut record.link_type, input.r#type.map(Some));
+        changed |= crate::state::write_supplied(&mut record.provider, input.provider.map(Some));
+        changed |= crate::state::write_supplied_by(
+            &mut record.bandwidth,
+            input.bandwidth,
+            crate::state::same_bandwidth,
+        );
+
+        // An ACCEPTED change is not applied instantly: AWS answers the reconfigured link in
+        // the non-terminal `UPDATING` state, so the clock owes the `UPDATING` ->
+        // `AVAILABLE` transition and a caller reading straight after this call still
+        // observes it. The due instant is stored and compared against the clock; nothing
+        // sleeps for it.
+        //
+        // A request that asks for the state the link is already in — one carrying no
+        // mutable member, or carrying exactly the values the record holds — changes
+        // nothing: it does not move the link to `UPDATING` and writes nothing at all,
+        // because there is no change for the service to apply. That is the rule the two
+        // attachment updaters of this crate apply to an attachment.
+        if changed {
+            record.updating_until = Some(now + crate::state::SETTLE_DELAY);
+        }
         let link = record.to_shape(now);
 
         Ok(UpdateLinkOutput { link: Some(link) })

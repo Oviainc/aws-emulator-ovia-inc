@@ -203,6 +203,8 @@ mod update_device;
 mod update_empty_optional_reference;
 #[path = "all/update_link.rs"]
 mod update_link;
+#[path = "all/update_no_op.rs"]
+mod update_no_op;
 #[path = "all/update_site.rs"]
 mod update_site;
 #[path = "all/vpc_attachment_lifecycle.rs"]

@@ -48,17 +48,22 @@ fn base_tags() -> Value {
 
 /// One row of the update table: the request body, and the two mutable members the stored
 /// record must hold afterwards (`Value::Null` standing for "the member is absent").
+/// One row of the update table: the request body, the members the stored record must hold
+/// afterwards, and whether the request ASKS FOR A CHANGE — a request that asks for the
+/// state the site is already in leaves the service nothing to apply.
 struct UpdateCase {
     case: &'static str,
     body: Value,
     description: Value,
     location: Value,
+    changes: bool,
 }
 
 /// The rows of the update table. They differ along WHICH mutable members the request
-/// carries (both, one, neither), and along the value's form — an empty string (the
+/// carries (both, one, neither), along the value's form — an empty string (the
 /// documented removal), the modelled maximum length of `ConstrainedString` (256), a
-/// multi-line and non-ASCII value, and a `Location` carrying a subset of its members.
+/// multi-line and non-ASCII value, and a `Location` carrying a subset of its members —
+/// and along whether the value asked for DIFFERS from the one the record already holds.
 fn update_cases() -> Vec<UpdateCase> {
     vec![
         UpdateCase {
@@ -69,42 +74,70 @@ fn update_cases() -> Vec<UpdateCase> {
             }),
             description: json!("updated description"),
             location: json!({ "Address": "2 Elm St", "Latitude": "40.7128", "Longitude": "-74.0060" }),
+            changes: true,
         },
         UpdateCase {
             case: "Description only, so the stored Location is left alone",
             body: json!({ "Description": "description only" }),
             description: json!("description only"),
             location: base_location(),
+            changes: true,
         },
         UpdateCase {
             case: "Location only, so the stored Description is left alone",
             body: json!({ "Location": { "Address": "3 Oak Ave", "Latitude": "0", "Longitude": "0" } }),
             description: json!(BASE_DESCRIPTION),
             location: json!({ "Address": "3 Oak Ave", "Latitude": "0", "Longitude": "0" }),
+            changes: true,
         },
         UpdateCase {
             case: "no mutable member at all, so nothing changes",
             body: json!({}),
             description: json!(BASE_DESCRIPTION),
             location: base_location(),
+            changes: false,
+        },
+        UpdateCase {
+            case: "both members supplied, each the value the site already holds",
+            body: json!({ "Description": BASE_DESCRIPTION, "Location": base_location() }),
+            description: json!(BASE_DESCRIPTION),
+            location: base_location(),
+            changes: false,
+        },
+        UpdateCase {
+            case: "a Location equal to the stored one, member for member",
+            body: json!({ "Location": base_location() }),
+            description: json!(BASE_DESCRIPTION),
+            location: base_location(),
+            changes: false,
+        },
+        UpdateCase {
+            case: "the stored Description beside a Location that differs",
+            body: json!({ "Description": BASE_DESCRIPTION, "Location": { "Address": "6 Cedar Ct" } }),
+            description: json!(BASE_DESCRIPTION),
+            location: json!({ "Address": "6 Cedar Ct" }),
+            changes: true,
         },
         UpdateCase {
             case: "an empty Description removes the information it held",
             body: json!({ "Description": "" }),
             description: json!(""),
             location: base_location(),
+            changes: true,
         },
         UpdateCase {
             case: "empty Location members remove the information they held",
             body: json!({ "Location": { "Address": "", "Latitude": "", "Longitude": "" } }),
             description: json!(BASE_DESCRIPTION),
             location: json!({ "Address": "", "Latitude": "", "Longitude": "" }),
+            changes: true,
         },
         UpdateCase {
             case: "a Location carrying one member replaces the whole structure",
             body: json!({ "Location": { "Address": "4 Pine Rd" } }),
             description: json!(BASE_DESCRIPTION),
             location: json!({ "Address": "4 Pine Rd" }),
+            changes: true,
         },
         UpdateCase {
             case: "values at the modelled maximum length of 256 characters",
@@ -118,6 +151,7 @@ fn update_cases() -> Vec<UpdateCase> {
                 "Latitude": "1".repeat(256),
                 "Longitude": "2".repeat(256),
             }),
+            changes: true,
         },
         UpdateCase {
             case: "multi-line and non-ascii values",
@@ -127,6 +161,7 @@ fn update_cases() -> Vec<UpdateCase> {
             }),
             description: json!("line one\nline two \u{1f310}"),
             location: json!({ "Address": "Hauptstraße 1\nBerlin", "Latitude": "52,52", "Longitude": "13,40" }),
+            changes: true,
         },
     ]
 }
@@ -261,12 +296,14 @@ async fn update_site_writes_only_the_supplied_members_and_round_trips_through_ge
             "case {}: Tags must not be rewritten, got {site}",
             row.case
         );
-        // Applying the change is not instant, so the reconfigured site reports the
-        // transitional state its update is outstanding in.
+        // Applying an accepted change is not instant, so the reconfigured site reports the
+        // transitional state its update is outstanding in; a request that asks for the state
+        // the site is already in owes no transition and is answered in the state it found.
+        let expected_state = if row.changes { "UPDATING" } else { "AVAILABLE" };
         assert_eq!(
             site["State"],
-            json!("UPDATING"),
-            "case {}: an update answers the site as UPDATING, got {site}",
+            json!(expected_state),
+            "case {}: expected State {expected_state}, got {site}",
             row.case
         );
 
@@ -277,6 +314,15 @@ async fn update_site_writes_only_the_supplied_members_and_round_trips_through_ge
             "case {}: GetSites must answer the record the update returned, got {stored}",
             row.case
         );
+        if !row.changes {
+            // Nothing was asked for, so nothing was written: the whole record — its state
+            // included — is the one the update found.
+            assert_eq!(
+                stored, before,
+                "case {}: a change-free update must write nothing, got {stored}",
+                row.case
+            );
+        }
     }
 
     // No update reached a site it did not name.
@@ -319,30 +365,35 @@ async fn successive_updates_accumulate_on_the_stored_record() {
             body: json!({}),
             description: Value::Null,
             location: Value::Null,
+            changes: false,
         },
         UpdateCase {
             case: "step 2: a Description where there was none",
             body: json!({ "Description": "first" }),
             description: json!("first"),
             location: Value::Null,
+            changes: true,
         },
         UpdateCase {
             case: "step 3: a Location where there was none, keeping the Description",
             body: json!({ "Location": { "Address": "1 Main St" } }),
             description: json!("first"),
             location: json!({ "Address": "1 Main St" }),
+            changes: true,
         },
         UpdateCase {
             case: "step 4: emptying the Description keeps the Location",
             body: json!({ "Description": "" }),
             description: json!(""),
             location: json!({ "Address": "1 Main St" }),
+            changes: true,
         },
         UpdateCase {
             case: "step 5: a new Location replaces the old one member for member",
             body: json!({ "Location": { "Latitude": "0", "Longitude": "0" } }),
             description: json!(""),
             location: json!({ "Latitude": "0", "Longitude": "0" }),
+            changes: true,
         },
         UpdateCase {
             case: "step 6: both members at once",
@@ -352,6 +403,17 @@ async fn successive_updates_accumulate_on_the_stored_record() {
             }),
             description: json!("second"),
             location: json!({ "Address": "5 Birch Way", "Latitude": "1", "Longitude": "2" }),
+            changes: true,
+        },
+        UpdateCase {
+            case: "step 7: repeating step 6 asks for the state the record is already in",
+            body: json!({
+                "Description": "second",
+                "Location": { "Address": "5 Birch Way", "Latitude": "1", "Longitude": "2" },
+            }),
+            description: json!("second"),
+            location: json!({ "Address": "5 Birch Way", "Latitude": "1", "Longitude": "2" }),
+            changes: false,
         },
     ];
 

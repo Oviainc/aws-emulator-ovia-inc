@@ -35,9 +35,9 @@ use crate::global_network_lifecycle::{error_code, ids_of, Emulator, PAST_SETTLE}
 use crate::link_lifecycle::create_link_ok;
 
 /// The transitional state an outstanding reconfiguration puts a resource in.
-const UPDATING: &str = "UPDATING";
+pub(crate) const UPDATING: &str = "UPDATING";
 /// The settled state a resource reads once nothing is outstanding on it.
-const AVAILABLE: &str = "AVAILABLE";
+pub(crate) const AVAILABLE: &str = "AVAILABLE";
 /// The state a delete reports the record it removed in.
 const DELETING: &str = "DELETING";
 
@@ -67,7 +67,10 @@ fn policy_segments() -> Value {
 
 /// How one row's resource is read back: either a single-resource reader answering the
 /// record under one member, or a listing the row's record has to be picked out of by id.
-enum Reader {
+///
+/// Shared with the suites that table a rule over resources of several kinds
+/// (`crate::update_no_op`), so one reader description serves them all.
+pub(crate) enum Reader {
     /// `GET <uri>` answering `{ <member>: { .. } }`.
     One { uri: String, member: &'static str },
     /// `GET <uri>` answering `{ <member>: [ .. ] }`, where the row's record is the entry
@@ -98,7 +101,7 @@ struct UpdateCase {
 }
 
 /// The `State` of a resource shape, named so a failure says which row it belonged to.
-fn state_of(case: &str, resource: &Value) -> String {
+pub(crate) fn state_of(case: &str, resource: &Value) -> String {
     resource["State"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: no State in {resource}"))
@@ -106,7 +109,7 @@ fn state_of(case: &str, resource: &Value) -> String {
 }
 
 /// Read the row's resource back through its reader.
-async fn read_back(emulator: &Emulator, case: &str, id: &str, reader: &Reader) -> Value {
+pub(crate) async fn read_back(emulator: &Emulator, case: &str, id: &str, reader: &Reader) -> Value {
     match reader {
         Reader::One { uri, member } => {
             let (status, body) = emulator.get(uri).await;

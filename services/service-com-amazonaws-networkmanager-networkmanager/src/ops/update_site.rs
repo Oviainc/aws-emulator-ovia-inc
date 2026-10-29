@@ -176,18 +176,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored value alone, and a supplied one replaces it — an empty `Description`, or
         // a `Location` whose members are empty strings, is how the caller removes the
         // information it holds. Ids, ARN, `CreatedAt` and tags are never rewritten.
-        if input.description.is_some() {
-            record.description = input.description;
-        }
-        if input.location.is_some() {
-            record.location = input.location;
-        }
-        // An update is not applied instantly: AWS answers the reconfigured site in the
-        // non-terminal `UPDATING` state, so the clock owes the `UPDATING` -> `AVAILABLE`
-        // transition and a caller reading straight after this call still observes it. The
-        // due instant is stored and compared against the clock; nothing sleeps for it.
         let now = ::std::time::SystemTime::now();
-        record.updating_until = Some(now + crate::state::SETTLE_DELAY);
+        let mut changed =
+            crate::state::write_supplied(&mut record.description, input.description.map(Some));
+        changed |= crate::state::write_supplied_by(
+            &mut record.location,
+            input.location.map(Some),
+            |supplied, held| crate::state::same_location(supplied.as_ref(), held.as_ref()),
+        );
+
+        // An ACCEPTED change is not applied instantly: AWS answers the reconfigured site in
+        // the non-terminal `UPDATING` state, so the clock owes the `UPDATING` ->
+        // `AVAILABLE` transition and a caller reading straight after this call still
+        // observes it. The due instant is stored and compared against the clock; nothing
+        // sleeps for it. A request that asks for the state the site is already in changes
+        // nothing: it does not move the site to `UPDATING` and writes nothing at all,
+        // because there is no change for the service to apply.
+        if changed {
+            record.updating_until = Some(now + crate::state::SETTLE_DELAY);
+        }
         let site = record.to_shape(now);
 
         Ok(UpdateSiteOutput { site: Some(site) })

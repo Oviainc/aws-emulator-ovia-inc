@@ -13,6 +13,12 @@
 //! documented constraints is refused (400 `ValidationException`) exactly as `CreateLink`
 //! refuses it.
 //!
+//! A request that asks for the state the link is ALREADY in — one carrying no mutable
+//! member, or carrying exactly the values the record holds — asks for no change, so it
+//! writes nothing and the link keeps the state it was in rather than moving to `UPDATING`.
+//! `update_no_op` pins that rule across every updater of this crate; here it is one axis
+//! of the table below.
+//!
 //! Because the write lands in the store rather than in the answer alone, every reader of
 //! the record answers from it: a link updated here leaves the listing of the descriptor it
 //! no longer holds and joins the listing of the one it now does, keeps the site and the
@@ -57,8 +63,10 @@ fn base_tags() -> Value {
     json!([{ "Key": "env", "Value": "test" }])
 }
 
-/// One row of the update table: the request body, and the four mutable members the stored
-/// record must hold afterwards.
+/// One row of the update table: the request body, the four mutable members the stored
+/// record must hold afterwards, and whether the request ASKS FOR A CHANGE — a request that
+/// asks for the state the link is already in leaves the service nothing to apply, so it
+/// writes nothing and the link keeps the state it was in.
 struct UpdateCase {
     case: &'static str,
     body: Value,
@@ -66,13 +74,15 @@ struct UpdateCase {
     link_type: Value,
     provider: Value,
     bandwidth: Value,
+    changes: bool,
 }
 
 /// The rows of the update table. They differ along WHICH mutable members the request
-/// carries (every one, a single one, none at all), and along the form of the value: an
+/// carries (every one, a single one, none at all), along the form of the value — an
 /// empty string (the documented removal), the published maximum lengths, a non-ASCII and
 /// multi-line value, and a `Bandwidth` carrying one speed, no speed and the largest
-/// `Integer`.
+/// `Integer` — and along whether the value asked for DIFFERS from the one the record
+/// already holds.
 fn update_cases() -> Vec<UpdateCase> {
     vec![
         UpdateCase {
@@ -87,6 +97,7 @@ fn update_cases() -> Vec<UpdateCase> {
             link_type: json!("mpls"),
             provider: json!("Example Telecom"),
             bandwidth: json!({ "UploadSpeed": 100, "DownloadSpeed": 200 }),
+            changes: true,
         },
         UpdateCase {
             case: "Description only, so the other members are left alone",
@@ -95,6 +106,7 @@ fn update_cases() -> Vec<UpdateCase> {
             link_type: json!(BASE_TYPE),
             provider: json!(BASE_PROVIDER),
             bandwidth: base_bandwidth(),
+            changes: true,
         },
         UpdateCase {
             case: "Bandwidth only, replacing the whole structure with one speed",
@@ -103,6 +115,7 @@ fn update_cases() -> Vec<UpdateCase> {
             link_type: json!(BASE_TYPE),
             provider: json!(BASE_PROVIDER),
             bandwidth: json!({ "UploadSpeed": 5 }),
+            changes: true,
         },
         UpdateCase {
             case: "an empty Bandwidth removes both speeds",
@@ -111,6 +124,7 @@ fn update_cases() -> Vec<UpdateCase> {
             link_type: json!(BASE_TYPE),
             provider: json!(BASE_PROVIDER),
             bandwidth: json!({}),
+            changes: true,
         },
         UpdateCase {
             case: "no mutable member at all, so nothing changes",
@@ -119,6 +133,53 @@ fn update_cases() -> Vec<UpdateCase> {
             link_type: json!(BASE_TYPE),
             provider: json!(BASE_PROVIDER),
             bandwidth: base_bandwidth(),
+            changes: false,
+        },
+        UpdateCase {
+            case: "every mutable member supplied, each the value the link already holds",
+            body: json!({
+                "Description": BASE_DESCRIPTION,
+                "Type": BASE_TYPE,
+                "Provider": BASE_PROVIDER,
+                "Bandwidth": base_bandwidth(),
+            }),
+            description: json!(BASE_DESCRIPTION),
+            link_type: json!(BASE_TYPE),
+            provider: json!(BASE_PROVIDER),
+            bandwidth: base_bandwidth(),
+            changes: false,
+        },
+        UpdateCase {
+            case: "one descriptor, equal to the one the link already holds",
+            body: json!({ "Provider": BASE_PROVIDER }),
+            description: json!(BASE_DESCRIPTION),
+            link_type: json!(BASE_TYPE),
+            provider: json!(BASE_PROVIDER),
+            bandwidth: base_bandwidth(),
+            changes: false,
+        },
+        UpdateCase {
+            case: "a Bandwidth equal to the one the link already holds, member for member",
+            body: json!({ "Bandwidth": base_bandwidth() }),
+            description: json!(BASE_DESCRIPTION),
+            link_type: json!(BASE_TYPE),
+            provider: json!(BASE_PROVIDER),
+            bandwidth: base_bandwidth(),
+            changes: false,
+        },
+        UpdateCase {
+            case: "the values the link holds, and one that differs",
+            body: json!({
+                "Description": BASE_DESCRIPTION,
+                "Type": BASE_TYPE,
+                "Provider": "Example Telecom",
+                "Bandwidth": base_bandwidth(),
+            }),
+            description: json!(BASE_DESCRIPTION),
+            link_type: json!(BASE_TYPE),
+            provider: json!("Example Telecom"),
+            bandwidth: base_bandwidth(),
+            changes: true,
         },
         UpdateCase {
             case: "empty strings remove the information the descriptors held",
@@ -127,6 +188,7 @@ fn update_cases() -> Vec<UpdateCase> {
             link_type: json!(""),
             provider: json!(""),
             bandwidth: base_bandwidth(),
+            changes: true,
         },
         UpdateCase {
             case: "descriptors at their published maximum lengths",
@@ -139,6 +201,7 @@ fn update_cases() -> Vec<UpdateCase> {
             link_type: json!("t".repeat(MAX_DESCRIPTOR_CHARS)),
             provider: json!("p".repeat(MAX_DESCRIPTOR_CHARS)),
             bandwidth: base_bandwidth(),
+            changes: true,
         },
         UpdateCase {
             case: "multi-line and non-ascii values, and the largest Integer speeds",
@@ -152,6 +215,7 @@ fn update_cases() -> Vec<UpdateCase> {
             link_type: json!("fibre \u{1f310}"),
             provider: json!("Ünternet"),
             bandwidth: json!({ "UploadSpeed": i32::MAX, "DownloadSpeed": i32::MAX }),
+            changes: true,
         },
     ]
 }
@@ -292,10 +356,14 @@ async fn update_link_writes_only_the_supplied_members_and_round_trips_through_ge
             base_tags(),
             "case {case}: the tags must not be rewritten, got {link}"
         );
+        // A request that asks for a change is answered in the transient state the clock
+        // owes the transition out of; a request that asks for the state the link is
+        // already in owes no transition and is answered in the state it found.
+        let expected_state = if row.changes { "UPDATING" } else { "AVAILABLE" };
         assert_eq!(
             link["State"],
-            json!("UPDATING"),
-            "case {case}: an update answers the link in its transient state, got {link}"
+            json!(expected_state),
+            "case {case}: expected State {expected_state}, got {link}"
         );
 
         // The answer is the stored record: GetLinks reports the same link, member for
@@ -307,10 +375,21 @@ async fn update_link_writes_only_the_supplied_members_and_round_trips_through_ge
             without_state(link),
             "case {case}: GetLinks must answer the updated record, got {stored}"
         );
+        if !row.changes {
+            // Nothing was asked for, so nothing was written: the whole record — its state
+            // included — is the one the update found.
+            assert_eq!(
+                stored, before,
+                "case {case}: a change-free update must write nothing, got {stored}"
+            );
+        }
 
-        // Once that transition is due, the link is settled again — and the members the
-        // update wrote are still what it wrote.
-        std::thread::sleep(PAST_SETTLE);
+        // Once the transition a change owes is due, the link is settled again — and the
+        // members the update wrote are still what it wrote. A change-free update owes no
+        // transition, so there is nothing to wait for.
+        if row.changes {
+            std::thread::sleep(PAST_SETTLE);
+        }
         let settled = read_link(&emulator, &network, link_id).await;
         assert_eq!(
             settled["State"],
