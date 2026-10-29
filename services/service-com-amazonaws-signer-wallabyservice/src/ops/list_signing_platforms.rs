@@ -171,21 +171,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reader of any platform sees exactly what this one saw.
         let _ = (ctx, &self.engine);
 
-        // `maxResults` is modelled `@range(min: 1, max: 25)` and the boundary
-        // validator refused anything outside it before this handler ran, so the
-        // only case left is an absent value: serve the largest page the model
-        // allows. The `clamp` states that invariant rather than correcting a
-        // caller — a value reaching here outside the range is a validator bug,
-        // which the debug assertion surfaces instead of silently repairing.
-        let requested = input
-            .max_results
-            .unwrap_or(crate::state::PLATFORM_PAGE_LIMIT);
-        debug_assert!(
-            (1..=crate::state::PLATFORM_PAGE_LIMIT).contains(&requested),
-            "maxResults {requested} should have been refused at the boundary"
-        );
-        let page_size = usize::try_from(requested.clamp(1, crate::state::PLATFORM_PAGE_LIMIT))
-            .expect("a page size clamped into 1..=25 fits in usize");
+        // How many platforms this page carries: the `maxResults` the request
+        // named, or this operation's page limit when it named none — the one
+        // rule every paginated read of this service follows, stated once in
+        // [`crate::state::page_size`].
+        let page_size =
+            crate::state::page_size(input.max_results, crate::state::PLATFORM_PAGE_LIMIT);
 
         // Which platforms this call enumerates — the listing a page of it hands
         // a token out for, and the only listing that token resumes. A filter

@@ -112,6 +112,29 @@ pub const PLATFORM_PAGE_LIMIT: i32 = 25;
 /// the reason [`PLATFORM_PAGE_LIMIT`] gives.
 pub const JOB_PAGE_LIMIT: i32 = 25;
 
+/// How many resources one page of a paginated read carries: the `maxResults` the
+/// request named, or `limit` — the operation's own page limit — when it named
+/// none.
+///
+/// Every paginated read of this service models `maxResults` with a range whose
+/// `max` is that operation's page limit ([`PROFILE_PAGE_LIMIT`],
+/// [`PLATFORM_PAGE_LIMIT`], [`JOB_PAGE_LIMIT`], each kept per operation so one
+/// operation's model changing does not move another's page size), and the
+/// boundary validator refused anything outside that range before a handler ran,
+/// so the only case left here is an absent value: serve the largest page the
+/// model allows. The `clamp` states that invariant rather than correcting a
+/// caller — a value reaching here outside the range is a validator bug, which
+/// the debug assertion surfaces instead of silently repairing.
+pub fn page_size(requested: Option<i32>, limit: i32) -> usize {
+    let requested = requested.unwrap_or(limit);
+    debug_assert!(
+        (1..=limit).contains(&requested),
+        "maxResults {requested} should have been refused at the boundary"
+    );
+    usize::try_from(requested.clamp(1, limit))
+        .expect("a page size clamped into the modelled range fits in usize")
+}
+
 /// The most tags one signing profile can hold.
 ///
 /// Not a chosen number: `TagMap` — the shape `TagResource` writes and both

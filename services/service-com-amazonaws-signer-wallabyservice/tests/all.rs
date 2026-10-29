@@ -23,6 +23,9 @@ mod error_responses;
 #[path = "all/job_listing.rs"]
 mod job_listing;
 
+#[path = "all/paginated_page_size.rs"]
+mod paginated_page_size;
+
 #[path = "all/platform_id_character_class.rs"]
 mod platform_id_character_class;
 
