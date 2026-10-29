@@ -266,9 +266,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let source_graph_status = graph.status;
 
         // "The graph state should be AVAILABLE"
-        // (`smithy_query(query="operation",operation="StartExportTask")`): while an
-        // earlier transition is still outstanding the graph's data is in flight, which
-        // is the same precondition `CreateGraphSnapshot` states. The wording is the
+        // (`smithy_query(query="operation",operation="StartExportTask")`): an export
+        // reads the graph through its serving data plane, so a graph that is not serving
+        // has nothing to export from. The wording is the
         // service's one precondition refusal
         // (`crate::state::graph_status_precondition_conflict`), which fronts no
         // identifier: the graph was addressed by one the caller sent.

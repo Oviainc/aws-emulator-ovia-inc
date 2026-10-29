@@ -252,7 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Only a serving graph can be reached through a new endpoint: while an earlier
         // transition is still outstanding the graph is not serving, which is the same
-        // precondition `CreateGraphSnapshot` and `StartImportTask` state. The wording is
+        // precondition `StartImportTask` states. The wording is
         // the service's one precondition refusal
         // (`crate::state::graph_status_precondition_conflict`), which fronts no
         // identifier: the graph was addressed by one the caller sent.

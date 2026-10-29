@@ -300,9 +300,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The graph needs to be empty and in the AVAILABLE state" — the STATUS half of
-        // that sentence: while an earlier transition is still outstanding the graph's
-        // data is in flight, which is the same precondition `UpdateGraph` and
-        // `CreateGraphSnapshot` state. The wording is the service's one precondition
+        // that sentence: a bulk load writes through the graph's serving data plane, which
+        // is the same precondition `UpdateGraph` states. The wording is the service's one
+        // precondition
         // refusal (`crate::state::graph_status_precondition_conflict`), so this half
         // reads as the sibling of the emptiness half below rather than as a second
         // grammar, and it fronts no identifier: the graph was addressed by one the

@@ -173,9 +173,10 @@ impl GraphStatus {
 
     /// Whether this is a RESTING status: one the clock owes nothing out of.
     ///
-    /// A graph rests either serving (`AVAILABLE`) or stopped (`STOPPED`); every other
-    /// status this slice produces is a transition already in flight, during which a
-    /// request that would start another transition is a conflict.
+    /// A graph rests either serving (`AVAILABLE`) or stopped (`STOPPED`), and a resting
+    /// graph holds its data and its configuration settled; every other status this slice
+    /// produces is a transition already in flight, during which a request that would
+    /// start another transition, or capture the data moving under it, is a conflict.
     pub const fn is_at_rest(self) -> bool {
         matches!(self, Self::Available | Self::Stopped)
     }
@@ -2937,8 +2938,8 @@ pub fn graph_state_conflict(action: &str, status: GraphStatus) -> ConflictExcept
 
 /// The modelled `ConflictException` for a call on ANOTHER resource whose precondition is
 /// the status of the graph it names (`StartImportTask`, `StartExportTask`,
-/// `CreateGraphSnapshot`, `CreatePrivateGraphEndpoint`), made while that graph is not
-/// serving.
+/// `CreateGraphSnapshot`, `CreatePrivateGraphEndpoint`), made while that graph's status
+/// does not meet it.
 ///
 /// `action` is the whole phrase of what the call could not do ("start the import task",
 /// "create the graph snapshot"), because the refusal is not about a transition of the

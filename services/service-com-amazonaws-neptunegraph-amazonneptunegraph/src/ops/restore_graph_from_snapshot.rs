@@ -272,9 +272,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Only a complete snapshot can be restored: while its creation is still
         // outstanding the snapshot holds no usable copy of the data, and one whose
-        // deletion has been accepted is on its way out. That is the same precondition
-        // `CreateGraphSnapshot` states about the graph it snapshots, and it is worded by
-        // the one builder every snapshot state gate in this service reaches.
+        // deletion has been accepted is on its way out. That is the record-at-rest
+        // condition `CreateGraphSnapshot` states about the graph it captures, read here
+        // of the snapshot, and it is worded by the one builder every snapshot state gate
+        // in this service reaches.
         if snapshot_status != crate::state::SnapshotStatus::Available {
             return Err(RestoreGraphFromSnapshotErrorModeled::ConflictException(
                 crate::state::snapshot_state_conflict("restore", snapshot_status),

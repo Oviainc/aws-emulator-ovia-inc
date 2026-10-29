@@ -280,13 +280,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Only a serving graph can be snapshotted: while an earlier transition is
-        // still outstanding the graph's data is in flight, which is the same
-        // precondition `UpdateGraph` and `DeleteGraph` state. The wording is the
-        // service's one precondition refusal
+        // A snapshot is a copy of the graph's STORED data, which a graph AT REST holds
+        // complete and settled — whether it rests serving (`AVAILABLE`) or stopped
+        // (`STOPPED`), since a stopped graph keeps its data and its configuration. What
+        // cannot be captured is a graph whose transition is still in flight: its data is
+        // in motion, so there is no settled copy to take. That is the one condition
+        // every snapshot of a graph's data in this service applies
+        // (`crate::state::GraphStatus::is_at_rest`), which is what `DeleteGraph` gates
+        // its final snapshot on too, so the artefact one of them produces is never one
+        // the other refuses. The wording is the service's one precondition refusal
         // (`crate::state::graph_status_precondition_conflict`), which fronts no
         // identifier: the graph was addressed by one the caller sent.
-        if source_graph_status != crate::state::GraphStatus::Available {
+        if !source_graph_status.is_at_rest() {
             return Err(CreateGraphSnapshotErrorModeled::ConflictException(
                 crate::state::graph_status_precondition_conflict(
                     "create the graph snapshot",
@@ -322,13 +327,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Taking a snapshot takes the SOURCE GRAPH through SNAPSHOTTING (a modelled
-        // `GraphStatus` value); the clock owes the move back to AVAILABLE the same span
-        // later, so a caller that reads the graph straight after this call still sees
-        // the transient status.
+        // `GraphStatus` value); the clock owes the move back the same span later, so a
+        // caller that reads the graph straight after this call still sees the transient
+        // status. What it moves back INTO is the status the call found the graph resting
+        // in: snapshotting reads a graph's data, it does not start or stop the graph, so
+        // a stopped graph is still stopped once the capture finishes.
         if let Some(graph) = store.graphs.get_mut(&source_graph_id) {
             graph.begin_transition(
                 crate::state::GraphStatus::Snapshotting,
-                crate::state::GraphStatus::Available,
+                source_graph_status,
                 now,
             );
         }

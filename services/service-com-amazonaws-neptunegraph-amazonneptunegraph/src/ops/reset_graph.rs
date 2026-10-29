@@ -199,9 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Emptying a graph's data is a write to its data plane, and that plane serves
         // only while the graph is serving: a graph that is provisioning, reconfiguring,
         // importing, snapshotting, stopped or on its way out has no data to empty
-        // through, which is the precondition `CreateGraphSnapshot` and `UpdateGraph`
-        // state too. A reset does not remove the graph, so deletion protection — which
-        // holds back a DELETION — does not hold this request back.
+        // through, which is the precondition `UpdateGraph` states too. A reset does not
+        // remove the graph, so deletion protection — which holds back a DELETION — does
+        // not hold this request back.
         if graph_status != crate::state::GraphStatus::Available {
             return Err(ResetGraphErrorModeled::ConflictException(
                 crate::state::graph_state_conflict("reset", graph_status),

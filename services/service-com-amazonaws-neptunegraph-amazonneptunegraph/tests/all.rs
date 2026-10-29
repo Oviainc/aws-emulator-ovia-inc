@@ -87,6 +87,8 @@ mod query_status_reporting;
 mod region_scoping;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/snapshot_of_a_graph_at_rest.rs"]
+mod snapshot_of_a_graph_at_rest;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/task_namespace_refusals.rs"]

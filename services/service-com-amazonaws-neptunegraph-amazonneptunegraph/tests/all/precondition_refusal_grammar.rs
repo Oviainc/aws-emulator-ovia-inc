@@ -277,7 +277,7 @@ async fn an_operation_held_back_by_the_graphs_status_words_its_action_and_that_s
     // whose precondition is the status of a graph it was handed the identifier of, as
     // opposed to the five that ask for a transition OF the graph (covered by
     // `graph_state_gate_messages`).
-    let operations: &[(&str, &str)] = &[
+    let actions: &[(&str, &str)] = &[
         ("StartImportTask", "start the import task"),
         ("CreateGraphSnapshot", "create the graph snapshot"),
         ("StartExportTask", "start the export task"),
@@ -286,24 +286,44 @@ async fn an_operation_held_back_by_the_graphs_status_words_its_action_and_that_s
             "create the private graph endpoint",
         ),
     ];
-
-    // Every status this service puts a graph into except `AVAILABLE`, which is the one
-    // that lets all four calls through. Source for the status set: the modelled
-    // `GraphStatus` enum (`smithy_query(query="shape",shape="GraphStatus")`) minus
-    // `FAILED`, which no path in this service produces.
-    let statuses = [
-        "CREATING",
-        "UPDATING",
-        "SNAPSHOTTING",
-        "IMPORTING",
-        "STOPPING",
-        "STOPPED",
-        "STARTING",
-        "RESETTING",
-        "DELETING",
+    // The three that need the graph's SERVING data plane, so every status but `AVAILABLE`
+    // holds them back.
+    let needs_serving: &[&str] = &[
+        "StartImportTask",
+        "StartExportTask",
+        "CreatePrivateGraphEndpoint",
+    ];
+    // All four, which is what any status with a transition still in flight holds back:
+    // `CreateGraphSnapshot` captures the graph's stored data, so it is held back only
+    // while that data is in motion.
+    let every_operation: &[&str] = &[
+        "StartImportTask",
+        "CreateGraphSnapshot",
+        "StartExportTask",
+        "CreatePrivateGraphEndpoint",
     ];
 
-    for graph_status in statuses {
+    // (the status the graph is in, the operations that status holds back). Every status
+    // this service puts a graph into except `AVAILABLE`, which is the one that lets all
+    // four calls through. Source for the status set: the modelled `GraphStatus` enum
+    // (`smithy_query(query="shape",shape="GraphStatus")`) minus `FAILED`, which no path
+    // in this service produces.
+    let rows: &[(&str, &[&str])] = &[
+        ("CREATING", every_operation),
+        ("UPDATING", every_operation),
+        ("SNAPSHOTTING", every_operation),
+        ("IMPORTING", every_operation),
+        ("STOPPING", every_operation),
+        // A stopped graph RESTS: its data is settled, so a snapshot of it is served
+        // (see `snapshot_of_a_graph_at_rest`) and only the three calls that need the
+        // serving data plane are held back.
+        ("STOPPED", needs_serving),
+        ("STARTING", every_operation),
+        ("RESETTING", every_operation),
+        ("DELETING", every_operation),
+    ];
+
+    for (graph_status, refused) in rows {
         let nonce = graph_status.to_lowercase();
         let setup = format!("a graph in {graph_status}");
         let graph_id = graph_in_status(
@@ -317,7 +337,12 @@ async fn an_operation_held_back_by_the_graphs_status_words_its_action_and_that_s
         // Fired back to back with no wait: an in-flight transition is in flight only
         // until the clock makes it due, and a refusal changes nothing, so one graph
         // serves every operation this status holds back.
-        for (operation, action) in operations {
+        for operation in *refused {
+            let action = actions
+                .iter()
+                .find(|(named, _)| named == operation)
+                .map(|(_, action)| *action)
+                .unwrap_or_else(|| panic!("no action is worded for {operation:?}"));
             let case = format!("{operation} against a graph in {graph_status}");
             let (method, path, body) = graph_precondition_request(operation, &graph_id, &nonce);
             let (code, answered) = call(&router, method, &path, body).await;

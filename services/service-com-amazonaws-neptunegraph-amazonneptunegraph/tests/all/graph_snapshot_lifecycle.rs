@@ -13,8 +13,10 @@
 //!   status the clock settles to `AVAILABLE`.
 //! * A snapshot name is unique within the account, so a second snapshot by a stored
 //!   name is refused `ConflictException` (409) whichever graph it is taken from.
-//! * A graph that is not `AVAILABLE` cannot be snapshotted (409), and taking a
-//!   snapshot takes the source graph through the modelled `SNAPSHOTTING` status.
+//! * A graph whose transition is still in flight cannot be snapshotted (409), and
+//!   taking a snapshot takes the source graph through the modelled `SNAPSHOTTING`
+//!   status (a graph AT REST, serving or stopped, is snapshottable — covered by
+//!   `snapshot_of_a_graph_at_rest`).
 //! * A name outside the modelled `SnapshotName` constraints, or an identifier naming
 //!   no stored resource, is refused by its modelled error rather than served.
 //!
@@ -579,7 +581,7 @@ async fn taking_a_snapshot_takes_the_source_graph_through_snapshotting() {
 }
 
 #[tokio::test]
-async fn a_graph_that_is_not_available_cannot_be_snapshotted() {
+async fn a_graph_whose_transition_is_in_flight_cannot_be_snapshotted() {
     let router = emulator();
     let (status, created) = call(
         &router,
