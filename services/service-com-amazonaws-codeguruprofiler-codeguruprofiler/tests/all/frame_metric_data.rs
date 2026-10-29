@@ -48,8 +48,9 @@ const FIVE_MINUTES: i64 = 5 * 60;
 
 /// How close two metric values have to be to count as the same ratio. The values are
 /// doubles (the modelled `FrameMetricValue`), so a ratio such as 6/9 is compared with a
-/// tolerance rather than bit for bit.
-const TOLERANCE: f64 = 1e-9;
+/// tolerance rather than bit for bit. `pub(crate)` so every suite asserting a reported
+/// ratio compares it the same way.
+pub(crate) const TOLERANCE: f64 = 1e-9;
 
 /// How many frame metrics one request may ask about
 /// (`state::MAX_FRAME_METRICS_PER_REQUEST`), restated here so these cases pin the wire
@@ -289,196 +290,206 @@ struct ValueCase {
     label: &'static str,
     body: Vec<u8>,
     frame_name: &'static str,
-    thread_states: Vec<&'static str>,
+    thread_states: &'static [&'static str],
     expected: f64,
 }
 
-/// The epoch-millisecond `start` every submitted profile states: a profile states the
-/// start of the period it covers, and `PostAgentProfile` parses the submitted data and
-/// refuses a profile without it. The instant itself is immaterial to a frame metric,
-/// which is computed from the counts the document records.
-const PROFILE_START_MILLIS: i64 = 1_600_000_000_000;
-
-/// A profile document, as JSON bytes: the frames the case records, under the `start` a
-/// submitted profile carries.
-fn document(value: serde_json::Value) -> Vec<u8> {
-    let mut value = value;
-    if let Some(fields) = value.as_object_mut() {
-        fields.insert(
-            "start".to_string(),
-            serde_json::json!(PROFILE_START_MILLIS),
-        );
-    }
-    serde_json::to_vec(&value).expect("a serializable document")
+/// One row of the ratio table stated as the CALL GRAPH a profile records rather than as
+/// stored bytes: the frames and counts, the metric asked about them, and the ratio the
+/// step must report.
+///
+/// `pub(crate)` because the ratio a frame metric reports is one rule read by more than
+/// this suite: the sibling suite about which representation a stored profile is read in
+/// crosses these same rows with the media types a profile can be announced under, so the
+/// rows are written once and encoded by whoever stores them.
+pub(crate) struct CallgraphCase {
+    pub(crate) label: &'static str,
+    pub(crate) callgraph: serde_json::Value,
+    pub(crate) frame_name: &'static str,
+    pub(crate) thread_states: &'static [&'static str],
+    pub(crate) expected: f64,
 }
 
-/// The table. Rows differ along what the rule generalises over: how many frames the
-/// profile holds, how deeply they nest, how many instances share a frame name, how many
-/// thread states the metric asks about, whether the profile records a count in them at
-/// all, whether the counts are whole or fractional, and whether the document is one this
-/// service can read at all.
-fn value_cases() -> Vec<ValueCase> {
+/// A submitted profile document: the call graph `callgraph` records, beside the `start`
+/// member a submitted profile has to carry
+/// ([`crate::profiling_group_lifecycle::PROFILE_START_MILLIS`], which `PostAgentProfile`
+/// refuses a submitted profile without). The instant itself is immaterial to a frame
+/// metric, which is computed from the counts the document records.
+///
+/// `pub(crate)` so the sibling suite that stores the same call graphs in either
+/// representation builds the document the one way, beside the one
+/// [`callgraph_cases`] table.
+pub(crate) fn profile_of(callgraph: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "callgraph": callgraph,
+        "start": crate::profiling_group_lifecycle::PROFILE_START_MILLIS,
+    })
+}
+
+/// [`profile_of`] as the JSON bytes an agent submits a profile as.
+fn document(callgraph: serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(&profile_of(callgraph)).expect("a serializable document")
+}
+
+/// The ratio table. Rows differ along what the rule generalises over: how many frames the
+/// profile holds, how deeply they nest, how many instances share a frame name, whether
+/// the frames are keyed or listed, how many thread states the metric asks about, whether
+/// the profile records a count in them at all, and whether the counts are whole,
+/// fractional or no count at all.
+pub(crate) fn callgraph_cases() -> Vec<CallgraphCase> {
     vec![
-        ValueCase {
+        CallgraphCase {
             label: "one frame of two, one thread state",
-            body: document(serde_json::json!({
-                "callgraph": { "A": { "RUNNABLE": 4 }, "B": { "RUNNABLE": 1 } }
-            })),
+            callgraph: serde_json::json!({ "A": { "RUNNABLE": 4 }, "B": { "RUNNABLE": 1 } }),
             frame_name: "A",
-            thread_states: vec!["RUNNABLE"],
+            thread_states: &["RUNNABLE"],
             expected: 0.8,
         },
-        ValueCase {
+        CallgraphCase {
             label: "a frame's time includes the frames it calls",
-            body: document(serde_json::json!({
-                "callgraph": {
-                    "A": { "RUNNABLE": 4, "B": { "RUNNABLE": 2 } },
-                    "C": { "RUNNABLE": 3 }
-                }
-            })),
+            callgraph: serde_json::json!({
+                "A": { "RUNNABLE": 4, "B": { "RUNNABLE": 2 } },
+                "C": { "RUNNABLE": 3 }
+            }),
             frame_name: "A",
-            thread_states: vec!["RUNNABLE"],
+            thread_states: &["RUNNABLE"],
             expected: 6.0 / 9.0,
         },
-        ValueCase {
+        CallgraphCase {
             label: "the called frame of the same profile carries its own time",
-            body: document(serde_json::json!({
-                "callgraph": {
-                    "A": { "RUNNABLE": 4, "B": { "RUNNABLE": 2 } },
-                    "C": { "RUNNABLE": 3 }
-                }
-            })),
+            callgraph: serde_json::json!({
+                "A": { "RUNNABLE": 4, "B": { "RUNNABLE": 2 } },
+                "C": { "RUNNABLE": 3 }
+            }),
             frame_name: "B",
-            thread_states: vec!["RUNNABLE"],
+            thread_states: &["RUNNABLE"],
             expected: 2.0 / 9.0,
         },
-        ValueCase {
+        CallgraphCase {
             label: "two thread states count together",
-            body: document(serde_json::json!({
-                "callgraph": {
-                    "A": { "RUNNABLE": 4, "BLOCKED": 1 },
-                    "C": { "RUNNABLE": 3, "WAITING": 2 }
-                }
-            })),
+            callgraph: serde_json::json!({
+                "A": { "RUNNABLE": 4, "BLOCKED": 1 },
+                "C": { "RUNNABLE": 3, "WAITING": 2 }
+            }),
             frame_name: "A",
-            thread_states: vec!["RUNNABLE", "BLOCKED"],
+            thread_states: &["RUNNABLE", "BLOCKED"],
             expected: 5.0 / 8.0,
         },
-        ValueCase {
+        CallgraphCase {
             label: "a thread state the profile never recorded counts nothing",
-            body: document(serde_json::json!({
-                "callgraph": {
-                    "A": { "RUNNABLE": 4, "BLOCKED": 1 },
-                    "C": { "RUNNABLE": 3 }
-                }
-            })),
+            callgraph: serde_json::json!({
+                "A": { "RUNNABLE": 4, "BLOCKED": 1 },
+                "C": { "RUNNABLE": 3 }
+            }),
             frame_name: "A",
-            thread_states: vec!["TERMINATED"],
+            thread_states: &["TERMINATED"],
             expected: 0.0,
         },
-        ValueCase {
+        CallgraphCase {
             label: "a metric that asks about no thread state counts nothing",
-            body: document(serde_json::json!({
-                "callgraph": { "A": { "RUNNABLE": 4 }, "B": { "RUNNABLE": 1 } }
-            })),
+            callgraph: serde_json::json!({ "A": { "RUNNABLE": 4 }, "B": { "RUNNABLE": 1 } }),
             frame_name: "A",
-            thread_states: vec![],
+            thread_states: &[],
             expected: 0.0,
         },
-        ValueCase {
+        CallgraphCase {
             label: "every instance of the frame name is aggregated",
-            body: document(serde_json::json!({
-                "callgraph": {
-                    "A": { "RUNNABLE": 2 },
-                    "B": { "A": { "RUNNABLE": 3 } },
-                    "C": { "RUNNABLE": 5 }
-                }
-            })),
+            callgraph: serde_json::json!({
+                "A": { "RUNNABLE": 2 },
+                "B": { "A": { "RUNNABLE": 3 } },
+                "C": { "RUNNABLE": 5 }
+            }),
             frame_name: "A",
-            thread_states: vec!["RUNNABLE"],
+            thread_states: &["RUNNABLE"],
             expected: 0.5,
         },
-        ValueCase {
+        CallgraphCase {
             label: "a frame inside a frame of the same name counts its samples once",
-            body: document(serde_json::json!({
-                "callgraph": {
-                    "A": { "RUNNABLE": 2, "B": { "A": { "RUNNABLE": 3 } } },
-                    "C": { "RUNNABLE": 5 }
-                }
-            })),
+            callgraph: serde_json::json!({
+                "A": { "RUNNABLE": 2, "B": { "A": { "RUNNABLE": 3 } } },
+                "C": { "RUNNABLE": 5 }
+            }),
             frame_name: "A",
-            thread_states: vec!["RUNNABLE"],
+            thread_states: &["RUNNABLE"],
             expected: 0.5,
         },
-        ValueCase {
+        CallgraphCase {
             label: "a frame name the profile does not hold",
-            body: document(serde_json::json!({
-                "callgraph": { "A": { "RUNNABLE": 4 }, "B": { "RUNNABLE": 1 } }
-            })),
+            callgraph: serde_json::json!({ "A": { "RUNNABLE": 4 }, "B": { "RUNNABLE": 1 } }),
             frame_name: "NotInTheProfile",
-            thread_states: vec!["RUNNABLE"],
+            thread_states: &["RUNNABLE"],
             expected: 0.0,
         },
-        ValueCase {
+        CallgraphCase {
             label: "fractional counts",
-            body: document(serde_json::json!({
-                "callgraph": { "A": { "RUNNABLE": 0.5 }, "B": { "RUNNABLE": 1.5 } }
-            })),
+            callgraph: serde_json::json!({ "A": { "RUNNABLE": 0.5 }, "B": { "RUNNABLE": 1.5 } }),
             frame_name: "A",
-            thread_states: vec!["RUNNABLE"],
+            thread_states: &["RUNNABLE"],
             expected: 0.25,
         },
-        ValueCase {
+        CallgraphCase {
             label: "frames listed rather than keyed sit in the enclosing frame",
-            body: document(serde_json::json!({
-                "callgraph": {
-                    "A": [{ "RUNNABLE": 2 }, { "RUNNABLE": 1 }],
-                    "B": { "RUNNABLE": 1 }
-                }
-            })),
+            callgraph: serde_json::json!({
+                "A": [{ "RUNNABLE": 2 }, { "RUNNABLE": 1 }],
+                "B": { "RUNNABLE": 1 }
+            }),
             frame_name: "A",
-            thread_states: vec!["RUNNABLE"],
+            thread_states: &["RUNNABLE"],
             expected: 0.75,
         },
-        ValueCase {
+        CallgraphCase {
             label: "a negative number is no sample count",
-            body: document(serde_json::json!({
-                "callgraph": {
-                    "A": { "RUNNABLE": -1, "B": { "RUNNABLE": 2 } },
-                    "C": { "RUNNABLE": 2 }
-                }
-            })),
+            callgraph: serde_json::json!({
+                "A": { "RUNNABLE": -1, "B": { "RUNNABLE": 2 } },
+                "C": { "RUNNABLE": 2 }
+            }),
             frame_name: "A",
-            thread_states: vec!["RUNNABLE"],
+            thread_states: &["RUNNABLE"],
             expected: 0.5,
         },
-        ValueCase {
+        CallgraphCase {
             label: "a count five frames down still belongs to the frame",
-            body: document(serde_json::json!({
-                "callgraph": {
-                    "A": { "B": { "C": { "D": { "E": { "RUNNABLE": 3 } } } } },
-                    "F": { "RUNNABLE": 1 }
-                }
-            })),
+            callgraph: serde_json::json!({
+                "A": { "B": { "C": { "D": { "E": { "RUNNABLE": 3 } } } } },
+                "F": { "RUNNABLE": 1 }
+            }),
             frame_name: "A",
-            thread_states: vec!["RUNNABLE"],
+            thread_states: &["RUNNABLE"],
             expected: 0.75,
         },
-        ValueCase {
+        CallgraphCase {
             label: "a document that records no count at all",
-            body: document(serde_json::json!({ "callgraph": { "A": {}, "B": {} } })),
+            callgraph: serde_json::json!({ "A": {}, "B": {} }),
             frame_name: "A",
-            thread_states: vec!["RUNNABLE"],
-            expected: 0.0,
-        },
-        ValueCase {
-            label: "bytes that are no document hold no frames",
-            body: b"this is not a profile document".to_vec(),
-            frame_name: "A",
-            thread_states: vec!["RUNNABLE"],
+            thread_states: &["RUNNABLE"],
             expected: 0.0,
         },
     ]
+}
+
+/// The table this suite stores: every row of [`callgraph_cases`] as the JSON document a
+/// profile is submitted as, plus the one row whose bytes are no document at all — which
+/// has no call graph to state, and so belongs to the READER rule this suite asserts rather
+/// than to the shared ratio table.
+fn value_cases() -> Vec<ValueCase> {
+    let mut cases: Vec<ValueCase> = callgraph_cases()
+        .into_iter()
+        .map(|case| ValueCase {
+            label: case.label,
+            body: document(case.callgraph),
+            frame_name: case.frame_name,
+            thread_states: case.thread_states,
+            expected: case.expected,
+        })
+        .collect();
+    cases.push(ValueCase {
+        label: "bytes that are no document hold no frames",
+        body: b"this is not a profile document".to_vec(),
+        frame_name: "A",
+        thread_states: &["RUNNABLE"],
+        expected: 0.0,
+    });
+    cases
 }
 
 #[tokio::test]
@@ -502,7 +513,7 @@ async fn a_frame_metric_is_the_frames_counts_over_the_profiles_counts() {
         )
         .await;
 
-        let requested = frame_metric(case.frame_name, &case.thread_states);
+        let requested = frame_metric(case.frame_name, case.thread_states);
         let answer = frame_metric_data(
             &harness,
             &name,
@@ -605,9 +616,7 @@ async fn the_steps_are_the_aligned_windows_of_the_reported_resolution() {
     let harness = Harness::new();
     // The profile sits in the FIRST window of the period at every resolution, so the one
     // non-zero value is the first step's whatever the resolution is.
-    let body = document(serde_json::json!({
-        "callgraph": { "A": { "RUNNABLE": 4 }, "B": { "RUNNABLE": 1 } }
-    }));
+    let body = document(serde_json::json!({ "A": { "RUNNABLE": 4 }, "B": { "RUNNABLE": 1 } }));
 
     for (index, case) in resolution_cases().into_iter().enumerate() {
         let label = case.label;
@@ -699,9 +708,7 @@ async fn a_step_whose_aggregation_is_not_due_is_an_unprocessed_instance() {
         201,
         "create must succeed"
     );
-    let body = document(serde_json::json!({
-        "callgraph": { "A": { "RUNNABLE": 4 }, "B": { "RUNNABLE": 1 } }
-    }));
+    let body = document(serde_json::json!({ "A": { "RUNNABLE": 4 }, "B": { "RUNNABLE": 1 } }));
     // Posted over HTTP, so the receipt is the clock's: the window it lands in is still
     // open and its aggregation has not fallen due.
     let before = now();
@@ -860,7 +867,7 @@ async fn a_request_that_names_no_metric_still_reports_the_period_and_its_steps()
     group_with_profile(
         &harness,
         name,
-        document(serde_json::json!({ "callgraph": { "A": { "RUNNABLE": 1 } } })),
+        document(serde_json::json!({ "A": { "RUNNABLE": 1 } })),
         DAY_START + 60,
         true,
     )
@@ -980,7 +987,7 @@ async fn the_reported_period_is_the_one_the_request_names() {
     group_with_profile(
         &harness,
         name,
-        document(serde_json::json!({ "callgraph": { "A": { "RUNNABLE": 1 } } })),
+        document(serde_json::json!({ "A": { "RUNNABLE": 1 } })),
         DAY_START + 60,
         true,
     )
@@ -1047,7 +1054,7 @@ async fn a_period_far_from_the_epoch_is_still_a_bounded_series() {
     group_with_profile(
         &harness,
         name,
-        document(serde_json::json!({ "callgraph": { "A": { "RUNNABLE": 1 } } })),
+        document(serde_json::json!({ "A": { "RUNNABLE": 1 } })),
         DAY_START + 60,
         true,
     )
@@ -1321,7 +1328,7 @@ async fn a_request_the_operation_cannot_report_on_is_refused() {
     group_with_profile(
         &harness,
         group,
-        document(serde_json::json!({ "callgraph": { "A": { "RUNNABLE": 1 } } })),
+        document(serde_json::json!({ "A": { "RUNNABLE": 1 } })),
         DAY_START + 60,
         true,
     )

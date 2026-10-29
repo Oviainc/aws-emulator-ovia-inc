@@ -14,13 +14,16 @@
 //! under (each of the two the model names, one of them carrying a parameter, a media type
 //! that names no representation, and a third media type) crossed with the representation
 //! its bytes are really a document in (each of the two), and then — for each of those —
-//! the representation the request accepts and the depth it bounds the profile to.
+//! the representation the request accepts and the depth it bounds the profile to, and the
+//! call graph the profile records with the frame metric asked about it.
 
 use aws_smithy_types::DateTime;
 use aws_smithy_types::date_time::Format;
 use ion_rs::{Element, v1_0};
 
-use crate::frame_metric_data::{datum, frame_metric, frame_metric_data};
+use crate::frame_metric_data::{
+    TOLERANCE, callgraph_cases, datum, frame_metric, frame_metric_data, profile_of,
+};
 use crate::interval_validation::create_group;
 use crate::profile_times::place_receipts;
 use crate::profiling_group_lifecycle::Harness;
@@ -41,7 +44,7 @@ const OCTETS: &str = "application/octet-stream";
 /// the request.
 const RECEIPT_SECONDS: i64 = 1_600_000_000;
 
-/// One hour in seconds — the resolution the frame-metric case reports at.
+/// One hour in seconds — the resolution the frame-metric cases report at.
 const HOUR: i64 = 60 * 60;
 
 /// An instant as the ISO 8601 `date-time` form the modelled timestamp members carry.
@@ -101,13 +104,10 @@ fn expected_element(document: &serde_json::Value) -> Element {
     element_of(&serde_json::to_vec(document).expect("a serializable document"))
 }
 
-/// The profile document every case stores: a call stack three frames deep under one
-/// member, beside the `start` member a submitted profile has to carry.
+/// The profile document the served-representation cases store: a call stack three frames
+/// deep under one member.
 fn profile() -> serde_json::Value {
-    serde_json::json!({
-        "callgraph": { "A": { "B": { "RUNNABLE": 2 } } },
-        "start": 1_600_000_000_000i64,
-    })
+    profile_of(serde_json::json!({ "A": { "B": { "RUNNABLE": 2 } } }))
 }
 
 /// [`profile`] with every frame nested deeper than `max_depth` left out — the member's
@@ -120,7 +120,7 @@ fn bounded_profile(max_depth: i64) -> serde_json::Value {
         3 => serde_json::json!({ "A": { "B": {} } }),
         _ => serde_json::json!({ "A": { "B": { "RUNNABLE": 2 } } }),
     };
-    serde_json::json!({ "callgraph": callgraph, "start": 1_600_000_000_000i64 })
+    profile_of(callgraph)
 }
 
 /// One stored profile: the media type it was announced under, and the representation its
@@ -333,75 +333,175 @@ async fn the_representation_served_is_the_one_the_stored_bytes_are_a_document_in
     }
 }
 
+/// The start of the one hourly window every frame-metric case below reports over: the
+/// window holding [`RECEIPT_SECONDS`], aligned to UTC by starting a whole number of hours
+/// past the epoch.
+fn metric_window_start() -> i64 {
+    RECEIPT_SECONDS - RECEIPT_SECONDS.rem_euclid(HOUR)
+}
+
+/// The values of the one-step series `name` reports for the metric on `frame_name` over
+/// `thread_states`, having checked the datum names the metric the request asked for.
+async fn reported_series(
+    harness: &Harness,
+    name: &str,
+    frame_name: &str,
+    thread_states: &[&str],
+    label: &str,
+) -> Vec<f64> {
+    let requested = frame_metric(frame_name, thread_states);
+    let answer = frame_metric_data(
+        harness,
+        name,
+        &format!(
+            "?startTime={}&endTime={}&targetResolution=PT1H",
+            iso(metric_window_start()),
+            iso(metric_window_start() + HOUR)
+        ),
+        std::slice::from_ref(&requested),
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "case {label:?}: expected HTTP 200, got {} {}",
+        answer.status,
+        String::from_utf8_lossy(&answer.body)
+    );
+    let (metric, values) = datum(&answer, 0);
+    assert_eq!(
+        metric, requested,
+        "case {label:?}: the datum must name the metric it was asked for, got {metric:?}"
+    );
+    values
+}
+
 /// The frame-metric reader finds the frames of a stored profile by the same rule: a
-/// profile whose bytes are a document records its counts whatever media type it was
-/// announced under.
+/// profile whose bytes are a document records exactly the counts those bytes hold,
+/// whatever media type it was announced under.
 ///
-/// The document records one sample under frame `A` and one under frame `C`, so
-/// `AggregatedRelativeTotalTime` for `A` — "Metric value aggregated for all instances of
-/// a frame name in a profile relative to the root frame" — is half the profile's counts,
-/// where a profile the reader cannot read at all records nothing and reports zero.
+/// `AggregatedRelativeTotalTime` is "Metric value aggregated for all instances of a frame
+/// name in a profile relative to the root frame", so the value of the step is the counts
+/// recorded under the named frame over the counts of the whole profile, both only in the
+/// thread states the metric asks about. That ratio is the one table
+/// [`crate::frame_metric_data::callgraph_cases`] states; here every one of its rows is
+/// stored under every announced media type of [`cases`] and must answer the one ratio its
+/// own counts state. A reader that judged the bytes by their announced media type instead
+/// would find no frames at all in most of these rows and answer zero.
 #[tokio::test]
 async fn a_frame_metric_reads_a_stored_profile_by_the_same_rule() {
     let harness = Harness::new();
-    let document = serde_json::json!({
-        "callgraph": { "A": { "RUNNABLE": 1 }, "C": { "RUNNABLE": 1 } },
-        "start": 1_600_000_000_000i64,
-    });
-    // The series is reported over one hourly window holding the receipt, so the window is
-    // aligned to UTC by starting it a whole number of hours past the epoch.
-    let window_start = RECEIPT_SECONDS - RECEIPT_SECONDS.rem_euclid(HOUR);
+    let metrics = callgraph_cases();
 
     for (index, case) in cases().into_iter().enumerate() {
-        let label = case.label;
-        let name = format!("stored-representation-metric-{index}");
-        create_group(&harness, &name).await;
+        for (row, metric) in metrics.iter().enumerate() {
+            let label = format!("{} / {}", case.label, metric.label);
+            let name = format!("stored-representation-metric-{index}-{row}");
+            create_group(&harness, &name).await;
+            let posted = harness
+                .post_agent_profile(
+                    &name,
+                    case.announced,
+                    None,
+                    case.representation
+                        .bytes(&profile_of(metric.callgraph.clone())),
+                )
+                .await;
+            assert_eq!(
+                posted.status,
+                204,
+                "case {label:?}: posting the profile must succeed, got {} {}",
+                posted.status,
+                String::from_utf8_lossy(&posted.body)
+            );
+            place_receipts(&harness, &name, &[metric_window_start() + 60]);
+
+            let values = reported_series(
+                &harness,
+                &name,
+                metric.frame_name,
+                metric.thread_states,
+                &label,
+            )
+            .await;
+            assert_eq!(
+                values.len(),
+                1,
+                "case {label:?}: expected one value per reported step, got {values:?}"
+            );
+            assert!(
+                (values[0] - metric.expected).abs() < TOLERANCE,
+                "case {label:?}: expected {}, got {:?}",
+                metric.expected,
+                values[0]
+            );
+        }
+    }
+}
+
+/// Every profile of a step counts towards its frame metric, whatever media type each one
+/// was announced under: the value is the named frame's counts over the counts of ALL the
+/// profiles of that step, so dropping one of them for its announced media type would move
+/// both halves of the ratio.
+///
+/// The group holds two profiles in one hourly window — one recording a single sample under
+/// frame `A`, one recording three under frame `B` — each announced under a media type that
+/// is NOT the representation its bytes are a document in. `A` therefore accounts for one of
+/// the four samples the step holds, where reading only one of the two profiles would report
+/// 1 or 0 instead.
+#[tokio::test]
+async fn a_step_counts_every_stored_profile_whatever_it_was_announced_under() {
+    let harness = Harness::new();
+    let name = "stored-representation-metric-aggregate";
+    create_group(&harness, name).await;
+
+    let profiles: [(&str, Representation, serde_json::Value); 2] = [
+        (
+            TEXT,
+            Representation::Json,
+            serde_json::json!({ "A": { "RUNNABLE": 1 } }),
+        ),
+        (
+            JSON,
+            Representation::Ion,
+            serde_json::json!({ "B": { "RUNNABLE": 3 } }),
+        ),
+    ];
+    for (announced, representation, callgraph) in profiles {
         let posted = harness
             .post_agent_profile(
-                &name,
-                case.announced,
+                name,
+                announced,
                 None,
-                case.representation.bytes(&document),
+                representation.bytes(&profile_of(callgraph)),
             )
             .await;
         assert_eq!(
             posted.status,
             204,
-            "case {label:?}: posting the profile must succeed, got {} {}",
+            "posting a profile announced as {announced} must succeed, got {} {}",
             posted.status,
             String::from_utf8_lossy(&posted.body)
         );
-        place_receipts(&harness, &name, &[window_start + 60]);
+    }
+    place_receipts(
+        &harness,
+        name,
+        &[metric_window_start() + 60, metric_window_start() + 120],
+    );
 
-        let requested = frame_metric("A", &["RUNNABLE"]);
-        let answer = frame_metric_data(
-            &harness,
-            &name,
-            &format!(
-                "?startTime={}&endTime={}&targetResolution=PT1H",
-                iso(window_start),
-                iso(window_start + HOUR)
-            ),
-            std::slice::from_ref(&requested),
-        )
-        .await;
+    for (frame_name, expected) in [("A", 0.25), ("B", 0.75), ("NotInTheProfile", 0.0)] {
+        let label = format!("two profiles of one step, metric on {frame_name}");
+        let values = reported_series(&harness, name, frame_name, &["RUNNABLE"], &label).await;
         assert_eq!(
-            answer.status,
-            200,
-            "case {label:?}: expected HTTP 200, got {} {}",
-            answer.status,
-            String::from_utf8_lossy(&answer.body)
+            values.len(),
+            1,
+            "case {label:?}: expected one value per reported step, got {values:?}"
         );
-        let (metric, values) = datum(&answer, 0);
-        assert_eq!(
-            metric, requested,
-            "case {label:?}: the datum must name the metric it was asked for, got {metric:?}"
-        );
-        assert_eq!(
-            values,
-            vec![0.5],
-            "case {label:?}: expected the frame's counts over the profile's counts, got \
-             {values:?}"
+        assert!(
+            (values[0] - expected).abs() < TOLERANCE,
+            "case {label:?}: expected {expected}, got {:?}",
+            values[0]
         );
     }
 }
