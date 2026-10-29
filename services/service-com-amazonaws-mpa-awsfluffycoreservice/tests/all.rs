@@ -63,6 +63,8 @@ mod pagination_token_provenance;
 mod pending_baseline_session_uniqueness;
 #[path = "all/pending_team_update.rs"]
 mod pending_team_update;
+#[path = "all/policy_attachment_status.rs"]
+mod policy_attachment_status;
 #[path = "all/policy_catalog.rs"]
 mod policy_catalog;
 #[path = "all/policy_version_detail.rs"]

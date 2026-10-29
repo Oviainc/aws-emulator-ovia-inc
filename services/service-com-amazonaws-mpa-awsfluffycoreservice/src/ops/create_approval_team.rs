@@ -44,13 +44,14 @@
 //!   ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) earns `ValidationException` (400): such
 //!   a key is AWS's, not the caller's, so no path that writes tags writes one and no team
 //!   is ever stored already carrying one.
-//! * `Policies` naming a policy version the catalog does not hold earns
+//! * `Policies` naming a policy version the catalog does not hold, or one whose
+//!   `PolicyStatus` the catalog no longer reports as attachable, earns
 //!   `ValidationException` (400). An attachment is resolved through
 //!   [`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::policy_version`], the one
 //!   resolver a `QualifiedPolicyArn` is read by, so an attachment this call accepts is
 //!   one `GetApprovalTeam`, `ListResourcePolicies` and `GetResourcePolicy` all resolve to
 //!   the same policy version; the modelled pattern fixes an attachment's FORM, not the
-//!   existence of what it names.
+//!   existence or the status of what it names.
 //!
 //! A new team is `PENDING` / `PENDING_ACTIVATION` until its approvers have answered their
 //! invitations; see [`crate::state`] for who materialises that.
@@ -329,19 +330,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Policies` ATTACHES policies to the team, and a policy is AWS-owned: nothing in
         // this model mints one, so a reference is attachable only when the catalog holds
-        // the policy and the version the reference names. Each reference is resolved here
-        // through the same resolver the resource-policy reads and `GetPolicyVersion` use,
-        // and one that resolves to nothing is refused with the declared
-        // `ValidationException` (400) before any team is stored — otherwise the team would
-        // carry an attachment `GetApprovalTeam` reports and `ListResourcePolicies` /
-        // `GetResourcePolicy` cannot resolve.
-        if let Some(unattachable) = state.unattachable_policy_reference(
+        // the policy and the version the reference names AND that version's status still
+        // allows attaching it. Each reference is held against the one attach gate in
+        // `crate::state`, and one that resolves to nothing or to a version no longer
+        // attachable is refused with the declared `ValidationException` (400) before any
+        // team is stored — otherwise the team would carry an attachment `GetApprovalTeam`
+        // reports and `ListResourcePolicies` / `GetResourcePolicy` cannot resolve, or one
+        // the catalog reads themselves report as no longer attachable.
+        if let Some(refusal) = state.unattachable_policy_reference(
             input.policies.iter().map(|policy| policy.policy_arn.as_str()),
         ) {
-            return Err(CreateApprovalTeamErrorModeled::ValidationException(
-                crate::state::unattachable_policy(unattachable),
-            )
-            .into());
+            return Err(CreateApprovalTeamErrorModeled::ValidationException(refusal).into());
         }
 
         let approval_strategy = match &input.approval_strategy {

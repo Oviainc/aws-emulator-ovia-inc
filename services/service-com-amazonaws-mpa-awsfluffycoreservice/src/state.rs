@@ -193,9 +193,11 @@
 //!   the [`RESERVED_TAG_KEY_PREFIX`] namespace with ([`names_reserved_tag_key`]).
 //! * [`foreign_next_token`] / [`FOREIGN_NEXT_TOKEN_MESSAGE`] — the one message every
 //!   paginated listing refuses a `NextToken` it did not issue with.
-//! * [`unattachable_policy`] — the one message a policy reference the catalog cannot
-//!   resolve is refused with
-//!   ([`ComAmazonawsMpaAwsfluffycoreserviceState::unattachable_policy_reference`]).
+//! * [`unattachable_policy`] / [`policy_version_not_attachable`] — the two messages the
+//!   one attach gate refuses a policy reference with
+//!   ([`ComAmazonawsMpaAwsfluffycoreserviceState::unattachable_policy_reference`]): the
+//!   first for a reference the catalog cannot resolve, the second for one it resolves to
+//!   a version whose [`PolicyStatus`] no longer allows attaching it.
 //! * [`repeated_identity`] — the one message either write path that takes an approver
 //!   list refuses a repeated identity with.
 //! * [`malformed_approver_identity_source`] — the malformed-ARN refusal either write path
@@ -860,6 +862,28 @@ pub fn unattachable_policy(policy_arn: &str) -> ValidationException {
         message: bounded_message(format!(
             "Policies names a policy version that does not exist: {policy_arn}. Attach a \
              policy version ListPolicies and ListPolicyVersions report."
+        )),
+    }
+}
+
+/// The refusal a `Policies` reference that resolves to a policy version whose status no
+/// longer allows attaching it earns.
+///
+/// The version EXISTS — the catalog reads keep reporting it — so the refusal names the
+/// status that stops it being attached, read off the catalog record, and the status an
+/// attachable version carries. Like every message that quotes a request value back, it is
+/// held to the bound its own `Message` member declares ([`bounded_message`]).
+#[must_use]
+pub fn policy_version_not_attachable(
+    policy_arn: &str,
+    status: PolicyStatus,
+) -> ValidationException {
+    ValidationException {
+        message: bounded_message(format!(
+            "Policies names a policy version whose status is {}: {policy_arn}. Attach a \
+             policy version ListPolicyVersions reports as {}.",
+            status.as_wire(),
+            PolicyStatus::Attachable.as_wire()
         )),
     }
 }
@@ -2274,6 +2298,18 @@ pub enum PolicyStatus {
 }
 
 impl PolicyStatus {
+    /// Whether a version in this status may still be attached to a team — the question
+    /// this field answers, and the one the attach gate
+    /// ([`ComAmazonawsMpaAwsfluffycoreserviceState::unattachable_policy_reference`]) asks
+    /// it.
+    #[must_use]
+    pub fn is_attachable(self) -> bool {
+        match self {
+            Self::Attachable => true,
+            Self::Deprecated => false,
+        }
+    }
+
     /// The wire token, as `PolicyStatus` spells it.
     #[must_use]
     pub fn as_wire(self) -> &'static str {
@@ -3190,23 +3226,35 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
         self.policies.get(arn)
     }
 
-    /// The first of `references` that names no policy version this store holds, or
-    /// `None` when every one of them resolves.
+    /// The refusal the first of `references` that may not be attached earns, or `None`
+    /// when every one of them is attachable.
     ///
     /// A policy is AWS-owned — no operation of this model mints, updates or deletes one —
-    /// so a reference is only attachable when the catalog already holds the policy AND
-    /// the version it names. References are resolved through [`Self::policy_version`],
-    /// the one resolver a `QualifiedPolicyArn` is read by, so an attachment that is
-    /// accepted when a resource is written is one every later read of that resource can
-    /// resolve.
+    /// so a reference is attachable only when the catalog already holds the policy AND
+    /// the version it names, and that version's [`PolicyStatus`] still allows attaching
+    /// it ([`PolicyStatus::is_attachable`]): a status is the catalog's own statement of
+    /// whether a version may still be attached, so a version it reports as no longer
+    /// attachable is refused even though it resolves.
+    ///
+    /// References are resolved through [`Self::policy_version`], the one resolver a
+    /// `QualifiedPolicyArn` is read by — which keeps resolving a version in any status, so
+    /// the catalog reads report every version this store holds and an attachment recorded
+    /// while its version was attachable stays resolvable. An attachment this gate accepts
+    /// is therefore one every later read of the resource can resolve.
     #[must_use]
-    pub fn unattachable_policy_reference<'a, I>(&self, references: I) -> Option<&'a str>
+    pub fn unattachable_policy_reference<'a, I>(&self, references: I) -> Option<ValidationException>
     where
         I: IntoIterator<Item = &'a str>,
     {
         references
             .into_iter()
-            .find(|reference| self.policy_version(reference).is_none())
+            .find_map(|reference| match self.policy_version(reference) {
+                None => Some(unattachable_policy(reference)),
+                Some((_, version)) if !version.status.is_attachable() => {
+                    Some(policy_version_not_attachable(reference, version.status))
+                }
+                Some(_) => None,
+            })
     }
 
     /// The catalog policy and the one of its versions that a `QualifiedPolicyArn` names,
