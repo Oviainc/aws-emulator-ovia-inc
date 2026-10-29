@@ -59,6 +59,8 @@ mod delete_user;
 mod delete_user_attributes;
 #[path = "all/delete_user_pool_client.rs"]
 mod delete_user_pool_client;
+#[path = "all/delete_user_pool_client_secret.rs"]
+mod delete_user_pool_client_secret;
 #[path = "all/delete_user_pool_domain.rs"]
 mod delete_user_pool_domain;
 #[path = "all/delete_web_authn_credential.rs"]

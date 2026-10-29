@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteUserPoolClientSecret
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteUserPoolClientSecret`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteUserPoolClientSecret::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Drops one stored client secret from an app client of a user pool, leaving every
+//! other secret the client holds active — and refusing the one secret that is the
+//! client's last.
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +141,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteUserPoolClientSecret` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteUserPoolClientSecretErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteUserPoolClientSecret"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        let mut guard = state.lock();
+
+        // The request names the pool, the app client of it and the secret of that
+        // client, so a `ClientId` that names a client of ANOTHER pool is as absent
+        // as one no create minted.
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        let client = pool
+            .clients
+            .get_mut(&input.client_id)
+            .ok_or_else(|| client_not_found(&input.client_id))?;
+
+        // "Deletes a specific client secret from a user pool app client" (this
+        // operation's own doc): the secret deleted is the one `ClientSecretId`
+        // names, so an id this app client holds no secret for names nothing to
+        // delete — including every id of ANOTHER app client, and every id an
+        // earlier delete already took away.
+        let at = client
+            .client_secrets
+            .iter()
+            .position(|held| held.id == input.client_secret_id)
+            .ok_or_else(|| client_secret_not_found(&input.client_secret_id))?;
+
+        // "You cannot delete the last remaining secret for an app client" (this
+        // operation's own doc), so a confidential app client never loses the
+        // credential that authenticates it: the delete is refused while the named
+        // secret is the only one the client holds, whatever its id is.
+        if client.client_secrets.len() == 1 {
+            return Err(last_remaining_secret(&input.client_id));
+        }
+
+        // Every other secret stays stored, in the order it was created, so the
+        // secrets this app client still holds keep authenticating it and a later
+        // read reports exactly them.
+        client.client_secrets.remove(at);
+
+        Ok(DeleteUserPoolClientSecretOutput {})
     }
 }
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> DeleteUserPoolClientSecretError {
+    DeleteUserPoolClientSecretErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a `ClientId` the named pool
+/// holds no app client for.
+fn client_not_found(client_id: &str) -> DeleteUserPoolClientSecretError {
+    DeleteUserPoolClientSecretErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a `ClientSecretId` the named
+/// app client holds no secret for.
+fn client_secret_not_found(client_secret_id: &str) -> DeleteUserPoolClientSecretError {
+    DeleteUserPoolClientSecretErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("Client secret {client_secret_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's refusal to take an app client's only secret away.
+fn last_remaining_secret(client_id: &str) -> DeleteUserPoolClientSecretError {
+    DeleteUserPoolClientSecretErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(format!(
+            "Cannot delete the last remaining client secret of user pool client {client_id}."
+        )),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> DeleteUserPoolClientSecretError {
+    DeleteUserPoolClientSecretErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
+}
+
