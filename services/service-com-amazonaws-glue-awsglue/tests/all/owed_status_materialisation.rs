@@ -316,7 +316,7 @@ async fn the_status_a_record_reports_is_the_one_its_due_instant_says() {
 #[derive(Debug, Clone)]
 enum Settling {
     BlueprintRegistration(BlueprintEntry),
-    Session(SessionEntry),
+    Session(Box<SessionEntry>),
     BlueprintRun(BlueprintRunEntry),
 }
 
@@ -368,7 +368,7 @@ fn settling(engine: &Arc<engine::InMemoryEngine>, record: Record) -> (Settling, 
                 .unwrap_or_else(|| panic!("{NAME} was created"))
                 .clone();
             let due = entry.settles_at;
-            (Settling::Session(entry), due)
+            (Settling::Session(Box::new(entry)), due)
         }
         Record::BlueprintRun => {
             let entry = store

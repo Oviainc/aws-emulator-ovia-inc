@@ -224,6 +224,13 @@
 //! the instant its own timeouts fall due, and whichever later call reads it materialises
 //! what the clock had already reached.
 //!
+//! A session also holds the STATEMENTS run on it ([`SessionEntry::statements`]), in the
+//! order they were submitted, because every operation that addresses a statement names its
+//! session and then an `Id` the session itself mints — so a statement is a record of the
+//! session it was run on and not an account-level resource. A statement that has not
+//! finished is what makes its session busy, which is what a further run of that session is
+//! refused by.
+//!
 //! Database and table names are folded to lowercase on the way in — the model says
 //! so for both `DatabaseInput$Name` ("For Hive compatibility, this is folded to
 //! lowercase when it is stored") and `TableInput$Name` — and every lookup folds the
@@ -278,6 +285,7 @@ use crate::ops::types::{
     StartColumnStatisticsTaskRunInput,
     StartDataQualityRuleRecommendationRunInput,
     StartJobRunInput, StorageDescriptor, Table, TableIdentifier, TableInput,
+    Statement, StatementOutput,
     TableVersion, TargetRedshiftCatalog,
     TransformEncryption, TransformFilterCriteria, TransformParameters, TransformSortCriteria,
     Blueprint, BlueprintDetails, BlueprintRun, CreateBlueprintInput, StartBlueprintRunInput,
@@ -5524,6 +5532,18 @@ pub struct SessionEntry {
     /// operations, for the reason [`BlueprintEntry::tags`] gives: [`TaggedResourceKind`]
     /// carries no session variant yet.
     pub tags: HashMap<String, String>,
+    /// The statements run on this session, oldest first — which is submission order,
+    /// because a statement is appended here by the run that recorded it.
+    ///
+    /// They live ON the session, as a job's runs live on the job, because every operation
+    /// that addresses a statement names its `SessionId` and then the `Id` this session
+    /// minted for it ([`Self::next_statement_id`]).
+    pub statements: Vec<StatementEntry>,
+    /// The `Id` the next statement run on this session is given: one past the last one
+    /// minted, counting from [`FIRST_STATEMENT_ID`]. Kept on the session rather than
+    /// derived from [`Self::statements`], so an id is never reused once the oldest records
+    /// are dropped.
+    pub next_statement_id: i32,
 }
 
 impl SessionEntry {
@@ -5561,6 +5581,9 @@ impl SessionEntry {
             // "Default for Spark ETL jobs is value of Timeout."
             idle_timeout: input.idle_timeout.unwrap_or(timeout),
             tags: input.tags.clone().unwrap_or_default(),
+            // Nothing has been run on a session its create has just returned.
+            statements: Vec::new(),
+            next_statement_id: FIRST_STATEMENT_ID,
         }
     }
 
@@ -5654,6 +5677,231 @@ impl SessionEntry {
             // create carries no profile member, so no session this store holds has one.
             profile_name: None,
             session_type: self.session_type.clone(),
+        }
+    }
+
+    /// Move every statement of this session into the terminal state the clock owed it at
+    /// `now`, if it owed one.
+    ///
+    /// This is the one write a reporting operation makes, for the reason
+    /// [`Self::settle_if_due`] gives: a statement was due to leave the state its run put
+    /// it in at [`StatementEntry::settles_at`] whether or not anybody called.
+    pub fn settle_due_statements(&mut self, now: SystemTime) {
+        for statement in &mut self.statements {
+            statement.settle_if_due(now);
+        }
+    }
+
+    /// The statement of this session under `id`, or `None` when it has none.
+    ///
+    /// Call [`Self::settle_due_statements`] first, or the record answered carries the
+    /// state it was in before the clock moved it.
+    pub fn statement(&self, id: i32) -> Option<&StatementEntry> {
+        self.statements.iter().find(|statement| statement.id == id)
+    }
+
+    /// Whether a statement of this session has not finished, which is what makes the
+    /// session busy: the remote runtime is "currently busy processing another request"
+    /// (`SessionBusyException`) until the statement it is running comes to rest.
+    ///
+    /// Call [`Self::settle_due_statements`] first, or a statement the clock has already
+    /// finished still counts as in flight.
+    pub fn has_statement_in_flight(&self) -> bool {
+        self.statements
+            .iter()
+            .any(|statement| !statement.is_terminal())
+    }
+
+    /// Record `code` as the next statement of this session, and answer the `Id` it was
+    /// given — "the Id of the statement that was run" (`RunStatementResponse$Id`).
+    ///
+    /// Running a statement is what a session is used for, so it is also the activity the
+    /// IDLE leg of its timeout is measured from ([`Self::times_out_at`]). At most
+    /// [`MAX_STATEMENTS_PER_SESSION`] records are kept, the oldest dropped first, exactly
+    /// as a job keeps its runs; the id sequence is unaffected by that drop.
+    pub fn run_statement(&mut self, code: &str, now: SystemTime) -> i32 {
+        let id = self.next_statement_id;
+        self.next_statement_id = id.saturating_add(1);
+        self.last_active_on = now;
+        self.statements.push(StatementEntry::run(id, code, now));
+        if self.statements.len() > MAX_STATEMENTS_PER_SESSION {
+            let overflow = self.statements.len() - MAX_STATEMENTS_PER_SESSION;
+            self.statements.drain(..overflow);
+        }
+        id
+    }
+}
+
+/// The `StatementState` a statement is in the instant its run returns: the session has
+/// taken it and nothing has begun actioning it yet. One of the modelled `StatementState`
+/// values, whose published list the generated
+/// [`crate::ops::types::STATEMENT_STATE_VALUES`] carries (`WAITING`, `RUNNING`,
+/// `AVAILABLE`, `CANCELLING`, `CANCELLED`, `ERROR`).
+pub const STATEMENT_STATE_WAITING: &str = "WAITING";
+
+/// The `StatementState` of a statement whose code ran and whose output is readable. See
+/// [`STATEMENT_STATE_WAITING`].
+pub const STATEMENT_STATE_AVAILABLE: &str = "AVAILABLE";
+
+/// The `StatementState` of a statement a cancel stopped before it ran. See
+/// [`STATEMENT_STATE_WAITING`].
+pub const STATEMENT_STATE_CANCELLED: &str = "CANCELLED";
+
+/// The `StatementState` of a statement that ended without producing output. See
+/// [`STATEMENT_STATE_WAITING`].
+pub const STATEMENT_STATE_ERROR: &str = "ERROR";
+
+/// The `StatementState` values a statement never moves out of again: of the modelled
+/// enum quoted on [`STATEMENT_STATE_WAITING`], the ones that name a finished statement.
+/// The other three (`WAITING`, `RUNNING`, `CANCELLING`) each still owe a further state.
+pub const TERMINAL_STATEMENT_STATES: [&str; 3] = [
+    STATEMENT_STATE_AVAILABLE,
+    STATEMENT_STATE_CANCELLED,
+    STATEMENT_STATE_ERROR,
+];
+
+/// How long a statement stays in the state its run put it in before the clock owes it its
+/// terminal one.
+///
+/// CHOSEN, not documented: Glue publishes no duration for actioning a statement, so this
+/// is the emulator's own span, the same one a session's provisioning takes
+/// ([`SESSION_SETTLES_AFTER`]) — deliberately not zero, so a caller that runs a second
+/// statement straight after the first still observes the session busy. The due instant is
+/// stored on the record and materialised by whichever later call reads it; nothing sleeps.
+pub const STATEMENT_SETTLES_AFTER: Duration = SESSION_SETTLES_AFTER;
+
+/// `StatementOutput$ErrorValue` for the terminal state the clock owes every statement.
+///
+/// This emulator is the Glue control plane: it records a statement faithfully, but it runs
+/// no Spark runtime, so a statement can never reach [`STATEMENT_STATE_AVAILABLE`] — it
+/// ends in the modelled error state carrying a reason that says exactly that, rather than
+/// reporting output nothing computed. The same reading as
+/// [`JOB_RUN_NOT_EXECUTED_MESSAGE`].
+pub const STATEMENT_NOT_EXECUTED_MESSAGE: &str =
+    "This emulator records statements but runs no Spark runtime, so the statement ended \
+     without running.";
+
+/// `StatementOutput$ErrorName` for that state: the kind of the error above, which is that
+/// nothing was available to run the code on.
+pub const STATEMENT_NOT_EXECUTED_ERROR_NAME: &str = "RuntimeUnavailable";
+
+/// The `Id` the first statement of a session is given, which a session's ids then count
+/// up from.
+pub const FIRST_STATEMENT_ID: i32 = 1;
+
+/// How many statements one session keeps.
+///
+/// CHOSEN: Glue publishes no retention for statement records, so this is the emulator's
+/// own window, for the reason [`MAX_RUNS_PER_JOB`] gives: it bounds
+/// [`SessionEntry::statements`], and with it every per-session walk. The OLDEST record is
+/// dropped first, so the statements a caller is most likely to read are kept.
+pub const MAX_STATEMENTS_PER_SESSION: usize = 100;
+
+/// One statement run on a session: "the statement or request for a particular action to
+/// occur in a session" (`Statement`), as the run that submitted it recorded it.
+///
+/// Everything a caller can observe through the modelled `Statement` shape is held here —
+/// the id the session minted for it, the code it was submitted with, the state it has
+/// reached and the instants it moved between.
+#[derive(Debug, Clone)]
+pub struct StatementEntry {
+    /// `Statement$Id`: "The ID of the statement", minted by
+    /// [`SessionEntry::run_statement`].
+    pub id: i32,
+    /// `Statement$Code`: "The execution code of the statement", exactly as the run sent
+    /// it.
+    pub code: String,
+    /// One of the modelled `StatementState` values: "The state while request is actioned."
+    pub state: String,
+    /// `Statement$StartedOn`: the instant the run recorded this statement.
+    pub started_on: SystemTime,
+    /// `Statement$CompletedOn`: the instant it reached a terminal state, and `None` until
+    /// it has.
+    pub completed_on: Option<SystemTime>,
+    /// The instant the clock owes this statement its next state; `None` once it has
+    /// settled.
+    pub settles_at: Option<SystemTime>,
+    /// The `StatementState` the clock owes this statement at [`Self::settles_at`].
+    pub settles_to: String,
+}
+
+impl StatementEntry {
+    /// Record a statement submitted at `now` under `id`, in [`STATEMENT_STATE_WAITING`]
+    /// with its terminal state due [`STATEMENT_SETTLES_AFTER`] out.
+    pub fn run(id: i32, code: &str, now: SystemTime) -> Self {
+        Self {
+            id,
+            code: code.to_string(),
+            state: STATEMENT_STATE_WAITING.to_string(),
+            started_on: now,
+            completed_on: None,
+            settles_at: Some(now.checked_add(STATEMENT_SETTLES_AFTER).unwrap_or(now)),
+            // Nothing runs the code here, so the state the clock owes a statement nobody
+            // cancels is the modelled error state.
+            settles_to: STATEMENT_STATE_ERROR.to_string(),
+        }
+    }
+
+    /// Whether this statement has finished, by [`TERMINAL_STATEMENT_STATES`].
+    pub fn is_terminal(&self) -> bool {
+        TERMINAL_STATEMENT_STATES.contains(&self.state.as_str())
+    }
+
+    /// Move this statement into the state the clock owed it at `now`, if it owed one.
+    ///
+    /// The instants recorded are the DUE instant, not the instant somebody read it, so
+    /// two reads of a settled statement report the same record.
+    pub fn settle_if_due(&mut self, now: SystemTime) {
+        let Some(due) = self.settles_at.filter(|due| *due <= now) else {
+            return;
+        };
+        self.settles_at = None;
+        self.state = self.settles_to.clone();
+        if self.is_terminal() {
+            self.completed_on = Some(due);
+        }
+    }
+
+    /// `Statement$Output`: "The output in JSON", which a statement has once it has
+    /// finished — and which, for one nothing ran, is the modelled error output carrying
+    /// [`STATEMENT_NOT_EXECUTED_MESSAGE`] rather than data nothing computed.
+    fn output(&self) -> Option<StatementOutput> {
+        if !self.is_terminal() {
+            return None;
+        }
+        let errored = self.state == STATEMENT_STATE_ERROR;
+        Some(StatementOutput {
+            // "The code execution output": there is none, from a statement that ran no
+            // code.
+            data: None,
+            // "The execution count of the output": nothing executed, so this is the
+            // model's own default.
+            execution_count: 0,
+            // "The status of the code execution output", which is the state the statement
+            // came to rest in.
+            status: Some(self.state.clone()),
+            error_name: errored.then(|| STATEMENT_NOT_EXECUTED_ERROR_NAME.to_string()),
+            error_value: errored.then(|| STATEMENT_NOT_EXECUTED_MESSAGE.to_string()),
+            // "The traceback of the output": a Python traceback, which only code that ran
+            // has.
+            traceback: None,
+        })
+    }
+
+    /// Rebuild the modelled `Statement` shape from what is stored, so every reader of a
+    /// statement reports the same record.
+    pub fn to_statement(&self) -> Statement {
+        Statement {
+            id: self.id,
+            code: Some(self.code.clone()),
+            state: Some(self.state.clone()),
+            output: self.output(),
+            // "The code execution progress", which is the model's own default for a
+            // statement whose code nothing ran.
+            progress: 0.0,
+            started_on: to_unix_millis(self.started_on),
+            // The model's own default of 0 while the statement has not completed.
+            completed_on: self.completed_on.map(to_unix_millis).unwrap_or_default(),
         }
     }
 }
@@ -11161,6 +11409,38 @@ pub mod messages {
         format!("this endpoint holds {ceiling} sessions, which is as many as it can hold")
     }
 
+    /// A statement run on a session whose `SessionStatus` is not
+    /// [`super::SESSION_STATUS_READY`], which is the only status a remote Spark runtime
+    /// can take code in. NOT recorded word for word: what is pinned is the behaviour —
+    /// 400 with the run's modelled `IllegalSessionStateException` — so the sentence names
+    /// the session the request addressed, the status it is actually in and the status it
+    /// would have to be in, every part of it read off the request and the store.
+    pub fn session_not_ready(id: &str, status: &str) -> String {
+        let ready = super::SESSION_STATUS_READY;
+        format!("Session {id} is in {status} status, and a statement can only be run on a session in {ready} status.")
+    }
+
+    /// A statement run on a session that is still actioning one: the runtime is busy, so
+    /// it cannot take the code. RECORDED: what is pinned is the behaviour — 400 with the
+    /// run's modelled `InvalidInputException`, which is the refusal this service answers a
+    /// session already running a statement with, rather than the `SessionBusyException`
+    /// the model also declares for the operation. The sentence names the session and the
+    /// statement it is still running, which is what a caller waits on.
+    pub fn session_busy_with_statement(id: &str, statement_id: i32) -> String {
+        format!(
+            "Session {id} is still running statement {statement_id}, so it cannot take \
+             another statement yet."
+        )
+    }
+
+    /// A statement read (`GetStatement`, and every other operation that addresses a
+    /// statement by its session and `Id`) for an id that session never minted. Follows
+    /// the per-resource template of [`session_not_found`], built from the two members that
+    /// together are the whole address of a statement.
+    pub fn statement_not_found(session_id: &str, id: i32) -> String {
+        format!("Statement {id} not found in session {session_id}.")
+    }
+
     /// A usage profile write whose `ConfigurationObject` sets a `DefaultValue` above the
     /// `MaxValue` it sets for the same parameter. RECORDED template: the sentence carries
     /// the parameter key, the `ProfileConfiguration` member its map arrived under, and the
@@ -11691,6 +11971,16 @@ pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
+}
+
+/// The same instant as the `LongValue` members that carry "the unix time and date"
+/// (`Statement$StartedOn`) report it: milliseconds since the epoch, which is the scale a
+/// Glue statement's instants are stated in.
+pub fn to_unix_millis(at: SystemTime) -> i64 {
+    let since_epoch = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// How many digits the instant part of a continuation token is padded to, so the token

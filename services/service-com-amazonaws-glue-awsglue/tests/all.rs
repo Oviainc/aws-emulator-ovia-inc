@@ -203,6 +203,8 @@ mod security_configurations;
 mod sessions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/statements.rs"]
+mod statements;
 #[path = "all/store_capacity.rs"]
 mod store_capacity;
 #[path = "all/table_optimizers.rs"]

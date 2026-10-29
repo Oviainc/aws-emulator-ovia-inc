@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RunStatement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RunStatement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RunStatement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Records ONE statement on the session the request names, in the Region that session was
+//! created in ([`crate::state::SessionEntry::statements`]), and answers with the `Id` that
+//! session minted for it, so `GetStatement` reads back the code this run submitted and a
+//! session's ids count up in submission order.
+//!
+//! A statement can only be taken by a runtime that is up and free, so this run is refused
+//! when the session is in any status but `READY` (its modelled
+//! `IllegalSessionStateException`), and when a statement of that session has not finished
+//! yet (its modelled `InvalidInputException`, which is the refusal this service is recorded
+//! answering a session still actioning a statement with). The statement itself is recorded
+//! in `WAITING` with its terminal state due [`crate::state::STATEMENT_SETTLES_AFTER`] out,
+//! so a caller that runs a second statement straight after this one still observes the
+//! session busy.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +170,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RunStatement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RunStatementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RunStatement"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(RunStatementErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue session store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "The origin of the request" names who is asking, not what is run, so it changes
+        // nothing about the statement recorded.
+        let _ = &input.request_origin;
+        // A session is served only through the endpoint that created it, so the Region and
+        // the id together are the whole address this run resolves.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(session) = store.session_mut(&region, &input.session_id) else {
+            return Err(RunStatementErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    // The refusal names the id that resolved to nothing, which is the
+                    // whole address of a session.
+                    message: Some(crate::state::messages::session_not_found(
+                        &input.session_id,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // The only writes made before a statement is recorded are the ones the clock had
+        // already made due: the session's own status, and the terminal state of every
+        // statement it was owed. Both decide whether this run can be taken, so both are
+        // materialised first rather than judged from a stale record.
+        session.settle_if_due(now);
+        session.settle_due_statements(now);
+
+        // "The period in which a remote Spark runtime environment is running": a session
+        // still being provisioned, or one its own timeout has ended, has no runtime to
+        // take code, so the run is refused instead of recording a statement nothing could
+        // ever action.
+        if session.status != crate::state::SESSION_STATUS_READY {
+            return Err(RunStatementErrorModeled::IllegalSessionStateException(
+                IllegalSessionStateException {
+                    message: Some(crate::state::messages::session_not_ready(
+                        &input.session_id,
+                        &session.status,
+                    )),
+                },
+            )
+            .into());
+        }
+        // One runtime actions one statement at a time, so a session still actioning one
+        // cannot take another. The recorded refusal for that is this operation's
+        // `InvalidInputException` rather than the `SessionBusyException` the model also
+        // declares for it, and it names the statement the caller is waiting on.
+        if let Some(in_flight) = session
+            .statements
+            .iter()
+            .find(|statement| !statement.is_terminal())
+            .map(|statement| statement.id)
+        {
+            return Err(RunStatementErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::session_busy_with_statement(
+                        &input.session_id,
+                        in_flight,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // "Returns the Id of the statement that was run": the id the session minted for
+        // the record just written, so this answer and every later read of that statement
+        // agree.
+        let id = session.run_statement(&input.code, now);
+        ::tracing::info!(
+            operation = "RunStatement",
+            region = %region,
+            session = %input.session_id,
+            statement = id,
+            "recorded a statement on a Glue interactive session"
+        );
+
+        Ok(RunStatementOutput { id })
     }
 }
