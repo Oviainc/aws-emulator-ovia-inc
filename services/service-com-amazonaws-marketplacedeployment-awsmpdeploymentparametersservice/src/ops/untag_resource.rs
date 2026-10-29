@@ -7,6 +7,19 @@
 //! a key that is already absent is removed by doing nothing, so a repeat of the
 //! same call answers 204 again.
 //!
+//! The `tagKeys` it carries are judged as an INPUT
+//! (`crate::state::validate_tag_keys_member`) with the one judgement every tag key
+//! of this service earns, whichever member carries it: a key in the namespace AWS
+//! reserves for its own generated tags, and a string outside the length bound a tag
+//! key may hold, are each the modelled `ValidationException` (HTTP 400) naming this
+//! member in `fieldName`. AWS's tagging limits say what a tag key IS, so a string
+//! outside them names no tag key the service can hold — nothing to remove — and the
+//! same string the sibling `TagResource` refuses on its `tags` is refused here. This
+//! member targets the model's UNCONSTRAINED `StringList`, so the character class the
+//! model states for its constrained tag map is no part of the judgement
+//! (`crate::state::TagConstraints`), and a key of any other UTF-8 text inside the
+//! bound is removed as sent.
+//!
 //! Resolving the label is the sequence every operation that addresses a deployment
 //! parameter by a caller-supplied `resourceArn` runs, written once as
 //! `crate::state::write_tagged_parameter` (the writing view of that sequence); what
@@ -172,19 +185,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The removal below is everything this operation adds to it.
         //
         // The ARN check comes first: a value that is not a resource ARN this API
-        // addresses is a bad request, not a missing resource. A tag key in the
-        // namespace AWS reserves for its own generated tags cannot be removed by a
-        // caller either, so a `tagKeys` naming one is refused on the input before the
-        // resource is resolved — the reservation covers removal as much as creation,
-        // and the request removes nothing. A record whose `expirationDate` has passed
-        // is scheduled for deletion, so a tag removal against it is a write to a
-        // resource that no longer exists.
+        // addresses is a bad request, not a missing resource. The `tagKeys` are next,
+        // still before the resource is resolved: a tag key is judged by what a tag key
+        // IS, so the whole judgement every tag key of this service earns holds here as
+        // much as on the creating side — a key in the namespace AWS reserves for its
+        // own generated tags cannot be removed by a caller, and a string outside the
+        // length bound a tag key may hold names no tag key at all, so neither is a
+        // removal this service can perform and the request removes nothing. A record
+        // whose `expirationDate` has passed is scheduled for deletion, so a tag removal
+        // against it is a write to a resource that no longer exists.
         crate::state::write_tagged_parameter(
             &*self.engine,
             &input.resource_arn,
             UntagResourceErrorModeled::InternalServerException,
             || {
-                crate::state::validate_tag_keys_unreserved(
+                crate::state::validate_tag_keys_member(
                     input.tag_keys.iter().map(String::as_str),
                     "tagKeys",
                 )

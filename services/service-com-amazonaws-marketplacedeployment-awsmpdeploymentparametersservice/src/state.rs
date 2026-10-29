@@ -801,12 +801,60 @@ pub fn is_tag_value(candidate: &str) -> bool {
     tag_text_len(candidate) <= TAG_VALUE_MAX_LEN
 }
 
+/// The modelled `ValidationException` (HTTP 400) for a tag key outside the length
+/// bound a tag key may hold ([`is_tag_key`]), blamed on the input member
+/// `field_name` that carried it.
+///
+/// The bound is stated, never the member's own shape: the limit is AWS's tagging
+/// limit for every taggable resource and holds whichever member carried the key.
+pub fn tag_key_outside_length(key: &str, field_name: &str) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "tag key '{key}' is outside the 1..{TAG_KEY_MAX_LEN} characters a tag key may hold"
+        ),
+        field_name: field_name.to_string(),
+    }
+}
+
+/// Judge the tag KEYS a request names, before anything is read or written.
+///
+/// A tag key earns the same judgement whichever member carries it and whatever the
+/// request means to do with it: AWS's tagging limits are limits on what a tag key
+/// IS, so a string outside them names no tag key the service can hold — nothing to
+/// create, nothing to change and nothing to remove. Both halves therefore hold on
+/// every input of this service that names tag keys: the namespace AWS reserves
+/// ([`validate_tag_keys_unreserved`]) and the length bound [`is_tag_key`] states.
+///
+/// The members that carry tag keys here are the `tags` a deployment-parameter write
+/// or a `TagResource` carries — judged through [`validate_tags_member`], which runs
+/// this over the map's keys — and the `tagKeys` an `UntagResource` carries, which is
+/// keys alone and runs this directly.
+///
+/// `field_name` is the member that carried them, spelled as the request spells it
+/// (lowerCamel), which is how the modelled `ValidationException$fieldName` names a
+/// member. The keys are judged in sorted order and the reservation ahead of the
+/// bound, so the key a refusal quotes depends neither on hash iteration order nor on
+/// which key the caller happened to write first.
+pub fn validate_tag_keys_member<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+    field_name: &str,
+) -> Result<(), ValidationException> {
+    let mut ordered: Vec<&str> = keys.into_iter().collect();
+    ordered.sort_unstable();
+    validate_tag_keys_unreserved(ordered.iter().copied(), field_name)?;
+    match ordered.into_iter().find(|key| !is_tag_key(key)) {
+        Some(key) => Err(tag_key_outside_length(key, field_name)),
+        None => Ok(()),
+    }
+}
+
 /// Judge the tag map a request CARRIES, before anything is read or written.
 ///
 /// This is a judgement on the INPUT alone: every entry of `incoming` is held to
-/// AWS's own tagging limits — a key in no reserved namespace
-/// ([`validate_tag_keys_unreserved`]) and the length bounds [`is_tag_key`] /
-/// [`is_tag_value`] state — the map is held to the part of
+/// AWS's own tagging limits — its key to the judgement every tag key of this
+/// service earns ([`validate_tag_keys_member`]: no reserved namespace and the
+/// [`is_tag_key`] bound) and its value to the bound [`is_tag_value`]
+/// states — the map is held to the part of
 /// [`MAX_TAGS_PER_RESOURCE`] the request alone decides, and a map arriving through a
 /// member that targets the modelled constrained map is additionally held to the
 /// character class that map's key shape states ([`TagConstraints`]).
@@ -823,17 +871,9 @@ pub fn validate_tags_member(
     incoming: &HashMap<String, String>,
     constraints: TagConstraints,
 ) -> Result<(), ValidationException> {
-    validate_tag_keys_unreserved(incoming.keys().map(String::as_str), "tags")?;
+    validate_tag_keys_member(incoming.keys().map(String::as_str), "tags")?;
     let ordered: BTreeMap<&String, &String> = incoming.iter().collect();
     for (key, value) in ordered {
-        if !is_tag_key(key) {
-            return Err(ValidationException {
-                message: format!(
-                    "tag key '{key}' is outside the 1..{TAG_KEY_MAX_LEN} characters a tag key may hold"
-                ),
-                field_name: "tags".to_string(),
-            });
-        }
         if !is_tag_value(value) {
             return Err(ValidationException {
                 message: format!(

@@ -51,6 +51,8 @@ mod state_roundtrip;
 mod support;
 #[path = "all/tag_input_judged_before_lookup.rs"]
 mod tag_input_judged_before_lookup;
+#[path = "all/tag_key_judged_the_same_by_every_member.rs"]
+mod tag_key_judged_the_same_by_every_member;
 #[path = "all/tag_write_last_written.rs"]
 mod tag_write_last_written;
 #[path = "all/tagging_resolution_sequence.rs"]
