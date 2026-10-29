@@ -38,6 +38,9 @@ mod component_type_delete_composite_references;
 #[path = "all/component_type_inherited_schema.rs"]
 mod component_type_inherited_schema;
 
+#[path = "all/component_type_instance_scope.rs"]
+mod component_type_instance_scope;
+
 #[path = "all/component_type_lifecycle.rs"]
 mod component_type_lifecycle;
 

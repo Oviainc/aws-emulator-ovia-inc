@@ -391,6 +391,23 @@ fn scoped_composite_component<'a>(
     }
 }
 
+/// One component of an entity, however it was reached — resolved from a
+/// `componentPath` or walked to by the scan of a component type's instances —
+/// as a component the query reads.
+fn scoped_at<'a>(
+    entity_id: &'a str,
+    component: crate::state::ComponentAtPath<'a>,
+) -> ScopedComponent<'a> {
+    match component {
+        crate::state::ComponentAtPath::TopLevel(component) => {
+            scoped_component(entity_id, component)
+        }
+        crate::state::ComponentAtPath::Composite { composite, .. } => {
+            scoped_composite_component(entity_id, composite)
+        }
+    }
+}
+
 /// The component of `entity` a `componentPath` addresses, resolved by the one
 /// read-side rule every property reader shares
 /// ([`crate::state::component_at_path`]).
@@ -398,14 +415,10 @@ fn component_at_path<'a>(
     entity: &'a crate::state::Entity,
     component_path: &str,
 ) -> Option<ScopedComponent<'a>> {
-    Some(match crate::state::component_at_path(entity, component_path)? {
-        crate::state::ComponentAtPath::TopLevel(component) => {
-            scoped_component(&entity.entity_id, component)
-        }
-        crate::state::ComponentAtPath::Composite { composite, .. } => {
-            scoped_composite_component(&entity.entity_id, composite)
-        }
-    })
+    Some(scoped_at(
+        &entity.entity_id,
+        crate::state::component_at_path(entity, component_path)?,
+    ))
 }
 
 /// What the request addresses, resolved against stored state.
@@ -492,39 +505,28 @@ fn resolve_query<'a>(
         )));
     };
 
-    // The component types an instance of the named one may name, resolved ONCE
-    // per request rather than per component tested against it.
-    let instance_type_ids = workspace.component_type_instance_ids(component_type_id);
-    // In (entityId, componentName) order, the order the store is keyed in, so
-    // two reads of unchanged state build the same table and a page boundary
-    // does not depend on map iteration order. The scope is request-chosen and
-    // the workspace is caller-grown, so it is CAPPED: past the ceiling the
-    // request is refused rather than answered out of an unbounded scan.
-    let mut components = Vec::new();
-    for entity in workspace.entities.values() {
-        for component in entity.components.values() {
-            if component
-                .component_type_id
-                .as_deref()
-                .is_some_and(|instantiated| instance_type_ids.contains(instantiated))
-            {
-                components.push(scoped_component(&entity.entity_id, component));
-            }
-            for composite in component.composite_components.values() {
-                if instance_type_ids.contains(composite.component_type_id.as_str()) {
-                    components.push(scoped_composite_component(&entity.entity_id, composite));
-                }
-            }
-            if components.len() > MAX_TABLE_ROWS {
-                return Err(invalid(format!(
-                    "componentType {component_type_id} has more instances in workspace {} than \
-                     the {MAX_TABLE_ROWS} rows one table is built from; name an entityId, a \
-                     narrower componentTypeId or a propertyFilter",
-                    input.workspace_id
-                )));
-            }
-        }
+    // One row per instance of the named component type, scoped by the one scan
+    // every reader of a component type shares
+    // ([`crate::state::component_type_instances`]) — in (entityId,
+    // componentName) order, so two reads of unchanged state build the same
+    // table and a page boundary does not depend on map iteration order. The
+    // scope is request-chosen and the workspace is caller-grown, so it is
+    // CAPPED: past the ceiling the request is refused rather than answered out
+    // of an unbounded scan.
+    let instances =
+        crate::state::component_type_instances(workspace, component_type_id, MAX_TABLE_ROWS);
+    if instances.len() > MAX_TABLE_ROWS {
+        return Err(invalid(format!(
+            "componentType {component_type_id} has more instances in workspace {} than \
+             the {MAX_TABLE_ROWS} rows one table is built from; name an entityId, a \
+             narrower componentTypeId or a propertyFilter",
+            input.workspace_id
+        )));
     }
+    let components = instances
+        .into_iter()
+        .map(|(entity_id, component)| scoped_at(entity_id, component))
+        .collect();
     Ok(Query::Table {
         component_type_id: Some(component_type_id),
         components,

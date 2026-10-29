@@ -709,50 +709,52 @@ fn scope<'a>(
         )));
     }
 
-    // The component types an instance of the named one may name, resolved ONCE
-    // per request rather than per component tested against it. In (entityId,
-    // componentName) order, the order the store is keyed in, so two reads of
-    // unchanged state build the same answer and a page boundary does not depend
-    // on map iteration order.
-    let instance_type_ids = workspace.component_type_instance_ids(component_type_id);
-    let mut components = Vec::new();
-    for entity in workspace.entities.values() {
-        for component in entity.components.values() {
-            if component
-                .component_type_id
-                .as_deref()
-                .is_some_and(|instantiated| instance_type_ids.contains(instantiated))
-            {
-                components.push(scoped(&entity.entity_id, component));
-            }
-            for composite in component.composite_components.values() {
-                if instance_type_ids.contains(composite.component_type_id.as_str()) {
-                    components.push(scoped_composite(&entity.entity_id, composite));
-                }
-            }
-            if components.len() > MAX_COMPONENTS_IN_SCOPE {
-                return Err(invalid(format!(
-                    "componentType {component_type_id} has more instances in workspace {} than \
-                     the {MAX_COMPONENTS_IN_SCOPE} one request reads; name an entityId or a \
-                     narrower componentTypeId",
-                    input.workspace_id
-                )));
-            }
+    // One series per instance of the named component type, scoped by the one
+    // scan every reader of a component type shares
+    // ([`crate::state::component_type_instances`]) — in (entityId,
+    // componentName) order, so two reads of unchanged state report the same
+    // series in the same order and a page boundary does not depend on map
+    // iteration order. CAPPED, the scope being request-chosen over
+    // caller-grown state.
+    let instances = crate::state::component_type_instances(
+        workspace,
+        component_type_id,
+        MAX_COMPONENTS_IN_SCOPE,
+    );
+    if instances.len() > MAX_COMPONENTS_IN_SCOPE {
+        return Err(invalid(format!(
+            "componentType {component_type_id} has more instances in workspace {} than \
+             the {MAX_COMPONENTS_IN_SCOPE} one request reads; name an entityId or a \
+             narrower componentTypeId",
+            input.workspace_id
+        )));
+    }
+    Ok(instances
+        .into_iter()
+        .map(|(entity_id, component)| scoped_at(entity_id, component))
+        .collect())
+}
+
+/// One component of an entity, however it was reached — resolved from a
+/// `componentPath` or walked to by the scan of a component type's instances —
+/// as a component the request reads.
+fn scoped_at<'a>(entity_id: &'a str, component: crate::state::ComponentAtPath<'a>) -> Scoped<'a> {
+    match component {
+        crate::state::ComponentAtPath::TopLevel(component) => scoped(entity_id, component),
+        crate::state::ComponentAtPath::Composite { composite, .. } => {
+            scoped_composite(entity_id, composite)
         }
     }
-    Ok(components)
 }
 
 /// The component of `entity` a `componentPath` addresses, resolved by the one
 /// read-side rule every property reader shares
 /// ([`crate::state::component_at_path`]).
 fn at_path<'a>(entity: &'a crate::state::Entity, component_path: &str) -> Option<Scoped<'a>> {
-    Some(match crate::state::component_at_path(entity, component_path)? {
-        crate::state::ComponentAtPath::TopLevel(component) => scoped(&entity.entity_id, component),
-        crate::state::ComponentAtPath::Composite { composite, .. } => {
-            scoped_composite(&entity.entity_id, composite)
-        }
-    })
+    Some(scoped_at(
+        &entity.entity_id,
+        crate::state::component_at_path(entity, component_path)?,
+    ))
 }
 
 /// The properties the request selected, de-duplicated and in name order, each

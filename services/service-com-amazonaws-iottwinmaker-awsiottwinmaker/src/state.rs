@@ -3851,6 +3851,52 @@ pub fn component_at_path<'a>(
     }
 }
 
+/// Every INSTANCE of one component type in a workspace, as the entity each sits
+/// in and the component it is: a component whose `componentTypeId` is that type
+/// or one that extends it ([`Workspace::component_type_instance_ids`]), at every
+/// path an entity holds a component at ([`Entity::components_at_every_path`]) —
+/// so a composite component of the type is an instance of it too.
+///
+/// This is the one scan a query addressed to a component TYPE is scoped by:
+/// every reader that answers such a query resolves its scope here, so one
+/// change to what counts as an instance — or to the order the instances come
+/// back in — reaches all of them at once and they cannot disagree about which
+/// components one component type names. The pairs come back in (entityId,
+/// componentName) order, the order the store is keyed in, so two reads of
+/// unchanged state build the same answer and a page boundary does not depend on
+/// map iteration order.
+///
+/// BOUNDED by `ceiling`: the scope is request-chosen over caller-grown state, so
+/// the scan stops as soon as it has collected MORE pairs than `ceiling` — the
+/// caller sees a result longer than its own ceiling and refuses the request in
+/// its own words rather than paying for the rest of the walk. Which ceiling, and
+/// what the refusal says, stay with the caller: each reader materialises
+/// something different per instance.
+pub fn component_type_instances<'a>(
+    workspace: &'a Workspace,
+    component_type_id: &str,
+    ceiling: usize,
+) -> Vec<(&'a str, ComponentAtPath<'a>)> {
+    // The component types an instance of the named one may name, resolved ONCE
+    // per scan rather than once per component tested against it.
+    let instance_type_ids = workspace.component_type_instance_ids(component_type_id);
+    let mut instances: Vec<(&str, ComponentAtPath<'_>)> = Vec::new();
+    for entity in workspace.entities.values() {
+        for component in entity.components_at_every_path() {
+            if component
+                .component_type_id()
+                .is_some_and(|instantiated| instance_type_ids.contains(instantiated))
+            {
+                instances.push((entity.entity_id.as_str(), component));
+                if instances.len() > ceiling {
+                    return instances;
+                }
+            }
+        }
+    }
+    instances
+}
+
 /// Which plane wrote to a property's value LAST, which is the plane whose value
 /// a read of the property reports ([`PropertyRecord::latest_written_value`]).
 ///
