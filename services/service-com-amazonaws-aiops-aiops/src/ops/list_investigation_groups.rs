@@ -156,14 +156,21 @@ fn encode_page_token(id: &str) -> String {
 /// operation rejects reads like every other refusal this service makes (the member and
 /// the requirement, with no value).
 ///
-/// What a group id looks like is [`crate::state::is_group_id`]'s to decide — the same
-/// rule that judges the id segment of an ARN — so a token carries a group id here
-/// exactly when an ARN could carry it as its last segment.
-fn decode_page_token(token: &str) -> Result<String, ListInvestigationGroupsError> {
+/// The token is resolved against the STORE, not judged on its shape: a token this
+/// operation issued names a group it listed in the Region the page was served for, so
+/// it is accepted exactly when `region` still holds a group with that id
+/// ([`crate::state::ComAmazonawsAiopsAiopsState::holds_group_in_region`]). Any other
+/// text — whatever shape it has — names no place in this Region's listing, and the only
+/// honest answer to it is the refusal, never a page the store cannot back.
+fn decode_page_token(
+    token: &str,
+    store: &crate::state::ComAmazonawsAiopsAiopsState,
+    region: &str,
+) -> Result<String, ListInvestigationGroupsError> {
     hex::decode(token)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
-        .filter(|id| crate::state::is_group_id(id))
+        .filter(|id| store.holds_group_in_region(id, region))
         .ok_or_else(|| {
             ListInvestigationGroupsErrorModeled::ValidationException(ValidationException {
                 message: Some(crate::state::validation_message(
@@ -227,13 +234,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = input.max_results.map_or(MAX_PAGE_SIZE, |requested| {
             requested.clamp(1, MAX_PAGE_SIZE as i32) as usize
         });
+        let store = state.lock();
+
+        // Where a page resumes is server state, so a `nextToken` is resolved against
+        // the store this Region's listing is built from, and one that names no group
+        // of it is refused rather than walked from.
         let start = input
             .next_token
             .as_deref()
-            .map(decode_page_token)
+            .map(|token| decode_page_token(token, &store, &region))
             .transpose()?;
-
-        let store = state.lock();
 
         // Reserve no more than the store can actually yield.
         let mut investigation_groups =

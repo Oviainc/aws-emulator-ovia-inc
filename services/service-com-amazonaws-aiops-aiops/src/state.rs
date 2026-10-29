@@ -302,8 +302,12 @@ impl ComAmazonawsAiopsAiopsState {
     /// This is the reader a PAGINATED regional reader needs — the store is keyed by
     /// id, so a page token naming an id is where the next page starts — and it is the
     /// one place "which groups belong to this Region" is decided, for the quota and
-    /// for a listing alike. `start_id` need not be a stored id: the walk simply
-    /// begins at the first id that is not before it.
+    /// for a listing alike. The walk itself asks nothing of `start_id`: it simply
+    /// begins at the first id that is not before it, so a reader resuming at a
+    /// CALLER-SUPPLIED position must first resolve that position against this store
+    /// ([`Self::holds_group_in_region`]) — a position the Region never held names no
+    /// place in its listing, and walking from it would answer a page the store cannot
+    /// back.
     pub fn groups_in_region_from<'a>(
         &'a self,
         region: &'a str,
@@ -319,6 +323,20 @@ impl ComAmazonawsAiopsAiopsState {
     /// How many groups this account already holds in `region`, for the quota check.
     pub fn group_count_in_region(&self, region: &str) -> usize {
         self.groups_in_region(region).count()
+    }
+
+    /// Whether `region` holds a group whose id is exactly `id`.
+    ///
+    /// What a caller-supplied resume position has to satisfy before
+    /// [`Self::groups_in_region_from`] is walked from it: a position is a place in
+    /// THIS Region's listing, which only a group this Region holds is. Judged in one
+    /// place so every reader that resumes a walk at a position a caller handed back
+    /// judges it the same way, and from the stored record rather than from the shape
+    /// of the text.
+    pub fn holds_group_in_region(&self, id: &str, region: &str) -> bool {
+        self.investigation_groups
+            .get(id)
+            .is_some_and(|group| group.region == region)
     }
 
     /// Store a newly created group.

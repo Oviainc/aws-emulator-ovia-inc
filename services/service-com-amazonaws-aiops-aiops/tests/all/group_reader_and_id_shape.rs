@@ -16,8 +16,10 @@
 //!    the modelled `InvestigationGroupArn`
 //!    (`smithy_query(query="shape",shape="InvestigationGroupArn")`). The same
 //!    `state::is_group_id` judgement decides whether an ARN addresses a group
-//!    (`GetInvestigationGroup`) and whether a `nextToken` carries a group id
-//!    (`ListInvestigationGroups`).
+//!    (`GetInvestigationGroup`) and, through it, every identifier this service
+//!    resolves. A `nextToken` is NOT judged that way: a resume position is resolved
+//!    against the store, so id-shaped text no group carries addresses nothing there
+//!    either and the listing refuses it.
 
 use std::sync::Arc;
 
@@ -369,8 +371,8 @@ async fn the_region_a_listing_reports_is_the_region_the_quota_counts() {
 /// frontend's unconstrained `resourceArn`, and the resource surface's `identifier`,
 /// whose modelled pattern states the same rule), and the `nextToken`
 /// `ListInvestigationGroups` resumes a page at. Text that is not id-shaped addresses
-/// nothing and is refused as a token; text that is id-shaped is accepted as a token and
-/// addresses a group only when a group has that id.
+/// nothing — neither as the id segment of an ARN nor as a resume position, which the
+/// listing resolves against the store rather than from the shape of the text.
 #[tokio::test]
 async fn one_rule_decides_what_a_group_id_looks_like() {
     let router = emulator();
@@ -441,50 +443,28 @@ async fn one_rule_decides_what_a_group_id_looks_like() {
             "case {case:?}: expected {want_code}, got {body:?}"
         );
 
-        // The page token: the same judgement decides whether the token carries a group
-        // id at all. One that does not is refused; one that does resumes the Region's
-        // walk at that id, so the Region's group is reported exactly when its id is not
-        // before the token's.
+        // The page token: a resume position is resolved against the STORE, so no row
+        // of this table — id-shaped or not, since no group carries any of these ids —
+        // names a place in this Region's listing, and every one of them is refused
+        // rather than resuming a walk that would report a page the store cannot back.
         let token = hex::encode(&text);
-        let (status, arns, next, body) =
+        let (status, _arns, _next, body) =
             listing(&router, region, &format!("?nextToken={token}")).await;
-        if is_id_shaped {
-            assert_eq!(
-                status, 200,
-                "case {case:?}: a token carrying a group id is accepted, \
-                 got {status} / {body:?}"
-            );
-            let expected: Vec<String> = if text.as_str() <= stored_id.as_str() {
-                vec![arn.clone()]
-            } else {
-                Vec::new()
-            };
-            assert_eq!(
-                arns, expected,
-                "case {case:?}: a page resumed at {text:?} reports the groups of \
-                 {region} from that id on (stored id {stored_id:?}), got {body:?}"
-            );
-            assert!(
-                next.is_none(),
-                "case {case:?}: the resumed page is the last one, got {next:?}"
-            );
-        } else {
-            assert_eq!(
-                status, 400,
-                "case {case:?}: a token this operation never issued is refused, \
-                 got {status} / {body:?}"
-            );
-            assert_eq!(
-                error_code(&body),
-                "ValidationException",
-                "case {case:?}: expected ValidationException, got {body:?}"
-            );
-            assert!(
-                text.is_empty() || !format!("{body}").contains(&text),
-                "case {case:?}: the refusal of a sensitive token never echoes it, \
-                 got {body:?}"
-            );
-        }
+        assert_eq!(
+            status, 400,
+            "case {case:?}: no group carries the id {text:?}, so a token naming it is \
+             refused, got {status} / {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body:?}"
+        );
+        assert!(
+            text.is_empty() || !format!("{body}").contains(&text),
+            "case {case:?}: the refusal of a sensitive token never echoes it, \
+             got {body:?}"
+        );
     }
 
     // The control: the stored group's own ARN still resolves, and its own id is a token
