@@ -1149,6 +1149,30 @@ pub fn default_encryption_configuration() -> EncryptionConfiguration {
     }
 }
 
+/// The encryption configuration a write STORES for the configuration it was given,
+/// which is what every later read of the group reports.
+///
+/// `type` is not `@required` on the structure
+/// (`smithy_query(query="shape",shape="EncryptionConfiguration")`), so a request may
+/// name the member while naming no key type at all — and `encryptionConfiguration` is
+/// documented as the way to ask for a customer managed KMS key, with the Amazon Web
+/// Services owned key used when the request does not ask for one. A configuration that
+/// names no type therefore asks for no customer managed key and selects the same
+/// documented default as omitting the member does
+/// ([`default_encryption_configuration`]), rather than being stored as given: the
+/// stored member always names how the group's data is encrypted.
+///
+/// Single-homed here because every writer of the member — the create and the update —
+/// stores what this returns, so the two cannot disagree about what a configuration
+/// naming no type means.
+pub fn stored_encryption_configuration(
+    supplied: Option<EncryptionConfiguration>,
+) -> EncryptionConfiguration {
+    supplied
+        .filter(|configuration| configuration.r#type.is_some())
+        .unwrap_or_else(default_encryption_configuration)
+}
+
 /// Why a `crossAccountConfigurations` list is unacceptable, or `None` when every
 /// entry names an account other than this one.
 ///

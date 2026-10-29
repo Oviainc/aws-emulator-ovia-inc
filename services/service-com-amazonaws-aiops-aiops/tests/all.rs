@@ -37,6 +37,8 @@ mod regional_identifier_resolution;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stored_encryption_configuration.rs"]
+mod stored_encryption_configuration;
 #[path = "all/tag_write_last_modified_stamp.rs"]
 mod tag_write_last_modified_stamp;
 #[path = "all/tagging_frontend_errors.rs"]

@@ -323,14 +323,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             region: region.clone(),
             name: input.name,
             role_arn: input.role_arn,
-            // Omitting `encryptionConfiguration` selects the Amazon Web Services owned
-            // key, which is a configuration like any other: it is stored, so every
-            // later read reports how this group's data is encrypted.
-            encryption_configuration: Some(
-                input
-                    .encryption_configuration
-                    .unwrap_or_else(crate::state::default_encryption_configuration),
-            ),
+            // A request that asks for no customer managed key — by omitting
+            // `encryptionConfiguration`, or by carrying a structure that names no key
+            // type — selects the Amazon Web Services owned key, which is a
+            // configuration like any other: it is stored, so every later read reports
+            // how this group's data is encrypted. The rule is single-homed in
+            // `crate::state::stored_encryption_configuration`, which the update path
+            // stores through too.
+            encryption_configuration: Some(crate::state::stored_encryption_configuration(
+                input.encryption_configuration,
+            )),
             // `retentionInDays` and `isCloudTrailEventHistoryEnabled` each document the
             // value the service applies when the request omits them, so the stored
             // group — and every later read of it — carries that value, not nothing.

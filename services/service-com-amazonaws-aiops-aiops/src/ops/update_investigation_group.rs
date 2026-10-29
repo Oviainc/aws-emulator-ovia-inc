@@ -231,8 +231,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(role_arn) = input.role_arn {
             group.role_arn = role_arn;
         }
-        if let Some(encryption_configuration) = input.encryption_configuration {
-            group.encryption_configuration = Some(encryption_configuration);
+        // A configuration the request carries replaces the stored one through the same
+        // normalisation the create path stores through
+        // (`crate::state::stored_encryption_configuration`): one that names no key type
+        // asks for no customer managed key and so selects the documented Amazon Web
+        // Services owned key, which means the stored member keeps naming how this
+        // group's data is encrypted rather than going blank.
+        if input.encryption_configuration.is_some() {
+            group.encryption_configuration = Some(crate::state::stored_encryption_configuration(
+                input.encryption_configuration,
+            ));
         }
         if let Some(tag_key_boundaries) = input.tag_key_boundaries {
             group.tag_key_boundaries = tag_key_boundaries;
