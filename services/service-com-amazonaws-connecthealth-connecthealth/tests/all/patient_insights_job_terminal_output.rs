@@ -44,14 +44,21 @@ const BUCKET_LEN: (usize, usize) = (3, 63);
 /// The two spans a job takes to reach a terminal status (`SUBMITTED` -> `IN_PROGRESS` ->
 /// terminal), plus a quarter span of slack, so both transitions the clock owes have
 /// fallen due by the time a row is read.
-fn past_both_spans() -> std::time::Duration {
+///
+/// `pub(crate)` so the sibling suite that drives the same pair waits the same way rather
+/// than growing its own copy of the span arithmetic.
+pub(crate) fn past_both_spans() -> std::time::Duration {
     PATIENT_INSIGHTS_JOB_STEP_SPAN * 2 + PATIENT_INSIGHTS_JOB_STEP_SPAN / 4
 }
 
 /// Whether `uri` satisfies the modelled `S3Uri` shape — matched by hand, field by field,
 /// rather than with a regex engine (the sibling suites in this workspace do the same).
-fn is_s3_uri(uri: &str) -> bool {
-    if uri.is_empty() || uri.len() > MAX_S3_URI_LEN {
+///
+/// The `@length` bound is counted in characters, the unit `@length` on a string is
+/// defined in, so a URI of multi-byte characters is judged by the same rule as an ASCII
+/// one.
+pub(crate) fn is_s3_uri(uri: &str) -> bool {
+    if uri.is_empty() || uri.chars().count() > MAX_S3_URI_LEN {
         return false;
     }
     let Some(rest) = uri.strip_prefix("s3://") else {
@@ -71,14 +78,16 @@ fn is_s3_uri(uri: &str) -> bool {
 }
 
 /// A `StartPatientInsightsJob` body whose output path is `s3_output_path`.
-fn body_with_output(s3_output_path: &str) -> Value {
+///
+/// `pub(crate)` so the sibling suite varies the same member of the same request.
+pub(crate) fn body_with_output(s3_output_path: &str) -> Value {
     let mut body = minimal_body();
     body["outputDataConfig"] = json!({ "s3OutputPath": s3_output_path });
     body
 }
 
 /// A domain to start jobs in.
-async fn domain_of(emulator: &Emulator, name: &str) -> String {
+pub(crate) async fn domain_of(emulator: &Emulator, name: &str) -> String {
     string_at(&emulator.create_domain(&json!({ "name": name })).await, "domainId")
 }
 
@@ -195,7 +204,7 @@ async fn a_completed_job_reports_its_output_under_the_configured_path() {
                 is_s3_uri(&uri),
                 "case {case:?}: the reported uri must satisfy the modelled S3Uri shape, \
                  got {uri:?} ({} characters)",
-                uri.len()
+                uri.chars().count()
             );
 
             // Under the configured path: the location starts at the path the start was
@@ -211,7 +220,7 @@ async fn a_completed_job_reports_its_output_under_the_configured_path() {
             // And it identifies the job that wrote it — except where the configured path
             // is so long that a job prefix would not fit inside the modelled `S3Uri`
             // bound, which is the one case the location stays the configured path.
-            let room = configured.len() + job_id.len() + 2 <= MAX_S3_URI_LEN;
+            let room = configured_has_room(path, job_id);
             if room {
                 assert_eq!(
                     uri,
@@ -260,9 +269,13 @@ async fn a_completed_job_reports_its_output_under_the_configured_path() {
     }
 }
 
-/// Whether a job prefix fits under `path` inside the modelled `S3Uri` bound.
-fn configured_has_room(path: &str, job_id: &str) -> bool {
-    path.trim_end_matches('/').len() + job_id.len() + 2 <= MAX_S3_URI_LEN
+/// Whether a job prefix fits under `path` inside the modelled `S3Uri` bound — counted in
+/// characters, the unit the modelled `@length` is measured in.
+///
+/// `pub(crate)` so the sibling suite that spans character widths states the room rule
+/// once rather than twice.
+pub(crate) fn configured_has_room(path: &str, job_id: &str) -> bool {
+    path.trim_end_matches('/').chars().count() + job_id.chars().count() + 2 <= MAX_S3_URI_LEN
 }
 
 #[tokio::test]

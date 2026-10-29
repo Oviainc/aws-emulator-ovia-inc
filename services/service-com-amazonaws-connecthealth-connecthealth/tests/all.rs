@@ -39,6 +39,8 @@ mod pagination_token_issuance;
 mod patient_insights_job_lifecycle;
 #[path = "all/patient_insights_job_terminal_output.rs"]
 mod patient_insights_job_terminal_output;
+#[path = "all/patient_insights_output_uri_character_bound.rs"]
+mod patient_insights_output_uri_character_bound;
 #[path = "all/recorded_domain_identity_projection.rs"]
 mod recorded_domain_identity_projection;
 #[path = "all/region_scoping.rs"]

@@ -127,6 +127,7 @@ pub const PATIENT_INSIGHTS_JOB_STEP_SPAN: Duration = Duration::from_millis(400);
 /// The MODELLED length bound of an S3 URI this service reports or accepts: `S3Uri` is
 /// `@length max 1024` (`smithy_query(query="shape",shape="S3Uri,InsightsOutput")`), which
 /// holds for `InsightsOutput$uri` as much as for `OutputDataConfig$s3OutputPath`.
+/// Measured in CHARACTERS, as `@length` on a string is defined.
 ///
 /// Stated here because [`patient_insights_output_uri`] DERIVES one S3 URI from another and
 /// so has to stay inside the bound the member it fills declares.
@@ -1350,9 +1351,14 @@ pub fn patient_insights_job_arn(domain_arn: &str, job_id: &str) -> String {
 /// `InsightsOutput$uri` is an `S3Uri`, so the result must satisfy that shape's
 /// [`MAX_S3_URI_LEN`]: a configured path with no room left for a job prefix is reported
 /// unchanged rather than lengthened past the bound its own member declares.
+///
+/// The fit is measured in CHARACTERS, as `@length` on a string is defined and as every
+/// other modelled bound this module keeps counts it, so a path whose characters are
+/// multi-byte is reported under its job prefix exactly like an ASCII path of the same
+/// length: a value's encoding is not what the bound it fills constrains.
 pub fn patient_insights_output_uri(s3_output_path: &str, job_id: &str) -> String {
     let derived = format!("{}/{job_id}/", s3_output_path.trim_end_matches('/'));
-    if derived.len() <= MAX_S3_URI_LEN {
+    if derived.chars().count() <= MAX_S3_URI_LEN {
         derived
     } else {
         s3_output_path.to_string()
