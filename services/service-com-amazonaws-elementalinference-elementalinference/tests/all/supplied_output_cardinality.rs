@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The CARDINALITY rule every request that supplies a feed's output list is held to, end
-//! to end over the wire.
+//! The CARDINALITY rules a request that carries a feed's output list is held to, end to
+//! end over the wire.
 //!
 //! Every case here drives the real request path — the router picks the service from the
 //! SigV4 credential scope, the framework deserializes and validates the body, the handler
@@ -21,13 +21,13 @@
 //! already held and the claim is SERVED. The list shape carries no `@length`, so the
 //! boundary validator decides none of this and the service's own rule does.
 //!
-//! Both halves are asserted over a TABLE whose rows differ along what the rule
-//! generalises over: which operation carries the list, the optional members the request
-//! carries beside it (a create's tags and access role, a claim's `dryRun`), how many
-//! outputs the stored feed holds, whether a resource already holds that feed, and — for
-//! the lists the rule ADMITS — how many outputs they carry, from one to the bound a feed
-//! is held to. The further rules a supplied list is held to (a name twice, the bound) are
-//! `output_list_rule.rs` and `feed_output_validation.rs`.
+//! Both rules are asserted over a TABLE whose rows differ along what they generalise over:
+//! which operation carries the list, the optional members the request carries beside it (a
+//! create's tags and access role, a claim's `dryRun`), how many outputs the stored feed
+//! holds — up to the bound a feed is held to — whether a resource already holds that feed,
+//! and, for the lists a setter ADMITS, how many outputs they carry. The further rules a
+//! supplied list is held to (a name twice, the bound) are `output_list_rule.rs` and
+//! `feed_output_validation.rs`.
 
 use crate::harness::{call, enabled_output, message_of, router};
 use serde_json::{json, Value};
@@ -204,7 +204,7 @@ async fn stored_feed(
     id
 }
 
-/// One row of the refusal table: which operation carries the empty list, what else the
+/// One row of the refusal table: which SETTER carries the empty list, what else the
 /// request carries, and the stored feed it is sent against.
 struct EmptyListCase {
     label: &'static str,
@@ -294,13 +294,22 @@ fn empty_append_cases() -> Vec<EmptyListCase> {
             claimed: true,
             extra: json!({}),
         },
+        EmptyListCase {
+            // The feed already holds as many outputs as a feed may: an append that adds
+            // none grows the list by nothing, so the bound is not in its way either.
+            label: "a claim of a feed holding as many outputs as a feed may hold",
+            supplier: Supplier::Associate { dry_run: false },
+            held: MAX_OUTPUTS_PER_FEED,
+            claimed: false,
+            extra: json!({}),
+        },
     ]
 }
 
 /// A request whose list would leave the feed holding no output at all is refused by every
 /// operation that SETS the whole list, with one invariant sentence — and writes nothing.
 #[tokio::test]
-async fn a_supplied_output_list_carrying_no_output_is_refused_by_every_operation() {
+async fn a_set_output_list_carrying_no_output_is_refused_by_every_setter() {
     let mut sentences: Vec<String> = Vec::new();
 
     for case in empty_list_cases() {
@@ -415,6 +424,44 @@ async fn an_appended_output_list_carrying_no_output_is_served() {
             "case {label:?}: the claimed feed reports ACTIVE and its association, got {after}"
         );
     }
+}
+
+/// An append of no output leaves the APPEND PATH as it was: the same resource's next
+/// claim, carrying one output, appends exactly that output to the list the feed still
+/// held.
+#[tokio::test]
+async fn an_output_appended_after_an_empty_append_is_the_only_one_added() {
+    const HELD: usize = 2;
+    let label = "an empty append followed by a claim carrying one output";
+    let router = router();
+    let id = stored_feed(&router, label, HELD, false).await;
+
+    for (round, outputs) in [json!([]), fresh_outputs(1)].into_iter().enumerate() {
+        let (status, body) = supply(
+            &router,
+            Supplier::Associate { dry_run: false },
+            &id,
+            &outputs,
+            &json!({}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: round {round} is served with HTTP 200, got {status} with {body}"
+        );
+    }
+
+    let expected: Vec<String> = held_names(HELD)
+        .into_iter()
+        .chain(["fresh0".to_string()])
+        .collect();
+    let feed = get_feed(&router, label, &id).await;
+    assert_eq!(
+        output_names(&feed),
+        expected,
+        "case {label:?}: expected the feed to hold {expected:?}, got {:?}",
+        feed["outputs"]
+    );
 }
 
 /// The control: a list carrying one output or more is SERVED by each of those operations,

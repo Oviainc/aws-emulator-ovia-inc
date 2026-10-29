@@ -394,7 +394,8 @@ pub fn too_many_outputs_message() -> String {
 /// `UpdateFeed`, whose list is the one the feed is left holding — refuse an empty list,
 /// because the feed it describes holds nothing. An APPEND is not one of them: it leaves
 /// the feed holding what it already holds, so a list that adds nothing takes nothing
-/// away either (see [`appended_output_list_refusal`]). The rule is about the shape of the
+/// away either (its one rule about the names the request carries is
+/// [`first_duplicate_output_name`]). The rule is about the shape of the
 /// request rather than about any one value it carried, so the message is the rule's
 /// invariant sentence and interpolates nothing.
 pub const MISSING_OUTPUTS_MESSAGE: &str = "You must specify at least one output.";
@@ -408,7 +409,8 @@ pub const MISSING_OUTPUTS_MESSAGE: &str = "You must specify at least one output.
 /// class each failure earns are stated ONCE here, so no two operations that carry such a
 /// list can come to disagree about what a feed's outputs may look like — the operations
 /// that REPLACE the list through [`output_list_refusal`] and the one that APPENDS to it
-/// through [`appended_output_list_refusal`]. A handler only lifts the outcome into its
+/// through the name scan that statement shares with it
+/// ([`first_duplicate_output_name`]). A handler only lifts the outcome into its
 /// own modelled error enum, which is per-operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputListRefusal<'a> {
