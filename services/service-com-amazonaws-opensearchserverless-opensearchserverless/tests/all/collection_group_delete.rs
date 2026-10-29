@@ -484,10 +484,22 @@ async fn delete_collection_group_refuses_an_unknown_id_and_a_non_empty_group() {
 /// The `collectionDetails` entry at `index` of a `BatchGetCollection` answer, or
 /// `Value::Null` — the collection-shaped counterpart of
 /// `collection_group_lifecycle::detail_at`.
-fn detail_at_collection(answer: &Value, index: usize) -> Value {
+pub(crate) fn detail_at_collection(answer: &Value, index: usize) -> Value {
     at(answer, "collectionDetails")
         .as_array()
         .and_then(|details| details.get(index))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// The `collectionErrorDetails` entry at `index` of a `BatchGetCollection` answer, or
+/// `Value::Null` — the collection-shaped counterpart of
+/// `collection_group_lifecycle::error_at`, beside [`detail_at_collection`] so both
+/// `BatchGetCollection` accessors live together.
+pub(crate) fn error_at_collection(answer: &Value, index: usize) -> Value {
+    at(answer, "collectionErrorDetails")
+        .as_array()
+        .and_then(|errors| errors.get(index))
         .cloned()
         .unwrap_or(Value::Null)
 }

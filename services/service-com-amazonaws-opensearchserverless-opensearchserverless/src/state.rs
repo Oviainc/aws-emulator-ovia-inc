@@ -2066,6 +2066,15 @@ pub fn index_collection_not_found_message(id: &str) -> String {
     format!("The Collection with Id '{id}' does not exist.")
 }
 
+/// How this service words a collection group that is not there, from its NAME — the way a
+/// request that names the group it wants its collection in addresses one. The
+/// id-addressed wording ("Collection group with ID ... is not found", the counterpart of
+/// [`collection_not_found_message`]) is what the operations that take a
+/// `CollectionGroupId` answer with.
+pub fn collection_group_not_found_message(name: &str) -> String {
+    format!("Collection group with name {name} is not found")
+}
+
 /// Hold an `IndexName` to the rule `CreateIndexRequest$indexName` documents: "Index names
 /// must be lowercase and can't begin with underscores (_) or hyphens (-)".
 ///

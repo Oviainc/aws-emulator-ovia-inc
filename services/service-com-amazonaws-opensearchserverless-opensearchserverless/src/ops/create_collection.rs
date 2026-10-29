@@ -7,7 +7,9 @@
 //! the stored record. The collection's encryption setting must come from somewhere — the
 //! request's `encryptionConfig` or a stored `encryption` security policy covering
 //! `collection/<name>` — and a request with neither is refused with
-//! `ValidationException`. A second create for a name already taken is a
+//! `ValidationException`. A `collectionGroupName` that names no stored collection group is
+//! refused the same way, since the member asserts the collection is contained in that
+//! group. A second create for a name already taken is a
 //! `ConflictException`.
 //!
 //! ## Shape of an operation
@@ -284,6 +286,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // `collectionGroupName` names the group that, per the member's own documentation,
+        // "contains this collection" — so it has to resolve to a group this account holds
+        // for the stored collection to report a containment any read can resolve. A name
+        // no stored group carries is the invalid input `ValidationException` describes,
+        // and nothing is created: otherwise the collection would report membership in a
+        // group `BatchGetCollectionGroup` answers with its `NOT_FOUND` detail, and the
+        // capacity limits, standby setting and generation a group exists to impose would
+        // have no record behind them.
+        if let Some(group) = input.collection_group_name.as_deref() {
+            if store.collection_group_by_name(group).is_none() {
+                return Err(CreateCollectionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::collection_group_not_found_message(group)),
+                    },
+                )
+                .into());
+            }
         }
 
         // A collection name identifies one collection in the account, so a name already

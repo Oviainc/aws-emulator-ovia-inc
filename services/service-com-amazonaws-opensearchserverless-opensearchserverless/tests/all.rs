@@ -25,6 +25,8 @@ mod collection_group_capacity;
 mod collection_group_delete;
 #[path = "all/collection_group_lifecycle.rs"]
 mod collection_group_lifecycle;
+#[path = "all/collection_group_membership.rs"]
+mod collection_group_membership;
 #[path = "all/collection_lifecycle.rs"]
 mod collection_lifecycle;
 #[path = "all/encryption_indexes_and_tagging.rs"]
