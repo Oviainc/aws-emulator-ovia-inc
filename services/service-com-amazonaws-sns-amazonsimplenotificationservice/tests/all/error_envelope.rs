@@ -144,14 +144,15 @@ async fn every_awsquery_error_document_carries_a_request_id() {
         },
         ErrorCase {
             case: "an operation that is still scaffolded",
-            action: "SetPlatformApplicationAttributes",
+            action: "SetEndpointAttributes",
             params: vec![
                 (
-                    "PlatformApplicationArn",
-                    "arn:aws:sns:us-east-1:000000000000:app/GCM/push-app",
+                    "EndpointArn",
+                    "arn:aws:sns:us-east-1:000000000000:endpoint/GCM/push-app/\
+                     11111111-1111-4111-8111-111111111111",
                 ),
-                ("Attributes.entry.1.key", "PlatformCredential"),
-                ("Attributes.entry.1.value", "AIzaSy0123456789"),
+                ("Attributes.entry.1.key", "CustomUserData"),
+                ("Attributes.entry.1.value", "user-data"),
             ],
             status: 501,
             code: "NotImplemented",

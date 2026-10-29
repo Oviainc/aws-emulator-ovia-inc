@@ -197,13 +197,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // SNS defines a closed set of platform-application attribute names and refuses
         // any other; the refusal is built from the request — the member the map arrived
-        // in and the key that was not recognised — so the caller can find the entry it
-        // has to fix.
+        // in and the key that was not recognised, in the mobile push plane's own words —
+        // so the caller can find the entry it has to fix.
         if let Some(unknown) = state::unknown_attribute_name(
             &input.attributes,
             state::is_platform_application_attribute,
         ) {
-            return Err(refuse(state::unknown_attribute_refusal(
+            return Err(refuse(state::mobile_push_unknown_attribute_refusal(
                 state::ATTRIBUTES_MEMBER,
                 unknown,
             )));
@@ -262,7 +262,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 // An application SNS has just registered sends notifications, so a
                 // fresh record carries the delivery flag from the moment it exists —
-                // under the request's own value when the create asked for one.
+                // under the request's own value when the create asked for one: the
+                // REGISTRATION sets the record's initial flag, where the attribute write
+                // does not take it from its caller at all.
                 let mut attributes = ::std::collections::HashMap::from([(
                     state::PLATFORM_APPLICATION_ENABLED_ATTRIBUTE.to_string(),
                     state::attribute_flag(true),

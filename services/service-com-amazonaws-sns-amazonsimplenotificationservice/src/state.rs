@@ -2970,6 +2970,44 @@ pub fn is_platform_application_attribute(name: &str) -> bool {
     PLATFORM_APPLICATION_ATTRIBUTE_NAMES.contains(&name)
 }
 
+/// The platform-application attributes an attribute WRITE does not take from its
+/// caller: the ones SNS reports for an application and maintains itself.
+///
+/// The delivery flag is one. `SetPlatformApplicationAttributesInput$Attributes`
+/// enumerates what that call writes — the credential pair, the four event topics, the
+/// two feedback roles with their sample rate and the two APNs identifiers — and the flag
+/// is in none of those clauses: SNS is what moves it, clearing it when the notification
+/// service rejects the application's credentials.
+///
+/// The REGISTRATION is the exception, and its own recorded behaviour says so: a create
+/// carrying the flag persists the value it carried, because that is the INITIAL value of
+/// a record SNS is minting rather than a change to one it already maintains. So this
+/// list belongs to the write, not to the attribute catalog.
+///
+/// Recorded evidence: an attribute write carrying the delivery flag is SERVED, and the
+/// application still reports the value the service holds — so the name is accepted (it
+/// is one SNS defines for an application) and the caller's value is not written.
+pub const PLATFORM_APPLICATION_ATTRIBUTES_A_WRITE_DOES_NOT_TAKE: &[&str] =
+    &[PLATFORM_APPLICATION_ENABLED_ATTRIBUTE];
+
+/// Whether `name` is a platform-application attribute an attribute write does not take
+/// from its caller ([`PLATFORM_APPLICATION_ATTRIBUTES_A_WRITE_DOES_NOT_TAKE`]).
+pub fn platform_application_attribute_is_the_services_own(name: &str) -> bool {
+    PLATFORM_APPLICATION_ATTRIBUTES_A_WRITE_DOES_NOT_TAKE.contains(&name)
+}
+
+/// The entries of a caller's platform-application attribute map an attribute write
+/// APPLIES: every one except the names the service maintains itself
+/// ([`platform_application_attribute_is_the_services_own`]).
+pub fn platform_application_attributes_a_write_applies(
+    attributes: &HashMap<String, String>,
+) -> impl Iterator<Item = (String, String)> + '_ {
+    attributes
+        .iter()
+        .filter(|(name, _)| !platform_application_attribute_is_the_services_own(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+}
+
 /// The name a refusal gives a platform application record, for the shared
 /// attribute-map ceiling ([`attribute_bytes_refusal`]).
 pub const PLATFORM_APPLICATION_RECORD: &str = "a platform application";
@@ -4202,8 +4240,28 @@ pub fn unknown_attribute_name(
 ///
 /// Built from the REQUEST, so a caller reading it can find the typo it made: the
 /// member names where to look and the echoed key names which entry of it.
+///
+/// This is the NOTIFICATION plane's wording; the mobile push plane states the same
+/// refusal in its own words ([`mobile_push_unknown_attribute_refusal`]). Recorded
+/// evidence: `Subscribe` carrying a misspelling of a subscription attribute answers
+/// `400 InvalidParameter` with exactly this sentence.
 pub fn unknown_attribute_refusal(member: &str, name: &str) -> String {
     format!("Invalid parameter: {member} Reason: Unknown attribute {name}")
+}
+
+/// The same refusal as the MOBILE PUSH plane states it: the input member the map
+/// arrived in, and a `Reason:` clause saying the attribute NAME is not one the service
+/// defines — still built from the request, so the key names which entry to fix.
+///
+/// The two spellings are the same split as the two spellings of the paging refusal
+/// ([`MOBILE_PUSH_INVALID_NEXT_TOKEN_REFUSAL`] beside
+/// [`INVALID_NEXT_TOKEN_REFUSAL`]): the mobile push plane words its own refusals.
+/// Recorded evidence: `SetPlatformApplicationAttributes` carrying a name SNS defines
+/// for no platform application answers `400 InvalidParameter` with exactly this
+/// sentence, where the notification plane's calls answer
+/// [`unknown_attribute_refusal`]'s.
+pub fn mobile_push_unknown_attribute_refusal(member: &str, name: &str) -> String {
+    format!("Invalid parameter: {member} Reason: Invalid attribute name: {name}")
 }
 
 /// The sentence SNS refuses a `NextToken` that is not one it minted with.

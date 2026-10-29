@@ -234,7 +234,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(unknown) = state::unknown_attribute_name(&attributes, |name| {
             state::is_endpoint_attribute(&platform, name)
         }) {
-            let message = state::unknown_attribute_refusal(state::ATTRIBUTES_MEMBER, unknown);
+            let message =
+                state::mobile_push_unknown_attribute_refusal(state::ATTRIBUTES_MEMBER, unknown);
             return Err(refuse(message));
         }
         if let Some(data) = input.custom_user_data {

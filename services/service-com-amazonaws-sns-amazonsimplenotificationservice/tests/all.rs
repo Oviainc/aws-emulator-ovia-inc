@@ -104,6 +104,9 @@ mod regional_listings;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 
+#[path = "all/set_platform_application_attributes.rs"]
+mod set_platform_application_attributes;
+
 #[path = "all/set_subscription_attributes.rs"]
 mod set_subscription_attributes;
 

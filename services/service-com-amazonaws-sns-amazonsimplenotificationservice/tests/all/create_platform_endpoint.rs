@@ -30,8 +30,8 @@ use std::collections::HashMap;
 
 use service_com_amazonaws_sns_amazonsimplenotificationservice::state::{
     attribute_flag, custom_user_data_refusal, endpoint_token_conflict_refusal,
-    platform_application_arn, platform_endpoint_arn, unknown_attribute_refusal, ATTRIBUTES_MEMBER,
-    CHANNEL_ENDPOINT_ATTRIBUTE_NAMES, ENDPOINT_CUSTOM_USER_DATA_ATTRIBUTE,
+    mobile_push_unknown_attribute_refusal, platform_application_arn, platform_endpoint_arn,
+    ATTRIBUTES_MEMBER, CHANNEL_ENDPOINT_ATTRIBUTE_NAMES, ENDPOINT_CUSTOM_USER_DATA_ATTRIBUTE,
     ENDPOINT_ENABLED_ATTRIBUTE, ENDPOINT_TOKEN_ATTRIBUTE, MAX_ENDPOINT_CUSTOM_USER_DATA_BYTES,
     PLATFORM_APPLICATION_DOES_NOT_EXIST, PLATFORM_NAMES, PLATFORM_WITH_CHANNEL_ENDPOINTS,
 };
@@ -745,7 +745,7 @@ async fn bad_arguments_are_refused_as_bad_input() {
         refused(
             case,
             &answer,
-            &unknown_attribute_refusal(ATTRIBUTES_MEMBER, name),
+            &mobile_push_unknown_attribute_refusal(ATTRIBUTES_MEMBER, name),
             &sns,
             0,
         );

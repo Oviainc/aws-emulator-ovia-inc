@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetPlatformApplicationAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetPlatformApplicationAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetPlatformApplicationAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +71,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -166,23 +158,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = SET_PLATFORM_APPLICATION_ATTRIBUTES_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Apply the request's attribute map to the platform application
+    /// `PlatformApplicationArn` names.
+    ///
+    /// A MUTATION the spec names: "Sets the attributes of the platform application
+    /// object for the supported push notification services". The request carries a MAP,
+    /// so the entries it holds are applied OVER the ones the record already holds and
+    /// every attribute the request does not name is left as it was — a write of one
+    /// attribute is not an instruction to forget the rest. The record this writes is the
+    /// one the attribute read and the application listing report, so the write reads back
+    /// through either of them (with the write-only credential material withheld, as every
+    /// report of an application withholds it).
+    ///
+    /// Two rules are argument validation, judged before the store is consulted and each
+    /// answered with `InvalidParameterException` (HTTP 400): the ARN has to be an ARN of
+    /// the region this endpoint serves, and the map may carry only names SNS defines for
+    /// a platform application. An ARN-shaped value this account holds no application
+    /// record for is a lookup miss instead — the modelled `NotFoundException` (HTTP 404),
+    /// the same split the application's attribute read makes.
+    ///
+    /// A write that replaces the push credential material is held to the same rule the
+    /// create holds it to, measured on the pair the record WOULD hold: material that is
+    /// not the artifact the application's platform authenticates with is refused rather
+    /// than stored, so an application never ends up holding credentials its push service
+    /// could not use.
+    ///
+    /// An entry naming an attribute SNS MAINTAINS ITSELF rather than takes from a caller
+    /// (the delivery flag, which this operation's attribute-map doc does not enumerate)
+    /// is accepted and not written: the name IS one SNS defines for an application, so it
+    /// is no typo to report, and the value stays the service's own. The REGISTRATION is
+    /// the exception — the flag's initial value is the record's, so `CreatePlatformApplication`
+    /// keeps persisting what its own request carried.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetPlatformApplicationAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetPlatformApplicationAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetPlatformApplicationAttributes"))
+        let invalid_parameter = |message: String| -> Self::Error {
+            SetPlatformApplicationAttributesErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        let region = state::request_region(ctx.parts());
+        if let Some(message) = state::regional_arn_refusal(
+            "PlatformApplicationArn",
+            &input.platform_application_arn,
+            &region,
+        ) {
+            return Err(invalid_parameter(message));
+        }
+        // SNS defines a closed set of platform-application attribute names and refuses
+        // any other; the refusal is built from the request — the member the map arrived
+        // in and the key that was not recognised — so the caller can find the entry it
+        // has to fix.
+        if let Some(unknown) = state::unknown_attribute_name(
+            &input.attributes,
+            state::is_platform_application_attribute,
+        ) {
+            return Err(invalid_parameter(
+                state::mobile_push_unknown_attribute_refusal(state::ATTRIBUTES_MEMBER, unknown),
+            ));
+        }
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(
+                SetPlatformApplicationAttributesErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some("the SNS store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = store.lock();
+
+        let Some(application) = store
+            .platform_applications
+            .get_mut(&input.platform_application_arn)
+        else {
+            return Err(
+                SetPlatformApplicationAttributesErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(state::PLATFORM_APPLICATION_DOES_NOT_EXIST.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The map the record WOULD hold: what it holds now, with the request's entries
+        // applied over it — except the ones naming an attribute the SERVICE maintains,
+        // whose value is not the caller's to write. Every rule below is judged on THAT
+        // map, so neither credential material the platform could not use nor a map past
+        // the per-record ceiling is ever stored, and a half-applied write cannot be
+        // observed.
+        let mut would_hold = application.attributes.clone();
+        would_hold.extend(state::platform_application_attributes_a_write_applies(
+            &input.attributes,
+        ));
+        if input
+            .attributes
+            .keys()
+            .any(|name| state::is_platform_credential_attribute(name))
+        {
+            if let Some(message) =
+                state::platform_credential_refusal(&application.platform, &would_hold)
+            {
+                return Err(invalid_parameter(message));
+            }
+        }
+        if let Some(message) =
+            state::attribute_bytes_refusal(state::PLATFORM_APPLICATION_RECORD, &would_hold)
+        {
+            return Err(invalid_parameter(message));
+        }
+        application.attributes = would_hold;
+
+        Ok(SetPlatformApplicationAttributesOutput)
     }
 }

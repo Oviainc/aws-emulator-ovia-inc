@@ -30,7 +30,7 @@
 use std::collections::HashMap;
 
 use service_com_amazonaws_sns_amazonsimplenotificationservice::state::{
-    attribute_flag, platform_application_arn, unknown_attribute_refusal,
+    attribute_flag, mobile_push_unknown_attribute_refusal, platform_application_arn,
     unsupported_platform_refusal, ATTRIBUTES_MEMBER, INVALID_PLATFORM_APPLICATION_NAME_REFUSAL,
     INVALID_PLATFORM_CREDENTIALS_REFUSAL, MAX_PLATFORM_APPLICATION_NAME_LEN,
     PLATFORM_APPLICATION_ATTRIBUTE_NAMES, PLATFORM_APPLICATION_ENABLED_ATTRIBUTE,
@@ -412,7 +412,7 @@ async fn the_attribute_map_is_the_closed_set_the_service_defines() {
         refused(
             case,
             &answer,
-            &unknown_attribute_refusal(ATTRIBUTES_MEMBER, name),
+            &mobile_push_unknown_attribute_refusal(ATTRIBUTES_MEMBER, name),
             held,
             &sns,
         );
