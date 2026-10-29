@@ -4225,7 +4225,8 @@ pub fn official_lens_arn(region: &str, lens: &str) -> String {
 /// The pillar priority order a workload is created with when the request names none:
 /// the framework's own pillar order, which is what orders the items in a review's
 /// improvement plan (`WorkloadPillarPriorities` doc: "The priorities of the pillars,
-/// which are used to order items in the improvement plan").
+/// which are used to order items in the improvement plan") — the order
+/// [`order_by_pillar_priority`] puts that plan's questions in.
 pub fn default_pillar_priorities() -> Vec<String> {
     WELL_ARCHITECTED_PILLARS
         .iter()
@@ -8616,7 +8617,9 @@ pub fn decode_check_summary_next_token(token: &str) -> Option<String> {
 /// page resumes from when the selection does not fit in this one.
 #[derive(Debug)]
 pub struct QuestionPage<'a> {
-    /// The questions this page reports, in the LENS's own order.
+    /// The questions this page reports, in the order of the question set it was paged
+    /// over — the lens's own order, except where the caller ordered that set first
+    /// ([`order_by_pillar_priority`]).
     pub questions: Vec<&'a ReviewQuestion>,
     /// The cursor a caller follows for the rest of the selection, `None` on the last
     /// page.
@@ -8628,9 +8631,10 @@ pub struct QuestionPage<'a> {
 ///
 /// Shared by every operation that pages over the answers of a lens review (a workload's
 /// or a review template's), so they cannot drift about the order, the cursor or where a
-/// page ends. The cursor is start-EXCLUSIVE and names a `QuestionId` in the lens's own
-/// order, so `select` can differ between pages without a question being served twice or
-/// skipped.
+/// page ends. The cursor is start-EXCLUSIVE and names a `QuestionId` by its position in
+/// `catalog`, so `select` can differ between pages without a question being served twice
+/// or skipped — and a caller that serves the set in an order of its own
+/// ([`order_by_pillar_priority`]) pages over it in that order by handing it in that order.
 ///
 /// `None` when `resume_after` names a question the lens does not ask: that is not a
 /// cursor this review issued, so it is as undecodable as a malformed token and the
@@ -8667,6 +8671,48 @@ pub fn question_page<'a, Select: Fn(&ReviewQuestion) -> bool>(
         questions: page.iter().map(|(_, question)| *question).collect(),
         next_token,
     })
+}
+
+/// Re-order a lens review's questions into the order the IMPROVEMENT PLAN of a workload
+/// reports them: the questions of the pillar the workload prioritises first, then those of
+/// the next, and inside one pillar the lens's own question order.
+///
+/// `WorkloadPillarPriorities` is "the priorities of the pillars, which are used to order
+/// items in the improvement plan. Each pillar is represented by its
+/// PillarReviewSummary$PillarId" (`smithy_query(query="doc",
+/// shape="WorkloadPillarPriorities")`), so the plan's order is the workload's own, not the
+/// lens's: two workloads that differ only in those priorities serve the same items in
+/// different orders. A pillar the priority list does not name is not prioritised at all, so
+/// its questions follow every prioritised pillar's, still in the lens's order — which is
+/// also the whole order for a priority list that names nothing, though no write path leaves
+/// a workload carrying one ([`resolved_pillar_priorities`]). The sort is STABLE, so the
+/// lens's order is what breaks every tie.
+///
+/// The order is applied to the question set BEFORE it is selected over and paged
+/// ([`question_page`]), because the plan's cursor names a position in the order the plan
+/// is served in.
+///
+/// `WorkloadPillarPriorities` carries no modelled list bound
+/// (`smithy_query(query="shape", shape="WorkloadPillarPriorities")`), so a stored priority
+/// list is as long as the request that wrote it. Each pillar's rank is therefore resolved
+/// ONCE into an index and each question's key read ONCE from it, so this costs the question
+/// count and the priority length ADDED rather than multiplied: no request can make the work
+/// of ordering the plan grow with the product of the two.
+pub fn order_by_pillar_priority(questions: &mut [ReviewQuestion], pillar_priorities: &[String]) {
+    // The first position a pillar is named at is its rank, so a list naming one twice ranks
+    // it where it was first named.
+    let mut rank: BTreeMap<&str, usize> = BTreeMap::new();
+    for (position, pillar_id) in pillar_priorities.iter().enumerate() {
+        rank.entry(pillar_id.as_str()).or_insert(position);
+    }
+    // Every rank is below the list's length, so that length is the rank of a pillar the
+    // list does not name: behind every pillar it does.
+    let unprioritized = pillar_priorities.len();
+    questions.sort_by_cached_key(|question| {
+        rank.get(question.pillar_id.as_str())
+            .copied()
+            .unwrap_or(unprioritized)
+    });
 }
 
 /// `ValidationExceptionReason$FIELD_VALIDATION_FAILED` — the modelled classification for

@@ -3,7 +3,7 @@
 //! @op ListLensReviewImprovements
 //! This operation reports the IMPROVEMENT PLAN of ONE lens review of ONE workload: the
 //! questions of that review the workload's answers leave a risk in, each with the risk
-//! it is rated at.
+//! it is rated at, in the workload's own pillar priority order.
 //!
 //! It is a REPORTING operation: it resolves the workload, the milestone (when one is
 //! named) and the lens review, reads the lens's question catalog and the workload's
@@ -232,11 +232,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The improvement plan is a SELECTION over the lens's questions, in the lens's own
-        // order: the questions whose stored answer leaves a risk, narrowed further by the
-        // request's filters and paged through the service's shared question cursor. The
-        // question set is the LENS's own content — an AWS-official lens's catalog entry or
-        // a custom lens's imported document — which is what
+        // The improvement plan is a SELECTION over the lens's questions, in the ORDER the
+        // workload is reviewed in: the questions whose stored answer leaves a risk,
+        // narrowed further by the request's filters and paged through the service's shared
+        // question cursor. The question set is the LENS's own content — an AWS-official
+        // lens's catalog entry or a custom lens's imported document — which is what
         // `crate::state::...::lens_review_questions` resolves, for the lens VERSION this
         // review is against. `PillarId` and
         // `QuestionPriority` FILTER that set rather than resolving anything, so a value
@@ -248,10 +248,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let priority_selects = input.question_priority.as_deref().is_none_or(|priority| {
             priority == crate::state::question_priority_of(crate::state::DEFAULT_QUESTION_TYPE)
         });
-        let questions = store.lens_review_questions(
+        let mut questions = store.lens_review_questions(
             &input.lens_alias,
             workload.lens_review_version(&input.lens_alias),
         );
+        // "The priorities of the pillars, which are used to order items in the improvement
+        // plan" (`WorkloadPillarPriorities` doc): the plan's order is the WORKLOAD's, so
+        // the question set is put in the reviewed workload's pillar priority order before
+        // anything is selected or paged over it
+        // (`crate::state::order_by_pillar_priority`, which also fixes where a pillar those
+        // priorities do not name sits). The workload here is the one whose plan is being
+        // read — the live one, or the one the named milestone recorded — so a milestone
+        // reports the priorities it froze.
+        crate::state::order_by_pillar_priority(&mut questions, &workload.pillar_priorities);
         let page = crate::state::question_page(
             &questions,
             |question| {

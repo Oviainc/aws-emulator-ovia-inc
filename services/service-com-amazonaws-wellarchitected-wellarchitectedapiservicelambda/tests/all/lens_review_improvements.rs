@@ -6,7 +6,8 @@
 //! The rule these pin, over tables of inputs rather than one recorded request: the
 //! improvement plan of a lens review reports one `ImprovementSummary` per question of
 //! that lens whose stored answer the review rates at an IDENTIFIED risk — `HIGH` or
-//! `MEDIUM` — in the lens's own order, narrowed by the request's `PillarId` /
+//! `MEDIUM` — in the order the WORKLOAD's `PillarPriorities` put their pillars in (and,
+//! inside one pillar, in the lens's own order), narrowed by the request's `PillarId` /
 //! `QuestionPriority` filters and paged by `MaxResults`/`NextToken`. A question whose
 //! answer leaves no best practice out (`NONE`), one the workload says does not apply
 //! (`NOT_APPLICABLE`) and one with no stored answer (`UNANSWERED`) leave no identified
@@ -25,7 +26,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::AnswerRecord;
 
 use super::workload_harness::{
-    answered, created_id, encode_path_segment, minimal_create, official_lens_arn, Answer, Client,
+    answered, created_id, encode_path_segment, minimal_create, official_lens_arn, stored_workload,
+    Answer, Client,
 };
 
 /// The AWS Well-Architected Framework lens's pillars: the `PillarId` each is named by on
@@ -272,13 +274,24 @@ async fn workload_with_spread_answers(
     name: &str,
 ) -> (String, Vec<(String, String, String)>) {
     let workload_id = framework_workload(client, name).await;
+    let seeded = seed_spread_answers(client, &workload_id);
+    (workload_id, seeded)
+}
+
+/// Answer every question of the framework lens review of one STORED workload, cycling
+/// through the four ratings, and answer the `(PillarId, QuestionId, Risk)` the seeding
+/// stored — in the LENS's own order, so a test states its expectation from the seed rather
+/// than from the code under test. Split from [`workload_with_spread_answers`] so a case
+/// that creates its workload itself (one that names its own `PillarPriorities`, say) seeds
+/// the same answers.
+fn seed_spread_answers(client: &Client, workload_id: &str) -> Vec<(String, String, String)> {
     let mut seeded: Vec<(String, String, String)> = Vec::new();
     for (index, (pillar, question_id)) in catalog().into_iter().enumerate() {
         let (record, risk) = spread_answer(index);
-        client.record_answer(&workload_id, FRAMEWORK_LENS, &question_id, record);
+        client.record_answer(workload_id, FRAMEWORK_LENS, &question_id, record);
         seeded.push((pillar, question_id, risk.to_string()));
     }
-    (workload_id, seeded)
+    seeded
 }
 
 /// Whether a `Risk` is one the review IDENTIFIED, which is what makes a question an
@@ -381,7 +394,9 @@ async fn only_identified_risks_appear_in_the_improvement_plan() {
         "the seeded plan fits in one full page, got {pages} pages"
     );
 
-    // The plan, in the lens's own order: the rows that carry a risk, each at that risk.
+    // The plan, in the lens's own order: this workload named no `PillarPriorities`, so it
+    // is reviewed in the framework's own pillar order — the order its question catalog is
+    // already in. The rows that carry a risk, each at that risk.
     let order = catalog();
     let mut expected: Vec<(String, String)> = Vec::new();
     for (_, question_id) in &order {
@@ -1087,6 +1102,384 @@ async fn reading_the_plan_does_not_change_it() {
         assert_eq!(
             actual, baseline,
             "case {case:?}: a read must not change the plan, expected {baseline:?}, got {actual:?}"
+        );
+    }
+}
+
+/// Where a pillar sits in a workload's `PillarPriorities`: its position in that list, and
+/// behind every pillar the list names when it names this one nowhere. "The priorities of
+/// the pillars, which are used to order items in the improvement plan. Each pillar is
+/// represented by its PillarReviewSummary$PillarId" (`smithy_query(query="doc",
+/// shape="WorkloadPillarPriorities")`) — a pillar nothing prioritised is not prioritised
+/// ahead of one that was.
+fn priority_rank(priorities: &[&str], pillar_id: &str) -> usize {
+    priorities
+        .iter()
+        .position(|priority| *priority == pillar_id)
+        .unwrap_or(priorities.len())
+}
+
+/// The plan a workload whose priorities are `priorities` must serve, given what the seed
+/// stored: the questions left at an identified risk, ordered by their pillar's priority
+/// rank. The sort is STABLE and `seeded` is in the lens's own order, so that order is what
+/// breaks every tie — including the tie between two pillars the priorities do not name.
+fn expected_plan(
+    priorities: &[&str],
+    seeded: &[(String, String, String)],
+) -> Vec<(String, String)> {
+    let mut at_risk: Vec<&(String, String, String)> = seeded
+        .iter()
+        .filter(|(_, _, risk)| is_identified_risk(risk))
+        .collect();
+    at_risk.sort_by_key(|(pillar_id, _, _)| priority_rank(priorities, pillar_id));
+    at_risk
+        .iter()
+        .map(|(_, question_id, risk)| (question_id.clone(), risk.clone()))
+        .collect()
+}
+
+/// The pillars one plan serves, in the order it first served each of them.
+fn served_pillars(summaries: &[Value]) -> Vec<String> {
+    let mut pillars: Vec<String> = Vec::new();
+    for summary in summaries {
+        let pillar = string_member(summary, "PillarId");
+        if !pillars.contains(&pillar) {
+            pillars.push(pillar);
+        }
+    }
+    pillars
+}
+
+/// One row of the priority table: the `PillarPriorities` the workload is created with, the
+/// list a later `UpdateWorkload` sets (none for a row that updates nothing), and the
+/// priorities the workload then holds — what `GetWorkload` must report and what the plan
+/// must be ordered by.
+struct Priorities {
+    case: &'static str,
+    created_with: Option<Vec<&'static str>>,
+    updated_to: Option<Vec<&'static str>>,
+    priorities: Vec<&'static str>,
+}
+
+/// What one row of the priority table SERVED: the case, the priorities the workload held
+/// and the plan it answered with, kept so the rows can be compared against each other.
+struct Served {
+    case: &'static str,
+    priorities: Vec<&'static str>,
+    plan: Vec<(String, String)>,
+}
+
+/// The workload's own `PillarPriorities` order the improvement plan: the plan serves each
+/// prioritised pillar's risk-bearing questions in turn, in the lens's own order inside one
+/// pillar, with the pillars those priorities do not name behind every pillar they do. Rows
+/// differ along how the workload came by its priorities and along the list itself — its
+/// length, its order, whether it names every pillar, a pillar the lens does not have, the
+/// same pillar twice, or nothing at all (which leaves the order the workload already has).
+#[tokio::test]
+async fn the_workloads_pillar_priorities_order_the_improvement_plan() {
+    // The framework's own pillar order, which is what a workload that names no priorities
+    // is created with, read off this suite's catalog table rather than the code under test.
+    let framework_order: Vec<&str> = FRAMEWORK_PILLARS
+        .iter()
+        .map(|(pillar_id, _, _)| *pillar_id)
+        .collect();
+
+    let rows: Vec<Priorities> = vec![
+        Priorities {
+            case: "named-none",
+            created_with: None,
+            updated_to: None,
+            priorities: framework_order.clone(),
+        },
+        Priorities {
+            case: "every-pillar-reversed",
+            created_with: Some(framework_order.iter().rev().copied().collect()),
+            updated_to: None,
+            priorities: framework_order.iter().rev().copied().collect(),
+        },
+        Priorities {
+            case: "two-pillars-first",
+            created_with: Some(vec!["sustainability", "security"]),
+            updated_to: None,
+            priorities: vec!["sustainability", "security"],
+        },
+        Priorities {
+            case: "one-pillar-first",
+            created_with: Some(vec!["costOptimization"]),
+            updated_to: None,
+            priorities: vec!["costOptimization"],
+        },
+        Priorities {
+            case: "pillar-the-lens-does-not-have",
+            created_with: Some(vec!["notapillar", "performance"]),
+            updated_to: None,
+            priorities: vec!["notapillar", "performance"],
+        },
+        Priorities {
+            case: "same-pillar-twice",
+            created_with: Some(vec!["reliability", "reliability", "operationalExcellence"]),
+            updated_to: None,
+            priorities: vec!["reliability", "reliability", "operationalExcellence"],
+        },
+        Priorities {
+            case: "updated",
+            created_with: Some(vec!["sustainability"]),
+            updated_to: Some(vec!["performance", "sustainability"]),
+            priorities: vec!["performance", "sustainability"],
+        },
+        Priorities {
+            // An update that names no priority order leaves the workload in the order it is
+            // already reviewed in (`crate::state::resolved_pillar_priorities`), so the plan
+            // keeps the order the create set.
+            case: "updated-to-name-none",
+            created_with: Some(vec!["security"]),
+            updated_to: Some(Vec::new()),
+            priorities: vec!["security"],
+        },
+    ];
+
+    // Every row seeds the SAME answers, so the plans they serve hold the same items and can
+    // differ only in their order.
+    let mut served: Vec<Served> = Vec::new();
+
+    for row in &rows {
+        let case = row.case;
+        let client = Client::new();
+        let mut request = minimal_create(&format!("priority-{case}"), &format!("tok-{case}"));
+        if let Some(created_with) = &row.created_with {
+            request["PillarPriorities"] = json!(created_with);
+        }
+        let workload_id = created_id(&client.create(request).await, case);
+        let seeded = seed_spread_answers(&client, &workload_id);
+
+        if let Some(updated_to) = &row.updated_to {
+            let updated = client
+                .update(&workload_id, json!({ "PillarPriorities": updated_to }))
+                .await;
+            assert_eq!(
+                updated.status, 200,
+                "case {case:?}: UpdateWorkload must set the priorities, got {updated:?}"
+            );
+        }
+
+        // Read the priorities back through `GetWorkload`: the plan is ordered by what the
+        // workload holds, so the test and the service must agree about that first.
+        let workload = stored_workload(&client, &workload_id, case).await;
+        assert_eq!(
+            workload.get("PillarPriorities"),
+            Some(&json!(row.priorities)),
+            "case {case:?}: expected PillarPriorities {:?}, got {workload:?}",
+            row.priorities
+        );
+
+        let (summaries, _) =
+            collect_improvements(&client, case, &workload_id, FRAMEWORK_LENS, &[], None).await;
+        let plan = rated_questions(&summaries);
+        let expected = expected_plan(&row.priorities, &seeded);
+        assert_eq!(
+            plan, expected,
+            "case {case:?}: the plan must be ordered by the workload's pillar priorities \
+             {:?}, expected {expected:?}, got {plan:?}",
+            row.priorities
+        );
+
+        // The priorities ORDER the plan; they select nothing. Compared as sets, every row
+        // serves the questions the seed left at an identified risk.
+        let mut sorted_plan = plan.clone();
+        sorted_plan.sort();
+        let mut sorted_expected = expected.clone();
+        sorted_expected.sort();
+        assert_eq!(
+            sorted_plan, sorted_expected,
+            "case {case:?}: the priorities must not change WHICH questions the plan holds"
+        );
+
+        // Each pillar's items are served together, and the pillars come in priority rank
+        // order: a prioritised pillar ahead of a less prioritised one, and both ahead of a
+        // pillar the priorities do not name.
+        let pillars = served_pillars(&summaries);
+        let mut ranked = pillars.clone();
+        ranked.sort_by_key(|pillar_id| priority_rank(&row.priorities, pillar_id));
+        assert_eq!(
+            pillars, ranked,
+            "case {case:?}: the plan must serve the pillars in priority rank order, got {pillars:?}"
+        );
+        assert_eq!(
+            pillars.len(),
+            FRAMEWORK_PILLARS.len(),
+            "case {case:?}: the seed leaves a risk in every pillar, so each must be served \
+             exactly once, got {pillars:?}"
+        );
+
+        // Inside one pillar the lens's own order stands, and the `PillarId` filter serves
+        // exactly that pillar's slice of the plan.
+        for (pillar_id, _, _) in FRAMEWORK_PILLARS {
+            let in_plan: Vec<(String, String)> = summaries
+                .iter()
+                .filter(|summary| string_member(summary, "PillarId") == pillar_id)
+                .map(|summary| {
+                    (
+                        string_member(summary, "QuestionId"),
+                        string_member(summary, "Risk"),
+                    )
+                })
+                .collect();
+            let lens_order: Vec<(String, String)> = seeded
+                .iter()
+                .filter(|(seeded_pillar, _, risk)| {
+                    seeded_pillar == pillar_id && is_identified_risk(risk)
+                })
+                .map(|(_, question_id, risk)| (question_id.clone(), risk.clone()))
+                .collect();
+            assert_eq!(
+                in_plan, lens_order,
+                "case {case:?}: inside {pillar_id} the lens's own order stands, expected \
+                 {lens_order:?}, got {in_plan:?}"
+            );
+            let (filtered, _) = collect_improvements(
+                &client,
+                &format!("{case}/{pillar_id}"),
+                &workload_id,
+                FRAMEWORK_LENS,
+                &[format!("PillarId={pillar_id}")],
+                None,
+            )
+            .await;
+            assert_eq!(
+                rated_questions(&filtered),
+                in_plan,
+                "case {case:?}: a read filtered to {pillar_id} must serve that pillar's slice \
+                 of the plan"
+            );
+        }
+
+        // Paging serves the same order, whatever page size the request asks for: the
+        // cursor names a position in the plan's order, not in the lens's.
+        for page_size in [1, 7] {
+            let (paged, pages) = collect_improvements(
+                &client,
+                &format!("{case}/paged-{page_size}"),
+                &workload_id,
+                FRAMEWORK_LENS,
+                &[],
+                Some(page_size),
+            )
+            .await;
+            assert_eq!(
+                rated_questions(&paged),
+                expected,
+                "case {case:?}: paging at {page_size} per page must serve the plan in the same \
+                 order, in {pages} pages"
+            );
+        }
+
+        served.push(Served {
+            case,
+            priorities: row.priorities.clone(),
+            plan,
+        });
+    }
+
+    // Two workloads that differ only in their priorities serve the same items in a
+    // DIFFERENT order whenever those priorities rank the pillars differently — and in the
+    // SAME order when they rank them the same: the member the model says exists in order to
+    // order this list orders it.
+    let ranked_pillars = |priorities: &[&str]| -> Vec<String> {
+        let mut pillars: Vec<String> = FRAMEWORK_PILLARS
+            .iter()
+            .map(|(pillar_id, _, _)| (*pillar_id).to_string())
+            .collect();
+        pillars.sort_by_key(|pillar_id| priority_rank(priorities, pillar_id));
+        pillars
+    };
+    for (index, row) in served.iter().enumerate() {
+        let case = row.case;
+        for other in served.iter().take(index) {
+            let other_case = other.case;
+            let mut items = row.plan.clone();
+            items.sort();
+            let mut other_items = other.plan.clone();
+            other_items.sort();
+            assert_eq!(
+                items, other_items,
+                "case {case:?} vs {other_case:?}: every row seeds the same answers, so the \
+                 plans must hold the same items"
+            );
+            if ranked_pillars(&row.priorities) == ranked_pillars(&other.priorities) {
+                assert_eq!(
+                    row.plan, other.plan,
+                    "case {case:?} vs {other_case:?}: these priorities rank the pillars the \
+                     same, so the plans must agree"
+                );
+            } else {
+                assert_ne!(
+                    row.plan, other.plan,
+                    "case {case:?} vs {other_case:?}: these priorities rank the pillars \
+                     differently, so the plans must differ"
+                );
+            }
+        }
+    }
+}
+
+/// A milestone records the workload at an instant, its `PillarPriorities` included: the
+/// plan it reports is ordered by the priorities it froze, while the live plan follows the
+/// priorities the workload now holds.
+#[tokio::test]
+async fn a_milestone_orders_its_plan_by_the_priorities_it_recorded() {
+    let client = Client::new();
+    let recorded_priorities = vec!["sustainability", "operationalExcellence"];
+    let live_priorities = vec!["operationalExcellence", "sustainability"];
+
+    let mut request = minimal_create("frozen-priorities-host", "tok-frozen-priorities");
+    request["PillarPriorities"] = json!(recorded_priorities);
+    let workload_id = created_id(&client.create(request).await, "recorded");
+    let seeded = seed_spread_answers(&client, &workload_id);
+
+    let recorded = client
+        .send(
+            "POST",
+            &format!("/workloads/{workload_id}/milestones"),
+            Some(json!({
+                "MilestoneName": "before-the-reprioritisation",
+                "ClientRequestToken": "tok-frozen-priorities-milestone",
+            })),
+        )
+        .await;
+    assert_eq!(
+        recorded.status, 200,
+        "case \"record\": CreateMilestone must succeed, got {recorded:?}"
+    );
+
+    let updated = client
+        .update(&workload_id, json!({ "PillarPriorities": live_priorities }))
+        .await;
+    assert_eq!(
+        updated.status, 200,
+        "case \"reprioritise\": UpdateWorkload must set the priorities, got {updated:?}"
+    );
+
+    for (case, filters, priorities) in [
+        ("live", Vec::new(), &live_priorities),
+        (
+            "milestone",
+            vec!["MilestoneNumber=1".to_string()],
+            &recorded_priorities,
+        ),
+    ] {
+        let (summaries, _) =
+            collect_improvements(&client, case, &workload_id, FRAMEWORK_LENS, &filters, None).await;
+        let expected = expected_plan(priorities, &seeded);
+        let actual = rated_questions(&summaries);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: the plan must be ordered by {priorities:?}, expected {expected:?}, \
+             got {actual:?}"
+        );
+        assert_eq!(
+            served_pillars(&summaries).first().map(String::as_str),
+            priorities.first().copied(),
+            "case {case:?}: the most prioritised pillar must be served first, got {summaries:?}"
         );
     }
 }
