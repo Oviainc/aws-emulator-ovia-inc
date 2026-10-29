@@ -266,11 +266,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `If-Match`: delete only if the targeted version's ETag is the one the
         // caller last read. A caller that read a different version — or that
-        // targets a version which does not exist — is refused 412.
+        // targets a version which does not exist — is refused 412. The refusal is
+        // worded by [`crate::state::precondition_failed_removal_message`], the
+        // one place this service words a failed precondition on an asset-model
+        // REMOVAL: the conditional header that failed, and nothing of the
+        // request's own values.
         if let Some(expected) = input.if_match.as_deref() {
             if target_e_tag.as_deref() != Some(expected) {
                 return Err(precondition_failed(
-                    "Precondition failed for provided If-Match value.",
+                    &crate::state::precondition_failed_removal_message(
+                        crate::state::HEADER_IF_MATCH,
+                    ),
                     &id,
                     &arn,
                 ));
@@ -286,7 +292,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             && target_e_tag.is_some()
         {
             return Err(precondition_failed(
-                "Precondition failed for provided If-None-Match value.",
+                &crate::state::precondition_failed_removal_message(
+                    crate::state::HEADER_IF_NONE_MATCH,
+                ),
                 &id,
                 &arn,
             ));

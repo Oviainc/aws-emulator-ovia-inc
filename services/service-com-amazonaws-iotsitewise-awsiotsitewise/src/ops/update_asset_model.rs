@@ -275,15 +275,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // preconditions are: a precondition that fails changes nothing at all, so
         // it is decided before any other refusal and before any write.
         //
-        // The wording of both refusals is the one IoT SiteWise answers a failed
-        // asset-model precondition with — "Provided If-Match value does not match
-        // the current latest version ETag." — parameterised by the version the
-        // headers targeted; nothing of the request's own values goes into it.
-        let version_type = input
-            .match_for_version_type
-            .as_deref()
-            .unwrap_or(crate::state::VERSION_TYPE_LATEST)
-            .to_lowercase();
+        // The wording of both refusals is
+        // [`crate::state::precondition_failed_message`], the one place this
+        // service words a failed precondition on an asset-model write: the
+        // conditional header that failed and the version the headers targeted,
+        // and nothing of the request's own values.
         let target_e_tag = {
             let record = store
                 .asset_models
@@ -303,9 +299,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(precondition_failed(
                     &region,
                     &id,
-                    format!(
-                        "Provided If-Match value does not match the current {version_type} \
-                         version ETag."
+                    crate::state::precondition_failed_message(
+                        crate::state::HEADER_IF_MATCH,
+                        input.match_for_version_type.as_deref(),
                     ),
                 ));
             }
@@ -319,9 +315,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(precondition_failed(
                 &region,
                 &id,
-                format!(
-                    "Provided If-None-Match value does not match the current {version_type} \
-                     version ETag."
+                crate::state::precondition_failed_message(
+                    crate::state::HEADER_IF_NONE_MATCH,
+                    input.match_for_version_type.as_deref(),
                 ),
             ));
         }

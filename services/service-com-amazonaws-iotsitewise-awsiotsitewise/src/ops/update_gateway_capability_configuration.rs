@@ -219,34 +219,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // The stored list is bounded: a write naming a namespace the gateway does not
-        // hold yet is the only thing that lengthens it and nothing shortens it, so
-        // past the cap that write is a quota refusal. A write REPLACING a namespace
-        // already configured adds nothing, so it is never refused for the cap.
-        if gateway.capability(&input.capability_namespace).is_none()
-            && gateway.capabilities.len() >= crate::state::MAX_CAPABILITIES_PER_GATEWAY
-        {
-            return Err(UpdateGatewayCapabilityConfigurationError::Modeled(
-                UpdateGatewayCapabilityConfigurationErrorModeled::LimitExceededException(
-                    LimitExceededException {
-                        message: format!(
-                            "This emulator holds at most {} capability configurations per gateway.",
-                            crate::state::MAX_CAPABILITIES_PER_GATEWAY
-                        ),
-                    },
-                ),
-            ));
-        }
-
         // The write is the last word on the namespace it names: a configuration
         // already there is replaced, a namespace nothing has configured is defined,
         // and either way the capability is out of sync until the gateway processes it.
+        //
+        // The stored list is bounded at the single writer: a write naming a
+        // namespace the gateway does not hold yet is the only thing that lengthens
+        // it and nothing shortens it, so past the cap that write is this quota
+        // refusal, which `set_capability` reports rather than pushing.
         let capability_sync_status = gateway
             .set_capability(
                 &input.capability_namespace,
                 input.capability_configuration.clone(),
                 now,
             )
+            .map_err(limit_exceeded)?
             .to_string();
 
         Ok(UpdateGatewayCapabilityConfigurationOutput {
@@ -261,6 +248,16 @@ fn invalid_request(message: String) -> UpdateGatewayCapabilityConfigurationError
     UpdateGatewayCapabilityConfigurationError::Modeled(
         UpdateGatewayCapabilityConfigurationErrorModeled::InvalidRequestException(
             InvalidRequestException { message },
+        ),
+    )
+}
+
+/// HTTP 410 `LimitExceededException` carrying `message`: the quota the write
+/// would have taken the gateway past.
+fn limit_exceeded(message: String) -> UpdateGatewayCapabilityConfigurationError {
+    UpdateGatewayCapabilityConfigurationError::Modeled(
+        UpdateGatewayCapabilityConfigurationErrorModeled::LimitExceededException(
+            LimitExceededException { message },
         ),
     )
 }

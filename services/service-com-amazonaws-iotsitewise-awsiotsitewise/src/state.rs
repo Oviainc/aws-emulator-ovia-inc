@@ -1556,35 +1556,58 @@ impl GatewayRecord {
 
     /// Configure `namespace` on this gateway with `configuration`, replacing
     /// whatever a previous write put there, and report the sync status the write
-    /// answers with.
+    /// answers with — or, past [`MAX_CAPABILITIES_PER_GATEWAY`], the message the
+    /// quota refusal carries.
     ///
     /// A write is the last word on the namespace it names and says nothing about
     /// any other, so an existing entry is replaced IN PLACE — keeping the order a
     /// reader reports — and a namespace nothing has configured is appended. The
     /// gateway's `lastUpdateDate` moves with it, because the capability summaries
     /// a gateway reader reports are part of what this write changed.
+    ///
+    /// The bound lives HERE, at the only thing that lengthens the list: the
+    /// namespace is caller-supplied and nothing evicts an entry, so without a
+    /// ceiling at the writer a stream of writes naming fresh namespaces would
+    /// grow one emulator process without limit. A write REPLACING a namespace
+    /// already configured lengthens nothing, so it is never refused for the cap.
+    /// The `Err` carries the refusal message, which the calling operation lifts
+    /// into its own modelled `LimitExceededException`.
     pub fn set_capability(
         &mut self,
         namespace: &str,
         configuration: String,
         now: SystemTime,
-    ) -> &'static str {
+    ) -> Result<&'static str, String> {
+        let existing = self
+            .capabilities
+            .iter_mut()
+            .find(|capability| capability.namespace == namespace);
         let record = GatewayCapabilityRecord {
             namespace: namespace.to_string(),
             configuration,
             in_sync_at: now + ACTIVATION_DELAY,
         };
-        match self
-            .capabilities
-            .iter_mut()
-            .find(|capability| capability.namespace == namespace)
-        {
+        match existing {
             Some(existing) => *existing = record,
-            None => self.capabilities.push(record),
+            None => {
+                if self.capabilities.len() >= MAX_CAPABILITIES_PER_GATEWAY {
+                    return Err(capability_limit_message());
+                }
+                self.capabilities.push(record);
+            }
         }
         self.last_update_date = now;
-        CAPABILITY_SYNC_OUT_OF_SYNC
+        Ok(CAPABILITY_SYNC_OUT_OF_SYNC)
     }
+}
+
+/// The message the per-gateway capability quota is refused with: the ceiling
+/// [`MAX_CAPABILITIES_PER_GATEWAY`] states, named as the refusal's own limit.
+pub fn capability_limit_message() -> String {
+    format!(
+        "This emulator holds at most {MAX_CAPABILITIES_PER_GATEWAY} capability configurations \
+         per gateway."
+    )
 }
 
 /// One capability configured on a gateway: the namespace that selects it, the
@@ -6438,6 +6461,52 @@ pub fn asset_model_target_etag(
     record
         .version_view(version_type, now)
         .map(|view| asset_model_etag(&view))
+}
+
+/// The conditional request header an asset-model write carries the expected
+/// entity tag in, spelled the way the model binds it (`@httpHeader("If-Match")`).
+pub const HEADER_IF_MATCH: &str = "If-Match";
+
+/// The conditional request header an asset-model write asks for the ABSENCE of
+/// the targeted version with, spelled the way the model binds it
+/// (`@httpHeader("If-None-Match")`).
+pub const HEADER_IF_NONE_MATCH: &str = "If-None-Match";
+
+/// The message a failed asset-model precondition carries on an operation that
+/// WRITES the model's definition — the creates and the updates: the conditional
+/// request header whose precondition evaluated to FALSE, and the version
+/// `matchForVersionType` targeted ([`VERSION_TYPE_LATEST`] by default).
+///
+/// This is the sentence IoT SiteWise was observed answering those writes with.
+/// Nothing of the REQUEST's own values goes into it — not the entity tag the
+/// caller sent, which is the value the precondition rejected and which the
+/// caller already holds, not the spelling it sent the header in, and not the
+/// resource's own id — so the refusal states the condition that failed and the
+/// version it was evaluated on, and leaves the caller to re-read the resource
+/// for the tag it now carries.
+///
+/// One wording for every one of those writes, so `CreateAssetModelCompositeModel`,
+/// `UpdateAssetModel` and `UpdateAssetModelCompositeModel` cannot word one
+/// condition on one resource three ways. The REMOVALS answer the sentence of
+/// their own that IoT SiteWise was observed answering them with; it is
+/// [`precondition_failed_removal_message`].
+pub fn precondition_failed_message(header: &str, version_type: Option<&str>) -> String {
+    let version_type = version_type.unwrap_or(VERSION_TYPE_LATEST).to_lowercase();
+    format!("Provided {header} value does not match the current {version_type} version ETag.")
+}
+
+/// The message a failed asset-model precondition carries on an operation that
+/// REMOVES part of the model — `DeleteAssetModel` and
+/// `DeleteAssetModelCompositeModel`: the conditional request header whose
+/// precondition evaluated to FALSE, and nothing else.
+///
+/// This is the sentence IoT SiteWise was observed answering the removals with:
+/// it names no version, so the version selector does not reach it either. As
+/// with [`precondition_failed_message`], nothing of the REQUEST's own values
+/// goes into it. One wording for both removals, so neither can word the
+/// condition its own way.
+pub fn precondition_failed_removal_message(header: &str) -> String {
+    format!("Precondition failed for provided {header} value.")
 }
 
 /// The message a read or a precondition carries when the asset model has no

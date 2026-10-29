@@ -284,12 +284,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // written, the way HTTP preconditions are: one that fails leaves the asset
         // model exactly as it was. They talk about the asset model, since that is
         // the versioned resource this call writes to, and which version they target
-        // is the shared rule every asset-model write follows.
-        let version_type = input
-            .match_for_version_type
-            .as_deref()
-            .unwrap_or(crate::state::VERSION_TYPE_LATEST)
-            .to_lowercase();
+        // is the shared rule every asset-model write follows. So is the wording of
+        // the refusal: [`crate::state::precondition_failed_message`] names the
+        // conditional header that failed and the version the headers targeted,
+        // and nothing of the request's own values.
         let target_e_tag = crate::state::asset_model_target_etag(
             record,
             input.match_for_version_type.as_deref(),
@@ -303,9 +301,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(precondition_failed(
                     &region,
                     &asset_model_id,
-                    format!(
-                        "Provided If-Match value does not match the current {version_type} \
-                         version ETag."
+                    crate::state::precondition_failed_message(
+                        crate::state::HEADER_IF_MATCH,
+                        input.match_for_version_type.as_deref(),
                     ),
                 ));
             }
@@ -319,9 +317,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(precondition_failed(
                 &region,
                 &asset_model_id,
-                format!(
-                    "Provided If-None-Match value does not match the current {version_type} \
-                     version ETag."
+                crate::state::precondition_failed_message(
+                    crate::state::HEADER_IF_NONE_MATCH,
+                    input.match_for_version_type.as_deref(),
                 ),
             ));
         }
