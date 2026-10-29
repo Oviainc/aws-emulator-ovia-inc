@@ -214,6 +214,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // The failover setting the flow STORES names its primary source by NAME
+        // (`SourcePriority$PrimarySource`: "the name of the source you choose as the primary
+        // source for this flow"), so it is a reference to one of the flow's own sources —
+        // the very reference every path that writes a priority resolves against the sources
+        // the flow holds (`crate::state::flow_primary_source_rejection`). Taking that source
+        // away would leave the stored setting naming a source the flow has not got, a state
+        // no later write could restate, so a request to remove it is a semantic error and
+        // removes nothing — exactly as RemoveFlowMediaStream and RemoveFlowVpcInterface
+        // refuse to leave a media-stream or a VPC-interface reference behind.
+        if let Some(rejection) = crate::state::flow_primary_source_removal_rejection(
+            flow.source_failover_config.as_ref(),
+            &flow.sources[position].name,
+        ) {
+            return Err(bad_request(rejection));
+        }
+
         let removed = flow.sources.remove(position);
         let flow_arn = flow.flow_arn.clone();
         let removed_source_arn = removed.source_arn;

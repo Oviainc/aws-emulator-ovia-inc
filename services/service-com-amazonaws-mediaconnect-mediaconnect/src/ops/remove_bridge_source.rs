@@ -79,6 +79,17 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]).
+fn bad_request(detail: impl Into<String>) -> RemoveBridgeSourceError {
+    RemoveBridgeSourceErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
 /// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
 /// in the request does not exist in the system" — the bridge or the source `identifier`
 /// addressed, in this service's not-found envelope
@@ -200,6 +211,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(position) = bridge.source_position(&input.source_name) else {
             return Err(not_found(&input.source_name));
         };
+        // The failover setting the bridge STORES names its primary source by NAME
+        // (`SourcePriority$PrimarySource`), so it is a reference to one of the bridge's own
+        // sources — the very reference every path that writes a priority resolves against
+        // the sources the bridge holds (`crate::state::bridge_primary_source_rejection`).
+        // Taking that source away would leave the stored setting naming a source the bridge
+        // has not got, a state no later write could restate, so a request to remove it is a
+        // semantic error and removes nothing, as it is on the flow side of the same
+        // reference (RemoveFlowSource).
+        if let Some(rejection) = crate::state::bridge_primary_source_removal_rejection(
+            bridge.source_failover_config.as_ref(),
+            crate::state::bridge_source_name(&bridge.sources[position]),
+        ) {
+            return Err(bad_request(rejection));
+        }
+
         let removed = bridge.sources.remove(position);
 
         // "The ARN of the bridge from which the source was removed" and "the name of the

@@ -1379,6 +1379,62 @@ fn primary_source_rejection<'a>(
     ))
 }
 
+/// Why the source named `source_name` cannot be taken out of a FLOW whose stored source
+/// failover setting is `config`, or `None` when taking it out leaves that setting naming a
+/// source the flow still has.
+///
+/// See [`primary_source_removal_rejection`], which both the flow side and the bridge side
+/// read the relation from.
+pub fn flow_primary_source_removal_rejection(
+    config: Option<&FailoverConfig>,
+    source_name: &str,
+) -> Option<String> {
+    primary_source_removal_rejection("flow", config, source_name)
+}
+
+/// Why the source named `source_name` cannot be taken out of a BRIDGE whose stored source
+/// failover setting is `config`, or `None` when taking it out leaves that setting naming a
+/// source the bridge still has.
+///
+/// See [`primary_source_removal_rejection`], which both the flow side and the bridge side
+/// read the relation from.
+pub fn bridge_primary_source_removal_rejection(
+    config: Option<&FailoverConfig>,
+    source_name: &str,
+) -> Option<String> {
+    primary_source_removal_rejection("bridge", config, source_name)
+}
+
+/// The detail a REMOVE request is refused with when `source_name` is the source that
+/// `resource` — a flow or a bridge, the two resources whose sources one
+/// `SourceFailoverConfig` governs — stores as its primary source, or `None` when the stored
+/// setting names some other source or none at all.
+///
+/// The removal side of the reference [`primary_source_rejection`] resolves on every write: a
+/// stored failover setting may only name a source its resource HAS, so a request that would
+/// take that source away is a semantic error and takes nothing away — the same reading the
+/// other removals of this family apply to the references their resource holds (a media
+/// stream a source or an output still associates, a VPC interface a source or an output
+/// still references). A caller that wants the source gone points the priority at another
+/// source of the resource first, through the update path that writes one.
+fn primary_source_removal_rejection(
+    resource: &str,
+    config: Option<&FailoverConfig>,
+    source_name: &str,
+) -> Option<String> {
+    let primary = config
+        .and_then(|config| config.source_priority.as_ref())
+        .and_then(|priority| priority.primary_source.as_deref())?;
+    if primary != source_name {
+        return None;
+    }
+    Some(format!(
+        "Source {source_name:?} is the primary source of this {resource}'s source failover \
+         configuration. A source can be removed only while the source failover priority of \
+         its {resource} does not name it as the primary source."
+    ))
+}
+
 /// The encryption a resource holds after `update` is applied to `stored`, or `None` when
 /// the merge would leave an encryption with no role ARN.
 ///
