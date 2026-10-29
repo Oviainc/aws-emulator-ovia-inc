@@ -141,7 +141,7 @@ fn associate_cases() -> Vec<AssociateCase> {
 }
 
 /// `POST /projects/{projectId}/assets/associate`.
-fn associate_uri(project_id: &str) -> String {
+pub(crate) fn associate_uri(project_id: &str) -> String {
     format!("{PROJECTS}/{project_id}/assets/associate")
 }
 
@@ -151,7 +151,7 @@ fn project_assets_uri(project_id: &str) -> String {
 }
 
 /// The body one association request carries.
-fn associate_body(asset_ids: &[String], client_token: Option<&str>) -> Value {
+pub(crate) fn associate_body(asset_ids: &[String], client_token: Option<&str>) -> Value {
     let mut body = Map::new();
     body.insert(
         "assetIds".to_string(),

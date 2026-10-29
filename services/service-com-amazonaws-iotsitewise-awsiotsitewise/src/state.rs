@@ -9165,8 +9165,13 @@ pub enum TokenVerdict {
     /// The SAME request already ran under this token, so this one is a retry of
     /// it: answer from the resource named here and write nothing.
     Replay(String),
-    /// A DIFFERENT request already spent this token: refuse it, naming the
-    /// resource that earlier call acted on.
+    /// A DIFFERENT request — this operation, this token, other members — already
+    /// spent this token, which names the resource that earlier call acted on.
+    /// Such a request repeats no call, so what it gets depends on what the
+    /// operation can say: one whose error list declares the modelled conflict
+    /// refuses it, naming that resource, and one that declares none carries it
+    /// out as the request it is, because its answer would otherwise assert a
+    /// change nothing recorded.
     Spent(String),
 }
 

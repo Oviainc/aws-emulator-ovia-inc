@@ -352,6 +352,10 @@ mod associated_assets;
 mod batch_get_latest_values;
 #[path = "all/batch_property_value_history.rs"]
 mod batch_property_value_history;
+// In its alphabetical place inside the sorted list, between the two batch suites
+// it sorts beside.
+#[path = "all/batch_project_assets_client_token.rs"]
+mod batch_project_assets_client_token;
 #[path = "all/batch_put_timestamp_and_quality.rs"]
 mod batch_put_timestamp_and_quality;
 // In its alphabetical place inside the sorted list, rather than appended after

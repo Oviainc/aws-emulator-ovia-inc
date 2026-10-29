@@ -54,12 +54,12 @@ const ABSENT_ID: &str = "11111111-2222-3333-4444-555555555555";
 /// `POST /projects/{projectId}/assets/disassociate`, as the model binds the
 /// operation (same source as above: `http {method: POST, uri:
 /// /projects/{projectId}/assets/disassociate}`).
-fn disassociate_uri(project_id: &str) -> String {
+pub(crate) fn disassociate_uri(project_id: &str) -> String {
     format!("/projects/{project_id}/assets/disassociate")
 }
 
 /// The body one disassociation request carries.
-fn disassociate_body(asset_ids: &[String], client_token: Option<&str>) -> Value {
+pub(crate) fn disassociate_body(asset_ids: &[String], client_token: Option<&str>) -> Value {
     let mut body = Map::new();
     body.insert(
         "assetIds".to_string(),
