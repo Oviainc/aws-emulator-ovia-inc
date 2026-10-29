@@ -157,6 +157,13 @@ pub(crate) fn rule(name: &str, statement: Value) -> Value {
     })
 }
 
+/// A blob member — `ByteMatchStatement$SearchString` is one — travels base64-encoded
+/// in an awsJson body. One copy for every suite that writes such a statement.
+pub(crate) fn base64_of(value: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
+}
+
 /// A `SqliMatchStatement` over the query string.
 pub(crate) fn sqli_statement() -> Value {
     json!({

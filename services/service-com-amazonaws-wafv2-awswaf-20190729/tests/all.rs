@@ -71,6 +71,8 @@ mod parameter_validation;
 mod permission_policy;
 #[path = "all/rate_based_statement_managed_keys.rs"]
 mod rate_based_statement_managed_keys;
+#[path = "all/rate_based_window_recovery.rs"]
+mod rate_based_window_recovery;
 #[path = "all/referenced_resource_deletes.rs"]
 mod referenced_resource_deletes;
 #[path = "all/regex_pattern_set_lifecycle.rs"]
@@ -99,6 +101,8 @@ mod rule_group_lifecycle;
 mod rule_group_updates;
 #[path = "all/sampled_requests.rs"]
 mod sampled_requests;
+#[path = "all/sampled_rule_provenance.rs"]
+mod sampled_rule_provenance;
 #[path = "all/settlement_records.rs"]
 mod settlement_records;
 #[path = "all/state_roundtrip.rs"]

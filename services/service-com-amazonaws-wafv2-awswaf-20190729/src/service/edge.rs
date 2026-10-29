@@ -401,6 +401,35 @@ pub fn rule_path(referrer: Option<&str>, rule_name: &str) -> String {
     }
 }
 
+/// The separator the segments of a group-qualified rule name are joined with; see
+/// [`group_rule_name`].
+const RULE_NAME_QUALIFIER_SEPARATOR: &str = "#";
+
+/// The name `SampledHTTPRequest$RuleNameWithinRuleGroup` reports for a rule that
+/// decided INSIDE a rule group: the segments that name the GROUP, then the rule's
+/// group-local name.
+///
+/// The member states the form — "For managed rule groups, the format for this name is
+/// `<vendor name>#<managed rule group name>#<rule name>`. For your own rule groups, the
+/// format for this name is `<rule group name>#<rule name>`. If the rule is not in a
+/// rule group, this field is absent." So the qualification is whatever names the group
+/// the rule lives in (a managed group's vendor and its name, a customer-owned group's
+/// name), the group-local name is the last segment, and a rule of the web ACL itself
+/// lives in no group and so has no name here at all.
+///
+/// A segment nothing named is left out rather than joined as an empty one: the value is
+/// read by a client that splits it, so a separator with nothing in front of it would
+/// name a group that does not exist.
+fn group_rule_name(group: &[&str], rule_name: &str) -> String {
+    group
+        .iter()
+        .copied()
+        .filter(|segment| !segment.is_empty())
+        .chain(::std::iter::once(rule_name))
+        .collect::<Vec<&str>>()
+        .join(RULE_NAME_QUALIFIER_SEPARATOR)
+}
+
 /// Decide one request against the web ACL in front of `resource_arn`, and record what
 /// WAF records about its own data plane.
 ///
@@ -766,7 +795,8 @@ enum RuleOutcome {
         action: EdgeAction,
         /// Its `CustomResponse`, if it configured one.
         custom_response: Option<CustomResponse>,
-        /// The rule within a rule group that decided, when a group rule did.
+        /// The rule within a rule group that decided, when a group rule did, named as
+        /// [`group_rule_name`] qualifies it.
         inner_rule: Option<String>,
     },
 }
@@ -902,6 +932,9 @@ impl Evaluation<'_> {
                 managed.excluded_rules.as_deref(),
                 managed.rule_action_overrides.as_deref(),
                 rule.override_action.as_ref(),
+                // What NAMES this group, for the rule name a sample of it reports: a
+                // managed group is named by its vendor and its own name.
+                &[managed.vendor_name.as_str(), managed.name.as_str()],
                 &managed_namespace(managed),
                 cx,
                 inserted,
@@ -949,6 +982,7 @@ impl Evaluation<'_> {
         excluded: Option<&[ExcludedRule]>,
         overrides: Option<&[RuleActionOverride]>,
         override_action: Option<&OverrideAction>,
+        group: &[&str],
         namespace: &str,
         cx: &mut MatchContext<'_>,
         inserted: &mut Vec<(String, String)>,
@@ -980,7 +1014,7 @@ impl Evaluation<'_> {
             if let Some(outcome) = terminating(
                 action.as_ref(),
                 inserted,
-                Some(group_rule.name.clone()),
+                Some(group_rule_name(group, &group_rule.name)),
             ) {
                 return outcome;
             }
@@ -1034,9 +1068,12 @@ impl Evaluation<'_> {
                 overrides,
                 counted_group,
             );
-            if let Some(outcome) =
-                terminating(action.as_ref(), inserted, Some(group_rule.name.clone()))
-            {
+            if let Some(outcome) = terminating(
+                action.as_ref(),
+                inserted,
+                // A customer-owned group is named by its own name alone.
+                Some(group_rule_name(&[group_name], &group_rule.name)),
+            ) {
                 return outcome;
             }
         }
@@ -2629,6 +2666,32 @@ mod tests {
             assert_eq!(
                 actual, *expected,
                 "case {scope}/{key}: expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_group_rule_name_is_the_group_then_the_rule() {
+        // `SampledHTTPRequest$RuleNameWithinRuleGroup`: `<vendor name>#<managed rule
+        // group name>#<rule name>` for a managed group, `<rule group name>#<rule name>`
+        // for one of the account's own, and a segment nothing named is left out rather
+        // than joined as an empty one.
+        let cases: &[(&[&str], &str, &str)] = &[
+            (
+                &["AWS", "AWSManagedRulesSQLiRuleSet"],
+                "SQLi_QUERYARGUMENTS",
+                "AWS#AWSManagedRulesSQLiRuleSet#SQLi_QUERYARGUMENTS",
+            ),
+            (&["own-guard"], "deny-upload", "own-guard#deny-upload"),
+            (&[""], "deny-upload", "deny-upload"),
+            (&[], "deny-upload", "deny-upload"),
+        ];
+        for (group, rule_name, expected) in cases {
+            let actual = group_rule_name(group, rule_name);
+            assert_eq!(
+                actual, *expected,
+                "case {group:?} holding {rule_name:?}: expected {expected:?}, got \
+                 {actual:?}"
             );
         }
     }

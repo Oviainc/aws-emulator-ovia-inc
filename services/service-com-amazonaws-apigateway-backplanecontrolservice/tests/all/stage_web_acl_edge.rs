@@ -1088,10 +1088,18 @@ async fn a_managed_rule_group_decides_and_the_sample_names_the_rule_that_did() {
     );
     for sample in &blocked {
         let named = sample["RuleNameWithinRuleGroup"].as_str().unwrap_or_default();
+        // `SampledHTTPRequest$RuleNameWithinRuleGroup`: "For managed rule groups, the
+        // format for this name is <vendor name>#<managed rule group name>#<rule
+        // name>" — so the terminating rule is named by the group that holds it, and
+        // the group-local SQLi rule is the last segment.
+        let segments: Vec<&str> = named.split('#').collect();
         assert!(
-            named.starts_with("SQLi"),
+            segments.len() == 3
+                && segments[0] == "AWS"
+                && segments[1] == "AWSManagedRulesSQLiRuleSet"
+                && segments[2].starts_with("SQLi"),
             "case the sample of the rule that blocked: expected the group's own SQLi \
-             rule to be named, got {named:?} in {sample}"
+             rule named AWS#AWSManagedRulesSQLiRuleSet#<rule>, got {named:?} in {sample}"
         );
     }
 }

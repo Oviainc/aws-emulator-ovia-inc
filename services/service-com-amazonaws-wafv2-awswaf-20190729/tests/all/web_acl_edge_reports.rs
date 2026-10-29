@@ -27,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use service_com_amazonaws_wafv2_awswaf_20190729::service::edge::{self, InspectedRequest};
 
-use crate::web_acl_lifecycle::{visibility, Waf, TEST_REGION};
+use crate::web_acl_lifecycle::{base64_of, visibility, Waf, TEST_REGION};
 
 /// A stub protected resource: an API Gateway REST API stage, the one ARN form
 /// `AssociateWebACLRequest$ResourceArn` documents for one. The stage itself belongs to
@@ -53,12 +53,6 @@ fn request_from(client_ip: &str, path: &str) -> InspectedRequest {
         body: Vec::new(),
         client_ip: client_ip.to_string(),
     }
-}
-
-/// `ByteMatchStatement$SearchString` is a blob, which an awsJson body carries base64.
-fn base64_of(value: &str) -> String {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
 }
 
 /// The web ACL both reports below are read of: one blocking byte-match rule and one
