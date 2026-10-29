@@ -28,7 +28,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
-    service_state, MAX_PAGE_SIZE, MAX_RECORDS_PER_STORE, SCHEDULING_SETTLES_AFTER,
+    parse_ground_stations, service_state, MAX_PAGE_SIZE, MAX_RECORDS_PER_STORE,
+    SCHEDULING_SETTLES_AFTER,
 };
 use service_com_amazonaws_groundstation_groundstation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -153,6 +154,45 @@ pub(crate) fn provision_uplink_approval(engine: &engine::InMemoryEngine) {
 pub(crate) fn harness() -> MultiServiceRouter {
     let (router, engine) = harness_with_engine();
     provision_uplink_approval(&engine);
+    router
+}
+
+/// Tell this account it is served by the ground stations `setting` describes — what
+/// happens OUTSIDE this API, which models no operation that builds an inventory, so the
+/// stations land exactly where `state::GROUND_STATIONS_ENV` lands them.
+///
+/// `pub(crate)`: a ground station named in a request is one of the stations this account
+/// is served by, so every sibling suite that reserves antenna time or asks what is held
+/// at a station says here which stations its account knows rather than relying on a
+/// lookup that found none. Entries are ADDED to what the account already knows, so a
+/// suite can stock a second station without losing the first.
+pub(crate) fn stock_ground_stations(engine: &engine::InMemoryEngine, setting: &str) {
+    let inventory = parse_ground_stations(setting);
+    assert!(
+        !inventory.is_empty(),
+        "the setting {setting:?} must describe at least one ground station"
+    );
+    service_state(engine)
+        .expect("this service's state store")
+        .lock()
+        .ground_stations
+        .extend(inventory);
+}
+
+/// The ground station the suites of this target book antenna time at by default.
+///
+/// `pub(crate)`: a reservation names a ground station this account is served by, so a
+/// suite that books a pass stocks THIS station ([`stock_ground_stations`] /
+/// [`harness_serving`]) and books at it, rather than each suite inventing a name of its
+/// own beside its seeding call.
+pub(crate) const STATION: &str = "Ohio-1";
+
+/// A router over an account provisioned as [`harness`] does and served by the ground
+/// stations `setting` describes ([`stock_ground_stations`]).
+pub(crate) fn harness_serving(setting: &str) -> MultiServiceRouter {
+    let (router, engine) = harness_with_engine();
+    provision_uplink_approval(&engine);
+    stock_ground_stations(&engine, setting);
     router
 }
 
@@ -1325,7 +1365,9 @@ async fn list_contacts(router: &MultiServiceRouter, filters: Value) -> Vec<Strin
 
 #[tokio::test]
 async fn reserve_contact_enforces_the_window_the_mission_profile_requires() {
-    let router = harness();
+    // The account is served by the station every row reserves at: a reservation names a
+    // ground station this account knows.
+    let router = harness_serving("Ohio-1");
     let minimum = 180_i64;
     let profile_arn = create_mission_profile(&router, "windows", minimum, None, None).await;
     let start = 1_800_000_000_i64;

@@ -33,7 +33,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::minute_usage::{epoch, reserve_pass};
 use crate::scheduling_loop::{
-    create_config, create_tracking_config, harness_with_engine, send, spectrum_config, Reply,
+    create_config, create_tracking_config, harness_with_engine, send, spectrum_config,
+    stock_ground_stations, Reply,
     ABSENT_UUID, REGION,
 };
 
@@ -181,6 +182,8 @@ pub(crate) fn put_in_status(engine: &engine::InMemoryEngine, contact_id: &str, s
 #[tokio::test]
 async fn a_mission_profile_is_deleted_only_when_no_contact_still_to_be_flown_names_it() {
     let (router, engine) = harness_with_engine();
+    // The account is served by the station every reservation below is held at.
+    stock_ground_stations(&engine, GROUND_STATION);
 
     for terminal in TERMINAL_CONTACT_STATUSES {
         assert!(
@@ -286,7 +289,8 @@ async fn a_mission_profile_is_deleted_only_when_no_contact_still_to_be_flown_nam
 
 #[tokio::test]
 async fn the_refusal_names_every_holding_contact_and_the_delete_lands_once_they_are_released() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, GROUND_STATION);
     let (profile_id, profile_arn) = profile_with_one_dataflow(&router, "held profile").await;
     // A second profile no contact is reserved against: the guard counts the contacts that
     // name THIS profile, not every contact the store holds.
@@ -392,7 +396,8 @@ async fn the_refusal_names_every_holding_contact_and_the_delete_lands_once_they_
 
 #[tokio::test]
 async fn a_refused_delete_leaves_the_profile_and_the_contact_loop_exactly_as_they_were() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, GROUND_STATION);
     let (profile_id, profile_arn) = profile_with_one_dataflow(&router, "untouched profile").await;
     let start = epoch(2035, 7, 9, 13, 30);
     let contact_id = reserve_pass(&router, &profile_arn, "untouched", start, 10 * 60).await;

@@ -20,7 +20,9 @@ use service_com_amazonaws_groundstation_groundstation::state::service_state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::minute_usage::{epoch, minute_usage, minutes, month_of, reserve_pass};
-use crate::scheduling_loop::{create_mission_profile, harness_with_engine, send, AFTER_SETTLE};
+use crate::scheduling_loop::{
+    create_mission_profile, harness_with_engine, send, stock_ground_stations, AFTER_SETTLE, STATION,
+};
 
 /// What a cancel does to a contact that holds a given `ContactStatus`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +97,7 @@ async fn described_status(router: &MultiServiceRouter, contact_id: &str, case: &
 #[tokio::test]
 async fn a_cancel_releases_only_a_contact_that_still_holds_a_reservation() {
     let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, STATION);
     let profile_arn = create_mission_profile(&router, "cancel table", 60, None, None).await;
     let start = epoch(2033, 5, 17, 9, 0);
 
@@ -201,6 +204,7 @@ async fn a_cancel_gives_back_only_antenna_time_no_pass_has_used() {
     for (status, expected_after) in rows {
         // One store per row, so the month's usage is the one contact's.
         let (router, engine) = harness_with_engine();
+        stock_ground_stations(&engine, STATION);
         let profile_arn = create_mission_profile(&router, "antenna time", 60, None, None).await;
         let start = epoch(2034, 2, 8, 11, 0);
         let month = month_of(start);

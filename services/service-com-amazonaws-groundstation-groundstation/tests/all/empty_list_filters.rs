@@ -32,7 +32,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ephemeris_catalog::{create_ok, tle_inline, wait_out_validation, FUTURE, PAST};
-use crate::scheduling_loop::{create_mission_profile, harness_with_engine, send, AFTER_SETTLE};
+use crate::scheduling_loop::{
+    create_mission_profile, harness_with_engine, send, stock_ground_stations, AFTER_SETTLE,
+};
 
 /// The ground station every contact of these suites is reserved at.
 const STATION: &str = "Ohio-1";
@@ -226,7 +228,9 @@ async fn reserve(
 /// them: a reservation the scheduler has confirmed, one whose pass the clock is inside, and
 /// one that was released. The statuses are read back rather than assumed.
 async fn contacts_in_several_statuses() -> (MultiServiceRouter, Vec<Held>, (i64, i64)) {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    // The account is served by the station every contact below is reserved at.
+    stock_ground_stations(&engine, STATION);
     let profile_arn = create_mission_profile(&router, "empty status list", 60, None, None).await;
     let now = now_seconds();
 

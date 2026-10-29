@@ -44,7 +44,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::contact_cancellation::put_in_status;
 use crate::scheduling_loop::{
-    create_mission_profile, harness_with_engine, is_uuid, send, Reply, AFTER_SETTLE,
+    create_mission_profile, harness_with_engine, is_uuid, send, stock_ground_stations, Reply,
+    AFTER_SETTLE,
 };
 
 /// The ground station every row holds its pass at. Nothing is recorded about its antennas,
@@ -239,6 +240,8 @@ fn stored_contacts(engine: &engine::InMemoryEngine) -> usize {
 /// in the state the row describes, with the move the row leaves owed not yet applied.
 async fn stand_up(row: &Row) -> Standing {
     let (router, engine) = harness_with_engine();
+    // The account is served by the station the row's contact is held at.
+    stock_ground_stations(&engine, STATION);
     // A pre-pass and a post-pass period, so the contact has every stage of a pass the rows
     // put it in.
     let profile_arn = create_mission_profile(&router, row.case, 60, Some(120), Some(60)).await;
@@ -453,6 +456,7 @@ async fn a_reservation_is_placed_against_the_contact_statuses_the_clock_has_made
 #[tokio::test]
 async fn a_reservation_is_the_first_call_after_a_stopped_passs_release_fell_due() {
     let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, STATION);
     let profile_arn =
         create_mission_profile(&router, "the pass clock", 60, Some(120), Some(60)).await;
 

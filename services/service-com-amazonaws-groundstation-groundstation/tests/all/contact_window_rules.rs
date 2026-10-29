@@ -281,7 +281,10 @@ async fn held_antennas(
 
 #[tokio::test]
 async fn a_window_whose_antenna_time_has_elapsed_is_not_reservable() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    // The account is served by the station every row reserves at, and has been told no
+    // antenna for it: the placement gives it the one antenna the emulator numbers.
+    stock_inventory(&engine, STATION, 0);
     let profile_arn = create_mission_profile(&router, "elapsed windows", 60, None, None).await;
     let now = now_seconds();
 
@@ -341,7 +344,8 @@ async fn a_window_whose_antenna_time_has_elapsed_is_not_reservable() {
 
 #[tokio::test]
 async fn a_window_an_antenna_already_holds_is_not_reservable() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    stock_inventory(&engine, STATION, 0);
     let profile_arn = create_mission_profile(&router, "overlapping windows", 60, None, None).await;
 
     // The pass the station's one antenna holds. The station has no recorded inventory, so

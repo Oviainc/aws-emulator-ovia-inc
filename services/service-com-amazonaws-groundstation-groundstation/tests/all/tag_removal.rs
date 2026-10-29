@@ -40,8 +40,8 @@ use crate::resource_tagging::{
     taggable_resources, tags_of, Taggable,
 };
 use crate::scheduling_loop::{
-    create_config, harness, send, Reply, ABSENT_CONFIG_ARN, ABSENT_MISSION_PROFILE_ARN, ABSENT_UUID,
-    REGION,
+    create_config, harness, harness_serving, send, Reply, ABSENT_CONFIG_ARN,
+    ABSENT_MISSION_PROFILE_ARN, ABSENT_UUID, REGION, STATION,
 };
 
 /// The longest `tagKeys` list the model admits (`smithy_query(query="shape",
@@ -178,7 +178,9 @@ async fn seed(router: &MultiServiceRouter, case: &str, arn: &str) -> BTreeMap<St
 
 #[tokio::test]
 async fn untag_resource_drops_the_named_keys_from_the_resource_its_arn_names() {
-    let router = harness();
+    // The taggable resources include a reserved contact, so the account is served by the
+    // station that reservation is held at.
+    let router = harness_serving(STATION);
 
     for resource in taggable_resources(&router).await {
         let Taggable {
@@ -255,7 +257,7 @@ async fn untag_resource_drops_the_named_keys_from_the_resource_its_arn_names() {
 
 #[tokio::test]
 async fn a_removal_touches_only_the_resource_its_arn_names() {
-    let router = harness();
+    let router = harness_serving(STATION);
     let resources = taggable_resources(&router).await;
 
     // One key every resource holds, so removing it from one is observable on all.

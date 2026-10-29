@@ -32,7 +32,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::dataflow_endpoint_groups::{create_group, details, endpoint_kinds, get_group};
 use crate::scheduling_loop::{
-    create_config, create_tracking_config, harness, send, spectrum_config, AFTER_SETTLE,
+    create_config, create_tracking_config, harness_serving, send, spectrum_config, AFTER_SETTLE,
 };
 
 /// The window every row's contact is reserved over: antenna time far enough ahead that no
@@ -110,7 +110,7 @@ struct Case {
 /// contact reserved against the profile carrying that dataflow; answer the router, the
 /// `contactId` and the `dataflowEndpointGroupId`.
 async fn provision(label: &str, member: &str, body: &Value) -> (MultiServiceRouter, String, String) {
-    let router = harness();
+    let router = harness_serving(GROUND_STATION);
     let endpoint_name = body
         .get("name")
         .and_then(Value::as_str)

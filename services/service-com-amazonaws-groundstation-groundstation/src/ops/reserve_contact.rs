@@ -266,6 +266,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ReserveContactErrorModeled::ResourceNotFoundException(error).into());
         }
 
+        // WHERE the antenna is: a contact holds antenna time AT a ground station of this
+        // account, so a `groundStation` naming none this account can address
+        // (`crate::state::ComAmazonawsGroundstationGroundstationState::knows_ground_station`:
+        // the account's own inventory plus the stations its onboardings reach) references
+        // nothing and is refused as the bad parameter it carries, before any antenna is
+        // placed and any contact id is minted. Otherwise the placement's fallback antenna
+        // (`crate::state::placement_antennas`) would hold time at a station the service
+        // itself reports the account cannot address — the reservation could never be
+        // listed. The same rule, under the same text
+        // (`crate::state::ground_station_not_found_message`), that every operation whose
+        // subject is a ground station named in a required member reads.
+        if !guard.knows_ground_station(&input.ground_station) {
+            return Err(ReserveContactErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::ground_station_not_found_message(
+                        &input.ground_station,
+                    )),
+                    parameter_name: Some("groundStation".to_string()),
+                },
+            )
+            .into());
+        }
+
         // The antenna this pass is placed on. A reservation holds an antenna for its
         // window and an antenna serves one pass at a time, so the scheduler places the
         // contact on the first antenna of the ground station nothing else holds for that

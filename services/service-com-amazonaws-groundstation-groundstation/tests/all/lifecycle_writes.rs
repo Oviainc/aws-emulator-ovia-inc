@@ -22,8 +22,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::scheduling_loop::{
     antenna_uplink_config_data, config_data_table, create_config, create_tracking_config, harness,
-    send, spectrum_config, Reply, ABSENT_CONFIG_ARN, ABSENT_MISSION_PROFILE_ARN, ABSENT_UUID,
-    REGION,
+    harness_serving, send, spectrum_config, Reply, ABSENT_CONFIG_ARN, ABSENT_MISSION_PROFILE_ARN,
+    ABSENT_UUID, REGION, STATION,
 };
 
 /// `GET /config/{configType}/{configId}`.
@@ -795,7 +795,9 @@ async fn update_mission_profile_replaces_every_member_it_carries_and_no_other() 
 
 #[tokio::test]
 async fn a_read_serializes_tags_as_a_map_even_when_the_resource_carries_none() {
-    let router = harness();
+    // One row of the table reserves a contact, so the account is served by the station it
+    // is held at.
+    let router = harness_serving(STATION);
     let tracking_arn = create_tracking_config(&router, "tags tracking").await;
 
     // The rule generalises over how many tags a resource carries, so the table runs
@@ -856,7 +858,7 @@ async fn a_read_serializes_tags_as_a_map_even_when_the_resource_carries_none() {
         let start = 1_800_000_000_i64 + i64::try_from(slot).expect("a row index fits in i64") * 86_400;
         let mut reserve = json!({
             "missionProfileArn": profile_arn,
-            "groundStation": "Ohio-1",
+            "groundStation": STATION,
             "startTime": start,
             "endTime": start + 600,
         });

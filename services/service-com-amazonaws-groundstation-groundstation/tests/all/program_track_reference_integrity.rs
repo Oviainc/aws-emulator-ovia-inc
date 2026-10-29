@@ -40,7 +40,8 @@ use crate::ephemeris_catalog::{
     OEM_BODY,
 };
 use crate::scheduling_loop::{
-    create_mission_profile, harness_with_engine, send, Reply, AFTER_SETTLE,
+    create_mission_profile, harness_with_engine, send, stock_ground_stations, Reply, AFTER_SETTLE,
+    STATION,
 };
 
 /// The contact window a reservation in slot 0 books; a later slot books the same window a
@@ -100,7 +101,7 @@ async fn reserve_contact(
     let shift = slot * 86_400;
     let mut body = json!({
         "missionProfileArn": profile_arn,
-        "groundStation": "Ohio-1",
+        "groundStation": STATION,
         "startTime": CONTACT_START + shift,
         "endTime": CONTACT_END + shift,
     });
@@ -179,6 +180,7 @@ async fn ephemeris_of_type(router: &MultiServiceRouter, ephemeris_type: &str) ->
 #[tokio::test]
 async fn an_update_naming_an_ephemeris_this_account_does_not_hold_is_refused() {
     let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, STATION);
     let profile_arn = create_mission_profile(&router, "absent program track", 180, None, None).await;
     let contact_id = reserve_ok(&router, "absent program track", &profile_arn, None, 0).await;
 
@@ -224,6 +226,7 @@ async fn an_update_naming_an_ephemeris_this_account_does_not_hold_is_refused() {
 #[tokio::test]
 async fn a_program_track_must_name_an_ephemeris_of_the_form_its_member_requires() {
     let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, STATION);
     let profile_arn = create_mission_profile(&router, "typed program track", 180, None, None).await;
     let contact_id = reserve_ok(&router, "typed program track", &profile_arn, None, 0).await;
 
@@ -309,6 +312,7 @@ async fn a_program_track_must_name_an_ephemeris_of_the_form_its_member_requires(
 #[tokio::test]
 async fn a_reservation_resolves_the_program_track_its_first_version_carries() {
     let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, STATION);
     let profile_arn = create_mission_profile(&router, "reserved program track", 180, None, None).await;
 
     // A reservation takes the same overrides for a contact's FIRST version, so it is held
@@ -396,6 +400,7 @@ async fn a_reservation_resolves_the_program_track_its_first_version_carries() {
 #[tokio::test]
 async fn an_ephemeris_a_standing_contact_program_tracks_is_in_use_until_it_is_not() {
     let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, STATION);
     let profile_arn = create_mission_profile(&router, "program track in use", 180, None, None).await;
 
     // An ephemeris no satellite of this account is on-boarded for, so what holds it is the
@@ -483,7 +488,8 @@ async fn an_ephemeris_a_standing_contact_program_tracks_is_in_use_until_it_is_no
 
 #[tokio::test]
 async fn overrides_that_name_no_program_track_resolve_nothing() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, STATION);
     let profile_arn = create_mission_profile(&router, "no program track", 180, None, None).await;
 
     // `programTrackSettings` is optional on `TrackingOverrides` (`smithy_query(query="shape",
@@ -515,7 +521,8 @@ async fn overrides_that_name_no_program_track_resolve_nothing() {
 
 #[tokio::test]
 async fn a_program_track_resolves_an_ephemeris_whatever_status_it_is_in() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, STATION);
     let profile_arn = create_mission_profile(&router, "validating track", 180, None, None).await;
     let contact_id = reserve_ok(&router, "validating track", &profile_arn, None, 0).await;
 

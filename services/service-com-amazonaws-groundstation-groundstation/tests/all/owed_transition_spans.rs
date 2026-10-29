@@ -44,7 +44,9 @@ use crate::dataflow_endpoint_groups::{create_group, details, endpoint_kinds, get
 use crate::ephemeris_catalog::{create_ok, tle_inline, FUTURE};
 use crate::ephemeris_description::describe_ok;
 use crate::minute_usage::reserve_pass;
-use crate::scheduling_loop::{create_mission_profile, harness_with_engine, send, Reply};
+use crate::scheduling_loop::{
+    create_mission_profile, harness_with_engine, send, stock_ground_stations, Reply, STATION,
+};
 
 /// The first window this suite reserves: antenna time far enough ahead that no
 /// reservation is refused for having already elapsed.
@@ -187,6 +189,8 @@ fn dataflow_group_body() -> Value {
 #[tokio::test]
 async fn every_transition_this_service_owes_outlasts_the_calls_the_caller_makes_next() {
     let (router, engine) = harness_with_engine();
+    // The account is served by the station the reserved pass below is held at.
+    stock_ground_stations(&engine, STATION);
     let profile_arn =
         create_mission_profile(&router, "owed transitions", 60, Some(120), Some(180)).await;
 

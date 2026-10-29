@@ -33,7 +33,13 @@ use service_com_amazonaws_groundstation_groundstation::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::scheduling_loop::{create_mission_profile, harness_with_engine, send, Reply};
+use crate::scheduling_loop::{
+    create_mission_profile, harness_with_engine, send, stock_ground_stations, Reply, STATION,
+};
+
+/// A second station the table books an overlapping window at: an antenna serves one pass
+/// at a time, so a window already held at [`STATION`] is booked here instead.
+const OVERLAP_STATION: &str = "Oregon-1";
 
 /// Midnight-anchored epoch seconds for a UTC civil instant, so a test case reads as the
 /// calendar date it is about.
@@ -118,7 +124,7 @@ pub(crate) async fn reserve_pass(
     start: i64,
     seconds: i64,
 ) -> String {
-    reserve_pass_at_station(router, profile_arn, case, "Ohio-1", start, seconds).await
+    reserve_pass_at_station(router, profile_arn, case, STATION, start, seconds).await
 }
 
 /// One pass to reserve, and the minutes of antenna time it holds.
@@ -134,7 +140,10 @@ struct Pass {
 
 #[tokio::test]
 async fn usage_counts_each_months_passes_in_whole_minutes() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    // The account is served by both stations the table books at: a reservation names a
+    // ground station this account knows.
+    stock_ground_stations(&engine, &format!("{STATION},{OVERLAP_STATION}"));
     // A one-second minimum viable duration, so the shortest row in the table is a window
     // this profile admits (`minimumViableContactDurationSeconds` is bounded 1..21600 —
     // see OPERATIONS.md's CreateMissionProfile entry).
@@ -185,7 +194,7 @@ async fn usage_counts_each_months_passes_in_whole_minutes() {
             // Inside the pass above, so it is held at another ground station: the two
             // windows overlap, and one antenna cannot hold both.
             case: "starts-at-the-first-instant-of-the-next-month",
-            station: "Oregon-1",
+            station: OVERLAP_STATION,
             start: epoch(2030, 8, 1, 0, 0),
             seconds: 1800,
             minutes: 30,
@@ -288,6 +297,7 @@ pub(crate) const STATUS_HOLDS_ANTENNA_TIME: &[(&str, bool)] = &[
 #[tokio::test]
 async fn usage_counts_only_the_statuses_that_hold_antenna_time() {
     let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, STATION);
     let profile_arn = create_mission_profile(&router, "status table", 60, None, None).await;
     let start = epoch(2029, 4, 9, 6, 0);
     let month = month_of(start);
@@ -327,7 +337,8 @@ async fn usage_counts_only_the_statuses_that_hold_antenna_time() {
 
 #[tokio::test]
 async fn cancelling_a_contact_releases_its_minutes() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, STATION);
     let profile_arn = create_mission_profile(&router, "cancellation", 60, None, None).await;
     let start = epoch(2031, 11, 4, 14, 0);
     let month = month_of(start);
@@ -399,6 +410,7 @@ async fn upcoming_minutes_are_the_minutes_whose_pass_has_not_started() {
 
     for (case, start, seconds, expected_upcoming) in rows {
         let (router, engine) = harness_with_engine();
+        stock_ground_stations(&engine, STATION);
         let profile_arn = create_mission_profile(&router, "clock split", 60, None, None).await;
         // A pass whose window has already elapsed cannot be RESERVED — antenna time that
         // is over is not reservable — so each row reserves a window still to come and then
@@ -436,6 +448,7 @@ async fn upcoming_minutes_are_the_minutes_whose_pass_has_not_started() {
 #[tokio::test]
 async fn the_reserved_minutes_plan_decides_the_allocation_and_what_remains() {
     let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, STATION);
     let profile_arn = create_mission_profile(&router, "allocation", 60, None, None).await;
     let start = epoch(2032, 9, 12, 3, 0);
     let (year, month) = month_of(start);

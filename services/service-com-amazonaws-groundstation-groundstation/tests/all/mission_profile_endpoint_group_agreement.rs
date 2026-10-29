@@ -30,8 +30,8 @@ use crate::dataflow_endpoint_group_in_use_guard::group_holding;
 use crate::dataflow_endpoint_groups::get_group;
 use crate::minute_usage::{epoch, reserve_pass};
 use crate::scheduling_loop::{
-    antenna_uplink_config_data, create_config, create_tracking_config, harness, send,
-    spectrum_config, Reply, AFTER_SETTLE,
+    antenna_uplink_config_data, create_config, create_tracking_config, harness, harness_serving,
+    send, spectrum_config, Reply, AFTER_SETTLE, STATION,
 };
 
 /// How long the reserved pass of the contact suite runs.
@@ -429,7 +429,8 @@ async fn an_update_cannot_leave_a_profile_holding_a_graph_no_one_group_can_serve
 
 #[tokio::test]
 async fn a_contact_resolves_every_dataflow_endpoint_of_its_pass_out_of_one_group() {
-    let router = harness();
+    // The account is served by the station the pass below is booked at.
+    let router = harness_serving(STATION);
     // One group holding both endpoints the pass runs through: the downlink is delivered to
     // one of them and the uplink is radiated from the other.
     let group_id = group_holding(&router, "pass", "endpoint", &["pass-sink", "pass-source"]).await;

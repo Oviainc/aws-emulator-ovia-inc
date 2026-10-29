@@ -39,7 +39,7 @@ use crate::minute_usage::{epoch, reserve_pass};
 use crate::mission_profile_deletion::{put_in_status, CONTACT_STATUSES};
 use crate::scheduling_loop::{
     create_config, create_tracking_config, harness_with_engine, send, spectrum_config,
-    ABSENT_UUID,
+    stock_ground_stations, ABSENT_UUID, STATION,
 };
 
 /// How long each reserved pass runs.
@@ -269,6 +269,8 @@ async fn assert_refused_as_in_use(
 #[tokio::test]
 async fn a_group_is_deleted_only_when_no_contact_still_to_be_flown_is_wired_to_its_endpoints() {
     let (router, engine) = harness_with_engine();
+    // The account is served by the station every pass below is booked at.
+    stock_ground_stations(&engine, STATION);
     let first_window = epoch(2033, 5, 17, 9, 0);
 
     for (slot, status) in CONTACT_STATUSES.iter().enumerate() {
@@ -354,7 +356,8 @@ async fn a_group_is_deleted_only_when_no_contact_still_to_be_flown_is_wired_to_i
 
 #[tokio::test]
 async fn the_guard_holds_for_every_endpoint_member_and_lifts_once_the_contact_is_released() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, STATION);
     let first_window = epoch(2034, 8, 21, 7, 0);
 
     // Rows differ along which member of `EndpointDetails` describes the endpoint the
@@ -398,7 +401,8 @@ async fn the_guard_holds_for_every_endpoint_member_and_lifts_once_the_contact_is
 
 #[tokio::test]
 async fn the_refusal_names_every_contact_wired_to_the_group_and_no_other() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, STATION);
     let first_window = epoch(2035, 3, 4, 12, 0);
     let mut slot = 0_i64;
     let mut next_window = || {

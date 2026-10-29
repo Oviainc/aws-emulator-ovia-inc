@@ -34,7 +34,10 @@ use service_com_amazonaws_groundstation_groundstation::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::dataflow_endpoint_groups::security_details;
-use crate::scheduling_loop::{create_tracking_config, harness_with_engine, is_uuid, send, Reply};
+use crate::scheduling_loop::{
+    create_tracking_config, harness_with_engine, is_uuid, send, stock_ground_stations, Reply,
+    STATION,
+};
 
 /// A multi-byte character, for the rows that assert a length bound is counted in
 /// CHARACTERS and not in the bytes a UTF-8 encoding of them takes.
@@ -131,7 +134,7 @@ async fn create_tagged(
                 "/contact",
                 json!({
                     "missionProfileArn": profile_arn,
-                    "groundStation": "Ohio-1",
+                    "groundStation": STATION,
                     "startTime": start,
                     "endTime": start + 600,
                 }),
@@ -379,6 +382,9 @@ async fn an_illegal_tag_map_is_refused_on_every_create_path_and_stores_nothing()
 #[tokio::test]
 async fn a_legal_tag_map_is_created_and_reads_back_verbatim_on_every_create_path() {
     let (router, engine) = harness_with_engine();
+    // The contact rows reserve a pass, so the account is served by the station they book
+    // at.
+    stock_ground_stations(&engine, STATION);
 
     for target in Target::ALL {
         for (index, (row, tags)) in legal_tag_maps().into_iter().enumerate() {

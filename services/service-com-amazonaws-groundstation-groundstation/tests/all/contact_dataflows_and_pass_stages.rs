@@ -39,8 +39,13 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::dataflow_endpoint_groups::{create_group, details, endpoint_kinds};
 use crate::scheduling_loop::{
     create_config, create_tracking_config, harness_with_engine, send, spectrum_config,
-    AFTER_SETTLE, RECORDING_BUCKET, REGION,
+    stock_ground_stations, AFTER_SETTLE, RECORDING_BUCKET, REGION,
 };
+
+/// The ground stations this suite's reservations are placed at — the account is told it is
+/// served by them, since a reservation names a ground station this account knows. The
+/// second one is for a window already held at the first.
+const STATIONS: &str = "Ohio-1,Ohio-2";
 
 /// The endpoint of this account the `dataflowEndpointConfig` below names.
 const ENDPOINT_NAME: &str = "downlink-endpoint";
@@ -149,7 +154,8 @@ async fn describe(router: &MultiServiceRouter, contact_id: &str, case: &str) -> 
 
 #[tokio::test]
 async fn describe_contact_derives_one_dataflow_detail_per_mission_profile_edge() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, STATIONS);
 
     // The dataflow endpoint of this account the `dataflowEndpointConfig` names, in a group
     // of its own — a DATAFLOW endpoint, so the group carries the security details Ground
@@ -459,6 +465,7 @@ async fn contact_status_follows_the_clock_through_the_contacts_own_pass_window()
     ];
 
     let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, STATIONS);
     let profile_arn =
         create_profile_with_edges(&router, "pass stages", Some(120), Some(180), vec![]).await;
 

@@ -45,8 +45,8 @@ use crate::dataflow_endpoint_groups::security_details;
 use crate::ephemeris_catalog::tle_inline;
 use crate::scheduling_loop::{
     antenna_uplink_config_data, config_data_table, create_config, create_mission_profile, harness,
-    harness_with_engine, provision_uplink_approval, send, Reply, ABSENT_CONFIG_ARN,
-    ABSENT_MISSION_PROFILE_ARN, ABSENT_UUID, REGION,
+    harness_serving, harness_with_engine, provision_uplink_approval, send, Reply,
+    ABSENT_CONFIG_ARN, ABSENT_MISSION_PROFILE_ARN, ABSENT_UUID, REGION, STATION,
 };
 use crate::tag_rules::{illegal_tag_maps, legal_tag_maps, tag_map};
 
@@ -274,7 +274,7 @@ async fn reserve_contact(
         "/contact",
         Some(json!({
             "missionProfileArn": profile_arn,
-            "groundStation": "Ohio-1",
+            "groundStation": STATION,
             "startTime": start,
             "endTime": start + 600,
             "tags": tags,
@@ -425,7 +425,9 @@ pub(crate) async fn taggable_resources(router: &MultiServiceRouter) -> Vec<Tagga
 
 #[tokio::test]
 async fn tag_resource_merges_its_entries_into_the_tags_of_the_resource_its_arn_names() {
-    let router = harness();
+    // The taggable resources include a reserved contact, so the account is served by the
+    // station that reservation is held at.
+    let router = harness_serving(STATION);
 
     for resource in taggable_resources(&router).await {
         let Taggable {
@@ -499,7 +501,7 @@ async fn tag_resource_merges_its_entries_into_the_tags_of_the_resource_its_arn_n
 
 #[tokio::test]
 async fn a_tag_write_touches_only_the_resource_its_arn_names() {
-    let router = harness();
+    let router = harness_serving(STATION);
     let resources = taggable_resources(&router).await;
 
     // What every resource holds before the one write below.

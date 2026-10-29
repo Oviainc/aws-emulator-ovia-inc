@@ -39,8 +39,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::contact_satellite_reference_integrity::onboard_satellite_arns;
 use crate::ephemeris_catalog::program_track_ephemeris;
 use crate::scheduling_loop::{
-    create_config, create_tracking_config, harness_with_engine, send, spectrum_config, Reply,
-    ABSENT_UUID, AFTER_SETTLE, RECORDING_BUCKET,
+    create_config, create_tracking_config, harness_with_engine, send, spectrum_config,
+    stock_ground_stations, Reply, ABSENT_UUID, AFTER_SETTLE, RECORDING_BUCKET, STATION,
 };
 
 /// The window every reservation in this suite books: far enough ahead that the contact
@@ -162,7 +162,7 @@ async fn reserve_contact(
 ) -> String {
     let mut body = json!({
         "missionProfileArn": profile_arn,
-        "groundStation": "Ohio-1",
+        "groundStation": STATION,
         "startTime": CONTACT_START,
         "endTime": CONTACT_END,
         "tags": {"mission": "version-description"},
@@ -478,6 +478,7 @@ async fn every_version_is_described_with_the_configuration_that_version_carried(
 #[tokio::test]
 async fn a_version_scoped_member_no_version_named_is_reported_absent_and_then_inherited() {
     let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, STATION);
     let profile_arn = create_profile_with_an_edge(&router, "absent configuration").await;
     // Reserved with neither a satellite nor overrides, so the first version carries none.
     let contact_id = reserve_contact(&router, &profile_arn, None, None).await;
@@ -519,6 +520,7 @@ async fn a_version_scoped_member_no_version_named_is_reported_absent_and_then_in
 #[tokio::test]
 async fn a_version_the_contact_does_not_hold_is_not_described() {
     let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, STATION);
     let profile_arn = create_profile_with_an_edge(&router, "version not found").await;
     let contact_id = reserve_contact(&router, &profile_arn, None, None).await;
     std::thread::sleep(AFTER_SETTLE);
@@ -632,7 +634,8 @@ async fn a_version_the_contact_does_not_hold_is_not_described() {
 
 #[tokio::test]
 async fn a_version_id_outside_the_modelled_range_is_a_bad_request() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    stock_ground_stations(&engine, STATION);
     let profile_arn = create_profile_with_an_edge(&router, "version bounds").await;
     let contact_id = reserve_contact(&router, &profile_arn, None, None).await;
     std::thread::sleep(AFTER_SETTLE);

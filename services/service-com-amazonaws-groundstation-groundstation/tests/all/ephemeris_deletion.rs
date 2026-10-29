@@ -43,8 +43,13 @@ use crate::ephemeris_catalog::{
     PAST,
 };
 use crate::scheduling_loop::{
-    create_mission_profile, harness_with_engine, send, Reply, ABSENT_UUID, AFTER_SETTLE, REGION,
+    create_mission_profile, harness_with_engine, send, stock_ground_stations, Reply, ABSENT_UUID,
+    AFTER_SETTLE, REGION,
 };
+
+/// The ground station every reservation of this suite is placed at: a `GroundStationName`
+/// AWS spells with a space.
+const STATION: &str = "Ohio 1";
 
 /// Every value of the model's `ContactStatus`.
 ///
@@ -198,7 +203,7 @@ async fn reserve_against(
         "/contact",
         Some(json!({
             "missionProfileArn": profile_arn,
-            "groundStation": "Ohio 1",
+            "groundStation": STATION,
             "startTime": start,
             "endTime": start + 600,
             "satelliteArn": satellite_arn,
@@ -461,6 +466,9 @@ async fn delete_and_assert_gone(
 #[tokio::test]
 async fn an_ephemeris_in_force_is_held_by_every_non_terminal_contact_of_its_satellite() {
     let (router, engine) = harness_with_engine();
+    // The rows' satellites are on-boarded to no ground station, so the account is told
+    // about the station the reservations are placed at directly.
+    stock_ground_stations(&engine, STATION);
     // One satellite per row, each with its own ephemeris and its own contact, so a row's
     // refusal names exactly the contact of that row and one row's delete cannot be what
     // the next row observes.
