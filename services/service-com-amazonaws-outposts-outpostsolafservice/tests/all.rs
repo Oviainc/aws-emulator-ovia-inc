@@ -81,6 +81,8 @@ mod outpost_hardware_installation;
 mod outpost_hardware_type_change;
 #[path = "all/outpost_order_driven_lifecycle.rs"]
 mod outpost_order_driven_lifecycle;
+#[path = "all/outpost_server_asset_kind.rs"]
+mod outpost_server_asset_kind;
 #[path = "all/outpost_server_connection.rs"]
 mod outpost_server_connection;
 #[path = "all/page_boundary_rule.rs"]

@@ -32,11 +32,12 @@
 //!    exactly as it was, under the id it was given.
 //!
 //! Where the hardware comes from: an asset is a PHYSICAL unit of hardware that
-//! arrives with a fulfilled order, and no order this emulator accepts is ever carried
-//! as far as being delivered and installed (see [`crate::order_lifecycle`]), so
-//! each row RECORDS its asset on the stored Outpost through this crate's store —
-//! exactly as [`crate::outpost_assets`] does, whose two recording helpers this suite
-//! reuses.
+//! arrives with the fulfilment of an order placed on the Outpost, over spans far
+//! longer than a case can wait for (see [`crate::order_lifecycle`]), so each row
+//! RECORDS its asset on the stored Outpost through this crate's store — exactly as
+//! [`crate::outpost_assets`] does, whose two recording helpers this suite reuses.
+//! What the ORDER path installs, and which of those units a connection can be
+//! started for, is [`crate::outpost_server_asset_kind`]'s own rule.
 
 use std::collections::BTreeSet;
 
@@ -206,11 +207,17 @@ async fn outpost_holding(outposts: &Outposts, name: &str, asset_id: &str) -> Str
 
 /// The same, for an Outpost holding every asset in `asset_ids` — a rack carries more
 /// than one unit of hardware, and each unit is its own installation.
+///
+/// Every unit is recorded as `COMPUTE` — "Server asset used for customer compute",
+/// a value of the modelled `AssetType` enum (`ops::types::ASSET_TYPE_VALUES`) —
+/// because the hardware a connection installs is the Outpost SERVER itself; which
+/// kinds of unit `StartConnection` accepts is [`crate::outpost_server_asset_kind`]'s
+/// own rule.
 async fn outpost_holding_all(outposts: &Outposts, name: &str, asset_ids: &[&str]) -> String {
     let (outpost_id, _) = outposts.site_and_outpost(name).await;
     let hardware: Vec<_> = asset_ids
         .iter()
-        .map(|asset_id| asset(asset_id, "rack-1", None, None, None))
+        .map(|asset_id| asset(asset_id, "rack-1", Some("COMPUTE"), None, None))
         .collect();
     record(outposts, &outpost_id, &hardware, name);
     outpost_id

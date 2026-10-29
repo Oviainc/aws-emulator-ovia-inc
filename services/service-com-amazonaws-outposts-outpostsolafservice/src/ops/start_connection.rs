@@ -9,11 +9,13 @@
 //! keys it against the one tunnel server it reports. `GetConnection` then answers
 //! that record.
 //!
-//! The asset has to be one an Outpost of the store holds, as it does at AWS. No
-//! operation in this API records hardware on an Outpost — hardware arrives with
-//! a fulfilled order, and no order this emulator accepts is ever carried as far as
-//! being delivered and installed — so that precondition is reachable only for an
-//! Outpost whose assets were recorded through the store.
+//! The asset has to be one an Outpost of the store holds, as it does at AWS, and it
+//! has to be the kind of hardware an Outpost SERVER is: the `AssetId` names "the ID
+//! of the Outpost server", so a unit recorded as a power shelf, a switch, a
+//! networking asset or a storage server is no server to install and the request
+//! naming one is refused. Hardware arrives with the fulfilment of an order placed on
+//! an Outpost — a rack arrives as a whole rack of units — so the ids a caller reads
+//! out of `ListAssets` span every kind the modelled `AssetType` declares.
 //!
 //! ## Shape of an operation
 //!
@@ -177,12 +179,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of `ListAssets` are the ones it can start a connection for.
         store.settle_outposts();
         // A connection installs one Outpost SERVER, named by the `AssetId` of that
-        // unit of hardware, so an asset no Outpost of this store holds has no
-        // connection to start: the not-found error this call models, worded as every
-        // refusal about an asset this service holds none of is.
-        if store.outpost_with_asset(&region, &input.asset_id).is_none() {
-            return Err(StartConnectionErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::asset_not_found(&input.asset_id)),
+        // unit of hardware, so the asset is resolved against the hardware the store
+        // holds and WHAT that unit is decides whether there is a server to install:
+        //
+        // * an asset no Outpost of this store holds has no connection to start: the
+        //   not-found error this call models, worded as every refusal about an asset
+        //   this service holds none of is;
+        // * one this store does hold that is not a server is hardware this call does
+        //   not install, so the request naming it is the bad request this call models
+        //   — the asset resolved, so it is not the not-found error — and no tunnel is
+        //   minted for it.
+        let installs_a_server = match store.asset_in_region(&region, &input.asset_id) {
+            Some(asset) => crate::state::is_outpost_server(asset),
+            None => {
+                return Err(StartConnectionErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::asset_not_found(&input.asset_id)),
+                })
+                .into())
+            }
+        };
+        if !installs_a_server {
+            return Err(StartConnectionErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::connection_asset_report()),
             })
             .into());
         }

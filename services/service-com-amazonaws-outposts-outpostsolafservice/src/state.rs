@@ -2472,6 +2472,20 @@ pub const ASSET_TYPE_SWITCH: &str = "SWITCH";
 /// networking purposes". See [`ASSET_TYPE_COMPUTE`].
 pub const ASSET_TYPE_NETWORKING: &str = "NETWORKING";
 
+/// Whether one recorded hardware asset is an Outpost SERVER: a unit of the
+/// [`ASSET_TYPE_COMPUTE`] kind.
+///
+/// `COMPUTE` is "Server asset used for customer compute", and it is the one kind of
+/// unit an Outposts server is installed with ([`SERVER_HARDWARE`]) — every other
+/// value of the modelled set is a unit an Outposts RACK is built of: a power shelf
+/// feeding it, a switch or a networking asset attaching it, or a server belonging to
+/// a storage service. An operation whose member names the Outpost SERVER itself
+/// therefore accepts a unit of this kind and refuses the rest, and hardware whose
+/// kind was never recorded names no server either.
+pub fn is_outpost_server(asset: &AssetInfo) -> bool {
+    asset.asset_type.as_deref() == Some(ASSET_TYPE_COMPUTE)
+}
+
 /// The `ComputeAssetState` of installed compute hardware: the model's "`ACTIVE` - The
 /// asset is available and can provide capacity for new compute resources".
 ///
@@ -4628,20 +4642,25 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             .clone()
     }
 
-    /// The Outpost of `region` holding the hardware asset `asset_id`, if this
-    /// store holds one.
+    /// The hardware asset `asset_id` an Outpost of `region` holds, if this store
+    /// holds one.
     ///
     /// An `AssetId` names one physical unit of hardware, installed in one rack of
     /// one Outpost, so at most one Outpost holds it: an operation that acts on an
-    /// asset resolves it here rather than walking the store itself. The hardware of
-    /// another region's Outpost is not this region's to act on (see
-    /// [`RegionalRecord`]).
-    pub fn outpost_with_asset(&self, region: &str, asset_id: &str) -> Option<&OutpostRecord> {
-        self.outposts_in(region).find(|record| {
+    /// asset of this REGION's inventory, rather than of one named Outpost
+    /// ([`Self::asset_of_outpost`]), resolves it here rather than walking the store
+    /// itself. The hardware of another region's Outpost is not this region's to act
+    /// on (see [`RegionalRecord`]).
+    ///
+    /// It answers the asset ITSELF and not the Outpost around it, because what an
+    /// operation decides about a unit of hardware is decided by what that unit is
+    /// ([`is_outpost_server`]) and the record is where that is held.
+    pub fn asset_in_region(&self, region: &str, asset_id: &str) -> Option<&AssetInfo> {
+        self.outposts_in(region).find_map(|record| {
             record
                 .assets
                 .iter()
-                .any(|asset| asset.asset_id.as_deref() == Some(asset_id))
+                .find(|asset| asset.asset_id.as_deref() == Some(asset_id))
         })
     }
 
@@ -6020,6 +6039,24 @@ pub fn renewal_token_report() -> String {
         CLIENT_TOKEN_MEMBER,
         "a client token already used for a renewal of the Outpost must name the same \
          payment option and payment term",
+    )])
+}
+
+/// The report an installation connection started for hardware that is no Outpost
+/// server states.
+///
+/// `StartConnection` "installs Outpost servers" and its `AssetId` is "the ID of the
+/// Outpost server", so a unit of hardware that is not a server
+/// ([`is_outpost_server`]) is not hardware this call installs: the request names a
+/// resolved asset the operation cannot act on, which is the bad request the modelled
+/// `ValidationException` (HTTP 400) states — the asset exists, so it is not the
+/// not-found error. AWS publishes no wording for the refusal, so the sentence is the
+/// emulator's own, worded by the same rule as every other constraint this service
+/// reports — the member and the requirement, never the value.
+pub fn connection_asset_report() -> String {
+    validation_report(&[clause(
+        ASSET_ID_MEMBER,
+        "the asset must be an Outpost server",
     )])
 }
 
