@@ -170,29 +170,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this Region's stored load balancers from that name onward in the
         // store's own total order. Using the name rather than an index means a
         // load balancer deleted between two pages cannot make the walk skip or
-        // repeat another one.
+        // repeat another one. The walk itself is the ONE page walk every listing
+        // of this service shares (`crate::state::resource_page`).
         let page_token = input.page_token.unwrap_or_default();
 
         crate::state::with_state(&*self.engine, |store| {
-            let mut load_balancers = Vec::new();
-            let mut next_page_token = None;
-            // The store keys load balancers by `(region, name)`, so a range from
-            // this Region and the page token walks exactly this Region's load
-            // balancers in name order and leaves it behind at the first key of
-            // the next one.
-            let page_start = (region.clone(), page_token);
-            for ((balancer_region, name), balancer) in store.load_balancers.range(page_start..) {
-                if balancer_region != &region {
-                    break;
-                }
-                if load_balancers.len() == crate::state::LOAD_BALANCER_PAGE_SIZE {
-                    // More remain, so the caller is told where to resume; the
-                    // token is absent once this page is the last one.
-                    next_page_token = Some(name.clone());
-                    break;
-                }
-                load_balancers.push(balancer.view());
-            }
+            let (load_balancers, next_page_token) = crate::state::resource_page(
+                // The store keys load balancers by `(region, name)`, so the walk
+                // takes exactly this Region's load balancers in name order and
+                // leaves the Region behind at the first key of the next one.
+                crate::state::regional_records_from(&store.load_balancers, &region, &page_token),
+                crate::state::LOAD_BALANCER_PAGE_SIZE,
+                |_, balancer| balancer.view(),
+            );
             GetLoadBalancersOutput {
                 // A Region with no load balancers reports an empty list, not an
                 // absent one: the caller asked what it has, and the answer is

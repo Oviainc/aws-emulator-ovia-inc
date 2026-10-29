@@ -169,24 +169,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `pageToken` is the name the previous page stopped before, so a page is
         // the stored records from that name onward in the store's own total
         // order. Using the name rather than an index means a record appended
-        // between two pages cannot make the walk skip or repeat another one.
+        // between two pages cannot make the walk skip or repeat another one. The
+        // walk itself is the ONE page walk every listing of this service shares
+        // (`crate::state::resource_page`).
         let page_token = input.page_token.unwrap_or_default();
 
         crate::state::with_state(&*self.engine, |store| {
             // Reporting only: each record is answered exactly as the store holds
             // it, including the state the clock has already settled it into
             // (`with_state` applies what the clock owed before this body ran).
-            let mut export_snapshot_records = Vec::new();
-            let mut next_page_token = None;
-            for (name, record) in store.export_snapshot_records.range(page_token.clone()..) {
-                if export_snapshot_records.len()
-                    == crate::state::EXPORT_SNAPSHOT_RECORD_PAGE_SIZE
-                {
-                    next_page_token = Some(name.clone());
-                    break;
-                }
-                export_snapshot_records.push(record.view());
-            }
+            let (export_snapshot_records, next_page_token) = crate::state::resource_page(
+                crate::state::records_from(&store.export_snapshot_records, &page_token),
+                crate::state::EXPORT_SNAPSHOT_RECORD_PAGE_SIZE,
+                |_, record| record.view(),
+            );
             GetExportSnapshotRecordsOutput {
                 // An account that has exported nothing reports an empty list,
                 // not an absent one: the caller asked which exports it has made,

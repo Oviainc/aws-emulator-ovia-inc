@@ -1105,6 +1105,80 @@ fn catalog_page<T: Clone>(
 }
 
 // ---------------------------------------------------------------------------
+// Resource paging
+// ---------------------------------------------------------------------------
+
+/// The records of a name-keyed map from the one `page_token` names onward, in the
+/// map's own total order — where a page of a stored-resource listing starts.
+///
+/// A page token NAMES a record rather than carrying an index, so a record created
+/// or deleted between two pages cannot make the walk skip or repeat another one,
+/// and a token that names no record resumes at the first record after it. An empty
+/// token asks for the first page, because every name sorts at or after it.
+///
+/// TOTAL on every input, including an arbitrary caller-supplied token: the token is
+/// only ever COMPARED against the keys, so there is no indexing, no slicing, no
+/// unwrap and no arithmetic that can overflow or panic.
+pub fn records_from<'a, R>(
+    records: &'a BTreeMap<String, R>,
+    page_token: &str,
+) -> impl Iterator<Item = (&'a str, &'a R)> {
+    records
+        .range(page_token.to_string()..)
+        .map(|(name, record)| (name.as_str(), record))
+}
+
+/// The records of a `(region, name)`-keyed map that belong to `region`, from the
+/// one `page_token` names onward, in name order.
+///
+/// The same start [`records_from`] computes over a map keyed by name alone, for a
+/// resource whose identity includes the Region it was created in: the key pair
+/// orders this Region's records together, so the walk leaves the Region behind at
+/// the first key of the next one and never reports another Region's record.
+pub fn regional_records_from<'a, R>(
+    records: &'a BTreeMap<(String, String), R>,
+    region: &'a str,
+    page_token: &str,
+) -> impl Iterator<Item = (&'a str, &'a R)> {
+    records
+        .range((region.to_string(), page_token.to_string())..)
+        .take_while(move |((record_region, _), _)| record_region.as_str() == region)
+        .map(|((_, name), record)| (name.as_str(), record))
+}
+
+/// One page of a resource listing: at most `page_size` of `records`, each as
+/// `view_of` reports it, plus the name of the first record AFTER them — named only
+/// while records remain.
+///
+/// Shared by every stored-resource listing this service pages, so each one walks
+/// its records exactly the same way; [`catalog_page`] is the same walk over this
+/// service's static catalogs. The start of the page comes from [`records_from`] or
+/// [`regional_records_from`], and a listing whose request NARROWS which records it
+/// reports puts that filter on the iterator ([`Iterator::filter`]): the page size
+/// then counts the records reported, and the next page starts at the first record
+/// after them that this listing reports too.
+///
+/// TOTAL on every input: records are only ever taken from the iterator in order and
+/// the page is bounded by `page_size`, so there is no indexing, no slicing, no
+/// unwrap and no arithmetic that can overflow or panic. `page_size` is at least
+/// one, so a walk over a listing that holds records always advances.
+pub fn resource_page<'a, R: 'a, T>(
+    records: impl IntoIterator<Item = (&'a str, &'a R)>,
+    page_size: usize,
+    mut view_of: impl FnMut(&'a str, &'a R) -> T,
+) -> (Vec<T>, Option<String>) {
+    let page_size = page_size.max(1);
+    let mut page = Vec::new();
+    for (name, record) in records {
+        if page.len() == page_size {
+            return (page, Some(name.to_string()));
+        }
+        page.push(view_of(name, record));
+    }
+    (page, None)
+}
+
+// ---------------------------------------------------------------------------
 // Bundles
 // ---------------------------------------------------------------------------
 
@@ -2914,6 +2988,28 @@ pub fn relational_database_blueprint_ids() -> String {
         .map(RelationalDatabaseBlueprintSpec::blueprint_id)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// One page of `reported`: at most `page_size` database blueprints from the entry
+/// `page_token` names onward, and the id of the first entry of the page after it
+/// — present only while entries remain.
+///
+/// `None` is the answer when the token names no blueprint of `reported`: there is
+/// no page to report, which the caller turns into a refusal. An absent token asks
+/// for the first page.
+///
+/// The walk itself is [`catalog_page`], shared with this service's other paged
+/// catalogs; only the member a token names is this catalog's own, and it is
+/// DERIVED from the entry rather than held by it, which is what that walk's `Cow`
+/// answer is for.
+pub fn relational_database_blueprint_page(
+    reported: &[RelationalDatabaseBlueprintSpec],
+    page_size: usize,
+    page_token: Option<&str>,
+) -> Option<(Vec<RelationalDatabaseBlueprintSpec>, Option<String>)> {
+    catalog_page(reported, page_size, page_token, |spec| {
+        Some(std::borrow::Cow::Owned(spec.blueprint_id()))
+    })
 }
 
 // ---------------------------------------------------------------------------

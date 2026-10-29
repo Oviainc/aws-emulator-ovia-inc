@@ -172,21 +172,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the stored static IPs from that name onward in the store's own total
         // order. Using the name rather than an index means a static IP allocated
         // or released between two pages cannot make the walk skip or repeat
-        // another one.
+        // another one. The walk itself is the ONE page walk every listing of this
+        // service shares (`crate::state::resource_page`).
         let page_token = input.page_token.unwrap_or_default();
 
         crate::state::with_state(&*self.engine, |store| {
-            let mut static_ips = Vec::new();
-            let mut next_page_token = None;
-            for (name, static_ip) in store.static_ips.range(page_token..) {
-                if static_ips.len() == crate::state::STATIC_IP_PAGE_SIZE {
-                    next_page_token = Some(name.clone());
-                    break;
-                }
+            let (static_ips, next_page_token) = crate::state::resource_page(
+                crate::state::records_from(&store.static_ips, &page_token),
+                crate::state::STATIC_IP_PAGE_SIZE,
                 // The SAME view `GetStaticIp` reports: one stored record read by
                 // two operations, never a second rendering of a static IP.
-                static_ips.push(static_ip.view());
-            }
+                |_, static_ip| static_ip.view(),
+            );
             GetStaticIpsOutput {
                 // An account holding no static IP reports an empty list, not an
                 // absent one: the caller asked what it has, and the answer is

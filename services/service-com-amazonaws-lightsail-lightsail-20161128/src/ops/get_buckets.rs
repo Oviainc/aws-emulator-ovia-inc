@@ -197,7 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `pageToken` is the name the previous page stopped before, so a page is
         // this region's stored buckets from that name onward in the store's own
         // total order. Using the name rather than an index means a bucket deleted
-        // between two pages cannot make the walk skip or repeat another one.
+        // between two pages cannot make the walk skip or repeat another one. The
+        // walk itself is the ONE page walk every listing of this service shares
+        // (`crate::state::resource_page`).
         let page_token = input.page_token.unwrap_or_default();
 
         crate::state::with_state(&*self.engine, |store| {
@@ -218,26 +220,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
             }
 
-            let mut buckets = Vec::new();
-            let mut next_page_token = None;
-            // The store keys buckets by `(region, name)`, so a range from this
-            // region and the page token walks exactly this region's buckets in
-            // name order and leaves it behind at the first key of the next one.
-            let page_start = (region.clone(), page_token);
-            for ((bucket_region, name), bucket) in store.buckets.range(page_start..) {
-                if bucket_region != &region {
-                    break;
-                }
-                if buckets.len() == crate::state::BUCKET_PAGE_SIZE {
-                    next_page_token = Some(name.clone());
-                    break;
-                }
-                buckets.push(bucket.view(
-                    endpoint.as_deref(),
-                    include_connected_resources,
-                    include_cors,
-                ));
-            }
+            let (buckets, next_page_token) = crate::state::resource_page(
+                // The store keys buckets by `(region, name)`, so the walk takes
+                // exactly this region's buckets in name order and leaves the
+                // region behind at the first key of the next one.
+                crate::state::regional_records_from(&store.buckets, &region, &page_token),
+                crate::state::BUCKET_PAGE_SIZE,
+                |_, bucket| {
+                    bucket.view(
+                        endpoint.as_deref(),
+                        include_connected_resources,
+                        include_cors,
+                    )
+                },
+            );
             Ok(GetBucketsOutput {
                 // A region with no buckets reports an empty list, not an absent
                 // one: the caller asked what it has, and the answer is

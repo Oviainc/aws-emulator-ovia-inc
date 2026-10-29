@@ -186,7 +186,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is the stored distributions from that name onward in the store's own
         // total order. Using the name rather than an index means a distribution
         // deleted between two pages cannot make the walk skip or repeat
-        // another one.
+        // another one. The walk itself is the ONE page walk every listing of
+        // this service shares (`crate::state::resource_page`).
         let page_token = input.page_token.unwrap_or_default();
 
         crate::state::with_state(&*self.engine, |store| {
@@ -203,15 +204,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
             }
 
-            let mut distributions = Vec::new();
-            let mut next_page_token = None;
-            for (name, distribution) in store.distributions.range(page_token..) {
-                if distributions.len() == crate::state::DISTRIBUTION_PAGE_SIZE {
-                    next_page_token = Some(name.clone());
-                    break;
-                }
-                distributions.push(distribution.view());
-            }
+            let (distributions, next_page_token) = crate::state::resource_page(
+                crate::state::records_from(&store.distributions, &page_token),
+                crate::state::DISTRIBUTION_PAGE_SIZE,
+                |_, distribution| distribution.view(),
+            );
             Ok(GetDistributionsOutput {
                 // An account with no distributions reports an empty list, not
                 // an absent one: the caller asked what it has, and the answer

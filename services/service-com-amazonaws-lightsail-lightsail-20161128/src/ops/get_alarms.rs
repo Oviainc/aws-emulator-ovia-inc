@@ -185,28 +185,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `pageToken` is the name the previous page stopped before, so a page is
         // the matching alarms from that name onward in the store's own total
         // order. Using the name rather than an index means an alarm deleted
-        // between two pages cannot make the walk skip or repeat another one.
+        // between two pages cannot make the walk skip or repeat another one. The
+        // walk itself is the ONE page walk every listing of this service shares
+        // (`crate::state::resource_page`), and the filters narrow WHICH records
+        // it walks, so a page is a full page of matching alarms.
         let page_token = input.page_token.unwrap_or_default();
 
         crate::state::with_state(&*self.engine, |store| {
-            let mut alarms = Vec::new();
-            let mut next_page_token = None;
-            for (name, alarm) in store.alarms.range(page_token..) {
-                if alarm_name.as_ref().is_some_and(|wanted| wanted != name) {
-                    continue;
-                }
-                if monitored_resource_name
-                    .as_ref()
-                    .is_some_and(|wanted| wanted != &alarm.monitored_resource.name)
-                {
-                    continue;
-                }
-                if alarms.len() == crate::state::ALARM_PAGE_SIZE {
-                    next_page_token = Some(name.clone());
-                    break;
-                }
-                alarms.push(alarm.view());
-            }
+            let (alarms, next_page_token) = crate::state::resource_page(
+                crate::state::records_from(&store.alarms, &page_token).filter(|(name, alarm)| {
+                    alarm_name
+                        .as_ref()
+                        .is_none_or(|wanted| wanted.as_str() == *name)
+                        && monitored_resource_name
+                            .as_ref()
+                            .is_none_or(|wanted| wanted == &alarm.monitored_resource.name)
+                }),
+                crate::state::ALARM_PAGE_SIZE,
+                |_, alarm| alarm.view(),
+            );
             GetAlarmsOutput {
                 // An account with no matching alarm reports an empty list, not an
                 // absent one: the caller asked what it has, and the answer is

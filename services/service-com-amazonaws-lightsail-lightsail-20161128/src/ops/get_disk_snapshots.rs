@@ -171,19 +171,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `pageToken` is the name the previous page stopped before, so a page is
         // the stored snapshots from that name onward in the store's own total
         // order. Using the name rather than an index means a snapshot deleted
-        // between two pages cannot make the walk skip or repeat another one.
+        // between two pages cannot make the walk skip or repeat another one. The
+        // walk itself is the ONE page walk every listing of this service shares
+        // (`crate::state::resource_page`).
         let page_token = input.page_token.unwrap_or_default();
 
         crate::state::with_state(&*self.engine, |store| {
-            let mut disk_snapshots = Vec::new();
-            let mut next_page_token = None;
-            for (name, snapshot) in store.disk_snapshots.range(page_token..) {
-                if disk_snapshots.len() == crate::state::DISK_SNAPSHOT_PAGE_SIZE {
-                    next_page_token = Some(name.clone());
-                    break;
-                }
-                disk_snapshots.push(snapshot.view());
-            }
+            let (disk_snapshots, next_page_token) = crate::state::resource_page(
+                crate::state::records_from(&store.disk_snapshots, &page_token),
+                crate::state::DISK_SNAPSHOT_PAGE_SIZE,
+                |_, snapshot| snapshot.view(),
+            );
             GetDiskSnapshotsOutput {
                 // An account with no disk snapshots reports an empty list, not an
                 // absent one: the caller asked what it has, and the answer is

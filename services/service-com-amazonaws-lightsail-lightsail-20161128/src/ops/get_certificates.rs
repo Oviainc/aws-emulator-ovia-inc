@@ -196,7 +196,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this account's certificates from that name onward in the store's own
         // total order. Using the name rather than an index means a certificate
         // deleted between two pages cannot make the walk skip or repeat another
-        // one.
+        // one. The walk itself is the ONE page walk every listing of this service
+        // shares (`crate::state::resource_page`).
         let page_token = input.page_token.unwrap_or_default();
         let matches_status = |status: Option<&str>| match &statuses {
             None => true,
@@ -234,21 +235,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
             }
 
-            let mut certificates = Vec::new();
-            let mut next_page_token = None;
-            for (name, certificate) in store.certificates.range(page_token..) {
-                if !matches_status(Some(certificate.status)) {
-                    continue;
-                }
-                if certificates.len() == crate::state::CERTIFICATE_PAGE_SIZE {
-                    next_page_token = Some(name.clone());
-                    break;
-                }
-                certificates.push(certificate.view(
-                    store.certificate_in_use_resource_count(name),
-                    include_details,
-                ));
-            }
+            let (certificates, next_page_token) = crate::state::resource_page(
+                // The status filter selects which records the listing REPORTS, so
+                // it narrows the walk rather than the page: a page is a full page
+                // of certificates in a wanted status.
+                crate::state::records_from(&store.certificates, &page_token)
+                    .filter(|(_, certificate)| matches_status(Some(certificate.status))),
+                crate::state::CERTIFICATE_PAGE_SIZE,
+                |name, certificate| {
+                    certificate.view(
+                        store.certificate_in_use_resource_count(name),
+                        include_details,
+                    )
+                },
+            );
             Ok(GetCertificatesOutput {
                 // An account with no certificates reports an empty list, not an
                 // absent one: the caller asked what it has, and the answer is

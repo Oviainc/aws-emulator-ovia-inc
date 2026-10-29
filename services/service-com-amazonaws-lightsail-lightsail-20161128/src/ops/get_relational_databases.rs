@@ -175,19 +175,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `pageToken` is the name the previous page stopped before, so a page is the
         // stored databases from that name onward in the store's own total order.
         // Using the name rather than an index means a database deleted between two
-        // pages cannot make the walk skip or repeat another one.
+        // pages cannot make the walk skip or repeat another one. The walk itself is
+        // the ONE page walk every listing of this service shares
+        // (`crate::state::resource_page`).
         let page_token = input.page_token.unwrap_or_default();
 
         crate::state::with_state(&*self.engine, |store| {
-            let mut databases = Vec::new();
-            let mut next_page_token = None;
-            for (name, database) in store.relational_databases.range(page_token..) {
-                if databases.len() == crate::state::RELATIONAL_DATABASE_PAGE_SIZE {
-                    next_page_token = Some(name.clone());
-                    break;
-                }
-                databases.push(database.view());
-            }
+            let (databases, next_page_token) = crate::state::resource_page(
+                crate::state::records_from(&store.relational_databases, &page_token),
+                crate::state::RELATIONAL_DATABASE_PAGE_SIZE,
+                |_, database| database.view(),
+            );
             GetRelationalDatabasesOutput {
                 // An account with no databases reports an empty list, not an absent
                 // one: the caller asked what it has, and the answer is "nothing".

@@ -176,7 +176,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the reported key pairs from that name onward in the store's own total
         // order. Using the name rather than an index means a key pair created or
         // deleted between two pages cannot make the walk skip or repeat another
-        // one.
+        // one. The walk itself is the ONE page walk every listing of this service
+        // shares (`crate::state::resource_page`).
         let page_token = input.page_token.unwrap_or_default();
         // "whether to include the default key pair in the response of your
         // request": the account's default pair is reported only when the request
@@ -185,23 +186,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let include_default = input.include_default_key_pair.unwrap_or(false);
 
         crate::state::with_state(&*self.engine, |store| {
-            let mut key_pairs = Vec::new();
-            let mut next_page_token = None;
-            for (name, key_pair) in store.key_pairs.range(page_token..) {
-                // The switch selects which records the listing REPORTS, so it is
-                // applied before the page is filled: a page the default pair is
-                // excluded from still carries a full page of the others.
-                if key_pair.is_default() && !include_default {
-                    continue;
-                }
-                if key_pairs.len() == crate::state::KEY_PAIR_PAGE_SIZE {
-                    next_page_token = Some(name.clone());
-                    break;
-                }
+            let (key_pairs, next_page_token) = crate::state::resource_page(
+                // The switch selects which records the listing REPORTS, so it
+                // narrows the walk rather than the page: a page the default pair
+                // is excluded from still carries a full page of the others.
+                crate::state::records_from(&store.key_pairs, &page_token)
+                    .filter(|(_, key_pair)| include_default || !key_pair.is_default()),
+                crate::state::KEY_PAIR_PAGE_SIZE,
                 // The SAME view `GetKeyPair` reports: one stored record read by
                 // two operations, never a second rendering of a key pair.
-                key_pairs.push(key_pair.view());
-            }
+                |_, key_pair| key_pair.view(),
+            );
             GetKeyPairsOutput {
                 // An account holding no key pair reports an empty list, not an
                 // absent one: the caller asked what it has, and the answer is

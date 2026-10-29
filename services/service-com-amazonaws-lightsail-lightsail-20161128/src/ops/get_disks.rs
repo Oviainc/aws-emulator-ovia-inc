@@ -168,21 +168,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `pageToken` is the name the previous page stopped before, so a page is
         // the stored disks from that name onward in the store's own total order.
         // Using the name rather than an index means a disk created or deleted
-        // between two pages cannot make the walk skip or repeat another one.
+        // between two pages cannot make the walk skip or repeat another one. The
+        // walk itself is the ONE page walk every listing of this service shares
+        // (`crate::state::resource_page`).
         let page_token = input.page_token.unwrap_or_default();
 
         crate::state::with_state(&*self.engine, |store| {
-            let mut disks = Vec::new();
-            let mut next_page_token = None;
-            for (name, disk) in store.disks.range(page_token..) {
-                if disks.len() == crate::state::DISK_PAGE_SIZE {
-                    next_page_token = Some(name.clone());
-                    break;
-                }
+            let (disks, next_page_token) = crate::state::resource_page(
+                crate::state::records_from(&store.disks, &page_token),
+                crate::state::DISK_PAGE_SIZE,
                 // The SAME view `GetDisk` reports: one stored record read by two
                 // operations, never a second rendering of a disk.
-                disks.push(disk.view());
-            }
+                |_, disk| disk.view(),
+            );
             GetDisksOutput {
                 // An account with no disks reports an empty list, not an absent
                 // one: the caller asked what it has, and the answer is

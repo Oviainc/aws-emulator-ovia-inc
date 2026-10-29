@@ -180,24 +180,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // page is the catalog from that entry onward. Naming the entry rather than
         // an index means a catalog that gained or lost a blueprint between two
         // pages cannot make the walk skip or repeat another one. An absent — or
-        // empty — token asks for the first page.
-        let start = match input.page_token.as_deref().filter(|token| !token.is_empty()) {
-            None => 0,
-            Some(token) => catalog
-                .iter()
-                .position(|spec| spec.blueprint_id() == token)
-                .ok_or_else(|| invalid_page_token(token))?,
-        };
-
-        let mut blueprints = Vec::new();
-        let mut next_page_token = None;
-        for spec in &catalog[start..] {
-            if blueprints.len() == crate::state::RELATIONAL_DATABASE_BLUEPRINT_PAGE_SIZE {
-                next_page_token = Some(spec.blueprint_id());
-                break;
-            }
-            blueprints.push(spec.view());
-        }
+        // empty — token asks for the first page. The walk itself is the ONE
+        // catalog page walk this service's paged catalogs share, so a token
+        // naming no entry leaves no page to report and is refused.
+        let page_token = input.page_token.as_deref().filter(|token| !token.is_empty());
+        let (page, next_page_token) = crate::state::relational_database_blueprint_page(
+            catalog,
+            crate::state::RELATIONAL_DATABASE_BLUEPRINT_PAGE_SIZE,
+            page_token,
+        )
+        .ok_or_else(|| invalid_page_token(page_token.unwrap_or_default()))?;
+        let blueprints = page
+            .iter()
+            .map(crate::state::RelationalDatabaseBlueprintSpec::view)
+            .collect();
 
         Ok(GetRelationalDatabaseBlueprintsOutput {
             // A page always reports a list, empty or not: the caller asked what

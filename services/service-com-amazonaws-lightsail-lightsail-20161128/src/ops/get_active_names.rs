@@ -174,20 +174,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the account's names from that name onward in the store's own total
         // order. Using the name rather than an index means a resource created or
         // deleted between two pages cannot make the walk skip or repeat another
-        // name.
+        // name. The walk itself is the ONE page walk every listing of this
+        // service shares (`crate::state::resource_page`).
         let page_token = input.page_token.unwrap_or_default();
 
         crate::state::with_state(&*self.engine, |store| {
             let held = store.active_names(&region);
-            let mut active_names = Vec::new();
-            let mut next_page_token = None;
-            for name in held.range(page_token..) {
-                if active_names.len() == crate::state::ACTIVE_NAME_PAGE_SIZE {
-                    next_page_token = Some(name.clone());
-                    break;
-                }
-                active_names.push(name.clone());
-            }
+            // A held name IS the record here — this listing reports names rather
+            // than resource records — so the set lends each name as both.
+            let (active_names, next_page_token) = crate::state::resource_page(
+                held.range(page_token..).map(|name| (name.as_str(), name)),
+                crate::state::ACTIVE_NAME_PAGE_SIZE,
+                |_, name| name.clone(),
+            );
             GetActiveNamesOutput {
                 // An account holding no resource reports an empty list, not an
                 // absent one: the caller asked which names are taken, and the
