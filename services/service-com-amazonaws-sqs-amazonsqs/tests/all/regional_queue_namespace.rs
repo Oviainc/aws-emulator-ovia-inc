@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::{
-    invalid_parameter_message, DEAD_LETTER_TARGET_NAMESPACE_REASON, QUEUE_DOES_NOT_EXIST_MESSAGE,
-    REDRIVE_POLICY,
+    invalid_parameter_message, DEAD_LETTER_TARGET_OWNER_REASON, DEAD_LETTER_TARGET_REGION_REASON,
+    QUEUE_DOES_NOT_EXIST_MESSAGE, REDRIVE_POLICY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -347,52 +347,64 @@ async fn a_dead_letter_target_outside_the_queues_own_region_is_refused() {
     let home = REGION;
     let target = "regional-dlq";
 
-    // (case, the target ARN, whether the policy is refused). The rows walk every namespace
-    // a target can be in: this one, each other region, and another account.
-    let mut rows: Vec<(String, String, bool)> = vec![
+    // The two sentences the rule is stated in, spelled out rather than imported, so a row
+    // fails if the wording the crate answers with drifts: each field of the target ARN that
+    // puts it outside the source's namespace has its OWN rule, and the `Reason` clause is
+    // the only thing telling a caller which of them to fix.
+    const REGION_REASON: &str = "Dead-letter target must be in same region as the source.";
+    const OWNER_REASON: &str = "Dead-letter target owner should be same as the source.";
+    assert_eq!(
+        DEAD_LETTER_TARGET_REGION_REASON, REGION_REASON,
+        "case the region rule: expected Amazon SQS's own sentence, got {DEAD_LETTER_TARGET_REGION_REASON:?}"
+    );
+    assert_eq!(
+        DEAD_LETTER_TARGET_OWNER_REASON, OWNER_REASON,
+        "case the owner rule: expected Amazon SQS's own sentence, got {DEAD_LETTER_TARGET_OWNER_REASON:?}"
+    );
+
+    // (case, the target ARN, the `Reason` the refusal must state, or `None` for a target the
+    // policy may name). The rows walk every namespace a target can be in: this one, each
+    // other region, another account, and another account of another region.
+    let mut rows: Vec<(String, String, Option<&'static str>)> = vec![
         (
             "a target of this region".to_string(),
             expected_arn_in(home, target),
-            false,
+            None,
         ),
         (
             "a target of another account".to_string(),
             format!("arn:aws:sqs:{home}:{OTHER_ACCOUNT}:{target}"),
-            true,
+            Some(OWNER_REASON),
+        ),
+        (
+            "a target of another account in another region".to_string(),
+            format!("arn:aws:sqs:us-west-2:{OTHER_ACCOUNT}:{target}"),
+            Some(OWNER_REASON),
         ),
     ];
     for region in REGIONS.iter().filter(|region| **region != home) {
         rows.push((
             format!("a target of {region}"),
             expected_arn_in(region, target),
-            true,
+            Some(REGION_REASON),
         ));
     }
 
-    for (index, (case, target_arn, refused)) in rows.iter().enumerate() {
+    for (index, (case, target_arn, reason)) in rows.iter().enumerate() {
         let router = emulator();
         let _ = create_ok_in(&router, home, target, &json!({})).await;
         let policy = redrive_policy(target_arn);
         // Spelled out rather than composed from the constants the handler itself uses, so
         // this row fails if either the template or the reason changes: the fixed text is
-        // Amazon SQS's own refused-parameter-value template and the rule the model states
-        // for a dead-letter target, and the only variable part is the `RedrivePolicy` this
-        // request supplied.
-        let expected_message = refused.then(|| {
-            format!(
-                "Value {policy} for parameter RedrivePolicy is invalid. Reason: Only source \
-                 queues in this Amazon Web Services account in the same Region can specify \
-                 this queue as the dead-letter queue."
-            )
+        // Amazon SQS's own refused-parameter-value template and the rule the broken field
+        // publishes, and the only variable part is the `RedrivePolicy` this request supplied.
+        let expected_message = reason.map(|reason| {
+            format!("Value {policy} for parameter RedrivePolicy is invalid. Reason: {reason}")
         });
         assert_eq!(
             expected_message.as_deref(),
-            refused
-                .then(|| invalid_parameter_message(
-                    &policy,
-                    REDRIVE_POLICY,
-                    DEAD_LETTER_TARGET_NAMESPACE_REASON
-                ))
+            reason
+                .map(|reason| invalid_parameter_message(&policy, REDRIVE_POLICY, reason))
                 .as_deref(),
             "case {case}: the expected message must be the one the service composes"
         );

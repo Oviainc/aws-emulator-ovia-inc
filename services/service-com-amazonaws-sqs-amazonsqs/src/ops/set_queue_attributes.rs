@@ -271,11 +271,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A dead-letter link never crosses an account or a region boundary: a
         // `RedrivePolicy` whose target is some other namespace's queue could never
-        // deliver, so the attribute is left as it was rather than stored.
+        // deliver, so the attribute is left as it was rather than stored. The refusal states
+        // the rule that field of the ARN broke.
         if let Some(why) = input
             .attributes
             .get(state::REDRIVE_POLICY)
             .and_then(|value| state::redrive_policy_refusal(&region, value))
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
+        }
+        // The same boundary from the other end of the link: a `RedriveAllowPolicy` listing a
+        // source queue of another region admits a queue no redrive could ever come from, so
+        // the attribute is left as it was rather than stored.
+        if let Some(why) = input
+            .attributes
+            .get(state::REDRIVE_ALLOW_POLICY)
+            .and_then(|value| state::redrive_allow_policy_document_refusal(&region, value))
         {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
         }

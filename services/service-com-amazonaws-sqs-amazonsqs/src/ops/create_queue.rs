@@ -319,6 +319,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
         }
+        // The same boundary from the other end of the link: a `RedriveAllowPolicy` listing a
+        // source queue of another region admits a queue no redrive could ever come from, so
+        // no queue is created carrying it.
+        if let Some(why) = supplied
+            .get(state::REDRIVE_ALLOW_POLICY)
+            .and_then(|value| state::redrive_allow_policy_document_refusal(&region, value))
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
+        }
 
         let store = state::service_state(&*self.engine).ok_or_else(|| {
             CreateQueueErrorModeled::UnsupportedOperation(state::store_unavailable())

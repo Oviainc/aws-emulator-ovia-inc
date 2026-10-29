@@ -101,7 +101,10 @@
 //! ([`ComAmazonawsSqsAmazonsqsState::redrive_allow_policy_refusal`], from `CreateQueue` and
 //! `SetQueueAttributes`) and every automatic move out of an already associated source queue
 //! ([`ComAmazonawsSqsAmazonsqsState::dead_letter_due`]) — so a permission tightened after
-//! the wiring was made governs the next move as well.
+//! the wiring was made governs the next move as well. The permission DOCUMENT is judged when
+//! it is written, like the redrive document above: a `sourceQueueArns` entry naming another
+//! region's queue names a source this queue could never have, so it is refused rather than
+//! stored ([`redrive_allow_policy_document_refusal`]).
 //!
 //! # Message movement tasks
 //!
@@ -3200,22 +3203,50 @@ fn redrive_max_receive_count(policy: &::serde_json::Value) -> Option<u32> {
         .and_then(|count| u32::try_from(count).ok())
 }
 
-/// The reason a refusal gives for a `deadLetterTargetArn` that is not a queue of the
-/// SOURCE queue's own account and region.
+/// The reason a refusal gives for a `deadLetterTargetArn` naming a queue of ANOTHER
+/// REGION than the queue the policy is written on.
 ///
-/// The sentence is the rule as this service's own model states it, in the model's words:
-/// the `Attributes` member of `CreateQueue`/`SetQueueAttributes` documents the dead-letter
-/// redrive permission's default as "`allowAll` – (Default) Any source queues in this
-/// Amazon Web Services account in the same Region can specify this queue as the
-/// dead-letter queue"
-/// (`smithy_query(query="doc", shape="SetQueueAttributesRequest", member="Attributes",
-/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`),
-/// so a source queue of one account and region can name a dead-letter target of that
-/// account and region and of no other: redrive moves a message from the source queue to
-/// the target queue, and that delivery never crosses either boundary.
-pub const DEAD_LETTER_TARGET_NAMESPACE_REASON: &str =
-    "Only source queues in this Amazon Web Services account in the same Region can specify \
-     this queue as the dead-letter queue.";
+/// A redrive moves a message from the source queue to the target queue, and that delivery
+/// never crosses a region ([`Queue::dead_letter_target`]), so the rule the value broke is
+/// about the dead-letter TARGET: it has to be in the source's own region. Amazon SQS states
+/// that rule in its own sentence, and it is NOT the sentence about which source queues a
+/// dead-letter queue admits ([`REDRIVE_ALLOW_POLICY_REGION_REASON`] and the `allowAll`
+/// wording quoted on [`REDRIVE_PERMISSION_ALLOW_ALL`]), which is the dead-letter queue's
+/// own `RedriveAllowPolicy` rule: a caller branching on the `Reason` clause has only that
+/// clause to tell it which of the two constraints to go and fix.
+pub const DEAD_LETTER_TARGET_REGION_REASON: &str =
+    "Dead-letter target must be in same region as the source.";
+
+/// The reason a refusal gives for a `deadLetterTargetArn` naming a queue of ANOTHER
+/// ACCOUNT than the queue the policy is written on.
+///
+/// The other half of the namespace rule, stated for the other field an ARN carries: a
+/// redrive delivery crosses no account boundary either, so a target of some other account's
+/// is refused — with the rule about the target's OWNER rather than the one about its region,
+/// so the clause names the field the caller has to change.
+pub const DEAD_LETTER_TARGET_OWNER_REASON: &str =
+    "Dead-letter target owner should be same as the source.";
+
+/// Why the `deadLetterTargetArn` value `target` names no queue a source queue of `region`
+/// could ever drive its messages to, as the `Reason` clause stating the rule it broke, or
+/// `None` when it names one of this region's own queues.
+///
+/// Each field of the ARN that puts the target outside the source's namespace has its OWN
+/// rule and its own sentence: the region field ([`DEAD_LETTER_TARGET_REGION_REASON`]) and
+/// the account field ([`DEAD_LETTER_TARGET_OWNER_REASON`]). A value that is no queue ARN at
+/// all — another service's resource, or text with the wrong shape entirely — names no
+/// dead-letter target to judge the namespace of, and is left to the store's own rule about a
+/// target that is not there ([`DEAD_LETTER_TARGET_MISSING_REASON`]).
+fn dead_letter_target_namespace_reason(target: &str, region: &str) -> Option<&'static str> {
+    let (service, named_region, account, _) = queue_arn_fields(target)?;
+    if service != ARN_SERVICE {
+        return None;
+    }
+    if account != ::engine::emulator_account_id() {
+        return Some(DEAD_LETTER_TARGET_OWNER_REASON);
+    }
+    (named_region != region).then_some(DEAD_LETTER_TARGET_REGION_REASON)
+}
 
 /// Why the `RedrivePolicy` value `policy` cannot be stored on a queue of `region`, as the
 /// text of the refusal a caller has to fix the request from, or `None` when it can.
@@ -3227,15 +3258,16 @@ pub const DEAD_LETTER_TARGET_NAMESPACE_REASON: &str =
 /// no redrive any delivery could ever make, so it is refused rather than stored — otherwise
 /// the wiring looks configured and black-holes.
 ///
-/// A redrive link is between two queues of ONE account and region
-/// ([`DEAD_LETTER_TARGET_NAMESPACE_REASON`]): the target a policy names is read in the
-/// region the queue carrying the policy lives in, so a `deadLetterTargetArn` naming
-/// another region or another account names a queue no redrive from this queue could ever
-/// deliver to.
+/// A redrive link is between two queues of ONE account and region: the target a policy
+/// names is read in the region the queue carrying the policy lives in, so a
+/// `deadLetterTargetArn` naming another region or another account names a queue no redrive
+/// from this queue could ever deliver to — each of those two fields refused with the rule
+/// stated for IT ([`dead_letter_target_namespace_reason`]).
 ///
 /// Each refusal is worded in the one template this service answers a refused parameter
 /// VALUE in ([`invalid_parameter_message`]), with the value taken from the request: the
-/// `RedrivePolicy` the caller supplied, exactly as supplied.
+/// `RedrivePolicy` the caller supplied, exactly as supplied, and a `Reason` clause stating
+/// the one rule that value broke.
 ///
 /// What this judges is the document ALONE. Whether the two queues it links may be linked
 /// needs the store: whether the target is there at all and whether it is of the source's
@@ -3265,11 +3297,9 @@ pub fn redrive_policy_refusal(region: &str, policy: &str) -> Option<String> {
     if !within {
         return refused(&max_receive_count_reason(&supplied_member_text(count)));
     }
-    match parse_queue_arn(target, region) {
-        QueueArn::OfThisRegion(_) | QueueArn::Malformed => None,
-        QueueArn::OfAnotherRegion { .. } | QueueArn::Elsewhere => {
-            refused(DEAD_LETTER_TARGET_NAMESPACE_REASON)
-        }
+    match dead_letter_target_namespace_reason(target, region) {
+        Some(reason) => refused(reason),
+        None => None,
     }
 }
 
@@ -3396,6 +3426,57 @@ fn numeric_member(supplied: ::serde_json::Value) -> ::serde_json::Value {
 pub const REDRIVE_ALLOW_POLICY_REASON: &str =
     "The value for the dead-letter queue's RedriveAllowPolicy attribute prevents you from \
      completing this request.";
+
+/// The reason a refusal gives for a `RedriveAllowPolicy` that lists a source queue ARN of
+/// another region than the queue the permission is written on.
+///
+/// The SAME boundary as [`DEAD_LETTER_TARGET_REGION_REASON`], seen from the other end of the
+/// link: a `sourceQueueArns` entry names "the source queues that can specify this queue as
+/// the dead-letter queue", and a queue of another region can never be one of them, so the
+/// permission would admit nothing. Amazon SQS words this end of the rule for the parameter
+/// that carried the ARNs, and that wording is what the caller has to fix the document from.
+pub const REDRIVE_ALLOW_POLICY_REGION_REASON: &str =
+    "Amazon SQS can't create the redrive allow policy. All source queue ARNs must be in the \
+     same region as the current SQS queue.";
+
+/// Why the `RedriveAllowPolicy` value `policy` cannot be stored on a queue of `region`, as
+/// the text of the refusal a caller has to fix the request from, or `None` when it can.
+///
+/// The permission document is judged when it is WRITTEN, exactly as a `RedrivePolicy`
+/// document is ([`redrive_policy_refusal`]): a `sourceQueueArns` entry naming a queue of
+/// another region names a queue that could never specify this one as its dead-letter target,
+/// so the document admits nothing and is refused rather than stored
+/// ([`REDRIVE_ALLOW_POLICY_REGION_REASON`]).
+///
+/// What this judges is the document ALONE, and only the ARNs it lists: whether the queues it
+/// names exist is not part of the permission — a source queue may be created after the
+/// dead-letter queue has already been told to admit it — and an entry that is no queue ARN at
+/// all names no source queue in any region, which the permission simply never admits
+/// ([`Queue::admits_dead_letter_source`]). A value that is not JSON at all is left to the
+/// attribute's own form rules ([`check_attribute_value`]).
+pub fn redrive_allow_policy_document_refusal(region: &str, policy: &str) -> Option<String> {
+    let parsed = ::serde_json::from_str::<::serde_json::Value>(policy).ok()?;
+    let listed = parsed.get(SOURCE_QUEUE_ARNS_MEMBER)?.as_array()?;
+    listed
+        .iter()
+        .filter_map(::serde_json::Value::as_str)
+        .any(|arn| source_queue_arn_of_another_region(arn.trim(), region))
+        .then(|| {
+            invalid_parameter_message(
+                policy,
+                REDRIVE_ALLOW_POLICY,
+                REDRIVE_ALLOW_POLICY_REGION_REASON,
+            )
+        })
+}
+
+/// Whether `arn` names an Amazon SQS queue of a region OTHER than `region` — the one thing
+/// [`redrive_allow_policy_document_refusal`] judges a listed source queue on.
+fn source_queue_arn_of_another_region(arn: &str, region: &str) -> bool {
+    queue_arn_fields(arn).is_some_and(|(service, named_region, _, _)| {
+        service == ARN_SERVICE && named_region != region
+    })
+}
 
 /// How a refusal of a `RedrivePolicy` VALUE names the policy it refused: the two parameters
 /// the policy carries, each as the request supplied it, rather than the document's own
