@@ -67,3 +67,5 @@ mod vpc_endpoint;
 mod vpc_endpoint_batch_read;
 #[path = "all/vpc_endpoint_delete.rs"]
 mod vpc_endpoint_delete;
+#[path = "all/vpc_endpoint_listing.rs"]
+mod vpc_endpoint_listing;

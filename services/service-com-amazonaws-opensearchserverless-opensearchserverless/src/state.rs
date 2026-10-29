@@ -31,6 +31,7 @@ use crate::ops::types::{
     LifecyclePolicySummary, SamlConfigOptions, SecurityConfigDetail, SecurityConfigSummary, SecurityPolicyDetail,
     SecurityPolicySummary, Tag, UpdateCollectionDetail, UpdateCollectionGroupDetail,
     UpdateIamIdentityCenterConfigOptions, VectorOptions, VpcEndpointDetail, VpcEndpointErrorDetail,
+    VpcEndpointSummary,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -2263,6 +2264,16 @@ impl VpcEndpointRecord {
             failure_message: None,
         }
     }
+
+    /// The `VpcEndpointSummary` body for this record — the shape `ListVpcEndpoints` pages
+    /// over, so the listing reports the same identity and status the detail readers do.
+    pub fn summary(&self) -> VpcEndpointSummary {
+        VpcEndpointSummary {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            status: Some(self.status.clone()),
+        }
+    }
 }
 
 /// Per-service state for com-amazonaws-opensearchserverless-opensearchserverless. A handler reaches it through [`service_state`].
@@ -2847,6 +2858,12 @@ impl Paged for CollectionRecord {
 }
 
 impl Paged for SecurityConfigRecord {
+    fn page_cursor(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Paged for VpcEndpointRecord {
     fn page_cursor(&self) -> &str {
         &self.id
     }

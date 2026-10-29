@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListVpcEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListVpcEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListVpcEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: enumerates the managed interface VPC endpoints stored in [`crate::state`],
+//! in endpoint-id order, keeps only the ones whose status the request's
+//! `vpcEndpointFilters` names (when it names one), and cuts the page `maxResults` and
+//! `nextToken` select — handing back a `nextToken` only while records remain after the
+//! page.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +148,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListVpcEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListVpcEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListVpcEndpoints"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListVpcEndpointsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `VpcEndpointFilters$status` is an enum the boundary validator does not narrow; a
+        // value outside the model's list names no endpoint status at all.
+        if let Some(status) = input
+            .vpc_endpoint_filters
+            .as_ref()
+            .and_then(|filters| filters.status.as_deref())
+        {
+            if !VPC_ENDPOINT_STATUS_VALUES.contains(&status) {
+                return Err(ListVpcEndpointsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "vpcEndpointFilters.status must be one of [{}], got {status:?}",
+                            VPC_ENDPOINT_STATUS_VALUES.join(", ")
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+        // A `PENDING` endpoint reaches `ACTIVE`, and one whose deletion was accepted is
+        // purged, on their own: applying the transitions the clock has already made due is
+        // what a later caller sees, not a change this read made.
+        store.settle_due_transitions();
+
+        // The only filter the model declares is an equality test on the record's own
+        // status, and a filter the request leaves absent selects every stored endpoint.
+        let filters = input.vpc_endpoint_filters.unwrap_or_default();
+        let matching: Vec<&crate::state::VpcEndpointRecord> = store
+            .vpc_endpoints
+            .values()
+            .filter(|record| {
+                filters
+                    .status
+                    .as_deref()
+                    .is_none_or(|status| record.status == status)
+            })
+            .collect();
+
+        let page = crate::state::page(matching, input.next_token.as_deref(), input.max_results)
+            .map_err(|message| {
+                ListVpcEndpointsErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+            })?;
+
+        Ok(ListVpcEndpointsOutput {
+            vpc_endpoint_summaries: Some(
+                page.items.iter().map(|record| record.summary()).collect(),
+            ),
+            next_token: page.next_token,
+        })
     }
 }
