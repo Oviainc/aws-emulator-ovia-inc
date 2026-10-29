@@ -22,7 +22,8 @@ use service_com_amazonaws_bedrockdataautomation_amazonbedrockkeystonebuildtimese
 
 use crate::ops::types::{
     AssetProcessingConfiguration, Blueprint, DataAutomationConfiguration, EncryptionConfiguration,
-    NotificationConfiguration, Tag, TimestampSegment, VideoSegmentConfiguration,
+    NotificationConfiguration, ResourceNotFoundException, Tag, TimestampSegment,
+    VideoSegmentConfiguration,
 };
 
 /// The region every ARN this service mints falls back to when the request carries no
@@ -441,8 +442,30 @@ pub fn timestamp_segment_refusal(
 ///
 /// It is the service's own fixed string and carries NOTHING from the request: the ARN
 /// the caller sent is not interpolated, because this service does not echo it back. Kept
-/// in one place so the four readers cannot drift apart.
+/// in one place so the four readers cannot drift apart — through
+/// [`unknown_invocation_refusal`], which is the only thing that reads it.
 pub const INVOCATION_NOT_FOUND_MESSAGE: &str = "Data Automation Invocation ARN not found.";
+
+/// The whole refusal a caller-supplied ARN naming no retained invocation earns: the
+/// `ResourceNotFoundException` shape carrying [`INVOCATION_NOT_FOUND_MESSAGE`], answered
+/// with this service's recorded client-error status rather than the status the shape's
+/// advisory `smithy.api#httpError` trait declares (see
+/// [`crate::scaffolded::Scaffolded::ClientError`]).
+///
+/// `not_found` is the calling operation's own `ResourceNotFoundException` variant — the
+/// shape itself is the one generated struct every operation here shares, so the variant
+/// constructor is all that differs between callers. EVERYTHING else about the refusal
+/// lives here once: the shape, the message, and the STATUS DECISION the status-override
+/// channel documents as evidence-gated. That is the same reason the tag-key rule is
+/// single-homed in [`malformed_tag_key_refusal`]: the operations that resolve an ARN
+/// cannot come to disagree about what one naming nothing answers.
+pub fn unknown_invocation_refusal<E>(
+    not_found: impl FnOnce(ResourceNotFoundException) -> E,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::client_error(not_found(ResourceNotFoundException {
+        message: Some(INVOCATION_NOT_FOUND_MESSAGE.to_string()),
+    }))
+}
 
 /// What this service answers when a tag edit would take one invocation past [`MAX_TAGS`]
 /// — the message behind `ServiceQuotaExceededException` for `TagResource`.
@@ -671,8 +694,11 @@ impl Invocation {
 /// TOGETHER and only after it has freed a slot. That is what bounds this store: no
 /// request-reachable path can insert into one map without the other, so
 /// `client_tokens` can never outgrow `invocations`, and `invocations` can never exceed
-/// [`MAX_INVOCATIONS`]. A handler reads a record through [`Self::invocation`] /
-/// [`Self::invocation_mut`], which cannot grow anything.
+/// [`MAX_INVOCATIONS`]. A handler reaches a record through
+/// [`Self::resolve_invocation`] / [`Self::resolve_invocation_mut`] — which is also where
+/// an ARN naming no record earns its refusal — or through the bare
+/// [`Self::invocation`] / [`Self::invocation_mut`] lookups those are built on; none of
+/// them can grow anything.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeserviceState {
     /// Every invocation this emulator has minted, keyed by its `invocationArn`. Bounded
@@ -717,6 +743,31 @@ impl ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeservice
     /// The invocation `invocation_arn` names, for a reporting read.
     pub fn invocation(&self, invocation_arn: &str) -> Option<&Invocation> {
         self.invocations.get(invocation_arn)
+    }
+
+    /// Resolve `invocation_arn` for a reporting read, or the refusal it earns when this
+    /// store retains no such invocation ([`unknown_invocation_refusal`]).
+    ///
+    /// The resolve-or-refuse step every ARN-keyed operation here starts with, so each one
+    /// writes `?` over it rather than restating the refusal.
+    pub fn resolve_invocation<E>(
+        &self,
+        invocation_arn: &str,
+        not_found: impl FnOnce(ResourceNotFoundException) -> E,
+    ) -> Result<&Invocation, crate::scaffolded::Scaffolded<E>> {
+        self.invocation(invocation_arn)
+            .ok_or_else(|| unknown_invocation_refusal(not_found))
+    }
+
+    /// [`Self::resolve_invocation`] for a caller that edits the record it resolves in
+    /// place, so the two differ only in the borrow they hand back and not in the refusal.
+    pub fn resolve_invocation_mut<E>(
+        &mut self,
+        invocation_arn: &str,
+        not_found: impl FnOnce(ResourceNotFoundException) -> E,
+    ) -> Result<&mut Invocation, crate::scaffolded::Scaffolded<E>> {
+        self.invocation_mut(invocation_arn)
+            .ok_or_else(|| unknown_invocation_refusal(not_found))
     }
 
     /// The invocation `invocation_arn` names, for a caller that edits the record in

@@ -167,17 +167,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
-        let Some(invocation) = store.invocation(&input.resource_arn) else {
-            // 400, not the 404 the shape's advisory `@httpError` declares: see
-            // `crate::scaffolded::Scaffolded::ClientError`.
-            return Err(crate::scaffolded::Scaffolded::client_error(
-                ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::INVOCATION_NOT_FOUND_MESSAGE.to_string()),
-                    },
-                ),
-            ));
-        };
+        // Resolved through the store's own resolve-or-refuse step, so this operation and
+        // its siblings answer an ARN naming nothing identically
+        // (`crate::state::unknown_invocation_refusal`).
+        let invocation = store.resolve_invocation(
+            &input.resource_arn,
+            ListTagsForResourceErrorModeled::ResourceNotFoundException,
+        )?;
 
         Ok(ListTagsForResourceOutput {
             tags: Some(invocation.tag_list()),

@@ -183,17 +183,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this handler runs, so an ARN that reaches here is well formed; one naming no
         // stored invocation is simply absent.
         let mut store = state.lock();
-        let Some(invocation) = store.invocation_mut(&input.invocation_arn) else {
-            // 400, not the 404 the shape's advisory `@httpError` declares: see
-            // `crate::scaffolded::Scaffolded::ClientError`.
-            return Err(crate::scaffolded::Scaffolded::client_error(
-                GetDataAutomationStatusErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::INVOCATION_NOT_FOUND_MESSAGE.to_string()),
-                    },
-                ),
-            ));
-        };
+        // What an ARN naming nothing answers — shape, message and status — is this
+        // service's one rule, so it is resolved through the store's own resolve-or-refuse
+        // step (`crate::state::unknown_invocation_refusal`) rather than restated here.
+        let invocation = store.resolve_invocation_mut(
+            &input.invocation_arn,
+            GetDataAutomationStatusErrorModeled::ResourceNotFoundException,
+        )?;
 
         invocation.advance_to(::std::time::SystemTime::now());
 
