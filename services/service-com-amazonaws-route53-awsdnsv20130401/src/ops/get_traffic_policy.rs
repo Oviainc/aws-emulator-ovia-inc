@@ -148,7 +148,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A traffic policy is addressed by both halves of `(Id, Version)`, so a
         // policy the account does not hold and a version that policy does not
         // hold are the same refusal: there is no such traffic policy version to
-        // report. A read, so nothing in the store is touched.
+        // report. A version a DELETE has flagged is still reported here, and
+        // only here: "Route 53 never fully deletes the traffic policy … if you
+        // retain the ID of the policy, you can get information about the policy,
+        // including the traffic policy document, by running GetTrafficPolicy."
+        // A read, so nothing in the store is touched.
         let store = state.lock();
         let traffic_policy = store
             .traffic_policies

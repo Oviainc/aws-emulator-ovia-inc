@@ -206,11 +206,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the stored policy version rather than taken from the request, which
         // carries no type at all. A policy id the account does not hold and a
         // version that policy does not hold are the same refusal: there is no
-        // such traffic policy version to generate record sets from.
+        // such traffic policy version to generate record sets from. A version a
+        // delete has flagged is not one the account holds either — its record is
+        // retained only for `GetTrafficPolicy` — so no instance is built on one.
         let traffic_policy_type = store
             .traffic_policies
             .get(&input.traffic_policy_id)
-            .and_then(|policy| policy.versions.get(&input.traffic_policy_version))
+            .and_then(|policy| policy.live_version(input.traffic_policy_version))
             .map(|version| version.record_type.clone())
             .ok_or_else(|| {
                 CreateTrafficPolicyInstanceErrorModeled::NoSuchTrafficPolicy(

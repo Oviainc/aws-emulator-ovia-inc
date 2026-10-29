@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTrafficPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTrafficPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTrafficPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This operation flags one version of a traffic policy deleted. The record is
+//! RETAINED: a flagged version is no longer one of the account's traffic policy
+//! versions — nothing lists it, nothing new is built on it, and addressing it
+//! again is the modelled 404 — while `GetTrafficPolicy` still reports the
+//! document it held.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +70,21 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::no_such_traffic_policy;
+
+/// The refusal text a delete of a traffic policy version that traffic policy
+/// instances were created from answers with (`TrafficPolicyInUse`, HTTP 400).
+///
+/// A CONSTANT naming neither the policy nor the instances still built on it,
+/// like the other refusals this service words about a resource class: the
+/// shape's own documentation states the rule without either ("One or more
+/// traffic policy instances were created by using the specified traffic
+/// policy"), the instance ids are server-generated, so a refusal quoting them
+/// would differ on every run, and the instances themselves are in state, where
+/// `ListTrafficPolicyInstancesByPolicy` reports them.
+const TRAFFIC_POLICY_IN_USE_MESSAGE: &str =
+    "One or more traffic policy instances were created by using the specified traffic policy.";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -146,18 +157,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTrafficPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTrafficPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTrafficPolicy"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`; `InvalidInput` is the only error this
+            // operation models that can carry the reason at all.
+            DeleteTrafficPolicyErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // `ConcurrentModification` reports that "another user submitted a
+        // request to create, update, or delete the object at the same time that
+        // you did". The store below is taken for the whole of this delete, so no
+        // delete it accepts overlaps another write to the same policy and that
+        // condition never arises.
+        let mut store = state.lock();
+
+        // "One or more traffic policy instances were created by using the
+        // specified traffic policy": an instance's record sets are generated
+        // from the policy VERSION it names and keep reporting that pair
+        // (`TrafficPolicyInstance$TrafficPolicyId` and `$TrafficPolicyVersion`),
+        // so the version a live instance was built from cannot go while that
+        // instance is there. COUNTED off the instances, so deleting the last
+        // instance built on the version makes it deletable again. Read before
+        // the policy is reached for writing, so this borrow of the store ends
+        // here.
+        let in_use = store.traffic_policy_instances.values().any(|instance| {
+            instance.traffic_policy_id == input.id
+                && instance.traffic_policy_version == input.version
+        });
+
+        // A traffic policy version is addressed by both halves of
+        // `(Id, Version)`, so a policy the account does not hold and a version
+        // that policy does not hold are the same refusal, worded through the ONE
+        // place this service words a traffic policy it does not hold. A version
+        // an earlier delete already flagged is no longer one the account holds
+        // either, so deleting it again is that same refusal rather than a second
+        // success.
+        let stored = store
+            .traffic_policies
+            .get_mut(&input.id)
+            .and_then(|policy| policy.versions.get_mut(&input.version))
+            .filter(|version| !version.deleted)
+            .ok_or_else(|| {
+                DeleteTrafficPolicyErrorModeled::NoSuchTrafficPolicy(no_such_traffic_policy())
+            })?;
+
+        if in_use {
+            return Err(DeleteTrafficPolicyErrorModeled::TrafficPolicyInUse(
+                TrafficPolicyInUse {
+                    message: Some(TRAFFIC_POLICY_IN_USE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The write this operation exists for. "Route 53 sets a flag on the
+        // policy to indicate that it has been deleted. However, Route 53 never
+        // fully deletes the traffic policy" — so the record stays and the flag
+        // IS the delete: from here nothing lists the version, no instance and no
+        // further version is built on it, and addressing it is a 404, while
+        // `GetTrafficPolicy` still reports the document it held, which is the
+        // one reader the documentation keeps. The version NUMBER stays taken as
+        // well, so the policy's next version does not reuse it.
+        stored.deleted = true;
+
+        // A policy with no version left is no longer one the account holds, and
+        // its slot in the account's quota is free again — so the retained record
+        // is remembered in deletion order and released once the store holds more
+        // deleted policies than it keeps. A write on the mutating path, never on
+        // a read.
+        if store
+            .traffic_policies
+            .get(&input.id)
+            .is_some_and(crate::state::StoredTrafficPolicy::is_deleted)
+        {
+            store.retain_deleted_traffic_policy(input.id);
+        }
+
+        Ok(DeleteTrafficPolicyOutput {})
     }
 }

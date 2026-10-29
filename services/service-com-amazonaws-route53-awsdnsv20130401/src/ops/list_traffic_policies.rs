@@ -135,7 +135,9 @@ impl From<ListTrafficPoliciesErrorModeled> for ListTrafficPoliciesError {
 /// The summary of one traffic policy: its id and name, and the `Type` of its
 /// LATEST version, which is the version this listing reports ("information
 /// about the latest version for every traffic policy"). `None` for a policy
-/// holding no version at all, which has no latest version to summarise.
+/// holding no version at all, and for one whose every version a delete has
+/// flagged — "deleted traffic policies aren't listed if you run
+/// ListTrafficPolicies" — neither of which has a latest version to summarise.
 ///
 /// `TrafficPolicyCount` is the number of versions this policy holds: the member
 /// targets `TrafficPolicyVersion` (`range 1..1000`), the per-policy version
@@ -243,7 +245,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `skip` rather than a slice index: `start` came from the request, and
         // a walk that skips can never index past the end of the listing.
         for policy in ordered.iter().skip(start) {
-            // A policy holding no version has no latest version to report.
+            // A policy holding no version the account still holds has no
+            // latest version to report.
             let Some(summary) = traffic_policy_summary(policy) else {
                 continue;
             };

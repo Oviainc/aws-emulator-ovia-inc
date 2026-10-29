@@ -201,6 +201,20 @@ pub const MAX_HEALTH_CHECKS: usize = 200;
 /// number of health checks any one client session creates and deletes.
 const MAX_RETAINED_HEALTH_CHECK_REFERENCES: usize = 10_000;
 
+/// The most deleted traffic policies the store keeps holding.
+///
+/// A deleted policy's record OUTLIVES the delete — `GetTrafficPolicy` still
+/// reports it ([`StoredTrafficPolicyVersion::deleted`]) — and the delete frees
+/// the account's quota slot, so without a cap a create/delete loop would grow
+/// the store for the life of the process. Past this many deleted policies the
+/// oldest one's record is released
+/// ([`ComAmazonawsRoute53Awsdnsv20130401State::retain_deleted_traffic_policies`]),
+/// which is the eviction policy the live population already gets from
+/// [`MAX_TRAFFIC_POLICIES`]; the cap is far above the number of policies any one
+/// client session creates and deletes, so a policy a caller still holds the id
+/// of is never the one released.
+const MAX_RETAINED_DELETED_TRAFFIC_POLICIES: usize = 10_000;
+
 /// The `HealthCheckType` values that check an endpoint of the caller's, rather
 /// than reading a CloudWatch alarm, combining other health checks or following a
 /// routing control (`HealthCheckType` enum).
@@ -1415,6 +1429,22 @@ pub struct StoredTrafficPolicyVersion {
     pub document: String,
     /// This version's comment, when it was created with one.
     pub comment: Option<String>,
+    /// Whether a delete has flagged this version deleted.
+    ///
+    /// `DeleteTrafficPolicy`'s own documentation: "When you delete a traffic
+    /// policy, Route 53 sets a flag on the policy to indicate that it has been
+    /// deleted. However, Route 53 never fully deletes the traffic policy …
+    /// Deleted traffic policies aren't listed if you run ListTrafficPolicies …
+    /// If you retain the ID of the policy, you can get information about the
+    /// policy, including the traffic policy document, by running
+    /// GetTrafficPolicy." So the delete is this FLAG rather than the removal of
+    /// the record: a flagged version is no longer one of the account's traffic
+    /// policy versions — nothing lists it, nothing new is built on it, and
+    /// addressing it is the same 404 as a version that never existed — while
+    /// `GetTrafficPolicy`, the one reader the documentation keeps, still reports
+    /// the document it held. The version number stays taken either way
+    /// ([`StoredTrafficPolicy::next_version`]).
+    pub deleted: bool,
 }
 
 /// A traffic policy and every version of it.
@@ -1422,7 +1452,7 @@ pub struct StoredTrafficPolicyVersion {
 /// A traffic policy is addressed by `(Id, Version)` — `GetTrafficPolicy` takes
 /// both — so the versions live ON the policy, keyed by version number: one
 /// policy's id and name cannot then disagree between two of its versions, and
-/// the highest key is its latest version.
+/// the highest LIVE key is its latest version.
 #[derive(Debug, Clone)]
 pub struct StoredTrafficPolicy {
     /// The policy id, which is also this record's key in
@@ -1450,6 +1480,10 @@ impl StoredTrafficPolicy {
     /// create and a later read cannot report one policy version differently.
     pub fn to_traffic_policy(&self, version: i32) -> Option<TrafficPolicy> {
         let stored = self.versions.get(&version)?;
+        // Reported whether or not the version is flagged deleted: the retained
+        // record IS what `GetTrafficPolicy` reports for a deleted version, and
+        // every other reader selects the versions it reports through
+        // [`Self::live_versions`] before projecting them.
         Some(TrafficPolicy {
             id: self.id.clone(),
             version,
@@ -1474,17 +1508,51 @@ impl StoredTrafficPolicy {
             .map_or(FIRST_TRAFFIC_POLICY_VERSION, |highest| highest + 1)
     }
 
-    /// The highest version number this policy holds — its LATEST version, the
-    /// one a listing reports — or `None` for a policy holding no version.
-    pub fn latest_version(&self) -> Option<i32> {
-        self.versions.keys().next_back().copied()
+    /// Every version of this policy a delete has NOT flagged, in numerical
+    /// order by version number, as `(version number, version)`.
+    ///
+    /// The ONE place this service decides which versions of a policy still
+    /// count, so a listing, a version create and a delete cannot disagree about
+    /// it: a flagged version is retained only for `GetTrafficPolicy`
+    /// ([`StoredTrafficPolicyVersion::deleted`]).
+    pub fn live_versions(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (i32, &StoredTrafficPolicyVersion)> {
+        self.versions
+            .iter()
+            .filter(|(_, stored)| !stored.deleted)
+            .map(|(&version, stored)| (version, stored))
     }
 
-    /// How many versions this policy holds, as the `TrafficPolicyVersion` the
-    /// count shapes carry (`range 1..1000`, which is also
-    /// [`MAX_TRAFFIC_POLICY_VERSION`], so the count cannot leave that range).
+    /// The version `version` of this policy, if the policy holds it and a
+    /// delete has not flagged it.
+    pub fn live_version(&self, version: i32) -> Option<&StoredTrafficPolicyVersion> {
+        self.versions
+            .get(&version)
+            .filter(|stored| !stored.deleted)
+    }
+
+    /// Whether every version this policy ever held is flagged deleted, which is
+    /// what makes the POLICY deleted: it is then no longer one of the account's
+    /// traffic policies, so nothing lists it and no further version is built on
+    /// it.
+    pub fn is_deleted(&self) -> bool {
+        self.live_versions().next().is_none()
+    }
+
+    /// The highest version number this policy still holds — its LATEST version,
+    /// the one a listing reports — or `None` for a policy holding no live
+    /// version, which a listing does not report at all.
+    pub fn latest_version(&self) -> Option<i32> {
+        self.live_versions().next_back().map(|(version, _)| version)
+    }
+
+    /// How many versions this policy still holds, as the
+    /// `TrafficPolicyVersion` the count shapes carry (`range 1..1000`, which is
+    /// also [`MAX_TRAFFIC_POLICY_VERSION`], so the count cannot leave that
+    /// range).
     pub fn version_count(&self) -> i32 {
-        i32::try_from(self.versions.len()).unwrap_or(MAX_TRAFFIC_POLICY_VERSION)
+        i32::try_from(self.live_versions().count()).unwrap_or(MAX_TRAFFIC_POLICY_VERSION)
     }
 }
 
@@ -1578,9 +1646,14 @@ pub struct ComAmazonawsRoute53Awsdnsv20130401State {
     /// submission order, so the oldest can be evicted first.
     change_order: VecDeque<String>,
     /// Every traffic policy, keyed by its id. A `BTreeMap` so a listing pages
-    /// over a stable total order of policy ids. Bounded by
-    /// [`MAX_TRAFFIC_POLICIES`].
+    /// over a stable total order of policy ids. The policies the ACCOUNT holds
+    /// are bounded by [`MAX_TRAFFIC_POLICIES`]; a record OUTLIVES the delete
+    /// that flagged its last version, and those records are bounded by
+    /// [`MAX_RETAINED_DELETED_TRAFFIC_POLICIES`].
     pub traffic_policies: BTreeMap<String, StoredTrafficPolicy>,
+    /// The ids of the deleted traffic policies in deletion order, so the oldest
+    /// record can be released first.
+    deleted_traffic_policy_order: VecDeque<String>,
     /// Every traffic policy instance of the account's, keyed by its id. A
     /// `BTreeMap` so a listing pages over a stable total order of instance ids.
     /// Bounded by [`MAX_TRAFFIC_POLICY_INSTANCES`].
@@ -1641,6 +1714,7 @@ impl Default for ComAmazonawsRoute53Awsdnsv20130401State {
             changes: HashMap::new(),
             change_order: VecDeque::new(),
             traffic_policies: BTreeMap::new(),
+            deleted_traffic_policy_order: VecDeque::new(),
             traffic_policy_instances: BTreeMap::new(),
             health_checks: BTreeMap::new(),
             health_check_by_caller_reference: HashMap::new(),
@@ -1717,6 +1791,25 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
         while self.deleted_health_check_references.len() > MAX_RETAINED_HEALTH_CHECK_REFERENCES {
             if let Some(released) = self.deleted_health_check_references.pop_front() {
                 self.health_check_by_caller_reference.remove(&released);
+            }
+        }
+    }
+
+    /// Record that the traffic policy `id` has no version the account still
+    /// holds, so its retained record can be released once the store holds too
+    /// many of them.
+    ///
+    /// The record itself is LEFT IN PLACE — `GetTrafficPolicy` still reports
+    /// every version of it — and the policy is remembered in deletion order;
+    /// past [`MAX_RETAINED_DELETED_TRAFFIC_POLICIES`] the oldest deleted
+    /// policy's record is dropped, so the store cannot grow without end for a
+    /// caller that creates and deletes policies in a loop. Called from the
+    /// delete that flags the policy's last version, never from a read.
+    pub fn retain_deleted_traffic_policy(&mut self, id: String) {
+        self.deleted_traffic_policy_order.push_back(id);
+        while self.deleted_traffic_policy_order.len() > MAX_RETAINED_DELETED_TRAFFIC_POLICIES {
+            if let Some(released) = self.deleted_traffic_policy_order.pop_front() {
+                self.traffic_policies.remove(&released);
             }
         }
     }
@@ -1813,11 +1906,28 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
     /// has the same value for Name already exists" — is about the POLICY, not
     /// one of its versions, so the lookup is over the policies, and it is
     /// searched off the store rather than tracked beside it: a policy that is
-    /// deleted frees its name by itself.
+    /// deleted frees its name by itself. A policy every version of which is
+    /// flagged deleted is not one the account holds
+    /// ([`StoredTrafficPolicy::is_deleted`]), so it carries no name a create
+    /// can collide with, even though its record is retained for
+    /// `GetTrafficPolicy`.
     pub fn traffic_policy_with_name(&self, name: &str) -> Option<&StoredTrafficPolicy> {
         self.traffic_policies
             .values()
-            .find(|policy| policy.name == name)
+            .find(|policy| policy.name == name && !policy.is_deleted())
+    }
+
+    /// How many traffic policies the account holds right now.
+    ///
+    /// COUNTED off the store, and over the policies that are not flagged
+    /// deleted: the quota is on the policies the account HAS, so a delete
+    /// releases a slot by itself even though the deleted policy's record is
+    /// retained for `GetTrafficPolicy`.
+    pub fn traffic_policy_count(&self) -> usize {
+        self.traffic_policies
+            .values()
+            .filter(|policy| !policy.is_deleted())
+            .count()
     }
 
     /// The traffic policy instance that already answers for `name` at
@@ -1850,9 +1960,10 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
     ///
     /// Read off the policies rather than tracked in a counter beside them, so
     /// the positions cannot disagree with the policies the account actually
-    /// holds. A position freed by a delete may be handed out again, which leaves
-    /// the ORDER of the surviving policies untouched: every one of them was
-    /// created before the policy taking the new position.
+    /// holds. A deleted policy's record is retained
+    /// ([`StoredTrafficPolicyVersion::deleted`]), so its position is never
+    /// handed out again and the ORDER of the surviving policies is untouched:
+    /// every one of them was created before the policy taking the new position.
     pub fn next_traffic_policy_position(&self) -> u64 {
         self.traffic_policies
             .values()
@@ -1861,12 +1972,16 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
             .map_or(FIRST_TRAFFIC_POLICY_POSITION, |highest| highest + 1)
     }
 
-    /// Every traffic policy the account holds, in the order they were created
-    /// in — the order `ListTrafficPolicies` reports them in.
+    /// Every traffic policy record this store holds, in the order they were
+    /// created in — the order `ListTrafficPolicies` reports them in.
     ///
     /// The creation position is unique among the policies the account holds, so
     /// the id breaks a tie only for completeness: the order is TOTAL, which is
-    /// what lets a page resume at one place.
+    /// what lets a page resume at one place. The RETAINED record of a deleted
+    /// policy ([`StoredTrafficPolicy::is_deleted`]) is in the walk as well, so
+    /// the caller decides what to do with it: a listing has none to report for
+    /// it and skips it, which is what keeps a deleted policy out of
+    /// `ListTrafficPolicies` without moving where the surviving ones resume.
     pub fn traffic_policies_in_creation_order(&self) -> Vec<&StoredTrafficPolicy> {
         let mut ordered: Vec<&StoredTrafficPolicy> = self.traffic_policies.values().collect();
         ordered.sort_by(|left, right| {
@@ -1934,7 +2049,7 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
         let (limit, count) = match limit_type {
             ACCOUNT_LIMIT_MAX_HOSTED_ZONES => (MAX_HOSTED_ZONES, self.zones.len()),
             ACCOUNT_LIMIT_MAX_TRAFFIC_POLICIES => {
-                (MAX_TRAFFIC_POLICIES, self.traffic_policies.len())
+                (MAX_TRAFFIC_POLICIES, self.traffic_policy_count())
             }
             ACCOUNT_LIMIT_MAX_HEALTH_CHECKS => (MAX_HEALTH_CHECKS, self.health_checks.len()),
             ACCOUNT_LIMIT_MAX_REUSABLE_DELEGATION_SETS => {

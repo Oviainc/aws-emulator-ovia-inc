@@ -153,13 +153,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The comment belongs to ONE VERSION of the policy, so the request
         // addresses both halves of `(Id, Version)`: a policy the account does
         // not hold and a version that policy does not hold are the same refusal,
-        // worded through the ONE place this service words it.
+        // worded through the ONE place this service words it. A version a delete
+        // has flagged is not one the account holds either — its record is
+        // retained only for `GetTrafficPolicy` — so there is no comment of it to
+        // update.
         let policy = store.traffic_policies.get_mut(&input.id).ok_or_else(|| {
             UpdateTrafficPolicyCommentErrorModeled::NoSuchTrafficPolicy(no_such_traffic_policy())
         })?;
-        let stored = policy.versions.get_mut(&input.version).ok_or_else(|| {
-            UpdateTrafficPolicyCommentErrorModeled::NoSuchTrafficPolicy(no_such_traffic_policy())
-        })?;
+        let stored = policy
+            .versions
+            .get_mut(&input.version)
+            .filter(|version| !version.deleted)
+            .ok_or_else(|| {
+                UpdateTrafficPolicyCommentErrorModeled::NoSuchTrafficPolicy(
+                    no_such_traffic_policy(),
+                )
+            })?;
 
         // The write this operation exists for: the comment the request carries
         // REPLACES the one that version held. `Comment` is required here, so

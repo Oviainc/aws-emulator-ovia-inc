@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The account's own quota: a caller chooses the name freely, so without
         // this the store would grow for every distinct one it sends.
-        if store.traffic_policies.len() >= MAX_TRAFFIC_POLICIES {
+        if store.traffic_policy_count() >= MAX_TRAFFIC_POLICIES {
             return Err(CreateTrafficPolicyErrorModeled::TooManyTrafficPolicies(
                 TooManyTrafficPolicies {
                     message: Some(format!(
@@ -226,6 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 record_type,
                 document: input.document,
                 comment: input.comment,
+                deleted: false,
             },
         );
         store.traffic_policies.insert(

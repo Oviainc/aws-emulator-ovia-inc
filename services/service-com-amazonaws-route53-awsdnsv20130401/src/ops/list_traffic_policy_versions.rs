@@ -201,12 +201,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The request addresses ONE policy and lists the versions OF it, so an
         // `Id` the account holds no policy under has no versions to list —
         // refused through the ONE place this service words a traffic policy it
-        // does not hold.
-        let policy = store.traffic_policies.get(&input.id).ok_or_else(|| {
-            ListTrafficPolicyVersionsErrorModeled::NoSuchTrafficPolicy(
-                crate::state::no_such_traffic_policy(),
-            )
-        })?;
+        // does not hold. A policy whose every version a delete has flagged is
+        // not one the account holds either: its record is retained only for
+        // `GetTrafficPolicy`.
+        let policy = store
+            .traffic_policies
+            .get(&input.id)
+            .filter(|policy| !policy.is_deleted())
+            .ok_or_else(|| {
+                ListTrafficPolicyVersionsErrorModeled::NoSuchTrafficPolicy(
+                    crate::state::no_such_traffic_policy(),
+                )
+            })?;
 
         // The marker is a VERSION NUMBER (`TrafficPolicyVersionMarker`), and the
         // listing runs in numerical order by it, so the marker positions the
@@ -236,10 +242,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut traffic_policies = Vec::new();
         let mut next_marker = None;
-        // The versions are keyed by number on the policy, so walking the range
-        // from the marker upwards IS the documented numerical order, and no
-        // version can be reported twice or skipped.
-        for (&version, _) in policy.versions.range(start_version..) {
+        // The versions are keyed by number on the policy, so walking them from
+        // the marker upwards IS the documented numerical order, and no version
+        // can be reported twice or skipped. A version a delete has flagged is
+        // not one of the policy's versions any more, so the walk is over the
+        // live ones: "deleted traffic policies aren't listed".
+        for (version, _) in policy
+            .live_versions()
+            .filter(|(version, _)| *version >= start_version)
+        {
             if traffic_policies.len() >= page_size as usize {
                 next_marker = Some(version);
                 break;

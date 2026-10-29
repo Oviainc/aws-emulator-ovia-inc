@@ -203,10 +203,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The request addresses ONE existing policy — the new version is a
         // version OF it — so an `Id` the account holds no policy under names
         // nothing to add a version to, refused through the ONE place this
-        // service words a traffic policy it does not hold.
-        let policy = store.traffic_policies.get_mut(&input.id).ok_or_else(|| {
-            CreateTrafficPolicyVersionErrorModeled::NoSuchTrafficPolicy(no_such_traffic_policy())
-        })?;
+        // service words a traffic policy it does not hold. A policy whose every
+        // version a delete has flagged is not one the account holds either: its
+        // record is retained only for `GetTrafficPolicy`, so no version is added
+        // to it.
+        let policy = store
+            .traffic_policies
+            .get_mut(&input.id)
+            .filter(|policy| !policy.is_deleted())
+            .ok_or_else(|| {
+                CreateTrafficPolicyVersionErrorModeled::NoSuchTrafficPolicy(
+                    no_such_traffic_policy(),
+                )
+            })?;
 
         // The per-policy ceiling: a policy's versions only ever count upwards,
         // so once its highest version is the last number a version can carry
@@ -232,6 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 record_type,
                 document: input.document,
                 comment: input.comment,
+                deleted: false,
             },
         );
 

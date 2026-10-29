@@ -46,7 +46,11 @@ const INSTANCE_ID_MAX_LEN: usize = 36;
 // ---------------------------------------------------------------------------
 
 /// Delete one traffic policy instance.
-async fn delete_instance(router: &MultiServiceRouter, id: &str) -> Reply {
+///
+/// `pub(crate)` so the traffic-policy DELETION suite clears the instance that
+/// blocks a version's delete through the SAME request rather than growing a
+/// second copy of it.
+pub(crate) async fn delete_instance(router: &MultiServiceRouter, id: &str) -> Reply {
     call(
         router,
         "DELETE",
