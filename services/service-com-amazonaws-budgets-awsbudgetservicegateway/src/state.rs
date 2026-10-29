@@ -1059,6 +1059,9 @@ pub const THRESHOLD_TYPE_PERCENTAGE: &str = "PERCENTAGE";
 /// notification is in alarm" (`Notification$NotificationState`), a state the service
 /// moves on its own as spend crosses the threshold, so a caller naming a notification
 /// cannot be required to guess the alarm state it is in at that instant.
+///
+/// The threshold is a `double`, so it is compared as the VALUE it is rather than with
+/// IEEE equality ([`same_threshold`]).
 pub fn same_notification(left: &Notification, right: &Notification) -> bool {
     fn threshold_type(notification: &Notification) -> &str {
         notification
@@ -1068,8 +1071,27 @@ pub fn same_notification(left: &Notification, right: &Notification) -> bool {
     }
     left.notification_type == right.notification_type
         && left.comparison_operator == right.comparison_operator
-        && left.threshold == right.threshold
+        && same_threshold(left.threshold, right.threshold)
         && threshold_type(left) == threshold_type(right)
+}
+
+/// Whether two `Threshold`s are the same threshold, for the identity
+/// [`same_notification`] is made of.
+///
+/// `Notification$Threshold` is a modelled `double`, and awsJson spells the non-finite
+/// doubles as the strings `"NaN"`, `"Infinity"` and `"-Infinity"`, so a threshold that
+/// is not a number is a value a caller can send. IEEE equality answers false for such a
+/// value even against ITSELF, so an identity resting on `==` alone would hold a
+/// notification that does not name itself: the budget could be given a second copy of
+/// it where [`attaches_duplicate_notification`] says none may exist, and no later read,
+/// update or delete could resolve either copy.
+///
+/// Identity is therefore reflexive over every value the member admits — two thresholds
+/// name the same notification exactly when they are the same value, with all the
+/// not-a-number thresholds being one value of their own, and the two spellings of zero
+/// the single value they both name.
+fn same_threshold(left: f64, right: f64) -> bool {
+    left == right || (left.is_nan() && right.is_nan())
 }
 
 /// The notification of `stored` that `wanted` names ([`same_notification`]), or `None`
