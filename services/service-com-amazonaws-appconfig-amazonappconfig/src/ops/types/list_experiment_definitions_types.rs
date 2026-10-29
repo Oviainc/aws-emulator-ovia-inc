@@ -22,14 +22,36 @@ pub struct ListExperimentDefinitionsInput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appconfig#ExperimentDefinitions")]
+/// Carries a list of [`ExperimentDefinitionSummary`], whose instants need the hand-written
+/// serializer below, so this shape's schema and serializer come from `ac_schema_and_codec!`
+/// too — a list element is written against the element shape's own `SCHEMA`, and only a
+/// hand-written parent reaches the hand-written element.
+///
+/// Member set and order from `smithy_query(query="shape", shape="ExperimentDefinitions")`.
 #[derive(Debug, Clone, Default)]
 pub struct ListExperimentDefinitionsOutput {
     pub items: Option<Vec<ExperimentDefinitionSummary>>,
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appconfig#ExperimentDefinitionSummary")]
+ac_schema_and_codec!(
+    ListExperimentDefinitionsOutput,
+    LIST_EXPERIMENT_DEFINITIONS_OUTPUT_SCHEMA,
+    "com.amazonaws.appconfig#ExperimentDefinitions",
+    "com.amazonaws.appconfig",
+    "ExperimentDefinitions",
+    (M_ITEMS, items, "Items", 0, opt, list_of(ExperimentDefinitionSummary)),
+    (M_NEXT_TOKEN, next_token, "NextToken", 1, opt, string),
+);
+
+/// `CreatedAt` and `UpdatedAt` target `Iso8601DateTime` (`@timestampFormat("date-time")`),
+/// so this shape's schema and serializer come from `ac_schema_and_codec!` rather than from
+/// `#[smithy_macros::smithy(shape = ...)]` — see `types/deployment_wire.rs`. A summary
+/// reports the definition's own write instants, so it reports them in the same wire form
+/// `GetExperimentDefinition` does.
+///
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="ExperimentDefinitionSummary")`.
 #[derive(Debug, Clone, Default)]
 pub struct ExperimentDefinitionSummary {
     pub application_id: Option<String>,
@@ -43,4 +65,29 @@ pub struct ExperimentDefinitionSummary {
     pub created_at: Option<::aws_smithy_types::DateTime>,
     pub updated_at: Option<::aws_smithy_types::DateTime>,
 }
+
+ac_schema_and_codec!(
+    ExperimentDefinitionSummary,
+    EXPERIMENT_DEFINITION_SUMMARY_SCHEMA,
+    "com.amazonaws.appconfig#ExperimentDefinitionSummary",
+    "com.amazonaws.appconfig",
+    "ExperimentDefinitionSummary",
+    (M_APPLICATION_ID, application_id, "ApplicationId", 0, opt, string),
+    (M_ID, id, "Id", 1, opt, string),
+    (M_NAME, name, "Name", 2, opt, string),
+    (M_HYPOTHESIS, hypothesis, "Hypothesis", 3, opt, string),
+    (M_STATUS, status, "Status", 4, opt, string),
+    (
+        M_CONFIGURATION_PROFILE_ID,
+        configuration_profile_id,
+        "ConfigurationProfileId",
+        5,
+        opt,
+        string
+    ),
+    (M_ENVIRONMENT_ID, environment_id, "EnvironmentId", 6, opt, string),
+    (M_FLAG_KEY, flag_key, "FlagKey", 7, opt, string),
+    (M_CREATED_AT, created_at, "CreatedAt", 8, opt, date_time),
+    (M_UPDATED_AT, updated_at, "UpdatedAt", 9, opt, date_time),
+);
 

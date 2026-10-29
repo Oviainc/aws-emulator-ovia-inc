@@ -51,6 +51,8 @@ mod deployment_wire_fidelity;
 mod environment_state_wire_form;
 #[path = "all/environment_update.rs"]
 mod environment_update;
+#[path = "all/experiment_definition_wire_fidelity.rs"]
+mod experiment_definition_wire_fidelity;
 #[path = "all/experiment_definitions.rs"]
 mod experiment_definitions;
 #[path = "all/experiment_run_refusal_messages.rs"]

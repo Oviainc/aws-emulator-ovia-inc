@@ -131,10 +131,11 @@ pub(crate) async fn create_strategy(router: &MultiServiceRouter, index: usize, r
         .unwrap_or_else(|| panic!("case {case:?}: CreateDeploymentStrategy answered no Id"))
 }
 
-/// The instant a Deployment member names, asserted to be on the wire as the modelled
-/// `date-time` STRING: a JSON number here is the epoch-seconds fallback the protocol uses
-/// for a member schema carrying no `@timestampFormat`, which is exactly the defect.
-fn iso_instant(case: &str, document: &str, member: &str, value: &Value) -> DateTime {
+/// The instant a member names, asserted to be on the wire as the modelled `date-time`
+/// STRING: a JSON number here is the epoch-seconds fallback the protocol uses for a member
+/// schema carrying no `@timestampFormat`, which is exactly the defect. `pub(crate)` because
+/// more than one suite pins the wire form of this service's `Iso8601DateTime` members.
+pub(crate) fn iso_instant(case: &str, document: &str, member: &str, value: &Value) -> DateTime {
     let text = value.as_str().unwrap_or_else(|| {
         panic!(
             "case {case:?}: {document}'s {member} targets Iso8601DateTime, so it must be an \

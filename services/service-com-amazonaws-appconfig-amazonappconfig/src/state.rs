@@ -1251,20 +1251,21 @@ fn resolve_by_name<'store, T: 'store>(
 }
 
 /// The key the control treatment carries. See [`treatment_key`].
-pub const CONTROL_TREATMENT_KEY: &str = "C";
+pub const CONTROL_TREATMENT_KEY: &str = "c";
 
 /// The key this service gives the `index`-th treatment of a definition, counting from
 /// `0`.
 ///
 /// The model's `TreatmentKey` is `^[a-zA-Z0-9]{1,8}$` and the `Treatment` shape carries
-/// it while `TreatmentInput` does not, so the key is the SERVICE's to mint; AWS
-/// documents no composition for it. It is derived from the treatment's place in the
-/// definition — the control is [`CONTROL_TREATMENT_KEY`] and the treatments compared
-/// against it are `T1`, `T2`, … in the order the request listed them — so it is unique
-/// within a definition, stays within the modelled pattern for every list the model
-/// allows (`TreatmentInputList` holds at most 5), and is stable across every read.
+/// it while `TreatmentInput` does not, so the key is the SERVICE's to mint. AppConfig
+/// composes it from the treatment's place in the definition, in LOWER case: the control
+/// is [`CONTROL_TREATMENT_KEY`], `c`, and the treatments compared against it are `t1`,
+/// `t2`, … in the order the request listed them. So it is unique within a definition,
+/// stays within the modelled pattern for every list the model allows
+/// (`TreatmentInputList` holds at most 5), and is stable across every read — which is
+/// what lets a client assign an entity to a key it read back.
 pub fn treatment_key(index: usize) -> String {
-    format!("T{}", index + 1)
+    format!("t{}", index + 1)
 }
 
 /// The treatment a request wrote, under the `key` this service minted for it. Every

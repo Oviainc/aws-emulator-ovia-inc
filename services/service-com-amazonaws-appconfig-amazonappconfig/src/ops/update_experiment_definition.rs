@@ -284,7 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than editing it: the member is the treatment list itself. `TreatmentInput`
         // carries no key and `Treatment` does, so each key is minted here exactly as a
         // create mints it — from the treatment's place in the definition — which keeps a
-        // replaced list's keys contiguous from `T1` rather than leaving the keys of a
+        // replaced list's keys contiguous from `t1` rather than leaving the keys of a
         // longer previous list behind.
         if let Some(control) = input.control {
             definition.control =

@@ -127,8 +127,9 @@ struct Fixed {
 }
 
 /// `PATCH /applications/{ApplicationIdentifier}/experimentdefinitions/{ExperimentDefinitionIdentifier}`,
-/// this operation's modelled URI.
-async fn update_definition(
+/// this operation's modelled URI. `pub(crate)` because more than one suite asserts what an
+/// update reports about a stored definition.
+pub(crate) async fn update_definition(
     router: &MultiServiceRouter,
     application: &str,
     definition: &str,
@@ -285,15 +286,15 @@ fn assert_definition(
     );
 
     // The control keeps the key the service mints for it, and the compared treatments are
-    // keyed from their place in the stored list — contiguously from `T1`, whatever the
+    // keyed from their place in the stored list — contiguously from `t1`, whatever the
     // list held before.
     let control = body
         .get("Control")
         .unwrap_or_else(|| panic!("case {case:?} ({source}): no Control in {body}"));
     assert_eq!(
         text(control, "Key").as_deref(),
-        Some("C"),
-        "case {case:?} ({source}): expected the control key C, got {:?}",
+        Some("c"),
+        "case {case:?} ({source}): expected the control key c, got {:?}",
         control.get("Key")
     );
     assert_treatment_body(case, "Control", &expected.control, control);
@@ -310,7 +311,7 @@ fn assert_definition(
         treatments.len()
     );
     for (index, (want, got)) in expected.treatments.iter().zip(treatments).enumerate() {
-        let key = format!("T{}", index + 1);
+        let key = format!("t{}", index + 1);
         assert_eq!(
             text(got, "Key").as_deref(),
             Some(key.as_str()),

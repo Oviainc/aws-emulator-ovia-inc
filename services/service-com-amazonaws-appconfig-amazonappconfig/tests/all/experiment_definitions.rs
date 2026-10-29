@@ -11,7 +11,7 @@
 //!   stored — so a later `GetExperimentDefinition`, addressed by that id or by the
 //!   definition's name, answers exactly the same record;
 //! * the service mints each treatment's `Key` (`TreatmentInput` carries none,
-//!   `Treatment` does): the control is `C` and the compared treatments are `T1`, `T2`, …
+//!   `Treatment` does): the control is `c` and the compared treatments are `t1`, `t2`, …
 //!   in the order the request listed them, every key inside the model's
 //!   `^[a-zA-Z0-9]{1,8}$`;
 //! * a definition nothing has run yet is `IDLE`, and its `UpdatedAt` is its `CreatedAt`;
@@ -339,8 +339,8 @@ async fn an_experiment_definition_round_trips_across_the_modelled_input_range() 
             answered.get("KmsKeyIdentifier")
         );
 
-        // The service keys the treatments: the control is `C`, the compared treatments are
-        // `T1`.. in request order, and every treatment keeps its own weight, description
+        // The service keys the treatments: the control is `c`, the compared treatments are
+        // `t1`.. in request order, and every treatment keeps its own weight, description
         // and flag value.
         let requested_control = request
             .get("Control")
@@ -350,8 +350,8 @@ async fn an_experiment_definition_round_trips_across_the_modelled_input_range() 
             .unwrap_or_else(|| panic!("case {case:?}: no Control in {answered}"));
         assert_eq!(
             control.get("Key").and_then(Value::as_str),
-            Some("C"),
-            "case {case:?}: expected the control key C, got {:?}",
+            Some("c"),
+            "case {case:?}: expected the control key c, got {:?}",
             control.get("Key")
         );
         assert_treatment_body(case, "Control", requested_control, control);
@@ -374,7 +374,7 @@ async fn an_experiment_definition_round_trips_across_the_modelled_input_range() 
         for (index, (requested, answered_treatment)) in
             requested_treatments.iter().zip(treatments).enumerate()
         {
-            let expected_key = format!("T{}", index + 1);
+            let expected_key = format!("t{}", index + 1);
             let key = answered_treatment.get("Key").and_then(Value::as_str);
             assert_eq!(
                 key,

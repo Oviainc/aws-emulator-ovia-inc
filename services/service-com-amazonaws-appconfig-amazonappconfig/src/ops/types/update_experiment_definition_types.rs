@@ -24,7 +24,12 @@ pub struct UpdateExperimentDefinitionInput {
     pub launch_criteria: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appconfig#ExperimentDefinition")]
+/// `CreatedAt` and `UpdatedAt` target `Iso8601DateTime` (`@timestampFormat("date-time")`),
+/// so this shape's schema and serializer come from `ac_experiment_definition_shape!` rather
+/// than from `#[smithy_macros::smithy(shape = ...)]` — see
+/// `types/experiment_definition_wire.rs`. It carries the same schema as the documents
+/// `CreateExperimentDefinition` and `GetExperimentDefinition` answer because it is the same
+/// shape, and one shape cannot have two wire forms.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateExperimentDefinitionOutput {
     pub application_id: Option<String>,
@@ -44,4 +49,9 @@ pub struct UpdateExperimentDefinitionOutput {
     pub updated_at: Option<::aws_smithy_types::DateTime>,
     pub kms_key_identifier: Option<String>,
 }
+
+ac_experiment_definition_shape!(
+    UpdateExperimentDefinitionOutput,
+    UPDATE_EXPERIMENT_DEFINITION_OUTPUT_SCHEMA
+);
 

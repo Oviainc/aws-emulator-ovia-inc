@@ -77,8 +77,9 @@ const MAX_RESULTS_MAX: i64 = MAX_LIST_PAGE_SIZE as i64;
 
 /// `GET /experimentdefinitions` with `query` as the request's `httpQuery` members
 /// (`application_identifier`, `configuration_profile_identifier`,
-/// `environment_identifier`, `status`, `max_results`, `next_token`).
-async fn list(router: &MultiServiceRouter, query: &[(&str, String)]) -> Answer {
+/// `environment_identifier`, `status`, `max_results`, `next_token`). `pub(crate)` because
+/// more than one suite asserts what a listing reports about a stored definition.
+pub(crate) async fn list(router: &MultiServiceRouter, query: &[(&str, String)]) -> Answer {
     let mut uri = "/experimentdefinitions".to_string();
     if !query.is_empty() {
         let rendered: Vec<String> = query

@@ -64,6 +64,10 @@
 //! NOT `#[macro_export]`ed: `src/ops/mod.rs` reaches `types` through an `include!`, so a
 //! `macro_rules!` declared under it counts as macro-expanded and cannot be named by an
 //! absolute `$crate::` path (rust-lang #52234).
+//!
+//! [`ac_schema_and_codec`] is not the `Deployment` shape's: every shape of this service
+//! with a `date-time` member needs it, so `types/experiment_definition_wire.rs` states the
+//! `ExperimentDefinition` shape's member list against the same macros.
 
 /// The `ShapeType` one member kind names. Mirrors the vendored codegen's
 /// `codegen::shape_type_ident`.
@@ -83,13 +87,16 @@ macro_rules! ac_shape_type {
     (list_of) => {
         ::aws_smithy_schema::ShapeType::List
     };
+    (struct_of) => {
+        ::aws_smithy_schema::ShapeType::Structure
+    };
 }
 
 /// One member's schema, as the vendored codegen would emit it, plus the
 /// `@timestampFormat("date-time")` chain call it cannot.
 ///
 /// `$kind` is the member's shape kind — `string` (a `string` or an `enum` shape, both
-/// string-encoded), `integer`, `float`, `date_time` or `list_of(T)`.
+/// string-encoded), `integer`, `float`, `date_time`, `list_of(T)` or `struct_of(T)`.
 macro_rules! ac_member_schema {
     ($ns:literal, $local:literal, $wire:literal, $idx:literal, date_time) => {
         ::aws_smithy_schema::Schema::new_member(
@@ -135,6 +142,12 @@ macro_rules! ac_write_member {
             }
             Ok(())
         })?;
+    };
+    // A structure-typed member is written against the MEMBER schema, which is where the
+    // codec reads the wire name from; the value's own member schemas write what is inside
+    // it. The vendored codegen's `emit_write` does exactly this for `ShapeKind::Structure`.
+    ($s:ident, $m:expr, $v:expr, struct_of($inner:ty)) => {
+        $s.write_struct($m, $v)?;
     };
 }
 
