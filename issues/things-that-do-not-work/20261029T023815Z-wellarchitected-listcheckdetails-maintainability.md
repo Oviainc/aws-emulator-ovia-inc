@@ -1,0 +1,30 @@
+Issue-Severity: LOW
+Issue-Gap-Class: maintainability
+Issue-Commit: 2271003192907dc435917d10fce42c387f42c2e4
+
+# The best-practice resolution-and-refusal walk is spelled out twice, once in ListCheckDetails and once in ListCheckSummaries, so the two copies can drift
+
+_Filed: 2026-10-29T02:38:15Z_
+_Operation: ListCheckDetails | Class: maintainability_
+
+> _Note: this issue was identified against the code base at commit `2271003192907dc435917d10fce42c387f42c2e4`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Description
+
+ListCheckDetails and ListCheckSummaries report the Trusted Advisor checks of ONE best practice of ONE lens review of ONE workload; they differ only in whether the report is expanded per account. Everything before that — the page-size clamp, the cursor decode refusal, the workload lookup, the "lens the workload does not review" 404, the pinned lens version and its content, the pillar / question / choice refusals in that outermost-first order, the Trusted-Advisor-activated gate and the catalog lookup of the checks — is written out twice, line for line, in the two handlers. That is one RULE ("which best practice does this request name, and when is it refused") held in two places, so a later change to the refusal order, to the version the content is resolved at, or to the activation gate can be applied to one copy and not the other, and the two operations would then disagree about the same request.
+
+The crate already keeps every sub-rule of that walk in `crate::state` (`page_size`, `decode_check_*_next_token`, `workload_not_found`, `lens_review_not_found`, `lens_content_at`, `undefined_pillar_refusal`, `undefined_pillar_question_refusal`, `lens_review_question`, `undefined_choice_member_refusal`, `checks_for_best_practice`) precisely so no two operations word them differently; what is duplicated is the SEQUENCE that composes them. Lifting that sequence into one `crate::state` helper that answers the resolved `(workload, lens_arn, question, checks)` — or its refusal — leaves both responses byte-identical and both operations' existing suites untouched, since each already pins the whole refusal table on its own side.
+
+## Evidence
+
+Copy 1 — `src/ops/list_check_details.rs:155-255`: `let page_size = crate::state::page_size(input.max_results);` … `let workload = store.workloads.get(&input.workload_id).ok_or_else(|| … crate::state::workload_not_found(&input.workload_id))?;` … `if !workload.reviews_lens(&input.lens_arn) { … crate::state::lens_review_not_found(&input.workload_id, &input.lens_arn) … }` … `let pinned = workload.lens_review_version(&input.lens_arn); let content = store.lens_content_at(&input.lens_arn, pinned); if let Some(exception) = crate::state::undefined_pillar_refusal(crate::state::PILLAR_ID_MEMBER, &input.lens_arn, &content, std::iter::once(input.pillar_id.as_str())) { … } if let Some(exception) = crate::state::undefined_pillar_question_refusal(crate::state::QUESTION_ID_MEMBER, &input.lens_arn, &input.pillar_id, &content, std::iter::once(input.question_id.as_str())) { … }` … `let question = store.lens_review_question(&input.lens_arn, pinned, &input.question_id); if let Some(question) = question.as_ref() { if let Some(exception) = crate::state::undefined_choice_member_refusal(crate::state::CHOICE_ID_MEMBER, question, std::iter::once(input.choice_id.as_str())) { … } }` … `let checks = question.as_ref().filter(|_| workload.trusted_advisor_integration_enabled()).map(|question| crate::state::checks_for_best_practice(&input.lens_arn, question, &input.choice_id)).unwrap_or_default(); let lens_arn = store.lens_arn_of(&input.lens_arn, &crate::state::request_region(ctx.parts()));`
+
+Copy 2 — `src/ops/list_check_summaries.rs:159-256`, the same statements in the same order, including the comment verbatim: "// `PillarId`, `QuestionId` and `ChoiceId` name ONE best practice OF THAT LENS, so // each is judged against the lens's own content, outermost first: the pillar the // lens defines, the question that pillar asks and the choice that question offers." (`list_check_details.rs:190-192` and `list_check_summaries.rs:194-196` are the identical block), ending in the identical `let checks = question.as_ref().filter(|_| workload.trusted_advisor_integration_enabled()).map(|question| crate::state::checks_for_best_practice(&input.lens_arn, question, &input.choice_id)).unwrap_or_default();` (`list_check_summaries.rs:248-254`).
+
+Test coverage that must stay unchanged: `tests/all/check_details.rs:609-610` `async fn the_read_refuses_what_the_lens_does_not_define()` and `tests/all/check_summaries.rs:697-702` "What the read refuses: a workload that does not exist and a lens the workload does not review do not resolve (404), and a pillar, question or choice the lens's content does not define — or a `MaxResults` outside the modelled range, or a token this operation did not issue — is a bad request (400)" / `async fn the_read_refuses_what_the_lens_does_not_define()`; plus `checks_reported_are_the_ones_associated_to_the_best_practice` (`check_details.rs:165-166`) and `summaries_reported_are_the_checks_associated_to_the_best_practice` (`check_summaries.rs:198-199`), which pin the reported sets on each side.
+
+## Steps to Reproduce
+
+1. Read src/ops/list_check_details.rs:155-255 and src/ops/list_check_summaries.rs:159-256 side by side: the page-size clamp, cursor refusal, workload lookup, reviews_lens 404, pinned-version content resolution, the three refusals in the same order, the activation gate and the catalog lookup are identical statements with identical comments
+2. Note that every sub-rule is already single-homed in crate::state, so only the SEQUENCE is duplicated
+3. Change any one element of the walk (for example the order of the pillar/question/choice refusals, or the lens version the content is resolved at) in one handler and observe that the other keeps the old behaviour, with no test or type forcing the two back into agreement
