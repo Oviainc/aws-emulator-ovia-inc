@@ -195,12 +195,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let (page, next_token) = crate::state::paginate(
             &selected,
-            // The cursor is a position in THIS list: the operation plus the filter
-            // selection, so a cursor minted for another selection is not accepted here.
+            // The cursor belongs to THIS list: the operation plus the filter selection, so
+            // a cursor minted for another selection is not accepted here.
             &format!(
                 "linux-subscriptions/{}",
                 crate::state::filter_signature(&filters)
             ),
+            // What a cursor NAMES in this list: the (name, type) pair the subscriptions are
+            // grouped and ordered by, which is what identifies one of them.
+            |subscription| {
+                vec![
+                    subscription.name.clone(),
+                    subscription.subscription_type.clone(),
+                ]
+            },
             input.max_results,
             input.next_token.as_deref(),
         )

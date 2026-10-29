@@ -2,8 +2,10 @@
 
 //! @op ListRegisteredSubscriptionProviders
 //! Reports the registered Linux subscription providers held in this service's state, in
-//! registration order, narrowed to the `SubscriptionProviderSources` the caller named and
-//! paged through the `@paginated` `MaxResults`/`NextToken` contract.
+//! `SubscriptionProviderArn` order (the key the store holds them under, and registration
+//! order for the registrations one Region minted), narrowed to the
+//! `SubscriptionProviderSources` the caller named and paged through the `@paginated`
+//! `MaxResults`/`NextToken` contract.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -171,12 +173,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let (page, next_token) = crate::state::paginate(
             &selected,
-            // The cursor is a position in THIS list: the operation plus the source
-            // selection, so a cursor minted for another selection is not accepted here.
+            // The cursor belongs to THIS list: the operation plus the source selection, so
+            // a cursor minted for another selection is not accepted here.
             &format!(
                 "registered-subscription-providers/{}",
                 crate::state::source_filter_signature(&sources)
             ),
+            // What a cursor NAMES in this list: the registration's own
+            // `SubscriptionProviderArn`, which is the key the store orders it under — so a
+            // registration deregistered between two pages of one walk cannot move another
+            // across the cursor.
+            |record| vec![record.arn.clone()],
             input.max_results,
             input.next_token.as_deref(),
         )

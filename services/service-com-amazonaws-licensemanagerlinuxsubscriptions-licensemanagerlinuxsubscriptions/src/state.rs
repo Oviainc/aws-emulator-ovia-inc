@@ -301,10 +301,15 @@ pub struct ServiceSettingsRecord {
 /// Per-service state for com-amazonaws-licensemanagerlinuxsubscriptions-licensemanagerlinuxsubscriptions. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState {
-    /// Registered providers by `SubscriptionProviderArn`.
-    pub providers: HashMap<String, SubscriptionProviderRecord>,
-    /// Provider ARNs in registration order, so a list is stable and pageable.
-    pub provider_order: Vec<String>,
+    /// Registered providers by `SubscriptionProviderArn`, which is also the order the
+    /// list operation reports and pages them in.
+    ///
+    /// The key is a TOTAL ORDER over this account's registrations, and a minted id is
+    /// monotonic in registration order ([`provider_id`]), so the sequence a page is cut
+    /// from is decided by the registrations themselves rather than by how many of them the
+    /// store held when a page was cut — which is what lets a pagination cursor name an
+    /// element of that sequence and keep its meaning across a write.
+    pub providers: BTreeMap<String, SubscriptionProviderRecord>,
     /// How many registrations this account has ever minted, so a fresh
     /// `SubscriptionProviderArn` is unique even after the registration that held the
     /// previous one was deregistered.
@@ -386,8 +391,7 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
             fresh_tags,
             now,
         );
-        self.providers.insert(arn.clone(), record.clone());
-        self.provider_order.push(arn);
+        self.providers.insert(arn, record.clone());
         Ok(record)
     }
 
@@ -398,22 +402,16 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
     /// [`MAX_REGISTERED_PROVIDERS`] bounds, so the work one registration costs is bounded
     /// however many registrations have been made.
     fn registered_arn(&self, source: &str, secret_arn: &str) -> Option<String> {
-        self.provider_order
+        self.providers
             .iter()
-            .find(|arn| {
-                self.providers
-                    .get(*arn)
-                    .is_some_and(|record| record.source == source && record.secret_arn == secret_arn)
-            })
-            .cloned()
+            .find(|(_, record)| record.source == source && record.secret_arn == secret_arn)
+            .map(|(arn, _)| arn.clone())
     }
 
-    /// The registered providers in registration order.
+    /// The registered providers in `SubscriptionProviderArn` order — the order the list
+    /// operation reports them in, and the one a pagination cursor names an element of.
     pub fn providers_in_order(&self) -> Vec<SubscriptionProviderRecord> {
-        self.provider_order
-            .iter()
-            .filter_map(|arn| self.providers.get(arn).cloned())
-            .collect()
+        self.providers.values().cloned().collect()
     }
 
     /// Resolve a registration by its `SubscriptionProviderArn`.
@@ -605,11 +603,13 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
         self.providers.get_mut(arn).map(|record| &mut record.tags)
     }
 
-    /// Remove a registration from the store and from the order that reaches it.
+    /// Remove a registration from the store.
+    ///
+    /// Nothing else holds the order the list reports — the store's own key IS that order —
+    /// so a removal cannot shift the position of any other registration, and a walk
+    /// already past this one is unaffected by it.
     pub fn remove_provider(&mut self, arn: &str) -> Option<SubscriptionProviderRecord> {
-        let record = self.providers.remove(arn)?;
-        self.provider_order.retain(|stored| stored != arn);
-        Some(record)
+        self.providers.remove(arn)
     }
 }
 
@@ -894,21 +894,32 @@ pub fn is_known_region(region: &str) -> bool {
 /// so an unparseable or foreign one is a `ValidationException` rather than a silent
 /// restart from the beginning. A page size below 1 would make no progress, so it is
 /// refused too.
+///
+/// A cursor names the ELEMENT the previous page reported LAST, by `cursor_key` — the
+/// element's own identity in the list's order — and the next page starts at the first
+/// element ordered after it. It is NOT a count of the elements already reported: the store
+/// a list projects can be written between two pages of one walk (a resource removed,
+/// another created), and a position re-resolved against the changed sequence would carry
+/// an element the walk never reported across the cursor and skip it, or report one twice.
+/// Resuming after a named element also ends the walk correctly when that element is the
+/// one the write removed.
+///
+/// `items` must therefore be in ascending `cursor_key` order and the key must identify an
+/// element, which is how every list of this service is held: each is ordered by the key it
+/// is stored or grouped under.
 pub fn paginate<T: Clone>(
     items: &[T],
     kind: &str,
+    cursor_key: impl Fn(&T) -> Vec<String>,
     max_results: Option<i32>,
     next_token: Option<&str>,
 ) -> Result<(Vec<T>, Option<String>), StateError> {
-    let offset = match next_token {
-        Some(token) => decode_page_token(kind, token)?,
-        None => 0,
-    };
-    if offset > items.len() {
-        return Err(StateError::Validation(
-            "NextToken does not refer to a position in this list".to_string(),
-        ));
-    }
+    debug_assert!(
+        items
+            .windows(2)
+            .all(|pair| cursor_key(&pair[0]) < cursor_key(&pair[1])),
+        "a paged list must be in ascending cursor-key order"
+    );
     let page_size = match max_results {
         Some(max) if max < 1 => {
             return Err(StateError::Validation(format!(
@@ -918,43 +929,55 @@ pub fn paginate<T: Clone>(
         Some(max) => max as usize,
         None => items.len(),
     };
-    let end = offset.saturating_add(page_size).min(items.len());
-    let page = items[offset..end].to_vec();
-    let token = if end < items.len() {
-        Some(encode_page_token(kind, end))
-    } else {
-        None
+    // A cursor whose element is ordered past every element left in the list resumes at the
+    // end of it: the walk reported everything it could and is over.
+    let start = match next_token {
+        Some(token) => {
+            let reported_last = decode_page_token(kind, token)?;
+            items
+                .iter()
+                .position(|item| cursor_key(item) > reported_last)
+                .unwrap_or(items.len())
+        }
+        None => 0,
     };
+    let end = start.saturating_add(page_size).min(items.len());
+    let page = items[start..end].to_vec();
+    let token = (end < items.len())
+        .then(|| encode_page_token(kind, &cursor_key(&items[end - 1])));
     Ok((page, token))
 }
 
-/// This service's opaque pagination cursor: the list it belongs to and the offset it
-/// resumes at.
+/// This service's opaque pagination cursor: the list it belongs to and the key of the
+/// element the page that minted it reported last.
 ///
-/// Hex is an encoding, not a secret — a client can decode one. What makes a cursor
-/// trustworthy here is the `kind` check in [`decode_page_token`]: a token is only
-/// honoured by the list that minted it, so a forged or stale one is refused rather than
-/// applied to a different list.
-fn encode_page_token(kind: &str, offset: usize) -> String {
-    ::hex::encode(format!("{kind}:{offset}"))
+/// Hex over a JSON pair rather than a hand-rolled framing, so the DECODE below is
+/// `serde_json`'s — a cursor is caller-supplied input, and the typed shape it has to parse
+/// into is what decides whether it is one. Hex is an encoding, not a secret: a client can
+/// decode one. What makes a cursor trustworthy here is the `kind` check in
+/// [`decode_page_token`] — a token is only honoured by the list that minted it, so a forged
+/// or stale one is refused rather than applied to a different list.
+fn encode_page_token(kind: &str, key: &[String]) -> String {
+    ::hex::encode(
+        ::serde_json::to_vec(&(kind, key)).expect("a list identity and a cursor key serialize"),
+    )
 }
 
-/// Decode a cursor minted by [`encode_page_token`] for the same list.
-///
-/// The offset is split off the END, so a list identity may itself contain `:`.
-fn decode_page_token(kind: &str, token: &str) -> Result<usize, StateError> {
+/// Decode a cursor minted by [`encode_page_token`] for the same list, into the key of the
+/// element the minting page reported last.
+fn decode_page_token(kind: &str, token: &str) -> Result<Vec<String>, StateError> {
     let invalid = || StateError::Validation("NextToken is not a valid pagination token".to_string());
     let decoded = ::hex::decode(token).map_err(|_| invalid())?;
-    let decoded = String::from_utf8(decoded).map_err(|_| invalid())?;
-    let (token_kind, offset) = decoded.rsplit_once(':').ok_or_else(invalid)?;
+    let (token_kind, key): (String, Vec<String>) =
+        ::serde_json::from_slice(&decoded).map_err(|_| invalid())?;
     if token_kind != kind {
         return Err(invalid());
     }
-    offset.parse::<usize>().map_err(|_| invalid())
+    Ok(key)
 }
 
 /// A deterministic rendering of the `SubscriptionProviderSources` selection, for the
-/// list identity a pagination cursor is minted against: a cursor is a position in ONE
+/// list identity a pagination cursor is minted against: a cursor names an element of ONE
 /// list, so it must not be accepted for a list selected by a different filter.
 ///
 /// Every component is LENGTH-PREFIXED, so no two different selections can render to the
@@ -964,7 +987,7 @@ pub fn source_filter_signature(sources: &[String]) -> String {
 }
 
 /// The same rendering for a `FilterList` selection, so the `Filters`-driven lists get
-/// cursors that are positions in the list THAT selection produced.
+/// cursors that name an element of the list THAT selection produced.
 ///
 /// Each filter contributes its name, its operator and its values, every component
 /// length-prefixed, closed by the number of values it carried — so neither a different

@@ -458,7 +458,6 @@ pub fn seed_provider(
             std::time::SystemTime::now(),
         ),
     );
-    state.provider_order.push(arn.clone());
     arn
 }
 
