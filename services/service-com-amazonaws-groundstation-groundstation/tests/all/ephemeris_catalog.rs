@@ -167,17 +167,29 @@ async fn list_all(
             "case {request} maxResults={page_size:?} page-{page}: expected 200, got {} {}",
             reply.status, reply.body
         );
-        let on_page = reply
-            .field("ephemerides")
-            .as_array()
-            .unwrap_or_else(|| {
-                panic!(
-                    "case {request} maxResults={page_size:?} page-{page}: ephemerides must be a \
-                     list, got {}",
+        // A page that selected nothing carries no `ephemerides` member at all —
+        // `EphemeridesList` is `len 1..500`, so the empty list is not a value the member
+        // may take — and a page that selected something carries it as a list.
+        let on_page = match reply.body.get("ephemerides") {
+            None => Vec::new(),
+            Some(member) => {
+                let items = member.as_array().unwrap_or_else(|| {
+                    panic!(
+                        "case {request} maxResults={page_size:?} page-{page}: a present \
+                         ephemerides must be a list, got {}",
+                        reply.body
+                    )
+                });
+                assert!(
+                    !items.is_empty(),
+                    "case {request} maxResults={page_size:?} page-{page}: ephemerides is \
+                     len 1.., so a page that selected nothing must omit it rather than \
+                     answer [], got {}",
                     reply.body
-                )
-            })
-            .clone();
+                );
+                items.clone()
+            }
+        };
         if let Some(size) = page_size {
             assert!(
                 on_page.len() as i64 <= size,
@@ -388,8 +400,9 @@ async fn list_ephemerides_reports_every_member_of_each_ephemeris_it_stored() {
     let (router, engine) = harness_with_engine();
     let satellites = onboard(&engine, "25994=Ohio 1,27424");
 
-    // An account holding no ephemeris lists none: the member is present, empty, and the
-    // listing is closed.
+    // An account holding no ephemeris lists none: the member is absent — `EphemeridesList`
+    // is `len 1..500`, so an empty page is reported by omitting it — and the listing is
+    // closed.
     let empty = send(
         &router,
         "POST",
@@ -402,10 +415,10 @@ async fn list_ephemerides_reports_every_member_of_each_ephemeris_it_stored() {
         "case no-ephemerides: expected ListEphemerides 200, got {} {}",
         empty.status, empty.body
     );
-    assert_eq!(
-        empty.field("ephemerides"),
-        &json!([]),
-        "case no-ephemerides: an account holding none must list none, got {}",
+    assert!(
+        empty.body.get("ephemerides").is_none(),
+        "case no-ephemerides: an account holding none must list none, with the member left \
+         out rather than empty, got {}",
         empty.body
     );
     assert!(

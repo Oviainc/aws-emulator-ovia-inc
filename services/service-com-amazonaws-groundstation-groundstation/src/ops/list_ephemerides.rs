@@ -306,10 +306,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ListEphemeridesOutput {
             next_token,
-            // Present and empty when nothing matched, as every other listing of this
-            // service answers: a client's pagination loop then reads the same member on
-            // every page.
-            ephemerides: Some(page),
+            // `EphemeridesList` is `len 1..500` (`smithy_query(query="shape",
+            // shape="EphemeridesList")`), so a page that selected nothing is reported by
+            // leaving the member out rather than by an empty list the member's own shape
+            // forbids — the same reading `nextToken` above gets, and the one this
+            // service's other `len 1..` members already get
+            // (`crate::state::non_empty_list`).
+            ephemerides: crate::state::non_empty_list(page),
         })
     }
 }

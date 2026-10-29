@@ -455,23 +455,36 @@ async fn an_ephemeris_status_filter_naming_no_status_narrows_nothing() {
             "case {case}: expected ListEphemerides 200, got {} {}",
             reply.status, reply.body
         );
-        let mut reported: Vec<String> = reply
-            .field("ephemerides")
-            .as_array()
-            .unwrap_or_else(|| {
-                panic!(
-                    "case {case}: ephemerides must be a list, got {}",
+        // `EphemeridesList` is `len 1..500` (`smithy_query(query="shape",
+        // shape="EphemeridesList")`), so a filter that admits nothing is answered with the
+        // member left out rather than with an empty list; a page that selected something
+        // carries it as a non-empty list.
+        let mut reported: Vec<String> = match reply.body.get("ephemerides") {
+            None => Vec::new(),
+            Some(page) => {
+                let items = page.as_array().unwrap_or_else(|| {
+                    panic!(
+                        "case {case}: a present ephemerides must be a list, got {}",
+                        reply.body
+                    )
+                });
+                assert!(
+                    !items.is_empty(),
+                    "case {case}: ephemerides admits no empty list, so a page that selected \
+                     nothing must omit it, got {}",
                     reply.body
-                )
-            })
-            .iter()
-            .map(|item| {
-                item.get("ephemerisId")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string()
-            })
-            .collect();
+                );
+                items
+                    .iter()
+                    .map(|item| {
+                        item.get("ephemerisId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                    .collect()
+            }
+        };
         reported.sort();
         assert_eq!(
             reported,

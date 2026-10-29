@@ -81,6 +81,21 @@ impl Listing {
             Self::GroundStationReservations => "reservationList",
         }
     }
+
+    /// Whether [`Self::items_member`]'s modelled list shape admits an EMPTY page, so an
+    /// answered listing that selected nothing still carries the member.
+    ///
+    /// `ContactList` carries no length constraint and `GroundStationReservationList` is
+    /// `len 0..100`, while `EphemeridesList` is `len 1..500`
+    /// (`smithy_query(query="shape", shape="ContactList,GroundStationReservationList,\
+    /// EphemeridesList")`), so only the last reports an empty page by leaving the member
+    /// out.
+    fn empty_page_is_serialized(self) -> bool {
+        match self {
+            Self::Contacts | Self::GroundStationReservations => true,
+            Self::Ephemerides => false,
+        }
+    }
 }
 
 /// What an answer to a listing over a window amounts to, reduced to what this suite
@@ -144,16 +159,31 @@ async fn ask(router: &MultiServiceRouter, listing: Listing, window: (f64, f64)) 
             .unwrap_or_default()
             .to_string(),
     };
-    // An answered listing carries its page; a refused one carries no page at all. Asserted
-    // here so a 200 that answered with nothing cannot pass as an answer below.
+    // An answered listing carries its page as a list, unless its page member's own shape
+    // forbids an empty list, in which case a page that selected nothing leaves the member
+    // out and a page that selected something still carries it; a refused one carries no
+    // page at all. Asserted here so a 200 that answered with something other than a page
+    // cannot pass as an answer below.
     if answer.status == 200 {
-        assert!(
-            reply.field(listing.items_member()).is_array(),
-            "case {} over {window:?}: an answered listing must carry {} as a list, got {}",
-            listing.operation(),
-            listing.items_member(),
-            reply.body
-        );
+        let page = reply.field(listing.items_member());
+        if listing.empty_page_is_serialized() {
+            assert!(
+                page.is_array(),
+                "case {} over {window:?}: an answered listing must carry {} as a list, got {}",
+                listing.operation(),
+                listing.items_member(),
+                reply.body
+            );
+        } else {
+            assert!(
+                page.as_array().is_none_or(|items| !items.is_empty()),
+                "case {} over {window:?}: {} admits no empty list, so an answered listing \
+                 either reports entries or leaves the member out, got {}",
+                listing.operation(),
+                listing.items_member(),
+                reply.body
+            );
+        }
     } else {
         assert!(
             reply.field(listing.items_member()).is_null(),

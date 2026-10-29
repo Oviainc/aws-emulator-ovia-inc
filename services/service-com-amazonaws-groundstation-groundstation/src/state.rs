@@ -1240,6 +1240,25 @@ pub fn page_size(max_results: Option<i32>) -> usize {
     }
 }
 
+/// A response list member whose modelled shape admits NO empty list, the way a response of
+/// this service carries it: the entries when it has any, and ABSENT when it has none.
+///
+/// A list shape with a non-zero minimum length forbids the empty list, so a member
+/// targeting one reports "nothing to report" by being left out: serializing `[]` there
+/// would answer with a value outside the member's own modelled constraint. This is the
+/// reading this service's reads already take for a `len 1..` member they have nothing for,
+/// and it is the opposite of how a member whose shape admits zero entries answers — that
+/// one stays present and empty, as [`response_tags`] keeps a tag map present.
+///
+/// This is where a member of this service whose list shape carries a non-zero minimum
+/// COLLECTS its entries, so the reading is written once rather than per operation. A
+/// member that can never have an entry to collect states it directly instead —
+/// `DescribeEphemeris$errorReasons`, which this emulator's validation records no detail
+/// for, is reported absent at its own site.
+pub fn non_empty_list<T>(entries: Vec<T>) -> Option<Vec<T>> {
+    (!entries.is_empty()).then_some(entries)
+}
+
 /// Whether a listing's list-valued filter member, which NAMED the values `named`, admits
 /// an item carrying `value`.
 ///
