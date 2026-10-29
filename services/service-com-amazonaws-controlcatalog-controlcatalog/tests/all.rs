@@ -29,6 +29,8 @@ mod framework_cross_walk;
 mod global_catalog_arn_reading;
 #[path = "all/ontology_listing.rs"]
 mod ontology_listing;
+#[path = "all/pagination_token_spelling.rs"]
+mod pagination_token_spelling;
 #[path = "all/published_controls.rs"]
 mod published_controls;
 #[path = "all/published_ontology.rs"]

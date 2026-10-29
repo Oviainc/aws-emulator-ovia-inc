@@ -651,12 +651,23 @@ fn encode_page_token(collection: &str, fingerprint: &str, last_key: &str) -> Str
 
 /// Decode a `NextToken` back to the key it resumes after, refusing one that was not
 /// issued for this collection and filter.
+///
+/// A token is this service's only when it is spelled exactly as
+/// [`encode_page_token`] mints it. The hex reader accepts several spellings of the
+/// same bytes — upper-, lower- and mixed-case digits — while the writer emits only
+/// lowercase ones, so a token is compared against the one spelling the encoder can
+/// produce for the bytes it carries: every other spelling is a token no previous
+/// call handed out, and is refused like any other made-up token rather than served
+/// as a cursor.
 fn decode_page_token(
     token: &str,
     collection: &str,
     fingerprint: &str,
 ) -> Result<String, PageError> {
     let decoded = hex::decode(token).map_err(|_| PageError::InvalidToken)?;
+    if hex::encode(&decoded) != token {
+        return Err(PageError::InvalidToken);
+    }
     let decoded = String::from_utf8(decoded).map_err(|_| PageError::InvalidToken)?;
     let mut fields = decoded.split(TOKEN_SEPARATOR);
     let (Some(token_collection), Some(token_fingerprint), Some(last_key), None) = (
