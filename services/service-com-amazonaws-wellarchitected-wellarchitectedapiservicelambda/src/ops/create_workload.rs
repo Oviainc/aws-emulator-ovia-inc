@@ -334,12 +334,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let applications = input.applications.unwrap_or_default();
         // "The priorities of the pillars, which are used to order items in the
         // improvement plan" (`PillarPriorities` doc): a workload is always reviewed in
-        // some pillar order, so a request that names none is created with the
-        // framework's own pillar order rather than with no priorities at all.
-        let pillar_priorities = match input.pillar_priorities {
-            Some(priorities) if !priorities.is_empty() => priorities,
-            _ => crate::state::default_pillar_priorities(),
-        };
+        // some pillar order, so a request that names none — an absent member or an empty
+        // list — is created with the framework's own pillar order rather than with no
+        // priorities at all. Resolved through the one place that rule lives, which
+        // `UpdateWorkload` resolves the member it merges through too, so a workload no
+        // create could have produced cannot be reached by updating one that could.
+        let pillar_priorities = crate::state::resolved_pillar_priorities(
+            input.pillar_priorities,
+            // A workload being created is reviewed in no order yet, so a request that
+            // names none falls back to the framework's own order.
+            &[],
+        );
         let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
             "AccountIds": &account_ids,
             "Applications": &applications,

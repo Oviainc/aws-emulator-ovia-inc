@@ -4233,6 +4233,29 @@ pub fn default_pillar_priorities() -> Vec<String> {
         .collect()
 }
 
+/// The pillar order a request leaves a workload reviewed in: the priorities the request
+/// names, or — when it names NONE, whether by omitting the member or by carrying an empty
+/// list — the order the workload is already reviewed in, falling back to the framework's
+/// own pillar order when it carries none yet.
+///
+/// A workload is always reviewed in some pillar order ("The priorities of the pillars,
+/// which are used to order items in the improvement plan", `WorkloadPillarPriorities`
+/// doc), and `WorkloadPillarPriorities` publishes no `@length`, so the boundary validator
+/// passes an empty list through to the handler. The rule therefore lives HERE, in the one
+/// place every path that writes the member resolves it through — a create against no
+/// current order, an update against the order the stored workload carries — so no path
+/// can leave a workload reviewed in no order at all.
+pub fn resolved_pillar_priorities(
+    requested: Option<Vec<String>>,
+    current: &[String],
+) -> Vec<String> {
+    match requested {
+        Some(priorities) if !priorities.is_empty() => priorities,
+        _ if !current.is_empty() => current.to_vec(),
+        _ => default_pillar_priorities(),
+    }
+}
+
 /// What a `CreateWorkload` idempotency token resolves to: the workload the original
 /// request created, plus a fingerprint of that request's parameters so a reuse of the
 /// token with DIFFERENT parameters can be told apart from a genuine replay.

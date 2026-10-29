@@ -426,3 +426,8 @@ mod template_share_invitation_answers;
 // for a lens suite falls in a crowded run of this list.
 #[path = "all/lens_token_alias_spelling.rs"]
 mod lens_token_alias_spelling;
+
+// Appended at the end of this list for the reason the notes above give: the sorted position
+// for a workload suite falls in a crowded run of this list.
+#[path = "all/workload_pillar_order.rs"]
+mod workload_pillar_order;

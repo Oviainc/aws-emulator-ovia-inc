@@ -7,8 +7,9 @@
 //! no workload carries — whatever its syntax — is `ResourceNotFoundException` (404).
 //! Every invariant of the resource is judged on the record the merge WOULD leave
 //! behind, so an update cannot reach a workload a create would have refused: a
-//! workload always names at least one Region, every Region it names is a Region, and
-//! its industry type is one the service publishes.
+//! workload always names at least one Region, every Region it names is a Region, its
+//! industry type is one the service publishes, and it is always reviewed in some pillar
+//! order.
 //!
 //! ## Shape of an operation
 //!
@@ -353,7 +354,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.non_aws_regions = non_aws_regions;
         }
         if let Some(pillar_priorities) = input.pillar_priorities {
-            record.pillar_priorities = pillar_priorities;
+            // "The priorities of the pillars, which are used to order items in the
+            // improvement plan" (`PillarPriorities` doc): a workload is always reviewed
+            // in some pillar order — an invariant of the workload, not a rule about one
+            // request — and `WorkloadPillarPriorities` carries no `@length`, so an empty
+            // list reaches the handler. It names no priority order, so it leaves the
+            // workload in the order it is already reviewed in, exactly as an absent
+            // member does; resolved through the one place that rule lives, the same one
+            // `CreateWorkload` resolves the member through, so a workload no create could
+            // have produced cannot be reached by updating one that could.
+            let resolved = crate::state::resolved_pillar_priorities(
+                Some(pillar_priorities),
+                &record.pillar_priorities,
+            );
+            record.pillar_priorities = resolved;
         }
         if let Some(architectural_design) = input.architectural_design {
             record.architectural_design = Some(architectural_design);
