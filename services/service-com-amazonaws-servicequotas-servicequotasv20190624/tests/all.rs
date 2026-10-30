@@ -45,6 +45,8 @@ mod default_quota_published_codes;
 mod error_envelope;
 #[path = "all/history_filter_chain.rs"]
 mod history_filter_chain;
+#[path = "all/no_such_quota_wording.rs"]
+mod no_such_quota_wording;
 #[path = "all/open_request_plane_scope.rs"]
 mod open_request_plane_scope;
 #[path = "all/pagination_token_scope.rs"]

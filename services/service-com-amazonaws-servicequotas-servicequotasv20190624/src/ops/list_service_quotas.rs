@@ -139,11 +139,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(requested) = input.quota_code.as_deref() {
                 codes.retain(|code| code == requested);
                 if codes.is_empty() {
+                    // A `QuotaCode` filter naming a pair the catalog does not hold is
+                    // the same fact every other read and write of one quota reports, so
+                    // it is stated in the crate's ONE wording for it
+                    // ([`crate::state::no_such_quota_message`]) rather than a second
+                    // sentence of this handler's own.
                     return Err(ListServiceQuotasErrorModeled::NoSuchResourceException(
                         NoSuchResourceException {
-                            message: Some(format!(
-                                "ServiceCode '{}' has no quota with QuotaCode '{requested}'",
-                                input.service_code
+                            message: Some(crate::state::no_such_quota_message(
+                                &input.service_code,
+                                requested,
                             )),
                         },
                     )
