@@ -574,15 +574,23 @@ fn references() -> Vec<Reference> {
     ]
 }
 
-/// How this service words "there is no such resource", for a resource of `kind` — the
-/// text every family's not-found refusal carries ("The requested job couldn't be
-/// found. Check the job name and try your request again." in the recorded responses),
-/// naming the KIND and never the name the caller asked about.
+/// How this service words "there is no such resource", for a resource of `kind` — most
+/// families' not-found refusal carries the sentence below ("The requested job couldn't
+/// be found. Check the job name and try your request again." in the recorded
+/// responses), naming the KIND and never the name the caller asked about.
+///
+/// The wording belongs to the FAMILY: the Call Analytics category family words the same
+/// condition its own way, which its refusal suite
+/// (`crate::call_analytics_category_refusals`) pins, so that family's sentence is read
+/// from there rather than composed here.
 ///
 /// `pub(crate)` so the Call Analytics start suite
 /// (`crate::call_analytics_job_start_limits`) asserts the same wording from one home
 /// rather than restating it.
 pub(crate) fn not_found_message(kind: &str) -> String {
+    if kind == "category" {
+        return crate::call_analytics_category_refusals::ABSENT_CATEGORY_MESSAGE.to_string();
+    }
     format!("The requested {kind} couldn't be found. Check the {kind} name and try your request again.")
 }
 

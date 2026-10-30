@@ -222,17 +222,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .call_analytics_categories
             .contains(&region, &input.category_name)
         {
-            return Err(CreateCallAnalyticsCategoryErrorModeled::ConflictException(
-                ConflictException {
-                    // The service's own text names the resource KIND and does not echo
-                    // the name asked for — see
-                    // [`crate::state::name_already_exists_message`].
-                    message: Some(crate::state::name_already_exists_message(
-                        crate::state::KIND_CATEGORY,
-                    )),
-                },
-            )
-            .into());
+            // The shape a taken name is refused with is per family, like the text: this
+            // family answers `BadRequestException` — the shape whose own documentation
+            // covers a request that "didn't pass one or more validation tests" and the
+            // one this family's recorded refusals carry — not the `ConflictException`
+            // the model also declares here and the vocabulary and job families answer.
+            // The text names the resource KIND and does not echo the name asked for —
+            // see [`crate::state::name_already_exists_message`].
+            return Err(bad_request(&crate::state::name_already_exists_message(
+                crate::state::KIND_CATEGORY,
+            )));
         }
 
         if store.call_analytics_categories.len_in(&region)
@@ -308,10 +307,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// A `BadRequestException` refusing a request this operation cannot serve: one whose
-/// rules bound a search with only one end of a time range, which the model's own
-/// constraint traits cannot express (a conditional co-requirement is not a Smithy
-/// constraint, so the boundary validation never sees it).
+/// A `BadRequestException` refusing a request this operation cannot serve: one naming a
+/// category this account already holds (the shape and text this family refuses a taken
+/// name with — [`crate::state::name_already_exists_message`]) or one whose rules bound a
+/// search with only one end of a time range, which the model's own constraint traits
+/// cannot express (a conditional co-requirement is not a Smithy constraint, so the
+/// boundary validation never sees it).
 fn bad_request(message: &str) -> CreateCallAnalyticsCategoryError {
     CreateCallAnalyticsCategoryErrorModeled::BadRequestException(BadRequestException {
         message: Some(message.to_string()),

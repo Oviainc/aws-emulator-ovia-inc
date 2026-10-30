@@ -29,8 +29,9 @@ use serde_json::{json, Value};
 
 use crate::transcription_jobs::{Reply, Transcribe};
 
-/// The modelled client error this service answers for a category it does not hold, and
-/// the status its awsJson1_1 wire protocol puts on every client error.
+/// The modelled client error this family's refusals carry — a category it does not hold
+/// and a category name it already holds alike (`crate::call_analytics_category_refusals`)
+/// — and the status its awsJson1_1 wire protocol puts on every client error.
 const ABSENT_CODE: &str = "BadRequestException";
 /// See [`ABSENT_CODE`].
 const CLIENT_ERROR_STATUS: u16 = 400;
@@ -394,8 +395,11 @@ async fn a_category_this_account_does_not_hold_is_refused() {
 }
 
 /// RULE 5: a create naming a category this account already holds is refused with the
-/// modelled `ConflictException`, and the stored category keeps the rules, input type
-/// and tags of the create that won.
+/// shape this family refuses a taken name with — `BadRequestException`, as its lookups
+/// refuse with too, not the `ConflictException` the operation also models and the
+/// vocabulary and job families answer (`crate::call_analytics_category_refusals` pins
+/// the shape and the wording) — and the stored category keeps the rules, input type and
+/// tags of the create that won.
 #[tokio::test]
 async fn creating_a_category_whose_name_is_taken_is_refused() {
     let transcribe = Transcribe::new();
@@ -420,7 +424,7 @@ async fn creating_a_category_whose_name_is_taken_is_refused() {
         let conflict = transcribe
             .call("CreateCallAnalyticsCategory", second)
             .await;
-        conflict.refused(row.case, CLIENT_ERROR_STATUS, "ConflictException");
+        conflict.refused(row.case, CLIENT_ERROR_STATUS, ABSENT_CODE);
 
         let read = transcribe
             .call(

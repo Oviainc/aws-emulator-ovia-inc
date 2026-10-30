@@ -59,8 +59,10 @@ pub(crate) fn refused(reply: &Reply, case: &str) {
 }
 
 /// Assert `reply` is this service's absent-resource refusal for a resource of `kind`:
-/// a client error naming `BadRequestException` whose message names the KIND of
-/// resource and echoes nothing from the request.
+/// a client error naming `BadRequestException` whose message is the wording that
+/// family's not-found refusal carries
+/// (`crate::transcription_job_request_rules::not_found_message`), which names the KIND
+/// of resource and echoes nothing from the request.
 pub(crate) fn absent_resource_refusal(reply: &Reply, case: &str, kind: &str) {
     refused(reply, case);
     assert_eq!(
@@ -70,9 +72,10 @@ pub(crate) fn absent_resource_refusal(reply: &Reply, case: &str, kind: &str) {
         reply.body
     );
     let message = reply.error_message(case);
-    assert!(
-        message.contains(&format!("The requested {kind} couldn't be found")),
-        "case {case:?}: the refusal must name the {kind:?} kind, got {message:?}"
+    let expected = crate::transcription_job_request_rules::not_found_message(kind);
+    assert_eq!(
+        message, expected,
+        "case {case:?}: expected the {kind:?} refusal {expected:?}, got {message:?}"
     );
 }
 

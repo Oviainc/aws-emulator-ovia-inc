@@ -17,6 +17,8 @@ mod call_analytics_categories;
 mod call_analytics_category_listing;
 #[path = "all/call_analytics_category_quota.rs"]
 mod call_analytics_category_quota;
+#[path = "all/call_analytics_category_refusals.rs"]
+mod call_analytics_category_refusals;
 #[path = "all/call_analytics_category_update_rule_validation.rs"]
 mod call_analytics_category_update_rule_validation;
 #[path = "all/call_analytics_category_updates.rs"]

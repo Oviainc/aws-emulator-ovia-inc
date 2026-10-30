@@ -39,10 +39,12 @@ const CLIENT_ERROR_STATUS: u16 = 400;
 
 /// How this service words "no such category" — the refusal an update naming a category
 /// this account holds no record of earns instead of the one under test.
+///
+/// Read from the family's own refusal suite
+/// (`crate::call_analytics_category_refusals`), which pins that wording for every
+/// operation of the family, so the sentence has one home in these tests.
 fn not_found_message() -> String {
-    "The requested category couldn't be found. Check the category name and try your \
-     request again."
-        .to_string()
+    crate::call_analytics_category_refusals::ABSENT_CATEGORY_MESSAGE.to_string()
 }
 
 /// How the update words "that is not the input type this category was created with":

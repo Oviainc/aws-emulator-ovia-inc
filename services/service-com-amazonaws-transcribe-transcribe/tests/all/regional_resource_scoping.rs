@@ -75,7 +75,14 @@ struct Family {
     name_in_list: &'static str,
     /// The delete that drops one record of this family.
     delete: &'static str,
+    /// The modelled error shape THIS family refuses a name it already holds with: the
+    /// shape is a property of the family, not of the condition (see
+    /// `crate::call_analytics_category_refusals`).
+    taken_name_code: &'static str,
 }
+
+/// The shape most families refuse a name they already hold with.
+const CONFLICT_CODE: &str = "ConflictException";
 
 /// Every family this service holds records of, each with the create, read and listing
 /// this emulator implements
@@ -98,6 +105,7 @@ fn families() -> Vec<Family> {
             list: "ListTranscriptionJobs",
             name_in_list: "TranscriptionJobName",
             delete: "DeleteTranscriptionJob",
+            taken_name_code: CONFLICT_CODE,
         },
         Family {
             case: "medical transcription job",
@@ -119,6 +127,7 @@ fn families() -> Vec<Family> {
             list: "ListMedicalTranscriptionJobs",
             name_in_list: "MedicalTranscriptionJobName",
             delete: "DeleteMedicalTranscriptionJob",
+            taken_name_code: CONFLICT_CODE,
         },
         Family {
             case: "Call Analytics job",
@@ -134,6 +143,7 @@ fn families() -> Vec<Family> {
             list: "ListCallAnalyticsJobs",
             name_in_list: "CallAnalyticsJobName",
             delete: "DeleteCallAnalyticsJob",
+            taken_name_code: CONFLICT_CODE,
         },
         Family {
             case: "Medical Scribe job",
@@ -152,6 +162,7 @@ fn families() -> Vec<Family> {
             list: "ListMedicalScribeJobs",
             name_in_list: "MedicalScribeJobName",
             delete: "DeleteMedicalScribeJob",
+            taken_name_code: CONFLICT_CODE,
         },
         Family {
             case: "custom vocabulary",
@@ -168,6 +179,7 @@ fn families() -> Vec<Family> {
             list: "ListVocabularies",
             name_in_list: "VocabularyName",
             delete: "DeleteVocabulary",
+            taken_name_code: CONFLICT_CODE,
         },
         Family {
             case: "custom medical vocabulary",
@@ -186,6 +198,7 @@ fn families() -> Vec<Family> {
             list: "ListMedicalVocabularies",
             name_in_list: "VocabularyName",
             delete: "DeleteMedicalVocabulary",
+            taken_name_code: CONFLICT_CODE,
         },
         Family {
             case: "custom vocabulary filter",
@@ -202,6 +215,7 @@ fn families() -> Vec<Family> {
             list: "ListVocabularyFilters",
             name_in_list: "VocabularyFilterName",
             delete: "DeleteVocabularyFilter",
+            taken_name_code: CONFLICT_CODE,
         },
         Family {
             case: "custom language model",
@@ -222,6 +236,7 @@ fn families() -> Vec<Family> {
             list: "ListLanguageModels",
             name_in_list: "ModelName",
             delete: "DeleteLanguageModel",
+            taken_name_code: CONFLICT_CODE,
         },
         Family {
             case: "Call Analytics category",
@@ -237,6 +252,9 @@ fn families() -> Vec<Family> {
             list: "ListCallAnalyticsCategories",
             name_in_list: "CategoryName",
             delete: "DeleteCallAnalyticsCategory",
+            // This family refuses a taken name with the same shape its lookups refuse an
+            // absent one with.
+            taken_name_code: ABSENT_CODE,
         },
     ]
 }
@@ -368,7 +386,7 @@ async fn one_name_is_taken_only_in_the_region_that_holds_it() {
             again.refused(
                 &format!("{case}: second create in {region}"),
                 CLIENT_ERROR_STATUS,
-                "ConflictException",
+                family.taken_name_code,
             );
 
             let read = transcribe

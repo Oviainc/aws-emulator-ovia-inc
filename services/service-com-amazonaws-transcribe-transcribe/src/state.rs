@@ -927,9 +927,10 @@ pub const RESOURCE_TYPE_CALL_ANALYTICS_JOB: &str = "analytics-job";
 /// ARN's `<type>` segment names, for each type this emulator stores records of.
 ///
 /// The kinds are the ones the service's recorded messages name ("vocabulary",
-/// "vocabulary filter", "job"), so one template plus a kind words a refusal for every
-/// family rather than each handler spelling its own. An ARN whose type names nothing
-/// this emulator holds gets the neutral `KIND_RESOURCE`.
+/// "vocabulary filter", "job"), so a kind is what SELECTS the refusal a family words
+/// for a condition ([`not_found_message`], [`name_already_exists_message`]) rather
+/// than each handler spelling its own. An ARN whose type names nothing this emulator
+/// holds gets the neutral `KIND_RESOURCE`.
 pub const KIND_JOB: &str = "job";
 /// See [`KIND_JOB`].
 pub const KIND_VOCABULARY: &str = "vocabulary";
@@ -939,9 +940,9 @@ pub const KIND_MEDICAL_VOCABULARY: &str = "medical vocabulary";
 pub const KIND_VOCABULARY_FILTER: &str = "vocabulary filter";
 /// See [`KIND_JOB`].
 pub const KIND_LANGUAGE_MODEL: &str = "language model";
-/// See [`KIND_JOB`]: the word the recorded Call Analytics category responses name
-/// that family by ("The category that you've specified couldn't be found. Check the
-/// category name and try your request again.").
+/// See [`KIND_JOB`]: the word the Call Analytics category family's own refusals name
+/// it by — [`CATEGORY_NOT_FOUND_MESSAGE`] and [`CATEGORY_NAME_EXISTS_MESSAGE`], which
+/// are that family's wording for the two conditions a name can be refused for.
 pub const KIND_CATEGORY: &str = "category";
 /// See [`KIND_JOB`].
 pub const KIND_RESOURCE: &str = "resource";
@@ -1051,12 +1052,37 @@ pub fn resource_kind(resource_type: &str) -> &'static str {
 /// it; which error SHAPE carries it is the handler's own modelled choice
 /// (`BadRequestException` — see [`crate::scaffolded::wire_status`] for the status
 /// side of the same error channel).
+///
+/// The wording is a property of the FAMILY, not a template over every family: most
+/// families share the sentence above, and the Call Analytics category family words the
+/// same condition its own way ([`CATEGORY_NOT_FOUND_MESSAGE`]), so the text is looked
+/// up per family here rather than composed from the kind word at each call site.
 pub fn not_found_message(kind: &str) -> String {
+    if kind == KIND_CATEGORY {
+        return CATEGORY_NOT_FOUND_MESSAGE.to_string();
+    }
     format!(
         "The requested {kind} couldn't be found. Check the {kind} name and try your \
          request again."
     )
 }
+
+/// How this service words "there is no such Call Analytics category", for every
+/// operation of that family that looks one up — the read, the update and the delete.
+///
+/// Entirely FIXED text: no part of it comes from the request, so the name the caller
+/// asked about appears nowhere in it. Both apostrophes are U+2019 (RIGHT SINGLE
+/// QUOTATION MARK), as the service writes them, not the ASCII `'`.
+pub const CATEGORY_NOT_FOUND_MESSAGE: &str = "The category that you\u{2019}ve specified \
+     couldn\u{2019}t be found. Check the category name and try your request again.";
+
+/// How this service words "that Call Analytics category name is already taken", for the
+/// create that claims a category name.
+///
+/// Entirely FIXED text, like [`CATEGORY_NOT_FOUND_MESSAGE`], with the same U+2019
+/// apostrophe and no request value in it.
+pub const CATEGORY_NAME_EXISTS_MESSAGE: &str = "The category name that you\u{2019}ve \
+     requested already exists. Change the category name and try your request again.";
 
 /// How this service refuses a request that would APPLY a custom resource whose
 /// processing has not finished successfully: the resource of `kind` named `name` is in
@@ -1113,8 +1139,13 @@ pub fn resource_not_updatable_message(kind: &str, name: &str, state: &str) -> St
 ///
 /// Same shape of text as [`not_found_message`], and the same reason for naming only
 /// the kind: "The requested vocabulary filter name already exists. Use a different
-/// vocabulary filter name."
+/// vocabulary filter name." Per family for the same reason too: the Call Analytics
+/// category family words a taken name its own way
+/// ([`CATEGORY_NAME_EXISTS_MESSAGE`]).
 pub fn name_already_exists_message(kind: &str) -> String {
+    if kind == KIND_CATEGORY {
+        return CATEGORY_NAME_EXISTS_MESSAGE.to_string();
+    }
     format!("The requested {kind} name already exists. Use a different {kind} name.")
 }
 
