@@ -164,6 +164,28 @@ pub fn recorded_members<const N: usize>(
 /// invention, so it is stated once here and used by every recorder.
 pub const HIDDEN_SENSITIVE_VALUE: &str = "HIDDEN_DUE_TO_SECURITY_REASONS";
 
+/// The members whose values a record does NOT carry, and HOW each one is withheld.
+///
+/// Both sets hold MODELLED member names, so a set answers for every operation that
+/// carries a member of that name. They are separate because the serving API decides which
+/// of the two withholdings its records use, and the two are observably different to a
+/// client reading event history back:
+///
+/// * a REDACTED member is present in the document with [`HIDDEN_SENSITIVE_VALUE`] as its
+///   value, so the record still shows that the call carried it;
+/// * an OMITTED member is absent from the document altogether — there is no key for it at
+///   all, which is how a record of a call whose defining property is that the credential
+///   material was never persisted can be told apart from one that stored a placeholder.
+///
+/// A member named in neither set is recorded as the call carried it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WithheldFromRecord<'a> {
+    /// Members whose value is replaced by [`HIDDEN_SENSITIVE_VALUE`].
+    pub redacted: &'a [&'a str],
+    /// Members the record leaves out entirely, value and key both.
+    pub omitted: &'a [&'a str],
+}
+
 /// The member NAME a record spells a modelled member with: the modelled name with a
 /// lower-case first letter (`DBInstanceIdentifier` -> `dBInstanceIdentifier`), which is
 /// how a CloudTrail event document names the members of the call it records.
@@ -198,19 +220,20 @@ const MAX_RECORDED_VALUES: usize = 1_024;
 /// written (the generated walk writes nothing for an unset optional member), which is what
 /// keeps an absent member out of the record rather than in it as null.
 ///
-/// `sensitive_members` are the members the serving model declares `@sensitive`. A value
-/// held at one of them — a leaf, or a whole subtree — is replaced by
-/// [`HIDDEN_SENSITIVE_VALUE`] and never read, so the plaintext reaches no record.
+/// `withheld` names the members whose values this record does not carry: a value held at a
+/// REDACTED one — a leaf, or a whole subtree — is replaced by [`HIDDEN_SENSITIVE_VALUE`],
+/// and one held at an OMITTED member is left out of the document entirely. Neither is
+/// read, so the plaintext reaches no record either way (see [`WithheldFromRecord`]).
 #[must_use]
 pub fn recorded_shape(
     value: &dyn ::aws_smithy_schema::serde::SerializableStruct,
     schema: &::aws_smithy_schema::Schema,
-    sensitive_members: &[&str],
+    withheld: WithheldFromRecord<'_>,
 ) -> serde_json::Value {
     let mut walk = RecordedShape {
         stack: Vec::new(),
         root: serde_json::Value::Null,
-        sensitive_members,
+        withheld,
         written: 0,
     };
     // The root of a request or a response is a structure; drive it the way a codec does.
@@ -242,8 +265,8 @@ struct RecordedShape<'a> {
     stack: Vec<RecordedFrame>,
     /// The finished document, once the outermost container closes.
     root: serde_json::Value,
-    /// The members whose values are never stored.
-    sensitive_members: &'a [&'a str],
+    /// The members whose values are never stored, and how each is withheld.
+    withheld: WithheldFromRecord<'a>,
     /// How many values have been written, against [`MAX_RECORDED_VALUES`].
     written: usize,
 }
@@ -256,7 +279,17 @@ impl RecordedShape<'_> {
     fn is_sensitive(&self, schema: &::aws_smithy_schema::Schema) -> bool {
         schema
             .member_name()
-            .is_some_and(|name| self.sensitive_members.contains(&name))
+            .is_some_and(|name| self.withheld.redacted.contains(&name))
+    }
+
+    /// Whether `schema` names a member the serving API's records leave OUT: nothing at all
+    /// is written for it, so the finished document carries no key for it.
+    ///
+    /// Matched on the member's own MODELLED name, exactly as [`Self::is_sensitive`] is.
+    fn is_omitted(&self, schema: &::aws_smithy_schema::Schema) -> bool {
+        schema
+            .member_name()
+            .is_some_and(|name| self.withheld.omitted.contains(&name))
     }
 
     /// Whether this walk has already written everything one record holds.
@@ -336,7 +369,9 @@ impl RecordedShape<'_> {
             );
             return Ok(());
         }
-        if self.full() {
+        // An omitted member is not walked at all: its children are inside it, so leaving
+        // the composite out leaves every value it held out with it.
+        if self.is_omitted(schema) || self.full() {
             self.skipped();
             return Ok(());
         }
@@ -362,7 +397,7 @@ impl RecordedShape<'_> {
             );
             return;
         }
-        if self.full() {
+        if self.is_omitted(schema) || self.full() {
             self.skipped();
             return;
         }
@@ -596,7 +631,7 @@ impl ::aws_smithy_schema::serde::ShapeSerializer for RecordedShape<'_> {
         // A position whose value is withheld, and one past what this record holds, need
         // no walk of the document at all: `leaf` writes the redaction literal for the
         // first and nothing for the second.
-        if self.is_sensitive(schema) || self.full() {
+        if self.is_sensitive(schema) || self.is_omitted(schema) || self.full() {
             self.leaf(schema, serde_json::Value::Null);
             return Ok(());
         }
@@ -1239,7 +1274,7 @@ mod tests {
         let mut walk = RecordedShape {
             stack: Vec::new(),
             root: serde_json::Value::Null,
-            sensitive_members: &[],
+            withheld: WithheldFromRecord::default(),
             written: 0,
         };
         let recorded = walk.recorded_document(&document, 0);
@@ -1282,7 +1317,7 @@ mod tests {
         let mut walk = RecordedShape {
             stack: Vec::new(),
             root: serde_json::Value::Null,
-            sensitive_members: &[],
+            withheld: WithheldFromRecord::default(),
             written: 0,
         };
         let recorded = walk.recorded_document(&wide, 0);

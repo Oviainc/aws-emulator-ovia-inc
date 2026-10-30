@@ -127,6 +127,8 @@ mod login_profile_updates;
 mod login_profiles;
 #[path = "all/managed_policies.rs"]
 mod managed_policies;
+#[path = "all/management_event_recording.rs"]
+mod management_event_recording;
 #[path = "all/member_format_refusal_wording.rs"]
 mod member_format_refusal_wording;
 #[path = "all/mfa_device_reads.rs"]

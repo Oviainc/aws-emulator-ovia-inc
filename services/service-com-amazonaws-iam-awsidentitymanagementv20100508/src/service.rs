@@ -69,6 +69,16 @@
 //! this file only reaches it ahead of dispatch, through [`Service::override_operation`]
 //! — the one seam that sees a whole request before the modelled walk deserializes,
 //! validates and dispatches it.
+//!
+//! ## The audit leg
+//!
+//! Every call this service serves is also a management event of `iam.amazonaws.com`: the
+//! routing table its definition answers with is the one whose operations are wrapped in the
+//! shared management-event recorder ([`management_events`]), so each served call is
+//! recorded in the account's event history where CloudTrail's `LookupEvents` reports it —
+//! one code path for every operation rather than a recording written into each handler.
+
+pub mod management_events;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::{envelope, ProtocolError, Violation, ViolationKind};
@@ -382,7 +392,9 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// (see `service_common::query_error_envelope`), whichever layer rendered it — a
     /// routing failure, a transport failure and the pre-dispatch refusal below included.
     /// Identity, the protocol and the routing table are the generated entry's untouched.
-    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
+    entry: RequestIdEnvelopeDefinition<
+        management_events::AuditedDefinition<crate::ServiceDefinition<Eng>>,
+    >,
     /// The SAME shared engine the generated entry threaded into every operation, kept
     /// here too because the pre-dispatch credential check below has to read the access
     /// keys this service's own operations wrote. Never a store of its own: it is the
@@ -403,9 +415,14 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: RequestIdEnvelopeDefinition::new(crate::ServiceDefinition::new(Arc::clone(
-                &engine,
-            ))),
+            entry: RequestIdEnvelopeDefinition::new(management_events::AuditedDefinition::new(
+                crate::ServiceDefinition::new(Arc::clone(&engine)),
+                // Every operation of this service, each wrapped in the shared
+                // management-event recorder and built from this same shared engine (see
+                // [`management_events`]), so each call this service serves is recorded as
+                // a management event of `iam.amazonaws.com`.
+                management_events::audited_table(&engine),
+            )),
             engine,
             unusable_credential: UnusableCredential,
             envelope: RequestIdEnvelopeOperation,
@@ -493,12 +510,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             return Some(&self.unusable_credential);
         }
         // Every other request this model serves goes through the `awsQuery` envelope
-        // wrapper, which resolves the operation from the SAME generated routing table the
-        // router would have, delegates the whole deserialize → validate → handle →
-        // serialize walk to it, and adds the `<RequestId>` the envelope carries beside
-        // `<Error>`. A request the routing table does not answer is declined here, so it
-        // stays the router's own routing failure (itself stated through the wrapped
-        // definition, which names the request too).
+        // wrapper, which resolves the operation from the SAME routing table the router
+        // would have — this service's AUDITED table (see [`management_events`]), so the
+        // call is recorded inside the typed call it delegates the whole
+        // deserialize → validate → handle → serialize walk to — and adds the
+        // `<RequestId>` the envelope carries beside `<Error>`. A request the routing table
+        // does not answer is declined here, so it stays the router's own routing failure
+        // (itself stated through the wrapped definition, which names the request too).
         self.entry
             .routes(req)
             .then_some(&self.envelope as &dyn ErasedOperation)

@@ -19,7 +19,8 @@
 //! * `eventName` is the operation's modelled name ([`Operation::NAME`]);
 //! * `requestParameters` / `responseElements` are the built input and output rendered
 //!   against their own schemas ([`crate::management_events::recorded_shape`]), so a
-//!   sensitive member is replaced by the redaction literal rather than stored;
+//!   member whose value the serving API withholds is redacted or left out rather than
+//!   stored;
 //! * `errorCode` / `errorMessage` come from the error channel the caller was answered
 //!   through ([`crate::management_events::recorded_failure`]), so a failed call records
 //!   the fault SHAPE's name.
@@ -56,7 +57,9 @@ use smithy_server_runtime::{
     OperationRoutingTable, PreDispatchProtocol, Service,
 };
 
-use crate::management_events::{recorded_failure, recorded_shape, ServedApiCall};
+use crate::management_events::{
+    recorded_failure, recorded_shape, ServedApiCall, WithheldFromRecord,
+};
 
 /// The wire error code of the scaffold's "not implemented" signal, which every generated
 /// service's error channel renders a stub with (`crate::scaffolded` in each service
@@ -103,9 +106,20 @@ pub trait AuditedService: Send + Sync + 'static {
         Vec::new()
     }
 
-    /// The members this service's model declares `@sensitive`. A value held at one of
-    /// them is replaced by the redaction literal and never stored.
+    /// The members this service's model declares `@sensitive` whose records carry the
+    /// redaction literal in place of the value. A value held at one of them is replaced by
+    /// that literal and never stored.
     fn sensitive_members(&self) -> &'static [&'static str];
+
+    /// The members this service's records leave OUT entirely: no key for them at all,
+    /// rather than a key carrying the redaction literal.
+    ///
+    /// Which of the two withholdings a service's records use is the SERVING API's, not
+    /// this wrapper's: the default is none, so a service states only the members its own
+    /// records omit (see [`WithheldFromRecord`]).
+    fn omitted_members(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// Whether a call only REPORTED state, as CloudTrail stamps an event's `readOnly` — the
@@ -160,11 +174,7 @@ impl<O: Operation, S: AuditedService> Operation for AuditedOperation<O, S> {
     ) -> Result<Self::Output, Self::Error> {
         // The input is rendered BEFORE the handler runs, because the handler consumes it;
         // the document is what the request carried, which is what a record reports.
-        let request_parameters = recorded_shape(
-            &input,
-            O::INPUT_SCHEMA,
-            self.service.sensitive_members(),
-        );
+        let request_parameters = recorded_shape(&input, O::INPUT_SCHEMA, self.withheld());
         let outcome = self.operation.handle(input, ctx).await;
         self.record(&request_parameters, ctx, &outcome);
         outcome
@@ -172,6 +182,15 @@ impl<O: Operation, S: AuditedService> Operation for AuditedOperation<O, S> {
 }
 
 impl<O: Operation, S: AuditedService> AuditedOperation<O, S> {
+    /// What this service's records do not carry the values of, as the one walk over an
+    /// input or an output takes it.
+    fn withheld(&self) -> WithheldFromRecord<'static> {
+        WithheldFromRecord {
+            redacted: self.service.sensitive_members(),
+            omitted: self.service.omitted_members(),
+        }
+    }
+
     /// Record the call just served, unless it was refused as not implemented (so nothing
     /// was served at all).
     fn record(
@@ -190,11 +209,9 @@ impl<O: Operation, S: AuditedService> AuditedOperation<O, S> {
         // "responseElements" is what the call ANSWERED with, which a reporting call has
         // nothing of: CloudTrail records a read with a null `responseElements`.
         let response_elements = match (self.kind, outcome.as_ref().ok()) {
-            (CallKind::Mutating, Some(output)) => Some(recorded_shape(
-                output,
-                O::OUTPUT_SCHEMA,
-                self.service.sensitive_members(),
-            )),
+            (CallKind::Mutating, Some(output)) => {
+                Some(recorded_shape(output, O::OUTPUT_SCHEMA, self.withheld()))
+            }
             _ => None,
         };
         let (error_code, error_message) = recorded_failure(outcome);
