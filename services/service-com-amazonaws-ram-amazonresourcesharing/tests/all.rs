@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/invitation_reads.rs"]
+mod invitation_reads;
 #[path = "all/mutation_reports.rs"]
 mod mutation_reports;
 #[path = "all/pending_invitation_resources.rs"]
