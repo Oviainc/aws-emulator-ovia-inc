@@ -238,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|script| (script.script_id.clone(), script.region.clone()))
         else {
             return Err(UpdateScriptErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("The script {} was not found.", input.script_id)),
+                message: Some(crate::state::script_not_found_message(&input.script_id)),
             })
             .into());
         };

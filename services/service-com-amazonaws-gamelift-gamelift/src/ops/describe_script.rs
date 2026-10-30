@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(script) = state.resolve_script(&input.script_id) else {
             return Err(DescribeScriptErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!("The script {} was not found.", input.script_id)),
+                    message: Some(crate::state::script_not_found_message(&input.script_id)),
                 },
             )
             .into());

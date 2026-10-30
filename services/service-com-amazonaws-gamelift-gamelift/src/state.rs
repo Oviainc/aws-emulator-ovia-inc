@@ -1129,6 +1129,19 @@ pub fn aws_location_model(location: &str) -> LocationModel {
     }
 }
 
+/// What the service answers when no Realtime script is stored under the `ScriptIdOrArn`
+/// an operation was asked to act on — the message of the modelled `NotFoundException`,
+/// shared by every operation that names ONE script, so the same missing script reads the
+/// same way whichever of them was called.
+///
+/// The resource kind leads the sentence and the identifier the CALLER supplied is its one
+/// variable part, carried verbatim in parentheses: either of the two forms the member
+/// accepts selects the same script, so the refusal states what was asked for rather than
+/// anything the service resolved it to.
+pub fn script_not_found_message(id_or_arn: &str) -> String {
+    format!("Script ({id_or_arn}) not found.")
+}
+
 /// A Realtime script, as `CreateScript` persisted it — the one projection every read of
 /// the script is served from.
 #[derive(Debug, Clone)]

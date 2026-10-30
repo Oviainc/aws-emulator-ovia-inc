@@ -30,11 +30,11 @@ const MAX_NAME_LENGTH: usize = 1024;
 const MAX_ZIP_BYTES: usize = 5_000_000;
 
 /// The S3 bucket the rows below that upload from the CALLER's own bucket name.
-const CALLER_BUCKET: &str = "my-own-game-scripts";
+pub(crate) const CALLER_BUCKET: &str = "my-own-game-scripts";
 
 /// `len` deterministic bytes standing in for a zipped Realtime script, opening with the
 /// local-file signature a zip archive carries (`PK\x03\x04`) when there is room for it.
-fn zip_bytes(len: usize) -> Vec<u8> {
+pub(crate) fn zip_bytes(len: usize) -> Vec<u8> {
     let mut bytes: Vec<u8> = b"PK\x03\x04".to_vec();
     bytes.truncate(len);
     while bytes.len() < len {
@@ -45,7 +45,7 @@ fn zip_bytes(len: usize) -> Vec<u8> {
 
 /// A blob travels base64-encoded on awsJson1_1, which is what the wire serializer does
 /// with it (`aws_smithy_types::base64`, the codec the runtime itself uses).
-fn zip_file_member(bytes: &[u8]) -> Value {
+pub(crate) fn zip_file_member(bytes: &[u8]) -> Value {
     json!(aws_smithy_types::base64::encode(bytes))
 }
 
@@ -53,7 +53,7 @@ fn zip_file_member(bytes: &[u8]) -> Value {
 /// required: "the storage location must specify the Amazon S3 bucket name, the zip file
 /// name (the "key"), and a role ARN that allows Amazon GameLift Servers to access the
 /// Amazon S3 storage location".
-fn caller_location(key: &str) -> Value {
+pub(crate) fn caller_location(key: &str) -> Value {
     json!({
         "Bucket": CALLER_BUCKET,
         "Key": key,
@@ -71,7 +71,7 @@ enum Source {
 }
 
 /// The `ScriptId` of a created script.
-fn script_id_of(script: &Value) -> String {
+pub(crate) fn script_id_of(script: &Value) -> String {
     script["ScriptId"]
         .as_str()
         .expect("CreateScript must report a ScriptId")
@@ -82,7 +82,7 @@ fn script_id_of(script: &Value) -> String {
 /// `arn:aws:gamelift:<region>:<account>:script/<script id>` — the model's
 /// `^arn:.*:script\/script-\S+$` with "the resource ID matches the `ScriptId` value"
 /// (`smithy_query shape=Script` member `ScriptArn`).
-fn script_arn(script_id: &str) -> String {
+pub(crate) fn script_arn(script_id: &str) -> String {
     gamelift_arn(&format!("script/{script_id}"))
 }
 
