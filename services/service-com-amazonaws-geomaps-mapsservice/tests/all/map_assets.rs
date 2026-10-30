@@ -29,7 +29,7 @@ use service_com_amazonaws_geomaps_mapsservice::ops::types::{
 use service_com_amazonaws_geomaps_mapsservice::state::assets;
 use service_com_amazonaws_geomaps_mapsservice::state::vector_tile::Tile;
 use service_com_amazonaws_geomaps_mapsservice::state::{
-    route_shield_width, ColorSchemeKind, MapStyleKind, TileFormat, VariantKind, CITY_DOT_BOX,
+    route_shield_width, ColorSchemeKind, Hsla, MapStyleKind, TileFormat, VariantKind, CITY_DOT_BOX,
     CITY_DOT_LOWRANK_BOX, INCIDENT_ICON_BOX, MARKER_HEIGHT, MARKER_WIDTH, PLACE_ICON_BOX,
     RESTRICTION_SHIELD_BOX, SHIELD_BASE_WIDTH, SHIELD_DIGIT_WIDTH,
 };
@@ -427,18 +427,23 @@ async fn style_knobs_add_layers_whose_tiles_carry_them() {
         ("color-scheme=Dark", &[]),
         ("terrain=Hillshade", &["hillshade"]),
         ("terrain=Terrain3D", &[]),
-        ("contour-density=High", &["contour_lines", "contour_lines-line"]),
+        ("contour-density=High", &["contour_lines"]),
         (
             "traffic=All",
-            &["traffic_flow-line", "traffic_incidents-line"],
+            &["traffic_flow", "traffic_incidents", "traffic_incident_icons"],
         ),
         (
             "travel-modes=Transit&travel-modes=Truck",
-            &["transit-line", "logistics-line"],
+            &["road_truck", "shield_truck-restriction"],
         ),
         (
             "political-view=IND&buildings=Buildings3D",
-            &["borders", "borders-line"],
+            &[
+                "admin_country",
+                "admin_country-disputed",
+                "admin_country-disputed-mask",
+                "building_extrusion",
+            ],
         ),
     ];
 
@@ -522,7 +527,7 @@ async fn poi_density_off_removes_the_symbol_layer() {
             .as_array()
             .into_iter()
             .flatten()
-            .any(|layer| layer["id"] == "places");
+            .any(|layer| layer["id"] == "poi_100_food_drink");
         assert_eq!(
             has_places,
             density != "Off",
@@ -1555,7 +1560,7 @@ async fn responses_follow_the_catalog_in_engine_state() {
             .styles
             .get_mut(&(MapStyleKind::Standard, ColorSchemeKind::Light))
             .expect("the seeded Standard Light style");
-        record.palette.water = [0x01, 0x02, 0x03, 0xff];
+        record.palette.water = Hsla::new(201, 98, 41);
         record.name = "Catalog Edited".to_string();
     }
     let response = emulator.get("/v2/styles/Standard/descriptor").await;
@@ -1571,13 +1576,14 @@ async fn responses_follow_the_catalog_in_engine_state() {
         .as_array()
         .expect("layers")
         .iter()
-        .find(|layer| layer["id"] == "water")
+        .find(|layer| layer["id"] == "water_fill")
         .expect("a water layer")["paint"]["fill-color"]
         .as_str()
         .expect("a fill colour")
         .to_string();
     assert_eq!(
-        water, "#010203",
+        water,
+        Hsla::new(201, 98, 41).css(),
         "case \"edited style\": the paint colour must follow the stored palette"
     );
 }

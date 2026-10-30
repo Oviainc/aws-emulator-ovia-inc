@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/map_assets.rs"]
 mod map_assets;
+#[path = "all/published_style_document.rs"]
+mod published_style_document;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/static_map_knobs.rs"]

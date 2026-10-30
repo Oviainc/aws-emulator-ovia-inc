@@ -11,8 +11,6 @@
 //! [`elevation_at`] is the one terrain field, so a `raster.dem` tile, a
 //! `raster.satellite` tile and a static map all agree about where the land is.
 
-use std::fmt::Write as _;
-
 use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 
@@ -23,10 +21,12 @@ use super::vector_tile::{GeomType, GeometryWriter, LayerBuilder, TagValue, Tile}
 use crate::ops::types::{
     POI_CATEGORY_VALUES, STATIC_MAP_STYLE_VALUES, TILE_ADDITIONAL_FEATURE_VALUES,
 };
+use super::style_layers::{self, LayerGate, LayerRole, StyleLayerSpec};
 use super::{
-    boundaries, labels, ColorSchemeKind, ComAmazonawsGeomapsMapsserviceState, FontRecord,
-    IconShape, MapStyleKind, Palette, Rgba, SpriteSheetRecord, StyleRecord, TileFormat,
-    TilesetRecord, VariantKind, BUILDING_LAYER, GROUND_LAYER, POI_LAYER, TRAFFIC_INCIDENT_LAYER,
+    boundaries, labels, ColorSchemeKind, ComAmazonawsGeomapsMapsserviceState, FontRecord, Hsla,
+    IconShape, MapStyleKind, PaintValue, Palette, Rgba, SpriteSheetRecord, StyleRecord, TileFormat,
+    TilesetRecord, VariantKind, ADMIN_LAYER, BUILDING_LAYER, GROUND_LAYER, POI_LAYER, ROAD_LAYER,
+    TRAFFIC_FLOW_LAYER, TRAFFIC_INCIDENT_LAYER, VECTOR_MAX_ZOOM, WATER_LAYER,
 };
 
 /// Earth's equatorial circumference in metres, the constant that turns a
@@ -304,10 +304,10 @@ fn terrarium(elevation: f64) -> Rgba {
 /// level `palette.water`.
 fn terrain_color(palette: &Palette, elevation: f64) -> Rgba {
     if elevation < 0.0 {
-        return palette.water;
+        return palette.water.rgba();
     }
     let factor = (elevation / 2000.0).clamp(0.0, 1.0);
-    blend(palette.land, palette.building, factor)
+    blend(palette.land.rgba(), palette.building.rgba(), factor)
 }
 
 fn blend(from: Rgba, to: Rgba, factor: f64) -> Rgba {
@@ -324,23 +324,38 @@ fn blend(from: Rgba, to: Rgba, factor: f64) -> Rgba {
     ]
 }
 
-/// `#rrggbb`, or `rgba(r, g, b, a)` when the colour is not opaque — the two
-/// colour literals the MapLibre style specification accepts.
-fn css_color(color: Rgba) -> String {
-    if color[3] == 0xff {
-        let mut text = String::from("#");
-        for channel in &color[..3] {
-            let _ = write!(text, "{channel:02x}");
+/// A style-document paint value, in the JSON a MapLibre paint property takes:
+/// a colour literal for a flat colour, and an `interpolate` EXPRESSION for a
+/// colour that changes with zoom.
+///
+/// An expression is an array, so a serializer that could only write a string
+/// here would hand a renderer a value it cannot vary — which is why the catalog
+/// carries [`PaintValue`] rather than a colour.
+fn paint_value(value: &PaintValue) -> serde_json::Value {
+    match value {
+        PaintValue::Flat(color) => color.css().into(),
+        PaintValue::ZoomRamp(stops) => {
+            let mut expression = vec![
+                serde_json::json!("interpolate"),
+                serde_json::json!(["linear"]),
+                serde_json::json!(["zoom"]),
+            ];
+            for (zoom, color) in stops {
+                expression.push(zoom_literal(*zoom));
+                expression.push(color.css().into());
+            }
+            serde_json::Value::Array(expression)
         }
-        text
+    }
+}
+
+/// A zoom level as a JSON number: an integer when it is one, so a stop at zoom
+/// 16 is written `16` rather than `16.0`.
+fn zoom_literal(zoom: f64) -> serde_json::Value {
+    if zoom.fract() == 0.0 {
+        serde_json::json!(zoom as i64)
     } else {
-        format!(
-            "rgba({}, {}, {}, {:.3})",
-            color[0],
-            color[1],
-            color[2],
-            f64::from(color[3]) / 255.0
-        )
+        serde_json::json!(zoom)
     }
 }
 
@@ -368,6 +383,12 @@ pub const ROLE_ATTRIBUTE: &str = "role";
 pub const AREA_ROLE: &str = "area";
 pub const WAY_ROLE: &str = "way";
 pub const POINT_ROLE: &str = "point";
+
+/// The attribute a boundary feature over a disputed territory carries, saying
+/// which country's political view claims it. Written by [`vector_tile_bytes`]
+/// and filtered on by the disputed-boundary style layers, so a request's
+/// `PoliticalView` selects the alignment that view recognises.
+pub const POLITICAL_VIEW_ATTRIBUTE: &str = "political_view";
 
 /// The traffic tileset and the style-document source name it is declared
 /// under. Which of its layers carry incident events is the tileset record's
@@ -465,6 +486,12 @@ pub fn style_descriptor(
     let features = requested_features(options);
 
     let mut sources = serde_json::Map::new();
+    // Which tile layers each declared source really serves, in the order the
+    // document declares the sources. A style layer is drawn only when the tiles
+    // behind it carry the layer it reads, so this list is what switches the
+    // traffic, contour, hillshade and travel-mode families on: asking for one
+    // of those knobs is what puts its layer in the tiles the template fetches.
+    let mut available: Vec<(String, Vec<String>)> = Vec::new();
     // The ground is painted before anything else and has no geometry of its
     // own, which is exactly what a MapLibre `background` layer is: the
     // basemap's ground layer IS this document's background, not a polygon fill
@@ -472,7 +499,7 @@ pub fn style_descriptor(
     let mut layers: Vec<serde_json::Value> = vec![serde_json::json!({
         "id": GROUND_LAYER,
         "type": "background",
-        "paint": { "background-color": css_color(record.palette.land) },
+        "paint": { "background-color": paint_value(&record.background) },
     })];
 
     for source in &record.sources {
@@ -505,7 +532,7 @@ pub fn style_descriptor(
         sources.insert(source.name.clone(), source_entry(tileset, &url));
         match tileset.format {
             TileFormat::VectorMvt => {
-                layers.extend(vector_layers(record, options, &source.name, &tile_layers));
+                available.push((source.name.clone(), tile_layers));
             }
             TileFormat::RasterJpeg | TileFormat::RasterDemPng => layers.push(serde_json::json!({
                 "id": format!("{}-imagery", source.name),
@@ -517,8 +544,8 @@ pub fn style_descriptor(
 
     // Traffic is its own tileset, so asking for it adds a source as well as
     // layers. `Congestion` asks for the flow of traffic only, which is every
-    // layer the tileset does not declare an incident layer; `All` draws the
-    // incident layers too.
+    // layer the tileset does not declare an incident layer; `All` makes the
+    // incident layers available too.
     if let (Some(traffic), Some(tileset)) = (
         options.traffic.as_deref(),
         state.tilesets.get(TRAFFIC_TILESET),
@@ -531,9 +558,10 @@ pub fn style_descriptor(
             .filter(|name| traffic == "All" || !tileset.incident_layers.contains(name))
             .cloned()
             .collect();
-        layers.extend(vector_layers(record, options, TRAFFIC_SOURCE, &tile_layers));
+        available.push((TRAFFIC_SOURCE.to_string(), tile_layers));
     }
 
+    layers.extend(published_layers(record, options, &available));
     // 3D terrain is elevation data, which is the DEM tileset rather than a
     // layer of the basemap.
     let mut terrain_property = None;
@@ -548,49 +576,21 @@ pub fn style_descriptor(
         }
     }
 
+    // The metadata reports facts about the published DOCUMENT — the catalog
+    // version it was published at and the virtual variants the request put in
+    // effect — and nothing else: the style and the colour scheme it was built
+    // for are its `id` and its `name`, and echoing the request's knobs back
+    // would put members in the document that the published style does not
+    // declare.
     let mut metadata = serde_json::Map::new();
     metadata.insert("version".to_string(), record.version.clone().into());
     metadata.insert(
-        "aws:style".to_string(),
-        record.style.as_wire().to_string().into(),
+        "aws:virtual-variant".to_string(),
+        serde_json::json!([{
+            "key": TERRAIN_VARIANT_KEY,
+            "variants": terrain_variants(options.terrain.as_deref()),
+        }]),
     );
-    metadata.insert(
-        "aws:color-scheme".to_string(),
-        record.color_scheme.as_wire().to_string().into(),
-    );
-    for (key, value) in [
-        ("aws:political-view", options.political_view.as_deref()),
-        ("aws:terrain", options.terrain.as_deref()),
-        ("aws:contour-density", options.contour_density.as_deref()),
-        ("aws:traffic", options.traffic.as_deref()),
-        ("aws:buildings", options.buildings.as_deref()),
-        ("aws:poi-density", options.poi_density.as_deref()),
-    ] {
-        if let Some(value) = value {
-            metadata.insert(key.to_string(), value.to_string().into());
-        }
-    }
-    if !options.travel_modes.is_empty() {
-        metadata.insert(
-            "aws:travel-modes".to_string(),
-            options.travel_modes.clone().into(),
-        );
-    }
-    if !options.poi_categories.is_empty() {
-        metadata.insert(
-            "aws:poi-categories".to_string(),
-            options.poi_categories.clone().into(),
-        );
-    }
-    if let Some(variant) = terrain_variant(options.terrain.as_deref()) {
-        // A terrain request is served by a virtual variant of the published
-        // style rather than by a style of its own, and the document records
-        // which variant it was built from.
-        metadata.insert(
-            "aws:virtual-variant".to_string(),
-            serde_json::json!([{ "key": "terrain", "variants": [{ "id": variant }] }]),
-        );
-    }
 
     let mut document = serde_json::Map::new();
     document.insert("version".to_string(), 8.into());
@@ -619,11 +619,11 @@ pub fn style_descriptor(
     document.insert(
         "sky".to_string(),
         serde_json::json!({
-            "sky-color": css_color(record.sky.sky_color),
+            "sky-color": record.sky.sky_color.css(),
             "sky-horizon-blend": record.sky.sky_horizon_blend,
-            "horizon-color": css_color(record.sky.horizon_color),
+            "horizon-color": record.sky.horizon_color.css(),
             "horizon-fog-blend": record.sky.horizon_fog_blend,
-            "fog-color": css_color(record.sky.fog_color),
+            "fog-color": record.sky.fog_color.css(),
             "fog-ground-blend": record.sky.fog_ground_blend,
             "atmosphere-blend": record.sky.atmosphere_blend,
         }),
@@ -650,6 +650,23 @@ fn terrain_variant(terrain: Option<&str>) -> Option<&'static str> {
         "Hillshade" => Some("hillshade"),
         _ => None,
     }
+}
+
+/// The request knob the published styles' virtual variants are keyed on.
+const TERRAIN_VARIANT_KEY: &str = "terrain";
+
+/// The virtual variants of this knob the request put IN EFFECT: the one variant
+/// that renders the terrain the request asked for, and none when it asked for
+/// no terrain rendering.
+///
+/// The entry is part of the document either way — a client reads it to find out
+/// which variants are in effect, and an absent entry is indistinguishable from
+/// a document that cannot carry them at all.
+fn terrain_variants(terrain: Option<&str>) -> Vec<serde_json::Value> {
+    terrain_variant(terrain)
+        .into_iter()
+        .map(|id| serde_json::json!({ "id": id }))
+        .collect()
 }
 
 /// A style-document source entry for one tileset: its type, its tile template,
@@ -685,143 +702,247 @@ fn source_entry(tileset: &TilesetRecord, url: &str) -> serde_json::Value {
     serde_json::Value::Object(entry)
 }
 
-/// The style layers one vector source contributes: for every layer its tiles
-/// carry, the fill, line and label layers that draw that layer's polygon, line
-/// and point features.
+/// The layer list of a published style, projected through the request's knobs.
 ///
-/// A layer is drawn because the tiles behind it carry it, so a tileset record
-/// that gains a layer — or a request that asks for an additional feature —
-/// gains the layers that draw it without this function changing. Each one
-/// filters on the `role` attribute the tiles tag every feature with, so no
-/// layer tries to paint geometry of a kind it cannot.
-fn vector_layers(
+/// The list itself is catalog data ([`style_layers::BASEMAP_LAYERS`]); what this
+/// adds is the three rules that decide whether and how one entry is drawn:
+///
+/// * a layer is drawn only when the tiles behind it CARRY the tile layer it
+///   reads, which is what switches the traffic, contour, hillshade and
+///   travel-mode families on and off, and what keeps a style that declares no
+///   basemap source from declaring basemap layers;
+/// * the knobs that select between layers of one tile layer are the layer's own
+///   [`LayerGate`];
+/// * everything else about the layer object — its type, the geometry role it
+///   filters to, its colour, its width and its icon — is derived from the
+///   entry's [`LayerRole`], so one rule paints every member of a family.
+fn published_layers(
     record: &StyleRecord,
     options: &StyleOptions,
-    source: &str,
-    tile_layers: &[String],
+    available: &[(String, Vec<String>)],
 ) -> Vec<serde_json::Value> {
-    let palette = &record.palette;
-    let mut layers = Vec::with_capacity(tile_layers.len() * 3);
-    for name in tile_layers {
-        // The ground is the document's `background` layer (see
-        // `style_descriptor`), not a fill drawn over it.
-        if name == GROUND_LAYER {
+    let mut layers = Vec::with_capacity(record.layers.len());
+    for spec in record.layers {
+        if !gate_open(spec.gate, options) {
             continue;
         }
-        // `Off` is the one POI density that hides points of interest
-        // altogether; every other value only changes how far apart their
-        // labels are placed.
-        if name == POI_LAYER && options.poi_density.as_deref() == Some("Off") {
+        // The first source, in the order the document declares them, whose
+        // tiles carry this layer's tile layer. A layer no declared source
+        // serves is not drawn, because there would be nothing behind it.
+        let Some(source) = available
+            .iter()
+            .find(|(_, tile_layers)| tile_layers.iter().any(|name| name == spec.source_layer))
+            .map(|(name, _)| name.clone())
+        else {
             continue;
-        }
-        let color = css_color(layer_color(palette, name));
-
-        let mut fill = serde_json::json!({
-            "id": name,
-            "type": "fill",
-            "source": source,
-            "source-layer": name,
-            "filter": role_filter(AREA_ROLE),
-            "paint": { "fill-color": color },
-        });
-        // `Buildings3D` is the one value the model declares, and it is what
-        // turns the footprint fill into an extrusion.
-        if name == BUILDING_LAYER && options.buildings.as_deref() == Some("Buildings3D") {
-            fill["type"] = "fill-extrusion".into();
-            fill["paint"] = serde_json::json!({
-                "fill-extrusion-color": color,
-                "fill-extrusion-height": ["get", "height"],
-            });
-        }
-        if let Some(opacity) = fill_opacity(name) {
-            fill["paint"]["fill-opacity"] = opacity.into();
-        }
-        layers.push(fill);
-
-        layers.push(serde_json::json!({
-            "id": format!("{name}-line"),
-            "type": "line",
-            "source": source,
-            "source-layer": name,
-            "filter": role_filter(WAY_ROLE),
-            "paint": { "line-color": color, "line-width": line_width(name, options) },
-        }));
-
-        let mut label = serde_json::json!({
-            "id": format!("{name}-label"),
-            "type": "symbol",
-            "source": source,
-            "source-layer": name,
-            "filter": role_filter(POINT_ROLE),
-            "layout": {
-                "text-field": ["get", "name"],
-                "text-font": record.font_stack.clone(),
-                "text-size": 12,
-            },
-            "paint": { "text-color": css_color(palette.label) },
-        });
-        if name == POI_LAYER {
-            label["layout"]["icon-image"] = "poi-dot".into();
-            label["layout"]["symbol-spacing"] = poi_spacing(options.poi_density.as_deref()).into();
-            if !options.poi_categories.is_empty() {
-                // Only the requested categories are rendered, filtered on the
-                // `category` attribute a point feature carries.
-                label["filter"] = serde_json::json!([
-                    "all",
-                    role_filter(POINT_ROLE),
-                    ["in", ["get", "category"], ["literal", options.poi_categories.clone()]],
-                ]);
-            }
-        }
-        layers.push(label);
+        };
+        layers.push(layer_object(record, options, spec, &source));
     }
-
     layers
 }
 
-/// A style filter selecting the features of one geometry role.
-fn role_filter(role: &str) -> serde_json::Value {
-    serde_json::json!(["==", ["get", ROLE_ATTRIBUTE], role])
-}
-
-/// The palette entry a basemap layer is painted from. A layer with no entry of
-/// its own is drawn in the palette's detail colour, which is what the thin
-/// derived families (contours, hillshade, travel-mode networks) are.
-fn layer_color(palette: &Palette, name: &str) -> Rgba {
-    match name {
-        "water" => palette.water,
-        "roads" | "traffic_flow" => palette.road,
-        BUILDING_LAYER => palette.building,
-        POI_LAYER | TRAFFIC_INCIDENT_LAYER => palette.marker,
-        "borders" => palette.label,
-        _ => palette.graticule,
+/// Whether the request leaves a gated layer switched on.
+fn gate_open(gate: LayerGate, options: &StyleOptions) -> bool {
+    match gate {
+        LayerGate::Always => true,
+        // `Off` is the one POI density that hides points of interest
+        // altogether; every other value only changes how far apart they are
+        // placed.
+        LayerGate::Poi => options.poi_density.as_deref() != Some("Off"),
+        // `Buildings3D` is the one value the model declares, and it is what
+        // raises the footprints into extrusions.
+        LayerGate::Buildings3D => options.buildings.as_deref() == Some("Buildings3D"),
     }
 }
 
-/// How wide a layer's line features are drawn, in style pixels.
-fn line_width(name: &str, options: &StyleOptions) -> f64 {
-    // Contour lines are the one family whose width a request knob sets: the
-    // density asked for is how densely the available lines are rendered.
-    if is_feature_layer(CONTOUR_FEATURE, name) {
-        return match options.contour_density.as_deref() {
+/// One catalog entry as a style-document layer object.
+fn layer_object(
+    record: &StyleRecord,
+    options: &StyleOptions,
+    spec: &StyleLayerSpec,
+    source: &str,
+) -> serde_json::Value {
+    let palette = &record.palette;
+    let color = layer_color(palette, spec);
+    let mut layer = serde_json::Map::new();
+    layer.insert("id".to_string(), spec.id.into());
+    layer.insert("type".to_string(), spec.role.layer_type().into());
+    layer.insert("source".to_string(), source.into());
+    layer.insert("source-layer".to_string(), spec.source_layer.into());
+    if spec.min_zoom > 0 {
+        layer.insert("minzoom".to_string(), spec.min_zoom.into());
+    }
+    layer.insert("filter".to_string(), geometry_filter(spec, options));
+
+    let mut paint = serde_json::Map::new();
+    match spec.role {
+        LayerRole::Area | LayerRole::Shading => {
+            paint.insert("fill-color".to_string(), color.css().into());
+        }
+        LayerRole::Extrusion => {
+            paint.insert("fill-extrusion-color".to_string(), color.css().into());
+            paint.insert(
+                "fill-extrusion-height".to_string(),
+                serde_json::json!(["get", "height"]),
+            );
+        }
+        LayerRole::Way | LayerRole::Casing | LayerRole::Shadow => {
+            paint.insert("line-color".to_string(), color.css().into());
+            paint.insert("line-width".to_string(), line_width_value(spec, options));
+        }
+        LayerRole::Label | LayerRole::Icon => {
+            paint.insert("text-color".to_string(), palette.label.css().into());
+            paint.insert("text-halo-color".to_string(), palette.land.css().into());
+            paint.insert("text-halo-width".to_string(), LABEL_HALO_WIDTH.into());
+        }
+    }
+    layer.insert("paint".to_string(), paint.into());
+
+    if spec.role.is_symbol() {
+        let mut layout = serde_json::Map::new();
+        layout.insert(
+            "text-field".to_string(),
+            serde_json::json!(["get", "name"]),
+        );
+        layout.insert("text-font".to_string(), record.font_stack.clone().into());
+        layout.insert("text-size".to_string(), LABEL_TEXT_SIZE.into());
+        if spec.role == LayerRole::Icon {
+            // A feature names its own icon where it has one; everything else
+            // falls back to an icon the sheet this document points at carries.
+            layout.insert(
+                "icon-image".to_string(),
+                serde_json::json!([
+                    "coalesce",
+                    ["image", ["get", "icon"]],
+                    ["image", style_layers::fallback_icon(spec)],
+                ]),
+            );
+        }
+        if spec.gate == LayerGate::Poi {
+            layout.insert(
+                "symbol-spacing".to_string(),
+                poi_spacing(options.poi_density.as_deref()).into(),
+            );
+        }
+        layer.insert("layout".to_string(), layout.into());
+    }
+
+    serde_json::Value::Object(layer)
+}
+
+/// How wide a label's halo is drawn, and how large its text is set, in style
+/// pixels.
+const LABEL_HALO_WIDTH: f64 = 1.0;
+const LABEL_TEXT_SIZE: u32 = 12;
+
+/// The features a layer selects: the geometry role its [`LayerRole`] can draw,
+/// narrowed by the knob that narrows this family — the political view whose
+/// alternative boundary alignment a disputed layer draws, and the categories a
+/// point-of-interest band was asked for.
+fn geometry_filter(spec: &StyleLayerSpec, options: &StyleOptions) -> serde_json::Value {
+    let role = match spec.role {
+        LayerRole::Area | LayerRole::Shading | LayerRole::Extrusion => AREA_ROLE,
+        LayerRole::Way | LayerRole::Casing | LayerRole::Shadow => WAY_ROLE,
+        LayerRole::Label | LayerRole::Icon => POINT_ROLE,
+    };
+    let role_filter = serde_json::json!(["==", ["get", ROLE_ATTRIBUTE], role]);
+    // A disputed alignment is a boundary under ONE country's view, so the layer
+    // that draws it selects the territories the view IN EFFECT claims, on the
+    // `political_view` attribute such a feature carries — and selects nothing
+    // when the request named no view, which is what leaves the de-facto
+    // boundary standing.
+    if style_layers::is_disputed(spec) {
+        let views: Vec<&str> = options.political_view.as_deref().into_iter().collect();
+        return serde_json::json!([
+            "all",
+            role_filter,
+            ["in", ["get", POLITICAL_VIEW_ATTRIBUTE], ["literal", views]],
+        ]);
+    }
+    let narrowing = match spec.gate {
+        // Only the requested categories are rendered, filtered on the
+        // `category` attribute a point feature carries.
+        LayerGate::Poi if !options.poi_categories.is_empty() => serde_json::json!([
+            "in",
+            ["get", "category"],
+            ["literal", options.poi_categories.clone()],
+        ]),
+        _ => return role_filter,
+    };
+    serde_json::json!(["all", role_filter, narrowing])
+}
+
+/// The palette entry a style layer is painted from, and how its role shades it.
+///
+/// WHICH entry is decided by the TILE LAYER the style layer reads — the data
+/// behind it is what gives it its colour, so every layer of one family is
+/// painted from one entry. The role then shades it: a casing is the same colour
+/// darkened, which is what makes it an outline, and a shadow is darker still
+/// and translucent, which is what lifts a bridge off what it crosses.
+fn layer_color(palette: &Palette, spec: &StyleLayerSpec) -> Hsla {
+    // A masking layer hides what is drawn under it, so it is painted in the
+    // ground's own colour rather than in the colour of the data it reads.
+    if style_layers::is_mask(spec) {
+        return palette.land;
+    }
+    let base = match spec.source_layer {
+        WATER_LAYER => palette.water,
+        ROAD_LAYER | TRAFFIC_FLOW_LAYER => palette.road,
+        BUILDING_LAYER => palette.building,
+        POI_LAYER | TRAFFIC_INCIDENT_LAYER => palette.marker,
+        ADMIN_LAYER => palette.label,
+        // Land use and the derived thin families (contours, hillshading) are
+        // drawn in the palette's detail colour.
+        _ => palette.graticule,
+    };
+    match spec.role {
+        LayerRole::Casing => base.darker(CASING_DARKEN),
+        LayerRole::Shadow => base.darker(2 * CASING_DARKEN).with_alpha(SHADOW_ALPHA),
+        LayerRole::Shading => base.with_alpha(SHADING_ALPHA),
+        _ => base,
+    }
+}
+
+/// How many percentage points darker than the way it outlines a casing is
+/// painted, how opaque a bridge shadow is, and how opaque shading drawn over
+/// the ground is — in [`Hsla`]'s thousandths.
+const CASING_DARKEN: u8 = 8;
+const SHADOW_ALPHA: u16 = 300;
+const SHADING_ALPHA: u16 = 400;
+
+/// How wide a line layer draws, as the zoom interpolation a published style
+/// states it with: the catalog's width where the layer comes in, growing to
+/// [`WIDTH_ZOOM_FACTOR`] times that at the highest zoom the tiles reach — and
+/// an interpolation's stops must ASCEND, so a layer that comes in at that zoom
+/// grows over the one level above it.
+///
+/// Contour lines are the one family whose width a request knob sets: the
+/// density asked for is how densely the available lines are rendered.
+fn line_width_value(spec: &StyleLayerSpec, options: &StyleOptions) -> serde_json::Value {
+    let width = if is_feature_layer(CONTOUR_FEATURE, spec.source_layer) {
+        match options.contour_density.as_deref() {
             Some("High") => 1.5,
             Some("Medium") => 1.0,
             _ => 0.5,
-        };
-    }
-    if name == "roads" {
-        1.5
+        }
     } else {
-        1.0
-    }
+        style_layers::line_width(spec)
+    };
+    let top_zoom = VECTOR_MAX_ZOOM.max(spec.min_zoom + 1);
+    serde_json::json!([
+        "interpolate",
+        ["linear"],
+        ["zoom"],
+        spec.min_zoom,
+        width,
+        top_zoom,
+        width * WIDTH_ZOOM_FACTOR,
+    ])
 }
 
-/// The opacity a layer's polygons are filled at, when it is not opaque.
-/// Hillshade is shading OVER the ground rather than a surface of its own, so it
-/// is drawn translucent and everything under it stays visible.
-fn fill_opacity(name: &str) -> Option<f64> {
-    is_feature_layer(HILLSHADE_FEATURE, name).then_some(0.4)
-}
+/// How much wider a line is drawn at the top of the zoom range than at the
+/// zoom it comes in at.
+const WIDTH_ZOOM_FACTOR: f64 = 3.0;
 
 /// How far apart point-of-interest labels are placed, in style pixels, for one
 /// `PoiDensity`: a denser value places more of them, so they sit closer.
@@ -869,6 +990,28 @@ impl TileCoord {
         let ny = (f64::from(self.y) * f64::from(TILE_SIZE) + f64::from(row)) / axis;
         (inv_merc_x(nx), inv_merc_y(ny))
     }
+
+    /// The ground this tile covers, which is what decides which of the world's
+    /// features it carries.
+    pub fn envelope(self) -> Option<Envelope> {
+        Envelope::of(&[
+            self.pixel_position(0, 0),
+            self.pixel_position(TILE_SIZE, TILE_SIZE),
+        ])
+    }
+}
+
+/// The disputed territory this tile's ground lies over, or `None` when it lies
+/// over none.
+///
+/// The territories are [`boundaries::DISPUTED_TERRITORIES`] — the one list
+/// `PoliticalView`'s own documentation gives — so a view the model adds is
+/// carried into the tiles without this function being edited.
+fn disputed_territory_at(coord: TileCoord) -> Option<&'static boundaries::DisputedTerritory> {
+    let envelope = coord.envelope()?;
+    boundaries::DISPUTED_TERRITORIES
+        .iter()
+        .find(|territory| territory.overlaps(envelope))
 }
 
 /// The bytes of one tile of `tileset`, in that tileset's own format.
@@ -904,7 +1047,7 @@ fn vector_tile_bytes(tileset: &TilesetRecord, coord: TileCoord, additional: &[St
         let step = i32::try_from(index).unwrap_or(0) + 1;
         let margin = (step * 128).min(extent / 2 - 64);
         let attributes = |role: &'static str| {
-            vec![
+            let mut tags = vec![
                 ("layer", TagValue::Str(name.clone())),
                 ("tileset", TagValue::Str(tileset.id.clone())),
                 (ROLE_ATTRIBUTE, TagValue::Str(role.to_string())),
@@ -916,7 +1059,27 @@ fn vector_tile_bytes(tileset: &TilesetRecord, coord: TileCoord, additional: &[St
                     TagValue::Str(format!("{name} {}/{}/{}", coord.z, coord.x, coord.y)),
                 ),
                 ("height", TagValue::Int(i64::from(12 + coord.z))),
-            ]
+            ];
+            // A boundary feature over a territory whose alignment depends on
+            // the political view says which view claims it, so a style's
+            // disputed-boundary layer has the attribute it filters on. The
+            // territories are the ONE list `PoliticalView` documents (see
+            // `boundaries::DISPUTED_TERRITORIES`), matched against this tile's
+            // own ground, so a tile outside every disputed territory carries no
+            // disputed boundary at all.
+            if name == ADMIN_LAYER {
+                if let Some(territory) = disputed_territory_at(coord) {
+                    tags.push((
+                        POLITICAL_VIEW_ATTRIBUTE,
+                        TagValue::Str(territory.view.to_string()),
+                    ));
+                    tags.push((
+                        "territory",
+                        TagValue::Str(territory.territory.to_string()),
+                    ));
+                }
+            }
+            tags
         };
 
         // A ring covering the tile, inset per layer so the layers of one tile
@@ -983,7 +1146,7 @@ fn feature_id(coord: TileCoord, layer: usize, slot: u64) -> u64 {
 /// A raster tile: the terrain field sampled over the tile's own pixel grid, so
 /// the imagery really is a picture of this tile's ground.
 fn raster_tile_bytes(tileset: &TilesetRecord, coord: TileCoord) -> Vec<u8> {
-    let mut canvas = Canvas::new(TILE_SIZE, TILE_SIZE, tileset.palette.land);
+    let mut canvas = Canvas::new(TILE_SIZE, TILE_SIZE, tileset.palette.land.rgba());
     for row in 0..TILE_SIZE {
         for column in 0..TILE_SIZE {
             let (lon, lat) = coord.pixel_position(column, row);
@@ -993,10 +1156,10 @@ fn raster_tile_bytes(tileset: &TilesetRecord, coord: TileCoord) -> Vec<u8> {
     }
     // A one-pixel edge, which is what makes a tile seam visible at all.
     let last = i64::from(TILE_SIZE) - 1;
-    canvas.hline(0, 0, last, tileset.palette.graticule);
-    canvas.hline(last, 0, last, tileset.palette.graticule);
-    canvas.vline(0, 0, last, tileset.palette.graticule);
-    canvas.vline(last, 0, last, tileset.palette.graticule);
+    canvas.hline(0, 0, last, tileset.palette.graticule.rgba());
+    canvas.hline(last, 0, last, tileset.palette.graticule.rgba());
+    canvas.vline(0, 0, last, tileset.palette.graticule.rgba());
+    canvas.vline(last, 0, last, tileset.palette.graticule.rgba());
     canvas.to_jpeg()
 }
 
@@ -1270,7 +1433,7 @@ impl StaticMapView {
 /// labels, and a scale bar.
 pub fn render_static_map(palette: &Palette, view: &StaticMapView) -> Vec<u8> {
     let (pixel_width, pixel_height) = view.pixel_size();
-    let mut canvas = Canvas::new(pixel_width, pixel_height, palette.land);
+    let mut canvas = Canvas::new(pixel_width, pixel_height, palette.land.rgba());
     let inset = view.padding * view.pixel_ratio;
     let frame_width = pixel_width.saturating_sub(inset * 2).max(1);
     let frame_height = pixel_height.saturating_sub(inset * 2).max(1);
@@ -1316,7 +1479,7 @@ pub fn render_static_map(palette: &Palette, view: &StaticMapView) -> Vec<u8> {
                 &mut canvas,
                 project(pair[0]),
                 project(pair[1]),
-                palette.label,
+                palette.label.rgba(),
                 view.pixel_ratio,
             );
         }
@@ -1334,7 +1497,7 @@ pub fn render_static_map(palette: &Palette, view: &StaticMapView) -> Vec<u8> {
         let icon_radius = 2 * view.pixel_ratio;
         for (position, name) in labelled_places(view.envelope, &view.label_language) {
             let (px, py) = project(position);
-            canvas.disc(px, py, icon_radius, palette.label);
+            canvas.disc(px, py, icon_radius, palette.label.rgba());
             // The label sits to the right of its icon, on the icon's own
             // baseline, the way a symbol layer places text beside an icon.
             let anchor = (
@@ -1363,31 +1526,36 @@ pub fn render_static_map(palette: &Palette, view: &StaticMapView) -> Vec<u8> {
                 &name,
                 label_size,
                 anchor,
-                palette.label,
+                palette.label.rgba(),
             );
         }
     }
 
     for marker in &view.markers {
         let (px, py) = project(*marker);
-        canvas.disc(px, py, 3 * view.label_scale * view.pixel_ratio, palette.marker);
+        canvas.disc(
+            px,
+            py,
+            3 * view.label_scale * view.pixel_ratio,
+            palette.marker.rgba(),
+        );
     }
 
     if let Some(center) = view.center {
         let (px, py) = project(center);
         let radius = 5 * view.label_scale * view.pixel_ratio;
-        canvas.disc(px, py, radius, palette.marker);
+        canvas.disc(px, py, radius, palette.marker.rgba());
         canvas.hline(
             py,
             px.saturating_sub(i64::from(radius)),
             px.saturating_add(i64::from(radius)),
-            palette.label,
+            palette.label.rgba(),
         );
         canvas.vline(
             px,
             py.saturating_sub(i64::from(radius)),
             py.saturating_add(i64::from(radius)),
-            palette.label,
+            palette.label.rgba(),
         );
     }
 
@@ -1396,10 +1564,20 @@ pub fn render_static_map(palette: &Palette, view: &StaticMapView) -> Vec<u8> {
     // The frame edge, so the padded border is visibly a border.
     let right = i64::from(pixel_width) - 1 - i64::from(inset);
     let bottom = i64::from(pixel_height) - 1 - i64::from(inset);
-    canvas.hline(i64::from(inset), i64::from(inset), right, palette.graticule);
-    canvas.hline(bottom, i64::from(inset), right, palette.graticule);
-    canvas.vline(i64::from(inset), i64::from(inset), bottom, palette.graticule);
-    canvas.vline(right, i64::from(inset), bottom, palette.graticule);
+    canvas.hline(
+        i64::from(inset),
+        i64::from(inset),
+        right,
+        palette.graticule.rgba(),
+    );
+    canvas.hline(bottom, i64::from(inset), right, palette.graticule.rgba());
+    canvas.vline(
+        i64::from(inset),
+        i64::from(inset),
+        bottom,
+        palette.graticule.rgba(),
+    );
+    canvas.vline(right, i64::from(inset), bottom, palette.graticule.rgba());
 
     canvas.to_jpeg()
 }
@@ -1471,7 +1649,7 @@ fn draw_graticule(
             px + inset,
             inset,
             inset + i64::from(frame_height) - 1,
-            palette.graticule,
+            palette.graticule.rgba(),
         );
         lon += step;
     }
@@ -1483,7 +1661,7 @@ fn draw_graticule(
             py + inset,
             inset,
             inset + i64::from(frame_width) - 1,
-            palette.graticule,
+            palette.graticule.rgba(),
         );
         lat += step;
     }
@@ -1513,19 +1691,19 @@ fn draw_overlay_shape(
     match shape {
         OverlayShape::Point(position) => {
             let (px, py) = project(*position);
-            canvas.disc(px, py, 4, palette.marker);
+            canvas.disc(px, py, 4, palette.marker.rgba());
         }
         OverlayShape::Line(points) => {
             for pair in points.windows(2) {
-                canvas.line(project(pair[0]), project(pair[1]), palette.marker);
+                canvas.line(project(pair[0]), project(pair[1]), palette.marker.rgba());
             }
         }
         OverlayShape::Polygon(points) => {
             for pair in points.windows(2) {
-                canvas.line(project(pair[0]), project(pair[1]), palette.marker);
+                canvas.line(project(pair[0]), project(pair[1]), palette.marker.rgba());
             }
             if let (Some(first), Some(last)) = (points.first(), points.last()) {
-                canvas.line(project(*last), project(*first), palette.marker);
+                canvas.line(project(*last), project(*first), palette.marker.rgba());
             }
         }
     }
@@ -1555,14 +1733,19 @@ fn draw_scale_bar(canvas: &mut Canvas, palette: &Palette, view: &StaticMapView, 
     let thickness = 2 * view.label_scale * view.pixel_ratio;
     let x = inset + i64::from(8 * view.pixel_ratio);
     let y = i64::from(canvas.height()) - inset - i64::from(8 * view.pixel_ratio);
-    canvas.fill_rect(x, y, length, thickness, palette.label);
+    canvas.fill_rect(x, y, length, thickness, palette.label.rgba());
     let tick = i64::from(4 * view.label_scale * view.pixel_ratio);
-    canvas.vline(x, y - tick, y + i64::from(thickness), palette.label);
+    canvas.vline(
+        x,
+        y - tick,
+        y + i64::from(thickness),
+        palette.label.rgba(),
+    );
     canvas.vline(
         x + i64::from(length),
         y - tick,
         y + i64::from(thickness),
-        palette.label,
+        palette.label.rgba(),
     );
 }
 

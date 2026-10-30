@@ -27,13 +27,135 @@ pub mod boundaries;
 pub mod canvas;
 pub mod glyph_pbf;
 pub mod labels;
+pub mod style_layers;
 pub mod vector_tile;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
-/// An 8-bit RGBA colour: the one colour representation the catalog, the
-/// renderer and the style documents share.
+use style_layers::StyleLayerSpec;
+
+/// An 8-bit RGBA colour: the one representation the RASTERIZERS work in, since
+/// a pixel of a tile or a static map is four bytes.
 pub type Rgba = [u8; 4];
+
+/// Opacity of a fully opaque [`Hsla`], in the thousandths the field counts in.
+pub const OPAQUE: u16 = 1000;
+
+/// A colour of the published style catalog, in the HSL notation a MapLibre
+/// style document states its colours in.
+///
+/// HSL rather than RGB because that is the notation the published styles are
+/// written in, and the two are not interchangeable: an achromatic colour keeps
+/// the hue of the ramp it belongs to (`hsl(228, 0%, 87%)`), which a round trip
+/// through RGB loses. [`Self::rgba`] converts to pixels for the rasterizers;
+/// nothing converts back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hsla {
+    /// Hue in degrees, `0..360`.
+    pub hue: u16,
+    /// Saturation, in percent.
+    pub saturation: u8,
+    /// Lightness, in percent.
+    pub lightness: u8,
+    /// Opacity in thousandths, so [`OPAQUE`] is fully opaque. Counted in
+    /// thousandths rather than held as a float so a published alpha is exact.
+    pub alpha: u16,
+}
+
+impl Hsla {
+    /// An opaque colour.
+    pub const fn new(hue: u16, saturation: u8, lightness: u8) -> Self {
+        Self {
+            hue,
+            saturation,
+            lightness,
+            alpha: OPAQUE,
+        }
+    }
+
+    /// The same colour at `alpha` thousandths of full opacity.
+    pub const fn with_alpha(self, alpha: u16) -> Self {
+        Self { alpha, ..self }
+    }
+
+    /// The same colour `points` percentage points darker, clamped to black.
+    /// How a casing or a shadow is derived from the surface it outlines: the
+    /// same hue, less light.
+    pub const fn darker(self, points: u8) -> Self {
+        Self {
+            lightness: self.lightness.saturating_sub(points),
+            ..self
+        }
+    }
+
+    /// Whether this colour is fully opaque.
+    pub const fn is_opaque(self) -> bool {
+        self.alpha >= OPAQUE
+    }
+
+    /// The colour as a MapLibre colour literal: `hsl(...)` when it is opaque,
+    /// `hsla(...)` when it is not — the alpha channel is part of the colour, so
+    /// a notation that cannot carry it would render translucent fog opaque.
+    pub fn css(self) -> String {
+        let Self {
+            hue,
+            saturation,
+            lightness,
+            ..
+        } = self;
+        if self.is_opaque() {
+            return format!("hsl({hue}, {saturation}%, {lightness}%)");
+        }
+        let mut alpha = format!("{:.3}", f64::from(self.alpha) / f64::from(OPAQUE));
+        while alpha.ends_with('0') {
+            alpha.pop();
+        }
+        if alpha.ends_with('.') {
+            alpha.pop();
+        }
+        format!("hsla({hue}, {saturation}%, {lightness}%, {alpha})")
+    }
+
+    /// The colour as a pixel, by the HSL-to-RGB conversion the CSS Color
+    /// specification defines. The one direction anything converts in.
+    pub fn rgba(self) -> Rgba {
+        let hue = f64::from(self.hue % 360) / 60.0;
+        let saturation = f64::from(self.saturation) / 100.0;
+        let lightness = f64::from(self.lightness) / 100.0;
+        let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+        let second = chroma * (1.0 - ((hue % 2.0) - 1.0).abs());
+        let (red, green, blue) = match hue as u32 {
+            0 => (chroma, second, 0.0),
+            1 => (second, chroma, 0.0),
+            2 => (0.0, chroma, second),
+            3 => (0.0, second, chroma),
+            4 => (second, 0.0, chroma),
+            _ => (chroma, 0.0, second),
+        };
+        let base = lightness - chroma / 2.0;
+        let channel = |value: f64| ((value + base) * 255.0).round().clamp(0.0, 255.0) as u8;
+        let alpha = (f64::from(self.alpha) / f64::from(OPAQUE) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        [channel(red), channel(green), channel(blue), alpha]
+    }
+}
+
+/// The value of a style-document paint property.
+///
+/// A MapLibre paint property is not a scalar: it may be an EXPRESSION, and a
+/// published style states a colour that changes with zoom as one. The variant
+/// is part of the catalog because a renderer that is handed a string where the
+/// style declares an expression cannot vary the property at all.
+#[derive(Debug, Clone)]
+pub enum PaintValue {
+    /// One colour, at every zoom.
+    Flat(Hsla),
+    /// A linear interpolation over zoom: `(zoom, colour)` stops in ascending
+    /// zoom order, which MapLibre writes as an `interpolate` expression.
+    ZoomRamp(Vec<(f64, Hsla)>),
+}
 
 /// The model's `MapStyle` enum (`Standard | Monochrome | Hybrid | Satellite`),
 /// as a catalog key. The wire values are the ones `ops::types::MAP_STYLE_VALUES`
@@ -139,13 +261,13 @@ impl VariantKind {
 /// look is catalog data rather than a constant in a handler.
 #[derive(Debug, Clone)]
 pub struct Palette {
-    pub land: Rgba,
-    pub water: Rgba,
-    pub road: Rgba,
-    pub building: Rgba,
-    pub graticule: Rgba,
-    pub label: Rgba,
-    pub marker: Rgba,
+    pub land: Hsla,
+    pub water: Hsla,
+    pub road: Hsla,
+    pub building: Hsla,
+    pub graticule: Hsla,
+    pub label: Hsla,
+    pub marker: Hsla,
 }
 
 /// One source a style document declares: the tileset it reads and the URL
@@ -179,9 +301,9 @@ pub struct LightRecord {
 /// into the next, `0..=1`.
 #[derive(Debug, Clone)]
 pub struct SkyRecord {
-    pub sky_color: Rgba,
-    pub horizon_color: Rgba,
-    pub fog_color: Rgba,
+    pub sky_color: Hsla,
+    pub horizon_color: Hsla,
+    pub fog_color: Hsla,
     pub sky_horizon_blend: f64,
     pub horizon_fog_blend: f64,
     pub fog_ground_blend: f64,
@@ -215,6 +337,16 @@ pub struct StyleRecord {
     /// The projection the style is rendered in (`globe`, `mercator`, ...).
     pub projection: String,
     pub palette: Palette,
+    /// How the ground is painted. Published as a paint VALUE rather than a
+    /// colour, because a style whose ground tightens as the buildings come in
+    /// publishes it as a zoom ramp.
+    pub background: PaintValue,
+    /// The layer catalogue this style draws from, in draw order. Style-catalog
+    /// data: many style layers read one tile layer, each drawing a different
+    /// slice of it, so the list cannot be derived from the tile layer names. A
+    /// document declares the entries whose tile layer a source it declares
+    /// really serves, so a style with no vector basemap declares none of them.
+    pub layers: &'static [StyleLayerSpec],
     /// The always-on sources, in draw order.
     pub sources: Vec<StyleSource>,
     /// The `GetSprites` URL template, without the `.png`/`.json` suffix a
@@ -493,65 +625,101 @@ fn seed() -> ComAmazonawsGeomapsMapsserviceState {
     }
 }
 
-/// The palette for one (style, colour scheme) pair.
+/// The palette for one (style, colour scheme) pair, in the HSL notation the
+/// published style documents state their colours in.
 fn palette(style: MapStyleKind, scheme: ColorSchemeKind) -> Palette {
     match (style, scheme) {
         (MapStyleKind::Standard, ColorSchemeKind::Light) => Palette {
-            land: [0xf7, 0xf5, 0xf2, 0xff],
-            water: [0xa0, 0xc8, 0xf0, 0xff],
-            road: [0xff, 0xff, 0xff, 0xff],
-            building: [0xe4, 0xdf, 0xd6, 0xff],
-            graticule: [0xd9, 0xd2, 0xc7, 0xff],
-            label: [0x33, 0x33, 0x33, 0xff],
-            marker: [0xd9, 0x42, 0x0b, 0xff],
+            land: Hsla::new(36, 24, 96),
+            water: Hsla::new(210, 73, 78),
+            road: Hsla::new(0, 0, 100),
+            building: Hsla::new(39, 21, 87),
+            graticule: Hsla::new(37, 19, 82),
+            label: Hsla::new(0, 0, 20),
+            marker: Hsla::new(16, 90, 45),
         },
         (MapStyleKind::Standard, ColorSchemeKind::Dark) => Palette {
-            land: [0x26, 0x28, 0x2b, 0xff],
-            water: [0x15, 0x29, 0x3f, 0xff],
-            road: [0x3b, 0x3f, 0x44, 0xff],
-            building: [0x31, 0x34, 0x38, 0xff],
-            graticule: [0x3a, 0x3d, 0x41, 0xff],
-            label: [0xe6, 0xe6, 0xe6, 0xff],
-            marker: [0xff, 0x70, 0x43, 0xff],
+            land: Hsla::new(180, 5, 16),
+            water: Hsla::new(211, 50, 16),
+            road: Hsla::new(213, 7, 25),
+            building: Hsla::new(214, 7, 21),
+            graticule: Hsla::new(214, 6, 24),
+            label: Hsla::new(0, 0, 90),
+            marker: Hsla::new(14, 100, 63),
         },
+        // The Monochrome styles are a single desaturated ramp, so every entry
+        // keeps the ramp's hue and differs only in lightness.
         (MapStyleKind::Monochrome, ColorSchemeKind::Light) => Palette {
-            land: [0xf2, 0xf2, 0xf2, 0xff],
-            water: [0xd9, 0xd9, 0xd9, 0xff],
-            road: [0xff, 0xff, 0xff, 0xff],
-            building: [0xe6, 0xe6, 0xe6, 0xff],
-            graticule: [0xcc, 0xcc, 0xcc, 0xff],
-            label: [0x26, 0x26, 0x26, 0xff],
-            marker: [0x59, 0x59, 0x59, 0xff],
+            land: Hsla::new(MONOCHROME_HUE, 0, 87),
+            water: Hsla::new(MONOCHROME_HUE, 0, 85),
+            road: Hsla::new(MONOCHROME_HUE, 0, 100),
+            building: Hsla::new(MONOCHROME_HUE, 0, 90),
+            graticule: Hsla::new(MONOCHROME_HUE, 0, 80),
+            label: Hsla::new(MONOCHROME_HUE, 0, 15),
+            marker: Hsla::new(MONOCHROME_HUE, 0, 35),
         },
         (MapStyleKind::Monochrome, ColorSchemeKind::Dark) => Palette {
-            land: [0x1f, 0x1f, 0x1f, 0xff],
-            water: [0x2e, 0x2e, 0x2e, 0xff],
-            road: [0x4d, 0x4d, 0x4d, 0xff],
-            building: [0x33, 0x33, 0x33, 0xff],
-            graticule: [0x3d, 0x3d, 0x3d, 0xff],
-            label: [0xf2, 0xf2, 0xf2, 0xff],
-            marker: [0xa6, 0xa6, 0xa6, 0xff],
+            land: Hsla::new(MONOCHROME_HUE, 0, 12),
+            water: Hsla::new(MONOCHROME_HUE, 0, 18),
+            road: Hsla::new(MONOCHROME_HUE, 0, 30),
+            building: Hsla::new(MONOCHROME_HUE, 0, 20),
+            graticule: Hsla::new(MONOCHROME_HUE, 0, 24),
+            label: Hsla::new(MONOCHROME_HUE, 0, 95),
+            marker: Hsla::new(MONOCHROME_HUE, 0, 65),
         },
         (MapStyleKind::Hybrid | MapStyleKind::Satellite, ColorSchemeKind::Light) => Palette {
-            land: [0x4a, 0x5d, 0x3a, 0xff],
-            water: [0x1b, 0x3a, 0x5c, 0xff],
-            road: [0xe8, 0xe0, 0xc0, 0xff],
-            building: [0x6b, 0x66, 0x5c, 0xff],
-            graticule: [0x7d, 0x8a, 0x6f, 0xff],
-            label: [0xff, 0xff, 0xff, 0xff],
-            marker: [0xff, 0xd5, 0x4f, 0xff],
+            land: Hsla::new(93, 23, 30),
+            water: Hsla::new(211, 55, 23),
+            road: Hsla::new(48, 47, 83),
+            building: Hsla::new(40, 8, 39),
+            graticule: Hsla::new(89, 11, 49),
+            label: Hsla::new(0, 0, 100),
+            marker: Hsla::new(46, 100, 65),
         },
         (MapStyleKind::Hybrid | MapStyleKind::Satellite, ColorSchemeKind::Dark) => Palette {
-            land: [0x2b, 0x36, 0x22, 0xff],
-            water: [0x0f, 0x21, 0x34, 0xff],
-            road: [0xb8, 0xb0, 0x92, 0xff],
-            building: [0x45, 0x42, 0x3b, 0xff],
-            graticule: [0x4a, 0x53, 0x42, 0xff],
-            label: [0xf0, 0xf0, 0xf0, 0xff],
-            marker: [0xff, 0xc1, 0x07, 0xff],
+            land: Hsla::new(93, 23, 17),
+            water: Hsla::new(211, 55, 13),
+            road: Hsla::new(47, 21, 65),
+            building: Hsla::new(42, 8, 25),
+            graticule: Hsla::new(92, 11, 29),
+            label: Hsla::new(0, 0, 94),
+            marker: Hsla::new(45, 100, 51),
         },
     }
 }
+
+/// The hue the Monochrome styles' desaturated ramp is written at. A zero
+/// saturation shows no hue, but the published notation still states one, and
+/// the colour literal a client reads is the published text.
+const MONOCHROME_HUE: u16 = 228;
+
+/// How the ground of one style is painted.
+///
+/// A Monochrome ground is published as a zoom ramp: the ground darkens by
+/// [`MONOCHROME_GROUND_STEP`] percentage points once the building footprints
+/// come in, so the buildings stay legible against it. Every other style paints
+/// the ground in its land colour at every zoom.
+fn background(style: MapStyleKind, palette: &Palette) -> PaintValue {
+    match style {
+        MapStyleKind::Monochrome => PaintValue::ZoomRamp(vec![
+            (MONOCHROME_GROUND_ZOOM, palette.land),
+            (
+                BUILDING_ZOOM,
+                palette.land.darker(MONOCHROME_GROUND_STEP),
+            ),
+        ]),
+        _ => PaintValue::Flat(palette.land),
+    }
+}
+
+/// The zoom a Monochrome ground starts darkening at, and how far it darkens by
+/// the zoom the buildings come in at.
+const MONOCHROME_GROUND_ZOOM: f64 = 15.5;
+const MONOCHROME_GROUND_STEP: u8 = 2;
+
+/// The zoom the building footprints come in at: the zoom their style layers
+/// start drawing at, and the top of the Monochrome ground ramp.
+pub const BUILDING_ZOOM: f64 = 16.0;
 
 /// The tilesets the documented `Tileset` values name.
 ///
@@ -566,16 +734,17 @@ fn seed_tilesets() -> Vec<TilesetRecord> {
             id: "vector.basemap".to_string(),
             format: TileFormat::VectorMvt,
             content_type: "application/vnd.mapbox-vector-tile".to_string(),
-            attribution: ATTRIBUTION.to_string(),
+            attribution: attribution(),
             min_zoom: 0,
             max_zoom: VECTOR_MAX_ZOOM,
             layers: vec![
                 GROUND_LAYER.to_string(),
-                "water".to_string(),
-                "roads".to_string(),
+                WATER_LAYER.to_string(),
+                LANDUSE_LAYER.to_string(),
+                ROAD_LAYER.to_string(),
                 BUILDING_LAYER.to_string(),
                 POI_LAYER.to_string(),
-                "borders".to_string(),
+                ADMIN_LAYER.to_string(),
             ],
             incident_layers: Vec::new(),
             palette: basemap_palette.clone(),
@@ -586,11 +755,11 @@ fn seed_tilesets() -> Vec<TilesetRecord> {
             id: "vector.traffic".to_string(),
             format: TileFormat::VectorMvt,
             content_type: "application/vnd.mapbox-vector-tile".to_string(),
-            attribution: ATTRIBUTION.to_string(),
+            attribution: attribution(),
             min_zoom: 0,
             max_zoom: VECTOR_MAX_ZOOM,
             layers: vec![
-                "traffic_flow".to_string(),
+                TRAFFIC_FLOW_LAYER.to_string(),
                 TRAFFIC_INCIDENT_LAYER.to_string(),
             ],
             incident_layers: vec![TRAFFIC_INCIDENT_LAYER.to_string()],
@@ -602,7 +771,7 @@ fn seed_tilesets() -> Vec<TilesetRecord> {
             id: "raster.satellite".to_string(),
             format: TileFormat::RasterJpeg,
             content_type: "image/jpeg".to_string(),
-            attribution: ATTRIBUTION.to_string(),
+            attribution: attribution(),
             min_zoom: 0,
             max_zoom: 19,
             layers: Vec::new(),
@@ -615,7 +784,7 @@ fn seed_tilesets() -> Vec<TilesetRecord> {
             id: "raster.dem".to_string(),
             format: TileFormat::RasterDemPng,
             content_type: "image/png".to_string(),
-            attribution: ATTRIBUTION.to_string(),
+            attribution: attribution(),
             min_zoom: 0,
             max_zoom: 14,
             layers: Vec::new(),
@@ -653,26 +822,16 @@ fn seed_style(style: MapStyleKind, scheme: ColorSchemeKind) -> StyleRecord {
         modified: STYLE_MODIFIED.to_string(),
         light: LightRecord {
             anchor: LIGHT_ANCHOR.to_string(),
-            // A dark scheme is lit lower than a light one: the same light cast
-            // at the light scheme's strength washes a dark basemap out.
-            intensity: match scheme {
-                ColorSchemeKind::Light => 0.3,
-                ColorSchemeKind::Dark => 0.15,
-            },
+            // The light block is the published style's own and does not vary
+            // with the colour scheme: the same light, cast on a different
+            // palette, is what a dark scheme is.
+            intensity: LIGHT_INTENSITY,
             position: LIGHT_POSITION,
         },
-        sky: SkyRecord {
-            // The sky is painted from the style's own palette, so a scheme's
-            // sky belongs to the scheme rather than to a constant here.
-            sky_color: palette.water,
-            horizon_color: palette.graticule,
-            fog_color: palette.land,
-            sky_horizon_blend: 0.8,
-            horizon_fog_blend: 0.6,
-            fog_ground_blend: 0.5,
-            atmosphere_blend: 0.8,
-        },
+        sky: sky(scheme),
         projection: PROJECTION.to_string(),
+        background: background(style, &palette),
+        layers: style_layers::BASEMAP_LAYERS,
         palette,
         sources,
         sprite_url_template: assets::sprite_url_template(style, scheme, variant),
@@ -709,16 +868,96 @@ pub const STYLE_VERSION: &str = "4.1.0";
 pub const STYLE_CREATED: &str = "2025-02-03T00:00:00Z";
 pub const STYLE_MODIFIED: &str = "2025-02-03T00:00:00Z";
 
-/// What a style's `light` position is measured against, and the
-/// `[radial, azimuthal, polar]` position itself.
+/// What a style's `light` position is measured against, the
+/// `[radial, azimuthal, polar]` position itself, and how strongly it is cast.
 const LIGHT_ANCHOR: &str = "viewport";
 const LIGHT_POSITION: [f64; 3] = [1.5, 235.0, 30.0];
+const LIGHT_INTENSITY: f64 = 0.3;
 
 /// The projection every published style is rendered in.
 const PROJECTION: &str = "globe";
 
+/// The sky and atmosphere the published styles paint above the horizon.
+///
+/// It belongs to the COLOUR SCHEME rather than to the palette: the sky is the
+/// real one above the map, so a light scheme shows daylight sky over white haze
+/// and a dark scheme shows night sky, and neither is the ground's colour. The
+/// fog is translucent, which is why a colour notation that carries alpha is the
+/// only one that can state it.
+fn sky(scheme: ColorSchemeKind) -> SkyRecord {
+    let (sky_color, horizon_color, fog_color) = match scheme {
+        ColorSchemeKind::Light => (
+            Hsla::new(208, 90, 72),
+            Hsla::new(0, 0, 100),
+            Hsla::new(0, 0, 100).with_alpha(FOG_ALPHA),
+        ),
+        ColorSchemeKind::Dark => (
+            Hsla::new(208, 30, 18),
+            Hsla::new(0, 0, 24),
+            Hsla::new(0, 0, 8).with_alpha(FOG_ALPHA),
+        ),
+    };
+    SkyRecord {
+        sky_color,
+        horizon_color,
+        fog_color,
+        sky_horizon_blend: 0.2,
+        horizon_fog_blend: 0.9,
+        fog_ground_blend: 0.8,
+        atmosphere_blend: 0.2,
+    }
+}
+
+/// How opaque the fog band is, in [`Hsla`]'s thousandths.
+const FOG_ALPHA: u16 = 200;
+
+/// One supplier of the map data this catalog serves, and where that supplier's
+/// own notice lives.
+#[derive(Debug, Clone, Copy)]
+pub struct DataSupplier {
+    pub name: &'static str,
+    pub notice_url: &'static str,
+}
+
+/// Every supplier of this catalog's map data, in the order the credit line
+/// names them: the service that serves the tiles, then the map-content supplier
+/// whose data they carry.
+///
+/// Source: the data-provider attribution the Amazon Location Service Developer
+/// Guide requires a client to display for map resources, which names the
+/// service and each content supplier behind the tiles with a link to that
+/// supplier's terms.
+pub const DATA_SUPPLIERS: &[DataSupplier] = &[
+    DataSupplier {
+        name: "AWS",
+        notice_url: "https://docs.aws.amazon.com/location/latest/developerguide/data-attribution.html",
+    },
+    DataSupplier {
+        name: "HERE",
+        notice_url: "https://legal.here.com/en-gb/terms/general-content-supplier-terms-and-notices",
+    },
+];
+
 /// The credit line this catalog's map data is served under.
-pub const ATTRIBUTION: &str = "\u{a9} AWS";
+///
+/// Every supplier in [`DATA_SUPPLIERS`] is named, each linked to its own
+/// notice: a client renders this line verbatim, so a line that names fewer
+/// suppliers than the tiles carry data from leaves a required notice
+/// undisplayed.
+pub fn attribution() -> String {
+    let mut line = String::from("\u{a9} ");
+    for (index, supplier) in DATA_SUPPLIERS.iter().enumerate() {
+        if index > 0 {
+            line.push_str(", ");
+        }
+        let _ = write!(
+            line,
+            "<a href='{}'>{}</a>",
+            supplier.notice_url, supplier.name
+        );
+    }
+    line
+}
 
 /// The highest zoom the vector tilesets have tiles for.
 pub const VECTOR_MAX_ZOOM: u32 = 17;
@@ -732,6 +971,19 @@ pub const SATELLITE_SOURCE: &str = "satellite";
 /// document's `background` layer, which is what lies under everything else.
 pub const GROUND_LAYER: &str = "land";
 
+/// The basemap layer that carries inland and coastal water.
+pub const WATER_LAYER: &str = "water";
+
+/// The basemap layer that carries land use: the surfaces a style fills before
+/// anything is drawn on them.
+pub const LANDUSE_LAYER: &str = "landuse";
+
+/// The basemap layer that carries the road, rail and ferry network.
+pub const ROAD_LAYER: &str = "roads";
+
+/// The basemap layer that carries administrative boundaries.
+pub const ADMIN_LAYER: &str = "admin";
+
 /// The basemap layer that carries points of interest, which `PoiDensity` and
 /// `PoiCategories` project onto.
 pub const POI_LAYER: &str = "places";
@@ -739,6 +991,9 @@ pub const POI_LAYER: &str = "places";
 /// The basemap layer that carries building footprints, which `Buildings`
 /// projects onto.
 pub const BUILDING_LAYER: &str = "buildings";
+
+/// The traffic layer that carries the continuous flow of traffic.
+pub const TRAFFIC_FLOW_LAYER: &str = "traffic_flow";
 
 /// The traffic layer that carries incident events, as opposed to the flow of
 /// traffic the rest of that tileset's layers carry.
@@ -796,7 +1051,7 @@ fn seed_sprite_sheet(
             PLACE_ICON_BOX,
             PLACE_ICON_BOX,
             IconShape::Disc,
-            p.label,
+            p.label.rgba(),
         ));
     }
     for name in INCIDENT_ICONS {
@@ -805,7 +1060,7 @@ fn seed_sprite_sheet(
             INCIDENT_ICON_BOX,
             INCIDENT_ICON_BOX,
             IconShape::Square,
-            p.marker,
+            p.marker.rgba(),
         ));
     }
     for name in CITY_DOT_ICONS {
@@ -815,7 +1070,7 @@ fn seed_sprite_sheet(
             box_size,
             box_size,
             IconShape::Disc,
-            p.label,
+            p.label.rgba(),
         ));
     }
     for name in MARKER_ICONS {
@@ -824,7 +1079,7 @@ fn seed_sprite_sheet(
             MARKER_WIDTH,
             MARKER_HEIGHT,
             IconShape::Pin,
-            p.marker,
+            p.marker.rgba(),
         ));
     }
     for name in ROUTE_SHIELD_ICONS {
@@ -833,7 +1088,7 @@ fn seed_sprite_sheet(
             route_shield_width(name),
             SHIELD_HEIGHT,
             IconShape::Square,
-            p.building,
+            p.building.rgba(),
         ));
     }
     for name in RESTRICTION_SHIELD_ICONS {
@@ -842,7 +1097,7 @@ fn seed_sprite_sheet(
             RESTRICTION_SHIELD_BOX,
             RESTRICTION_SHIELD_BOX,
             IconShape::Square,
-            p.road,
+            p.road.rgba(),
         ));
     }
     // One sheet is laid out in one order: by icon name, so the rectangle a

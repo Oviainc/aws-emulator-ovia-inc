@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 use service_com_amazonaws_geomaps_mapsservice::state::{
-    ColorSchemeKind, MapStyleKind, TileFormat, VariantKind,
+    ColorSchemeKind, MapStyleKind, PaintValue, TileFormat, VariantKind,
 };
 
 use crate::map_assets::{
@@ -64,12 +64,6 @@ async fn style_document(emulator: &Emulator, case: &str, path: &str) -> serde_js
             body_text(&response)
         )
     })
-}
-
-/// A `#rrggbb` literal, which is how an opaque palette colour is written in a
-/// style document.
-fn hex_color(color: [u8; 4]) -> String {
-    format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2])
 }
 
 fn as_f64(value: &serde_json::Value, case: &str, what: &str) -> f64 {
@@ -220,7 +214,7 @@ async fn a_published_style_carries_its_light_sky_and_projection() {
         for member in sky_colors {
             let color = sky[member].as_str().unwrap_or_default();
             assert!(
-                color.starts_with('#') || color.starts_with("rgba("),
+                color.starts_with("hsl(") || color.starts_with("hsla("),
                 "case {case:?}: sky {member} must be a colour literal, got {color:?}"
             );
         }
@@ -357,25 +351,44 @@ async fn every_source_reports_its_tileset_and_an_absolute_template() {
 }
 
 /// The ground is painted as the document's `background` layer — a background
-/// has no source geometry, which is what makes it the ground — in the style's
-/// own land colour, and it is the first layer drawn.
+/// has no source geometry, which is what makes it the ground — with the paint
+/// value the style publishes for it, and it is the first layer drawn.
 #[tokio::test]
 async fn the_ground_is_the_documents_background_layer() {
     let emulator = Emulator::new();
     for style in MapStyleKind::ALL {
         for scheme in ColorSchemeKind::ALL {
             let case = format!("{}/{}", style.as_wire(), scheme.as_wire());
+            // The published paint value, as the catalog states it: a colour for
+            // a flat ground and an `interpolate` expression for one that
+            // changes with zoom.
             let expected = {
                 let catalog = emulator.catalog();
                 let catalog = catalog.lock();
-                hex_color(
-                    catalog
-                        .styles
-                        .get(&(style, scheme))
-                        .unwrap_or_else(|| panic!("case {case:?}: the catalog publishes this style"))
-                        .palette
-                        .land,
-                )
+                match &catalog
+                    .styles
+                    .get(&(style, scheme))
+                    .unwrap_or_else(|| panic!("case {case:?}: the catalog publishes this style"))
+                    .background
+                {
+                    PaintValue::Flat(color) => serde_json::Value::String(color.css()),
+                    PaintValue::ZoomRamp(stops) => {
+                        let mut expression = vec![
+                            serde_json::json!("interpolate"),
+                            serde_json::json!(["linear"]),
+                            serde_json::json!(["zoom"]),
+                        ];
+                        for (zoom, color) in stops {
+                            expression.push(if zoom.fract() == 0.0 {
+                                serde_json::json!(*zoom as i64)
+                            } else {
+                                serde_json::json!(zoom)
+                            });
+                            expression.push(serde_json::json!(color.css()));
+                        }
+                        serde_json::Value::Array(expression)
+                    }
+                }
             };
             let path = format!(
                 "/v2/styles/{}/descriptor?color-scheme={}",
@@ -402,11 +415,10 @@ async fn the_ground_is_the_documents_background_layer() {
                 "case {case:?}: the ground must be drawn first, got {}",
                 layers[0]["id"]
             );
+            let painted = &ground["paint"]["background-color"];
             assert_eq!(
-                ground["paint"]["background-color"].as_str(),
-                Some(expected.as_str()),
-                "case {case:?}: the ground must be painted in the style's land colour {expected}, got {}",
-                ground["paint"]["background-color"]
+                painted, &expected,
+                "case {case:?}: the ground must carry the published paint value {expected}, got {painted}"
             );
             assert!(
                 ground["source"].is_null() && ground["source-layer"].is_null(),
@@ -441,24 +453,32 @@ async fn a_terrain_request_records_the_virtual_variant_it_is_served_by() {
         )
         .await;
         let recorded = &document["metadata"]["aws:virtual-variant"];
-        match expected {
-            None => assert!(
-                recorded.is_null(),
-                "case {case:?}: no terrain was asked for, so no virtual variant is recorded, got {recorded}"
-            ),
-            Some(variant) => {
-                assert_eq!(
-                    recorded[0]["key"].as_str(),
-                    Some("terrain"),
-                    "case {case:?}: the recorded variant must be keyed on terrain, got {recorded}"
-                );
-                assert_eq!(
-                    recorded[0]["variants"][0]["id"].as_str(),
-                    Some(variant),
-                    "case {case:?}: expected the variant {variant}, got {recorded}"
-                );
-            }
-        }
+        let entries = recorded.as_array().unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: the document must always carry the variant entry, got {recorded}"
+            )
+        });
+        assert_eq!(
+            entries.len(),
+            1,
+            "case {case:?}: the entry names the knob the variants vary, got {recorded}"
+        );
+        assert_eq!(
+            recorded[0]["key"].as_str(),
+            Some("terrain"),
+            "case {case:?}: the recorded variant must be keyed on terrain, got {recorded}"
+        );
+        let in_effect: Vec<&str> = recorded[0]["variants"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|variant| variant["id"].as_str())
+            .collect();
+        assert_eq!(
+            in_effect,
+            expected.into_iter().collect::<Vec<_>>(),
+            "case {case:?}: expected the variants {expected:?} in effect, got {recorded}"
+        );
     }
 }
 
@@ -475,37 +495,52 @@ async fn the_layer_set_follows_the_tiles_and_the_requested_options() {
         // the request did not ask for.
         (
             "",
-            &["water", "roads", "roads-line", "places-label", "borders"],
-            &["traffic_flow", "traffic_incidents", "contour_lines"],
+            &[
+                "water_fill",
+                "road_primary",
+                "road_primary-casing",
+                "rail_tunnel",
+                "bridge_minor-shadow",
+                "admin_country",
+                "place_label_locality_city",
+                "shield_us-state",
+            ],
+            &[
+                "traffic_flow",
+                "traffic_incidents",
+                "contour_lines",
+                "road_truck",
+                "road_traffic_primary",
+            ],
         ),
         // Congestion is flow events only; All adds the incident layers.
         (
             "traffic=Congestion",
-            &["traffic_flow-line"],
-            &["traffic_incidents-line"],
+            &["traffic_flow", "road_traffic_primary"],
+            &["traffic_incidents", "traffic_incident_icons"],
         ),
         (
             "traffic=All",
-            &["traffic_flow-line", "traffic_incidents-line"],
+            &["traffic_flow", "traffic_incidents", "traffic_incident_icons"],
             &[],
         ),
         // An additional feature is another layer in the tiles the template
         // fetches, so it is drawn.
         (
             "contour-density=Low&terrain=Hillshade",
-            &["contour_lines-line", "hillshade"],
+            &["contour_lines", "hillshade"],
             &[],
         ),
         (
             "travel-modes=Transit&travel-modes=Truck",
-            &["transit-line", "logistics-line"],
+            &["road_truck", "bridge_truck-casing", "shield_truck-hazmat"],
             &[],
         ),
         // Off hides points of interest altogether.
         (
             "poi-density=Off",
-            &["water", "roads"],
-            &["places", "places-label"],
+            &["water_fill", "road_primary"],
+            &["poi_100_food_drink", "poi_600_shopping"],
         ),
     ];
 
@@ -620,7 +655,7 @@ async fn requested_poi_categories_filter_the_symbol_layer() {
             .as_array()
             .into_iter()
             .flatten()
-            .find(|layer| layer["id"] == "places-label")
+            .find(|layer| layer["id"] == "poi_100_food_drink")
             .cloned()
             .unwrap_or_else(|| panic!("case {case:?}: the POI symbol layer must be drawn"));
 
@@ -636,11 +671,12 @@ async fn requested_poi_categories_filter_the_symbol_layer() {
             !categories.is_empty(),
             "case {case:?}: a filter on the category attribute is present only when categories were asked for, got {rendered}"
         );
-        assert_eq!(
-            document["metadata"]["aws:poi-categories"].as_array().map(|values| values.len()),
-            (!categories.is_empty()).then_some(categories.len()),
-            "case {case:?}: the metadata must record the categories asked for, got {}",
-            document["metadata"]["aws:poi-categories"]
+        // The document records the published style's own facts, so the
+        // categories asked for show up in the layer's filter and nowhere else.
+        assert!(
+            document["metadata"]["aws:poi-categories"].is_null(),
+            "case {case:?}: the metadata does not echo the request, got {}",
+            document["metadata"]
         );
     }
 }
