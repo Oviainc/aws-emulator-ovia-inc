@@ -133,3 +133,5 @@ mod update_extension;
 mod update_extension_association;
 #[path = "all/update_extension_visibility.rs"]
 mod update_extension_visibility;
+#[path = "all/validate_configuration_verdict.rs"]
+mod validate_configuration_verdict;
