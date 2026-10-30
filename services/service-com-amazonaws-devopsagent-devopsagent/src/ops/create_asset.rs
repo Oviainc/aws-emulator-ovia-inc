@@ -207,6 +207,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             AssetContent::sourceUrl(source) => Some(source.url.clone()),
             AssetContent::File(_) | AssetContent::Zip(_) => None,
         };
+        // Whether this asset's content IS one file is settled by the variant the
+        // create carried, not by how many files it happened to materialise: a
+        // bundle of one entry is still a set of files.
+        let content_is_one_file = matches!(&input.content, AssetContent::File(_));
 
         // Every asset is a stored record under its agent space, so the number of them
         // one space can hold is bounded: past the quota this operation answers the
@@ -240,6 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated_at: now,
             files,
             source_url,
+            content_is_one_file,
         };
         if let Some(token) = input.client_token.as_deref() {
             store.record_client_token(&token_scope, token, &asset_id, now);
@@ -277,11 +282,6 @@ const ASSET_ID_PREFIX: &str = "asset";
 fn token_scope(agent_space_id: &str) -> String {
     format!("CreateAsset@{agent_space_id}")
 }
-
-/// The longest `AssetFilePath` this service stores, from the model's own
-/// `@length(min: 1, max: 512)` (`smithy_query(query="shape",
-/// shape="AssetFilePath")`).
-const MAX_ASSET_FILE_PATH_LEN: usize = 512;
 
 /// The metadata to persist for a new asset.
 ///
@@ -369,9 +369,9 @@ fn document_kind(document: &::aws_smithy_types::Document) -> &'static str {
 /// and no file is invented for content nothing fetched.
 ///
 /// ONE rule decides what an asset's file may be called, whichever variant it
-/// arrived in: [`names_a_file_of_the_asset`]. A path the request names and a name an
-/// archive carries are the same thing once stored, so they are held to the same
-/// requirement.
+/// arrived in: [`crate::state::names_a_file_of_the_asset`]. A path the request
+/// names and a name an archive carries are the same thing once stored, so they are
+/// held to the same requirement.
 fn content_files(
     content: &AssetContent,
     now: ::std::time::SystemTime,
@@ -380,10 +380,10 @@ fn content_files(
         ::std::collections::BTreeMap::new();
     match content {
         AssetContent::File(file) => {
-            if !names_a_file_of_the_asset(&file.path) {
+            if !crate::state::names_a_file_of_the_asset(&file.path) {
                 return Err(invalid_content(
                     "content.file.path",
-                    format!("{} does not name a file of the asset", file.path),
+                    crate::state::not_a_file_of_the_asset_message(&file.path),
                 ));
             }
             files.insert(
@@ -428,10 +428,7 @@ fn content_files(
     if total > crate::state::MAX_ASSET_CONTENT_BYTES {
         return Err(CreateAssetErrorModeled::ContentSizeExceededException(
             ContentSizeExceededException {
-                message: format!(
-                    "The content exceeds the maximum size of {} bytes for one asset",
-                    crate::state::MAX_ASSET_CONTENT_BYTES
-                ),
+                message: crate::state::asset_content_size_exceeded_message(),
             },
         )
         .into());
@@ -447,8 +444,8 @@ fn content_files(
 /// one asset carries ([`crate::state::MAX_ASSET_CONTENT_BYTES`]), so a small
 /// compressed stream cannot expand into this process. A directory entry names no
 /// file; an entry whose name is no file of the asset
-/// ([`names_a_file_of_the_asset`]) is refused rather than stored under a name no
-/// read can name.
+/// ([`crate::state::names_a_file_of_the_asset`]) is refused rather than stored under
+/// a name no read can name.
 fn archive_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, CreateAssetError> {
     let mut archive = ::zip::ZipArchive::new(::std::io::Cursor::new(bytes)).map_err(|err| {
         invalid_content(
@@ -459,10 +456,7 @@ fn archive_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, CreateAssetEr
     if archive.len() > crate::state::MAX_ASSET_FILES {
         return Err(CreateAssetErrorModeled::ServiceQuotaExceededException(
             ServiceQuotaExceededException {
-                message: format!(
-                    "The request would exceed the maximum number of files ({}) for one asset",
-                    crate::state::MAX_ASSET_FILES
-                ),
+                message: crate::state::asset_file_quota_message(),
             },
         )
         .into());
@@ -487,7 +481,7 @@ fn archive_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, CreateAssetEr
         if name.ends_with('/') {
             continue;
         }
-        if !names_a_file_of_the_asset(&name) {
+        if !crate::state::names_a_file_of_the_asset(&name) {
             return Err(invalid_content(
                 ZIP_MEMBER,
                 format!("the entry {name} does not name a file of the asset"),
@@ -510,10 +504,7 @@ fn archive_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, CreateAssetEr
         if content.len() > budget {
             return Err(CreateAssetErrorModeled::ContentSizeExceededException(
                 ContentSizeExceededException {
-                    message: format!(
-                        "The content exceeds the maximum size of {} bytes for one asset",
-                        crate::state::MAX_ASSET_CONTENT_BYTES
-                    ),
+                    message: crate::state::asset_content_size_exceeded_message(),
                 },
             )
             .into());
@@ -539,34 +530,5 @@ fn invalid_content(member: &str, message: String) -> CreateAssetError {
         }]),
     })
     .into()
-}
-
-/// Whether `path` names a file OF the asset: an `AssetFilePath` (the model's
-/// `^[a-zA-Z0-9_./ ()-]+$` and its length bound, [`MAX_ASSET_FILE_PATH_LEN`]) that
-/// is relative to the asset's own root.
-///
-/// The modelled pattern admits `.` and `/`, so it also admits a path that walks out
-/// of the asset (`..`) or starts at a root (`/`). Such a path names no file of this
-/// asset, so it is refused for a file the request names and for an entry an archive
-/// carries alike.
-fn names_a_file_of_the_asset(path: &str) -> bool {
-    is_asset_file_path(path)
-        && !path.starts_with('/')
-        && !path.split('/').any(|segment| segment == "..")
-}
-
-/// Whether `path` is an `AssetFilePath`: the model's `^[a-zA-Z0-9_./ ()-]+$`
-/// pattern and its length bound ([`MAX_ASSET_FILE_PATH_LEN`]).
-///
-/// The framework already refuses a `content.file.path` that violates either, before
-/// this handler runs; what needs the check here is a name an ARCHIVE carries, which
-/// reaches no modelled member on the way in and so is held to the same requirement
-/// as the path a request names.
-fn is_asset_file_path(path: &str) -> bool {
-    !path.is_empty()
-        && path.len() <= MAX_ASSET_FILE_PATH_LEN
-        && path
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b' ' | b'(' | b')' | b'-'))
 }
 

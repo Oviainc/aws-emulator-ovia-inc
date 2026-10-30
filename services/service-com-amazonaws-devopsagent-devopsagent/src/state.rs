@@ -284,6 +284,82 @@ pub fn asset_version_not_found_message(asset_id: &str, asset_version: i32) -> St
     format!("Asset not found: {asset_id} version {asset_version}")
 }
 
+/// The refusal message a file operation answers with when the asset holds no file
+/// at the path the request names: the same form as [`asset_not_found_message`],
+/// naming the path that was asked for.
+pub fn asset_file_not_found_message(path: &str) -> String {
+    format!("Asset file not found: {path}")
+}
+
+/// The refusal message a create answers with when a value cannot name a file of
+/// the asset ([`names_a_file_of_the_asset`]).
+pub fn not_a_file_of_the_asset_message(path: &str) -> String {
+    format!("{path} does not name a file of the asset")
+}
+
+/// The refusal message a file create answers with when the asset's content IS one
+/// file and the asset already holds it.
+///
+/// An asset whose content is a single file has no room for a second one, whatever
+/// path the request names, so the refusal names the asset the request asked for and
+/// the file it already holds, taken from the store, so the caller can tell it from
+/// a path that is merely taken.
+pub fn asset_holds_one_file_message(asset_id: &str, path: &str) -> String {
+    format!("Asset {asset_id} contains a single file at {path}, so another file cannot be created in it")
+}
+
+/// The refusal message a file create answers with when the asset already holds a
+/// file at the path the request names.
+pub fn asset_file_exists_message(asset_id: &str, path: &str) -> String {
+    format!("A file already exists at {path} in asset {asset_id}")
+}
+
+/// The refusal message an asset operation answers with when the content it would
+/// store exceeds [`MAX_ASSET_CONTENT_BYTES`].
+pub fn asset_content_size_exceeded_message() -> String {
+    format!("The content exceeds the maximum size of {MAX_ASSET_CONTENT_BYTES} bytes for one asset")
+}
+
+/// The refusal message an asset operation answers with when one asset would hold
+/// more than [`MAX_ASSET_FILES`] files.
+pub fn asset_file_quota_message() -> String {
+    format!("The request would exceed the maximum number of files ({MAX_ASSET_FILES}) for one asset")
+}
+
+/// The longest `AssetFilePath` this service stores, from the model's own
+/// `@length(min: 1, max: 512)` (`smithy_query(query="shape",
+/// shape="AssetFilePath")`).
+pub const MAX_ASSET_FILE_PATH_LEN: usize = 512;
+
+/// Whether `path` names a file OF an asset: an `AssetFilePath` (the model's
+/// `^[a-zA-Z0-9_./ ()-]+$` and its length bound, [`MAX_ASSET_FILE_PATH_LEN`]) that
+/// is relative to the asset's own root.
+///
+/// The modelled pattern admits `.` and `/`, so it also admits a path that walks out
+/// of the asset (`..`) or starts at a root (`/`). Such a path names no file of the
+/// asset, so it is refused for a path a request names and for an entry an archive
+/// carries alike.
+pub fn names_a_file_of_the_asset(path: &str) -> bool {
+    is_asset_file_path(path)
+        && !path.starts_with('/')
+        && !path.split('/').any(|segment| segment == "..")
+}
+
+/// Whether `path` is an `AssetFilePath`: the model's `^[a-zA-Z0-9_./ ()-]+$`
+/// pattern and its length bound ([`MAX_ASSET_FILE_PATH_LEN`]).
+///
+/// The framework already refuses a modelled member that violates either, before a
+/// handler runs; what needs the check here is a name an ARCHIVE carries, which
+/// reaches no modelled member on the way in and so is held to the same requirement
+/// as the path a request names.
+fn is_asset_file_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= MAX_ASSET_FILE_PATH_LEN
+        && path.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b' ' | b'(' | b')' | b'-')
+        })
+}
+
 /// The URL operators use to reach the Operator App of one AgentSpace.
 ///
 /// One host per AgentSpace in the region the enabling request was signed for,
@@ -610,6 +686,14 @@ pub struct AssetRecord {
     /// where the content comes from; nothing is fetched, because this emulator
     /// makes no outbound connections, so the import materialises no files.
     pub source_url: Option<String>,
+    /// Whether this asset's content IS one file.
+    ///
+    /// `AssetContent` is "a single file, a zip bundle, or a source URL to import
+    /// from", so an asset either holds the ONE file its content named or the SET
+    /// of files a bundle or an import materialises. Which of the two an asset is,
+    /// is settled by the content the create carried, so it is persisted with the
+    /// asset rather than guessed at later from how many files it happens to hold.
+    pub content_is_one_file: bool,
 }
 
 impl AssetRecord {
@@ -623,6 +707,14 @@ impl AssetRecord {
             created_at: to_date_time(self.created_at),
             updated_at: to_date_time(self.updated_at),
         }
+    }
+
+    /// The bytes of content this asset currently holds, across all of its files.
+    pub fn content_bytes(&self) -> usize {
+        self.files
+            .values()
+            .map(AssetFileRecord::content_bytes)
+            .fold(0usize, |total, size| total.saturating_add(size))
     }
 }
 

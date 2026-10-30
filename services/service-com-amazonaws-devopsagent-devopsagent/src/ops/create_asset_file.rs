@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAssetFile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAssetFile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAssetFile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: creates one file of an asset in [`crate::state`] and reports the
+//! record it persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -98,7 +91,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-devopsagent-devopsagent
 // here — hence the `CreateAssetFileError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.devopsagent#CreateAssetFile")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.devopsagent#CreateAssetFile",
+    extra_errors = ["ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum CreateAssetFileErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -106,6 +102,10 @@ pub enum CreateAssetFileErrorModeled {
     ContentSizeExceededException(ContentSizeExceededException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
+    // Widened in through `extra_errors`: the SERVICE declares this shape as a
+    // common error (HTTP 402), which is what the per-asset file count has to
+    // answer with when one more file would take an asset past it.
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -161,18 +161,191 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAssetFile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAssetFileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAssetFile"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAssetFileErrorModeled::InternalServerException(InternalServerException {
+                message: "the DevOps Agent state store is unavailable".to_string(),
+            })
+        })?;
+
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // The asset plane authorises the caller against the named Agent Space before it
+        // can know whether anything inside it exists, so an `agentSpaceId` that names
+        // no space is an authorization failure; only inside a space the caller reaches
+        // is a missing asset reported as one.
+        if !store.agent_spaces.contains_key(&input.agent_space_id) {
+            return Err(CreateAssetFileErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // `@idempotencyToken`: a repeat with the same token reports the file the first
+        // call created instead of creating a second one. A file lives inside one asset,
+        // so the token record is scoped to that asset as well as to this operation.
+        let token_scope = token_scope(&input.agent_space_id, &input.asset_id);
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = store.replayed_id(&token_scope, token, now).and_then(|path| {
+                store
+                    .agent_spaces
+                    .get(&input.agent_space_id)
+                    .and_then(|space| space.assets.get(&input.asset_id))
+                    .and_then(|asset| asset.files.get(&path))
+            }) {
+                return Ok(CreateAssetFileOutput {
+                    file: existing.to_api(),
+                });
+            }
+        }
+
+        // The record to store, once every rule the asset imposes on a new file of it
+        // holds. The asset is read here and written below, so the borrow this needs
+        // ends with the block.
+        let record = {
+            let asset = store
+                .agent_spaces
+                .get(&input.agent_space_id)
+                .and_then(|space| space.assets.get(&input.asset_id))
+                .ok_or_else(|| {
+                    CreateAssetFileErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::asset_not_found_message(&input.asset_id),
+                        },
+                    )
+                })?;
+
+            // The greedy `{path+}` label carries every character after the asset's
+            // files prefix, so a value the modelled pattern admits can still walk out
+            // of the asset or start at a root: such a path names no file of this asset.
+            if !crate::state::names_a_file_of_the_asset(&input.path) {
+                return Err(invalid_path(crate::state::not_a_file_of_the_asset_message(
+                    &input.path,
+                )));
+            }
+
+            // A create never replaces content: a path the asset already holds a file at
+            // conflicts with the current state of the asset, and the file plane's own
+            // update is what changes a stored file. This is the most specific thing that
+            // can be wrong with the request, so it is answered before the rules about
+            // what the ASSET can hold.
+            if asset.files.contains_key(&input.path) {
+                return Err(CreateAssetFileErrorModeled::ConflictException(
+                    ConflictException {
+                        message: crate::state::asset_file_exists_message(
+                            &input.asset_id,
+                            &input.path,
+                        ),
+                    },
+                )
+                .into());
+            }
+
+            // An asset whose content IS one file has no room for a second: the file it
+            // was created with is the whole of its content, so no path at all names a
+            // file that can be created in it. An asset whose content is a SET of files
+            // (a bundle, or an import) takes one more, up to what this service stores
+            // for an asset.
+            //
+            // Such an asset always holds exactly that one file — the create that minted
+            // it stored the file its content named — so the refusal can always name it.
+            if asset.content_is_one_file {
+                if let Some(existing) = asset.files.keys().next() {
+                    return Err(invalid_path(crate::state::asset_holds_one_file_message(
+                        &input.asset_id,
+                        existing,
+                    )));
+                }
+            }
+            if asset.files.len() >= crate::state::MAX_ASSET_FILES {
+                return Err(CreateAssetFileErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: crate::state::asset_file_quota_message(),
+                    },
+                )
+                .into());
+            }
+
+            let record = crate::state::AssetFileRecord {
+                path: input.path.clone(),
+                body: input.content.clone(),
+                metadata: input.metadata.clone(),
+                // `AssetFile$version` is "the asset version this file belongs to", and
+                // a file created in an asset belongs to the revision the asset is at.
+                version: asset.version,
+                created_at: now,
+                updated_at: now,
+            };
+
+            // The content of one asset is bounded however it arrived, so a file that
+            // would take the asset past what this service stores for one is refused
+            // rather than persisted.
+            if asset.content_bytes().saturating_add(record.content_bytes())
+                > crate::state::MAX_ASSET_CONTENT_BYTES
+            {
+                return Err(CreateAssetFileErrorModeled::ContentSizeExceededException(
+                    ContentSizeExceededException {
+                        message: crate::state::asset_content_size_exceeded_message(),
+                    },
+                )
+                .into());
+            }
+            record
+        };
+
+        let asset = store
+            .agent_spaces
+            .get_mut(&input.agent_space_id)
+            .and_then(|space| space.assets.get_mut(&input.asset_id))
+            .ok_or_else(|| {
+                CreateAssetFileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::asset_not_found_message(&input.asset_id),
+                })
+            })?;
+        asset.files.insert(input.path.clone(), record);
+        // The asset's content changed, so the asset was updated at this instant.
+        asset.updated_at = now;
+
+        // Read the response back out of the store, so what the caller sees is what was
+        // persisted.
+        let stored = asset
+            .files
+            .get(&input.path)
+            .ok_or_else(|| {
+                CreateAssetFileErrorModeled::InternalServerException(InternalServerException {
+                    message: format!("asset file {} was not persisted", input.path),
+                })
+            })?
+            .to_api();
+
+        // The token is recorded only once the file IS stored, so a recorded token never
+        // names a path a later replay cannot find.
+        if let Some(token) = input.client_token.as_deref() {
+            store.record_client_token(&token_scope, token, &input.path, now);
+        }
+        Ok(CreateAssetFileOutput { file: stored })
     }
+}
+
+/// The scope one `CreateAssetFile` idempotency-token record belongs to: this
+/// operation on one asset, because the file it names lives in that asset and is
+/// reachable nowhere else.
+fn token_scope(agent_space_id: &str, asset_id: &str) -> String {
+    format!("CreateAssetFile@{agent_space_id}/{asset_id}")
+}
+
+/// Refuse the request as invalid: a 400 `ValidationException` naming the `path`
+/// member, so the caller can fix the request from the message alone.
+fn invalid_path(message: String) -> CreateAssetFileError {
+    CreateAssetFileErrorModeled::ValidationException(ValidationException {
+        message: message.clone(),
+        field_list: Some(vec![ValidationExceptionField {
+            path: "path".to_string(),
+            message,
+        }]),
+    })
+    .into()
 }
