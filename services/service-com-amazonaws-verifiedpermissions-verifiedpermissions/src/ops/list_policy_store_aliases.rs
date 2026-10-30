@@ -152,14 +152,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
-        // The cursor is decoded — and a forged one refused — by the service's one
-        // pagination rule, which this operation only lifts into its own error enum.
-        let resume_from =
-            crate::ops::page_cursor(input.next_token.as_deref()).map_err(|invalid| {
-                ListPolicyStoreAliasesErrorModeled::ValidationException(
-                    crate::ops::validation_exception([invalid]),
-                )
-            })?;
+        // The cursor is decoded — and one belonging to another listing refused —
+        // by the service's one pagination rule, which this operation only lifts
+        // into its own error enum. This listing enumerates the ACCOUNT's
+        // aliases rather than one store's, so its cursors name no store and
+        // nothing has to be resolved before reading one.
+        let cursor = crate::ops::PageCursor::read(
+            crate::state::page_scope(Self::NAME, None),
+            input.next_token.as_deref(),
+        )
+        .map_err(|invalid| {
+            ListPolicyStoreAliasesErrorModeled::ValidationException(
+                crate::ops::validation_exception([invalid]),
+            )
+        })?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListPolicyStoreAliasesErrorModeled::InternalServerException(InternalServerException {
@@ -179,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // results available", which is what the rule's cap answers with.
         let (policy_store_aliases, next_token) = crate::ops::page(
             &state.aliases,
-            resume_from.as_deref(),
+            &cursor,
             Some(input.max_results),
             ALIAS_DEFAULT_PAGE_SIZE,
             |alias| matches_filter(alias, input.filter.as_ref()),

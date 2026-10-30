@@ -144,15 +144,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
-        // The cursor is decoded — and a forged one refused — by the service's one
-        // pagination rule, which this operation only lifts into its own error enum.
-        let resume_from =
-            crate::ops::page_cursor(input.next_token.as_deref()).map_err(|invalid| {
-                ListPolicyTemplatesErrorModeled::ValidationException(
-                    crate::ops::validation_exception([invalid]),
-                )
-            })?;
-
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListPolicyTemplatesErrorModeled::InternalServerException(InternalServerException {
                 message: "the service state store is unavailable".to_string(),
@@ -164,13 +155,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(not_found)?;
         let store = state.policy_stores.get(&store_id).ok_or_else(not_found)?;
 
+        // A cursor names a position in the listing that minted it, so WHICH
+        // store is being enumerated is resolved first; the cursor is then
+        // decoded — and one belonging to another listing refused — by the
+        // service's one pagination rule, which this operation only lifts into
+        // its own error enum.
+        let cursor = crate::ops::PageCursor::read(
+            crate::state::page_scope(Self::NAME, Some(&store_id)),
+            input.next_token.as_deref(),
+        )
+        .map_err(|invalid| {
+            ListPolicyTemplatesErrorModeled::ValidationException(crate::ops::validation_exception(
+                [invalid],
+            ))
+        })?;
+
         // `policy_templates` is a `BTreeMap`, so the enumeration order is stable
         // across calls, and the page — its size, its boundary and the cursor that
         // resumes it — is built by the service's one pagination rule. The
         // operation models no filter, so every template is selected.
         let (policy_templates, next_token) = crate::ops::page(
             &store.policy_templates,
-            resume_from.as_deref(),
+            &cursor,
             input.max_results,
             crate::state::DEFAULT_PAGE_SIZE,
             |_| true,

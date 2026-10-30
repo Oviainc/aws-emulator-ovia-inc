@@ -8,7 +8,10 @@
 //! the asked-for `maxResults` — the operation's own documented default when the
 //! caller names none, never more than the documented maximum — reports a
 //! `nextToken` exactly while selected resources remain, and refuses a cursor it
-//! did not mint with a `ValidationException` naming `/nextToken`.
+//! did not mint FOR THAT LISTING with a `ValidationException` naming
+//! `/nextToken`. A listing is the operation and, for an operation that
+//! enumerates one policy store's resources, that store: a cursor names a
+//! position in one enumeration and means nothing in another.
 //!
 //! The suites next door assert what each operation reports about ONE kind of
 //! resource; this one asserts that all four page the SAME way, so the rule they
@@ -72,15 +75,16 @@ struct Listing {
     request: Value,
 }
 
-/// Every `@paginated` list operation this service implements, each with
-/// [`SEEDED`] resources of its kind already persisted.
+/// Seed ONE policy store with `count` resources of every kind this service
+/// pages, and return the listings that enumerate THAT store.
 ///
-/// `ListPolicyStores` is not here: it is still the scaffold, and it joins this
-/// table when its own issue implements it.
-async fn seeded_listings(router: &MultiServiceRouter) -> Vec<Listing> {
+/// `label` distinguishes the resources whose names are unique account-wide — a
+/// policy store alias, and the user pool an identity source references — so a
+/// suite can seed two stores on one router and still create each resource.
+async fn seed_store(router: &MultiServiceRouter, label: &str, count: usize) -> Vec<Listing> {
     let store_id = store(router).await;
 
-    for i in 0..SEEDED {
+    for i in 0..count {
         // The scopes differ per policy, so the seeded policies are distinct
         // resources rather than copies of one.
         ok(
@@ -110,7 +114,7 @@ async fn seeded_listings(router: &MultiServiceRouter) -> Vec<Listing> {
             router,
             "CreatePolicyStoreAlias",
             &json!({
-                "aliasName": format!("{ALIAS_PREFIX}alias-{i:03}"),
+                "aliasName": format!("{ALIAS_PREFIX}{label}-alias-{i:03}"),
                 "policyStoreId": store_id,
             }),
         )
@@ -119,8 +123,11 @@ async fn seeded_listings(router: &MultiServiceRouter) -> Vec<Listing> {
 
     // One pool, referenced by every seeded identity source: an identity source
     // can only name a user pool the user-pool service really holds.
-    let pool = user_pool_arn(SIGNING_REGION, &user_pool(router, "pagination-pool").await);
-    for i in 0..SEEDED {
+    let pool = user_pool_arn(
+        SIGNING_REGION,
+        &user_pool(router, &format!("{label}-pagination-pool")).await,
+    );
+    for i in 0..count {
         ok(
             router,
             "CreateIdentitySource",
@@ -155,14 +162,27 @@ async fn seeded_listings(router: &MultiServiceRouter) -> Vec<Listing> {
             default_page_size: DEFAULT_PAGE_SIZE,
             request: json!({ "policyStoreId": store_id }),
         },
-        Listing {
-            operation: "ListPolicyStoreAliases",
-            items_member: "policyStoreAliases",
-            id_member: "aliasName",
-            default_page_size: ALIAS_DEFAULT_PAGE_SIZE,
-            request: json!({}),
-        },
     ]
+}
+
+/// Every `@paginated` list operation this service implements, each with
+/// [`SEEDED`] resources of its kind already persisted.
+///
+/// `ListPolicyStores` is not here: it is still the scaffold, and it joins this
+/// table when its own issue implements it.
+async fn seeded_listings(router: &MultiServiceRouter) -> Vec<Listing> {
+    let mut listings = seed_store(router, "paged", SEEDED).await;
+    // `ListPolicyStoreAliases` enumerates the ACCOUNT's aliases rather than one
+    // store's, so it takes no `policyStoreId` and the aliases seeded above are
+    // all of them.
+    listings.push(Listing {
+        operation: "ListPolicyStoreAliases",
+        items_member: "policyStoreAliases",
+        id_member: "aliasName",
+        default_page_size: ALIAS_DEFAULT_PAGE_SIZE,
+        request: json!({}),
+    });
+    listings
 }
 
 /// One page of `listing`, requiring success. `max_results` and `next_token` are
@@ -311,6 +331,66 @@ async fn every_list_operation_pages_by_the_same_rule() {
     }
 }
 
+/// Mint one real cursor for `listing`, by asking it for a page smaller than what
+/// it holds. The token is whatever the service issued — this suite never builds
+/// one itself, so what it asserts is about the service's own cursors.
+async fn minted_cursor(router: &MultiServiceRouter, listing: &Listing) -> String {
+    let body = page(router, listing, Some(1), None).await;
+    body["nextToken"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "case {:?}: a page smaller than the listing must hand back a cursor, got {body}",
+                listing.operation
+            )
+        })
+        .to_string()
+}
+
+/// Assert `listing` refuses `token` the ONE way this service refuses a cursor it
+/// did not mint for that listing: HTTP 400 `ValidationException` whose
+/// `fieldList` names `/nextToken` and nothing else — never a 200 whose page is
+/// silently truncated or empty, which would hide the client's mistake.
+async fn assert_cursor_refused(
+    router: &MultiServiceRouter,
+    listing: &Listing,
+    token: &str,
+    case: &str,
+) {
+    let mut request = listing.request.clone();
+    request["nextToken"] = json!(token);
+    let (status, body) = call(router, listing.operation, &request).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ValidationException",
+        "case {case:?}: unexpected error code, got {body}"
+    );
+    assert_eq!(
+        fault_message(&body),
+        "Invalid input",
+        "case {case:?}: unexpected message, got {body}"
+    );
+    assert_eq!(
+        body["fieldList"][0]["path"].as_str(),
+        Some("/nextToken"),
+        "case {case:?}: the refusal must name the offending member, got {body}"
+    );
+    assert_eq!(
+        body["fieldList"][0]["message"].as_str(),
+        Some("it is not a cursor this service issued"),
+        "case {case:?}: unexpected fieldList reason, got {body}"
+    );
+    assert_eq!(
+        body["fieldList"].as_array().map(Vec::len),
+        Some(1),
+        "case {case:?}: only the cursor is at fault, got {body}"
+    );
+}
+
 /// Every list operation refuses a `nextToken` it did not mint the same way: HTTP
 /// 400 `ValidationException`, whose `fieldList` names `/nextToken` — not an empty
 /// page, which would hide the client's mistake.
@@ -319,48 +399,107 @@ async fn every_list_operation_refuses_a_forged_cursor_the_same_way() {
     let router = super::harness::router();
     let listings = seeded_listings(&router).await;
 
+    // Rows differ along HOW the cursor is wrong: not this service's encoding at
+    // all, an odd number of hex digits, hex that decodes to bytes which are not
+    // text, and — the rows a cursor has to carry its listing to refuse — hex
+    // that decodes PERFECTLY WELL to text naming no listing of this service: a
+    // string sorting above every id a store mints, an id in the shape AWS
+    // publishes for one (`SPEXAMPLEabcdefg111111`), and a key in the shape of a
+    // policy store alias name.
+    let forged: Vec<(String, String)> = vec![
+        ("not a cursor".to_string(), "notacursor".to_string()),
+        ("odd-length hex".to_string(), "953".to_string()),
+        ("hex that is not text".to_string(), "ff".to_string()),
+        ("hex of text past every minted id".to_string(), hex::encode("zz")),
+        (
+            "hex of a published id shape".to_string(),
+            hex::encode("SPEXAMPLEabcdefg111111"),
+        ),
+        (
+            "hex of an alias name".to_string(),
+            hex::encode(format!("{ALIAS_PREFIX}paged-alias-000")),
+        ),
+    ];
+
     for listing in &listings {
-        // Rows differ along HOW the cursor is wrong: not this service's encoding
-        // at all, an odd number of hex digits, and hex that decodes to bytes
-        // which are not text.
-        for (how, token) in [
-            ("not a cursor", "notacursor"),
-            ("odd-length hex", "953"),
-            ("hex that is not text", "ff"),
-        ] {
+        for (how, token) in &forged {
             let case = format!("{}: {how}", listing.operation);
-            let mut request = listing.request.clone();
-            request["nextToken"] = json!(token);
-            let (status, body) = call(&router, listing.operation, &request).await;
-            assert_eq!(
-                status, 400,
-                "case {case:?}: expected HTTP 400, got {status} {body}"
-            );
-            assert_eq!(
-                error_code(&body),
-                "ValidationException",
-                "case {case:?}: unexpected error code, got {body}"
-            );
-            assert_eq!(
-                fault_message(&body),
-                "Invalid input",
-                "case {case:?}: unexpected message, got {body}"
-            );
-            assert_eq!(
-                body["fieldList"][0]["path"].as_str(),
-                Some("/nextToken"),
-                "case {case:?}: the refusal must name the offending member, got {body}"
-            );
-            assert_eq!(
-                body["fieldList"][0]["message"].as_str(),
-                Some("it is not a cursor this service issued"),
-                "case {case:?}: unexpected fieldList reason, got {body}"
-            );
-            assert_eq!(
-                body["fieldList"].as_array().map(Vec::len),
-                Some(1),
-                "case {case:?}: only the cursor is at fault, got {body}"
-            );
+            assert_cursor_refused(&router, listing, token, &case).await;
         }
+    }
+}
+
+/// A cursor belongs to the LISTING that minted it — the operation that issued it
+/// and, for an operation that enumerates one policy store, that store — so every
+/// other listing refuses it, and only the one that minted it resumes with it.
+#[tokio::test]
+async fn a_cursor_is_accepted_only_by_the_listing_that_minted_it() {
+    let router = super::harness::router();
+    let listings = seeded_listings(&router).await;
+
+    // One real cursor per listing, so the rows below differ along WHICH of this
+    // service's own cursors is submitted to WHICH listing.
+    let mut minted: Vec<(&str, String)> = Vec::new();
+    for listing in &listings {
+        minted.push((listing.operation, minted_cursor(&router, listing).await));
+    }
+
+    for listing in &listings {
+        for (minted_by, token) in &minted {
+            if *minted_by == listing.operation {
+                let case = format!("{}: the cursor it minted itself", listing.operation);
+                let body = page(&router, listing, Some(1), Some(token)).await;
+                let ids = ids_of(&case, listing, &body);
+                assert_eq!(
+                    ids.len(),
+                    1,
+                    "case {case:?}: its own cursor must resume the walk, got {ids:?}"
+                );
+                continue;
+            }
+            let case = format!("{}: a cursor minted by {minted_by}", listing.operation);
+            assert_cursor_refused(&router, listing, token, &case).await;
+        }
+    }
+}
+
+/// How many resources of each kind the two-store table below seeds: enough that a
+/// page of one leaves a cursor behind.
+const SEEDED_PER_STORE: usize = 2;
+
+/// A cursor of a store-scoped listing names a position in ONE store's
+/// enumeration, so the same operation refuses it for any other store — rather
+/// than resuming that store's walk at a key drawn from somewhere else.
+#[tokio::test]
+async fn a_store_scoped_cursor_is_refused_by_another_store() {
+    let router = super::harness::router();
+    // Two stores holding the same kinds of resource. `ListPolicyStoreAliases` is
+    // not among these listings: it enumerates the ACCOUNT's aliases, so it has
+    // one enumeration and no store to disagree about.
+    let first = seed_store(&router, "first", SEEDED_PER_STORE).await;
+    let second = seed_store(&router, "second", SEEDED_PER_STORE).await;
+
+    for (mine, other) in first.iter().zip(second.iter()) {
+        let operation = mine.operation;
+        assert_eq!(
+            operation, other.operation,
+            "both stores must be seeded with the same listings, got {operation} and {}",
+            other.operation
+        );
+
+        let token = minted_cursor(&router, mine).await;
+        let case = format!("{operation}: a cursor minted for another store");
+        assert_cursor_refused(&router, other, &token, &case).await;
+
+        // The store that minted it still resumes with it, so the refusal above
+        // is about WHICH store is being enumerated and not about the cursor.
+        let case = format!("{operation}: the cursor its own store minted");
+        let body = page(&router, mine, Some(1), Some(&token)).await;
+        let ids = ids_of(&case, mine, &body);
+        assert_eq!(
+            ids.len(),
+            1,
+            "case {case:?}: the minting store must resume its own walk, got {ids:?}"
+        );
     }
 }

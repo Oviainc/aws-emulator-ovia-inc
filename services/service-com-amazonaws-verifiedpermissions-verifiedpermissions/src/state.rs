@@ -1403,18 +1403,57 @@ pub fn alias_reference(alias_name: &str) -> ReferencedResource {
     )
 }
 
-/// Encode a pagination cursor: the key the next page starts at, hex-encoded so
-/// the token is opaque to the caller and matches `NextToken`'s
-/// `^[A-Za-z0-9-_=+/\.]*$`.
-pub fn encode_page_token(next_key: &str) -> String {
-    hex::encode(next_key.as_bytes())
+/// Separates the listing a pagination cursor was minted for from the key the
+/// page it resumes starts at.
+///
+/// A unit separator, which neither part can contain: a listing is named by an
+/// operation name and a minted `policyStoreId`, and every key this service pages
+/// by is a minted id or an alias name — all of them printable text the model
+/// constrains to `[a-zA-Z0-9-/_]`.
+const PAGE_TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// The listing a pagination cursor belongs to: the `@paginated` operation that
+/// minted it and, for an operation that enumerates ONE policy store's resources,
+/// that store's own id — `None` for one that enumerates the account's.
+///
+/// A cursor names a POSITION in one enumeration, so it means nothing to any
+/// other: the keys `ListPolicies` walks are the ids of one store's policies, and
+/// that same string resumes nothing in another store's policies or in an
+/// enumeration of another kind of resource. Naming the listing is what lets
+/// [`decode_page_token`] tell a cursor its own listing minted from one it did
+/// not, so a cursor from elsewhere is refused instead of silently truncating a
+/// page.
+///
+/// `policy_store_id` is the store id the request RESOLVED to, never the
+/// `policyStoreId` member verbatim: a store reached by its id and the same store
+/// reached by an alias name are one listing, so a cursor minted through either
+/// reference resumes through the other.
+pub fn page_scope(operation: &str, policy_store_id: Option<&str>) -> String {
+    match policy_store_id {
+        Some(policy_store_id) => format!("{operation}/{policy_store_id}"),
+        None => operation.to_string(),
+    }
 }
 
-/// Decode a cursor produced by [`encode_page_token`]. `None` when the token was
-/// not produced by this service, which the caller refuses as invalid.
-pub fn decode_page_token(token: &str) -> Option<String> {
+/// Encode a pagination cursor for the listing `scope` ([`page_scope`]): the
+/// listing and the key the next page starts at, hex-encoded so the token is
+/// opaque to the caller and matches `NextToken`'s `^[A-Za-z0-9-_=+/\.]*$`.
+pub fn encode_page_token(scope: &str, next_key: &str) -> String {
+    hex::encode(format!("{scope}{PAGE_TOKEN_SEPARATOR}{next_key}").as_bytes())
+}
+
+/// The key a cursor minted for the listing `scope` resumes at. `None` when
+/// `token` is not one [`encode_page_token`] produced for THAT listing — a token
+/// that is not hex, whose bytes are not text, that carries no listing at all, or
+/// that carries another one — which the caller refuses as invalid.
+///
+/// Total over its input: every caller-supplied string either resumes the walk it
+/// was minted for or is refused, so one can never silently narrow a page.
+pub fn decode_page_token(scope: &str, token: &str) -> Option<String> {
     let bytes = hex::decode(token).ok()?;
-    String::from_utf8(bytes).ok()
+    let decoded = String::from_utf8(bytes).ok()?;
+    let (token_scope, next_key) = decoded.split_once(PAGE_TOKEN_SEPARATOR)?;
+    (token_scope == scope).then(|| next_key.to_string())
 }
 
 /// The ARN of a policy store alias, in `region`.

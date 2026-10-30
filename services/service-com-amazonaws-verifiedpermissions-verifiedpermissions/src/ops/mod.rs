@@ -188,28 +188,50 @@ pub fn invalid_alias_name(alias_name: &str) -> Option<types::ValidationException
     )]))
 }
 
-/// The key a `@paginated` list operation of this service resumes its walk at,
-/// decoded from the caller's `nextToken` — `None` when the caller named none, so
-/// the walk starts at the first key.
+/// Where one page of a `@paginated` list operation starts: the listing being
+/// walked ([`crate::state::page_scope`]) and, inside it, the key the caller's
+/// `nextToken` resumes at.
 ///
-/// A cursor this service did not mint is a bad request, not an empty page:
-/// answering an empty page would hide the client's mistake. The refusal is handed
-/// back as an [`InvalidInput`] naming [`paths::NEXT_TOKEN`] rather than as a
-/// modelled error, because each list operation declares its own
-/// `ValidationException` variant and lifts this into it through
-/// [`validation_exception`]; what every one of them shares is WHICH member is
-/// named and WHY, so that lives here once.
-pub fn page_cursor(next_token: Option<&str>) -> Result<Option<String>, InvalidInput> {
-    match next_token {
-        None => Ok(None),
-        Some(token) => crate::state::decode_page_token(token)
-            .map(Some)
-            .ok_or_else(|| {
-                InvalidInput::new(
-                    paths::NEXT_TOKEN,
-                    "it is not a cursor this service issued",
-                )
-            }),
+/// The listing travels with the position because a cursor is only meaningful to
+/// the enumeration that minted it, so the same value both ADMITS a cursor
+/// ([`Self::read`]) and MINTS the one that resumes the page after this one
+/// ([`page`]): a list operation cannot hand out a cursor for a listing other
+/// than the one it just validated against.
+#[derive(Debug)]
+pub struct PageCursor {
+    /// The listing this cursor belongs to, as [`crate::state::page_scope`]
+    /// names it.
+    scope: String,
+    /// The key the page resumes at — `None` when the caller named no
+    /// `nextToken`, so the walk starts at the first key.
+    resume_from: Option<String>,
+}
+
+impl PageCursor {
+    /// The position `next_token` names in the listing `scope`.
+    ///
+    /// A cursor this service did not mint FOR THAT LISTING is a bad request, not
+    /// an empty page: answering an empty (or silently truncated) page would hide
+    /// the client's mistake, whether the token was never minted here at all or
+    /// was minted by another operation or for another policy store. The refusal
+    /// is handed back as an [`InvalidInput`] naming [`paths::NEXT_TOKEN`] rather
+    /// than as a modelled error, because each list operation declares its own
+    /// `ValidationException` variant and lifts this into it through
+    /// [`validation_exception`]; what every one of them shares is WHICH member is
+    /// named and WHY, so that lives here once.
+    pub fn read(scope: String, next_token: Option<&str>) -> Result<Self, InvalidInput> {
+        let resume_from = match next_token {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(&scope, token).ok_or_else(
+                || {
+                    InvalidInput::new(
+                        paths::NEXT_TOKEN,
+                        "it is not a cursor this service issued",
+                    )
+                },
+            )?),
+        };
+        Ok(Self { scope, resume_from })
     }
 }
 
@@ -239,15 +261,16 @@ pub fn page_size(max_results: Option<i32>, default_page_size: usize) -> usize {
 /// lives, so no two list operations can page differently.
 ///
 /// `entries` is the map the operation enumerates, keyed by the resource id the
-/// cursor names; a `BTreeMap`, so the order is stable across calls and
-/// `resume_from` ([`page_cursor`]) resumes at the first key at or after it.
+/// cursor names; a `BTreeMap`, so the order is stable across calls and `cursor`
+/// ([`PageCursor`]) resumes at the first key at or after the position it carries.
 /// `selects` is the operation's own filter over a persisted record, and `item` is
 /// how it reports one. The page holds at most [`page_size`] items; when a further
-/// selected entry remains, the returned cursor names the key the page stopped at,
-/// so the next call resumes with it as its first candidate.
+/// selected entry remains, the returned cursor names the key the page stopped at
+/// AND the listing it was minted for, so the next call resumes with it as its
+/// first candidate and no other listing accepts it.
 pub fn page<Entry, Item>(
     entries: &std::collections::BTreeMap<String, Entry>,
-    resume_from: Option<&str>,
+    cursor: &PageCursor,
     max_results: Option<i32>,
     default_page_size: usize,
     selects: impl Fn(&Entry) -> bool,
@@ -258,11 +281,16 @@ pub fn page<Entry, Item>(
     let mut next_token = None;
     for (key, entry) in entries
         .iter()
-        .filter(|(key, _)| resume_from.is_none_or(|from| key.as_str() >= from))
+        .filter(|(key, _)| {
+            cursor
+                .resume_from
+                .as_deref()
+                .is_none_or(|from| key.as_str() >= from)
+        })
         .filter(|(_, entry)| selects(entry))
     {
         if items.len() == size {
-            next_token = Some(crate::state::encode_page_token(key));
+            next_token = Some(crate::state::encode_page_token(&cursor.scope, key));
             break;
         }
         items.push(item(entry));
