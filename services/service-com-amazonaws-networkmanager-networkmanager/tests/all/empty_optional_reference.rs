@@ -35,7 +35,7 @@ use crate::link_lifecycle::{create_link_ok, plain_link};
 /// names nothing.
 const UNSTORED_SITE: &str = "site-00000000000000099";
 /// See [`UNSTORED_SITE`].
-const UNSTORED_LINK: &str = "link-00000000000000099";
+pub(crate) const UNSTORED_LINK: &str = "link-00000000000000099";
 
 /// One probe of the rule: the same request sent with the optional reference members spelled
 /// as the empty string and with them omitted.
@@ -55,7 +55,7 @@ struct Probe<'a> {
 
 /// `resource` with `members` dropped, so two records of the same request compare on what
 /// the request put in them.
-fn without(resource: &Value, members: &[&str]) -> Value {
+pub(crate) fn without(resource: &Value, members: &[&str]) -> Value {
     let mut copy = resource.clone();
     if let Some(object) = copy.as_object_mut() {
         for member in members {
