@@ -18,10 +18,14 @@
 //! write advances `Version` and `LastUpdateDate` the same way the other write that moves a
 //! plane's status does.
 //!
-//! A refused submission counts against the preference's failed-attempt budget
+//! A refused submission counts against the failed-attempt budget of the code currently
+//! outstanding
 //! ([`crate::state::StoredProcurementPortalPreference::failed_verification_attempts`]),
 //! which is what the refusal REPORTS: its message names the attempt that failed and the
-//! budget it counts against ([`MAX_VERIFICATION_ATTEMPTS`]). It changes nothing a reader
+//! budget it counts against ([`MAX_VERIFICATION_ATTEMPTS`]). The budget is per issued
+//! code, so the call that issues one starts that count again
+//! ([`crate::state::StoredProcurementPortalPreference::issue_validation`]) and the first
+//! submission refused against a fresh code is its first attempt. It changes nothing a reader
 //! of the preference can observe: no modelled member moves, and `Version` — "the version
 //! number of the procurement portal preference configuration" — and `LastUpdateDate` stay
 //! at what the last SUCCESSFUL write left them, because this call wrote no configuration.
@@ -140,20 +144,26 @@ impl From<VerifyProcurementPortalValidationErrorModeled> for VerifyProcurementPo
     }
 }
 
-/// How many submissions of a validation code for one preference the refusal counts
-/// against: the budget AWS's recorded refusal states ("Attempt 1 of 3 failed"), which is
-/// what a client driving the OTP flow reads the remaining attempts off.
+/// How many submissions of ONE issued validation code the refusal counts against: the
+/// budget AWS's recorded refusal states ("Attempt 1 of 3 failed"), which is what a client
+/// driving the OTP flow reads the remaining attempts off.
+///
+/// It is the budget of a CODE, not of a preference for all time: the refusal's own remedy
+/// once it is spent is to ask for a new code, so `SendProcurementPortalValidation` issuing
+/// one starts the count again
+/// ([`crate::state::StoredProcurementPortalPreference::issue_validation`]) and a client
+/// that follows that instruction reads a number inside the budget it is stated against.
 ///
 /// It is a REPORTING budget: nothing in this service's model or in the recorded bodies
 /// says the service stops accepting submissions once it is spent, so no submission is
-/// refused for exceeding it and the attempt the refusal names is the true count of failed
-/// attempts — never clamped to the budget, which would report an attempt that did not
-/// fail.
+/// refused for exceeding it and the attempt the refusal names is the true count of
+/// submissions refused against the outstanding code — never clamped to the budget, which
+/// would report an attempt that did not fail.
 const MAX_VERIFICATION_ATTEMPTS: u32 = 3;
 
 /// The sentence a submitted `Code` is refused with: it states that the code is not valid
-/// and WHICH attempt failed, out of [`MAX_VERIFICATION_ATTEMPTS`], read from the
-/// preference's own failed-attempt count
+/// and WHICH attempt failed, out of [`MAX_VERIFICATION_ATTEMPTS`], read from the count of
+/// submissions refused since the preference's outstanding code was issued
 /// ([`crate::state::StoredProcurementPortalPreference::failed_verification_attempts`]).
 ///
 /// Recorded behaviour: AWS's refusal reports the failed-attempt number against that
@@ -276,8 +286,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|validation| validation.verified_at.is_none())
                 .map(|validation| validation.code.as_str());
             if outstanding != Some(input.code.as_str()) {
-                // The refused submission counts against this preference's attempt
-                // budget, which the refusal reports. No modelled member of the preference
+                // The refused submission counts against the attempt budget of the code
+                // outstanding for this preference, which the refusal reports — a budget
+                // the next issued code starts again. No modelled member of the preference
                 // moves with it: the call completed no validation and wrote no
                 // configuration, so `Version` and `LastUpdateDate` keep the values the
                 // last successful write left and a later read reports them unchanged.

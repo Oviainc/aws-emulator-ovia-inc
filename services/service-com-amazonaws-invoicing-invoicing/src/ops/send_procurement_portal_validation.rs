@@ -20,11 +20,14 @@
 //! submitting the code it received to `VerifyProcurementPortalValidation`, which checks it
 //! against the outstanding one.
 //!
-//! A later send ISSUES AGAIN: the code it mints becomes the outstanding one and the
-//! previous code is retired, which is what a client asking for a fresh code gets. Under
+//! A later send ISSUES AGAIN: the code it mints becomes the outstanding one, the previous
+//! code is retired and the fresh code carries its own failed-attempt budget — the count a
+//! refusal of `VerifyProcurementPortalValidation` reports counts submissions against the
+//! code currently outstanding, so asking for a new code (the remedy that refusal names)
+//! really does restore it. That is what a client asking for a fresh code gets. Under
 //! `@idempotency`, a replay — the same `ClientToken` against the same preference — answers
 //! with the ARN the first call returned and issues no second code, so the code that call
-//! issued stays outstanding.
+//! issued stays outstanding and the attempts already made against it still count.
 //!
 //! Issuing a code writes no CONFIGURATION: `Version` is "the version number of the
 //! procurement portal preference configuration" and `LastUpdateDate` is when the
@@ -244,15 +247,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
         // The code is kept in state and never put on the wire: the modelled output carries
         // only the ARN, because the real service delivers the code through the configured
-        // procurement portal. Nothing of the preference's CONFIGURATION is touched, so
-        // `Version` and `LastUpdateDate` stay at what the last successful write left them
-        // and no plane's verification status moves — nothing has verified the connection
-        // until that code comes back through `VerifyProcurementPortalValidation`.
-        stored.validation = Some(crate::state::IssuedPortalValidation {
-            code,
-            issued_at,
-            verified_at: None,
-        });
+        // procurement portal. Issuing it is also what gives the new code its own
+        // failed-attempt budget — the count a refusal of
+        // `VerifyProcurementPortalValidation` reports is the count against the code
+        // currently outstanding, and asking for a new code is the remedy that refusal
+        // names — so the write goes through
+        // [`crate::state::StoredProcurementPortalPreference::issue_validation`], which
+        // records the code and starts that count again. Nothing of the preference's
+        // CONFIGURATION is touched, so `Version` and `LastUpdateDate` stay at what the
+        // last successful write left them and no plane's verification status moves —
+        // nothing has verified the connection until that code comes back through
+        // `VerifyProcurementPortalValidation`.
+        stored.issue_validation(code, issued_at);
 
         store.record_result(
             Self::NAME,

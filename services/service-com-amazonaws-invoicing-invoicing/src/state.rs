@@ -48,8 +48,10 @@
 //! configuration and leaves both exactly as the last successful write left them. The
 //! validation calls keep their own record of what the flow tried: the code
 //! `SendProcurementPortalValidation` issued ([`IssuedPortalValidation`]) and how many
-//! submissions of one were refused
-//! ([`StoredProcurementPortalPreference::failed_verification_attempts`]). Neither is a
+//! submissions have been refused since it was issued
+//! ([`StoredProcurementPortalPreference::failed_verification_attempts`], which
+//! [`StoredProcurementPortalPreference::issue_validation`] starts again with each code,
+//! because the budget a refusal reports is one code's). Neither is a
 //! modelled member, so starting or refusing a validation changes nothing a reader
 //! observes.
 //!
@@ -549,9 +551,16 @@ pub struct StoredProcurementPortalPreference {
     /// preference, if any. `None` means no code is outstanding, so there is
     /// no code a `VerifyProcurementPortalValidation` could match.
     pub validation: Option<IssuedPortalValidation>,
-    /// How many submissions of a validation code for this preference have been REFUSED:
-    /// the failed attempts of `VerifyProcurementPortalValidation`, which its refusal
-    /// names ("attempt N of the budget").
+    /// How many submissions of a validation code for this preference have been REFUSED
+    /// SINCE THE SERVICE LAST ISSUED A CODE for it: the failed attempts of
+    /// `VerifyProcurementPortalValidation`, which its refusal names ("attempt N of the
+    /// budget").
+    ///
+    /// The count belongs to the code the service last issued, because the budget it is
+    /// reported against is the budget of ONE code: the refusal's own remedy is to ask for
+    /// a new code, so issuing one starts the count again
+    /// ([`Self::issue_validation`]) and the attempt a refusal names stays inside the
+    /// budget it is stated against.
     ///
     /// It is state the service keeps ABOUT the preference and no modelled member reports
     /// it, so keeping it moves nothing a reader of the preference sees: in particular a
@@ -576,6 +585,25 @@ pub struct IssuedPortalValidation {
 }
 
 impl StoredProcurementPortalPreference {
+    /// Record `code` as the validation outstanding for this preference, issued at
+    /// `issued_at` — the write the call that ISSUES a code performs.
+    ///
+    /// The code it records becomes the one a submission has to match, retiring whatever
+    /// an earlier issue left, and the failed-attempt count
+    /// ([`Self::failed_verification_attempts`]) starts again with it: the attempt count a
+    /// refusal reports is the count against the code currently outstanding, so a code
+    /// nothing has been submitted against yet has its whole budget. Every call that
+    /// issues a code goes through here, so the fresh code and the fresh count cannot come
+    /// apart.
+    pub fn issue_validation(&mut self, code: String, issued_at: DateTime) {
+        self.validation = Some(IssuedPortalValidation {
+            code,
+            issued_at,
+            verified_at: None,
+        });
+        self.failed_verification_attempts = 0;
+    }
+
     /// What identifies this preference apart from its ARN: the portal it talks to and
     /// the buyer/supplier pair it routes between.
     pub fn identity(&self) -> String {

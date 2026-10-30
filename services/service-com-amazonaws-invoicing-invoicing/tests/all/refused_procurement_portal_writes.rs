@@ -46,7 +46,7 @@ const STATUS_ACTIVE: &str = "ACTIVE";
 
 /// How many submissions of a validation code a refusal of this service counts against —
 /// the budget AWS's recorded refusal states.
-const VERIFICATION_ATTEMPT_BUDGET: u32 = 3;
+pub(crate) const VERIFICATION_ATTEMPT_BUDGET: u32 = 3;
 
 /// How many times a row repeats its refused submission: past that budget, so a row
 /// crosses it and the rule under test still holds.
@@ -108,7 +108,7 @@ pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Valu
 
 /// The wire error code of a failure body (`__type` on the awsJson protocols), without the
 /// namespace a backend stamps in front of it.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -688,7 +688,7 @@ pub(crate) fn shifted(code: &str) -> String {
 /// The whole sentence a refused submission of a validation code carries: it states that
 /// the code is not valid and WHICH attempt failed out of the budget, and past the budget
 /// it points at the call that issues a fresh code instead of inviting another try.
-fn invalid_code_sentence(attempt: u32) -> String {
+pub(crate) fn invalid_code_sentence(attempt: u32) -> String {
     let budget = VERIFICATION_ATTEMPT_BUDGET;
     let tail = if attempt < budget {
         "Please try again."
@@ -710,7 +710,7 @@ pub(crate) fn accepted_update_round(arn: &str, round: i64) -> Value {
 }
 
 /// The text of a failure body, under either key an error of this service may travel with.
-fn error_text(body: &Value) -> String {
+pub(crate) fn error_text(body: &Value) -> String {
     body.get("Message")
         .or_else(|| body.get("message"))
         .and_then(Value::as_str)
