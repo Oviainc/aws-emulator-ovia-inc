@@ -68,23 +68,20 @@ const ACTIVATION_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 /// on this engine, so no activation could be recorded and none is reported.
 const UNPLACEABLE_MESSAGE: &str = "The activation could not be issued.";
 
-/// The longest `activationRegion` a handshake may name.
-///
-/// The value is caller-supplied and is KEPT on the activation record, so its length is
-/// bounded here rather than stored as sent: an unsigned request must not be able to grow
-/// this service's memory by the size of its own query string. An EMULATOR bound, well past
-/// the longest region name AWS publishes.
-const MAX_ACTIVATION_REGION_LENGTH: usize = 64;
-
 /// What a handshake naming a region this service cannot issue a key for carries, stating
 /// what a region looks like so the caller can fix the request from the answer alone.
+///
+/// The bound it states is the one every region segment of this service is held to
+/// ([`crate::state::MAX_ARN_REGION_LENGTH`]), so the region a key may be issued for and the
+/// region an ARN may be minted in are one rule and cannot drift apart.
 ///
 /// The value asked for is NOT echoed back: nothing is gained by reflecting a
 /// caller-supplied value into a response body.
 fn invalid_region_message() -> String {
     format!(
-        "The activation region must name a region: at most \
-         {MAX_ACTIVATION_REGION_LENGTH} characters of letters, digits and hyphens."
+        "The activation region must name a region: at most {} characters of letters, \
+         digits and hyphens.",
+        crate::state::MAX_ARN_REGION_LENGTH
     )
 }
 
@@ -149,14 +146,13 @@ impl Handshake {
         })
     }
 
-    /// Whether the region this handshake asks for is one a key can be issued for: not
-    /// empty, short enough to keep on the record, and spelled the way a region is — which
-    /// is what `crate::state::arn_region` would otherwise silently substitute a fallback
-    /// for, so a key is never issued under a region the caller did not ask for.
+    /// Whether the region this handshake asks for is one a key can be issued for: a region
+    /// `crate::state::arn_region` keeps VERBATIM — not empty, spelled the way a region is
+    /// and short enough to be kept on the record and minted into an ARN — rather than one it
+    /// would silently substitute a fallback for, so a key is never issued under a region the
+    /// caller did not ask for.
     fn names_a_region(&self) -> bool {
-        !self.region.is_empty()
-            && self.region.len() <= MAX_ACTIVATION_REGION_LENGTH
-            && crate::state::arn_region(&self.region) == self.region
+        crate::state::arn_region(&self.region) == self.region
     }
 
     /// The type of gateway this handshake activates, or `None` when it names one this

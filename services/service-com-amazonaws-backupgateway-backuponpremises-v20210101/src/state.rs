@@ -552,6 +552,18 @@ const ACTIVATION_KEY_GROUP_SYMBOLS: usize = 5;
 /// scope to read one from (an unsigned request on an emulator with authentication off).
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// The longest region segment an ARN of this service may carry.
+///
+/// A region reaches a mint CALLER-SUPPLIED — off the credential scope the request was
+/// signed with, which the signing format bounds only to non-empty — while every ARN this
+/// service takes as INPUT is bounded by the model: 180 characters for `GatewayArn` and 500
+/// for `ServerArn`/`ResourceArn` (`smithy_query(query="shape",shape="GatewayArn,
+/// ServerArn")`). So the region segment is bounded here, where every ARN of this service is
+/// minted and matched, and no record is ever keyed under an ARN its own API would refuse.
+/// An EMULATOR bound, well past the longest region name AWS publishes and far enough inside
+/// the tightest modelled maximum that every resource type's ARN fits it.
+pub const MAX_ARN_REGION_LENGTH: usize = 64;
+
 /// The version the emulated gateway appliance reports as `SoftwareVersion`.
 ///
 /// `GatewayDetails$SoftwareVersion` targets the `Name` shape, whose modelled pattern is
@@ -3242,9 +3254,14 @@ pub fn arn_is_in_request_region(arn: &str, parts: &::http::request::Parts) -> bo
 }
 
 /// The region to mint an ARN in, falling back to [`DEFAULT_REGION`] for anything that
-/// would not satisfy the modelled ARN pattern's `[a-zA-Z-0-9]+` region segment.
+/// would not satisfy the modelled ARN pattern's `[a-zA-Z-0-9]+` region segment or would not
+/// fit inside a modelled ARN at all ([`MAX_ARN_REGION_LENGTH`]).
+///
+/// Both halves are the same question — whether an ARN built around this region is one the
+/// operations that TAKE such an ARN can resolve — so the length is settled here beside the
+/// character class rather than left to each minting path.
 pub fn arn_region(region: &str) -> String {
-    if is_arn_segment(region) {
+    if is_arn_segment(region) && region.len() <= MAX_ARN_REGION_LENGTH {
         region.to_string()
     } else {
         DEFAULT_REGION.to_string()

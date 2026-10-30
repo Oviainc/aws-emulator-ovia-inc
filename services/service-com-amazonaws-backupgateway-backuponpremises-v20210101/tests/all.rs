@@ -61,6 +61,8 @@ mod metadata_sync_publication_is_one_instant;
 mod metadata_sync_requires_property_mappings;
 #[path = "all/metadata_sync_restart_supersedes_the_pending_sync.rs"]
 mod metadata_sync_restart_supersedes_the_pending_sync;
+#[path = "all/minted_arn_region_is_bounded.rs"]
+mod minted_arn_region_is_bounded;
 #[path = "all/minted_hypervisor_identity.rs"]
 mod minted_hypervisor_identity;
 #[path = "all/minted_identity_is_never_reused.rs"]
