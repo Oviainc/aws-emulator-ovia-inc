@@ -180,31 +180,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The account this call acts on. An absent `AccountId` is the standalone
-        // call on the caller's own account; a PRESENT one names a member account
-        // of the caller's organization, which the caller's own account is not —
-        // so naming it is the modelled authorization refusal.
-        let account_id = match crate::state::target_account_id(input.account_id.as_deref()) {
-            Ok(account_id) => account_id,
-            Err(denied) => {
-                return Err(GetAlternateContactErrorModeled::AccessDeniedException(denied).into())
-            }
-        };
-        // A REPORTING operation: the store is read, never written.
+        // The account this call acts on, through the one composition of the
+        // account-target rule (`state::ComAmazonawsAccountAccountState::target_account`),
+        // decided BEFORE the contact is looked up: the caller's own account and
+        // an account this emulator holds no record of are both the modelled
+        // authorization refusal, because reporting "no contact of that type"
+        // for such an id would answer about an account the caller may not read
+        // at all. A REPORTING operation: the store is read, never written.
         let store = state.lock();
-        // The account is resolved BEFORE the contact is looked up: naming another
-        // account requires the caller to be an identity in the organization's
-        // management account with the named account a member of the same
-        // organization, which an account this emulator holds no record of is not.
-        // Reporting "no contact of that type" for such an id would answer about an
-        // account the caller may not read at all, so the refusal is the same
-        // `AccessDeniedException` every other read of this service answers with.
-        let Some(account) = store.account(&account_id) else {
-            return Err(GetAlternateContactErrorModeled::AccessDeniedException(
-                crate::state::account_not_accessible(&account_id),
-            )
-            .into());
-        };
+        let account = store
+            .target_account(input.account_id.as_deref())
+            .map_err(GetAlternateContactErrorModeled::AccessDeniedException)?;
 
         match account.alternate_contacts.get(&contact_type) {
             Some(record) => Ok(GetAlternateContactOutput {

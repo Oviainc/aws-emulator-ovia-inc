@@ -178,26 +178,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The account this call acts on. An absent `AccountId` is the standalone
-        // call on the caller's own account; a PRESENT one names a member account
-        // of the caller's organization, which the caller's own account is not —
-        // so naming it is the modelled authorization refusal.
-        let account_id = match crate::state::target_account_id(input.account_id.as_deref()) {
-            Ok(account_id) => account_id,
-            Err(denied) => {
-                return Err(GetRegionOptStatusErrorModeled::AccessDeniedException(denied).into())
-            }
-        };
+        // The account this call acts on, through the one composition of the
+        // account-target rule (`state::ComAmazonawsAccountAccountState::target_account`):
+        // the caller's own account and an account this emulator holds no record
+        // of are both the modelled authorization refusal. A REPORTING
+        // operation: the store is read, never written, so no record is created
+        // here and a later caller sees exactly what this one saw.
         let now = ::std::time::SystemTime::now();
-        // A REPORTING operation: the store is read, never written, so no record
-        // is created here and a later caller sees exactly what this one saw.
         let store = state.lock();
-        let Some(account) = store.account(&account_id) else {
-            return Err(GetRegionOptStatusErrorModeled::AccessDeniedException(
-                crate::state::account_not_accessible(&account_id),
-            )
-            .into());
-        };
+        let account = store
+            .target_account(input.account_id.as_deref())
+            .map_err(GetRegionOptStatusErrorModeled::AccessDeniedException)?;
         // The status as of now: a transition the CLOCK already owes reads as
         // its terminal status, whether or not anybody wrote it back.
         let status = account.region_opt_state(&input.region_name, kind, now);

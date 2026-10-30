@@ -171,39 +171,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // The account this call acts on. An absent `AccountId` is the standalone
-        // call on the caller's own account; a PRESENT one names a member account
-        // of the caller's organization, which the caller's own account is not —
-        // so naming it is the modelled authorization refusal.
-        let account_id = match crate::state::target_account_id(input.account_id.as_deref()) {
-            Ok(account_id) => account_id,
-            Err(denied) => {
-                return Err(
-                    GetPrimaryEmailUpdateStatusErrorModeled::AccessDeniedException(denied).into(),
-                )
-            }
-        };
-        // A REPORTING operation (`@readonly`): the store is read, never written, so
-        // no record is created here and a later caller sees exactly what this one
-        // saw. A completion the CLOCK already owes an accepted update is still
+        // The account this call acts on, through the one composition of the
+        // account-target rule (`state::ComAmazonawsAccountAccountState::target_account`):
+        // the caller's own account and an account this emulator holds no record
+        // of are both the modelled authorization refusal. A REPORTING operation
+        // (`@readonly`): the store is read, never written, so no record is
+        // created here and a later caller sees exactly what this one saw. A
+        // completion the CLOCK already owes an accepted update is still
         // reported from that instant on, because
         // `PrimaryEmailUpdate::settled_status` is a pure function of the record
         // and the clock.
         let store = state.lock();
-        let Some(account) = store.account(&account_id) else {
-            // Naming another account requires the caller to be an identity in the
-            // organization's management account, with the named account a member of
-            // the same organization. An account this emulator holds no record of is
-            // outside that organization, so the refusal is the modelled
-            // `AccessDeniedException` — the same rule `GetAccountInformation`
-            // applies.
-            return Err(
-                GetPrimaryEmailUpdateStatusErrorModeled::AccessDeniedException(
-                    crate::state::account_not_accessible(&account_id),
-                )
-                .into(),
-            );
-        };
+        let account = store
+            .target_account(input.account_id.as_deref())
+            .map_err(GetPrimaryEmailUpdateStatusErrorModeled::AccessDeniedException)?;
 
         let Some(update) = account.primary_email_update.as_ref() else {
             // No update has ever been started for this account, and `Status` is a

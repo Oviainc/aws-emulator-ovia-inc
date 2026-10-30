@@ -173,30 +173,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The account this call acts on. An absent `AccountId` is the standalone
-        // call on the caller's own account; a PRESENT one names a member account
-        // of the caller's organization, which the caller's own account is not —
-        // so naming it is the modelled authorization refusal.
-        let account_id = match crate::state::target_account_id(input.account_id.as_deref()) {
-            Ok(account_id) => account_id,
-            Err(denied) => {
-                return Err(GetContactInformationErrorModeled::AccessDeniedException(denied).into())
-            }
-        };
-        // A REPORTING operation: the store is read, never written, so no record is
-        // created here and a later caller sees exactly what this one saw.
+        // The account this call acts on, through the one composition of the
+        // account-target rule (`state::ComAmazonawsAccountAccountState::target_account`):
+        // the caller's own account and an account this emulator holds no record
+        // of are both the modelled authorization refusal. A REPORTING
+        // operation: the store is read, never written, so no record is created
+        // here and a later caller sees exactly what this one saw.
         let store = state.lock();
-        let Some(account) = store.account(&account_id) else {
-            // Same reasoning as `GetAccountInformation`: naming another account
-            // requires the caller to be an identity in the organization's
-            // management account, with the named account a member of the same
-            // organization — which an account this emulator holds no record of
-            // is not.
-            return Err(GetContactInformationErrorModeled::AccessDeniedException(
-                crate::state::account_not_accessible(&account_id),
-            )
-            .into());
-        };
+        let account = store
+            .target_account(input.account_id.as_deref())
+            .map_err(GetContactInformationErrorModeled::AccessDeniedException)?;
 
         let contact_information = account.contact_information.clone();
 

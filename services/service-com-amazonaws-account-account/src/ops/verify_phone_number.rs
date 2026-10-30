@@ -183,28 +183,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the boundary already, so what reaches here is a well-formed passcode;
         // WHICH passcode is the right one is this service's own rule.
         //
-        // The account this call acts on. An absent `AccountId` is the standalone
-        // call on the caller's own account; a PRESENT one names a member account
-        // of the caller's organization, which the caller's own account is not —
-        // so naming it is the modelled authorization refusal, decided before the
-        // passcode is looked at.
-        let account_id = match crate::state::target_account_id(input.account_id.as_deref()) {
-            Ok(account_id) => account_id,
-            Err(denied) => {
-                return Err(VerifyPhoneNumberErrorModeled::AccessDeniedException(denied).into())
-            }
-        };
+        // The account this call acts on, through the one composition of the
+        // account-target rule (`state::ComAmazonawsAccountAccountState::target_account_mut`),
+        // decided before the passcode is looked at: verifying acts on the
+        // primary contact of an account that already exists, so this call never
+        // creates a record, and the caller's own account and an account this
+        // emulator holds no record of are both the modelled authorization
+        // refusal.
         let mut store = state.lock();
-        // Verifying acts on the primary contact of an account that already
-        // exists, so this call never creates a record: an id this emulator holds
-        // no record of earns the `AccessDeniedException` a call naming an account
-        // outside the caller's organization does.
-        let Some(account) = store.existing_account_mut(&account_id) else {
-            return Err(VerifyPhoneNumberErrorModeled::AccessDeniedException(
-                crate::state::account_not_accessible(&account_id),
-            )
-            .into());
-        };
+        let account = store
+            .target_account_mut(input.account_id.as_deref())
+            .map_err(VerifyPhoneNumberErrorModeled::AccessDeniedException)?;
 
         // Nothing to evaluate the submitted passcode against: either no passcode
         // was ever sent to the number now in the primary contact information, or

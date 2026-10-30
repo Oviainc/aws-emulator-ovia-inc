@@ -199,29 +199,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The account this call acts on. An absent `AccountId` is the standalone
-        // call on the caller's own account; a PRESENT one names a member account
-        // of the caller's organization, which the caller's own account is not —
-        // so naming it is the modelled authorization refusal, decided before the
-        // contact is looked up.
-        let account_id = match crate::state::target_account_id(input.account_id.as_deref()) {
-            Ok(account_id) => account_id,
-            Err(denied) => {
-                return Err(DeleteAlternateContactErrorModeled::AccessDeniedException(denied).into())
-            }
-        };
+        // The account this call acts on, through the one composition of the
+        // account-target rule (`state::ComAmazonawsAccountAccountState::target_account_mut`),
+        // decided before the contact is looked up: deleting a contact acts on
+        // an account that already exists, so this call never creates a record,
+        // and the caller's own account and an account this emulator holds no
+        // record of are both the modelled authorization refusal rather than a
+        // report about that account's contacts.
         let mut store = state.lock();
-        // Deleting a contact acts on an account that already exists, so this call
-        // never creates a record: the account is resolved BEFORE the contact is
-        // looked up, and an id this emulator holds no record of earns the same
-        // `AccessDeniedException` a call naming an account outside the caller's
-        // organization does, rather than a report about that account's contacts.
-        let Some(account) = store.existing_account_mut(&account_id) else {
-            return Err(DeleteAlternateContactErrorModeled::AccessDeniedException(
-                crate::state::account_not_accessible(&account_id),
-            )
-            .into());
-        };
+        let account = store
+            .target_account_mut(input.account_id.as_deref())
+            .map_err(DeleteAlternateContactErrorModeled::AccessDeniedException)?;
 
         if account.alternate_contacts.remove(&contact_type).is_none() {
             // Nothing of that type was stored, so there was no resource to delete —

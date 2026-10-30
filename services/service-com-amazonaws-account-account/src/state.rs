@@ -22,7 +22,15 @@
 //! [`::emulator_server::emulator_account_id`]. Present, it names a MEMBER
 //! account of the caller's organization, which the caller's own account is not:
 //! that is [`target_account_id`], the one resolution every operation taking an
-//! account id goes through.
+//! account id goes through. An operation that acts on an account which must
+//! ALREADY exist refuses an id this emulator holds no record of in one place
+//! too ([`ComAmazonawsAccountAccountState::accessible_account`], and
+//! [`ComAmazonawsAccountAccountState::accessible_account_mut`] where the record
+//! is then changed), and the COMPOSITION of the two —
+//! [`ComAmazonawsAccountAccountState::target_account`] for a read,
+//! [`ComAmazonawsAccountAccountState::target_account_mut`] for a write that
+//! must not create a record — is what those handlers call, keeping only the
+//! mapping into their own operation's error enum.
 //!
 //! The GovCloud slice hangs off that record too:
 //! [`Account::gov_cloud_account`] holds the GovCloud account linked to the
@@ -1260,6 +1268,71 @@ impl ComAmazonawsAccountAccountState {
     /// record is a refusal rather than a new account.
     pub fn existing_account_mut(&mut self, account_id: &str) -> Option<&mut Account> {
         self.accounts.get_mut(account_id)
+    }
+
+    /// The account `account_id` names, or the refusal for an id this emulator
+    /// holds no record of — the second half of the account-target composition,
+    /// stated once.
+    ///
+    /// Naming another account requires the caller to be an identity in the
+    /// organization's management account with the named account a member of the
+    /// same organization, which an account this emulator holds no record of is
+    /// not: the modelled refusal is [`account_not_accessible`], never a report
+    /// about an account the caller may not read. Nothing is written, so a read
+    /// leaves the store exactly as it found it.
+    pub fn accessible_account(
+        &self,
+        account_id: &str,
+    ) -> Result<&Account, AccessDeniedException> {
+        self.account(account_id)
+            .ok_or_else(|| account_not_accessible(account_id))
+    }
+
+    /// The same half as [`accessible_account`](Self::accessible_account), for a
+    /// MUTATING call that must not bring a record into existence: the record is
+    /// handed back mutably, and an id naming no record is that same refusal
+    /// rather than a new account.
+    pub fn accessible_account_mut(
+        &mut self,
+        account_id: &str,
+    ) -> Result<&mut Account, AccessDeniedException> {
+        self.existing_account_mut(account_id)
+            .ok_or_else(|| account_not_accessible(account_id))
+    }
+
+    /// The account a call TARGETS: the account-id member resolved by
+    /// [`target_account_id`], then
+    /// [`accessible_account`](Self::accessible_account) — the COMPOSITION every
+    /// operation acting on an account that must already exist goes through.
+    ///
+    /// `Err` carries this service's two account-target refusals, both of them
+    /// the modelled `AccessDeniedException`: the member named the caller's own
+    /// account ([`cannot_target_own_account`]), or it named an account this
+    /// emulator holds no record of ([`account_not_accessible`]). The refusal is
+    /// decided HERE, before anything about that account's sub-resources is
+    /// looked at, and a caller keeps only the mapping into its own operation's
+    /// error enum.
+    ///
+    /// This is the REPORTING form: the record is handed back for reading, and
+    /// nothing is written.
+    pub fn target_account(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<&Account, AccessDeniedException> {
+        self.accessible_account(&target_account_id(requested)?)
+    }
+
+    /// The same composition as [`target_account`](Self::target_account), built
+    /// on [`accessible_account_mut`](Self::accessible_account_mut): the record
+    /// is handed back mutably, for a call that CHANGES an account which must
+    /// already exist and so must not bring one into existence (unlike
+    /// [`account_mut`](Self::account_mut), which creates on first touch).
+    pub fn target_account_mut(
+        &mut self,
+        requested: Option<&str>,
+    ) -> Result<&mut Account, AccessDeniedException> {
+        let account_id = target_account_id(requested)?;
+        self.accessible_account_mut(&account_id)
     }
 }
 

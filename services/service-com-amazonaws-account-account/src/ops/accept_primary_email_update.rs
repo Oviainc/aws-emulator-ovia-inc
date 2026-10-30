@@ -192,15 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account can't specify its own `AccountId`. The member is required
         // here, so it always names an account — and a named account is
         // resolved by the one resolution every operation taking an account id
-        // goes through, which is what refuses the caller's own.
-        let account_id = match crate::state::target_account_id(Some(&input.account_id)) {
-            Ok(account_id) => account_id,
-            Err(denied) => {
-                return Err(
-                    AcceptPrimaryEmailUpdateErrorModeled::AccessDeniedException(denied).into(),
-                )
-            }
-        };
+        // goes through (`state::target_account_id`), which is what refuses the
+        // caller's own.
+        let account_id = crate::state::target_account_id(Some(&input.account_id))
+            .map_err(AcceptPrimaryEmailUpdateErrorModeled::AccessDeniedException)?;
 
         // The address presented here is the one that becomes the account's root
         // user email address, so it is held to the same syntax
@@ -231,16 +226,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let address_in_use =
             store.primary_email_in_use_by_other(&input.primary_email, &account_id);
 
-        // This operation acts on an update that already exists, so it creates
-        // no account record: an account this emulator has never been told about
-        // is outside the caller's organization, which is the same refusal
-        // `GetPrimaryEmailUpdateStatus` applies.
-        let Some(account) = store.existing_account_mut(&account_id) else {
-            return Err(AcceptPrimaryEmailUpdateErrorModeled::AccessDeniedException(
-                crate::state::account_not_accessible(&account_id),
-            )
-            .into());
-        };
+        // The other half of the account-target rule, stated once in
+        // `state::ComAmazonawsAccountAccountState::accessible_account_mut`:
+        // this operation acts on an update that already exists, so it creates
+        // no account record, and an account this emulator has never been told
+        // about is the modelled authorization refusal.
+        let account = store
+            .accessible_account_mut(&account_id)
+            .map_err(AcceptPrimaryEmailUpdateErrorModeled::AccessDeniedException)?;
 
         let Some(update) = account.primary_email_update.as_mut() else {
             // Nothing originated from `StartPrimaryEmailUpdate` for this

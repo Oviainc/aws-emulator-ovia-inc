@@ -240,13 +240,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The account this call acts on. An absent `AccountId` is the standalone
         // call on the caller's own account; a PRESENT one names a member account
         // of the caller's organization, which the caller's own account is not —
-        // so naming it is the modelled authorization refusal.
-        let account_id = match crate::state::target_account_id(input.account_id.as_deref()) {
-            Ok(account_id) => account_id,
-            Err(denied) => {
-                return Err(ListRegionsErrorModeled::AccessDeniedException(denied).into())
-            }
-        };
+        // so naming it is the modelled authorization refusal
+        // (`state::target_account_id`), decided before the request's paging is
+        // read, exactly as it was before.
+        let account_id = crate::state::target_account_id(input.account_id.as_deref())
+            .map_err(ListRegionsErrorModeled::AccessDeniedException)?;
+
         let now = ::std::time::SystemTime::now();
         let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
             .unwrap_or(MAX_PAGE_SIZE as usize);
@@ -257,21 +256,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?),
         };
 
-        // A REPORTING operation: the store is read, never written, so no record is
-        // created here and a later caller sees exactly what this one saw.
+        // The other half of the account-target rule, stated once in
+        // `state::ComAmazonawsAccountAccountState::accessible_account`: an id
+        // this emulator holds no record of is the same modelled authorization
+        // refusal, decided before the Region list is projected. A REPORTING
+        // operation: the store is read, never written, so no record is created
+        // here and a later caller sees exactly what this one saw.
         let store = state.lock();
-        let Some(account) = store.account(&account_id) else {
-            // Naming another account requires the caller to be an identity in the
-            // organization's management account, with the named account a member of
-            // the same organization. An account this emulator holds no record of is
-            // outside that organization, and the operation models no "not found":
-            // the modelled refusal for an account the caller may not read is
-            // `AccessDeniedException`.
-            return Err(ListRegionsErrorModeled::AccessDeniedException(
-                crate::state::account_not_accessible(&account_id),
-            )
-            .into());
-        };
+        let account = store
+            .accessible_account(&account_id)
+            .map_err(ListRegionsErrorModeled::AccessDeniedException)?;
 
         // The filter is applied BEFORE the page is cut, so a page carries up to
         // `MaxResults` MATCHING Regions rather than up to `MaxResults` candidates. An

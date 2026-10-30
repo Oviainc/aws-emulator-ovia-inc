@@ -17,6 +17,8 @@ mod absent_subresource_is_not_found;
 mod account_information_wire_fidelity;
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/account_target_composition_is_shared.rs"]
+mod account_target_composition_is_shared;
 #[path = "all/account_target_resolution_is_shared.rs"]
 mod account_target_resolution_is_shared;
 #[path = "all/alternate_contact_delete_precedence.rs"]
