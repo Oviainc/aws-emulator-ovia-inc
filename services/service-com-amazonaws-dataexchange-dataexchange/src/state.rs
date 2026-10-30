@@ -447,23 +447,41 @@ pub fn store_unavailable() -> InternalServerException {
     }
 }
 
+/// The whole `Message` of a `ResourceNotFoundException`, for every resource kind and
+/// every lookup site.
+///
+/// The sentence has no variable part: the model gives the exception its own
+/// `ResourceId` ("The unique identifier for the resource that couldn't be found.")
+/// and `ResourceType` ("The type of resource that couldn't be found.") members, so
+/// the identity of the missing resource travels in those members and never in the
+/// text. Every constructor below composes the same sentence and differs only in the
+/// identity it reports.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource was not found.";
+
+/// The modelled 404 for an identifier that addresses no stored resource of
+/// `resource_type`: the fixed [`RESOURCE_NOT_FOUND_MESSAGE`], with the identifier the
+/// caller wrote in `ResourceId` and the kind the route addresses in `ResourceType`.
+///
+/// `resource_type` is a value of the model's `ResourceType` enum
+/// (`ASSET | DATA_GRANT | DATA_SET | EVENT_ACTION | JOB | REVISION`), or `None` where
+/// the request named no kind this service can state.
+fn resource_not_found(resource_id: &str, resource_type: Option<&str>) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+        resource_id: Some(resource_id.to_string()),
+        resource_type: resource_type.map(str::to_string),
+    }
+}
+
 /// The modelled 404 for a well-formed `DataSetId` that names no stored data set.
 pub fn data_set_not_found(data_set_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!("The data set {data_set_id} couldn't be found."),
-        resource_id: Some(data_set_id.to_string()),
-        resource_type: Some(RESOURCE_TYPE_DATA_SET.to_string()),
-    }
+    resource_not_found(data_set_id, Some(RESOURCE_TYPE_DATA_SET))
 }
 
 /// The modelled 404 for a well-formed `RevisionId` that names no revision of
 /// `data_set_id`.
 pub fn revision_not_found(revision_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!("The revision {revision_id} couldn't be found."),
-        resource_id: Some(revision_id.to_string()),
-        resource_type: Some(RESOURCE_TYPE_REVISION.to_string()),
-    }
+    resource_not_found(revision_id, Some(RESOURCE_TYPE_REVISION))
 }
 
 /// The modelled 404 for an `EventActionId` that names no stored event action.
@@ -472,20 +490,12 @@ pub fn revision_not_found(revision_id: &str) -> ResourceNotFoundException {
 /// `Id`), so there is no malformed-id refusal in front of this one: any id that
 /// addresses no stored event action is this 404.
 pub fn event_action_not_found(event_action_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!("The event action {event_action_id} couldn't be found."),
-        resource_id: Some(event_action_id.to_string()),
-        resource_type: Some(RESOURCE_TYPE_EVENT_ACTION.to_string()),
-    }
+    resource_not_found(event_action_id, Some(RESOURCE_TYPE_EVENT_ACTION))
 }
 
 /// The modelled 404 for a well-formed `JobId` that names no stored job.
 pub fn job_not_found(job_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!("The job {job_id} couldn't be found."),
-        resource_id: Some(job_id.to_string()),
-        resource_type: Some(RESOURCE_TYPE_JOB.to_string()),
-    }
+    resource_not_found(job_id, Some(RESOURCE_TYPE_JOB))
 }
 
 /// The modelled 404 for a tagging `ResourceArn` that is an ARN but addresses no
@@ -496,11 +506,7 @@ pub fn job_not_found(job_id: &str) -> ResourceNotFoundException {
 /// addresses nothing stored names no resource whose kind this service can state. The
 /// id-addressed 404s above report both, since there the kind is the route's.
 pub fn tagged_resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!("The resource {resource_arn} couldn't be found."),
-        resource_id: Some(resource_arn.to_string()),
-        resource_type: None,
-    }
+    resource_not_found(resource_arn, None)
 }
 
 /// The modelled 409 for a request that cannot hold against the current state of

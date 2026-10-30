@@ -45,7 +45,7 @@ const TAGS_ON_THE_WIRE: &str = "tags";
 /// Percent-encode one `@httpLabel` value the way an SDK does: the whole ARN is ONE
 /// path segment, so its `:` and `/` have to travel as `%3A` and `%2F` or the request
 /// addresses a different route.
-fn percent_encode(value: &str) -> String {
+pub(crate) fn percent_encode(value: &str) -> String {
     value
         .replace('%', "%25")
         .replace(':', "%3A")

@@ -21,6 +21,8 @@ mod event_actions;
 mod job_lifecycle;
 #[path = "all/jobs.rs"]
 mod jobs;
+#[path = "all/not_found_message.rs"]
+mod not_found_message;
 #[path = "all/optional_page_size.rs"]
 mod optional_page_size;
 #[path = "all/resource_tags.rs"]
