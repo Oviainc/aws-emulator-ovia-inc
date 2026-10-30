@@ -1,0 +1,850 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end tests for `CreateCustomKeyStore`, driven over the wire through the
+//! shared [`super::harness`].
+//!
+//! The rule under test: `CreateCustomKeyStore` persists ONE custom key store built
+//! from the request — the CloudHSM cluster, its trust anchor certificate and its
+//! kmsuser password for a key store whose `CustomKeyStoreType` is `AWS_CLOUDHSM`
+//! (the default), the external key store proxy's endpoint, API path, connectivity
+//! and authentication credential for an `EXTERNAL_KEY_STORE` one — mints its id,
+//! leaves it `DISCONNECTED` because it "has never been connected", and answers that
+//! id, so every later reader of the family serves the record this call left behind.
+//! A request that cannot produce a key store persists NOTHING and is refused: a
+//! property the asked-for type does not carry, or one that belongs to the other
+//! type, is an invalid request; a CloudHSM cluster this account does not hold, one
+//! that is not active, one whose subnets do not span two Availability Zones and one
+//! that already backs a key store of the account are each that cluster's own
+//! modelled refusal; a friendly name another key store of the account holds, and a
+//! proxy endpoint, proxy URI or Amazon VPC endpoint service another external key
+//! store of the Region holds, are each that collision's own modelled refusal.
+//!
+//! Every assertion is about that rule over a TABLE, whose rows differ in what backs
+//! the key store (a CloudHSM cluster, an external key store proxy on a public
+//! endpoint, one behind a VPC endpoint service), in whether the type is named or
+//! left to its default, in whether the endpoint service's owner is given or defaults
+//! to the calling account, in the friendly name (the shortest and the longest the
+//! modelled length admits), in the Region the key store belongs to, in which
+//! required property is withheld, and in which already-taken value the request
+//! reuses.
+//!
+//! A CloudHSM cluster is NOT a KMS resource: the clusters an account holds are the
+//! CloudHSM service's own records, so the rows that need one create it through
+//! CloudHSM's own `CreateCluster` with that service mounted beside this one over the
+//! same engine. `InitializeCluster` — the operation that takes a cluster to `ACTIVE`
+//! — is still a scaffold stub with its own issue, so a row that needs an ACTIVE
+//! cluster activates it through the CloudHSM store's own accessor, the way
+//! initializing it would.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
+
+use service_com_amazonaws_kms_trentservice::state::{
+    service_state, CUSTOM_KEY_STORE_CONNECTION_SPAN,
+};
+
+use super::harness::{call, error_code, error_message, is_lower_hex, ok, ok_in, REGION};
+
+/// The Region a row belongs to when the row is about regional scoping.
+const OTHER_REGION: &str = "eu-west-2";
+
+/// The shortest and longest friendly name `CustomKeyStoreNameType` admits
+/// (`smithy_query(query="shape",shape="CustomKeyStoreNameType")` — `@length(1..256)`).
+const MIN_NAME_LEN: usize = 1;
+/// See [`MIN_NAME_LEN`].
+const MAX_NAME_LEN: usize = 256;
+
+/// The `ClusterState` of a CloudHSM cluster that has finished initializing and is
+/// serving, from `smithy_query(query="shape",shape="ClusterState",
+/// model_path="services/service-com-amazonaws-cloudhsmv2-baldrapiservice/smithy-model/com-amazonaws-cloudhsmv2-baldrapiservice.json")`.
+const CLUSTER_STATE_ACTIVE: &str = "ACTIVE";
+
+/// A trust anchor certificate, as a caller sends the content of its `customerCA.crt`
+/// file. `TrustAnchorCertificateType` is modelled `@length(1..5000)` with no pattern.
+const TRUST_ANCHOR: &str = "-----BEGIN CERTIFICATE-----\nY3JlYXRl\n-----END CERTIFICATE-----";
+
+/// The kmsuser password, inside `KeyStorePasswordType`'s modelled `@length(7..32)`.
+const KEY_STORE_PASSWORD: &str = "kmsuser-password";
+
+/// An `XksProxyAuthenticationCredential` access key id: 20..30 characters of
+/// `^[A-Z2-7]+$` (`smithy_query(query="shape",shape="XksProxyAuthenticationCredentialType")`).
+const PROXY_ACCESS_KEY_ID: &str = "ABCDEFGHIJKLMNOPQRST";
+
+/// Its raw secret access key: 43..64 characters of `^[a-zA-Z0-9\/+=]+$` (the same
+/// shape). A credential this emulator never reports back.
+const PROXY_SECRET: &str = "c2VjcmV0L3Byb3h5K2NyZWRlbnRpYWw9PTAxMjM0NTY3ODk=";
+
+/// Long enough past [`CUSTOM_KEY_STORE_CONNECTION_SPAN`] that a connection the call
+/// started has certainly fallen due.
+fn past_the_span() -> Duration {
+    CUSTOM_KEY_STORE_CONNECTION_SPAN + Duration::from_millis(250)
+}
+
+/// A router carrying this service and the CloudHSM service over ONE shared engine —
+/// the assembly a row that names a CloudHSM cluster needs, since the clusters of the
+/// account are that service's own state.
+fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let (mut router, engine) = super::harness::router_with_engine();
+    router.register_service(
+        service_com_amazonaws_cloudhsmv2_baldrapiservice::EmulatedService::new(Arc::clone(&engine)),
+    );
+    (router, engine)
+}
+
+/// Create a CloudHSM cluster of this account over `subnets` private subnets —
+/// CloudHSM places one Availability Zone per subnet — through CloudHSM's OWN
+/// `CreateCluster`, and answer its cluster id.
+async fn cloud_hsm_cluster(router: &MultiServiceRouter, case: &str, subnets: usize) -> String {
+    let subnet_ids: Vec<String> = (0..subnets)
+        .map(|index| format!("subnet-{:08x}", 0x0abc_1000_u32 + index as u32))
+        .collect();
+    let body = json!({"HsmType": "hsm1.medium", "SubnetIds": subnet_ids});
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://cloudhsmv2.{REGION}.amazonaws.com/"))
+        .header("content-type", "application/x-amz-json-1.1")
+        .header("x-amz-target", "BaldrApiService.CreateCluster")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIDEMULATOR/20260101/{REGION}/cloudhsm/aws4_request, \
+                 SignedHeaders=host;x-amz-target, Signature=0000"
+            ),
+        )
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(&body).expect("the request body serializes"),
+        ))
+        .expect("the request builds");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let payload: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+    assert_eq!(
+        status, 200,
+        "case {case}: cloudhsm:CreateCluster must answer HTTP 200, got {status} with {payload}"
+    );
+    payload["Cluster"]["ClusterId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: expected a ClusterId in {payload}"))
+        .to_string()
+}
+
+/// Take the cluster `cluster_id` to [`CLUSTER_STATE_ACTIVE`] in the CloudHSM store —
+/// what `InitializeCluster`, still a scaffold stub with its own issue, would do — so
+/// the cluster is one that can back a CloudHSM key store.
+fn activate(engine: &Arc<engine::InMemoryEngine>, case: &str, cluster_id: &str) {
+    let state = service_com_amazonaws_cloudhsmv2_baldrapiservice::state::service_state(&**engine)
+        .expect("the CloudHSM state store is reachable");
+    let mut state = state.lock();
+    let cluster = state
+        .clusters
+        .get_mut(cluster_id)
+        .unwrap_or_else(|| panic!("case {case}: the CloudHSM store holds {cluster_id}"));
+    cluster.state = CLUSTER_STATE_ACTIVE.to_string();
+    cluster.state_message = None;
+    cluster.pending = None;
+}
+
+/// A CloudHSM cluster of the account that is active and spans two Availability
+/// Zones: a cluster that can back a CloudHSM key store.
+async fn active_cluster(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    case: &str,
+) -> String {
+    let cluster_id = cloud_hsm_cluster(router, case, 2).await;
+    activate(engine, case, &cluster_id);
+    cluster_id
+}
+
+/// A `CreateCustomKeyStore` request for a CloudHSM key store over `cluster_id`.
+fn cloud_hsm_request(name: &str, cluster_id: &str) -> Value {
+    json!({
+        "CustomKeyStoreName": name,
+        "CustomKeyStoreType": "AWS_CLOUDHSM",
+        "CloudHsmClusterId": cluster_id,
+        "KeyStorePassword": KEY_STORE_PASSWORD,
+        "TrustAnchorCertificate": TRUST_ANCHOR,
+    })
+}
+
+/// A `CreateCustomKeyStore` request for an external key store on a public endpoint.
+fn public_endpoint_request(name: &str, uri_endpoint: &str, uri_path: &str) -> Value {
+    json!({
+        "CustomKeyStoreName": name,
+        "CustomKeyStoreType": "EXTERNAL_KEY_STORE",
+        "XksProxyConnectivity": "PUBLIC_ENDPOINT",
+        "XksProxyUriEndpoint": uri_endpoint,
+        "XksProxyUriPath": uri_path,
+        "XksProxyAuthenticationCredential": {
+            "AccessKeyId": PROXY_ACCESS_KEY_ID,
+            "RawSecretAccessKey": PROXY_SECRET,
+        },
+    })
+}
+
+/// A `CreateCustomKeyStore` request for an external key store behind a VPC endpoint
+/// service.
+fn vpc_endpoint_request(
+    name: &str,
+    uri_endpoint: &str,
+    uri_path: &str,
+    service_name: &str,
+) -> Value {
+    json!({
+        "CustomKeyStoreName": name,
+        "CustomKeyStoreType": "EXTERNAL_KEY_STORE",
+        "XksProxyConnectivity": "VPC_ENDPOINT_SERVICE",
+        "XksProxyUriEndpoint": uri_endpoint,
+        "XksProxyUriPath": uri_path,
+        "XksProxyVpcEndpointServiceName": service_name,
+        "XksProxyAuthenticationCredential": {
+            "AccessKeyId": PROXY_ACCESS_KEY_ID,
+            "RawSecretAccessKey": PROXY_SECRET,
+        },
+    })
+}
+
+/// Create a custom key store in `region`, requiring success, and answer the id it
+/// minted — checked to have the form this service mints: the `cks-` prefix and 16
+/// lowercase hexadecimal characters, inside `CustomKeyStoreIdType`'s `@length(1..64)`.
+async fn created_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    request: &Value,
+) -> String {
+    let answer = ok_in(router, region, "CreateCustomKeyStore", request).await;
+    let id = answer["CustomKeyStoreId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: expected a CustomKeyStoreId in {answer}"))
+        .to_string();
+    assert_eq!(
+        answer.as_object().map(serde_json::Map::len),
+        Some(1),
+        "case {case}: the answer carries the new key store's id alone, got {answer}"
+    );
+    let body = id.strip_prefix("cks-").unwrap_or_default();
+    assert!(
+        body.len() == 16 && is_lower_hex(body) && id.len() <= 64,
+        "case {case}: expected a minted custom key store id, got {id:?}"
+    );
+    id
+}
+
+/// [`created_in`], in [`REGION`].
+async fn created(router: &MultiServiceRouter, case: &str, request: &Value) -> String {
+    created_in(router, REGION, case, request).await
+}
+
+/// The one entry `DescribeCustomKeyStores` reports for `custom_key_store_id` in
+/// `region`, without its `CreationDate` (which the clock, not the row, decides) —
+/// having checked the entry carries one.
+async fn entry_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    custom_key_store_id: &str,
+) -> Value {
+    let answer = ok_in(
+        router,
+        region,
+        "DescribeCustomKeyStores",
+        &json!({"CustomKeyStoreId": custom_key_store_id}),
+    )
+    .await;
+    let entries = answer["CustomKeyStores"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case}: expected a CustomKeyStores list in {answer}"))
+        .clone();
+    assert_eq!(
+        entries.len(),
+        1,
+        "case {case}: the created key store is reported exactly once, got {entries:?}"
+    );
+    let mut members = entries[0]
+        .as_object()
+        .unwrap_or_else(|| panic!("case {case}: expected a key store entry, got {}", entries[0]))
+        .clone();
+    let creation_date = members.remove("CreationDate").unwrap_or(Value::Null);
+    assert!(
+        creation_date.as_f64().is_some_and(|seconds| seconds > 0.0),
+        "case {case}: expected a CreationDate timestamp, got {}",
+        entries[0]
+    );
+    Value::Object(members)
+}
+
+/// [`entry_in`], in [`REGION`].
+async fn entry(router: &MultiServiceRouter, case: &str, custom_key_store_id: &str) -> Value {
+    entry_in(router, REGION, case, custom_key_store_id).await
+}
+
+/// How many custom key stores the store holds, over every Region — what a refusal
+/// must leave exactly as it was.
+fn held(engine: &Arc<engine::InMemoryEngine>) -> usize {
+    let state = service_state(&**engine).expect("the KMS state store is reachable");
+    let held = state.lock();
+    held.custom_key_stores.len()
+}
+
+/// One row of the success table: the request, and the entry the reader must report
+/// for the key store it created.
+struct Row {
+    case: &'static str,
+    request: Value,
+    expected: Value,
+}
+
+/// A created custom key store is the record the request describes: the reader reports
+/// exactly the members a key store of that type has, it has never been connected, and
+/// the whole list is what the creates left, in creation order.
+#[tokio::test]
+async fn create_custom_key_store_persists_the_key_store_the_request_describes() {
+    let (router, engine) = emulator();
+    let named_cluster = active_cluster(&router, &engine, "a CloudHSM key store").await;
+    let default_cluster = active_cluster(&router, &engine, "a CloudHSM key store by default").await;
+    let shortest = "n".repeat(MIN_NAME_LEN);
+    let longest = "n".repeat(MAX_NAME_LEN);
+    let account = engine::emulator_account_id();
+
+    let rows = vec![
+        Row {
+            case: "a CloudHSM key store, with its type named",
+            request: cloud_hsm_request("hsm-named", &named_cluster),
+            expected: json!({
+                "CustomKeyStoreName": "hsm-named",
+                "CustomKeyStoreType": "AWS_CLOUDHSM",
+                "CloudHsmClusterId": named_cluster,
+                "TrustAnchorCertificate": TRUST_ANCHOR,
+                "ConnectionState": "DISCONNECTED",
+            }),
+        },
+        Row {
+            // "The default value is AWS_CLOUDHSM. For a custom key store backed by an
+            // CloudHSM cluster, omit the parameter or enter AWS_CLOUDHSM."
+            case: "a CloudHSM key store, with its type left to the default",
+            request: json!({
+                "CustomKeyStoreName": shortest,
+                "CloudHsmClusterId": default_cluster,
+                "KeyStorePassword": KEY_STORE_PASSWORD,
+                "TrustAnchorCertificate": TRUST_ANCHOR,
+            }),
+            expected: json!({
+                "CustomKeyStoreName": shortest,
+                "CustomKeyStoreType": "AWS_CLOUDHSM",
+                "CloudHsmClusterId": default_cluster,
+                "TrustAnchorCertificate": TRUST_ANCHOR,
+                "ConnectionState": "DISCONNECTED",
+            }),
+        },
+        Row {
+            case: "an external key store on a public endpoint",
+            request: public_endpoint_request(&longest, "https://xks.example.com", "/kms/xks/v1"),
+            expected: json!({
+                "CustomKeyStoreName": longest,
+                "CustomKeyStoreType": "EXTERNAL_KEY_STORE",
+                "ConnectionState": "DISCONNECTED",
+                "XksProxyConfiguration": {
+                    "Connectivity": "PUBLIC_ENDPOINT",
+                    "AccessKeyId": PROXY_ACCESS_KEY_ID,
+                    "UriEndpoint": "https://xks.example.com",
+                    "UriPath": "/kms/xks/v1",
+                },
+            }),
+        },
+        Row {
+            // Two proxies on a PUBLIC_ENDPOINT may share an endpoint: it is the
+            // COMBINED endpoint and API path that has to be unique.
+            case: "an external key store sharing a public endpoint on its own API path",
+            request: public_endpoint_request(
+                "xks-public-shared",
+                "https://xks.example.com",
+                "/prefix/kms/xks/v2",
+            ),
+            expected: json!({
+                "CustomKeyStoreName": "xks-public-shared",
+                "CustomKeyStoreType": "EXTERNAL_KEY_STORE",
+                "ConnectionState": "DISCONNECTED",
+                "XksProxyConfiguration": {
+                    "Connectivity": "PUBLIC_ENDPOINT",
+                    "AccessKeyId": PROXY_ACCESS_KEY_ID,
+                    "UriEndpoint": "https://xks.example.com",
+                    "UriPath": "/prefix/kms/xks/v2",
+                },
+            }),
+        },
+        Row {
+            case: "an external key store behind a VPC endpoint service, with its owner given",
+            request: {
+                let mut request = vpc_endpoint_request(
+                    "xks-vpce-owned",
+                    "https://xks-vpce.example.com",
+                    "/kms/xks/v1",
+                    "com.amazonaws.vpce.us-east-1.vpce-svc-0abcdef1234567890",
+                );
+                request["XksProxyVpcEndpointServiceOwner"] = json!("111122223333");
+                request
+            },
+            expected: json!({
+                "CustomKeyStoreName": "xks-vpce-owned",
+                "CustomKeyStoreType": "EXTERNAL_KEY_STORE",
+                "ConnectionState": "DISCONNECTED",
+                "XksProxyConfiguration": {
+                    "Connectivity": "VPC_ENDPOINT_SERVICE",
+                    "AccessKeyId": PROXY_ACCESS_KEY_ID,
+                    "UriEndpoint": "https://xks-vpce.example.com",
+                    "UriPath": "/kms/xks/v1",
+                    "VpcEndpointServiceName":
+                        "com.amazonaws.vpce.us-east-1.vpce-svc-0abcdef1234567890",
+                    "VpcEndpointServiceOwner": "111122223333",
+                },
+            }),
+        },
+        Row {
+            // "If not provided, the Amazon Web Services account ID calling the action
+            // will be used."
+            case: "an external key store behind a VPC endpoint service of the calling account",
+            request: vpc_endpoint_request(
+                "xks-vpce-default-owner",
+                "https://xks-vpce-two.example.com",
+                "/example/kms/xks/v12",
+                "eu.amazonaws.vpce.eu-west-2.vpce-svc-1234567890abcdef0",
+            ),
+            expected: json!({
+                "CustomKeyStoreName": "xks-vpce-default-owner",
+                "CustomKeyStoreType": "EXTERNAL_KEY_STORE",
+                "ConnectionState": "DISCONNECTED",
+                "XksProxyConfiguration": {
+                    "Connectivity": "VPC_ENDPOINT_SERVICE",
+                    "AccessKeyId": PROXY_ACCESS_KEY_ID,
+                    "UriEndpoint": "https://xks-vpce-two.example.com",
+                    "UriPath": "/example/kms/xks/v12",
+                    "VpcEndpointServiceName":
+                        "eu.amazonaws.vpce.eu-west-2.vpce-svc-1234567890abcdef0",
+                    "VpcEndpointServiceOwner": account,
+                },
+            }),
+        },
+    ];
+
+    let mut ids: Vec<String> = Vec::new();
+    for row in &rows {
+        let id = created(&router, row.case, &row.request).await;
+        assert!(
+            !ids.contains(&id),
+            "case {}: every key store gets its own id, got {id} again",
+            row.case
+        );
+        let mut expected = row.expected.clone();
+        expected["CustomKeyStoreId"] = json!(id);
+        assert_eq!(
+            entry(&router, row.case, &id).await,
+            expected,
+            "case {}: the reader must serve exactly the key store the request described",
+            row.case
+        );
+        ids.push(id);
+    }
+
+    // The list of the Region is what the creates left, in creation order.
+    let answer = ok(&router, "DescribeCustomKeyStores", &json!({})).await;
+    let listed: Vec<String> = answer["CustomKeyStores"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case every created key store: expected a list in {answer}"))
+        .iter()
+        .filter_map(|entry| entry["CustomKeyStoreId"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        listed, ids,
+        "case every created key store: the reader lists the created key stores in creation order"
+    );
+
+    // A custom key store is a regional resource: the same name is free in another
+    // Region's endpoint only if the account does not hold it, and a key store created
+    // there is served there.
+    let elsewhere = created_in(
+        &router,
+        OTHER_REGION,
+        "a key store of another Region",
+        &public_endpoint_request(
+            "xks-elsewhere",
+            "https://xks-elsewhere.example.com",
+            "/kms/xks/v1",
+        ),
+    )
+    .await;
+    let (status, payload) = call(
+        &router,
+        REGION,
+        "DescribeCustomKeyStores",
+        &json!({"CustomKeyStoreId": elsewhere}),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&payload).as_str()),
+        (400, "CustomKeyStoreNotFoundException"),
+        "case a key store of another Region: it is not served by this Region's endpoint, got \
+         {status} with {payload}"
+    );
+}
+
+/// A created custom key store is a real record the rest of the family acts on: it can
+/// be connected, which is what takes it out of the state a create leaves it in, and
+/// renamed, and it is reported under either selector.
+#[tokio::test]
+async fn a_created_custom_key_store_is_one_the_family_acts_on() {
+    let (router, engine) = emulator();
+    let case = "a created key store the family acts on";
+    let cluster_id = active_cluster(&router, &engine, case).await;
+    let id = created(&router, case, &cloud_hsm_request("hsm-lifecycle", &cluster_id)).await;
+
+    // "You can create and use KMS keys in your custom key stores only when its
+    // ConnectionState is CONNECTED": the create leaves the key store disconnected, and
+    // connecting it starts the connection the clock then completes.
+    let answer = ok(&router, "ConnectCustomKeyStore", &json!({"CustomKeyStoreId": id})).await;
+    super::harness::assert_empty(case, "ConnectCustomKeyStore", &answer);
+    assert_eq!(
+        entry(&router, case, &id).await["ConnectionState"],
+        json!("CONNECTING"),
+        "case {case}: the key store enters the transient state at once"
+    );
+    tokio::time::sleep(past_the_span()).await;
+    assert_eq!(
+        entry(&router, case, &id).await["ConnectionState"],
+        json!("CONNECTED"),
+        "case {case}: the connection the call started falls due"
+    );
+
+    // The record is also the one an update changes, and the reader serves it under its
+    // new name.
+    let answer = ok(
+        &router,
+        "UpdateCustomKeyStore",
+        &json!({"CustomKeyStoreId": id, "NewCustomKeyStoreName": "hsm-renamed"}),
+    )
+    .await;
+    super::harness::assert_empty(case, "UpdateCustomKeyStore", &answer);
+    let by_name = ok(
+        &router,
+        "DescribeCustomKeyStores",
+        &json!({"CustomKeyStoreName": "hsm-renamed"}),
+    )
+    .await;
+    assert_eq!(
+        by_name["CustomKeyStores"][0]["CustomKeyStoreId"],
+        json!(id),
+        "case {case}: the renamed key store is the one the create made, got {by_name}"
+    );
+
+    // A proxy on a PUBLIC_ENDPOINT is not reached THROUGH an Amazon VPC endpoint
+    // service, so the create keeps none for it even when the request names one:
+    // switching such a key store to VPC_ENDPOINT_SERVICE has no endpoint service to
+    // fall back on, which is the one way the record's own members are observable.
+    let public_case = "a public endpoint proxy that named an endpoint service";
+    let mut request = public_endpoint_request(
+        "xks-public-with-service",
+        "https://xks-public-service.example.com",
+        "/kms/xks/v1",
+    );
+    request["XksProxyVpcEndpointServiceName"] =
+        json!("com.amazonaws.vpce.us-east-1.vpce-svc-0abcdef1234567890");
+    let public_id = created(&router, public_case, &request).await;
+    let (status, payload) = call(
+        &router,
+        REGION,
+        "UpdateCustomKeyStore",
+        &json!({"CustomKeyStoreId": public_id,
+                "XksProxyConnectivity": "VPC_ENDPOINT_SERVICE"}),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&payload).as_str()),
+        (
+            400,
+            "XksProxyVpcEndpointServiceInvalidConfigurationException"
+        ),
+        "case {public_case}: the created record holds no endpoint service, got {status} with \
+         {payload}"
+    );
+}
+
+/// A request that cannot produce a custom key store is refused with the modelled
+/// refusal for its case and persists NOTHING.
+#[tokio::test]
+async fn create_custom_key_store_refuses_a_request_that_cannot_produce_a_key_store() {
+    let (router, engine) = emulator();
+
+    // The fixture: one CloudHSM key store over an active cluster, one external key
+    // store on a public endpoint, one behind a VPC endpoint service, and one key store
+    // of another Region of the same account.
+    let taken_cluster = active_cluster(&router, &engine, "the fixture's cluster").await;
+    created(
+        &router,
+        "the fixture's CloudHSM key store",
+        &cloud_hsm_request("taken-here", &taken_cluster),
+    )
+    .await;
+    created(
+        &router,
+        "the fixture's public endpoint key store",
+        &public_endpoint_request(
+            "xks-taken",
+            "https://xks-taken.example.com",
+            "/kms/xks/v1",
+        ),
+    )
+    .await;
+    created(
+        &router,
+        "the fixture's VPC endpoint service key store",
+        &vpc_endpoint_request(
+            "xks-vpce-taken",
+            "https://xks-vpce-taken.example.com",
+            "/kms/xks/v1",
+            "com.amazonaws.vpce.us-east-1.vpce-svc-00000000000000001",
+        ),
+    )
+    .await;
+    created_in(
+        &router,
+        OTHER_REGION,
+        "the fixture's key store of another Region",
+        &public_endpoint_request(
+            "taken-elsewhere",
+            "https://xks-other-region.example.com",
+            "/kms/xks/v1",
+        ),
+    )
+    .await;
+
+    // Two clusters that cannot back a key store: one that was never activated, and one
+    // that is active but whose only private subnet is in a single Availability Zone.
+    let inactive_cluster = cloud_hsm_cluster(&router, "a cluster that is not active", 2).await;
+    let one_zone_cluster = cloud_hsm_cluster(&router, "a cluster in one zone", 1).await;
+    activate(&engine, "a cluster in one zone", &one_zone_cluster);
+
+    let credential = json!({
+        "AccessKeyId": PROXY_ACCESS_KEY_ID,
+        "RawSecretAccessKey": PROXY_SECRET,
+    });
+    let rows: Vec<(String, Value, &str)> = vec![
+        (
+            "a cluster id no cluster of the account has".to_string(),
+            cloud_hsm_request("refused", "cluster-2vkpqmfjzck"),
+            "CloudHsmClusterNotFoundException",
+        ),
+        (
+            "a cluster that has not been activated".to_string(),
+            cloud_hsm_request("refused", &inactive_cluster),
+            "CloudHsmClusterNotActiveException",
+        ),
+        (
+            "an active cluster with private subnets in one Availability Zone".to_string(),
+            cloud_hsm_request("refused", &one_zone_cluster),
+            "CloudHsmClusterInvalidConfigurationException",
+        ),
+        (
+            "a cluster another key store of the account already holds".to_string(),
+            cloud_hsm_request("refused", &taken_cluster),
+            "CloudHsmClusterInUseException",
+        ),
+        (
+            "a CloudHSM key store with no CloudHsmClusterId".to_string(),
+            json!({"CustomKeyStoreName": "refused",
+                   "KeyStorePassword": KEY_STORE_PASSWORD,
+                   "TrustAnchorCertificate": TRUST_ANCHOR}),
+            "ValidationException",
+        ),
+        (
+            "a CloudHSM key store with no KeyStorePassword".to_string(),
+            json!({"CustomKeyStoreName": "refused",
+                   "CloudHsmClusterId": taken_cluster,
+                   "TrustAnchorCertificate": TRUST_ANCHOR}),
+            "ValidationException",
+        ),
+        (
+            "a CloudHSM key store with no TrustAnchorCertificate".to_string(),
+            json!({"CustomKeyStoreName": "refused",
+                   "CloudHsmClusterId": taken_cluster,
+                   "KeyStorePassword": KEY_STORE_PASSWORD}),
+            "ValidationException",
+        ),
+        (
+            "a CloudHSM key store carrying an external key store property".to_string(),
+            json!({"CustomKeyStoreName": "refused",
+                   "CustomKeyStoreType": "AWS_CLOUDHSM",
+                   "CloudHsmClusterId": taken_cluster,
+                   "KeyStorePassword": KEY_STORE_PASSWORD,
+                   "TrustAnchorCertificate": TRUST_ANCHOR,
+                   "XksProxyUriEndpoint": "https://xks-wrong-type.example.com"}),
+            "ValidationException",
+        ),
+        (
+            "an external key store with no XksProxyUriEndpoint".to_string(),
+            json!({"CustomKeyStoreName": "refused",
+                   "CustomKeyStoreType": "EXTERNAL_KEY_STORE",
+                   "XksProxyConnectivity": "PUBLIC_ENDPOINT",
+                   "XksProxyUriPath": "/kms/xks/v1",
+                   "XksProxyAuthenticationCredential": credential}),
+            "ValidationException",
+        ),
+        (
+            "an external key store with no XksProxyUriPath".to_string(),
+            json!({"CustomKeyStoreName": "refused",
+                   "CustomKeyStoreType": "EXTERNAL_KEY_STORE",
+                   "XksProxyConnectivity": "PUBLIC_ENDPOINT",
+                   "XksProxyUriEndpoint": "https://xks-no-path.example.com",
+                   "XksProxyAuthenticationCredential": credential}),
+            "ValidationException",
+        ),
+        (
+            "an external key store with no XksProxyConnectivity".to_string(),
+            json!({"CustomKeyStoreName": "refused",
+                   "CustomKeyStoreType": "EXTERNAL_KEY_STORE",
+                   "XksProxyUriEndpoint": "https://xks-no-connectivity.example.com",
+                   "XksProxyUriPath": "/kms/xks/v1",
+                   "XksProxyAuthenticationCredential": credential}),
+            "ValidationException",
+        ),
+        (
+            "an external key store with no XksProxyAuthenticationCredential".to_string(),
+            json!({"CustomKeyStoreName": "refused",
+                   "CustomKeyStoreType": "EXTERNAL_KEY_STORE",
+                   "XksProxyConnectivity": "PUBLIC_ENDPOINT",
+                   "XksProxyUriEndpoint": "https://xks-no-credential.example.com",
+                   "XksProxyUriPath": "/kms/xks/v1"}),
+            "ValidationException",
+        ),
+        (
+            "a VPC endpoint service connectivity with no XksProxyVpcEndpointServiceName"
+                .to_string(),
+            json!({"CustomKeyStoreName": "refused",
+                   "CustomKeyStoreType": "EXTERNAL_KEY_STORE",
+                   "XksProxyConnectivity": "VPC_ENDPOINT_SERVICE",
+                   "XksProxyUriEndpoint": "https://xks-no-service.example.com",
+                   "XksProxyUriPath": "/kms/xks/v1",
+                   "XksProxyAuthenticationCredential": credential}),
+            "ValidationException",
+        ),
+        (
+            "an external key store carrying a CloudHSM property".to_string(),
+            {
+                let mut request = public_endpoint_request(
+                    "refused",
+                    "https://xks-wrong-type-two.example.com",
+                    "/kms/xks/v1",
+                );
+                request["CloudHsmClusterId"] = json!(taken_cluster);
+                request
+            },
+            "ValidationException",
+        ),
+        (
+            "a friendly name a key store of this Region holds".to_string(),
+            public_endpoint_request(
+                "taken-here",
+                "https://xks-name-taken.example.com",
+                "/kms/xks/v1",
+            ),
+            "CustomKeyStoreNameInUseException",
+        ),
+        (
+            "a friendly name a key store of another Region of the account holds".to_string(),
+            public_endpoint_request(
+                "taken-elsewhere",
+                "https://xks-name-taken-two.example.com",
+                "/kms/xks/v1",
+            ),
+            "CustomKeyStoreNameInUseException",
+        ),
+        (
+            "the proxy endpoint and API path another external key store holds".to_string(),
+            public_endpoint_request(
+                "refused",
+                "https://xks-taken.example.com",
+                "/kms/xks/v1",
+            ),
+            "XksProxyUriInUseException",
+        ),
+        (
+            "a public endpoint another external key store reaches through a VPC endpoint \
+             service"
+                .to_string(),
+            public_endpoint_request(
+                "refused",
+                "https://xks-vpce-taken.example.com",
+                "/kms/xks/v2",
+            ),
+            "XksProxyUriEndpointInUseException",
+        ),
+        (
+            "a private DNS name another external key store holds".to_string(),
+            vpc_endpoint_request(
+                "refused",
+                "https://xks-vpce-taken.example.com",
+                "/kms/xks/v2",
+                "com.amazonaws.vpce.us-east-1.vpce-svc-00000000000000002",
+            ),
+            "XksProxyUriEndpointInUseException",
+        ),
+        (
+            "the Amazon VPC endpoint service another external key store holds".to_string(),
+            vpc_endpoint_request(
+                "refused",
+                "https://xks-vpce-new.example.com",
+                "/kms/xks/v1",
+                "com.amazonaws.vpce.us-east-1.vpce-svc-00000000000000001",
+            ),
+            "XksProxyVpcEndpointServiceInUseException",
+        ),
+    ];
+
+    let before = held(&engine);
+    for (case, request, expected) in rows {
+        let (status, payload) = call(&router, REGION, "CreateCustomKeyStore", &request).await;
+        assert_eq!(
+            (status, error_code(&payload).as_str()),
+            (400, expected),
+            "case {case}: expected HTTP 400 {expected}, got {status} with {payload}"
+        );
+        assert_eq!(
+            held(&engine),
+            before,
+            "case {case}: a refused create must persist nothing"
+        );
+        // A refusal about the CloudHSM cluster carries the error code alone, as the
+        // recorded refusal of a cluster this account does not hold does.
+        if expected.starts_with("CloudHsmCluster") && expected != "CloudHsmClusterInUseException" {
+            assert!(
+                error_message(&payload).is_empty(),
+                "case {case}: the refusal carries no message text, got {payload}"
+            );
+        }
+        // A collision refusal names the value that is taken, which is the request's
+        // own, so a client can tell which one to change.
+        for (code, taken) in [
+            ("CustomKeyStoreNameInUseException", request["CustomKeyStoreName"].as_str()),
+            ("CloudHsmClusterInUseException", request["CloudHsmClusterId"].as_str()),
+            (
+                "XksProxyUriEndpointInUseException",
+                request["XksProxyUriEndpoint"].as_str(),
+            ),
+            (
+                "XksProxyVpcEndpointServiceInUseException",
+                request["XksProxyVpcEndpointServiceName"].as_str(),
+            ),
+        ] {
+            if expected == code {
+                let value = taken.unwrap_or_default();
+                assert!(
+                    error_message(&payload).contains(value),
+                    "case {case}: the refusal names {value:?}, got {payload}"
+                );
+            }
+        }
+    }
+}

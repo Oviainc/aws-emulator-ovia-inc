@@ -25,6 +25,8 @@ mod asymmetric_encrypt;
 mod aws_managed_keys;
 #[path = "all/client_error_status.rs"]
 mod client_error_status;
+#[path = "all/create_custom_key_store.rs"]
+mod create_custom_key_store;
 #[path = "all/cross_region_material.rs"]
 mod cross_region_material;
 #[path = "all/custom_key_store_connection.rs"]

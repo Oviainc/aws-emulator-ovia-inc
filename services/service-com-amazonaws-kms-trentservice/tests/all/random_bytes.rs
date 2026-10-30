@@ -21,10 +21,11 @@
 //! on a public endpoint and one behind a VPC endpoint service), the connection state the
 //! key store is in, and the Region the key store belongs to.
 //!
-//! `CreateCustomKeyStore` is still a scaffold stub with its own issue, so the key store
-//! rows seed the records DIRECTLY into the store — the same records a create leaves
-//! behind — and then drive `GenerateRandom` over the wire, exactly as
-//! [`super::custom_key_stores`] does for the reader it cannot create records for yet.
+//! The key store rows seed the records DIRECTLY into the store — the same records a
+//! create leaves behind — so a row fixes the connection state it is about without a
+//! create per row, and then drive `GenerateRandom` over the wire, exactly as
+//! [`super::custom_key_stores`] does for the reader. What a create itself answers is
+//! [`super::create_custom_key_store`].
 
 use std::collections::HashSet;
 use std::sync::Arc;

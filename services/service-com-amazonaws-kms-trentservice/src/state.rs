@@ -47,6 +47,10 @@ use crate::ops::types::{
 /// service's operations consult.
 pub mod authorization;
 
+/// The CloudHSM cluster behind an `AWS_CLOUDHSM` custom key store, resolved against the
+/// CloudHSM service's own records — the one place this service judges a cluster.
+pub mod cloud_hsm;
+
 /// The `ExpirationModelType` of imported key material that expires, which is the
 /// default: "the default is KEY_MATERIAL_EXPIRES"
 /// (`smithy_query(query="doc",shape="ImportKeyMaterialRequest",member="ExpirationModel")`).

@@ -21,10 +21,11 @@
 //! and the longest the modelled length admits), in the Region the key store belongs
 //! to, in which member selects it, and in the page size.
 //!
-//! `CreateCustomKeyStore` is still a scaffold stub with its own issue, so the rows
-//! seed the records DIRECTLY into the store — the same records a create leaves
-//! behind — and then drive `DescribeCustomKeyStores` over the wire, exactly as
-//! [`super::multi_region_primary`] does for the replicas it cannot create yet.
+//! The rows seed the records DIRECTLY into the store — the same records a create
+//! leaves behind — so a row fixes the connection state, the backing and the Region it
+//! is about without a create per row, and then drive `DescribeCustomKeyStores` over
+//! the wire, exactly as [`super::multi_region_primary`] does for the replicas it does
+//! not create. What a create itself answers is [`super::create_custom_key_store`].
 
 use std::sync::Arc;
 

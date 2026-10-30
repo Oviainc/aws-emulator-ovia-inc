@@ -30,9 +30,9 @@
 //!    or a value that is not a key store id at all. The rows differ in how the id fails
 //!    to name a key store.
 //!
-//! `CreateCustomKeyStore` is still a scaffold stub with its own issue, so the key-store
-//! rows seed the records DIRECTLY into the store — the same records a create leaves
-//! behind — exactly as [`super::custom_key_stores`] does.
+//! The key-store rows seed the records DIRECTLY into the store — the same records a
+//! create leaves behind — exactly as [`super::custom_key_stores`] does. What a create
+//! itself answers is [`super::create_custom_key_store`].
 
 use std::sync::Arc;
 

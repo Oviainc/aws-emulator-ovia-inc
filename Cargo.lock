@@ -11057,6 +11057,7 @@ dependencies = [
  "http",
  "ring",
  "serde_json",
+ "service-com-amazonaws-cloudhsmv2-baldrapiservice",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",

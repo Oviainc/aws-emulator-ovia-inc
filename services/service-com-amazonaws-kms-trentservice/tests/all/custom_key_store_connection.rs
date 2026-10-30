@@ -23,10 +23,11 @@
 //! longest id the modelled length admits), and in the Region the key store belongs
 //! to.
 //!
-//! `CreateCustomKeyStore` is still a scaffold stub with its own issue, so the rows
-//! seed the records DIRECTLY into the store — the same records a create leaves
-//! behind — and then drive the operations over the wire, exactly as
-//! [`super::custom_key_stores`] does for the reader.
+//! The rows seed the records DIRECTLY into the store — the same records a create
+//! leaves behind — so a row fixes the connection state it is about without a create
+//! per row, and then drive the operations over the wire, exactly as
+//! [`super::custom_key_stores`] does for the reader. What a create itself answers is
+//! [`super::create_custom_key_store`].
 
 use std::sync::Arc;
 use std::time::Duration;

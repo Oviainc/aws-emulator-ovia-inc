@@ -26,10 +26,11 @@
 //! one past it, a name another key store of the Region holds, and one a key store of
 //! another Region of the same account holds).
 //!
-//! `CreateCustomKeyStore` is still a scaffold stub with its own issue, so the rows seed
-//! the records DIRECTLY into the store — the same records a create leaves behind — and
-//! then drive the operation over the wire, exactly as [`super::custom_key_stores`]
-//! does.
+//! The rows seed the records DIRECTLY into the store — the same records a create leaves
+//! behind — so a row fixes the connection state and the Region it is about without a
+//! create per row, and then drive the operation over the wire, exactly as
+//! [`super::custom_key_stores`] does. What a create itself answers is
+//! [`super::create_custom_key_store`].
 
 use std::sync::Arc;
 

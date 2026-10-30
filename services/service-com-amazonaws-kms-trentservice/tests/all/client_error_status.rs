@@ -348,16 +348,10 @@ async fn a_scaffolded_operation_still_answers_501() {
 
     // Rows: operations this crate has not implemented yet
     // (`grep -l 'SCAFFOLDED, NOT IMPLEMENTED' src/ops/`).
-    let cases: Vec<(&str, Value)> = vec![
-        (
-            "CreateCustomKeyStore",
-            json!({"CustomKeyStoreName": "still-a-stub"}),
-        ),
-        (
-            "DeleteCustomKeyStore",
-            json!({"CustomKeyStoreId": "cks-still-a-stub"}),
-        ),
-    ];
+    let cases: Vec<(&str, Value)> = vec![(
+        "DeleteCustomKeyStore",
+        json!({"CustomKeyStoreId": "cks-still-a-stub"}),
+    )];
     for (operation, body) in cases {
         let (status, payload) = call(&router, REGION, operation, &body).await;
         let code = error_code(&payload);
