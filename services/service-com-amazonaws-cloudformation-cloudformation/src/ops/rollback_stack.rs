@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that put the resources back — or delete them — run after it, and each of
         // those reaches another service's own handler, which takes that service's lock.
-        let (stack_id, region, operation_id, provenance, work, held) = {
+        let (stack_id, region, operation_id, provenance, work, held, policies) = {
             let mut store = state.lock();
             store.settle(now);
 
@@ -241,8 +241,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // its calls with ("CloudFormation uses the role's credentials to make calls on
             // your behalf"), the deployment configuration it was asked for, and
             // `RetainExceptOnCreate` as the request states it — which `DescribeStacks`
-            // reports and which every resource of this stack is already deleted under, since
-            // this service implements no `DeletionPolicy` for one to override.
+            // reports and which decides whether a resource this stack created under a
+            // `Retain` deletion policy is deleted by the rollback below
+            // ([`crate::state::StoredStack::rolled_back_resource_policies`]).
             if let Some(role_arn) = &input.role_arn {
                 stack.role_arn = Some(role_arn.clone());
             }
@@ -272,6 +273,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The records the stack HOLDS, which is the set a discarding rollback
                 // reports a deletion of.
                 stack.held_resource_ids(),
+                // What that rollback does with the `DeletionPolicy` of the resources the
+                // failed operation created.
+                stack.rolled_back_resource_policies(),
             )
         };
 
@@ -285,8 +289,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // removed again in the services that own it, re-asked while one of them has not
             // let a resource go yet, exactly as a failed create's own rollback removes it.
             crate::state::RequestedRollback::Discard(resources) => {
-                let deleted =
-                    crate::state::provisioning::unwind(ctx, &region, &resources, &held).await;
+                let deleted = crate::state::provisioning::unwind(
+                    ctx,
+                    &region,
+                    &resources,
+                    &held,
+                    policies,
+                )
+                .await;
                 let mut store = state.lock();
                 if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
                     // The resources' own transitions come BEFORE the stack's terminal event:

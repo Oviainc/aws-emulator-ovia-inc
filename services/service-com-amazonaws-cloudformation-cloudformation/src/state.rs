@@ -849,6 +849,27 @@ pub mod resource_status {
     pub const DELETE_SKIPPED: &str = "DELETE_SKIPPED";
 }
 
+/// The `DeletionPolicy` values the resource attribute takes: "With the `DeletionPolicy`
+/// attribute you can preserve, and in some cases, backup a resource when its stack is
+/// deleted" — `Delete`, `Retain` and `Snapshot`, `Delete` being the default a declaration
+/// that states none gets.
+///
+/// The same three values `UpdateReplacePolicy` takes for the OLD resource of a REPLACEMENT
+/// ([`change_plan::policy_action`]), which is a separate attribute and governs a separate
+/// event: this one is read where a resource the stack manages is REMOVED — the stack's own
+/// deletion, and a deployment that no longer declares the resource.
+pub mod deletion_policy {
+    /// "CloudFormation deletes the resource and all its content if applicable during stack
+    /// deletion" — what a declaration stating no policy gets.
+    pub const DELETE: &str = "Delete";
+    /// "CloudFormation keeps the resource without deleting the resource or its contents
+    /// when its stack is deleted."
+    pub const RETAIN: &str = "Retain";
+    /// "For resources that support snapshots, CloudFormation creates a snapshot for the
+    /// resource before deleting it."
+    pub const SNAPSHOT: &str = "Snapshot";
+}
+
 /// `DeletionMode` values (the model's `DeletionMode` enum): "specifies the deletion mode for
 /// the stack" (`DeleteStackInput$DeletionMode`).
 pub mod deletion_mode {
@@ -1053,6 +1074,16 @@ pub struct StoredResource {
     /// provisioner for: nothing was created for it anywhere (see
     /// [`provisioning`](crate::state::provisioning)).
     pub materialised: bool,
+    /// The `DeletionPolicy` resource attribute the template declared for this resource, as
+    /// written — what CloudFormation does with the physical resource when the stack is
+    /// deleted or the resource is removed from it ([`deletion_policy`]).
+    ///
+    /// `None` for a declaration that carries none, which is the documented default
+    /// ([`deletion_policy::DELETE`]). Captured where the template is DEPLOYED
+    /// ([`template::provision`]), beside the `Metadata` attribute and for the same reason:
+    /// the attribute that governs the resource is the one of the template that deployed it,
+    /// and a read must not re-parse a caller-sized body to find it.
+    pub deletion_policy: Option<String>,
 }
 
 impl StoredResource {
@@ -3456,6 +3487,21 @@ impl StoredStack {
             held.extend(deployment.attempted.iter().cloned());
         }
         held
+    }
+
+    /// What the ROLLBACK of a failed operation on this stack does with the `DeletionPolicy`
+    /// of a resource that operation had created.
+    ///
+    /// `RetainExceptOnCreate` is what chooses: "when set to `true`, newly created resources
+    /// are deleted when the operation rolls back. This includes newly created resources
+    /// marked with a deletion policy of `Retain`" — so under it the rollback deletes them
+    /// whatever they declare, and under the documented default (`false`) each resource's own
+    /// policy stands, exactly as it does when the stack itself is deleted.
+    pub fn rolled_back_resource_policies(&self) -> provisioning::Policies {
+        match self.retain_except_on_create {
+            Some(true) => provisioning::Policies::Ignored,
+            _ => provisioning::Policies::Honoured,
+        }
     }
 
     /// How many resources the stack OCCUPIES right now, for the account-wide resource

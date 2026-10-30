@@ -1602,11 +1602,22 @@ impl Provisioner {
     /// The whole record is passed, not just its physical id: a type whose identity is a
     /// PAIR (a security policy's `(type, name)`) needs the property that carries the other
     /// half.
+    ///
+    /// `final_snapshot` is the identifier CloudFormation asks for a SNAPSHOT of the resource
+    /// under, for a resource whose `DeletionPolicy` is `Snapshot`
+    /// ([`super::provisioning::final_snapshot_identifier`]). It reaches the arms of the types
+    /// whose owning service takes a snapshot ON THE WAY OUT, as a member of the delete call
+    /// itself (Amazon RDS's `FinalDBSnapshotIdentifier`, Amazon Redshift's
+    /// `FinalClusterSnapshotIdentifier`) — the published list of types `Snapshot` supports is
+    /// wider than that, and a type whose snapshot is a call of its own is not one of these
+    /// arms yet, so it is deleted with no snapshot taken rather than with one invented for
+    /// it.
     pub(super) async fn delete(
         self,
         ctx: &smithy_server_runtime::OperationContext<'_>,
         region: &str,
         resource: &StoredResource,
+        final_snapshot: Option<&str>,
     ) -> Result<(), Refusal> {
         let physical_resource_id = &resource.physical_resource_id;
         match self {
@@ -1716,10 +1727,15 @@ impl Provisioner {
             }
             Self::MqBroker => delete_mq_broker(ctx, region, physical_resource_id).await,
             // The delete carries one member off the resource's own declaration
-            // (`DeleteAutomatedBackups`), so it takes the record rather than the id.
-            Self::RdsDbInstance => delete_db_instance(ctx, region, resource).await,
+            // (`DeleteAutomatedBackups`), so it takes the record rather than the id — and
+            // the final snapshot a `Snapshot` deletion policy asks for is a member of that
+            // same call.
+            Self::RdsDbInstance => {
+                delete_db_instance(ctx, region, resource, final_snapshot).await
+            }
             Self::RedshiftCluster => {
-                delete_redshift_cluster(ctx, region, physical_resource_id).await
+                delete_redshift_cluster(ctx, region, physical_resource_id, final_snapshot)
+                    .await
             }
             Self::RdsDbSubnetGroup => {
                 delete_db_subnet_group(ctx, region, physical_resource_id).await
@@ -11439,12 +11455,13 @@ async fn create_db_instance(
 /// the state the delete asks for.
 ///
 /// `DeleteDBInstance` requires the caller to say what becomes of the data: "you must
-/// specify the `FinalDBSnapshotIdentifier` parameter" unless the snapshot is skipped. This
-/// emulator's CloudFormation implements no `DeletionPolicy` — nothing in this crate reads
-/// that resource attribute, and a stack's deletion deletes every resource it created — so
-/// the call is the form CloudFormation makes for the `Delete` policy, which skips the final
-/// snapshot. The one member the type's own declaration carries for the delete,
-/// `DeleteAutomatedBackups`, is read off the record and sent as declared.
+/// specify the `FinalDBSnapshotIdentifier` parameter" unless the snapshot is skipped. Which
+/// of the two the call carries is the resource's `DeletionPolicy`
+/// ([`super::provisioning::Policies`]): `final_snapshot` is the identifier a `Snapshot`
+/// policy's snapshot is taken under, and without one the call is the form CloudFormation
+/// makes for the `Delete` policy, which skips the final snapshot. The one member the type's
+/// own declaration carries for the delete, `DeleteAutomatedBackups`, is read off the record
+/// and sent as declared.
 ///
 /// Amazon RDS answers the delete by putting the instance in `deleting` and removing it a
 /// moment later, so this arm then WAITS for it to be gone
@@ -11455,14 +11472,22 @@ async fn delete_db_instance(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
+    final_snapshot: Option<&str>,
 ) -> Result<(), Refusal> {
-    let mut parameters = vec![
-        (
-            "DBInstanceIdentifier".to_string(),
-            resource.physical_resource_id.clone(),
-        ),
-        ("SkipFinalSnapshot".to_string(), "true".to_string()),
-    ];
+    let mut parameters = vec![(
+        "DBInstanceIdentifier".to_string(),
+        resource.physical_resource_id.clone(),
+    )];
+    match final_snapshot {
+        // "The DBSnapshotIdentifier of the new DBSnapshot created when the SkipFinalSnapshot
+        // parameter is disabled" — and enabling both "results in an error", so the skip is
+        // not sent beside it.
+        Some(snapshot_identifier) => parameters.push((
+            "FinalDBSnapshotIdentifier".to_string(),
+            snapshot_identifier.to_string(),
+        )),
+        None => parameters.push(("SkipFinalSnapshot".to_string(), "true".to_string())),
+    }
     if let Some(declared) = resource
         .properties
         .get("DeleteAutomatedBackups")
@@ -11656,21 +11681,32 @@ async fn create_redshift_cluster(
 /// the state the delete asks for.
 ///
 /// `DeleteCluster` requires the caller to say what becomes of the data: a final snapshot
-/// identifier, or the skip. This emulator's CloudFormation implements no `DeletionPolicy`,
-/// so the call is the form CloudFormation makes for the `Delete` policy, which skips the
-/// final snapshot — exactly as [`delete_db_instance`] does for a DB instance.
+/// identifier, or the skip. Which one the call carries is the resource's `DeletionPolicy`,
+/// exactly as it is for [`delete_db_instance`]: `final_snapshot` is the identifier a
+/// `Snapshot` policy's snapshot is taken under, and without one the call skips the final
+/// snapshot, which is the form CloudFormation makes for the `Delete` policy.
 async fn delete_redshift_cluster(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     physical_resource_id: &str,
+    final_snapshot: Option<&str>,
 ) -> Result<(), Refusal> {
-    let parameters = vec![
-        (
-            "ClusterIdentifier".to_string(),
-            physical_resource_id.to_string(),
-        ),
-        ("SkipFinalClusterSnapshot".to_string(), "true".to_string()),
-    ];
+    let mut parameters = vec![(
+        "ClusterIdentifier".to_string(),
+        physical_resource_id.to_string(),
+    )];
+    match final_snapshot {
+        // "The FinalClusterSnapshotIdentifier parameter must be specified if
+        // SkipFinalClusterSnapshot is false", and the two cannot be sent together.
+        Some(snapshot_identifier) => parameters.push((
+            "FinalClusterSnapshotIdentifier".to_string(),
+            snapshot_identifier.to_string(),
+        )),
+        None => parameters.push((
+            "SkipFinalClusterSnapshot".to_string(),
+            "true".to_string(),
+        )),
+    }
     match call_query(
         ctx,
         REDSHIFT_SIGNING_NAME,
@@ -23630,6 +23666,7 @@ mod tests {
             metadata: None,
             properties,
             materialised: false,
+            deletion_policy: None,
         }
     }
 

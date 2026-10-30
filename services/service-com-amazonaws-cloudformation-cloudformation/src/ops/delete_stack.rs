@@ -390,6 +390,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &resources,
             &held,
             crate::state::on_refused_resource_deletion(deletion_mode.as_deref()),
+            // The stack is being deleted, which is the event each resource's
+            // `DeletionPolicy` governs: "preserve, and in some cases, backup a resource when
+            // its stack is deleted".
+            crate::state::provisioning::Policies::Honoured,
         )
         .await;
 

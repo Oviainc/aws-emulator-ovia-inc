@@ -177,6 +177,8 @@ mod refused_stack_deletion;
 mod regional_stack_namespace;
 #[path = "all/requested_rollback.rs"]
 mod requested_rollback;
+#[path = "all/resource_deletion_policies.rs"]
+mod resource_deletion_policies;
 #[path = "all/resource_scan_discovery.rs"]
 mod resource_scan_discovery;
 #[path = "all/resource_scan_lifecycle.rs"]

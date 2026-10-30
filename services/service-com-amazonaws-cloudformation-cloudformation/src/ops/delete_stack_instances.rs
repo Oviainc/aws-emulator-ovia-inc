@@ -439,6 +439,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `DeleteStackInstances` carries no `DeletionMode`, so a resource an owning
                 // service refuses to delete is this instance's deletion failure.
                 crate::state::provisioning::OnRefusal::Stop,
+                // An instance's stack is being deleted, so each resource's own
+                // `DeletionPolicy` decides what becomes of the physical resource.
+                crate::state::provisioning::Policies::Honoured,
             )
             .await;
             let failure = deleted.failure.clone();

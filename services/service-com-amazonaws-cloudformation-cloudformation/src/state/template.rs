@@ -1464,6 +1464,7 @@ pub fn provision(
                 // service has created the resource.
                 properties: Value::Null,
                 materialised: false,
+                deletion_policy: declared_deletion_policy(declared),
             },
         );
     }
@@ -1958,6 +1959,27 @@ fn declared_metadata(declared: &DeclaredResource) -> Option<String> {
     // `Value`'s `Display` is its compact JSON rendering and cannot fail, so no `Metadata`
     // a template declares can be lost to a serialisation error here.
     Some(metadata.to_string())
+}
+
+/// The `DeletionPolicy` resource attribute a declaration carries, as written.
+///
+/// `DeletionPolicy` is the attribute that says "what to do with the resource when its stack
+/// is deleted" — one of the resource attributes CloudFormation defines on a template's
+/// `Resources` entry, beside the `Metadata` [`declared_metadata`] reads and the
+/// `UpdateReplacePolicy` a replacement's own action is read off
+/// ([`super::change_plan`]). It is kept on the record so the walk that DELETES a stack's
+/// resources ([`super::provisioning::delete`]) reads the attribute of the template that
+/// deployed the resource.
+///
+/// `None` for a declaration that states none — the documented default
+/// ([`super::deletion_policy::DELETE`]) — and for one whose value is not a string, which
+/// names no policy.
+fn declared_deletion_policy(declared: &DeclaredResource) -> Option<String> {
+    declared
+        .declaration
+        .get("DeletionPolicy")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// Whether a declared resource is one this deployment creates.
