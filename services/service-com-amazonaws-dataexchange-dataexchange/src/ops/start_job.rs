@@ -4,8 +4,10 @@
 //! IMPLEMENTED: starts a job that has not been started — the stored job moves to
 //! `State` `IN_PROGRESS` and the execution it set going is owed a terminal `State`
 //! one execution span later, which any later read materialises — and refuses a job in
-//! any other state with the modelled 409. This is the ONLY file to touch for this
-//! operation.
+//! any other state with the modelled 409. An import whose content a client uploaded to
+//! the URL `CreateJob` announced carries its work out: it puts that content into the
+//! revision its details name as an asset and completes. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -141,7 +143,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StartJobErrorModeled::InternalServerException(
                 crate::state::store_unavailable(),
@@ -150,6 +151,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = crate::state::now();
+        // An asset this execution creates carries an ARN, so the Region this call was
+        // signed for is read here, where the request is.
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
         // An earlier execution may already be owed its terminal state, so that is
         // materialised before this call decides anything: otherwise a second start
@@ -174,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let settlement = execution_outcome(&job.r#type, now);
+        let settlement = execution_outcome(job, now, &region);
         job.state = crate::state::JOB_STATE_IN_PROGRESS.to_string();
         job.updated_at = now;
         // The execution does not run here and nothing sleeps: where it ends and when
@@ -189,11 +193,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// What this operation asks of the job, for the wording of the 409 a job in a state
 /// that does not admit it is refused with.
 const START_VERB: &str = "start";
-
-/// The `Code` of the job error an execution reports when the content it had to work
-/// on is not there: one of the model's `Code` values, enumerated by
-/// `crate::ops::types::CODE_VALUES`.
-const CODE_RESOURCE_NOT_FOUND: &str = "RESOURCE_NOT_FOUND_EXCEPTION";
 
 /// The source an export's content, and every import whose content is staged as an
 /// object, is read from — the Amazon S3 object behind a presigned URL, an asset
@@ -241,22 +240,96 @@ const CONTENT_SOURCE_FOR_TYPE: &[(&str, &str)] = &[
 ///
 /// Every `Type` this service creates moves asset CONTENT: an import reads the source
 /// its details name into the revision, an export writes the content of that
-/// revision's assets out. This emulator serves no object data plane — the URL
-/// `CreateJob` hands out for an upload is a locator nothing serves, and a stored
-/// asset is a record with no bytes behind it — so the content a started job must read
-/// is not there, and the execution ends in the terminal state that reports exactly
-/// that: `ERROR`, carrying the job error for a source that could not be found, naming
-/// the source the job's own `Type` reads.
-fn execution_outcome(job_type: &str, started_at: DateTime) -> crate::state::JobSettlement {
+/// revision's assets out.
+///
+/// An import that takes its content from an upload URL this service announced has that
+/// content exactly when a client has uploaded it: the execution then carries the import
+/// out — the staged bytes become an asset of the revision the details name — and ends
+/// in the terminal state of work that was done. For every other job the content is not
+/// there to read: this emulator serves no object store, so an export's assets, an asset
+/// source key, a Redshift datashare and a Lake Formation data permission are all
+/// unreadable, and so is an upload nobody uploaded to. Such an execution ends in the
+/// terminal state that reports exactly that: `ERROR`, carrying the job error for a
+/// source that could not be found, naming the source the job's own `Type` reads.
+fn execution_outcome(
+    job: &crate::state::Job,
+    started_at: DateTime,
+    region: &str,
+) -> crate::state::JobSettlement {
+    let due_at = crate::state::later(started_at, crate::state::JOB_EXECUTION_SECONDS);
+    if let Some(import) = staged_import(job, region) {
+        return crate::state::JobSettlement {
+            due_at,
+            state: crate::state::JOB_STATE_COMPLETED.to_string(),
+            // The execution read what it was pointed at, so there is nothing to report.
+            errors: Vec::new(),
+            import: Some(import),
+        };
+    }
     crate::state::JobSettlement {
-        due_at: crate::state::later(started_at, crate::state::JOB_EXECUTION_SECONDS),
+        due_at,
         state: crate::state::JOB_STATE_ERROR.to_string(),
         errors: vec![JobError {
-            code: CODE_RESOURCE_NOT_FOUND.to_string(),
-            message: format!("Resource not found. Unable to find source {}.", source_for(job_type)),
+            // `crate::state`'s constant, so every job error this service composes names
+            // the same value of the model's `Code` enum.
+            code: crate::state::JOB_ERROR_CODE_RESOURCE_NOT_FOUND.to_string(),
+            message: format!(
+                "Resource not found. Unable to find source {}.",
+                source_for(&job.r#type)
+            ),
             ..JobError::default()
         }],
+        import: None,
     }
+}
+
+/// The asset this job's import would add, when a client has uploaded its content to
+/// the URL the job announced — `None` for a job that announced none, or whose upload is
+/// still empty.
+///
+/// The two job types whose content arrives that way are the two whose `Details`
+/// announce an upload URL, and those same details name what the asset is: an asset
+/// imported from a signed URL is named by the `AssetName` the request gave it, and one
+/// imported from an API Gateway API is named by, and records, the API it fulfils
+/// (`smithy_query(query="shape", shape="ApiGatewayApiAsset,AssetEntry")` — an API asset
+/// IS that API, and `AssetEntry.Name` is the name of the asset).
+fn staged_import(job: &crate::state::Job, region: &str) -> Option<crate::state::PendingImport> {
+    if !job
+        .upload
+        .as_ref()
+        .is_some_and(|upload| upload.content.is_some())
+    {
+        return None;
+    }
+    if let Some(detail) = job.details.import_asset_from_signed_url.as_ref() {
+        return Some(crate::state::PendingImport {
+            region: region.to_string(),
+            data_set_id: detail.data_set_id.clone(),
+            revision_id: detail.revision_id.clone(),
+            asset_name: detail.asset_name.clone(),
+            api: None,
+        });
+    }
+    let detail = job.details.import_asset_from_api_gateway_api.as_ref()?;
+    Some(crate::state::PendingImport {
+        region: region.to_string(),
+        data_set_id: detail.data_set_id.clone(),
+        revision_id: detail.revision_id.clone(),
+        asset_name: detail.api_name.clone(),
+        api: Some(ApiGatewayApiAsset {
+            api_description: detail.api_description.clone(),
+            api_id: Some(detail.api_id.clone()),
+            api_key: detail.api_key.clone(),
+            api_name: Some(detail.api_name.clone()),
+            protocol_type: Some(detail.protocol_type.clone()),
+            stage: Some(detail.stage.clone()),
+            // Both of these are minted by whoever hands the API out to a reader, on the
+            // endpoint that read arrives at, so neither is part of what was imported.
+            api_endpoint: None,
+            api_specification_download_url: None,
+            api_specification_download_url_expires_at: None,
+        }),
+    })
 }
 
 /// The source [`CONTENT_SOURCE_FOR_TYPE`] pairs with `job_type`.

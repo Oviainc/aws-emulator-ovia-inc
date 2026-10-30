@@ -111,6 +111,10 @@ fn import_assets(
             id: asset_id,
             name: format!("feed-{index}.csv"),
             asset_type: asset_type.clone(),
+            // These assets are written straight into the store, so no import staged
+            // content for them and none fulfils an API.
+            content: Vec::new(),
+            api: None,
             created_at: imported_at,
             updated_at: imported_at,
         });

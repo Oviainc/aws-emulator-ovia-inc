@@ -4,9 +4,11 @@
 //! IMPLEMENTED: records a job in state — a fresh `Id` and `Arn`, `State` `WAITING`,
 //! the response form of the `Details` the request carried, and the asset
 //! configuration — after refusing a `Details` that does not match `Type`, and one
-//! naming a data set or revision this emulator does not hold. The job itself does no
-//! work until `StartJob` moves it on. This is the ONLY file to touch for this
-//! operation.
+//! naming a data set or revision this emulator does not hold. For a job that takes its
+//! content from an upload, the URL this call announces is a real, writable location
+//! until the expiry announced with it: `crate::state::upload_url` mints it and the
+//! upload plane in `crate::service` serves the PUT. The job itself does no work until
+//! `StartJob` moves it on. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -227,9 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(CreateJobErrorModeled::ConflictException(
                         crate::state::revision_conflict(
                             revision_id,
-                            format!(
-                                "The revision {revision_id} is finalized and can't be modified."
-                            ),
+                            crate::state::revision_is_finalized_message(revision_id),
                         ),
                     )
                     .into());
@@ -268,6 +268,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
                 // Nothing has started the job, so no execution is owed an outcome.
                 pending_settlement: None,
+                // The upload the URL this call announces names, where it announced one:
+                // it accepts the content from now until the expiry announced with it.
+                upload: plan.upload,
                 created_at,
                 updated_at: created_at,
             };
@@ -326,7 +329,9 @@ pub const DETAILS_MEMBER_FOR_TYPE: &[(&str, &str)] = &[
 ///
 /// This model publishes no validity for either URL member, so the window is this
 /// emulator's choice: long enough that a client can upload within it, short enough
-/// that the expiry is a real deadline rather than a formality.
+/// that the expiry is a real deadline rather than a formality. The upload plane
+/// refuses a PUT past the instant announced with the URL, so this is the window a
+/// client actually has.
 const UPLOAD_URL_VALIDITY_SECONDS: f64 = 3600.0;
 
 /// What the request asked the job to do, resolved against the model's
@@ -341,6 +346,9 @@ struct Plan {
     /// Whether the job would add assets to those revisions (an import or an S3 data
     /// access create) rather than only read them (an export).
     writes_assets: bool,
+    /// The upload the URL this creation announces names, for a job that takes its
+    /// content from one; `None` for a job that announces no URL.
+    upload: Option<crate::state::JobUpload>,
 }
 
 /// The detail member `job_type` names, or `None` for a `Type` outside the model's
@@ -390,19 +398,6 @@ fn request_endpoint(ctx: &smithy_server_runtime::OperationContext<'_>) -> Option
         .and_then(|value| value.to_str().ok())
         .or_else(|| ctx.parts().uri.authority().map(::http::uri::Authority::as_str))
         .map(ToString::to_string)
-}
-
-/// Where a client uploads the bytes an import job will take its content from.
-///
-/// AWS answers an S3 presigned URL here. This emulator has no object data plane, so
-/// the URL names THIS job's upload on the endpoint THIS REQUEST ARRIVED AT: no
-/// operation in this service serves it, and nothing downstream reads it back as
-/// content. It is a locator built from the request's own host and the minted job id,
-/// never a stand-in for content that was uploaded — and when the request names no
-/// host there is no endpoint to point at, so `None` comes back (a baked-in AWS
-/// endpoint here would send a following client's bytes to the real service).
-fn upload_url(endpoint: Option<&str>, job_id: &str, leaf: &str) -> Option<String> {
-    endpoint.map(|host| format!("https://{host}/v1/jobs/{job_id}/{leaf}"))
 }
 
 /// Refuse an `AssetConfiguration` the store will not hold.
@@ -473,6 +468,7 @@ fn plan_job(
                 data_set_id: detail.data_set_id.clone(),
                 revision_ids: vec![detail.revision_id.clone()],
                 writes_assets: true,
+                upload: None,
                 details: ResponseDetails {
                     create_s3_data_access_from_s3_bucket: Some(
                         CreateS3DataAccessFromS3BucketResponseDetails {
@@ -491,6 +487,7 @@ fn plan_job(
                 data_set_id: detail.data_set_id.clone(),
                 revision_ids: vec![detail.revision_id.clone()],
                 writes_assets: false,
+                upload: None,
                 details: ResponseDetails {
                     export_asset_to_signed_url: Some(ExportAssetToSignedUrlResponseDetails {
                         asset_id: detail.asset_id,
@@ -515,6 +512,7 @@ fn plan_job(
                 data_set_id: detail.data_set_id.clone(),
                 revision_ids: vec![detail.revision_id.clone()],
                 writes_assets: false,
+                upload: None,
                 details: ResponseDetails {
                     export_assets_to_s3: Some(ExportAssetsToS3ResponseDetails {
                         asset_destinations: detail.asset_destinations,
@@ -541,6 +539,7 @@ fn plan_job(
                     .map(|destination| destination.revision_id.clone())
                     .collect(),
                 writes_assets: false,
+                upload: None,
                 details: ResponseDetails {
                     export_revisions_to_s3: Some(ExportRevisionsToS3ResponseDetails {
                         data_set_id: detail.data_set_id,
@@ -558,15 +557,29 @@ fn plan_job(
             let detail = details.import_asset_from_api_gateway_api.ok_or_else(missing)?;
             // The model makes this one's upload URL required, so a request that names
             // no endpoint to serve it at cannot be answered at all.
-            let upload = upload_url(endpoint, job_id, "api-specification").ok_or_else(|| {
+            let upload = crate::state::upload_url(
+                endpoint,
+                job_id,
+                crate::state::UPLOAD_LEAF_API_SPECIFICATION,
+            )
+            .ok_or_else(|| {
                 "the request carries no Host header, so there is no endpoint to serve \
                  Details.ImportAssetFromApiGatewayApi.ApiSpecificationUploadUrl at"
                     .to_string()
             })?;
+            let expires_at = crate::state::later(created_at, UPLOAD_URL_VALIDITY_SECONDS);
             Ok(Plan {
                 data_set_id: detail.data_set_id.clone(),
                 revision_ids: vec![detail.revision_id.clone()],
                 writes_assets: true,
+                // The URL is announced, so the upload it names exists from now until
+                // the expiry announced with it.
+                upload: Some(crate::state::JobUpload {
+                    leaf: crate::state::UPLOAD_LEAF_API_SPECIFICATION,
+                    expires_at,
+                    md5_hash: detail.api_specification_md5_hash.clone(),
+                    content: None,
+                }),
                 details: ResponseDetails {
                     import_asset_from_api_gateway_api: Some(
                         ImportAssetFromApiGatewayApiResponseDetails {
@@ -576,10 +589,7 @@ fn plan_job(
                             api_name: detail.api_name,
                             api_specification_md5_hash: detail.api_specification_md5_hash,
                             api_specification_upload_url: upload,
-                            api_specification_upload_url_expires_at: crate::state::later(
-                                created_at,
-                                UPLOAD_URL_VALIDITY_SECONDS,
-                            ),
+                            api_specification_upload_url_expires_at: expires_at,
                             data_set_id: detail.data_set_id,
                             protocol_type: detail.protocol_type,
                             revision_id: detail.revision_id,
@@ -592,20 +602,30 @@ fn plan_job(
         }
         "ImportAssetFromSignedUrl" => {
             let detail = details.import_asset_from_signed_url.ok_or_else(missing)?;
-            let signed_url = upload_url(endpoint, job_id, "asset");
+            let signed_url =
+                crate::state::upload_url(endpoint, job_id, crate::state::UPLOAD_LEAF_ASSET);
+            // The expiry is announced with the URL and only with it, and it is the same
+            // instant the upload stops accepting bytes at.
+            let expires_at = signed_url
+                .is_some()
+                .then(|| crate::state::later(created_at, UPLOAD_URL_VALIDITY_SECONDS));
             Ok(Plan {
                 data_set_id: detail.data_set_id.clone(),
                 revision_ids: vec![detail.revision_id.clone()],
                 writes_assets: true,
+                upload: expires_at.map(|expires_at| crate::state::JobUpload {
+                    leaf: crate::state::UPLOAD_LEAF_ASSET,
+                    expires_at,
+                    md5_hash: detail.md5_hash.clone(),
+                    content: None,
+                }),
                 details: ResponseDetails {
                     import_asset_from_signed_url: Some(ImportAssetFromSignedUrlResponseDetails {
                         asset_name: detail.asset_name,
                         data_set_id: detail.data_set_id,
                         md5_hash: Some(detail.md5_hash),
                         revision_id: detail.revision_id,
-                        signed_url_expires_at: signed_url.is_some().then(|| {
-                            crate::state::later(created_at, UPLOAD_URL_VALIDITY_SECONDS)
-                        }),
+                        signed_url_expires_at: expires_at,
                         signed_url,
                     }),
                     ..ResponseDetails::default()
@@ -637,6 +657,7 @@ fn plan_job(
                 data_set_id: detail.data_set_id.clone(),
                 revision_ids: vec![detail.revision_id.clone()],
                 writes_assets: true,
+                upload: None,
                 details: ResponseDetails {
                     import_assets_from_lake_formation_tag_policy: Some(
                         ImportAssetsFromLakeFormationTagPolicyResponseDetails {
@@ -664,6 +685,7 @@ fn plan_job(
                 data_set_id: detail.data_set_id.clone(),
                 revision_ids: vec![detail.revision_id.clone()],
                 writes_assets: true,
+                upload: None,
                 details: ResponseDetails {
                     import_assets_from_redshift_data_shares: Some(
                         ImportAssetsFromRedshiftDataSharesResponseDetails {
@@ -686,6 +708,7 @@ fn plan_job(
                 data_set_id: detail.data_set_id.clone(),
                 revision_ids: vec![detail.revision_id.clone()],
                 writes_assets: true,
+                upload: None,
                 details: ResponseDetails {
                     import_assets_from_s3: Some(ImportAssetsFromS3ResponseDetails {
                         asset_sources: detail.asset_sources,

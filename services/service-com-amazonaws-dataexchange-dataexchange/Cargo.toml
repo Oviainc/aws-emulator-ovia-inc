@@ -24,6 +24,12 @@ tracing = { workspace = true }
 # Identifier minting: the SHA-256 digest behind a minted `Id`, rendered as hex.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The integrity check of content uploaded to a URL this service mints: the `Md5Hash` the
+# job declared and HTTP's own `Content-MD5` are both Base64 MD5 digests of the body.
+md-5 = "0.10"
+# `request_path`: the one reading of a request URI's path, which the upload plane's
+# routing goes through rather than splitting a URI of its own.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -31,6 +37,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The upload tests compute the Base64 MD5 and the entity tag of the content they PUT,
+# the way a client uploading to a presigned target does.
+md-5 = "0.10"
 
 [lints]
 workspace = true

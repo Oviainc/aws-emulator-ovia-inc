@@ -1,22 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-dataexchange-dataexchange service, plus the
-//! helpers every handler shares: identifier minting, ARN building and the opaque
-//! pagination cursor the `@paginated` list operations hand out.
+//! helpers every handler shares: identifier minting, ARN building, the opaque
+//! pagination cursor the `@paginated` list operations hand out, and the upload a job's
+//! minted URL names ([`parse_upload_path`], [`ComAmazonawsDataexchangeDataexchangeState::record_upload`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::aws_smithy_types::DateTime;
+// `Digest` is the one `digest` trait both hashes implement, so it is imported once and
+// carries `Sha256::digest` (a minted id) and `Md5::digest` (an uploaded payload's
+// `Content-MD5`) alike.
+use md5::Md5;
 use sha2::{Digest, Sha256};
 
 use ::aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 
 use crate::ops::types::{
-    Action, AssetConfiguration, ConflictException, Event, InternalServerException, JobError,
-    OriginDetails, ResourceNotFoundException, ResponseDetails, ServiceLimitExceededException,
-    ValidationException,
+    Action, ApiGatewayApiAsset, AssetConfiguration, ConflictException, Event,
+    InternalServerException, JobError, OriginDetails, ResourceNotFoundException, ResponseDetails,
+    ServiceLimitExceededException, ValidationException,
 };
 
 /// The service's SigV4 signing name, and so the ARN service segment.
@@ -129,6 +134,18 @@ pub struct Asset {
     /// `crate::ops::types::ASSET_TYPE_VALUES`; a revision's assets all carry the
     /// `AssetType` of the data set they belong to.
     pub asset_type: String,
+    /// The CONTENT of the asset: the bytes the import that created it read, which for
+    /// an import from an upload URL are the bytes a client uploaded to it. Empty for
+    /// an asset this emulator holds no bytes for.
+    pub content: Vec<u8>,
+    /// The API this asset fulfils, as the import that created it recorded it — set
+    /// only for an asset imported from an Amazon API Gateway API, whose content is
+    /// that API's specification rather than a data file.
+    ///
+    /// The members a READER mints per call (the API's endpoint, and the download URL
+    /// of its specification, which names the endpoint the read arrived at) are left
+    /// absent here: they are not part of what was imported.
+    pub api: Option<ApiGatewayApiAsset>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }
@@ -183,8 +200,37 @@ pub struct Job {
     /// clock owes it. `None` on a job nothing has started and on one that has already
     /// reached a terminal `State`.
     pub pending_settlement: Option<JobSettlement>,
+    /// The upload the URL this job's creation handed out names, for a job that takes
+    /// its content from one; `None` for a job that minted no URL.
+    pub upload: Option<JobUpload>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+}
+
+/// The upload the URL `CreateJob` minted for a job names: which of this service's
+/// published upload paths it is, until when it accepts the bytes, the digest the
+/// request declared for them, and the bytes a client has actually uploaded.
+///
+/// A URL a service hands out as an upload target is a promise that whoever holds it
+/// can WRITE there, so the record exists from the moment the URL is announced: it is
+/// what the data plane serving that path resolves the PUT against, and what the job's
+/// own execution then reads its content from.
+#[derive(Debug, Clone)]
+pub struct JobUpload {
+    /// The last segment of the published path, which is also WHICH content of the job
+    /// this upload carries: one of [`UPLOAD_LEAF_ASSET`] /
+    /// [`UPLOAD_LEAF_API_SPECIFICATION`].
+    pub leaf: &'static str,
+    /// The instant the announced URL stops accepting bytes — the expiry the create
+    /// call published alongside it.
+    pub expires_at: DateTime,
+    /// The Base64 MD5 the request declared for the content, which the model makes a
+    /// required member of both details that name an upload. It is what the uploaded
+    /// bytes are checked against.
+    pub md5_hash: String,
+    /// The bytes a client has uploaded, once it has. Taken out of here by the
+    /// execution that imports them, so one upload is imported exactly once.
+    pub content: Option<Vec<u8>>,
 }
 
 /// The terminal state a started job's execution reaches, and the instant it comes
@@ -204,30 +250,78 @@ pub struct JobSettlement {
     /// What the execution reports about why it ended there — the `Errors` list a
     /// reader answers with, empty for an execution that carried its work out.
     pub errors: Vec<JobError>,
+    /// The asset the execution puts into the revision it names when it finishes, for
+    /// an import that has content to read; `None` for an execution that adds none.
+    pub import: Option<PendingImport>,
+}
+
+/// The asset an import execution adds to the revision its details name.
+///
+/// What an import produces is fixed by the job's own `Details`, so it is resolved
+/// once, by the call that starts the job, and kept until the clock makes the execution
+/// due; the bytes stay in the job's [`JobUpload`] until then rather than being copied
+/// here.
+#[derive(Debug, Clone)]
+pub struct PendingImport {
+    /// The Region the asset's ARN carries: the one the call that started the job was
+    /// signed for.
+    pub region: String,
+    pub data_set_id: String,
+    pub revision_id: String,
+    /// The `Name` the asset carries — the name the job's details give the content.
+    pub asset_name: String,
+    /// The API the asset fulfils, for an import of an API specification; `None` for
+    /// an import of a data file. See [`Asset::api`].
+    pub api: Option<ApiGatewayApiAsset>,
+}
+
+/// An import whose execution has just finished and whose revision has yet to receive
+/// the asset — what [`Job::settle`] hands back so the store can place it.
+#[derive(Debug)]
+pub struct DueImport {
+    /// What the asset is, as the start call resolved it.
+    pub plan: PendingImport,
+    /// The content the asset carries: the bytes the client uploaded, moved out of the
+    /// job's upload.
+    pub content: Vec<u8>,
+    /// The instant the execution came due, which is what the asset was created at.
+    pub at: DateTime,
 }
 
 impl Job {
-    /// Materialise the terminal state this job's execution was already owed at `now`.
+    /// Materialise the terminal state this job's execution was already owed at `now`,
+    /// handing back the import it finished, for the store to place in its revision.
     ///
     /// This is the ONE write a reporting operation may make: the transition was due
     /// at the stored instant whether or not anybody called, so `updated_at` moves to
     /// that instant rather than to `now`.
-    pub fn settle(&mut self, now: DateTime) {
+    pub fn settle(&mut self, now: DateTime) -> Option<DueImport> {
         let due = self
             .pending_settlement
             .as_ref()
             .is_some_and(|settlement| settlement.due_at.as_secs_f64() <= now.as_secs_f64());
         if !due {
-            return;
+            return None;
         }
-        let Some(settlement) = self.pending_settlement.take() else {
-            return;
-        };
+        let settlement = self.pending_settlement.take()?;
         self.state = settlement.state;
         self.errors = settlement.errors;
         if settlement.due_at.as_secs_f64() > self.updated_at.as_secs_f64() {
             self.updated_at = settlement.due_at;
         }
+        let plan = settlement.import?;
+        // The staged bytes BECOME the asset's content, so they are moved out of the
+        // upload: a job imports one upload exactly once.
+        let content = self
+            .upload
+            .as_mut()
+            .and_then(|upload| upload.content.take())
+            .unwrap_or_default();
+        Some(DueImport {
+            plan,
+            content,
+            at: settlement.due_at,
+        })
     }
 
     /// Whether this job is still waiting to be started — the one `State` from which a
@@ -275,16 +369,161 @@ pub struct ComAmazonawsDataexchangeDataexchangeState {
 }
 
 impl ComAmazonawsDataexchangeDataexchangeState {
-    /// Materialise the terminal state every started job was already owed at `now`.
+    /// Materialise the terminal state every started job was already owed at `now`,
+    /// and place the asset each import that finished produced.
     ///
     /// Called at the top of each job operation, the reporting ones included: a job
     /// that was started finishes at an instant the start call fixed, so the move out
     /// of `IN_PROGRESS` is owed at that instant whether or not anybody polls. The
     /// scan is bounded by the store, which holds at most [`MAX_JOBS`] jobs.
     pub fn settle_jobs(&mut self, now: DateTime) {
+        // The jobs are settled first and their imports placed after, because placing
+        // one writes into a data set while the jobs are being walked.
+        let mut due: Vec<(String, DueImport)> = Vec::new();
         for job in self.jobs.values_mut() {
-            job.settle(now);
+            if let Some(import) = job.settle(now) {
+                due.push((job.id.clone(), import));
+            }
         }
+        for (job_id, import) in due {
+            if let Some(error) = self.receive_imported_asset(import) {
+                // The execution finished, but the revision it was importing into no
+                // longer admits the asset, so that — and not a completion — is what
+                // this job ended in.
+                if let Some(job) = self.jobs.get_mut(&job_id) {
+                    job.state = JOB_STATE_ERROR.to_string();
+                    job.errors = vec![error];
+                }
+            }
+        }
+    }
+
+    /// Put the asset an import produced into the revision the job's details named,
+    /// answering the job error that replaces the completion when it cannot be placed.
+    ///
+    /// The target is judged at the instant the execution came due rather than at the
+    /// start: a data set or revision that has gone since cannot receive an asset, and
+    /// neither can one that was finalized while the import ran — the model's
+    /// `Finalized` documentation calls that "this read-only state".
+    fn receive_imported_asset(&mut self, import: DueImport) -> Option<JobError> {
+        let plan = &import.plan;
+        let Some(data_set) = self.data_sets.get_mut(&plan.data_set_id) else {
+            return Some(import_target_not_found(
+                &plan.data_set_id,
+                JOB_ERROR_RESOURCE_TYPE_DATA_SET,
+            ));
+        };
+        // Every asset of a revision carries the `AssetType` of the data set it belongs
+        // to, which is where that type is recorded.
+        let asset_type = data_set.asset_type.clone();
+        let Some(revision) = data_set.revisions.get_mut(&plan.revision_id) else {
+            return Some(import_target_not_found(
+                &plan.revision_id,
+                JOB_ERROR_RESOURCE_TYPE_REVISION,
+            ));
+        };
+        if revision.finalized {
+            return Some(JobError {
+                code: JOB_ERROR_CODE_VALIDATION.to_string(),
+                message: revision_is_finalized_message(&plan.revision_id),
+                resource_id: Some(plan.revision_id.clone()),
+                resource_type: Some(JOB_ERROR_RESOURCE_TYPE_REVISION.to_string()),
+                ..JobError::default()
+            });
+        }
+        let asset_id = mint_id();
+        revision.assets.push(Asset {
+            arn: asset_arn(
+                &plan.region,
+                &plan.data_set_id,
+                &plan.revision_id,
+                &asset_id,
+            ),
+            id: asset_id,
+            name: plan.asset_name.clone(),
+            asset_type,
+            content: import.content,
+            api: plan.api.clone(),
+            created_at: import.at,
+            updated_at: import.at,
+        });
+        // The revision changed when the asset landed in it, which was the instant the
+        // execution came due.
+        if import.at.as_secs_f64() > revision.updated_at.as_secs_f64() {
+            revision.updated_at = import.at;
+        }
+        None
+    }
+
+    /// Record the bytes one PUT to a published upload URL carried.
+    ///
+    /// `digest` is the Base64 MD5 of `body`, computed by the caller ([`content_md5`]).
+    /// The upload the path addresses decides the answer, in this order: a path naming
+    /// no job of this emulator, or a job that published no upload at that path, is no
+    /// upload at all; a window that has closed is an expired request, which is a
+    /// different answer from one that never existed; bytes whose digest is not the one
+    /// the job declared are refused, so the content a job imports is the content its
+    /// creation described; and the store keeps what it retains bounded.
+    ///
+    /// A PUT is idempotent: a second one to the same URL replaces the bytes of the
+    /// first, and only the bytes that end up retained count against the ceiling.
+    pub fn record_upload(
+        &mut self,
+        target: &UploadTarget,
+        digest: &str,
+        body: Vec<u8>,
+        now: DateTime,
+    ) -> UploadOutcome {
+        let retained = self.retained_content_bytes();
+        let Some(job) = self.jobs.get_mut(&target.job_id) else {
+            return UploadOutcome::NoSuchUpload;
+        };
+        let Some(upload) = job
+            .upload
+            .as_mut()
+            .filter(|upload| upload.leaf == target.leaf)
+        else {
+            return UploadOutcome::NoSuchUpload;
+        };
+        if upload.expires_at.as_secs_f64() <= now.as_secs_f64() {
+            return UploadOutcome::Expired;
+        }
+        if digest != upload.md5_hash {
+            return UploadOutcome::DigestMismatch;
+        }
+        let replaced = upload.content.as_ref().map_or(0, Vec::len);
+        if retained.saturating_sub(replaced) + body.len() > MAX_CONTENT_BYTES {
+            return UploadOutcome::StoreFull;
+        }
+        upload.content = Some(body);
+        UploadOutcome::Stored
+    }
+
+    /// How many content bytes this store is holding: every upload staged against a job
+    /// plus every imported asset's own content.
+    ///
+    /// The scan is bounded by the store — at most [`MAX_JOBS`] jobs, and an asset
+    /// arrives only through a job's one import — and is what keeps
+    /// [`MAX_CONTENT_BYTES`] a ceiling on the whole store rather than on one upload.
+    fn retained_content_bytes(&self) -> usize {
+        let staged: usize = self
+            .jobs
+            .values()
+            .map(|job| {
+                job.upload
+                    .as_ref()
+                    .and_then(|upload| upload.content.as_ref())
+                    .map_or(0, Vec::len)
+            })
+            .sum();
+        let imported: usize = self
+            .data_sets
+            .values()
+            .flat_map(|data_set| data_set.revisions.values())
+            .flat_map(|revision| revision.assets.iter())
+            .map(|asset| asset.content.len())
+            .sum();
+        staged + imported
     }
 
     /// The tags stored on the resource the tagging `ResourceArn` addresses, or `None`
@@ -425,6 +664,54 @@ pub const JOB_STATE_ERROR: &str = "ERROR";
 /// same `State` value set.
 pub const JOB_STATE_CANCELLED: &str = "CANCELLED";
 
+/// The terminal `State` of an execution that carried its work out, from the same
+/// `State` value set. A job in it reports no `Errors`.
+pub const JOB_STATE_COMPLETED: &str = "COMPLETED";
+
+/// The `Code` of the job error an execution reports when a resource it had to work on
+/// is not there: one of the model's `Code` values, enumerated by
+/// `crate::ops::types::CODE_VALUES`.
+pub const JOB_ERROR_CODE_RESOURCE_NOT_FOUND: &str = "RESOURCE_NOT_FOUND_EXCEPTION";
+
+/// The `Code` of the job error an execution reports when the work it was to do does
+/// not hold against the state of the resource it names, from the same `Code` value set.
+pub const JOB_ERROR_CODE_VALIDATION: &str = "VALIDATION_EXCEPTION";
+
+/// `ResourceType` for a revision ON A JOB ERROR: a value of the model's
+/// `JobErrorResourceTypes` enum (`REVISION | ASSET | DATA_SET`), which is a different
+/// member — and a different value set — from the `ResourceType` the modelled
+/// exceptions carry, even where the two spell a kind the same way.
+pub const JOB_ERROR_RESOURCE_TYPE_REVISION: &str = "REVISION";
+
+/// `ResourceType` for a data set on a job error, from the same
+/// `JobErrorResourceTypes` value set.
+pub const JOB_ERROR_RESOURCE_TYPE_DATA_SET: &str = "DATA_SET";
+
+/// The job error an execution reports when the resource it was importing into is not
+/// there any more: the same not-found sentence this service's modelled 404 carries
+/// ([`RESOURCE_NOT_FOUND_MESSAGE`]), with the identity in the error's own members.
+///
+/// `resource_type` is a value of the model's `JobErrorResourceTypes` enum
+/// ([`JOB_ERROR_RESOURCE_TYPE_DATA_SET`] / [`JOB_ERROR_RESOURCE_TYPE_REVISION`]).
+fn import_target_not_found(resource_id: &str, resource_type: &str) -> JobError {
+    JobError {
+        code: JOB_ERROR_CODE_RESOURCE_NOT_FOUND.to_string(),
+        message: RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
+        ..JobError::default()
+    }
+}
+
+/// Why a write into `revision_id` cannot hold: the revision is in the state the
+/// model's `Finalized` documentation calls "this read-only state".
+///
+/// ONE sentence for every refusal of such a write, so the modelled 409 a request is
+/// refused with and the job error an execution reports state the same thing.
+pub fn revision_is_finalized_message(revision_id: &str) -> String {
+    format!("The revision {revision_id} is finalized and can't be modified.")
+}
+
 /// How long a started job's execution runs before the clock owes it a terminal
 /// `State`, in seconds.
 ///
@@ -438,6 +725,117 @@ pub const JOB_EXECUTION_SECONDS: f64 = 3.0;
 pub fn later(instant: DateTime, seconds: f64) -> DateTime {
     DateTime::from_secs_f64(instant.as_secs_f64() + seconds)
 }
+
+/// The path space every upload URL this service mints is served at:
+/// `/v1/jobs/{JobId}/{leaf}`.
+///
+/// It is the `/v1/jobs` space the modelled job operations live in, one segment deeper
+/// than any of them (`/v1/jobs`, `/v1/jobs/{JobId}`), so a published upload path names
+/// no modelled operation and collides with none.
+const UPLOAD_PATH_ROOT: &str = "/v1/jobs/";
+
+/// The leaf of the URL a job's ASSET content is uploaded to — the target
+/// `ImportAssetFromSignedUrlResponseDetails.SignedUrl` announces.
+pub const UPLOAD_LEAF_ASSET: &str = "asset";
+
+/// The leaf of the URL a job's API SPECIFICATION is uploaded to — the target
+/// `ImportAssetFromApiGatewayApiResponseDetails.ApiSpecificationUploadUrl` announces.
+pub const UPLOAD_LEAF_API_SPECIFICATION: &str = "api-specification";
+
+/// Every upload leaf this service publishes, which is the whole of the path space the
+/// upload plane claims.
+const UPLOAD_LEAVES: &[&str] = &[UPLOAD_LEAF_ASSET, UPLOAD_LEAF_API_SPECIFICATION];
+
+/// The URL a client uploads the content a job will import to, or `None` when the
+/// request named no endpoint to serve it at.
+///
+/// AWS answers an Amazon S3 presigned URL here. This emulator has no object store, so
+/// the URL names THIS job's upload on the endpoint THIS REQUEST ARRIVED AT, under the
+/// path space [`parse_upload_path`] reads back and the upload plane serves: a client
+/// that follows it writes the bytes into this emulator, and the job's own execution
+/// reads them from there. The two sides are built and read here so they cannot drift.
+///
+/// When the request names no host there is no endpoint to point at, so `None` comes
+/// back — a baked-in AWS endpoint here would send a following client's bytes to the
+/// real service.
+pub fn upload_url(endpoint: Option<&str>, job_id: &str, leaf: &str) -> Option<String> {
+    endpoint.map(|host| format!("https://{host}{UPLOAD_PATH_ROOT}{job_id}/{leaf}"))
+}
+
+/// Which upload a request's path addresses, or `None` for a path that is not one of
+/// the upload URLs this service mints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadTarget {
+    /// The job whose upload this is.
+    pub job_id: String,
+    /// Which of the job's uploads, as [`JobUpload::leaf`] records it.
+    pub leaf: &'static str,
+}
+
+/// Read a request path as one of the upload URLs [`upload_url`] mints.
+///
+/// The job id has to be a modelled `Id` and the leaf one this service publishes, so a
+/// path a client assembled itself addresses no upload — and the leaf handed back is
+/// this crate's own constant, never the caller's text.
+pub fn parse_upload_path(path: &str) -> Option<UploadTarget> {
+    let (job_id, leaf) = path.strip_prefix(UPLOAD_PATH_ROOT)?.split_once('/')?;
+    if !is_modelled_id(job_id) {
+        return None;
+    }
+    let leaf = UPLOAD_LEAVES
+        .iter()
+        .find(|published| **published == leaf)?;
+    Some(UploadTarget {
+        job_id: job_id.to_string(),
+        leaf,
+    })
+}
+
+/// Whether `value` is a `com.amazonaws.dataexchange#Id` — the model's
+/// `^[a-zA-Z0-9]{30,40}$`, which every identifier this service mints satisfies.
+fn is_modelled_id(value: &str) -> bool {
+    (30..=40).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// The Base64 MD5 of `body`, in the encoding the model's `Md5Hash` /
+/// `ApiSpecificationMd5Hash` members carry (`@length(24, 24)` with a base64
+/// `@pattern`) and HTTP's own `Content-MD5` header uses.
+pub fn content_md5(body: &[u8]) -> String {
+    ::aws_smithy_types::base64::encode(Md5::digest(body))
+}
+
+/// The entity tag of stored content: its MD5 as quoted hex, which is the `ETag` an
+/// Amazon S3 presigned upload of a whole object answers with.
+pub fn content_etag(body: &[u8]) -> String {
+    format!("\"{}\"", hex::encode(Md5::digest(body)))
+}
+
+/// What one PUT to a published upload URL did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadOutcome {
+    /// The bytes are now the job's staged content.
+    Stored,
+    /// The path addresses no upload this service minted.
+    NoSuchUpload,
+    /// The window the create call published for the URL has closed.
+    Expired,
+    /// The bytes are not the ones the job's declared digest describes.
+    DigestMismatch,
+    /// Retaining the bytes would push the store past [`MAX_CONTENT_BYTES`].
+    StoreFull,
+}
+
+/// The most bytes one upload to a published URL retains.
+///
+/// AWS's own presigned target takes an object far larger; this emulator holds the
+/// content in memory, so it keeps what one upload may leave behind bounded, and says
+/// so rather than truncating.
+pub const MAX_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
+
+/// The most content bytes the whole store retains: every upload staged against a job
+/// plus every imported asset's content, which is one ceiling over both because an
+/// upload's bytes BECOME an asset's.
+pub const MAX_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 
 /// The 500 a handler answers with when the shared engine is not the one this
 /// service's store lives in. Never a fresh engine: that would drop the write.

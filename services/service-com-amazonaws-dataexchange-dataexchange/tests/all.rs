@@ -33,5 +33,7 @@ mod resource_tags;
 mod revision_finalization;
 #[path = "all/revisions.rs"]
 mod revisions;
+#[path = "all/signed_url_uploads.rs"]
+mod signed_url_uploads;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
