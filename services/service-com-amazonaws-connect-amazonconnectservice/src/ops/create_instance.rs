@@ -223,29 +223,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let id = store.mint_resource_id();
-        let arn = crate::state::instance_arn(&region, &id);
-        let record = crate::state::InstanceRecord {
-            id: id.clone(),
-            arn: arn.clone(),
-            region,
-            identity_management_type: input.identity_management_type,
-            instance_alias: input.instance_alias.clone(),
-            directory_id: input.directory_id,
-            inbound_calls_enabled: input.inbound_calls_enabled,
-            outbound_calls_enabled: input.outbound_calls_enabled,
-            service_role: crate::state::instance_service_role(&id),
-            instance_access_url: crate::state::instance_access_url(
-                input.instance_alias.as_deref(),
-                &id,
-            ),
-            created_time: now,
-            active_at: now + crate::state::INSTANCE_ACTIVATION_DELAY,
-            tags: crate::state::tags_in(input.tags),
-            queues: ::std::collections::BTreeMap::new(),
-            contact_flows: ::std::collections::BTreeMap::new(),
-            hours_of_operations: ::std::collections::BTreeMap::new(),
-            storage_configs: ::std::collections::BTreeMap::new(),
-        };
+        let mut record = crate::state::InstanceRecord::new(
+            &region,
+            &id,
+            &input.identity_management_type,
+            input.instance_alias,
+            now,
+            // The instance is CREATION_IN_PROGRESS until the clock owes it ACTIVE.
+            now + crate::state::INSTANCE_ACTIVATION_DELAY,
+        );
+        record.directory_id = input.directory_id;
+        record.inbound_calls_enabled = input.inbound_calls_enabled;
+        record.outbound_calls_enabled = input.outbound_calls_enabled;
+        record.tags = crate::state::tags_in(input.tags);
+        // The ARN this call reports is the one stored on the record, so the create and
+        // every later read of the instance answer with the same ARN.
+        let arn = record.arn.clone();
 
         store.instances.insert(id.clone(), record);
 

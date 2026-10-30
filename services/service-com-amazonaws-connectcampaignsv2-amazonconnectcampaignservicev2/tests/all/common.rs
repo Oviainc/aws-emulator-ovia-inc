@@ -10,7 +10,6 @@
 //! exercises the restJson1 wire protocol, the modelled constraints and the handler
 //! together.
 
-use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -107,28 +106,21 @@ pub fn register_connect_instance(
     let now = SystemTime::now();
     store.instances.insert(
         instance.to_string(),
-        connect_state::InstanceRecord {
-            id: instance.to_string(),
-            arn: connect_state::instance_arn(region, instance),
-            region: region.to_string(),
+        // The record Connect's own `CreateInstance` writes, built through the
+        // constructor that crate exposes, so a member added to that record reaches this
+        // fixture with it.
+        connect_state::InstanceRecord::new(
+            region,
+            instance,
             // `DirectoryType`'s catalog (DIRECTORY_TYPE_VALUES in the Connect crate's
             // `ops::types`) opens with the type an instance Connect manages itself
             // carries.
-            identity_management_type: "CONNECT_MANAGED".to_string(),
-            instance_alias: Some(instance.to_string()),
-            directory_id: None,
-            inbound_calls_enabled: true,
-            outbound_calls_enabled: true,
-            service_role: connect_state::instance_service_role(instance),
-            instance_access_url: connect_state::instance_access_url(Some(instance), instance),
-            created_time: now,
-            active_at: now,
-            tags: BTreeMap::new(),
-            queues: BTreeMap::new(),
-            contact_flows: BTreeMap::new(),
-            hours_of_operations: BTreeMap::new(),
-            storage_configs: BTreeMap::new(),
-        },
+            "CONNECT_MANAGED",
+            Some(instance.to_string()),
+            now,
+            // Already past the clock-owed activation instant, so the instance is ACTIVE.
+            now,
+        ),
     );
 }
 

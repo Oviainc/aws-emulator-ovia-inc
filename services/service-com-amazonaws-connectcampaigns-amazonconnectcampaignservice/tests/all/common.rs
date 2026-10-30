@@ -10,7 +10,6 @@
 //! one thing every suite of this crate takes from here. `campaign_lifecycle.rs` keeps
 //! the host-style exchange harness it was written around and takes only the fixture.
 
-use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -169,29 +168,21 @@ pub fn register_connect_instance(engine: &engine::InMemoryEngine, region: &str, 
     let now = SystemTime::now();
     store.instances.insert(
         instance.to_string(),
-        connect_state::InstanceRecord {
-            id: instance.to_string(),
-            arn: connect_state::instance_arn(region, instance),
-            region: region.to_string(),
+        // The record Connect's own `CreateInstance` writes, built through the
+        // constructor that crate exposes, so a member added to that record reaches this
+        // fixture with it.
+        connect_state::InstanceRecord::new(
+            region,
+            instance,
             // `DirectoryType`'s catalog in the Connect crate opens with the type an
             // instance Connect manages itself carries.
-            identity_management_type: "CONNECT_MANAGED".to_string(),
-            instance_alias: Some(instance.to_string()),
-            directory_id: None,
-            inbound_calls_enabled: true,
-            outbound_calls_enabled: true,
-            service_role: connect_state::instance_service_role(instance),
-            instance_access_url: connect_state::instance_access_url(Some(instance), instance),
-            created_time: now,
-            active_at: now,
-            tags: BTreeMap::new(),
-            queues: BTreeMap::new(),
-            contact_flows: BTreeMap::new(),
-            hours_of_operations: BTreeMap::new(),
-            // A registered instance holds no storage configuration until
-            // `AssociateInstanceStorageConfig` writes one.
-            storage_configs: BTreeMap::new(),
-        },
+            "CONNECT_MANAGED",
+            Some(instance.to_string()),
+            now,
+            // Already past the clock-owed activation instant, so the instance is
+            // active.
+            now,
+        ),
     );
 }
 

@@ -851,7 +851,14 @@ impl PhoneNumberRecord {
 }
 
 /// One stored Connect instance.
+///
+/// Built through [`InstanceRecord::new`], which is also the only way a crate other than
+/// this one can build one: the record carries the resources that hang off an instance,
+/// so it grows a member whenever another of them is stored, and a member added here is
+/// given its value for every instance in that one constructor instead of in every
+/// caller.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct InstanceRecord {
     pub id: String,
     pub arn: String,
@@ -890,6 +897,44 @@ pub struct InstanceRecord {
 }
 
 impl InstanceRecord {
+    /// The record a created instance starts from: instance `id` in `region`, with
+    /// `identity_management_type` (one of the modelled `DirectoryType` values) and
+    /// `instance_alias`, created at `created_time` and owed `ACTIVE` at `active_at`.
+    ///
+    /// Everything else is derived or empty: the ARN, the service-linked role and the
+    /// access URL follow from the id and the alias, no directory is named, both call
+    /// directions are enabled, and the instance holds no tags and none of the resources
+    /// that hang off it — a caller that wants other values assigns those members on the
+    /// record this hands back.
+    pub fn new(
+        region: &str,
+        id: &str,
+        identity_management_type: &str,
+        instance_alias: Option<String>,
+        created_time: SystemTime,
+        active_at: SystemTime,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            arn: instance_arn(region, id),
+            region: region.to_string(),
+            identity_management_type: identity_management_type.to_string(),
+            instance_access_url: instance_access_url(instance_alias.as_deref(), id),
+            instance_alias,
+            directory_id: None,
+            inbound_calls_enabled: true,
+            outbound_calls_enabled: true,
+            service_role: instance_service_role(id),
+            created_time,
+            active_at,
+            tags: BTreeMap::new(),
+            queues: BTreeMap::new(),
+            contact_flows: BTreeMap::new(),
+            hours_of_operations: BTreeMap::new(),
+            storage_configs: BTreeMap::new(),
+        }
+    }
+
     /// The instance's status at `now` — derived from the stored activation instant, so
     /// reading it changes nothing a later caller sees.
     pub fn status(&self, now: SystemTime) -> &'static str {

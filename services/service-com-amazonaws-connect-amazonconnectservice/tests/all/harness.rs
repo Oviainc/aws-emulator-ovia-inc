@@ -32,6 +32,7 @@ pub(crate) struct Answer {
 pub(crate) struct Connect {
     router: MultiServiceRouter,
     region: String,
+    engine: Arc<InMemoryEngine>,
 }
 
 impl Default for Connect {
@@ -45,15 +46,23 @@ impl Connect {
         let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
         Self {
             router,
             region: region.to_string(),
+            engine,
         }
     }
 
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// The engine this emulator was built over — the single shared store its handlers
+    /// read, so a suite can put a record there the way another service's fixture does
+    /// and then read it back over HTTP.
+    pub(crate) fn engine(&self) -> &InMemoryEngine {
+        &self.engine
     }
 
     pub(crate) async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) {

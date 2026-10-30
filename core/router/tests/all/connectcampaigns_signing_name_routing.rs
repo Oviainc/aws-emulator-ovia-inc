@@ -22,7 +22,6 @@
 //! operation is implemented, or with its own scaffold `NotImplemented` when it is still
 //! a stub — and a path neither version models is refused only because nobody claims it.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -100,25 +99,18 @@ fn register_connect_instance(engine: &engine::InMemoryEngine, instance: &str) {
     let now = SystemTime::now();
     state.lock().instances.insert(
         instance.to_string(),
-        connect_state::InstanceRecord {
-            id: instance.to_string(),
-            arn: connect_state::instance_arn("us-east-1", instance),
-            region: "us-east-1".to_string(),
-            identity_management_type: "CONNECT_MANAGED".to_string(),
-            instance_alias: Some(instance.to_string()),
-            directory_id: None,
-            inbound_calls_enabled: true,
-            outbound_calls_enabled: true,
-            service_role: connect_state::instance_service_role(instance),
-            instance_access_url: connect_state::instance_access_url(Some(instance), instance),
-            created_time: now,
-            active_at: now,
-            tags: BTreeMap::new(),
-            queues: BTreeMap::new(),
-            contact_flows: BTreeMap::new(),
-            hours_of_operations: BTreeMap::new(),
-            storage_configs: BTreeMap::new(),
-        },
+        // The record Connect's own `CreateInstance` writes, built through the
+        // constructor that crate exposes, so a member added to that record reaches this
+        // fixture with it.
+        connect_state::InstanceRecord::new(
+            "us-east-1",
+            instance,
+            "CONNECT_MANAGED",
+            Some(instance.to_string()),
+            now,
+            // Already past its clock-owed activation instant.
+            now,
+        ),
     );
 }
 

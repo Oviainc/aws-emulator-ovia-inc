@@ -23,6 +23,8 @@ mod hours_of_operation_lifecycle;
 mod instance_default_resources;
 #[path = "all/instance_queue_lifecycle.rs"]
 mod instance_queue_lifecycle;
+#[path = "all/instance_registry_seam.rs"]
+mod instance_registry_seam;
 #[path = "all/instance_storage_config.rs"]
 mod instance_storage_config;
 #[path = "all/phone_number_inventory.rs"]
