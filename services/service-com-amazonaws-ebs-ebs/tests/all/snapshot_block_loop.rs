@@ -320,6 +320,17 @@ pub(crate) async fn get_block(
     .await
 }
 
+/// A string member of a response body (`Status`, `SnapshotId`, `Message`, `Reason`), or
+/// the empty string when the body does not carry it.
+pub(crate) fn member(reply: &Reply, name: &str) -> String {
+    reply
+        .json()
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// The `(BlockIndex, BlockToken)` pairs a listing reported, in the order it reported
 /// them.
 pub(crate) fn listed_blocks(reply: &Reply) -> Vec<(i32, String)> {
@@ -442,24 +453,28 @@ pub(crate) async fn write_snapshot(
         completed.status,
         String::from_utf8_lossy(&completed.body)
     );
-    // The 202 ACKNOWLEDGES the seal; the snapshot is still pending at that instant. The
-    // transition to `completed` is asserted on its own in `snapshot_completion.rs`.
+    // The 202 ACKNOWLEDGES the snapshot the seal was applied to, so it reports the
+    // status the record was in when the request arrived; the sealed `completed` is what
+    // every later call reads back (asserted in
+    // `sealed_status_and_fixed_refusal_text.rs`).
     assert_eq!(
         completed
             .json()
             .get("Status")
             .and_then(serde_json::Value::as_str),
         Some("pending"),
-        "case {case:?}: CompleteSnapshot must acknowledge with the pending status, got {}",
+        "case {case:?}: CompleteSnapshot must acknowledge the status it sealed, got {}",
         completed.json()
     );
 
     snapshot_id
 }
 
-/// One row of the write-then-read table: a human-readable case name, the volume size to
+/// One row of a write-then-read table: a human-readable case name, the volume size to
 /// start the snapshot with, and the `(BlockIndex, byte seed)` pairs to write into it.
-type WriteCase<'a> = (&'a str, i64, &'a [(i32, u8)]);
+/// `pub(crate)` so a sibling suite tabulating the same three columns names this type
+/// rather than restating it.
+pub(crate) type WriteCase<'a> = (&'a str, i64, &'a [(i32, u8)]);
 
 /// RULE 1 + 2: whatever set of block indexes was written, the listing reports exactly
 /// those indexes ascending and each block reads back byte-identical with a `DataLength`
@@ -1201,8 +1216,13 @@ async fn a_child_snapshot_starts_from_a_copy_of_the_parent_blocks() {
     assert_eq!(
         sealed.json().get("Status").and_then(serde_json::Value::as_str),
         Some("pending"),
-        "case \"child\": the acknowledgement must report the snapshot as pending, got {}",
+        "case \"child\": the acknowledgement must report the status the seal was applied to, got {}",
         sealed.json()
+    );
+    assert_eq!(
+        member(&complete_snapshot(&router, &child, 1).await, "Status"),
+        "completed",
+        "case \"child\": a later call must read the sealed status back off the record"
     );
 }
 

@@ -152,7 +152,7 @@ use crate::state::{
     BlockEntry, Snapshot, SnapshotStatus, SseType, StartSnapshotIdempotencyRecord, StoredTag,
     CLIENT_TOKEN_CONFLICT_MESSAGE, DEFAULT_SNAPSHOT_TIMEOUT_MINUTES,
     MAX_STORED_BLOCKS_PER_SNAPSHOT, MAX_STORED_BLOCKS_TOTAL, MAX_STORED_SNAPSHOTS,
-    MAX_VOLUME_SIZE_GIB, SNAPSHOT_BLOCK_SIZE_BYTES,
+    MAX_VOLUME_SIZE_GIB, PARENT_SNAPSHOT_ID_AND_ENCRYPT_MESSAGE, SNAPSHOT_BLOCK_SIZE_BYTES,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -248,12 +248,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Encrypted`: "You can't specify Encrypted and ParentSnapshotId in the same
         // request. If you specify both parameters, the request fails with
-        // ValidationException."
+        // ValidationException." The refusal's sentence is fixed text naming the two
+        // members, stated once in `crate::state`.
         if input.encrypted == Some(true) && input.parent_snapshot_id.is_some() {
             return Err(validation(
                 "INVALID_PARAMETER_VALUE",
-                "Encrypted and ParentSnapshotId cannot both be specified in the same request"
-                    .to_string(),
+                PARENT_SNAPSHOT_ID_AND_ENCRYPT_MESSAGE.to_string(),
             ));
         }
 
@@ -390,8 +390,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             encrypted,
             sse_type,
             timeout_minutes,
-            // No completion has been asked for yet: `CompleteSnapshot` sets this.
-            completion_due: None,
             blocks,
         };
         store.snapshots.insert(snapshot_id.clone(), snapshot);

@@ -33,17 +33,6 @@ pub const MAX_VOLUME_SIZE_GIB: i64 = 65_536;
 /// of the data. Only SHA256 checksums are supported.").
 pub const CHECKSUM_ALGORITHM_SHA256: &str = "SHA256";
 
-/// How long after an accepted `CompleteSnapshot` the seal becomes observable.
-///
-/// `CompleteSnapshot` is modelled `@http(code: 202)` — Accepted — and acknowledges the
-/// request while the snapshot is still `pending`: the seal is asynchronous and the
-/// terminal `completed` is observed by a later call. Nothing AWS publishes says how long
-/// that takes, so the span is CHOSEN: short enough not to slow a caller down, and never
-/// zero, so a caller acting straight after the 202 still observes the transient state and
-/// the refusals that go with it. The due instant is stored on the snapshot; nothing ever
-/// sleeps for it.
-pub const SNAPSHOT_COMPLETION_DELAY: Duration = Duration::from_millis(300);
-
 /// The expression a `blockToken` must satisfy, as the LIVE service reports it in its
 /// validation refusal: `1 validation error detected: Value '' at 'blockToken' failed to
 /// satisfy constraint: Member must satisfy regular expression pattern:
@@ -198,15 +187,6 @@ pub struct Snapshot {
     /// which case `SseType` is omitted from a response rather than reported as `none`.
     pub sse_type: Option<SseType>,
     pub timeout_minutes: i32,
-    /// When an accepted `CompleteSnapshot` makes this snapshot's seal observable, or
-    /// `None` when no completion has been asked for.
-    ///
-    /// Set by `CompleteSnapshot`, which answers 202 while the snapshot is still
-    /// `pending`; [`ComAmazonawsEbsEbsState::apply_due_transitions`] moves the status to
-    /// `completed` once the clock has passed it. A snapshot with this set is already
-    /// SEALED — its content is final and it accepts no further writes — even while it
-    /// still reports `pending`.
-    pub completion_due: Option<SystemTime>,
     /// The blocks written, keyed by `BlockIndex`. A `BTreeMap` because
     /// `ListSnapshotBlocks` enumerates ascending by index and pages from an index.
     pub blocks: BTreeMap<i32, BlockEntry>,
@@ -220,19 +200,18 @@ impl Snapshot {
         self.blocks.values().filter(|entry| entry.written).count()
     }
 
-    /// Whether this snapshot's content is final: it was completed, or a
-    /// `CompleteSnapshot` was accepted and the seal is in flight.
+    /// Whether this snapshot's content is final: `CompleteSnapshot` sealed it.
     ///
     /// "You cannot write new blocks to a snapshot after it has been completed", so this
     /// is also the answer to "may a block still be written", negated.
     pub fn is_sealed(&self) -> bool {
-        self.status == SnapshotStatus::Completed || self.completion_due.is_some()
+        self.status == SnapshotStatus::Completed
     }
 
     /// Whether `PutSnapshotBlock` may still write into this snapshot: "The target
-    /// snapshot must be in the pending state", and its seal has not been asked for.
+    /// snapshot must be in the pending state".
     pub fn accepts_writes(&self) -> bool {
-        self.status == SnapshotStatus::Pending && self.completion_due.is_none()
+        self.status == SnapshotStatus::Pending
     }
 }
 
@@ -251,9 +230,9 @@ pub struct ComAmazonawsEbsEbsState {
     pub snapshots: HashMap<String, Snapshot>,
     /// `StartSnapshot` idempotency, keyed by `ClientToken`.
     pub client_tokens: HashMap<String, StartSnapshotIdempotencyRecord>,
-    /// The earliest instant at which some stored snapshot owes a status transition — a
-    /// `Timeout` falling due, or an accepted `CompleteSnapshot`'s seal becoming
-    /// observable — or `None` when nothing is pending. [`Self::apply_due_transitions`]
+    /// The earliest instant at which some stored snapshot owes a status transition: a
+    /// `Timeout` falling due, or `None` when no snapshot is still pending.
+    /// [`Self::apply_due_transitions`]
     /// returns without scanning until that instant passes, so per-request cost does not
     /// grow with the number of stored snapshots.
     next_transition_due: Option<SystemTime>,
@@ -302,23 +281,20 @@ impl ComAmazonawsEbsEbsState {
 
     /// Materialise every status change the CLOCK has already made due.
     ///
-    /// Two are owed, both at an instant stored when the call that started them ran, so
-    /// each was owed whether or not anybody called again:
-    ///
-    /// * an accepted `CompleteSnapshot`'s seal: the 202 reports the snapshot `pending`
-    ///   and [`SNAPSHOT_COMPLETION_DELAY`] later it is `completed`.
-    /// * a `Timeout`: `StartSnapshotRequest$Timeout` documents that a snapshot is
-    ///   "automatically cancelled" when it is not completed within that many minutes;
-    ///   a cancelled snapshot is what the modeled `Status` enum calls `error`.
+    /// One is owed, at an instant stored when the call that started it ran, so it was
+    /// owed whether or not anybody called again: a `Timeout`.
+    /// `StartSnapshotRequest$Timeout` documents that a snapshot is "automatically
+    /// cancelled" when it is not completed within that many minutes; a cancelled
+    /// snapshot is what the modeled `Status` enum calls `error`.
     ///
     /// Every handler applies this before reading, and it never moves a status the clock
-    /// did not already owe.
+    /// did not already owe. A sealed snapshot has nothing left to cancel, so only a
+    /// snapshot still `pending` is considered.
     ///
     /// A cancelled snapshot can never be completed, nor its blocks listed or fetched
     /// again, so this is also where their bytes are released (and with them their block
     /// tokens, which live on the entries): it is this store's retention policy, not just
-    /// a status flip. A snapshot whose seal is in flight is NOT cancelled — its content
-    /// is already final, so the `Timeout` has nothing left to cancel.
+    /// a status flip.
     pub fn apply_due_transitions(&mut self, now: SystemTime) {
         // Nothing is due yet, so do not walk the map on every request.
         if self.next_transition_due.is_none_or(|due| now < due) {
@@ -328,32 +304,22 @@ impl ComAmazonawsEbsEbsState {
             if snapshot.status != SnapshotStatus::Pending {
                 continue;
             }
-            match snapshot.completion_due {
-                Some(due) => {
-                    if now >= due {
-                        snapshot.status = SnapshotStatus::Completed;
-                        snapshot.completion_due = None;
-                    }
-                }
-                None => {
-                    if now >= snapshot.expiry_time {
-                        snapshot.status = SnapshotStatus::Error;
-                        snapshot.blocks.clear();
-                    }
-                }
+            if now >= snapshot.expiry_time {
+                snapshot.status = SnapshotStatus::Error;
+                snapshot.blocks.clear();
             }
         }
         self.refresh_transition_schedule();
     }
 
     /// Recompute the earliest transition still outstanding. Call after storing a
-    /// snapshot or asking for its completion.
+    /// snapshot or sealing one.
     pub fn refresh_transition_schedule(&mut self) {
         self.next_transition_due = self
             .snapshots
             .values()
             .filter(|snapshot| snapshot.status == SnapshotStatus::Pending)
-            .map(|snapshot| snapshot.completion_due.unwrap_or(snapshot.expiry_time))
+            .map(|snapshot| snapshot.expiry_time)
             .min();
     }
 
@@ -480,6 +446,25 @@ pub fn unsupported_checksum_algorithm_message(algorithm: &str) -> String {
 pub fn invalid_volume_size_message(volume_size: i64) -> String {
     format!("Invalid volume size: {volume_size}")
 }
+
+/// The message `StartSnapshot` answers with when a request asks for a snapshot taken
+/// from a parent AND for encryption: a snapshot inherits its parent's encryption, so the
+/// two cannot be requested together.
+///
+/// FIXED and request-independent: the sentence names the two input members and
+/// interpolates nothing — not the parent id, not the volume, not any other value the
+/// request carried. The second member is named as the service names it in this refusal,
+/// which is not the spelling the input member carries.
+pub const PARENT_SNAPSHOT_ID_AND_ENCRYPT_MESSAGE: &str =
+    "ParentSnapshotId and Encrypt cannot be specified together";
+
+/// The message `PutSnapshotBlock` answers with when the block payload the request
+/// DECLARED cannot be read off it.
+///
+/// FIXED and request-independent: the sentence reports that the read failed and
+/// interpolates neither the declared `DataLength` nor how many bytes did arrive — a
+/// payload the service could not read gives it no block to describe.
+pub const FAILED_TO_READ_BLOCK_DATA_MESSAGE: &str = "Failed to read block data";
 
 /// The message the modelled `ConflictException` (HTTP 409) carries when a `ClientToken`
 /// is reused for a request that does not match the one it was stored with.

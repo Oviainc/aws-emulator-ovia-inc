@@ -15,6 +15,8 @@
 mod minted_query_tokens;
 #[path = "all/response_bodies_and_refusals.rs"]
 mod response_bodies_and_refusals;
+#[path = "all/sealed_status_and_fixed_refusal_text.rs"]
+mod sealed_status_and_fixed_refusal_text;
 #[path = "all/snapshot_block_loop.rs"]
 mod snapshot_block_loop;
 #[path = "all/state_roundtrip.rs"]

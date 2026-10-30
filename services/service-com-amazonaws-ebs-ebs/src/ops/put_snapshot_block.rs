@@ -119,7 +119,7 @@ use crate::state::{
     blocks_in_volume, checksum_base64_sha256, is_well_formed_snapshot_id,
     malformed_snapshot_id_message, snapshot_not_found_message,
     unsupported_checksum_algorithm_message, BlockEntry, CHECKSUM_ALGORITHM_SHA256,
-    MAX_STORED_BLOCKS_PER_SNAPSHOT, MAX_STORED_BLOCKS_TOTAL,
+    FAILED_TO_READ_BLOCK_DATA_MESSAGE, MAX_STORED_BLOCKS_PER_SNAPSHOT, MAX_STORED_BLOCKS_TOTAL,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -238,9 +238,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored_blocks = snapshot.blocks.len();
         let index_already_written = snapshot.blocks.contains_key(&input.block_index);
         // "The target snapshot must be in the pending state", and "You cannot write new
-        // blocks to a snapshot after it has been completed" — which includes a snapshot
-        // whose completion was accepted and whose seal is still in flight: its content is
-        // already final.
+        // blocks to a snapshot after it has been completed" — which a `CompleteSnapshot`
+        // applies, so a snapshot whose completion was accepted takes no further block.
         let write_refusal = (!snapshot.accepts_writes()).then(|| {
             if snapshot.is_sealed() {
                 format!(
@@ -285,15 +284,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // The declared length must describe the payload actually sent.
+        // `BlockData` is the `@httpPayload` and `DataLength` declares how many bytes of
+        // it the request carries, so a payload that does not deliver exactly that many
+        // bytes leaves the service with no block to judge at all: the declared block
+        // data could not be READ. That is a bad request parameter/payload, which the
+        // modelled `ValidationExceptionReason` calls `INVALID_PARAMETER_VALUE`, reported
+        // with the service's fixed sentence for a failed read. `INVALID_BLOCK` is
+        // reserved below for a block that WAS read and is then rejected on its content.
         let actual_length = i64::try_from(input.block_data.len()).unwrap_or(i64::MAX);
         if actual_length != i64::from(input.data_length) {
             return Err(validation(
-                "INVALID_BLOCK",
-                format!(
-                    "DataLength {} does not match the {actual_length} bytes of BlockData sent",
-                    input.data_length
-                ),
+                "INVALID_PARAMETER_VALUE",
+                FAILED_TO_READ_BLOCK_DATA_MESSAGE.to_string(),
             ));
         }
 

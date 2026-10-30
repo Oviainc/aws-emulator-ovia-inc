@@ -3,8 +3,8 @@
 //! @op CompleteSnapshot
 //!
 //! Implemented: checks the number of blocks actually written against
-//! `ChangedBlocksCount`, records the asynchronous seal the 202 acknowledges and answers
-//! with the status read back from the stored record.
+//! `ChangedBlocksCount`, seals the stored snapshot and acknowledges with the status that
+//! record was in when the request was accepted.
 //!
 //! ## Shape of an operation
 //!
@@ -97,7 +97,6 @@ use std::time::SystemTime;
 use crate::state::{
     is_well_formed_snapshot_id, malformed_snapshot_id_message, snapshot_not_found_message,
     unsupported_checksum_algorithm_message, SnapshotStatus, CHECKSUM_ALGORITHM_SHA256,
-    SNAPSHOT_COMPLETION_DELAY,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -235,19 +234,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The status the snapshot is in when this request is ACCEPTED, which is what the
+        // 202 reports. `CompleteSnapshot` is modelled `@http(code: 202)` — Accepted — so
+        // the response acknowledges the snapshot the seal was applied TO: the request has
+        // been taken, and the sealing it asks for is finished only after the answer. The
+        // seal itself is applied by this call ("Completing the snapshot changes the status
+        // to completed"), so every LATER call reads `completed` back off the record, and
+        // nothing is left outstanding for the clock to materialise.
+        let accepted_status = snapshot.status;
         match snapshot.status {
-            // The seal is ASYNCHRONOUS: this operation is modelled `@http(code: 202)` —
-            // Accepted — so it records when the seal falls due and leaves the status
-            // `pending`; "Completing the snapshot changes the status to completed" is
-            // what a caller observes afterwards, through a later read of the snapshot.
-            // Repeating the request while the seal is in flight re-reports the same
-            // acknowledgement and does not move the due instant.
-            SnapshotStatus::Pending => {
-                if snapshot.completion_due.is_none() {
-                    snapshot.completion_due = Some(now + SNAPSHOT_COMPLETION_DELAY);
-                }
-            }
-            // Already sealed: nothing left to change, so the stored status is the answer.
+            SnapshotStatus::Pending => snapshot.status = SnapshotStatus::Completed,
+            // Already sealed: completing it again changes nothing, so the stored status
+            // is the answer.
             SnapshotStatus::Completed => {}
             // A snapshot whose `Timeout` cancelled it can no longer be sealed.
             SnapshotStatus::Error => {
@@ -261,17 +259,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The snapshot now owes a seal rather than a `Timeout`, so the store's schedule
-        // is recomputed: `next_transition_due` keeps naming the earliest change the clock
-        // really does owe.
+        // A sealed snapshot no longer owes its `Timeout` — there is nothing left to
+        // cancel — so the store's schedule is recomputed: `next_transition_due` keeps
+        // naming the earliest change the clock really does owe.
         store.refresh_transition_schedule();
 
-        // Read the status back off the stored record rather than returning a literal.
-        let stored = store.snapshots.get(&input.snapshot_id).ok_or_else(|| {
-            no_state_message(format!("snapshot {} is no longer stored", input.snapshot_id))
-        })?;
+        // Rendered from the stored record, never from a literal: the status this request
+        // was accepted against. The record itself now holds `completed`, which is what
+        // every later call — including a repeat of this one — reads back.
         Ok(CompleteSnapshotOutput {
-            status: Some(stored.status.as_wire().to_string()),
+            status: Some(accepted_status.as_wire().to_string()),
         })
     }
 }

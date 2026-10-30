@@ -9,8 +9,9 @@
 //!
 //! 1. An optional response member the stored snapshot does not have is ABSENT, never a
 //!    placeholder (`SseType`, `Tags`).
-//! 2. `CompleteSnapshot` is an acknowledgement: its 202 reports the snapshot `pending`,
-//!    the snapshot is sealed from that instant, and `completed` is observed afterwards.
+//! 2. `CompleteSnapshot` applies the seal: its 202 acknowledges the status the snapshot
+//!    was in when the request arrived, no further block is accepted into it, and every
+//!    later call reads `completed` back.
 //! 3. A `blockToken` is judged against the expression the SERVICE enforces, and the
 //!    refusal reports that expression.
 //! 4. A checksum algorithm the service does not support is refused through its own
@@ -21,13 +22,10 @@
 //! 7. Every "that snapshot is not stored" refusal uses ONE template, in every operation
 //!    that resolves a snapshot id.
 
-use std::thread::sleep;
-use std::time::{Duration, Instant};
-
 use crate::snapshot_block_loop::{
     block_bytes, checksum, complete_snapshot, complete_snapshot_with_algorithm, get_block,
-    list_blocks, listed_blocks, put_block, put_block_with_algorithm, put_block_with_progress,
-    router, start_snapshot, write_snapshot, Reply, BLOCK_SIZE,
+    list_blocks, listed_blocks, member, put_block, put_block_with_algorithm,
+    put_block_with_progress, router, start_snapshot, write_snapshot, Reply, BLOCK_SIZE,
 };
 
 /// The expression the service enforces on a `blockToken`, which is also the one its
@@ -42,22 +40,6 @@ const SUPPORTED_ALGORITHM: &str = "SHA256";
 /// The widths of the hex suffix of a snapshot id the service accepts, mirroring
 /// `crate::state::SNAPSHOT_ID_HEX_WIDTHS`.
 const SNAPSHOT_ID_HEX_WIDTHS: [usize; 2] = [8, 17];
-
-/// A member of a modelled error body (`Message`, `Reason`), or the empty string when the
-/// body does not carry it.
-fn member(reply: &Reply, name: &str) -> String {
-    reply
-        .json()
-        .get(name)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// How long a test waits for a transition the clock owes. Generously longer than
-/// `crate::state::SNAPSHOT_COMPLETION_DELAY` so a loaded machine cannot fail the test,
-/// while a transition that never happens still fails it.
-const TRANSITION_DEADLINE: Duration = Duration::from_secs(5);
 
 /// A snapshot id a request may name that no `StartSnapshot` ever minted, WELL-FORMED so
 /// the refusal is about the snapshot and not about the id's shape: `snap-` plus 8 or 17
@@ -165,12 +147,12 @@ async fn optional_response_members_are_absent_when_the_snapshot_has_none() {
     }
 }
 
-/// RULE 2: `CompleteSnapshot` ACKNOWLEDGES the seal. Its 202 reports the snapshot as
-/// `pending`, the snapshot accepts no further block from that instant, and the terminal
-/// `completed` becomes observable afterwards — so a client that waits for
-/// pending -> completed has something to wait for.
+/// RULE 2: `CompleteSnapshot` APPLIES the seal and acknowledges the snapshot it sealed.
+/// Its 202 reports the status the record was in when the request arrived, the snapshot
+/// accepts no further block from that instant, everything written into it is still
+/// served, and every later call reads the sealed `completed` back.
 #[tokio::test]
-async fn completing_a_snapshot_is_acknowledged_pending_and_completes_from_the_clock() {
+async fn completing_a_snapshot_seals_it_and_acknowledges_the_status_it_sealed() {
     let router = router();
 
     // Rows differ along how many blocks were written before the seal, including none.
@@ -212,12 +194,12 @@ async fn completing_a_snapshot_is_acknowledged_pending_and_completes_from_the_cl
         assert_eq!(
             member(&accepted, "Status"),
             "pending",
-            "case {case:?}: the acknowledgement must report the snapshot as pending, got {}",
+            "case {case:?}: the acknowledgement must report the status the seal was applied to, got {}",
             accepted.json()
         );
 
-        // Sealed from the instant the completion was accepted: "You cannot write new
-        // blocks to a snapshot after it has been completed".
+        // Sealed by that call: "You cannot write new blocks to a snapshot after it has
+        // been completed".
         let data = block_bytes(99);
         let refused = put_block(
             &router,
@@ -240,23 +222,13 @@ async fn completing_a_snapshot_is_acknowledged_pending_and_completes_from_the_cl
             refused.error_code()
         );
 
-        // The transition the clock owes becomes observable, without this test knowing
-        // how it is implemented: it reads the status back through the API. `tokio`'s
-        // `time` feature is not enabled in this workspace, so the wait is a plain
-        // thread sleep between requests.
-        let deadline = Instant::now() + TRANSITION_DEADLINE;
-        let mut observed = String::new();
-        while Instant::now() < deadline {
-            let read_back = complete_snapshot(&router, &snapshot_id, count).await;
-            observed = member(&read_back, "Status");
-            if observed == "completed" {
-                break;
-            }
-            sleep(Duration::from_millis(25));
-        }
+        // Reading the status back reports the sealed value: the seal was applied by the
+        // accepted call, not left outstanding.
+        let read_back = complete_snapshot(&router, &snapshot_id, count).await;
+        let observed = member(&read_back, "Status");
         assert_eq!(
             observed, "completed",
-            "case {case:?}: the snapshot must reach the completed status, last observed {observed:?}"
+            "case {case:?}: a later call must read the sealed status back, observed {observed:?}"
         );
 
         // A completed snapshot still serves everything that was written into it.
