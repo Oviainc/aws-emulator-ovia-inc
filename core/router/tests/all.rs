@@ -19,6 +19,10 @@
 // else appends to.
 #[path = "all/cloudformation_refuses_s3vectors_vector_buckets.rs"]
 mod cloudformation_refuses_s3vectors_vector_buckets;
+// Declared here, at the head, for the reason the entries below record: the appended tail
+// and the sorted `a…` span are both regions concurrently landing suites add their line to.
+#[path = "all/assembled_router_refusal_identities.rs"]
+mod assembled_router_refusal_identities;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `c…` span (where every cloudformation suite lands) are both regions
 // concurrently landing suites add their line to.
