@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePlatformVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePlatformVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePlatformVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +137,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePlatformVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePlatformVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePlatformVersion"))
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeletePlatformVersionError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        // A build the clock has already completed, and a deletion it has already
+        // carried out, are what the store holds by the time this call reads it.
+        store.materialize_due_transitions();
+
+        // The model leaves `PlatformArn` optional, but there is no other member to
+        // name a platform version by, so a request that carries none names nothing
+        // to delete — the same refusal `DescribePlatformVersion` answers.
+        let Some(platform_arn) = input.platform_arn.as_ref() else {
+            return Err(DeletePlatformVersionError::missing_required_parameter(
+                "Must specify a PlatformArn.",
+            ));
+        };
+
+        // "Deletes the specified version of a CUSTOM platform": the versions this
+        // operation deletes are the ones an account created, so the ARN is resolved
+        // against them. A MANAGED version — one this service publishes, owned by
+        // the service rather than by any account — is described and launched on but
+        // never deleted by a caller, so an ARN naming one cannot be used here; an
+        // ARN that answers to neither names no platform version at all, and is
+        // refused in the wording a platform-version lookup answers in.
+        let Some(platform_version) = store.platform_versions.get(platform_arn) else {
+            let message = if crate::state::managed_platform_version(&region, platform_arn).is_some()
+            {
+                // The real service words an ARN whose platform version this
+                // account does not own as an OWNERSHIP refusal, naming the ARN
+                // the request carried: a managed version belongs to Elastic
+                // Beanstalk itself, so it belongs to no caller's account.
+                crate::state::foreign_platform_message(platform_arn)
+            } else {
+                crate::state::missing_platform_message(platform_arn)
+            };
+            return Err(DeletePlatformVersionError::invalid_parameter_value(message));
+        };
+
+        // "OperationInProgressException: Unable to perform the specified operation
+        // because another operation that effects an element in this activity is
+        // already in progress." A version with a status change still owed is in the
+        // middle of one — the build its create started, or a deletion an earlier
+        // call already started.
+        if platform_version.has_operation_in_progress() {
+            let status = platform_version.status.clone();
+            return Err(
+                DeletePlatformVersionErrorModeled::OperationInProgressException(
+                    OperationInProgressException {
+                        message: Some(format!(
+                            "Cannot delete platform version '{platform_arn}' because an \
+                             operation on it is already in progress; its status is {status}."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "PlatformVersionStillReferencedException: You cannot delete the platform
+        // version because there are still environments running on it." An
+        // environment counts as running until it has reached `Terminated`: one that
+        // is still shutting down is running on this version yet.
+        let running_on: Vec<String> = store
+            .environments
+            .values()
+            .filter(|environment| {
+                environment.platform_arn.as_deref() == Some(platform_arn.as_str())
+                    && !environment.is_terminated()
+            })
+            .map(|environment| environment.environment_name.clone())
+            .collect();
+        if !running_on.is_empty() {
+            return Err(
+                DeletePlatformVersionErrorModeled::PlatformVersionStillReferencedException(
+                    PlatformVersionStillReferencedException {
+                        message: Some(format!(
+                            "Cannot delete platform version '{platform_arn}' because there are \
+                             still environments running on it: {}.",
+                            running_on.join(", ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The delete is ASYNCHRONOUS: the call starts it and the version is still
+        // reported, as `Deleting`, while it runs — which is the status this call
+        // answers with — and the record is dropped by the first call that observes
+        // the completion the clock owes as due.
+        let platform_version = store
+            .platform_versions
+            .get_mut(platform_arn)
+            .expect("the version this call resolved above is the one being deleted");
+        platform_version.begin_deletion();
+
+        Ok(DeletePlatformVersionOutput {
+            // "PlatformSummary: Detailed information about the version of the
+            // custom platform" — the record as it now stands, its deletion started.
+            platform_summary: Some(platform_version.to_summary()),
+        })
     }
 }

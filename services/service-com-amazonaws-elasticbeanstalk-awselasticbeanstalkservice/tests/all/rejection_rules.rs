@@ -219,13 +219,16 @@ async fn every_error_envelope_names_the_request_it_answers() {
             code: "MissingRequiredParameter",
         },
         EnvelopeCase {
-            // `DeletePlatformVersion` still carries the scaffold header, so it
-            // answers the 501 — which is an error response and carries the element
-            // too. Its input models no required member, so the request reaches the
-            // handler.
+            // `DeleteConfigurationTemplate` still carries the scaffold header, so
+            // it answers the 501 — which is an error response and carries the
+            // element too. Both of its input's required members are supplied, so
+            // the request reaches the handler rather than the boundary validator.
             case: "the scaffold's 501",
-            action: "DeletePlatformVersion",
-            params: Vec::new(),
+            action: "DeleteConfigurationTemplate",
+            params: owned(&[
+                ("ApplicationName", "envelope-app"),
+                ("TemplateName", "envelope-template"),
+            ]),
             status: 501,
             code: "NotImplemented",
         },

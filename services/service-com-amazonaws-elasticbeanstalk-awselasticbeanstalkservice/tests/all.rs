@@ -29,6 +29,8 @@ mod configuration_set_deployment_status;
 mod configuration_templates;
 #[path = "all/custom_platform_version_tags.rs"]
 mod custom_platform_version_tags;
+#[path = "all/delete_platform_version.rs"]
+mod delete_platform_version;
 #[path = "all/describe_application_versions.rs"]
 mod describe_application_versions;
 #[path = "all/dns_availability.rs"]

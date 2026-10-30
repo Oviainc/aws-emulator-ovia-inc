@@ -164,6 +164,12 @@ pub const HEALTH_STATUS_OK: &str = "Ok";
 pub const PLATFORM_STATUS_CREATING: &str = "Creating";
 /// See [`PLATFORM_STATUS_CREATING`].
 pub const PLATFORM_STATUS_READY: &str = "Ready";
+/// The status a custom platform version is in while the delete
+/// `DeletePlatformVersion` started is running. See [`PLATFORM_STATUS_CREATING`].
+pub const PLATFORM_STATUS_DELETING: &str = "Deleting";
+/// The status a custom platform version reaches once that delete has finished,
+/// at which point the record itself is gone. See [`PLATFORM_STATUS_CREATING`].
+pub const PLATFORM_STATUS_DELETED: &str = "Deleted";
 
 /// The `PlatformOwner` a MANAGED platform version reports: Elastic Beanstalk
 /// itself publishes those, so they are owned by the service rather than by an
@@ -4301,8 +4307,9 @@ pub struct PlatformVersion {
     pub pending_status: Option<PendingPlatformStatus>,
 }
 
-/// The status change the clock owes a platform version: `Creating` -> `Ready`,
-/// due one [`STATUS_TRANSITION_SPAN`] after the call that started it.
+/// The status change the clock owes a platform version: `Creating` -> `Ready`
+/// or `Deleting` -> `Deleted`, due one [`STATUS_TRANSITION_SPAN`] after the call
+/// that started it.
 #[derive(Debug, Clone)]
 pub struct PendingPlatformStatus {
     pub due_at: Instant,
@@ -4312,9 +4319,20 @@ pub struct PendingPlatformStatus {
 impl PendingPlatformStatus {
     /// The move `CreatePlatformVersion` owes: `Creating` -> `Ready`.
     pub fn build_completion() -> Self {
+        Self::due(PLATFORM_STATUS_READY)
+    }
+
+    /// The move `DeletePlatformVersion` owes: `Deleting` -> `Deleted`.
+    pub fn deletion_completion() -> Self {
+        Self::due(PLATFORM_STATUS_DELETED)
+    }
+
+    /// The one place either move's due instant is taken, so the two cannot
+    /// drift: one [`STATUS_TRANSITION_SPAN`] after the call that started it.
+    fn due(status: &str) -> Self {
         Self {
             due_at: Instant::now() + STATUS_TRANSITION_SPAN,
-            status: PLATFORM_STATUS_READY.to_string(),
+            status: status.to_string(),
         }
     }
 }
@@ -4337,6 +4355,31 @@ impl PlatformVersion {
     /// Whether this version can be launched into an environment.
     pub fn is_ready(&self) -> bool {
         self.status == PLATFORM_STATUS_READY
+    }
+
+    /// Whether the clock has carried out the deletion this version was marked
+    /// for, which is when the record itself stops being held — see
+    /// [`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::materialize_due_transitions`].
+    pub fn is_deleted(&self) -> bool {
+        self.status == PLATFORM_STATUS_DELETED
+    }
+
+    /// Whether a change to this version is still owed: the build that follows
+    /// its create, or the deletion that follows a delete. That is exactly when
+    /// an operation on this version is already in progress, which is what the
+    /// modelled `OperationInProgressException` reports.
+    pub fn has_operation_in_progress(&self) -> bool {
+        self.pending_status.is_some()
+    }
+
+    /// Start the deletion `DeletePlatformVersion` asks for: the version reports
+    /// `Deleting` at once and the move to `Deleted` — the removal of the record
+    /// — is what the clock owes, so a caller that reads the version straight
+    /// after the delete observes the transient status the real service reports.
+    pub fn begin_deletion(&mut self) {
+        self.status = PLATFORM_STATUS_DELETING.to_string();
+        self.date_updated = now();
+        self.pending_status = Some(PendingPlatformStatus::deletion_completion());
     }
 
     /// The modelled `PlatformSummary` for this record.
@@ -7511,6 +7554,12 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
         for platform_version in self.platform_versions.values_mut() {
             platform_version.materialize_due(at);
         }
+        // A platform version whose deletion the clock has carried out is gone:
+        // the record is held only while the delete runs, so the version stops
+        // being described, listed and launched on once it has finished, and the
+        // same name and version can be created again.
+        self.platform_versions
+            .retain(|_, platform_version| !platform_version.is_deleted());
         self.evict_retired_environments();
         // After the eviction, so the completion of a compile whose environment
         // the store no longer holds is not recorded against a record that is
@@ -7909,6 +7958,19 @@ pub fn missing_environment_in_account_message(
 /// have, so this one is not applied there.
 pub fn missing_platform_message(platform_arn: &str) -> String {
     format!("Platform '{platform_arn}' does not exist.")
+}
+
+/// The message an operation that acts on an account's OWN platform version
+/// refuses a `PlatformArn` naming one the account does not own with.
+///
+/// Built from the request, in the real service's template for that refusal: the
+/// requested ARN quoted, then `does not belong to your account.` A version this
+/// service publishes is owned by Elastic Beanstalk itself
+/// ([`MANAGED_PLATFORM_OWNER`]), so it belongs to no caller's account and is
+/// refused here rather than reported as missing — it exists, and a read of it
+/// answers.
+pub fn foreign_platform_message(platform_arn: &str) -> String {
+    format!("Platform '{platform_arn}' does not belong to your account.")
 }
 
 /// The message that records a created resource, the middle event of the
