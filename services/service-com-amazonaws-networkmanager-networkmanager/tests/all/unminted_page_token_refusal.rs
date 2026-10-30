@@ -12,7 +12,7 @@
 //! `Reason` this service keeps for a document it could not read as the format it is
 //! written in (a resource policy that is no JSON), not for a member value it rejects.
 //!
-//! The tables below span that class: every listing the service pages with a token — all 23
+//! The tables below span that class: every listing the service pages with a token — all 24
 //! of them, reached at the method and URI the model binds each to (`smithy_query
 //! query="digest"`) — crossed with tokens differing in alphabet (not hex at all, lowercase
 //! hex, uppercase hex), in length (odd-length hex, and the modelled 2048-character bound)
@@ -130,6 +130,7 @@ fn listings(global_network: &str, core_network: &str, device: &str) -> Vec<Listi
         ),
         listing("ListAttachments", "/attachments".to_string()),
         listing("ListConnectPeers", "/connect-peers".to_string()),
+        listing("ListPeerings", "/peerings".to_string()),
         listing(
             "ListCoreNetworkPolicyVersions",
             format!("/core-networks/{core_network}/core-network-policy-versions"),

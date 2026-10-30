@@ -155,6 +155,8 @@ mod link_ids_filter_maximum;
 mod link_lifecycle;
 #[path = "all/list_attachments.rs"]
 mod list_attachments;
+#[path = "all/list_peerings.rs"]
+mod list_peerings;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
 #[path = "all/malformed_resource_arn_refusal.rs"]
