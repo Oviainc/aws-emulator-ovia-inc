@@ -648,6 +648,11 @@ pub fn integration_config_violation(member: &str, config: &IntegrationConfig) ->
 /// The same rules the config is judged by, read from the same schemas: an identifier
 /// names the integration a config created, so a value one refuses cannot name an
 /// integration the other could have stored.
+///
+/// Weighed before the instance or the record the identifier names is looked up, so a
+/// value no integration could have been stored under is the bad request its shape
+/// makes it rather than a missing resource — pinned by
+/// `tests/all/integration_identifier_precedes_lookup.rs`.
 pub fn integration_identifier_violation(
     member: &str,
     identifier: &IntegrationIdentifier,

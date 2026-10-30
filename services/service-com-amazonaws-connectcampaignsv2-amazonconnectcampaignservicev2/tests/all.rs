@@ -97,6 +97,8 @@ mod instance_onboarding_tags_and_outbound_requests;
 mod instance_refusal_messages;
 #[path = "all/integration_config_map_keys.rs"]
 mod integration_config_map_keys;
+#[path = "all/integration_identifier_precedes_lookup.rs"]
+mod integration_identifier_precedes_lookup;
 #[path = "all/onboarding_job_deletion.rs"]
 mod onboarding_job_deletion;
 #[path = "all/outbound_batch_is_one_rule.rs"]

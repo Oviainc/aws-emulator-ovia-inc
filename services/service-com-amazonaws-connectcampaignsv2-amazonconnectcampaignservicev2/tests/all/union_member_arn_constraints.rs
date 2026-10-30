@@ -58,7 +58,7 @@ const LAMBDA_ARN_HEAD: &str = "arn:aws:lambda:us-east-1:000000000000:function:";
 
 /// A value a shape forbids, as a row of the tables below: the case name, the value,
 /// and the requirement clause the refusal must state for it.
-type BadValue = (&'static str, String, String);
+pub(crate) type BadValue = (&'static str, String, String);
 
 /// How one case builds the value under test from an ARN.
 type Build = fn(&str) -> Value;
@@ -103,7 +103,7 @@ fn pattern() -> String {
 /// the published maximum, and three values of an admitted LENGTH that the `@pattern`
 /// refuses — no `arn:` prefix at all, a region field the pattern does not spell, and
 /// a service field carrying a character class it excludes.
-fn arns_outside_arns_bounds() -> Vec<BadValue> {
+pub(crate) fn arns_outside_arns_bounds() -> Vec<BadValue> {
     vec![
         ("the empty value", String::new(), min_length(ARN_MIN_LEN)),
         ("a single character", "x".to_string(), min_length(ARN_MIN_LEN)),
@@ -150,7 +150,7 @@ fn arns_outside_arns_bounds() -> Vec<BadValue> {
 /// this shape's own bounds: below its 1-character minimum, past its 140-character
 /// maximum, a well-formed ARN of another service (its `@pattern` admits a Lambda
 /// function ARN alone), and a Lambda ARN whose account field is not twelve digits.
-fn arns_outside_lambda_arns_bounds() -> Vec<BadValue> {
+pub(crate) fn arns_outside_lambda_arns_bounds() -> Vec<BadValue> {
     vec![
         (
             "the empty value",
@@ -177,7 +177,13 @@ fn arns_outside_lambda_arns_bounds() -> Vec<BadValue> {
 
 /// Assert `response` is the modelled refusal of the member at `path`, stating
 /// `requirement`.
-fn assert_refused(case: &str, status: u16, response: &Value, path: &str, requirement: &str) {
+pub(crate) fn assert_refused(
+    case: &str,
+    status: u16,
+    response: &Value,
+    path: &str,
+    requirement: &str,
+) {
     assert_eq!(
         status, 400,
         "case {case:?}: expected HTTP 400, got {status} {response}"
