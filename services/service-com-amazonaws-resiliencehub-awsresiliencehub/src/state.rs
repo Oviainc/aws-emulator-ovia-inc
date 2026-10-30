@@ -59,6 +59,38 @@ pub const MAX_APP_COMPONENTS_PER_APP_VERSION: usize = 200;
 /// resource cannot be created because a limit is reached.
 pub const MAX_RESOURCES_PER_APP_VERSION: usize = 200;
 
+/// The most resource resolutions this emulator remembers for ONE app version,
+/// oldest evicted first.
+///
+/// A MEMORY BOUND, not an AWS quota: `ResolveAppVersionResources` is reachable by
+/// any caller and records one resolution per call, so without a ceiling a resolve
+/// loop grows the process until the host is out of memory. Evicting the oldest
+/// rather than refusing the call is what AWS does with resolution history — the
+/// CURRENT resolution of a version is always readable — and a resolution the
+/// emulator has forgotten is reported as the modelled 404 by
+/// `DescribeAppVersionResourcesResolutionStatus`. Enforced in
+/// [`ComAmazonawsResiliencehubAwsresiliencehubState::start_resolution`], the only
+/// writer.
+pub const MAX_RESOLUTIONS_PER_APP_VERSION: usize = 50;
+
+/// How long a resource resolution started by `ResolveAppVersionResources` takes
+/// to finish.
+///
+/// CHOSEN, not a documented AWS duration: a real resolution's duration depends on
+/// how many resources it walks. It is never zero, so a caller that reads the
+/// resolution straight after starting it still sees the non-terminal status.
+pub const RESOLUTION_SPAN: ::std::time::Duration = ::std::time::Duration::from_secs(3);
+
+/// The `ResourceResolutionStatusType` value a resolution that has not finished
+/// yet reports — the non-terminal status `ResolveAppVersionResources` answers
+/// with (one of `RESOURCE_RESOLUTION_STATUS_TYPE_VALUES`, the enum the model
+/// gives `ResolveAppVersionResources$status`).
+pub const RESOLUTION_STATUS_PENDING: &str = "Pending";
+
+/// The `ResourceResolutionStatusType` value a finished resolution reports — the
+/// terminal status a read finds once [`RESOLUTION_SPAN`] has elapsed.
+pub const RESOLUTION_STATUS_SUCCESS: &str = "Success";
+
 /// The modelled `@length` of `AdditionalInfoValueList` — the value list of every
 /// `AdditionalInfoMap` entry — transcribed from the model (`smithy_query
 /// query="shape" shape="AdditionalInfoMap"`: `value` targets
@@ -169,6 +201,44 @@ impl AppVersionContents {
     }
 }
 
+/// One resource resolution of one app version: the record
+/// `ResolveAppVersionResources` starts and
+/// `DescribeAppVersionResourcesResolutionStatus` reports.
+///
+/// The STATUS is not stored: it is derived from the clock in [`Self::status`], so
+/// a read never has to write to move a resolution on and two readers at the same
+/// instant cannot disagree about it.
+#[derive(Debug, Clone)]
+pub struct ResourceResolution {
+    /// The server-generated `resolutionId` this resolution is addressed by —
+    /// unique within this emulator, and never derived from the request.
+    pub resolution_id: String,
+    /// When this resolution finishes: the instant the clock owes its move from
+    /// the non-terminal status to the terminal one, whether or not anybody asks.
+    pub completes_at: ::std::time::SystemTime,
+}
+
+impl ResourceResolution {
+    /// A resolution started at `now`, finishing one [`RESOLUTION_SPAN`] later.
+    pub fn started_at(now: ::std::time::SystemTime) -> Self {
+        Self {
+            resolution_id: mint_resource_id(),
+            completes_at: now + RESOLUTION_SPAN,
+        }
+    }
+
+    /// This resolution's `ResourceResolutionStatusType` at `now`:
+    /// [`RESOLUTION_STATUS_SUCCESS`] once the clock has reached
+    /// [`Self::completes_at`], [`RESOLUTION_STATUS_PENDING`] until then.
+    pub fn status(&self, now: ::std::time::SystemTime) -> &'static str {
+        if now >= self.completes_at {
+            RESOLUTION_STATUS_SUCCESS
+        } else {
+            RESOLUTION_STATUS_PENDING
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-resiliencehub-awsresiliencehub. A handler reaches it through [`service_state`].
 ///
 /// The modelled `App` and `ResiliencyPolicy` shapes ARE the stored records: a
@@ -180,8 +250,9 @@ impl AppVersionContents {
 /// `policies` by [`MAX_RESILIENCY_POLICIES`], `app_versions` by `apps` (an entry
 /// exists only for a stored application, and `DeleteApp` drops it) times
 /// [`MAX_PUBLISHED_APP_VERSIONS_PER_APP`] plus the draft, times
-/// [`MAX_APP_COMPONENTS_PER_APP_VERSION`] per version, and the idempotency store
-/// by [`MAX_IDEMPOTENCY_TOKENS`].
+/// [`MAX_APP_COMPONENTS_PER_APP_VERSION`] per version, the idempotency store
+/// by [`MAX_IDEMPOTENCY_TOKENS`], and `resolutions` by the same app versions
+/// times [`MAX_RESOLUTIONS_PER_APP_VERSION`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsResiliencehubAwsresiliencehubState {
     /// Every stored application, keyed by its minted `appArn`. At most
@@ -215,6 +286,16 @@ pub struct ComAmazonawsResiliencehubAwsresiliencehubState {
     /// The keys of `idempotency_tokens` in the order they were first recorded, so
     /// the ceiling evicts the oldest.
     idempotency_order: VecDeque<String>,
+    /// The resource resolutions of each app version, oldest first: `appArn` ->
+    /// `appVersion` -> that version's resolutions. An entry is recorded only for
+    /// a stored application's existing version and dropped by
+    /// [`Self::forget_app_versions`], so this map never outlives `apps`.
+    ///
+    /// PRIVATE, with [`Self::start_resolution`] / [`Self::resolution`] /
+    /// [`Self::current_resolution`] / [`Self::resolution_mut`] as the only
+    /// access: the per-version ceiling cannot be bypassed by a handler inserting
+    /// directly.
+    resolutions: HashMap<String, HashMap<String, VecDeque<ResourceResolution>>>,
 }
 
 impl ComAmazonawsResiliencehubAwsresiliencehubState {
@@ -303,9 +384,86 @@ impl ComAmazonawsResiliencehubAwsresiliencehubState {
     }
 
     /// Forget every app version of `app_arn`, so deleting an application releases
-    /// what its versions allocated.
+    /// what its versions allocated — their contents and their resolutions alike.
     pub fn forget_app_versions(&mut self, app_arn: &str) {
         self.app_versions.remove(app_arn);
+        self.resolutions.remove(app_arn);
+    }
+
+    /// Record a resolution of `app_version` of `app_arn`, started at `now`, as
+    /// that version's CURRENT resolution, and answer it. The caller has already
+    /// established that `app_arn` names a stored application and that
+    /// `app_version` is one of its versions.
+    ///
+    /// Past [`MAX_RESOLUTIONS_PER_APP_VERSION`] the oldest resolution of that
+    /// version is forgotten, so a resolve loop cannot grow this map without
+    /// bound.
+    pub fn start_resolution(
+        &mut self,
+        app_arn: &str,
+        app_version: &str,
+        now: ::std::time::SystemTime,
+    ) -> ResourceResolution {
+        let resolution = ResourceResolution::started_at(now);
+        let version_resolutions = self
+            .resolutions
+            .entry(app_arn.to_string())
+            .or_default()
+            .entry(app_version.to_string())
+            .or_default();
+        version_resolutions.push_back(resolution.clone());
+        while version_resolutions.len() > MAX_RESOLUTIONS_PER_APP_VERSION {
+            version_resolutions.pop_front();
+        }
+        resolution
+    }
+
+    /// The resolution of `app_version` of `app_arn` that `resolution_id`
+    /// addresses, while it is still remembered.
+    pub fn resolution(
+        &self,
+        app_arn: &str,
+        app_version: &str,
+        resolution_id: &str,
+    ) -> Option<&ResourceResolution> {
+        self.version_resolutions(app_arn, app_version)?
+            .iter()
+            .find(|resolution| resolution.resolution_id == resolution_id)
+    }
+
+    /// The CURRENT resolution of `app_version` of `app_arn` — the one most
+    /// recently started — when that version has been resolved at all.
+    pub fn current_resolution(
+        &self,
+        app_arn: &str,
+        app_version: &str,
+    ) -> Option<&ResourceResolution> {
+        self.version_resolutions(app_arn, app_version)?.back()
+    }
+
+    /// The resolution `resolution_id` addresses, for writing.
+    pub fn resolution_mut(
+        &mut self,
+        app_arn: &str,
+        app_version: &str,
+        resolution_id: &str,
+    ) -> Option<&mut ResourceResolution> {
+        self.resolutions
+            .get_mut(app_arn)?
+            .get_mut(app_version)?
+            .iter_mut()
+            .find(|resolution| resolution.resolution_id == resolution_id)
+    }
+
+    /// Every remembered resolution of `app_version` of `app_arn`, oldest first.
+    fn version_resolutions(
+        &self,
+        app_arn: &str,
+        app_version: &str,
+    ) -> Option<&VecDeque<ResourceResolution>> {
+        self.resolutions
+            .get(app_arn)
+            .and_then(|versions| versions.get(app_version))
     }
 
     /// The ARN `operation`'s `client_token` created on its first call, if it is

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResolveAppVersionResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResolveAppVersionResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResolveAppVersionResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a resource resolution of one app version of one application: a fresh,
+//! server-generated `resolutionId` is recorded as that version's CURRENT
+//! resolution and reported with the non-terminal status, and the resolution
+//! finishes one [`crate::state::RESOLUTION_SPAN`] later — which is what
+//! `DescribeAppVersionResourcesResolutionStatus` then reports.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +167,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResolveAppVersionResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResolveAppVersionResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResolveAppVersionResources"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure());
+        };
+
+        // Both modeled constraints on this input — `appArn`'s pattern and
+        // `appVersion`'s — are already refused by the boundary validator before this
+        // handler runs, so there is nothing left here to re-check.
+        let mut store = state.lock();
+
+        // A resolution is OF an app version of an application, so each link of that
+        // path has to resolve: recording a resolution under an unknown version would
+        // make a later read report a resolution of something that does not exist.
+        if !store.apps.contains_key(&input.app_arn) {
+            return Err(app_not_found(&input.app_arn));
+        }
+        if !store.app_version_exists(&input.app_arn, &input.app_version) {
+            return Err(app_version_not_found(&input.app_arn, &input.app_version));
+        }
+
+        // Resolving is work that TAKES TIME, so the call reports the resolution it
+        // started, not a finished one: the status comes from the resolution's own
+        // completion instant, which is one span after this call.
+        let now = ::std::time::SystemTime::now();
+        let resolution = store.start_resolution(&input.app_arn, &input.app_version, now);
+
+        Ok(ResolveAppVersionResourcesOutput {
+            app_arn: input.app_arn,
+            app_version: input.app_version,
+            resolution_id: resolution.resolution_id.clone(),
+            status: resolution.status(now).to_string(),
+        })
     }
+}
+
+/// The 500 for a service mounted on an engine that holds no state for it.
+fn internal_failure() -> ResolveAppVersionResourcesError {
+    ResolveAppVersionResourcesErrorModeled::InternalServerException(InternalServerException {
+        message: Some("resiliencehub state is unavailable on this engine".to_string()),
+    })
+    .into()
+}
+
+/// A 404 `ResourceNotFoundException` for an `appArn` that was never created, or was
+/// deleted, worded as this service words that error class.
+fn app_not_found(app_arn: &str) -> ResolveAppVersionResourcesError {
+    ResolveAppVersionResourcesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("App not found for appArn {app_arn}")),
+        resource_id: Some(app_arn.to_string()),
+        resource_type: Some("App".to_string()),
+    })
+    .into()
+}
+
+/// A 404 for an `appVersion` the application does not have.
+fn app_version_not_found(
+    app_arn: &str,
+    app_version: &str,
+) -> ResolveAppVersionResourcesError {
+    ResolveAppVersionResourcesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "App version {app_version} not found for appArn {app_arn}"
+        )),
+        resource_id: Some(app_version.to_string()),
+        resource_type: Some("AppVersion".to_string()),
+    })
+    .into()
 }
