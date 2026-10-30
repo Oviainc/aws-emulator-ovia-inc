@@ -1193,7 +1193,7 @@ async fn paging_the_configuration_list_visits_each_configuration_exactly_once() 
 
 /// An update mutates the stored record: the members it carries replace the stored
 /// ones, the members it omits are left as they were, and `LastModifiedAt` moves
-/// forward — all of which the next Get reports.
+/// forward when the update stored a new value — all of which the next Get reports.
 #[tokio::test]
 async fn an_update_mutates_the_stored_record_and_bumps_the_modified_stamp() {
     // (case, the update body, the Name and Description the Get must then report)
@@ -1217,6 +1217,14 @@ async fn an_update_mutates_the_stored_record_and_bumps_the_modified_stamp() {
             Some("second"),
         ),
         ("neither member", json!({}), Some("demo"), Some("first")),
+        (
+            // Both members carry the values the create stored, so this update asks for
+            // no change at all.
+            "the stored values again",
+            json!({ "Name": "demo", "Description": "first" }),
+            Some("demo"),
+            Some("first"),
+        ),
     ];
 
     for (case, body, want_name, want_description) in cases {
@@ -1269,10 +1277,23 @@ async fn an_update_mutates_the_stored_record_and_bumps_the_modified_stamp() {
             "case {case}: an update must not move CreatedAt, got {after:?}"
         );
         let modified_after = epoch_seconds(case, &after, "LastModifiedAt");
-        assert!(
-            modified_after > modified_before,
-            "case {case}: expected LastModifiedAt to move past {modified_before}, got {modified_after}"
-        );
+        // The stamp reports when the record was last CHANGED: it moves for a row whose
+        // update stored a new value, and stays put for one that stored none — the
+        // `@idempotent` trait's own case.
+        let stored_a_new_value = want_name != before.get("Name").and_then(Value::as_str)
+            || want_description != before.get("Description").and_then(Value::as_str);
+        if stored_a_new_value {
+            assert!(
+                modified_after > modified_before,
+                "case {case}: expected LastModifiedAt to move past {modified_before}, got {modified_after}"
+            );
+        } else {
+            assert_eq!(
+                modified_after, modified_before,
+                "case {case}: an update that stored no new value must not move \
+                 LastModifiedAt, expected {modified_before}, got {modified_after}"
+            );
+        }
     }
 }
 

@@ -3,8 +3,10 @@
 //! @op UpdateConfigurationManager
 //! Mutates the ONE stored configuration manager the ARN names: the `Name` and
 //! `Description` the request carries replace the stored ones and `LastModifiedAt` is
-//! bumped, so a later `GetConfigurationManager` reports the new values. The modelled
-//! 404 when no manager has that ARN; an empty body on success.
+//! bumped when one of them actually changed, so a later `GetConfigurationManager`
+//! reports the new values and a replay of an already-served update (`@idempotent`)
+//! moves nothing. The modelled 404 when no manager has that ARN; an empty body on
+//! success.
 //!
 //! ## Shape of an operation
 //!
@@ -209,15 +211,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Each member is optional and only what the request carries is replaced, so an
-        // update naming one member leaves the other as it was stored.
+        // update naming one member leaves the other as it was stored. A member carrying
+        // the value already stored stores nothing, which is what makes this
+        // `@idempotent` operation leave every reported value as it was however often
+        // the same request is repeated.
+        let mut changed = false;
         if input.name.is_some() {
-            manager.name = input.name;
+            changed |= crate::state::store_if_changed(&mut manager.name, input.name);
         }
         if input.description.is_some() {
-            manager.description = input.description;
+            changed |= crate::state::store_if_changed(&mut manager.description, input.description);
         }
-        // Monotonic: the stamp never moves backwards, whatever the host clock does.
-        manager.last_modified_at = now.max(manager.last_modified_at);
+        // The stamp moves only when the stored record actually changed. Monotonic: it
+        // never moves backwards, whatever the host clock does.
+        if changed {
+            manager.last_modified_at = now.max(manager.last_modified_at);
+        }
 
         Ok(UpdateConfigurationManagerOutput)
     }

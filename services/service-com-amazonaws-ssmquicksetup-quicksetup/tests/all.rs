@@ -29,6 +29,8 @@ mod deployment_target_required;
 mod deployment_targets;
 #[path = "all/first_class_parameters.rs"]
 mod first_class_parameters;
+#[path = "all/idempotent_mutations.rs"]
+mod idempotent_mutations;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
 #[path = "all/manager_not_found_message.rs"]

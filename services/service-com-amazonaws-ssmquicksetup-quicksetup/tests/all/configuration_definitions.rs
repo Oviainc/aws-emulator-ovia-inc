@@ -504,19 +504,39 @@ async fn an_update_replaces_only_the_members_it_carries_in_the_definition_it_nam
             created,
             "case {case}: CreatedAt must not move, got {after:?}"
         );
-        assert!(
-            epoch_seconds(case, &after, "LastModifiedAt") > modified_before,
-            "case {case}: LastModifiedAt must move forward, got {after:?}"
-        );
+        // The stamp reports when the record was last CHANGED, so it moves for a row
+        // whose update stored a new value and stays put for one that asked for no
+        // change at all (`@idempotent`).
+        let modified_after = epoch_seconds(case, &after, "LastModifiedAt");
+        if want == target_before {
+            assert_eq!(
+                modified_after, modified_before,
+                "case {case}: an update that stored no new value must not move \
+                 LastModifiedAt, expected {modified_before}, got {modified_after}"
+            );
+        } else {
+            assert!(
+                modified_after > modified_before,
+                "case {case}: LastModifiedAt must move forward, expected past \
+                 {modified_before}, got {modified_after}"
+            );
+        }
 
         // `@idempotent`: replaying exactly the same request leaves exactly the same
-        // definition.
+        // definition, and stores no new value, so the stamp stays where the first call
+        // left it.
         update_definition_ok(&router, case, &manager_arn, &target, &body).await;
         let replayed = get_ok(&router, case, &manager_arn).await;
         assert_eq!(
             definition_by_id(case, &replayed, &target),
             want,
             "case {case}: a replayed update must leave the same definition, got {replayed:?}"
+        );
+        let modified_replayed = epoch_seconds(case, &replayed, "LastModifiedAt");
+        assert_eq!(
+            modified_replayed, modified_after,
+            "case {case}: a replayed update must not move LastModifiedAt, expected \
+             {modified_after}, got {modified_replayed}"
         );
     }
 }

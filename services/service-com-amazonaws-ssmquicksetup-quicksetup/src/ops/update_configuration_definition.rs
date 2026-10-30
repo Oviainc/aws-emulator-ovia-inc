@@ -6,7 +6,10 @@
 //! left exactly as it was stored, and the configurations the service deploys from that
 //! definition are re-deployed with the new values — one per account and Region the
 //! definition's parameters now target — so a later `GetConfigurationManager` and
-//! `ListConfigurations` report them. The modelled 404 when no manager has that ARN
+//! `ListConfigurations` report them. `@idempotent`: a request that stores no new value
+//! — a replay of one already served, or a body carrying none of the optional members —
+//! changes nothing, so neither the stamps nor the deployment statuses the manager and
+//! its configurations report move for it. The modelled 404 when no manager has that ARN
 //! or that manager holds no definition with that id; an empty body on success.
 //!
 //! ## Shape of an operation
@@ -379,25 +382,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names no per-entry update — so a request carrying it replaces that set rather
         // than merging into it, which is also what keeps the operation `@idempotent`:
         // replaying one request leaves exactly the same definition.
+        //
+        // What a member carrying the value already stored leaves behind is nothing at
+        // all, so each write reports whether it changed the record
+        // ([`crate::state::store_if_changed`]) and the writes derived from the update
+        // below are owed only when one of them did.
+        let mut changed = false;
         if let Some(type_version) = resolved_version {
-            definition.type_version = Some(type_version);
+            changed |= crate::state::store_if_changed(
+                &mut definition.type_version,
+                Some(type_version),
+            );
         }
         if let Some(parameters) = input.parameters {
-            definition.parameters = crate::state::to_shared_parameters(Some(parameters));
+            changed |= crate::state::store_if_changed(
+                &mut definition.parameters,
+                crate::state::to_shared_parameters(Some(parameters)),
+            );
         }
         if let Some(role_name) = input.local_deployment_execution_role_name {
-            definition.local_deployment_execution_role_name = Some(role_name);
+            changed |= crate::state::store_if_changed(
+                &mut definition.local_deployment_execution_role_name,
+                Some(role_name),
+            );
         }
         if let Some(role_arn) = input.local_deployment_administration_role_arn {
-            definition.local_deployment_administration_role_arn = Some(role_arn);
+            changed |= crate::state::store_if_changed(
+                &mut definition.local_deployment_administration_role_arn,
+                Some(role_arn),
+            );
         }
-        let definition = definition.clone();
+        let definition = if changed {
+            definition.clone()
+        } else {
+            // A request that stored no new value is an update that asked for no change —
+            // the replay the `@idempotent` trait exists for, or a body carrying none of
+            // the four optional members — so there is nothing to submit for deployment
+            // and nothing a later read may report differently: the stamps and the status
+            // summaries of the manager and of every configuration deployed from this
+            // definition stay exactly as the call that last changed it left them.
+            return Ok(UpdateConfigurationDefinitionOutput);
+        };
 
         // Monotonic: the stamp never moves backwards, whatever the host clock does.
         manager.last_modified_at = now.max(manager.last_modified_at);
-        // Updating a definition submits it for deployment again, so every kind of work
-        // the manager reports starts over in its first phase and walks the rest the way
-        // the create's did.
+        // A definition the update CHANGED is submitted for deployment again, so every
+        // kind of work the manager reports starts over in its first phase and walks the
+        // rest the way the create's did.
         crate::state::restart_deployment(&mut manager.status_summaries, now);
 
         // A configuration IS the deployment of one definition in one account and

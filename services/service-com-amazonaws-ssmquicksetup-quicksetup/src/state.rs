@@ -912,6 +912,23 @@ pub fn restart_deployment(summaries: &mut Vec<StatusSummaryRecord>, now: SystemT
     *summaries = fresh_summaries(now);
 }
 
+/// Write `requested` over `stored` when the two differ, answering whether the stored
+/// value actually changed.
+///
+/// Every mutation of this service is modelled `@idempotent`, so what a request leaves
+/// behind is decided by the values it stores and not by the fact that it was sent: a
+/// request writing the value a record already holds has stored nothing, and nothing
+/// derived from a write — a `LastModifiedAt` stamp, a re-submitted deployment — is owed
+/// for it. The one place that comparison lives, so every member of every record a
+/// mutation may replace is guarded the same way.
+pub fn store_if_changed<T: PartialEq>(stored: &mut T, requested: T) -> bool {
+    if *stored == requested {
+        return false;
+    }
+    *stored = requested;
+    true
+}
+
 /// Report `summaries` as being torn down: the `Deployment` summary becomes the
 /// transient teardown one, and every other kind of summary keeps the status it had
 /// reached.

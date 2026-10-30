@@ -597,6 +597,9 @@ async fn each_summary_carries_the_message_its_status_and_type_call_for() {
     )
     .await;
 
+    // An update that stores no new value asks for no deployment, so the parameter set
+    // this one writes genuinely differs from the stored one; it targets the same
+    // accounts and Regions, so the configurations it redeploys are the same records.
     update_definition_ok(
         &router,
         case,
@@ -605,6 +608,7 @@ async fn each_summary_carries_the_message_its_status_and_type_call_for() {
         &json!({ "Parameters": {
             "TargetOrganizationalUnits": "ou-1",
             "TargetRegions": "us-east-1,us-west-2",
+            "TargetType": "*",
         } }),
     )
     .await;
@@ -710,6 +714,9 @@ async fn submitting_a_deployment_again_restarts_every_kind_of_work() {
          deployment has rolled out, got {settled:?}"
     );
 
+    // A deployment is submitted again for an update that stores a NEW value, so this
+    // parameter set differs from the stored one while naming the same account and
+    // Region to deploy to.
     update_definition_ok(
         &router,
         case,
@@ -718,6 +725,7 @@ async fn submitting_a_deployment_again_restarts_every_kind_of_work() {
         &json!({ "Parameters": {
             "TargetOrganizationalUnits": "ou-1",
             "TargetRegions": "us-east-1",
+            "TargetType": "*",
         } }),
     )
     .await;
