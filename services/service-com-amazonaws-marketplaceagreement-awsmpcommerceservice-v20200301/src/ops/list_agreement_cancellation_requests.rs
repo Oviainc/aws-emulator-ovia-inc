@@ -212,10 +212,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_agreements(now);
 
         // "An optional parameter to filter cancellation requests for a specific
-        // agreement": an `agreementId` the store holds no agreement for names no
-        // agreement of this account, so it is refused with the same
-        // `INVALID_AGREEMENT_ID` reason the sibling listings of this service
-        // answer the member with.
+        // agreement": the member targets this service's own `AgreementId`
+        // shape, which the model binds to the listings that RESOLVE the
+        // agreement named rather than filter on it, so an `agreementId` the
+        // store holds no agreement for is refused with the same
+        // `INVALID_AGREEMENT_ID` reason those sibling listings answer the member
+        // with (`crate::state::unknown_agreement_refusal`).
         if let Some(refusal) = store.unknown_agreement_refusal(input.agreement_id.as_deref()) {
             return Err(
                 ListAgreementCancellationRequestsErrorModeled::ValidationException(refusal).into(),
@@ -243,7 +245,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // Every remaining input member is "an optional parameter to filter
             // cancellation requests by" the member of the stored request it
-            // names; several are an AND.
+            // names; several are an AND. The agreement `agreementId` names was
+            // resolved above, so what is left here is the selection over the
+            // requests sent under it.
             if input
                 .agreement_id
                 .as_deref()

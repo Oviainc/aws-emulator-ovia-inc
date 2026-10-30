@@ -29,8 +29,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::agreement_lifecycle::{call, emulator, is_next_token, Answer};
-use crate::purchase_order_associations::{order, quote};
-use crate::purchase_order_updates::{agreement_holding, charges, items};
+use crate::purchase_order_associations::quote;
+use crate::purchase_order_updates::{agreement_holding, agreement_holding_linked, charges, items};
 
 /// The `agreementType` every agreement this service mints carries, and so the
 /// one `Charge$agreementType` reports ("for example, `PurchaseAgreement`").
@@ -74,21 +74,6 @@ async fn reported(router: &MultiServiceRouter, request: Value) -> Answer {
         answer.status, answer.body
     );
     answer
-}
-
-/// Associate `reference` with `charge_id` through `UpdatePurchaseOrders`.
-async fn link(router: &MultiServiceRouter, charge_id: &str, reference: &str) {
-    let updated = call(
-        router,
-        "UpdatePurchaseOrders",
-        json!({"purchaseOrders": [order(charge_id, reference)]}),
-    )
-    .await;
-    assert_eq!(
-        updated.status, 200,
-        "associating {reference:?} with {charge_id} must succeed, got {} with {:?}",
-        updated.status, updated.body
-    );
 }
 
 /// One store to report on: how many charges each accepted agreement holds, plus
@@ -292,12 +277,13 @@ async fn every_charge_is_reported_whether_or_not_a_purchase_order_is_linked() {
     for (index, row) in linkages().into_iter().enumerate() {
         let case = row.case;
         let router = emulator();
-        let (agreement, minted) =
-            agreement_holding(&router, &format!("ap-chargesPO{index}"), row.charges).await;
-
-        for (position, reference) in row.links {
-            link(&router, &minted[*position], reference).await;
-        }
+        let (agreement, minted) = agreement_holding_linked(
+            &router,
+            &format!("ap-chargesPO{index}"),
+            row.charges,
+            row.links,
+        )
+        .await;
 
         let answer = reported(&router, json!({"agreementId": agreement})).await;
         assert_eq!(
@@ -414,8 +400,8 @@ async fn the_page_size_bounds_the_report_within_the_modelled_range() {
 #[tokio::test]
 async fn reading_the_report_leaves_what_a_later_caller_sees_unchanged() {
     let router = emulator();
-    let (agreement, minted) = agreement_holding(&router, "ap-chargesReadonly", 3).await;
-    link(&router, &minted[1], "PO-readonly").await;
+    let (agreement, minted) =
+        agreement_holding_linked(&router, "ap-chargesReadonly", 3, &[(1, "PO-readonly")]).await;
 
     let before = reported(&router, json!({"agreementId": agreement})).await;
     let described_before = call(

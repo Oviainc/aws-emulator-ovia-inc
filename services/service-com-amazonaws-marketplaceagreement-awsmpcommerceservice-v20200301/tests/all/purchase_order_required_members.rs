@@ -21,8 +21,14 @@
 //!
 //! The rows differ in what the rule generalises over: which member is left out,
 //! how many elements the list carries, the position of the element at fault, how
-//! many charges the agreement holds, and which of the two operations carries the
-//! list (`UpdatePurchaseOrders` and `AcceptAgreementRequest$purchaseOrders`).
+//! many charges the agreement holds, and the operation that carries the list.
+//! `AcceptAgreementRequest$purchaseOrders` is where this service performs the
+//! association, so that is where the rule holds. `UpdatePurchaseOrders` performs
+//! no association at all (`purchase_order_updates`), so there the only absent
+//! member reported is `chargeId`, the one the MODEL requires, and a list that
+//! omits one of the other two is refused as the unsupported action — which the
+//! second test below pins, because a refusal of the omission there would tell a
+//! caller it could repair a request that nothing will act on.
 //! Every charge id comes from the quote that minted it, and the complete element
 //! each row is derived from is the one the other purchase-order suites send, so
 //! no row can agree with a handler that refuses on something else.
@@ -33,7 +39,9 @@ use serde_json::{json, Value};
 
 use crate::agreement_lifecycle::{accept, emulator, Answer};
 use crate::purchase_order_associations::{order, quote};
-use crate::purchase_order_updates::{agreement_holding, references, update};
+use crate::purchase_order_updates::{
+    agreement_holding, assert_unsupported_action, references, update,
+};
 
 /// One row: the member one element of the list leaves out, and the refusal that
 /// omission earns.
@@ -212,38 +220,42 @@ fn unassociated(charge_ids: &[String]) -> BTreeMap<String, Option<String>> {
         .collect()
 }
 
-/// `UpdatePurchaseOrders` refuses a list whose element omits any member of the
-/// association, associates nothing, and applies that same list once the member
-/// is stated.
+/// `UpdatePurchaseOrders` performs no association, so the members an
+/// association is made of are not what it refuses a list for: the only absent
+/// member it reports is `chargeId`, the one the model itself requires, and a
+/// list omitting either of the other two is refused as the unsupported action.
+/// Either way it associates nothing, and the same list with every member stated
+/// is refused the same way.
 #[tokio::test]
-async fn an_update_states_every_member_of_the_association() {
+async fn an_update_reports_only_the_absent_member_the_model_requires() {
     for (index, row) in omissions().iter().enumerate() {
         let case = row.case;
         let router = emulator();
         let (agreement, charge_ids) =
             agreement_holding(&router, &format!("ap-offerPOm{index}"), row.charges).await;
+        let nothing = unassociated(&charge_ids);
 
         let answered = update(&router, json!(with_omission(&charge_ids, row))).await;
-        assert_refused("UpdatePurchaseOrders", &answered, row);
-
+        if row.member == "chargeId" {
+            assert_refused("UpdatePurchaseOrders", &answered, row);
+        } else {
+            assert_unsupported_action(&format!("UpdatePurchaseOrders: {case}"), &answered);
+        }
         let reported = references(&router, &agreement).await;
-        let nothing = unassociated(&charge_ids);
         assert_eq!(
             reported, nothing,
             "case {case:?}: a refused update must associate nothing, got {reported:?}"
         );
 
-        let applied = update(&router, json!(complete(&charge_ids, row.elements))).await;
-        assert_eq!(
-            applied.status, 200,
-            "case {case:?}: the same list with every member stated must apply, got {} with {:?}",
-            applied.status, applied.body
+        let stated = update(&router, json!(complete(&charge_ids, row.elements))).await;
+        assert_unsupported_action(
+            &format!("UpdatePurchaseOrders: {case}, with every member stated"),
+            &stated,
         );
         let reported = references(&router, &agreement).await;
-        let expected = associated(&charge_ids, row.elements);
         assert_eq!(
-            reported, expected,
-            "case {case:?}: expected the charge report to carry {expected:?}, got {reported:?}"
+            reported, nothing,
+            "case {case:?}: no list this operation is sent associates anything, got {reported:?}"
         );
     }
 }

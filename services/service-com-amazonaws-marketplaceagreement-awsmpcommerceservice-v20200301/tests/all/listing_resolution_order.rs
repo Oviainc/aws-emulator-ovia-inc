@@ -17,6 +17,14 @@
 //! request carries, and never about `nextToken`. A token names a page OF a
 //! listing, and there is no listing of an agreement that does not exist.
 //!
+//! `ListAgreementCharges` is the one read of the seven whose `agreementId` is a
+//! FILTER (its member targets the generic `ResourceId` rather than this
+//! service's own `AgreementId` shape, and the corpus records it serving an empty
+//! page for an id naming no agreement): there is no agreement to resolve, so a
+//! request carrying no token selects nothing and one carrying a token is refused
+//! about `nextToken` — which IS the member at fault there, because the token
+//! names no page of that listing.
+//!
 //! The rows differ along what the rule generalises over: which read (seven of
 //! them, spanning both refusal shapes, the listings whose `agreementId` is
 //! optional and the reads where it is required), the form of the id that names
@@ -37,6 +45,9 @@ use crate::agreement_lifecycle::{
 };
 use crate::billing_adjustments::{entry, submit};
 use crate::error_bodies::{assert_input_fault, unresolvable_agreement_ids};
+// The empty page a filter that selects nothing serves is asserted by the suite
+// that owns the selector classes, so the two cannot drift on what it looks like.
+use crate::selector_resolution::assert_empty_page;
 
 /// The `resourceType` a not-found refusal about an agreement names
 /// (`ResourceNotFoundException$resourceType`), spelled out here rather than
@@ -59,19 +70,26 @@ const NEVER_MINTED_TOKEN: &str = "0123456789abcdef00000001";
 /// client branches on.
 const INVALID_NEXT_TOKEN: &str = "INVALID_NEXT_TOKEN";
 
-/// The `ValidationExceptionReason` for an `agreementId` naming no agreement.
+/// The `ValidationExceptionReason` for an `agreementId` naming no agreement, on
+/// the reads that resolve the member.
 const INVALID_AGREEMENT_ID: &str = "INVALID_AGREEMENT_ID";
 
-/// How one read refuses a reference to an agreement this store does not hold.
+/// How one read answers a reference to an agreement this store does not hold.
 #[derive(Clone, Copy, Debug)]
 enum Refusal {
     /// The read declares `ResourceNotFoundException`
-    /// (`smithy_query(query="operation", operation="<Operation>")`), so the
-    /// reference is answered with it.
+    /// (`smithy_query(query="operation", operation="<Operation>")`) and its
+    /// `agreementId` is the resource it reads, so the reference is answered with
+    /// that not-found.
     NotFound,
-    /// The read declares no `ResourceNotFoundException`, so the reference is
-    /// refused as a value of the member, naming `agreementId`.
+    /// The read declares no `ResourceNotFoundException` but RESOLVES the
+    /// agreement its `AgreementId`-targeting member names, so the reference is
+    /// refused as a value of that member.
     InvalidMember,
+    /// The read's `agreementId` is a filter (the generic `ResourceId`), so the
+    /// reference selects nothing: the empty page, and a token naming no page of
+    /// that listing is refused about `nextToken`.
+    EmptyPage,
 }
 
 /// One paginated read whose page belongs to one agreement.
@@ -144,6 +162,22 @@ fn assert_agreement_not_found(case: &str, agreement: &str, answer: &Answer) {
         answer.str_at("/message"),
         AGREEMENT_DOES_NOT_EXIST,
         "case {case:?}: expected the sentence for a missing agreement, got {:?}",
+        answer.body
+    );
+}
+
+/// Assert one refusal is about the agreement and not about the token the
+/// request carried: the member at fault is `agreementId`.
+fn assert_not_about_the_token(case: &str, answer: &Answer) {
+    assert_ne!(
+        answer.reason(),
+        INVALID_NEXT_TOKEN,
+        "case {case:?}: the member at fault is agreementId, not nextToken, got {:?}",
+        answer.body
+    );
+    assert!(
+        !field_names(answer).iter().any(|name| name == "nextToken"),
+        "case {case:?}: no fields entry may name nextToken, got {:?}",
         answer.body
     );
 }
@@ -234,7 +268,7 @@ async fn a_paginated_read_resolves_its_agreement_before_its_page_token() {
             operation: "ListAgreementCharges",
             members: json!({}),
             present: termed.clone(),
-            refusal: Refusal::InvalidMember,
+            refusal: Refusal::EmptyPage,
         },
         Read {
             operation: "ListAgreementPaymentRequests",
@@ -285,24 +319,24 @@ async fn a_paginated_read_resolves_its_agreement_before_its_page_token() {
                 .await;
 
                 match read.refusal {
-                    Refusal::NotFound => assert_agreement_not_found(&case, &absent, &answer),
-                    Refusal::InvalidMember => {
-                        assert_input_fault(&case, INVALID_AGREEMENT_ID, "agreementId", &answer)
+                    Refusal::NotFound => {
+                        assert_agreement_not_found(&case, &absent, &answer);
+                        assert_not_about_the_token(&case, &answer);
                     }
+                    Refusal::InvalidMember => {
+                        assert_input_fault(&case, INVALID_AGREEMENT_ID, "agreementId", &answer);
+                        assert_not_about_the_token(&case, &answer);
+                    }
+                    // Nothing was resolved, so the only thing that can be wrong
+                    // is the token: without one the filter selects nothing, and
+                    // with one the token names no page of this listing.
+                    Refusal::EmptyPage => match token {
+                        None => assert_empty_page(&case, &answer),
+                        Some(_) => {
+                            assert_input_fault(&case, INVALID_NEXT_TOKEN, "nextToken", &answer)
+                        }
+                    },
                 }
-                // Whichever shape the read refuses in, the refusal is about the
-                // member at fault: the token is not it.
-                assert_ne!(
-                    answer.reason(),
-                    INVALID_NEXT_TOKEN,
-                    "case {case:?}: the member at fault is agreementId, not nextToken, got {:?}",
-                    answer.body
-                );
-                assert!(
-                    !field_names(&answer).iter().any(|name| name == "nextToken"),
-                    "case {case:?}: no fields entry may name nextToken, got {:?}",
-                    answer.body
-                );
             }
         }
 

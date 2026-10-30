@@ -14,10 +14,14 @@
 //! each charge". Because the report is over every agreement the store holds, the
 //! end-date transitions the clock has already made due are materialised over the whole
 //! store first (`crate::state::settle_agreements`), as the sibling scanning report does.
-//! `agreementId`, `agreementType` and `catalog` select on the agreement; an
-//! `agreementId` the store holds no agreement for is refused as an invalid value for
-//! that member, as the sibling listings of this service refuse it, and so is an
-//! `agreementType` or a `catalog` outside the value set the service publishes for it.
+//! `agreementId`, `agreementType` and `catalog` select on the agreement. The first
+//! targets the generic `ResourceId` rather than this service's own `AgreementId`
+//! shape, which the model binds to the sibling listings that RESOLVE the agreement
+//! named: here the member is a FILTER, so a value inside `ResourceId`'s length and
+//! pattern that names no agreement this store holds selects nothing and the report
+//! is the empty page rather than a refusal. An `agreementType` or a `catalog`
+//! outside the value set the service publishes for it names nothing the service
+//! could ever hold, so those two are refused as values of their member.
 //!
 //! ## Shape of an operation
 //!
@@ -203,17 +207,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_agreements(now);
         store.settle_payment_requests(now);
 
-        // "The unique identifier of the agreement": an `agreementId` the store
-        // holds no agreement for names no agreement of this account, so it is
-        // not a valid value for the member rather than a filter that selects
-        // nothing. This operation models no `ResourceNotFoundException`, so the
-        // refusal is its modelled `ValidationException` carrying the
-        // `INVALID_AGREEMENT_ID` reason a client branches on — the same refusal
-        // the sibling listings of this service answer the same member with.
-        if let Some(refusal) = store.unknown_agreement_refusal(input.agreement_id.as_deref()) {
-            return Err(ListAgreementChargesErrorModeled::ValidationException(refusal).into());
-        }
-
         // "details about all charges regardless of whether a purchase order is
         // linked to each charge": every charge of every selected agreement, in
         // the store's own order over agreement ids and then the order each
@@ -221,6 +214,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // token indexes into the same sequence on every call.
         let mut matched: Vec<Charge> = Vec::new();
         for agreement in store.agreements.values() {
+            // "The unique identifier of the agreement": the member SELECTS the
+            // agreement whose charges are reported. It targets the generic
+            // `ResourceId`, not the `AgreementId` shape the model binds to the
+            // sibling listings that resolve the agreement named, and its
+            // constraints are that shape's length and pattern —
+            // well-formedness, not resolvability — while this operation models
+            // no error for a resource that is not there. So a value inside them
+            // that this store holds no agreement for selects nothing rather
+            // than failing a constraint: the page below is served, with `items`
+            // present and empty.
             if input
                 .agreement_id
                 .as_deref()

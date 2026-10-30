@@ -36,7 +36,7 @@ use crate::payment_requests::{
     PENDING_APPROVAL,
 };
 use crate::purchase_order_associations::order;
-use crate::purchase_order_updates::{charges, items as charge_items};
+use crate::purchase_order_updates::{assert_unsupported_action, charges, items as charge_items};
 
 /// `PaymentRequestStatus`'s value for an approved request: "Once accepted, the
 /// payment request transitions to APPROVED status"
@@ -841,20 +841,21 @@ async fn an_id_pair_that_names_no_stored_payment_request_is_not_found() {
 // ---------------------------------------------------------------------------
 
 /// The reference an approval recorded is the charge's ONE purchase order
-/// association: `UpdatePurchaseOrders` replaces it rather than standing a second
-/// one beside it, and a charge an approval left unassociated takes the
-/// association that call makes.
+/// association, and no later call replaces it: `UpdatePurchaseOrders` performs
+/// no association at all (`purchase_order_updates`), so what the report keeps
+/// carrying is the value the approval recorded — or no reference at all for a
+/// charge approved without one.
 ///
 /// The rows are the two ways the charge can start out — approved with a
-/// reference and approved without one — and the references they are then
-/// associated with differ in form and length.
+/// reference and approved without one — and the references they are approved
+/// with differ in form and length.
 #[tokio::test]
 async fn the_purchase_order_of_an_approved_charge_has_one_value() {
     let router = emulator();
 
     for (index, (case, approved_with, then)) in [
         (
-            "approved with a reference, then associated with another",
+            "approved with a reference, then an association is attempted",
             Some("PO-first"),
             "PO-2026-99999",
         ),
@@ -864,7 +865,7 @@ async fn the_purchase_order_of_an_approved_charge_has_one_value() {
             "finance/ap queue #4",
         ),
         (
-            "approved with the shortest reference, then a long one",
+            "approved with the shortest reference the model admits",
             Some("x"),
             "p",
         ),
@@ -898,11 +899,7 @@ async fn the_purchase_order_of_an_approved_charge_has_one_value() {
             json!({"purchaseOrders": [order(&charge_id, then)]}),
         )
         .await;
-        assert_eq!(
-            updated.status, 200,
-            "case {case:?}: associating {then:?} with {charge_id} must succeed, got {} with {:?}",
-            updated.status, updated.body
-        );
+        assert_unsupported_action(case, &updated);
 
         let charge = reported_charge(&router, &agreement_id, &charge_id)
             .await
@@ -911,8 +908,9 @@ async fn the_purchase_order_of_an_approved_charge_has_one_value() {
             });
         assert_eq!(
             charge["purchaseOrderReference"].as_str(),
-            Some(then),
-            "case {case:?}: a charge carries ONE reference, the last one associated, got {charge:?}"
+            approved_with,
+            "case {case:?}: a charge carries ONE reference, the one its approval recorded, got \
+             {charge:?}"
         );
     }
 }

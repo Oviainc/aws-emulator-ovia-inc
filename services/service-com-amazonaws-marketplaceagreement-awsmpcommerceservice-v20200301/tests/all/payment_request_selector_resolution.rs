@@ -6,12 +6,14 @@
 //! The rule under test: a listing selector whose admissible values this service
 //! fixes — `catalog`, which names a catalog AWS Marketplace exposes (it exposes
 //! exactly one), and `agreementType`, which names one of the types the model
-//! documents — or that must name a resource the account holds (`agreementId`) is
-//! resolved against that set before any stored record is read, so a value
-//! outside it is refused with HTTP 400 `ValidationException` carrying that
-//! member's `INVALID_<MEMBER>` reason and naming the member in `fields[0]`,
-//! whatever the store holds. A value INSIDE the set stays a filter: it reports
-//! whatever carries it, and an empty page is then a legitimate answer.
+//! documents — or that names a RESOURCE the account holds through this service's
+//! own `AgreementId` shape (`agreementId`, which the model binds to this listing
+//! and its two siblings over stored requests) is resolved against that set or
+//! that store before any stored record is read, so a value outside it is refused
+//! with HTTP 400 `ValidationException` carrying that member's
+//! `INVALID_<MEMBER>` reason and naming the member in `fields[0]`, whatever the
+//! store holds. A value INSIDE the set stays a filter: it reports whatever
+//! carries it, and an empty page is then a legitimate answer.
 //!
 //! `selector_resolution.rs` pins the same rule across every operation of this
 //! crate that carries one of those members, including on an empty store. This

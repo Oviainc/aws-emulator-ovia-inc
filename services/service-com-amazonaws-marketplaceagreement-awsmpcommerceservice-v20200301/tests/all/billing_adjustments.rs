@@ -925,8 +925,12 @@ async fn a_created_request_reads_back_through_get() {
 // ---------------------------------------------------------------------------
 
 /// `ListBillingAdjustmentRequestsInput$agreementId` must name an agreement this
-/// service holds: an id it holds none for is refused as an invalid value for
-/// the member, not accepted as a filter that selects nothing.
+/// service holds: the member targets this service's own `AgreementId` shape,
+/// which the model binds to the listings that RESOLVE the agreement named, so an
+/// id it holds none for is refused as an invalid value for the member, not
+/// accepted as a filter that selects nothing. (`ListAgreementCharges`, whose
+/// selector targets the generic `ResourceId`, is the counterpart —
+/// `unmatched_selector_pages` pins it.)
 ///
 /// The rows differ along the form of the id that names no agreement, and along
 /// which other members the call combines it with — the value is refused before

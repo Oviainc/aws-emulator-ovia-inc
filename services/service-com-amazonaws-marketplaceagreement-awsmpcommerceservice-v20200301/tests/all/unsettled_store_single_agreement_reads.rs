@@ -35,10 +35,8 @@
 //! harness (`call`, `describe`, `emulator_over_engine`, `invoices_of`, `search`,
 //! `term`, `with_agreement_type`) is `agreement_lifecycle`'s, with the terms of
 //! an auto-renewing purchase (`renewing_terms`) `agreement_renewals`', the batch
-//! (`entry`, `submit`) `billing_adjustments`', and the charge report and the
-//! purchase order update (`charges`, `items`, `references`, `update`,
-//! `INITIAL_CHARGE_REVISION`) `purchase_order_updates`' and
-//! `purchase_order_associations`'.
+//! (`entry`, `submit`) `billing_adjustments`', and the charge report
+//! (`charges`, `items`, `references`) `purchase_order_updates`'.
 
 use std::time::Duration;
 
@@ -51,8 +49,7 @@ use crate::agreement_lifecycle::{
 };
 use crate::agreement_renewals::renewing_terms;
 use crate::billing_adjustments::{entry, submit};
-use crate::purchase_order_associations::INITIAL_CHARGE_REVISION;
-use crate::purchase_order_updates::{charges, items, references, update};
+use crate::purchase_order_updates::{charges, items, references};
 
 /// The resource kinds a not-found refusal names in `resourceType`, from
 /// `smithy_query(query="shape", shape="ResourceType")`. Spelled out here rather
@@ -655,8 +652,8 @@ async fn an_agreement_id_no_end_date_created_is_still_not_found() {
 /// The same rule where the record a call acts on is a CHILD of the renewal the
 /// clock owes: the invoice the renewal's acceptance billed and the charge its
 /// own quote minted belong to the store from that end date on, so the batch
-/// that adjusts the one and the update that associates a purchase order with
-/// the other reach them on a store nothing else has read.
+/// that adjusts the one and the report that carries the other reach them on a
+/// store nothing else has read.
 #[tokio::test]
 async fn the_children_of_the_renewal_the_clock_owes_are_reached_without_an_earlier_call() {
     let row = Aged {
@@ -732,35 +729,37 @@ async fn the_children_of_the_renewal_the_clock_owes_are_reached_without_an_earli
         submitted.body
     );
 
-    // The purchase order update, as the FIRST call ITS store sees: the charge it
-    // associates the reference with is a charge of the renewal, and the
-    // association is what the charge report then carries.
+    // The charge report, as the FIRST call ITS store sees: the charges of the
+    // renewal are charges of the store from that end date on, so they are
+    // reported without any earlier call having settled anything.
     let (also_unsettled, same) = aged_store(&row, proposal).await;
     assert_eq!(
         same, source,
         "the identical setup must mint the identical agreement id"
     );
-    let reference = "PO-renewal-1";
-    let updated = update(
-        &also_unsettled,
-        json!([{
-            "chargeId": &charge,
-            "chargeRevision": INITIAL_CHARGE_REVISION,
-            "purchaseOrderReference": reference,
-        }]),
-    )
-    .await;
+    let first_read = charges(&also_unsettled, json!({"agreementId": &renewal})).await;
     assert_eq!(
-        updated.status, 200,
-        "case \"UpdatePurchaseOrders\": the charge {charge} of the renewal {renewal} is a charge \
-         this store holds, got {} with {:?}",
-        updated.status, updated.body
+        first_read.status, 200,
+        "case \"ListAgreementCharges\": the renewal {renewal} is an agreement this store holds, \
+         got {} with {:?}",
+        first_read.status, first_read.body
     );
+    let reported: Vec<String> = items(&first_read)
+        .iter()
+        .map(|charge| charge["id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        reported.contains(&charge),
+        "case \"ListAgreementCharges\": expected the charge {charge} of the renewal {renewal}, \
+         got {reported:?}"
+    );
+    // And the association that charge carries is the one its own agreement's
+    // acceptance recorded — none here, since nothing associated anything.
     let carried = references(&also_unsettled, &renewal).await;
     assert_eq!(
         carried.get(&charge),
-        Some(&Some(reference.to_string())),
-        "case \"UpdatePurchaseOrders\": expected charge {charge} to carry {reference:?}, got \
+        Some(&None),
+        "case \"ListAgreementCharges\": expected charge {charge} to carry no association, got \
          {carried:?}"
     );
 }

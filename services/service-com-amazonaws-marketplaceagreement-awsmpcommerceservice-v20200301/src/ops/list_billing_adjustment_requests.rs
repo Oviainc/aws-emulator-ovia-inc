@@ -200,25 +200,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
-        // The `agreementId` selector below is resolved against every agreement
-        // the store holds, so the end-date transitions already due are
-        // materialised over the whole store first — an agreement an end date
-        // created exists because that date passed, not because some unrelated
-        // call read it first.
+        // A renewal an end date already created holds adjustment requests of its
+        // own only once that date is materialised, and the `agreementId`
+        // resolved below is resolved against every agreement the store holds, so
+        // the end-date transitions the clock has already made due are applied
+        // over the whole store before anything is selected or refused — an
+        // agreement an end date created exists because that date passed, not
+        // because some unrelated call read it first.
         store.settle_agreements(now);
-        // "The unique identifier of the agreement": an `agreementId` the store
-        // holds no agreement for names no agreement of this account, so it is
-        // not a valid value for the member rather than a filter that selects
-        // nothing. This operation models no `ResourceNotFoundException`, so the
-        // refusal is its modelled `ValidationException` carrying the
-        // `INVALID_AGREEMENT_ID` reason a client branches on.
+
+        // "The unique identifier of the agreement to list billing adjustment
+        // requests for": the member targets this service's own `AgreementId`
+        // shape, which the model binds to the listings that RESOLVE the
+        // agreement named rather than filter on it, so an `agreementId` the
+        // store holds no agreement for is refused with the
+        // `INVALID_AGREEMENT_ID` reason a client branches on
+        // (`crate::state::unknown_agreement_refusal`).
         //
-        // The selector is resolved BEFORE the page token below, as the sibling
+        // The agreement is resolved BEFORE the page token below, as the sibling
         // listings of this crate do: the token's scope is built from this
-        // selector, so no token names a page of a listing scoped to an
-        // agreement that does not exist, and reading the token first would
-        // report `nextToken` as the member at fault when the member actually at
-        // fault is `agreementId`.
+        // selector, so no token names a page of a listing scoped to an agreement
+        // that does not exist, and reading the token first would report
+        // `nextToken` as the member at fault when the member actually at fault
+        // is `agreementId`.
         if let Some(refusal) = store.unknown_agreement_refusal(input.agreement_id.as_deref()) {
             return Err(
                 ListBillingAdjustmentRequestsErrorModeled::ValidationException(refusal).into(),
@@ -265,6 +269,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|request| {
                 // Every member the input carries is an AND over the stored
                 // request's own value, so the documented combinations select.
+                // The agreement `agreementId` names was resolved above, so what
+                // is left here is the selection over its own requests.
                 input
                     .agreement_id
                     .as_deref()

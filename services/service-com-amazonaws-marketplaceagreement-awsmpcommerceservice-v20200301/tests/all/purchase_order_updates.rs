@@ -1,40 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `UpdatePurchaseOrders`, and the charge report that reads its work back, end
-//! to end over HTTP.
+//! `UpdatePurchaseOrders`, and the charge report that reads back the
+//! associations this service does hold, end to end over HTTP.
 //!
-//! The rule under test: `UpdatePurchaseOrders` "allows acceptors to associate
-//! purchase orders with agreement charges after an agreement is created"
-//! (`smithy_query(query="doc", shape="UpdatePurchaseOrders")`), and one
-//! `PurchaseOrder` is "information about a purchase order association to a
-//! charge within an agreement" whose `chargeId` is "the unique identifier of the
-//! charge to associate the purchase order with" and whose
-//! `purchaseOrderReference` is "the purchase order reference to associate with
-//! the charge" (`smithy_query(query="shape", shape="PurchaseOrder")`). So each
-//! element of the list records its reference ON the charge it names, in the
-//! agreement that holds that charge — replacing the reference that charge
-//! carried, because a charge carries one — and a list is refused in the
-//! service's modelled `ValidationException` (HTTP 400), associating NOTHING,
-//! when an element names a charge no agreement holds (`INVALID_CHARGE_ID`),
-//! names one twice (`DUPLICATE_CHARGES`), carries no reference
-//! (`MISSING_PURCHASE_ORDER_REFERENCE`) or states an `agreementId` that is not
-//! the agreement holding the charge (`INVALID_AGREEMENT_ID`), with `fields[0]`
-//! naming that element's own member path. Each element also states the revision
-//! its charge is at, which is the precondition `purchase_order_charge_revisions`
-//! and `purchase_order_required_members` are about.
+//! The rule under test: associating purchase orders with the charges of an
+//! agreement is not an action this service performs for its caller, so a request
+//! the modelled constraints on `purchaseOrders` admit is refused at the REQUEST
+//! level — the modelled `ValidationException` (HTTP 400,
+//! `smithy_query(query="operation", operation="UpdatePurchaseOrders")`) carrying
+//! the `UNSUPPORTED_ACTION` reason `ValidationExceptionReason` publishes
+//! (`smithy_query(query="shape", shape="ValidationExceptionReason")`) and the
+//! sentence of that class, naming no member of the request. The refusal does not
+//! depend on what the list names or on what the store holds: no element is
+//! resolved against a stored charge, so no identifier of the caller's is ever
+//! reported as unknown, and nothing is associated.
 //!
-//! The rows differ in what the rule generalises over: how many charges the
-//! agreement holds, which of them the list names, how many agreements one call
-//! spans, how many calls run, the position of the element at fault, the form of
-//! the reference, and whether the element also names its agreement. Every charge
-//! id and agreement id is read back from the call that minted it, so no row can
-//! agree with a handler that invents ids.
+//! What the model itself states about the input is still refused first, on the
+//! member at fault, by the boundary walk: `purchaseOrders` is `@required` and
+//! `@length(1..86)`, an element's `chargeId` is a `@required` `ResourceId` and
+//! its `chargeRevision` is `@range(min: 1)`.
 //!
-//! `ListAgreementCharges` is the reader these assertions go through: it is what
-//! "allows acceptors to view charges and purchase orders that are associated
-//! with an agreement", so the association is checked against the service's own
-//! report rather than against handler internals. That report has its own suite,
-//! `agreement_charges`, which pins what it carries and how it pages.
+//! The rows differ in what the rule generalises over: how long the list is (one
+//! element, a few, and the published maximum), whether its elements name charges
+//! the store actually holds, how many agreements they span, which optional
+//! members they carry (`chargeRevision`, `agreementId`, `purchaseOrderReference`,
+//! and the forms a reference takes), and whether the same charge is named twice.
+//!
+//! The purchase-order associations this service DOES hold are made where it
+//! serves them — `AcceptAgreementRequest$purchaseOrders`, whose own suite is
+//! `purchase_order_associations` — and `ListAgreementCharges` is the reader these
+//! assertions go through, since it is what "allows acceptors to view charges and
+//! purchase orders that are associated with an agreement". Every charge id and
+//! agreement id is read back from the call that minted it, so no row can agree
+//! with a handler that invents ids.
 
 use std::collections::BTreeMap;
 
@@ -53,6 +51,18 @@ const AGREEMENT_TYPE: &str = "PurchaseAgreement";
 /// agreement of this service is created in.
 const CATALOG: &str = "AWSMarketplace";
 
+/// The `ValidationExceptionReason` a request for an action this service does not
+/// perform is refused under, and the sentence that class states — spelled out
+/// here rather than imported, so a change of wording in the service fails this
+/// test instead of agreeing with it.
+pub(crate) const UNSUPPORTED_ACTION: &str = "UNSUPPORTED_ACTION";
+/// See [`UNSUPPORTED_ACTION`].
+pub(crate) const UNSUPPORTED_ACTION_MESSAGE: &str = "This action is not supported.";
+
+/// `PurchaseOrders` is `@length(min: 1, max: 86)`
+/// (`smithy_query(query="operation", operation="UpdatePurchaseOrders")`), so a
+/// list of this many elements is the longest one the model admits.
+const MAX_PURCHASE_ORDERS: usize = 86;
 
 /// Create and accept a quote over `charges` charged terms, answering the
 /// agreement id and the ids of the charges that agreement holds, in the order
@@ -65,11 +75,39 @@ pub(crate) async fn agreement_holding(
     proposal: &str,
     charges: usize,
 ) -> (String, Vec<String>) {
+    agreement_holding_linked(router, proposal, charges, &[]).await
+}
+
+/// The same, with the charges at the positions `links` names carrying the
+/// purchase order references it pairs them with.
+///
+/// The association is recorded by the acceptance itself
+/// (`AcceptAgreementRequest$purchaseOrders`), which is where this service serves
+/// it: the list resolves against the charges the accepted quote minted.
+///
+/// `pub(crate)` because the suites that report on an associated charge
+/// (`agreement_charges`, and the revision and agreement-id suites) read one back
+/// through this one harness.
+pub(crate) async fn agreement_holding_linked(
+    router: &MultiServiceRouter,
+    proposal: &str,
+    charges: usize,
+    links: &[(usize, &str)],
+) -> (String, Vec<String>) {
     let (request_id, charge_ids) = quote(router, proposal, charges).await;
-    let accepted = accept(router, json!({"agreementRequestId": request_id})).await;
+    let mut request = json!({"agreementRequestId": request_id});
+    if !links.is_empty() {
+        request["purchaseOrders"] = Value::Array(
+            links
+                .iter()
+                .map(|(position, reference)| order(&charge_ids[*position], reference))
+                .collect(),
+        );
+    }
+    let accepted = accept(router, request).await;
     assert_eq!(
         accepted.status, 200,
-        "accepting {request_id} must succeed, got {} with {:?}",
+        "accepting {request_id} with the associations {links:?} must succeed, got {} with {:?}",
         accepted.status, accepted.body
     );
     (accepted.str_at("/agreementId"), charge_ids)
@@ -130,176 +168,44 @@ pub(crate) async fn references(
         .collect()
 }
 
-/// One row of the association table: the agreements to set up (one entry per
-/// agreement, carrying how many charges it holds), the calls to make over them,
-/// and the reference each charge must carry afterwards.
-///
-/// A call names its orders as `(agreement, charge, reference)` triples over the
-/// positions set up, so a row never writes an id by hand.
-struct Recorded {
-    case: &'static str,
-    agreements: &'static [usize],
-    calls: &'static [&'static [(usize, usize, &'static str)]],
-    expected: &'static [(usize, usize, &'static str)],
-    /// Whether every element also states the `agreementId` of the agreement
-    /// holding the charge it names — an optional member of `PurchaseOrder`.
-    names_agreement: bool,
+/// Assert one answer is the request-level refusal of the action: the modelled
+/// envelope, the published reason, the sentence of that class, and no `fields`
+/// entry — the refusal is of the whole request, so there is no member for a
+/// caller to repair.
+pub(crate) fn assert_unsupported_action(case: &str, answer: &Answer) {
+    assert_eq!(
+        answer.status, 400,
+        "case {case:?}: expected HTTP 400, got {} with {:?}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.error_code(),
+        "ValidationException",
+        "case {case:?}: expected a ValidationException, got {:?}",
+        answer.body
+    );
+    assert_eq!(
+        answer.reason(),
+        UNSUPPORTED_ACTION,
+        "case {case:?}: expected the reason {UNSUPPORTED_ACTION}, got {:?}",
+        answer.body
+    );
+    assert_eq!(
+        answer.str_at("/message"),
+        UNSUPPORTED_ACTION_MESSAGE,
+        "case {case:?}: expected the message {UNSUPPORTED_ACTION_MESSAGE:?}, got {:?}",
+        answer.body
+    );
+    assert!(
+        answer.body["fields"].is_null(),
+        "case {case:?}: a refusal of the action names no member, got {:?}",
+        answer.body
+    );
 }
 
-fn recordings() -> Vec<Recorded> {
-    vec![
-        Recorded {
-            case: "the only charge of an agreement",
-            agreements: &[1],
-            calls: &[&[(0, 0, "PO-1")]],
-            expected: &[(0, 0, "PO-1")],
-            names_agreement: false,
-        },
-        Recorded {
-            case: "one charge of several, leaving the others unassociated",
-            agreements: &[3],
-            calls: &[&[(0, 1, "PO-mid")]],
-            expected: &[(0, 1, "PO-mid")],
-            names_agreement: false,
-        },
-        Recorded {
-            case: "every charge of the agreement in one call",
-            agreements: &[4],
-            calls: &[&[(0, 0, "PO-a"), (0, 1, "PO-b"), (0, 2, "PO-c"), (0, 3, "PO-d")]],
-            expected: &[(0, 0, "PO-a"), (0, 1, "PO-b"), (0, 2, "PO-c"), (0, 3, "PO-d")],
-            names_agreement: false,
-        },
-        Recorded {
-            case: "two charges named out of the order the quote minted them in",
-            agreements: &[3],
-            calls: &[&[(0, 2, "PO-last"), (0, 0, "PO-first")]],
-            expected: &[(0, 0, "PO-first"), (0, 2, "PO-last")],
-            names_agreement: false,
-        },
-        Recorded {
-            case: "charges of two agreements in one call",
-            agreements: &[2, 2],
-            calls: &[&[(0, 1, "PO-x"), (1, 0, "PO-y")]],
-            expected: &[(0, 1, "PO-x"), (1, 0, "PO-y")],
-            names_agreement: false,
-        },
-        Recorded {
-            case: "a second call replaces the reference the charge carried",
-            agreements: &[2],
-            calls: &[&[(0, 0, "PO-first")], &[(0, 0, "PO-second")]],
-            expected: &[(0, 0, "PO-second")],
-            names_agreement: false,
-        },
-        Recorded {
-            case: "a second call on another charge leaves the first association",
-            agreements: &[2],
-            calls: &[&[(0, 0, "PO-kept")], &[(0, 1, "PO-added")]],
-            expected: &[(0, 0, "PO-kept"), (0, 1, "PO-added")],
-            names_agreement: false,
-        },
-        Recorded {
-            case: "the same charge named twice over two calls, in one of three",
-            agreements: &[3],
-            calls: &[
-                &[(0, 2, "PO-one")],
-                &[(0, 2, "PO-two")],
-                &[(0, 2, "PO-three")],
-            ],
-            expected: &[(0, 2, "PO-three")],
-            names_agreement: false,
-        },
-        Recorded {
-            // `PurchaseOrderReference` is `@length(min: 1)` with no pattern
-            // (`smithy_query(query="shape", shape="PurchaseOrder")`), so the
-            // references differ in form as well as in value.
-            case: "references differing in form",
-            agreements: &[3],
-            calls: &[&[(0, 0, "X"), (0, 1, "4500001234"), (0, 2, "po/2026-0001 rev2")]],
-            expected: &[(0, 0, "X"), (0, 1, "4500001234"), (0, 2, "po/2026-0001 rev2")],
-            names_agreement: false,
-        },
-        Recorded {
-            case: "an element that also names the agreement holding its charge",
-            agreements: &[2],
-            calls: &[&[(0, 1, "PO-named")]],
-            expected: &[(0, 1, "PO-named")],
-            names_agreement: true,
-        },
-        Recorded {
-            case: "elements of two agreements, each also naming its agreement",
-            agreements: &[1, 3],
-            calls: &[&[(1, 0, "PO-b0"), (0, 0, "PO-a0"), (1, 2, "PO-b2")]],
-            expected: &[(0, 0, "PO-a0"), (1, 0, "PO-b0"), (1, 2, "PO-b2")],
-            names_agreement: true,
-        },
-    ]
-}
-
-/// Every association a call records is the reference the charge it names carries
-/// afterwards, and no other charge of that agreement carries one.
-#[tokio::test]
-async fn an_association_is_recorded_on_the_charge_it_names() {
-    for row in recordings() {
-        let case = row.case;
-        let router = emulator();
-
-        // The agreements the row asks for, each with its own charges.
-        let mut agreements: Vec<(String, Vec<String>)> = Vec::new();
-        for (position, charges) in row.agreements.iter().enumerate() {
-            agreements
-                .push(agreement_holding(&router, &format!("ap-offerUP{position}"), *charges).await);
-        }
-
-        for (position, orders) in row.calls.iter().enumerate() {
-            let body: Vec<Value> = orders
-                .iter()
-                .map(|(agreement, charge, reference)| {
-                    let (agreement_id, charge_ids) = &agreements[*agreement];
-                    let mut element = order(&charge_ids[*charge], reference);
-                    if row.names_agreement {
-                        element["agreementId"] = json!(agreement_id);
-                    }
-                    element
-                })
-                .collect();
-            let answered = update(&router, Value::Array(body)).await;
-            assert_eq!(
-                answered.status, 200,
-                "case {case:?}: call {position} must succeed, got {} with {:?}",
-                answered.status, answered.body
-            );
-            assert_eq!(
-                answered.body,
-                json!({}),
-                "case {case:?}: call {position} answers the modelled empty output, got {:?}",
-                answered.body
-            );
-        }
-
-        // What the row expects, as the charge-id-keyed map the report answers.
-        for (position, (agreement_id, charge_ids)) in agreements.iter().enumerate() {
-            let mut expected: BTreeMap<String, Option<String>> = charge_ids
-                .iter()
-                .map(|charge_id| (charge_id.clone(), None))
-                .collect();
-            for (agreement, charge, reference) in row.expected {
-                if *agreement == position {
-                    expected.insert(charge_ids[*charge].clone(), Some((*reference).to_string()));
-                }
-            }
-            let reported = references(&router, agreement_id).await;
-            assert_eq!(
-                reported, expected,
-                "case {case:?}: expected agreement {position} to report {expected:?}, got \
-                 {reported:?}"
-            );
-        }
-    }
-}
-
-/// The agreements and charges every refusal row is built over: one agreement
-/// with two charges, a second with one, and a quote that was never accepted, so
-/// its charge belongs to no agreement.
+/// The agreements and charges every row is built over: one agreement with two
+/// charges, a second with one, and a quote that was never accepted, so its
+/// charge belongs to no agreement.
 struct Fixture {
     agreements: Vec<String>,
     charges: Vec<Vec<String>>,
@@ -317,32 +223,107 @@ async fn fixture(router: &MultiServiceRouter) -> Fixture {
     }
 }
 
-/// One row of the refusal table: the purchase orders to send over the fixture,
-/// and the refusal they earn.
-struct Refused {
+/// One list to send, over the fixture the row is built on.
+struct Sent {
     case: &'static str,
     orders: fn(&Fixture) -> Value,
-    reason: &'static str,
-    field: &'static str,
 }
 
-fn refusals() -> Vec<Refused> {
+/// Lists spanning what the rule generalises over — the ones that WOULD resolve
+/// against the stored charges among them, so no row can pass by resolving
+/// anything.
+fn lists() -> Vec<Sent> {
     vec![
-        Refused {
+        Sent {
+            case: "one element naming a charge the store holds",
+            orders: |fixture| json!([order(&fixture.charges[0][0], "PO-1")]),
+        },
+        Sent {
+            case: "every charge of one agreement, each once",
+            orders: |fixture| {
+                json!([
+                    order(&fixture.charges[0][0], "PO-a"),
+                    order(&fixture.charges[0][1], "PO-b"),
+                ])
+            },
+        },
+        Sent {
+            case: "charges of two agreements in one list",
+            orders: |fixture| {
+                json!([
+                    order(&fixture.charges[0][1], "PO-x"),
+                    order(&fixture.charges[1][0], "PO-y"),
+                ])
+            },
+        },
+        Sent {
+            case: "an element that also names the agreement holding its charge",
+            orders: |fixture| {
+                json!([{
+                    "chargeId": fixture.charges[0][0],
+                    "chargeRevision": INITIAL_CHARGE_REVISION,
+                    "agreementId": fixture.agreements[0],
+                    "purchaseOrderReference": "PO-named",
+                }])
+            },
+        },
+        Sent {
+            case: "an element naming an agreement that does not hold its charge",
+            orders: |fixture| {
+                json!([{
+                    "chargeId": fixture.charges[0][0],
+                    "chargeRevision": INITIAL_CHARGE_REVISION,
+                    "agreementId": fixture.agreements[1],
+                    "purchaseOrderReference": "PO-wrong",
+                }])
+            },
+        },
+        Sent {
+            // `PurchaseOrderReference` is `@length(min: 1)` with no pattern
+            // (`smithy_query(query="shape", shape="PurchaseOrder")`), so the
+            // references differ in form as well as in value.
+            case: "references differing in form",
+            orders: |fixture| {
+                json!([
+                    order(&fixture.charges[0][0], "X"),
+                    order(&fixture.charges[0][1], "4500001234"),
+                    order(&fixture.charges[1][0], "po/2026-0001 rev2"),
+                ])
+            },
+        },
+        Sent {
+            case: "an element carrying no reference at all",
+            orders: |fixture| json!([{"chargeId": fixture.charges[0][0]}]),
+        },
+        Sent {
+            case: "an element stating a revision the charge is not at",
+            orders: |fixture| {
+                json!([{
+                    "chargeId": fixture.charges[0][0],
+                    "chargeRevision": INITIAL_CHARGE_REVISION + 7,
+                    "purchaseOrderReference": "PO-rev",
+                }])
+            },
+        },
+        Sent {
+            case: "the same charge named twice in one list",
+            orders: |fixture| {
+                json!([
+                    order(&fixture.charges[0][0], "PO-1"),
+                    order(&fixture.charges[0][0], "PO-2"),
+                ])
+            },
+        },
+        Sent {
             case: "a charge id no quote ever minted",
             orders: |_| json!([order("ch-ffffffffffffffff", "PO-1")]),
-            reason: "INVALID_CHARGE_ID",
-            field: "purchaseOrders.1.member.chargeId",
         },
-        Refused {
-            // A charge of a quote nobody accepted belongs to no agreement, so
-            // there is no agreement charge to associate it with.
+        Sent {
+            // A charge of a quote nobody accepted belongs to no agreement.
             case: "a charge of a quote that was never accepted",
             orders: |fixture| json!([order(&fixture.unaccepted_charge, "PO-1")]),
-            reason: "INVALID_CHARGE_ID",
-            field: "purchaseOrders.1.member.chargeId",
         },
-        Refused {
+        Sent {
             case: "a resolvable element before an unresolvable one",
             orders: |fixture| {
                 json!([
@@ -350,93 +331,142 @@ fn refusals() -> Vec<Refused> {
                     order("ch-not-mine", "PO-2"),
                 ])
             },
-            reason: "INVALID_CHARGE_ID",
-            field: "purchaseOrders.2.member.chargeId",
         },
-        Refused {
-            case: "the same charge named twice in a row",
-            orders: |fixture| {
-                json!([
-                    order(&fixture.charges[0][0], "PO-1"),
-                    order(&fixture.charges[0][0], "PO-2"),
-                ])
+        Sent {
+            case: "the longest list the model admits, naming no stored charge",
+            orders: |_| {
+                Value::Array(
+                    (0..MAX_PURCHASE_ORDERS)
+                        .map(|position| order(&format!("ch-{position:016x}"), "PO-bulk"))
+                        .collect(),
+                )
             },
-            reason: "DUPLICATE_CHARGES",
-            field: "purchaseOrders.2.member.chargeId",
         },
-        Refused {
-            case: "a charge named again after a charge of another agreement",
+        Sent {
+            case: "the longest list the model admits, opening on stored charges",
             orders: |fixture| {
-                json!([
-                    order(&fixture.charges[0][0], "PO-1"),
-                    order(&fixture.charges[1][0], "PO-2"),
-                    order(&fixture.charges[0][0], "PO-3"),
-                ])
+                let mut orders: Vec<Value> = fixture
+                    .charges
+                    .iter()
+                    .flatten()
+                    .map(|charge| order(charge, "PO-held"))
+                    .collect();
+                while orders.len() < MAX_PURCHASE_ORDERS {
+                    orders.push(order(&format!("ch-{:016x}", orders.len()), "PO-rest"));
+                }
+                Value::Array(orders)
             },
-            reason: "DUPLICATE_CHARGES",
-            field: "purchaseOrders.3.member.chargeId",
-        },
-        Refused {
-            case: "an element with nothing to associate",
-            orders: |fixture| json!([{"chargeId": fixture.charges[0][1]}]),
-            reason: "MISSING_PURCHASE_ORDER_REFERENCE",
-            field: "purchaseOrders.1.member.purchaseOrderReference",
-        },
-        Refused {
-            case: "a later element with nothing to associate",
-            orders: |fixture| {
-                json!([
-                    order(&fixture.charges[0][0], "PO-1"),
-                    {"chargeId": fixture.charges[0][1], "chargeRevision": 2},
-                ])
-            },
-            reason: "MISSING_PURCHASE_ORDER_REFERENCE",
-            field: "purchaseOrders.2.member.purchaseOrderReference",
-        },
-        Refused {
-            case: "an element naming an agreement that does not hold its charge",
-            orders: |fixture| {
-                json!([{
-                    "chargeId": fixture.charges[0][0],
-                    "chargeRevision": INITIAL_CHARGE_REVISION,
-                    "agreementId": fixture.agreements[1],
-                    "purchaseOrderReference": "PO-1",
-                }])
-            },
-            reason: "INVALID_AGREEMENT_ID",
-            field: "purchaseOrders.1.member.agreementId",
-        },
-        Refused {
-            case: "a later element naming an agreement that does not exist",
-            orders: |fixture| {
-                json!([
-                    order(&fixture.charges[0][0], "PO-1"),
-                    {
-                        "chargeId": fixture.charges[1][0],
-                        "chargeRevision": INITIAL_CHARGE_REVISION,
-                        "agreementId": "agmt-ffffffffffffffff",
-                        "purchaseOrderReference": "PO-2",
-                    },
-                ])
-            },
-            reason: "INVALID_AGREEMENT_ID",
-            field: "purchaseOrders.2.member.agreementId",
         },
     ]
 }
 
-/// Every list that does not resolve against the charges the store holds is
-/// refused in the modelled envelope, and associates nothing — not even the
-/// elements before the one at fault.
+/// Every list the modelled constraints admit is refused as the unsupported
+/// action, and nothing in the store changes: the charges the fixture holds carry
+/// no reference before the call and none after it, and a later call is refused
+/// the same way rather than acting on anything the refused one left behind.
 #[tokio::test]
-async fn an_unresolvable_update_is_refused_and_associates_nothing() {
-    for row in refusals() {
+async fn an_update_is_refused_as_the_unsupported_action_whatever_its_list_names() {
+    for row in lists() {
         let case = row.case;
         let router = emulator();
         let fixture = fixture(&router).await;
 
-        let answer = update(&router, (row.orders)(&fixture)).await;
+        // What the store holds before the call: every charge of every agreement
+        // the fixture accepted, none of them associated.
+        let unassociated: Vec<BTreeMap<String, Option<String>>> = fixture
+            .charges
+            .iter()
+            .map(|ids| ids.iter().map(|id| (id.clone(), None)).collect())
+            .collect();
 
+        for attempt in 0..2 {
+            let answer = update(&router, (row.orders)(&fixture)).await;
+            assert_unsupported_action(&format!("{case} (attempt {attempt})"), &answer);
+
+            for (position, agreement_id) in fixture.agreements.iter().enumerate() {
+                let reported = references(&router, agreement_id).await;
+                assert_eq!(
+                    reported, unassociated[position],
+                    "case {case:?} (attempt {attempt}): a refused update associates nothing on \
+                     agreement {position}, expected {:?}, got {reported:?}",
+                    unassociated[position]
+                );
+            }
+        }
+    }
+}
+
+/// One request whose input the MODEL itself refuses, and the member the refusal
+/// names.
+struct Refused {
+    case: &'static str,
+    request: Value,
+    reason: &'static str,
+    field: &'static str,
+}
+
+/// The modelled constraints on the list and its elements — `purchaseOrders`
+/// `@required` and `@length(1..86)`, an element's `chargeId` a `@required`
+/// `ResourceId` (`@length(1..64)`, `@pattern(^[A-Za-z0-9_/-]+$)`) and its
+/// `chargeRevision` `@range(min: 1)`.
+fn malformed() -> Vec<Refused> {
+    let one = json!({"chargeId": "ch-0000000000000001", "purchaseOrderReference": "PO-1"});
+    vec![
+        Refused {
+            case: "no list at all",
+            request: json!({}),
+            reason: "MISSING_PURCHASE_ORDERS",
+            field: "purchaseOrders",
+        },
+        Refused {
+            case: "a list below its minimum length",
+            request: json!({"purchaseOrders": []}),
+            reason: "INVALID_PURCHASE_ORDERS",
+            field: "purchaseOrders",
+        },
+        Refused {
+            case: "a list one past its maximum length",
+            request: json!({
+                "purchaseOrders": vec![one.clone(); MAX_PURCHASE_ORDERS + 1],
+            }),
+            reason: "INVALID_PURCHASE_ORDERS",
+            field: "purchaseOrders",
+        },
+        Refused {
+            case: "an element missing the one member the model requires",
+            request: json!({"purchaseOrders": [{"purchaseOrderReference": "PO-1"}]}),
+            reason: "MISSING_CHARGE_ID",
+            field: "purchaseOrders.1.member.chargeId",
+        },
+        Refused {
+            case: "a later element whose charge id is outside its pattern",
+            request: json!({
+                "purchaseOrders": [one.clone(), {"chargeId": "not a charge id!!"}],
+            }),
+            reason: "INVALID_CHARGE_ID",
+            field: "purchaseOrders.2.member.chargeId",
+        },
+        Refused {
+            case: "an element whose revision is below its range",
+            request: json!({
+                "purchaseOrders": [{"chargeId": "ch-0000000000000001", "chargeRevision": 0}],
+            }),
+            reason: "INVALID_CHARGE_REVISION",
+            field: "purchaseOrders.1.member.chargeRevision",
+        },
+    ]
+}
+
+/// A request the model's own constraints refuse is answered about the MEMBER at
+/// fault, before the request-level refusal of the action: the caller is told
+/// what it can repair when there is something to repair, and told the action is
+/// unavailable only when there is not.
+#[tokio::test]
+async fn the_modelled_constraints_on_the_list_are_refused_on_their_own_member() {
+    let router = emulator();
+    for row in malformed() {
+        let case = row.case;
+        let answer = call(&router, "UpdatePurchaseOrders", row.request.clone()).await;
         assert_eq!(
             answer.status, 400,
             "case {case:?}: expected HTTP 400, got {} with {:?}",
@@ -445,13 +475,13 @@ async fn an_unresolvable_update_is_refused_and_associates_nothing() {
         assert_eq!(
             answer.error_code(),
             "ValidationException",
-            "case {case:?}: expected ValidationException, got {:?}",
+            "case {case:?}: expected a ValidationException, got {:?}",
             answer.body
         );
         assert_eq!(
             answer.reason(),
             row.reason,
-            "case {case:?}: expected reason {:?}, got {:?}",
+            "case {case:?}: expected the reason {:?}, got {:?}",
             row.reason,
             answer.body
         );
@@ -462,33 +492,20 @@ async fn an_unresolvable_update_is_refused_and_associates_nothing() {
             row.field,
             answer.body
         );
-
-        for (position, agreement_id) in fixture.agreements.iter().enumerate() {
-            let reported = references(&router, agreement_id).await;
-            let unassociated: BTreeMap<String, Option<String>> = fixture.charges[position]
-                .iter()
-                .map(|charge_id| (charge_id.clone(), None))
-                .collect();
-            assert_eq!(
-                reported, unassociated,
-                "case {case:?}: a refused update must associate nothing on agreement \
-                 {position}, got {reported:?}"
-            );
-        }
-
-        // The refusal is of the list, not of the operation: the same charges
-        // take an association once the list resolves.
-        let retried = update(&router, json!([order(&fixture.charges[0][0], "PO-ok")])).await;
-        assert_eq!(
-            retried.status, 200,
-            "case {case:?}: a resolvable update after the refusal must succeed, got {} with {:?}",
-            retried.status, retried.body
-        );
     }
+
+    // The other half of the rule: the same list with every modelled constraint
+    // satisfied is refused as the action rather than about a member.
+    let answer = update(
+        &router,
+        json!([{"chargeId": "ch-0000000000000001", "chargeRevision": 1}]),
+    )
+    .await;
+    assert_unsupported_action("a list the modelled constraints admit", &answer);
 }
 
-/// What a charge of an agreement reports, before and after an association, and
-/// which charges each selector of the report selects.
+/// What a charge of an agreement reports, and which charges each selector of the
+/// report selects.
 #[tokio::test]
 async fn the_charge_report_is_computed_from_the_agreement_that_holds_the_charge() {
     let router = emulator();
@@ -533,14 +550,10 @@ async fn the_charge_report_is_computed_from_the_agreement_that_holds_the_charge(
         );
     }
 
-    // An association shows up on that charge and on no other, whichever
-    // selector the report is asked under.
-    let associated = update(&router, json!([order(&first_charges[1], "PO-report")])).await;
-    assert_eq!(
-        associated.status, 200,
-        "associating {:?} must succeed, got {} with {:?}",
-        first_charges[1], associated.status, associated.body
-    );
+    // An association made where this service serves it shows up on that charge
+    // and on no other, whichever selector the report is asked under.
+    let (third, third_charges) =
+        agreement_holding_linked(&router, "ap-offerUPr3", 2, &[(1, "PO-report")]).await;
     let every = charges(&router, json!({})).await;
     assert_eq!(
         every.status, 200,
@@ -561,9 +574,10 @@ async fn the_charge_report_is_computed_from_the_agreement_that_holds_the_charge(
     let mut expected: BTreeMap<String, Option<String>> = first_charges
         .iter()
         .chain(second_charges.iter())
+        .chain(third_charges.iter())
         .map(|charge_id| (charge_id.clone(), None))
         .collect();
-    expected.insert(first_charges[1].clone(), Some("PO-report".to_string()));
+    expected.insert(third_charges[1].clone(), Some("PO-report".to_string()));
     assert_eq!(
         references_everywhere, expected,
         "expected the unfiltered report to carry {expected:?}, got {references_everywhere:?}"
@@ -575,11 +589,12 @@ async fn the_charge_report_is_computed_from_the_agreement_that_holds_the_charge(
         request: Value,
         expected: usize,
     }
+    let held = first_charges.len() + second_charges.len() + third_charges.len();
     let selections = vec![
         Selected {
             case: "no selector at all",
             request: json!({}),
-            expected: first_charges.len() + second_charges.len(),
+            expected: held,
         },
         Selected {
             case: "one agreement",
@@ -587,9 +602,14 @@ async fn the_charge_report_is_computed_from_the_agreement_that_holds_the_charge(
             expected: second_charges.len(),
         },
         Selected {
+            case: "the agreement holding the associated charge",
+            request: json!({"agreementId": third}),
+            expected: third_charges.len(),
+        },
+        Selected {
             case: "the agreement type every agreement carries",
             request: json!({"agreementType": AGREEMENT_TYPE}),
-            expected: first_charges.len() + second_charges.len(),
+            expected: held,
         },
         Selected {
             // The other value `DescribeAgreementOutput$agreementType`
@@ -601,7 +621,7 @@ async fn the_charge_report_is_computed_from_the_agreement_that_holds_the_charge(
         Selected {
             case: "the catalog every agreement is created in",
             request: json!({"catalog": CATALOG}),
-            expected: first_charges.len() + second_charges.len(),
+            expected: held,
         },
         Selected {
             case: "one agreement and the type it carries",
@@ -611,6 +631,14 @@ async fn the_charge_report_is_computed_from_the_agreement_that_holds_the_charge(
         Selected {
             case: "one agreement and an agreement type it does not carry",
             request: json!({"agreementId": first, "agreementType": "VendorInsightsAgreement"}),
+            expected: 0,
+        },
+        Selected {
+            // The selector names a resource rather than a value set, so a
+            // well-formed id the store holds no agreement for selects nothing —
+            // `unmatched_selector_pages` is the suite about that rule.
+            case: "an agreement id the store holds no agreement for",
+            request: json!({"agreementId": "agmt-ffffffffffffffff"}),
             expected: 0,
         },
     ];
@@ -630,21 +658,6 @@ async fn the_charge_report_is_computed_from_the_agreement_that_holds_the_charge(
             answer.body
         );
     }
-
-    // An `agreementId` the store holds no agreement for is not a selector that
-    // matches nothing: it is a value the member does not accept.
-    let unknown = charges(&router, json!({"agreementId": "agmt-ffffffffffffffff"})).await;
-    assert_eq!(
-        unknown.status, 400,
-        "an unknown agreement must be refused, got {} with {:?}",
-        unknown.status, unknown.body
-    );
-    assert_eq!(
-        unknown.reason(),
-        "INVALID_AGREEMENT_ID",
-        "expected the INVALID_AGREEMENT_ID reason, got {:?}",
-        unknown.body
-    );
 }
 
 /// The report pages over the charges it selects: every charge once, in one

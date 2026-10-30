@@ -1,23 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePurchaseOrders
-//! Associates purchase order references with the charges of the agreements that hold
-//! them. This is the ONLY file to touch for this operation.
+//! States that associating purchase orders with agreement charges is not an action
+//! this service performs for the caller. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## What this operation does
 //!
-//! Each `PurchaseOrder` of the list records its `purchaseOrderReference` on the charge
-//! its `chargeId` names, in the agreement that holds that charge — the charge belongs
-//! to the agreement whose quote minted it, so the agreement is RESOLVED from the charge
-//! rather than named by the request, which carries no agreement of its own. A charge
-//! carries one reference, so associating a charge that already has one replaces it.
+//! Nothing to the store. The association this operation exists for is unavailable to
+//! the caller, so a request whose members are acceptable is refused at the REQUEST
+//! level — the modelled `ValidationException` (HTTP 400) carrying the
+//! `UNSUPPORTED_ACTION` reason and the sentence that class states
+//! (`crate::state::unsupported_action`) — and no element is resolved against the
+//! stored charges, so the refusal does not depend on what the store holds.
 //!
-//! The list is refused whole, before anything is written, when an element names a
-//! charge no agreement holds, names one twice, carries no reference, states no
-//! `chargeRevision`, states one other than the revision the charge it names is
-//! at, or states an `agreementId` other than the agreement holding the charge it
-//! names (`crate::state::validate_purchase_orders`, the rule
-//! `AcceptAgreementRequest` refuses its own `purchaseOrders` under).
+//! What the request itself gets wrong is still reported first, by the boundary walk
+//! over the modelled constraints: `purchaseOrders` is `@required` and
+//! `@length(1..86)`, and an element's `chargeId` is a `@required` `ResourceId` whose
+//! `chargeRevision` is `@range(min: 1)`. Beyond those, no rule of this service's own
+//! is applied to the list — a refusal naming an element's member would say the
+//! caller can repair the request, and it cannot.
+//!
+//! The purchase-order associations this service does hold are made where it serves
+//! them: `AcceptAgreementRequest$purchaseOrders` records them on the charges the
+//! acceptance mints, and an approved payment request records one on the charge the
+//! approval creates; `ListAgreementCharges` reports what each charge carries.
 //!
 //! ## Shape of an operation
 //!
@@ -150,135 +157,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _input: Self::Input,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let Some(state) = crate::state::service_state(&*self.engine) else {
+        // Nothing about the request and nothing in the store can make this call
+        // succeed, so neither is read: no charge is resolved, no agreement is
+        // written and no transition is materialised — which is why this
+        // handler's input and context are unused. The store is still reached
+        // for, as every handler of this crate does first, so a request this
+        // service could not serve at all is reported as its modelled server
+        // error rather than as a refusal of the caller's input.
+        if crate::state::service_state(&*self.engine).is_none() {
             return Err(UpdatePurchaseOrdersErrorModeled::InternalServerException(
                 crate::state::store_unavailable(),
             )
             .into());
-        };
-
-        let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-
-        // The input names charges and no agreement, so the agreement each
-        // association belongs to is RESOLVED from the charge: a charge belongs
-        // to the agreement whose quote minted it, and charge ids are minted from
-        // the store's single counter, so a `chargeId` names at most one charge
-        // of at most one agreement. The resolution is over every agreement the
-        // store holds, so every end-date transition the clock has already made
-        // due is materialised first (`crate::state::settle_agreements`, what
-        // the scanning reports of this crate call): the charges of a renewal an
-        // end date created are charges of the store from that date on. The
-        // charge an automatic payment-request approval creates is owed from its
-        // own stored instant in the same way, so that transition is materialised
-        // here too (`crate::state::settle_payment_requests`) and such a charge
-        // is one this call can associate a purchase order with.
-        store.settle_agreements(now);
-        store.settle_payment_requests(now);
-        // The state of each of those charges — the revision it is at, as the
-        // charge report states it, and the agreement holding it — which is what
-        // an element's `chargeRevision` and `agreementId` preconditions are
-        // checked against.
-        let targets = store.charge_association_targets();
-
-        // The same rule `AcceptAgreementRequest` refuses its own
-        // `purchaseOrders` under, applied to the charges of every agreement this
-        // call can reach: an element must name a charge that exists, name it at
-        // most once across the list, carry the reference the association exists
-        // to record, state the revision that charge is actually at, and, where
-        // it names an agreement at all, name the one holding the charge it names
-        // (`crate::state::validate_purchase_orders`). The list is refused BEFORE
-        // anything is written, so a refused call associates nothing.
-        if let Err(refusal) =
-            crate::state::validate_purchase_orders(&input.purchase_orders, &targets)
-        {
-            return Err(UpdatePurchaseOrdersErrorModeled::ValidationException(
-                crate::state::validation_exception(&refusal.reason, refusal.path),
-            )
-            .into());
         }
 
-        // One spelling of "this element's member is not acceptable": the
-        // modelled `ValidationException` whose reason is resolved FROM the
-        // member (`INVALID_CHARGE_ID`) and whose `fields` entry names that
-        // element's own request path.
-        let refuse = |index: usize, member: &str| -> UpdatePurchaseOrdersError {
-            let path = crate::state::purchase_order_member_path(index, member);
-            UpdatePurchaseOrdersErrorModeled::ValidationException(
-                crate::state::validation_exception(
-                    &crate::state::member_reason(&path, crate::state::RefusalKind::Invalid),
-                    path,
-                ),
-            )
-            .into()
-        };
-
-        // The whole write is planned before any of it is applied, for the same
-        // reason: one unresolvable element refuses the call rather than leaving
-        // the elements before it associated.
-        let mut plan: Vec<(usize, String, PurchaseOrder)> =
-            Vec::with_capacity(input.purchase_orders.len());
-        for (index, order) in input.purchase_orders.iter().enumerate() {
-            let Some(agreement_id) = targets
-                .get(&order.charge_id)
-                .and_then(|target| target.agreement_id.as_deref())
-            else {
-                // `validate_purchase_orders` already refused an unresolvable
-                // `chargeId` against this same map, so this cannot be reached —
-                // and it is spelled as that same refusal rather than a panic.
-                return Err(refuse(index, "chargeId"));
-            };
-            plan.push((
-                index,
-                agreement_id.to_string(),
-                PurchaseOrder {
-                    // The agreement the charge belongs to, resolved from the
-                    // store rather than taken from the request — which cannot
-                    // disagree with it, because an element naming another
-                    // agreement was refused by the validator above.
-                    agreement_id: Some(agreement_id.to_string()),
-                    ..order.clone()
-                },
-            ));
-        }
-
-        let mut updated: Vec<String> = Vec::new();
-        for (index, agreement_id, association) in plan {
-            let Some(agreement) = store.agreements.get_mut(&agreement_id) else {
-                // Unreachable: `targets` was read from `store.agreements` under
-                // the lock still held here, so the agreement a charge resolved
-                // to is still there. Spelled as the refusal an unresolvable
-                // `chargeId` earns rather than as a write silently dropped and
-                // reported as a success.
-                return Err(refuse(index, "chargeId"));
-            };
-            // A charge carries ONE purchase order reference, so associating a
-            // charge that already carries one REPLACES it: this operation
-            // associates purchase orders "with agreement charges after an
-            // agreement is created", which is an update of the charge's
-            // association and not a second association beside it. The write
-            // goes through the agreement's own single writer of its
-            // associations, which also stamps `updated_at`.
-            agreement.associate_purchase_order(association, now);
-            if !updated.contains(&agreement_id) {
-                updated.push(agreement_id);
-            }
-        }
-        for agreement_id in &updated {
-            crate::state::audit(
-                "UpdatePurchaseOrders",
-                "purchase orders associated",
-                agreement_id,
-                ctx.parts(),
-            );
-        }
-
-        // The output models no member: what this call associated is read back
-        // through `ListAgreementCharges`, which reports the reference carried by
-        // each charge of the agreement.
-        Ok(UpdatePurchaseOrdersOutput {})
+        // Associating purchase orders with the charges of an agreement is not
+        // available to the caller of this service. The refusal is of the ACTION
+        // rather than of a member of the request, so it is answered for every
+        // request the modelled constraints on `purchaseOrders` and its elements
+        // admit — whatever the elements name, and whatever the store holds:
+        // "unknown identifier" is never reported for an id this call never
+        // resolved. `ValidationExceptionReason` publishes that class as
+        // `UNSUPPORTED_ACTION` (`crate::state::unsupported_action`), which is
+        // what a client branches on to learn the association is unavailable
+        // rather than that an identifier of its own needs repairing.
+        //
+        // The associations this service does hold are made where it serves them:
+        // `AcceptAgreementRequest$purchaseOrders` records them on the charges
+        // the acceptance mints, and an approved payment request records one on
+        // the charge the approval creates. `ListAgreementCharges` reports what
+        // each charge carries either way.
+        Err(UpdatePurchaseOrdersErrorModeled::ValidationException(
+            crate::state::unsupported_action(),
+        )
+        .into())
     }
 }

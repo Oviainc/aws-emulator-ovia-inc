@@ -21,7 +21,10 @@
 //! to each charge",
 //! `smithy_query(query="operation", operation="ListAgreementCharges")`) and an
 //! `agreementId` these listings hold an agreement for — while an id no end date
-//! ever created is still refused.
+//! ever created is still answered about that agreement: refused by the listings
+//! whose member targets this service's own `AgreementId` shape, and served as
+//! the empty page by the charge report, whose member targets the generic
+//! `ResourceId`.
 //!
 //! The rows differ along what the rule generalises over: which contract length
 //! the acceptor purchased, how many whole lengths have passed since it was signed
@@ -59,13 +62,19 @@ use crate::purchase_order_updates::{charges, items};
 const ACCEPTOR: &str = "Acceptor";
 
 /// An `agreementId` that matches `ResourceId`'s `^[A-Za-z0-9_/-]+$` and names no
-/// agreement any end date of this store could have created, so it stays an
-/// invalid value for the member.
+/// agreement any end date of this store could have created.
 const UNKNOWN_AGREEMENT: &str = "agmt-ffffffffffffffff";
 
 /// The `ValidationExceptionReason` an `agreementId` naming no agreement is
-/// refused with, which is what a client branches on.
+/// refused with, on the listings that resolve it, which is what a client
+/// branches on.
 const INVALID_AGREEMENT_ID: &str = "INVALID_AGREEMENT_ID";
+
+/// The one listing of the four whose `agreementId` is a FILTER rather than a
+/// reference it resolves: its member targets the generic `ResourceId`
+/// (`smithy_query(query="operation", operation="ListAgreementCharges")`), so an
+/// id naming no agreement selects nothing there.
+const FILTERING_LISTING: &str = "ListAgreementCharges";
 
 /// The contract length the single-chain rows buy, and how long after signing a
 /// purchase of it is one renewal in.
@@ -388,11 +397,14 @@ async fn the_renewal_the_clock_owes_is_an_agreement_these_listings_hold() {
     }
 }
 
-/// An `agreementId` no end date of the store could have created is still not a
-/// valid value for the member: settling the clock admits the agreements it owed
-/// and nothing else.
+/// An `agreementId` no end date of the store could have created is still
+/// answered about that agreement: settling the clock admits the agreements it
+/// owed and nothing else. The listings whose member targets this service's own
+/// `AgreementId` shape refuse it as an invalid value for the member, and
+/// `ListAgreementCharges`, whose member targets the generic `ResourceId`,
+/// answers the empty page — neither reports a record of some other agreement.
 #[tokio::test]
-async fn an_agreement_id_no_end_date_created_is_still_refused() {
+async fn an_agreement_id_no_end_date_created_is_still_answered_about_that_agreement() {
     let (router, engine) = emulator_over_engine();
     let _source = aged_agreement(
         &router,
@@ -405,6 +417,26 @@ async fn an_agreement_id_no_end_date_created_is_still_refused() {
 
     for (listing, request) in whole_store_listings(UNKNOWN_AGREEMENT) {
         let answer = call(&router, listing, request.clone()).await;
+        if listing == FILTERING_LISTING {
+            assert_eq!(
+                answer.status, 200,
+                "case {listing}: a well-formed id its filter matches nothing for selects \
+                 nothing, got {} with {:?}",
+                answer.status, answer.body
+            );
+            assert!(
+                reported_ids(&answer).is_empty(),
+                "case {listing}: {UNKNOWN_AGREEMENT} names no agreement, so the page is empty, \
+                 got {:?}",
+                answer.body
+            );
+            assert!(
+                answer.body["nextToken"].is_null(),
+                "case {listing}: an empty page ends the listing, got {:?}",
+                answer.body
+            );
+            continue;
+        }
         assert_eq!(
             answer.status, 400,
             "case {listing}: {UNKNOWN_AGREEMENT} names no agreement, got {} with {:?}",

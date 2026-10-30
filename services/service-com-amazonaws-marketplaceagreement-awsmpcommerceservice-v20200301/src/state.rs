@@ -4459,6 +4459,36 @@ pub fn unsupported_filter_combination(path: impl Into<String>) -> ValidationExce
     }
 }
 
+/// How this service states a request for something it does not do for the
+/// caller at all.
+///
+/// Not derived from a member the way [`validation_message`] derives its
+/// sentence: no member of such a request is the wrong one — the request is
+/// well formed and the action itself is unavailable — so the sentence is about
+/// the action.
+pub const UNSUPPORTED_ACTION_MESSAGE: &str = "This action is not supported.";
+
+/// The `ValidationExceptionReason` for an action the service does not perform
+/// for the caller (`smithy_query(query="shape",
+/// shape="ValidationExceptionReason")` lists `UNSUPPORTED_ACTION`).
+pub const REASON_UNSUPPORTED_ACTION: &str = "UNSUPPORTED_ACTION";
+
+/// A `ValidationException` for a request the service will not act on however
+/// the request is written — the modelled `UNSUPPORTED_ACTION` reason.
+///
+/// No `fields` entry: the refusal is of the whole request rather than of a
+/// member of it, so there is no member for a caller to change, and the member
+/// is optional in the modelled shape
+/// (`smithy_query(query="shape", shape="ValidationException")`).
+pub fn unsupported_action() -> ValidationException {
+    ValidationException {
+        request_id: Some(next_request_id()),
+        message: Some(UNSUPPORTED_ACTION_MESSAGE.to_string()),
+        reason: Some(REASON_UNSUPPORTED_ACTION.to_string()),
+        fields: None,
+    }
+}
+
 /// The `ThrottlingException` a create answers when its store already holds the
 /// most records the emulator keeps: the request is declined, and nothing is
 /// stored, rather than letting state grow without end.
@@ -4853,16 +4883,27 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
             .collect()
     }
 
-    /// Refuse an `agreementId` selector that names no agreement this store
-    /// holds.
+    /// Refuse an `agreementId` that names no agreement this store holds.
     ///
     /// The same resolution [`selector_value_refusal`] applies to the members
-    /// whose value set is fixed, applied to the one that names a RESOURCE: an id
-    /// no agreement of this account carries is not a filter that selects
-    /// nothing, so a caller can tell "this agreement has no such records" from
-    /// "this agreement does not exist". The listing operations model no
-    /// `ResourceNotFoundException`, so the refusal is their modelled
-    /// `ValidationException` carrying the `INVALID_AGREEMENT_ID` reason.
+    /// whose value set is fixed, applied to the member that names a RESOURCE of
+    /// the account: the model gives this service its own `AgreementId` shape
+    /// beside the generic `ResourceId`, and binds it to the listings that
+    /// RESOLVE the agreement they name — `ListAgreementPaymentRequests`,
+    /// `ListAgreementCancellationRequests` and `ListBillingAdjustmentRequests`
+    /// (`smithy_query(query="operation",
+    /// operation="ListBillingAdjustmentRequests")`). The behavioural corpus
+    /// records that resolution: a call of one of them naming an agreement the
+    /// account does not hold is refused rather than answered with an empty page,
+    /// so a caller can tell "this agreement has no such records" from "this
+    /// agreement does not exist". They model no `ResourceNotFoundException`, so
+    /// the refusal is their modelled `ValidationException` carrying the
+    /// `INVALID_AGREEMENT_ID` reason.
+    ///
+    /// `ListAgreementCharges` is NOT one of them: its selector targets the
+    /// generic `ResourceId`, and the corpus records that operation serving the
+    /// empty page for the same class of value — so it filters where these three
+    /// resolve.
     pub fn unknown_agreement_refusal(
         &self,
         agreement_id: Option<&str>,
@@ -5283,29 +5324,6 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
         }
     }
 
-    /// The ids of the charges `agreement` holds.
-    ///
-    /// A charge belongs to the agreement whose quote minted it: the charges of
-    /// an agreement are the `ChargeSummary$expectedCharges` of the agreement
-    /// request it was accepted from ([`expected_charge_ids`]), which is the one
-    /// copy of them this store keeps — nothing re-derives a charge id, so a
-    /// charge cannot be reported under two identities. Beside them stand the
-    /// charges the approved payment requests of the agreement created
-    /// ([`Self::approved_payment_requests_of`]), each minted once by the
-    /// approval that created it.
-    pub fn charge_ids_of<'a>(&'a self, agreement: &'a Agreement) -> BTreeSet<&'a str> {
-        let mut ids = self
-            .agreement_requests
-            .get(&agreement.agreement_request_id)
-            .map(|request| expected_charge_ids(&request.charge_summary))
-            .unwrap_or_default();
-        ids.extend(
-            self.approved_payment_requests_of(agreement)
-                .filter_map(PaymentRequest::created_charge_id),
-        );
-        ids
-    }
-
     /// The payment requests of `agreement` whose approval created a charge, in
     /// the order they were sent.
     ///
@@ -5325,70 +5343,6 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
             .values()
             .filter(|request| request.agreement_id == agreement.id)
             .filter(|request| request.created_charge_id().is_some())
-    }
-
-    /// Every charge this store holds, mapped to the id of the agreement holding
-    /// it.
-    ///
-    /// Charge ids are minted from the store's single counter
-    /// ([`Self::mint_charge_id`]), so no charge belongs to two agreements and
-    /// this map IS the resolution of a `chargeId` a request names to the
-    /// agreement whose charge it is — what `UpdatePurchaseOrders` needs, since
-    /// its input names charges without naming an agreement.
-    pub fn charge_owners(&self) -> BTreeMap<String, String> {
-        let mut owners: BTreeMap<String, String> = BTreeMap::new();
-        for agreement in self.agreements.values() {
-            for charge_id in self.charge_ids_of(agreement) {
-                owners.insert(charge_id.to_string(), agreement.id.clone());
-            }
-        }
-        owners
-    }
-
-    /// The revision every charge this store holds is at, keyed by charge id.
-    ///
-    /// Read through [`Self::charges_of`], the one place that reports a charge's
-    /// `revision`, so the revision a caller's `chargeRevision` is checked
-    /// against is the same value `ListAgreementCharges` reported to that caller
-    /// — there is no second notion of a charge's revision to drift from it.
-    /// `Charge$revision` is an optional member, so a charge whose report omits
-    /// it is read as being at its first revision
-    /// ([`INITIAL_CHARGE_REVISION`]).
-    pub fn charge_revisions(&self) -> BTreeMap<String, i64> {
-        let mut revisions: BTreeMap<String, i64> = BTreeMap::new();
-        for agreement in self.agreements.values() {
-            for charge in self.charges_of(agreement) {
-                if let Some(id) = charge.id {
-                    revisions.insert(id, charge.revision.unwrap_or(INITIAL_CHARGE_REVISION));
-                }
-            }
-        }
-        revisions
-    }
-
-    /// The state of every charge this store holds, as a purchase-order
-    /// association is checked against it ([`validate_purchase_orders`]): the
-    /// revision the charge is at and the agreement holding it.
-    ///
-    /// Composed from the two reports that already answer those questions
-    /// ([`Self::charge_revisions`], [`Self::charge_owners`]), so a charge's
-    /// revision and its agreement are still read from the one copy of the
-    /// resource `ListAgreementCharges` reports.
-    pub fn charge_association_targets(&self) -> BTreeMap<String, ChargeAssociationTarget> {
-        let owners = self.charge_owners();
-        self.charge_revisions()
-            .into_iter()
-            .map(|(id, revision)| {
-                let agreement_id = owners.get(&id).cloned();
-                (
-                    id,
-                    ChargeAssociationTarget {
-                        revision,
-                        agreement_id,
-                    },
-                )
-            })
-            .collect()
     }
 
     /// The charges of `agreement`, in the order its quote minted them followed

@@ -4,13 +4,21 @@
 //!
 //! The rule under test: a selector member whose admissible values this service
 //! fixes — `catalog`, which names a catalog AWS Marketplace exposes (it exposes
-//! exactly one), `agreementType`, which names one of the types the model
-//! documents, and `agreementId`, which must name an agreement the account holds
-//! — is resolved against that set BEFORE anything is selected, so a value
-//! outside it is refused with HTTP 400 `ValidationException` carrying the
+//! exactly one), and `agreementType`, which names one of the types the model
+//! documents — is resolved against that set BEFORE anything is selected, so a
+//! value outside it is refused with HTTP 400 `ValidationException` carrying the
 //! `INVALID_<MEMBER>` reason and naming the member, instead of being reported as
 //! an empty page. A value INSIDE the set stays a filter: it selects whatever
 //! carries it, and an empty page is a legitimate answer.
+//!
+//! `agreementId` names a RESOURCE rather than a value of a fixed set, and the
+//! model splits the listings on which shape that member targets: the three that
+//! take this service's own `AgreementId` RESOLVE the agreement named, so an id
+//! the store holds none for is refused as a value of the member, while
+//! `ListAgreementCharges`, whose member targets the generic `ResourceId`,
+//! FILTERS — there a well-formed id the store holds no agreement for selects
+//! nothing and the empty page is served (`unmatched_selector_pages` is the suite
+//! about that half).
 //!
 //! Every operation of this crate that carries one of those members is a row, so
 //! the rule is pinned over the whole class rather than on the one operation it
@@ -89,6 +97,46 @@ struct Listing {
     agreement_id: bool,
     /// Whether the input declares an `agreementType` selector.
     agreement_type: bool,
+}
+
+/// The listings whose `agreementId` member targets this service's own
+/// `AgreementId` shape, which the model binds to the listings that RESOLVE the
+/// agreement named. One entry per operation, each naming the member the binding
+/// comes from, so a change to it has to be made here deliberately:
+///
+/// * `ListAgreementPaymentRequestsInput$agreementId` -> `AgreementId`
+/// * `ListAgreementCancellationRequestsInput$agreementId` -> `AgreementId`
+/// * `ListBillingAdjustmentRequestsInput$agreementId` -> `AgreementId`
+///
+/// (`smithy_query(query="operation",
+/// operation="ListAgreementPaymentRequests,ListAgreementCancellationRequests,ListBillingAdjustmentRequests")`).
+const RESOLVING_LISTINGS: &[&str] = &[
+    "ListAgreementPaymentRequests",
+    "ListAgreementCancellationRequests",
+    "ListBillingAdjustmentRequests",
+];
+
+/// The listings whose `agreementId` member targets the generic `ResourceId`, so
+/// that member filters rather than resolving:
+///
+/// * `ListAgreementChargesInput$agreementId` -> `ResourceId`
+///
+/// (`smithy_query(query="operation", operation="ListAgreementCharges")`).
+const FILTERING_LISTINGS: &[&str] = &["ListAgreementCharges"];
+
+/// Whether `operation`'s `agreementId` is one the service RESOLVES rather than
+/// filters on. An operation in neither list fails the lookup rather than
+/// defaulting to one of the two.
+pub(crate) fn resolves_agreement_id(operation: &str) -> bool {
+    if RESOLVING_LISTINGS.contains(&operation) {
+        return true;
+    }
+    assert!(
+        FILTERING_LISTINGS.contains(&operation),
+        "case {operation:?}: the suite states, per operation, whether its agreementId resolves \
+         (one of {RESOLVING_LISTINGS:?}) or filters (one of {FILTERING_LISTINGS:?})"
+    );
+    false
 }
 
 /// Every operation of this service whose input carries one of the resolved
@@ -190,6 +238,26 @@ fn assert_listed(case: &str, answer: &Answer) {
     );
 }
 
+/// Assert that `selector` is accepted and selects nothing: the page member is
+/// PRESENT and empty, and no token resumes a listing that has nothing to resume.
+pub(crate) fn assert_empty_page(case: &str, answer: &Answer) {
+    assert_listed(case, answer);
+    let page = answer.body["items"]
+        .as_array()
+        .or_else(|| answer.body["agreementViewSummaries"].as_array())
+        .unwrap_or_else(|| panic!("case {case:?}: a served listing carries its page member, got {:?}", answer.body));
+    assert!(
+        page.is_empty(),
+        "case {case:?}: expected the page to be empty, got {:?}",
+        answer.body
+    );
+    assert!(
+        answer.body["nextToken"].is_null(),
+        "case {case:?}: an empty page ends the listing, got {:?}",
+        answer.body
+    );
+}
+
 /// A `catalog` outside the single published one is refused by every operation
 /// that carries the member; the published one is accepted by all of them.
 #[tokio::test]
@@ -230,8 +298,10 @@ async fn an_agreement_type_outside_the_documented_pair_is_refused_everywhere() {
     }
 }
 
-/// An `agreementId` that names no agreement is refused; the id of a stored
-/// agreement is accepted, even when it carries none of the records listed.
+/// An `agreementId` that names no agreement is refused by the listings that
+/// RESOLVE the member and selects nothing on the one that filters on it; the id
+/// of a stored agreement is accepted everywhere, even when it carries none of
+/// the records listed.
 #[tokio::test]
 async fn an_agreement_id_naming_no_agreement_is_refused_everywhere() {
     let router = emulator();
@@ -241,7 +311,11 @@ async fn an_agreement_id_naming_no_agreement_is_refused_everywhere() {
         for agreement_id in unknown_agreement_ids(&known) {
             let case = format!("{} with agreementId {agreement_id:?}", listing.operation);
             let answer = listed(&router, &listing, &json!({"agreementId": agreement_id})).await;
-            assert_refused(&case, "agreementId", "INVALID_AGREEMENT_ID", &answer);
+            if resolves_agreement_id(listing.operation) {
+                assert_refused(&case, "agreementId", "INVALID_AGREEMENT_ID", &answer);
+            } else {
+                assert_empty_page(&case, &answer);
+            }
         }
         let case = format!("{} with agreementId {known:?}", listing.operation);
         let answer = listed(&router, &listing, &json!({"agreementId": known.clone()})).await;
@@ -249,9 +323,9 @@ async fn an_agreement_id_naming_no_agreement_is_refused_everywhere() {
     }
 }
 
-/// The refusal does not depend on what the store holds: on an empty store, a
-/// value outside the fixed set is refused the same way, and the id of an
-/// agreement that does not exist yet is refused rather than reported empty.
+/// The answer does not depend on what the store holds: on an empty store, a
+/// value outside a fixed set is refused the same way, and an `agreementId` that
+/// names no agreement is answered there exactly as it is on a populated one.
 #[tokio::test]
 async fn the_refusal_is_the_same_on_an_empty_store() {
     let router = emulator();
@@ -268,7 +342,11 @@ async fn the_refusal_is_the_same_on_an_empty_store() {
         if listing.agreement_id {
             let answer =
                 listed(&router, &listing, &json!({"agreementId": "agmt-nothing"})).await;
-            assert_refused(&case, "agreementId", "INVALID_AGREEMENT_ID", &answer);
+            if resolves_agreement_id(listing.operation) {
+                assert_refused(&case, "agreementId", "INVALID_AGREEMENT_ID", &answer);
+            } else {
+                assert_empty_page(&case, &answer);
+            }
         }
 
         // Every selector at its admitted value still answers a page, which on
@@ -282,9 +360,10 @@ async fn the_refusal_is_the_same_on_an_empty_store() {
     }
 }
 
-/// A selector the service refuses wins over one it admits, whichever order the
-/// request spells them in: the call is refused rather than answered with a page
-/// computed from the admitted members alone.
+/// A selector the service refuses wins over one it admits — and over one that
+/// merely selects nothing — whichever order the request spells them in: the call
+/// is refused rather than answered with a page computed from the rest of the
+/// members.
 #[tokio::test]
 async fn a_refused_selector_wins_over_an_admitted_one() {
     let router = emulator();
@@ -317,13 +396,21 @@ async fn a_refused_selector_wins_over_an_admitted_one() {
             reason: "INVALID_CATALOG",
         },
         Mixed {
-            case: "the published catalog and an agreement that does not exist",
-            selector: json!({"catalog": CATALOG, "agreementId": "agmt-does-not-exist"}),
-            member: "agreementId",
-            reason: "INVALID_AGREEMENT_ID",
+            case: "an agreement that does not exist and an undocumented agreement type",
+            selector: json!({
+                "agreementId": "agmt-does-not-exist",
+                "agreementType": "NotAType",
+            }),
+            member: "agreementType",
+            reason: "INVALID_AGREEMENT_TYPE",
+        },
+        Mixed {
+            case: "an agreement that does not exist and an unpublished catalog",
+            selector: json!({"agreementId": "agmt-does-not-exist", "catalog": "Other"}),
+            member: "catalog",
+            reason: "INVALID_CATALOG",
         },
     ];
-
     let rows = listings();
     for Mixed {
         case,

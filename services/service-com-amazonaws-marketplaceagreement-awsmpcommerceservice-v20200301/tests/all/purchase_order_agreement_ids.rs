@@ -14,12 +14,15 @@
 //! `ValidationException` (HTTP 400) under the reason that names the member
 //! (`INVALID_AGREEMENT_ID`) with `fields[0].name` at that element's own dotted
 //! path, writing nothing — rather than being ignored or silently replaced. The
-//! rule holds on both operations the member reaches the store through,
-//! `UpdatePurchaseOrders` and `AcceptAgreementRequest$purchaseOrders`; at the
-//! accept door the agreement that will hold the charges is minted BY the call,
-//! so no agreement holds them when the request is made and every stated value is
-//! refused there, while the same value becomes acceptable at the update door once
-//! the agreement holding the charge is the one named.
+//! rule holds where this service performs the association,
+//! `AcceptAgreementRequest$purchaseOrders`: at that door the agreement that will
+//! hold the charges is minted BY the call, so no agreement holds them when the
+//! request is made and every stated value is refused there.
+//! `UpdatePurchaseOrders` performs no association at all
+//! (`purchase_order_updates`), so there a list is refused as the unsupported
+//! action whatever its elements state about the agreement — which the first test
+//! below pins, because a refusal of the member there would tell a caller it
+//! could repair a request that nothing will act on.
 //!
 //! The rows differ in what the rule generalises over: whether the member is
 //! stated at all, what it states (the holder, another agreement the store holds,
@@ -40,7 +43,9 @@ use serde_json::{json, Value};
 
 use crate::agreement_lifecycle::{accept, emulator, Answer};
 use crate::purchase_order_associations::{order, quote};
-use crate::purchase_order_updates::{agreement_holding, charges, items, references, update};
+use crate::purchase_order_updates::{
+    agreement_holding, assert_unsupported_action, charges, items, references, update,
+};
 
 /// The `ValidationExceptionReason` the model publishes for an `agreementId` the
 /// request may not state that value for
@@ -103,14 +108,12 @@ enum Stated {
 /// agreement.
 type Element = (usize, usize, Stated);
 
-/// One row of the table: how many charges each agreement of the row holds, the
-/// elements of the list, and the 1-based position of the element the call must be
-/// refused for — `None` when the whole list is applied.
+/// One row of the table: how many charges each agreement of the row holds, and
+/// the elements of the list.
 struct Row {
     case: &'static str,
     agreements: &'static [usize],
     elements: &'static [Element],
-    refused_at: Option<usize>,
 }
 
 fn rows() -> Vec<Row> {
@@ -119,13 +122,11 @@ fn rows() -> Vec<Row> {
             case: "no agreement stated at all",
             agreements: &[1],
             elements: &[(0, 0, Stated::Omitted)],
-            refused_at: None,
         },
         Row {
             case: "the agreement holding the only charge",
             agreements: &[1],
             elements: &[(0, 0, Stated::Holder)],
-            refused_at: None,
         },
         Row {
             case: "the agreement holding each charge of several",
@@ -135,37 +136,31 @@ fn rows() -> Vec<Row> {
                 (0, 1, Stated::Holder),
                 (0, 2, Stated::Holder),
             ],
-            refused_at: None,
         },
         Row {
             case: "each agreement holding its own charge, across two agreements",
             agreements: &[2, 2],
             elements: &[(0, 1, Stated::Holder), (1, 0, Stated::Holder)],
-            refused_at: None,
         },
         Row {
             case: "the holder stated on one element and omitted on the other",
             agreements: &[2],
             elements: &[(0, 0, Stated::Holder), (0, 1, Stated::Omitted)],
-            refused_at: None,
         },
         Row {
             case: "an agreement that does not hold the charge the element names",
             agreements: &[1, 1],
             elements: &[(0, 0, Stated::Agreement(1))],
-            refused_at: Some(1),
         },
         Row {
             case: "the other agreement of the call on the second element of two",
             agreements: &[2, 2],
             elements: &[(0, 0, Stated::Holder), (1, 1, Stated::Agreement(0))],
-            refused_at: Some(2),
         },
         Row {
             case: "an id no agreement of the store is under",
             agreements: &[1],
             elements: &[(0, 0, Stated::Literal(UNHELD_AGREEMENT_ID))],
-            refused_at: Some(1),
         },
         Row {
             case: "an unheld id on the last element of three",
@@ -175,25 +170,21 @@ fn rows() -> Vec<Row> {
                 (0, 1, Stated::Omitted),
                 (0, 2, Stated::Literal(UNHELD_AGREEMENT_ID)),
             ],
-            refused_at: Some(3),
         },
         Row {
             case: "the shortest id the member admits",
             agreements: &[2],
             elements: &[(0, 1, Stated::Literal(SHORTEST_ID))],
-            refused_at: Some(1),
         },
         Row {
             case: "the longest id the member admits",
             agreements: &[1],
             elements: &[(0, 0, Stated::Literal(LONGEST_ID))],
-            refused_at: Some(1),
         },
         Row {
             case: "the longest id the member admits, on the second element of two",
             agreements: &[2],
             elements: &[(0, 0, Stated::Holder), (0, 1, Stated::Literal(LONGEST_ID))],
-            refused_at: Some(2),
         },
     ]
 }
@@ -248,9 +239,10 @@ fn assert_refused(case: &str, answer: &Answer, position: usize) {
     );
 }
 
-/// `UpdatePurchaseOrders` applies a list exactly when every element that states
-/// an `agreementId` states the agreement holding the charge it names, and refuses
-/// the list whole otherwise, associating nothing.
+/// `UpdatePurchaseOrders` associates nothing whatever its elements state about
+/// the agreement: the member is not what it refuses a list for, so every list —
+/// the one naming each charge's own holder among them — is refused as the
+/// unsupported action, and the charge report is unchanged.
 #[tokio::test]
 async fn an_update_states_the_agreement_holding_the_charge() {
     assert_published_bounds();
@@ -283,62 +275,19 @@ async fn an_update_states_the_agreement_holding_the_charge() {
             .collect();
 
         let answered = update(&router, Value::Array(orders)).await;
+        assert_unsupported_action(case, &answered);
 
-        // What the row's elements asked for, as the charge-keyed report states
-        // it: every association when the list resolved, none at all when it was
-        // refused.
-        let mut expected: Vec<BTreeMap<String, Option<String>>> = agreements
-            .iter()
-            .map(|(_, charge_ids)| {
-                charge_ids
-                    .iter()
-                    .map(|charge_id| (charge_id.clone(), None))
-                    .collect()
-            })
-            .collect();
-        match row.refused_at {
-            None => {
-                assert_eq!(
-                    answered.status, 200,
-                    "case {case:?}: expected HTTP 200, got {} with {:?}",
-                    answered.status, answered.body
-                );
-                for (position, (agreement, charge, _)) in row.elements.iter().enumerate() {
-                    let charge_id = agreements[*agreement].1[*charge].clone();
-                    expected[*agreement].insert(charge_id, Some(reference(position)));
-                }
-            }
-            Some(position) => assert_refused(case, &answered, position),
-        }
-        for (position, (agreement, _)) in agreements.iter().enumerate() {
+        // No charge of any agreement the row holds carries an association.
+        for (position, (agreement, charge_ids)) in agreements.iter().enumerate() {
+            let unassociated: BTreeMap<String, Option<String>> = charge_ids
+                .iter()
+                .map(|charge_id| (charge_id.clone(), None))
+                .collect();
             let reported = references(&router, agreement).await;
             assert_eq!(
-                reported, expected[position],
-                "case {case:?}: expected the charges of agreement {position} to carry {:?}, got \
-                 {reported:?}",
-                expected[position]
-            );
-        }
-
-        // The refusal is of the stated member, not of the operation: the same
-        // list applies once every element names the agreement holding its
-        // charge.
-        if row.refused_at.is_some() {
-            let corrected: Vec<Value> = row
-                .elements
-                .iter()
-                .enumerate()
-                .map(|(position, (agreement, charge, _))| {
-                    let (holder, charge_ids) = &agreements[*agreement];
-                    order_naming(&charge_ids[*charge], &reference(position), Some(holder))
-                })
-                .collect();
-            let retried = update(&router, Value::Array(corrected)).await;
-            assert_eq!(
-                retried.status, 200,
-                "case {case:?}: the same list naming each charge's own agreement must apply, got \
-                 {} with {:?}",
-                retried.status, retried.body
+                reported, unassociated,
+                "case {case:?}: expected the charges of agreement {position} to carry \
+                 {unassociated:?}, got {reported:?}"
             );
         }
     }
@@ -483,33 +432,30 @@ async fn an_accepted_list_states_no_agreement_because_none_holds_its_charges_yet
 
 /// The hinge of the rule, as one sequence: the id of the agreement an accept
 /// mints is refused at the accept door of ANOTHER quote, because no agreement
-/// holds that quote's charges, and is accepted at the update door for the charges
-/// that agreement does hold.
+/// holds that quote's charges — and once the accept has minted the holder, the
+/// update door still takes no list for the charges it holds, because that
+/// operation performs no association at all.
 #[tokio::test]
-async fn the_same_value_is_refused_before_the_agreement_holds_the_charge_and_accepted_after() {
+async fn the_holder_of_a_charge_is_refused_at_the_accept_door_and_no_list_reaches_the_update_door() {
     let router = emulator();
     let (minted, minted_charges) = agreement_holding(&router, "ap-offerAIhinge", 2).await;
 
-    // The update door takes that id for the charges that agreement holds.
-    let applied = update(
+    // The update door takes no list, not even one naming the agreement that
+    // holds the charge, and records nothing.
+    let answered = update(
         &router,
         json!([order_naming(&minted_charges[0], "PO-held", Some(&minted))]),
     )
     .await;
-    assert_eq!(
-        applied.status, 200,
-        "naming the agreement that holds the charge must apply, got {} with {:?}",
-        applied.status, applied.body
-    );
-    let mut expected: BTreeMap<String, Option<String>> = minted_charges
+    assert_unsupported_action("naming the agreement that holds the charge", &answered);
+    let unassociated: BTreeMap<String, Option<String>> = minted_charges
         .iter()
         .map(|charge_id| (charge_id.clone(), None))
         .collect();
-    expected.insert(minted_charges[0].clone(), Some("PO-held".to_string()));
     let reported = references(&router, &minted).await;
     assert_eq!(
-        reported, expected,
-        "expected the charge report to carry {expected:?}, got {reported:?}"
+        reported, unassociated,
+        "expected the charge report to carry {unassociated:?}, got {reported:?}"
     );
 
     // The accept door refuses the same id for the charges of a quote it does not
@@ -527,8 +473,8 @@ async fn the_same_value_is_refused_before_the_agreement_holds_the_charge_and_acc
     assert_refused("the holder of another agreement's charge", &refused, 1);
 
     // Accepted without the member, the same list records the association under
-    // the agreement that call mints — and that id is then the one the update
-    // door takes for those charges.
+    // the agreement that call mints — and that is where the association this
+    // service holds comes from.
     let accepted = accept(
         &router,
         json!({
@@ -547,20 +493,23 @@ async fn the_same_value_is_refused_before_the_agreement_holds_the_charge_and_acc
         holder, minted,
         "each accept mints its own agreement, got {holder:?} twice"
     );
-    let now_applied = update(
+    let after = references(&router, &holder).await;
+    assert_eq!(
+        after,
+        BTreeMap::from([(quoted_charges[0].clone(), Some("PO-now".to_string()))]),
+        "expected the accepted association on the charge, got {after:?}"
+    );
+
+    // And the update door leaves that association as the accept recorded it.
+    let later = update(
         &router,
         json!([order_naming(&quoted_charges[0], "PO-later", Some(&holder))]),
     )
     .await;
+    assert_unsupported_action("naming the agreement the accept minted", &later);
+    let unchanged = references(&router, &holder).await;
     assert_eq!(
-        now_applied.status, 200,
-        "naming the agreement the accept minted must apply, got {} with {:?}",
-        now_applied.status, now_applied.body
-    );
-    let after = references(&router, &holder).await;
-    assert_eq!(
-        after,
-        BTreeMap::from([(quoted_charges[0].clone(), Some("PO-later".to_string()))]),
-        "expected the association to be replaced on the charge, got {after:?}"
+        unchanged, after,
+        "expected the association the accept recorded to stand, got {unchanged:?}"
     );
 }
