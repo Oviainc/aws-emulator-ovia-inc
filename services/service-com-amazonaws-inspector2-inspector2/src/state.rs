@@ -246,6 +246,23 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// Encode the opaque `nextToken` cursor a paginated list operation hands out: the hex of
+/// the LAST key of the page it follows, so the next call resumes at the first record
+/// ordered after that key rather than at a position in a freshly built list, which stays
+/// correct when records are added or removed between pages.
+pub fn encode_cursor(key: &str) -> String {
+    ::hex::encode(key.as_bytes())
+}
+
+/// The key an opaque cursor names, or `None` when `token` is not a cursor this service
+/// minted. `is_key` decides what counts as a key of the records being listed — a filter
+/// ARN, an account id — so an arbitrary even-length hex string is refused by the calling
+/// operation rather than read as a position in its list.
+pub fn decode_cursor(token: &str, is_key: impl Fn(&str) -> bool) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    is_key(&decoded).then_some(decoded)
+}
+
 /// Render a stored instant as the modelled `DateTimeTimestamp`.
 pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = at

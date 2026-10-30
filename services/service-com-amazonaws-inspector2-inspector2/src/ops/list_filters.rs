@@ -142,21 +142,14 @@ impl<Eng> ListFilters<Eng> {
 /// everything it can in one answer.
 const DEFAULT_PAGE_SIZE: usize = 100;
 
-/// A `nextToken` is an opaque cursor, so it is the hex of the last ARN of the page it
-/// follows rather than a position in a freshly built list: the next call resumes at the
-/// first stored filter ordered after that ARN, which stays correct when filters are
-/// created or deleted between pages.
-fn encode_token(arn: &str) -> String {
-    ::hex::encode(arn.as_bytes())
-}
-
 /// The ARN a cursor names, or `None` when the value is not a cursor this service minted.
 /// A token only decodes when it is hex AND the bytes are a filter ARN of this service, so
-/// an arbitrary even-length hex string is refused rather than read as a position.
+/// an arbitrary even-length hex string is refused rather than read as a position. The hex
+/// coding itself is [`crate::state::decode_cursor`], shared with this service's other
+/// paginated operations.
 fn decode_token(token: &str) -> Option<String> {
-    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
     let minted_prefix = format!("arn:aws:{}:", crate::state::SERVICE_NAMESPACE);
-    decoded.starts_with(&minted_prefix).then_some(decoded)
+    crate::state::decode_cursor(token, |value| value.starts_with(&minted_prefix))
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
@@ -247,7 +240,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let truncated = selected.len() > page_size;
         let page = &selected[..selected.len().min(page_size)];
         let next_token = truncated
-            .then(|| page.last().map(|stored| encode_token(&stored.arn)))
+            .then(|| {
+                page.last()
+                    .map(|stored| crate::state::encode_cursor(&stored.arn))
+            })
             .flatten();
 
         let filters = page

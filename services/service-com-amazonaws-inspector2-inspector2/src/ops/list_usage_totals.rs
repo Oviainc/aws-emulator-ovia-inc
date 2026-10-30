@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListUsageTotals
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListUsageTotals`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListUsageTotals::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages through the accounts the request asks about, reporting for each one
+//! the usage Amazon Inspector has metered for the scans that account has enabled.
 //!
 //! ## Shape of an operation
 //!
@@ -123,6 +116,86 @@ impl From<ListUsageTotalsErrorModeled> for ListUsageTotalsError {
     }
 }
 
+/// `ListUsageTotals`'s page size when the request names no `maxResults`: the largest page
+/// the model allows (`ListUsageTotalsMaxResults` range 1..500), so an unpaginated caller
+/// sees everything it can in one answer.
+const DEFAULT_PAGE_SIZE: usize = 500;
+
+/// The only `Currency` token the model declares, so every metered amount is reported in
+/// it. Source: `smithy_query(query="shape", shape="Currency")` — `USD`.
+const CURRENCY: &str = "USD";
+
+/// The `CloudProvider` token for usage metered on Amazon Web Services resources, which is
+/// what every `ResourceScanType` scan covers.
+/// Source: `smithy_query(query="shape", shape="CloudProvider")` —
+/// `AWS | AZURE | NOT_APPLICABLE`.
+const CLOUD_PROVIDER_AWS: &str = "AWS";
+
+/// The `UsageType` meters one `ResourceScanType`'s scans produce, in model order.
+///
+/// Amazon Inspector bills a scan type by the resources that scan type covers — instance
+/// hours for its EC2 scans, one entry per container image scan, function hours for its
+/// Lambda scans, one entry per code-repository analysis — so each usage type belongs to
+/// exactly the scan type whose scans meter it, and a scan type that is off meters nothing.
+/// The `AZURE_*` usage types are metered on resources an Azure connector covers rather
+/// than on a `ResourceScanType`, so they belong to no entry here.
+///
+/// Source: `smithy_query(query="shape", shape="UsageType,ResourceScanType")`.
+fn usage_types_of(resource_scan_type: &str) -> &'static [&'static str] {
+    match resource_scan_type {
+        "EC2" => &["EC2_INSTANCE_HOURS", "EC2_AGENTLESS_INSTANCE_HOURS"],
+        "ECR" => &["ECR_INITIAL_SCAN", "ECR_RESCAN"],
+        "LAMBDA" => &["LAMBDA_FUNCTION_HOURS"],
+        "LAMBDA_CODE" => &["LAMBDA_FUNCTION_CODE_HOURS"],
+        "CODE_REPOSITORY" => &[
+            "CODE_REPOSITORY_SAST",
+            "CODE_REPOSITORY_IAC",
+            "CODE_REPOSITORY_SCA",
+        ],
+        _ => &[],
+    }
+}
+
+/// The usage rows for one account: one per usage type the scans that account has ENABLED
+/// meter, in scan-type then usage-type model order.
+///
+/// The amount on each row is what this emulator has metered for it. A meter advances when
+/// Amazon Inspector scans a resource, and this service's store records no scanned resource
+/// — nothing submits one, because Inspector meters the scans it runs itself — so every
+/// meter stands at zero, and an estimated monthly cost is a rate times a usage of zero
+/// whatever that rate is. The rows move with the account's enablement, and an amount moves
+/// as soon as a scanned resource is recorded for it.
+///
+/// An account with no enablement record has no scan turned on, so it meters nothing.
+fn usage_of(enablement: Option<&crate::state::AccountEnablement>) -> Vec<Usage> {
+    let Some(enablement) = enablement else {
+        return Vec::new();
+    };
+    crate::state::RESOURCE_SCAN_TYPES
+        .iter()
+        .filter(|scan_type| enablement.status_of(scan_type) == crate::state::STATUS_ENABLED)
+        .flat_map(|scan_type| usage_types_of(scan_type))
+        .map(|usage_type| Usage {
+            r#type: Some((*usage_type).to_string()),
+            total: 0.0,
+            estimated_monthly_cost: 0.0,
+            currency: Some(CURRENCY.to_string()),
+            cloud_provider: Some(CLOUD_PROVIDER_AWS.to_string()),
+        })
+        .collect()
+}
+
+/// The account id a cursor names, or `None` when the value is not a cursor this operation
+/// minted. A token only decodes when it is hex AND the bytes are a 12-digit account id, so
+/// an arbitrary even-length hex string is refused rather than read as a position. The hex
+/// coding itself is [`crate::state::decode_cursor`], shared with this service's other
+/// paginated operations.
+fn decode_token(token: &str) -> Option<String> {
+    crate::state::decode_cursor(token, |value| {
+        value.len() == 12 && value.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
 /// The `ListUsageTotals` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -159,18 +232,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListUsageTotals` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListUsageTotalsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListUsageTotals"))
+        let _ = ctx;
+        // Usage totals are counted over recorded state, so a call that cannot reach this
+        // service's store has to fail rather than report usage it never read.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListUsageTotalsErrorModeled::InternalServerException(InternalServerException {
+                message: "Amazon Inspector usage state is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        // A token this operation did not mint cannot name a position, so the request is
+        // refused rather than silently answered from the start of the list.
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_token(token).ok_or_else(|| {
+                ListUsageTotalsErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token returned by a previous ListUsageTotals \
+                              call."
+                        .to_string(),
+                    reason: "CANNOT_PARSE".to_string(),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: "nextToken".to_string(),
+                        message: "must be a nextToken returned by ListUsageTotals".to_string(),
+                    }]),
+                })
+            })?),
+            None => None,
+        };
+
+        // `maxResults` is modelled `range 1..500`, so the boundary validator has already
+        // refused anything outside it by the time this runs.
+        let page_size = input
+            .max_results
+            .map_or(DEFAULT_PAGE_SIZE, |max| max.max(1) as usize);
+
+        // `accountIds` is a caller-supplied list the model does not mark `@uniqueItems`,
+        // so the ids it names are collected into an ordered SET: an account named twice
+        // is one account to report usage for, and that order is what makes a page cursor
+        // meaningful across calls.
+        let requested: Option<::std::collections::BTreeSet<String>> = input
+            .account_ids
+            .as_ref()
+            .filter(|ids| !ids.is_empty())
+            .map(|ids| ids.iter().cloned().collect());
+
+        let guard = state.lock();
+        // A request that names no account asks about the caller's own usage, and about
+        // every account this service holds an Amazon Inspector record for — exactly the
+        // accounts whose scans it meters. An explicitly empty list names no account
+        // either, and means the same thing.
+        let scope: ::std::collections::BTreeSet<String> = requested.unwrap_or_else(|| {
+            guard
+                .accounts
+                .keys()
+                .cloned()
+                .chain(::std::iter::once(
+                    ::engine::emulator_account_id().to_string(),
+                ))
+                .collect()
+        });
+
+        // One more than the page is read so the cursor is only emitted when a further
+        // account really is in scope.
+        let selected: Vec<&String> = scope
+            .iter()
+            .filter(|account_id| {
+                after
+                    .as_deref()
+                    .is_none_or(|cursor| account_id.as_str() > cursor)
+            })
+            .take(page_size + 1)
+            .collect();
+
+        let truncated = selected.len() > page_size;
+        let page = &selected[..selected.len().min(page_size)];
+        let next_token = truncated
+            .then(|| {
+                page.last()
+                    .map(|account_id| crate::state::encode_cursor(account_id))
+            })
+            .flatten();
+
+        let totals = page
+            .iter()
+            .map(|account_id| UsageTotal {
+                account_id: Some((*account_id).clone()),
+                usage: Some(usage_of(guard.accounts.get(account_id.as_str()))),
+            })
+            .collect();
+
+        Ok(ListUsageTotalsOutput {
+            totals: Some(totals),
+            next_token,
+        })
     }
 }

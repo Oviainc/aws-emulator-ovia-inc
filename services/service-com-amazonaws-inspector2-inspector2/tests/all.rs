@@ -19,3 +19,5 @@ mod filters_and_enablement;
 mod finding_aggregations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/usage_totals.rs"]
+mod usage_totals;
