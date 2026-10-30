@@ -13,7 +13,9 @@
 //! invalidated is answered with `RefreshTokenReuseException`.
 //!
 //! On a user pool that remembers devices the request has to present the key of a device
-//! `ConfirmDevice` has confirmed for the token's user.
+//! `ConfirmDevice` has confirmed for the token's user. A refresh token this emulator
+//! issued and has since revoked is refused AS revoked, which is a different sentence
+//! from the one a value it cannot resolve at all gets.
 //!
 //! ## Shape of an operation
 //!
@@ -234,11 +236,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let invalid_from = now.checked_add(grace).ok_or_else(internal_error)?;
                 guard.rotate_out_refresh_token(&input.refresh_token, invalid_from);
                 guard
-                    .issue_tokens(&user_pool_id, &input.client_id, &username, now)
+                    .issue_rotated_tokens(
+                        &user_pool_id,
+                        &input.client_id,
+                        &username,
+                        now,
+                        &input.refresh_token,
+                    )
                     .ok_or_else(internal_error)?
             }
             None => guard
-                .refresh_tokens(&user_pool_id, &input.client_id, &username, now)
+                .refresh_tokens(
+                    &user_pool_id,
+                    &input.client_id,
+                    &username,
+                    now,
+                    &input.refresh_token,
+                )
                 .ok_or_else(internal_error)?,
         };
 
@@ -296,18 +310,28 @@ fn resolve(
     //
     // "A valid refresh token that can authorize the request for new tokens"
     // (`RefreshToken`): valid is read off the record this emulator wrote when it issued
-    // the token — a refresh token, of the app client the request names, not revoked and
-    // not past its expiry.
+    // the token — a refresh token, of the app client the request names, and not past
+    // its expiry.
     let record = state
         .token(&input.refresh_token)
         .filter(|record| {
             record.kind == crate::state::TokenKind::Refresh
-                && !record.revoked
-                && record.expires_at > now
                 && record.client_id == input.client_id
                 && record.user_pool_id == user_pool_id
         })
         .ok_or_else(invalid_refresh_token)?;
+    // A record this emulator issued for this app client and has since REVOKED — a
+    // sign-out of its user, or a revocation of the token itself — is refused as
+    // revoked, which is a different answer from the one a value this service cannot
+    // resolve gets: the caller holds a token this service did issue and has since
+    // invalidated, so the refusal reports that rather than denying the token was ever
+    // issued.
+    if record.revoked {
+        return Err(refresh_token_revoked());
+    }
+    if record.expires_at <= now {
+        return Err(invalid_refresh_token());
+    }
     // A token an earlier rotation replaced is answered as the reuse it is, for as long
     // as the record of it lives: `RefreshTokenReuseException` is "throw when your
     // application requests token refresh with a refresh token that has been invalidated
@@ -374,6 +398,14 @@ fn client_not_found(client_id: &str) -> GetTokensFromRefreshTokenError {
 /// of the app client the request names, or that the request is not authorized to use.
 fn invalid_refresh_token() -> GetTokensFromRefreshTokenError {
     not_authorized("Invalid Refresh Token.")
+}
+
+/// The refusal for a `RefreshToken` this emulator issued for the app client the request
+/// names and has since revoked — a sign-out of its user, or a revocation of the token
+/// itself. Told apart from [`invalid_refresh_token`] because the token did authorize
+/// this app client until it was invalidated.
+fn refresh_token_revoked() -> GetTokensFromRefreshTokenError {
+    not_authorized("Refresh Token has been revoked")
 }
 
 /// This operation's `NotAuthorizedException`, carrying `message`.

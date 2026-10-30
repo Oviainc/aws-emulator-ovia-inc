@@ -742,6 +742,8 @@ async fn an_access_token_that_names_no_signed_in_user_is_refused() {
                 sub: sub.to_string(),
                 kind: state::TokenKind::Access,
                 scopes: vec![state::USER_ADMIN_SCOPE.to_string()],
+                // The sign-in lineage this planted record belongs to.
+                origin: "planted-sign-in".to_string(),
                 issued_at: now - Duration::from_secs(60),
                 expires_at,
                 revoked: false,

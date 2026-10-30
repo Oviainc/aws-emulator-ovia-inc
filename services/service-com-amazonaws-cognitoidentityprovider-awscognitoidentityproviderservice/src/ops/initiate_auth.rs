@@ -725,7 +725,7 @@ fn refresh_sign_in(
     };
 
     let authentication_result = state
-        .refresh_tokens(&user_pool_id, client_id, &username, now)
+        .refresh_tokens(&user_pool_id, client_id, &username, now, refresh_token)
         .ok_or_else(internal_error)?;
     Ok(authenticated(authentication_result))
 }

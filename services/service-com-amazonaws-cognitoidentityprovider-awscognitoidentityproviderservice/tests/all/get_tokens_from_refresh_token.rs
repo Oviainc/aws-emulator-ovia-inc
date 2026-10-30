@@ -675,6 +675,8 @@ async fn only_a_live_refresh_token_of_the_app_client_refreshes() {
                 kind: state::TokenKind::Refresh,
                 // A refresh token carries no `scope` claim.
                 scopes: Vec::new(),
+                // The sign-in lineage this planted record belongs to.
+                origin: "planted-sign-in".to_string(),
                 issued_at: now - Duration::from_secs(7_200),
                 expires_at: now - Duration::from_secs(60),
                 revoked: false,

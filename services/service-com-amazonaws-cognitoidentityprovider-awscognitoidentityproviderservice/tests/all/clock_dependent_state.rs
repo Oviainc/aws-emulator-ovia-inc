@@ -519,6 +519,8 @@ async fn issuing_tokens_sweeps_the_records_the_clock_expired() {
             sub: alice_sub.clone(),
             kind: state::TokenKind::Access,
             scopes: vec![state::USER_ADMIN_SCOPE.to_string()],
+            // The sign-in lineage both planted records belong to.
+            origin: "planted-sign-in".to_string(),
             issued_at: now - Duration::from_secs(7200),
             expires_at,
             revoked: false,
