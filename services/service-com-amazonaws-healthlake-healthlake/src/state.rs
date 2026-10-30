@@ -1504,6 +1504,24 @@ pub fn mapping_bytes(mapping: &BTreeMap<String, String>) -> usize {
     })
 }
 
+/// Whether a holder that RETAINS `retained` bytes stays inside `ceiling` once a
+/// write adds `added` bytes of content and gives `released` of the bytes already
+/// counted back.
+///
+/// The arithmetic EVERY byte ceiling in this service is charged with, in one place
+/// so the per-holder and the store-wide ceilings — and each write that charges
+/// them, whether it mints, replaces or snapshots content — can never measure the
+/// same write two different ways. `saturating_*`, so no arithmetic edge can wrap
+/// into an admission.
+pub fn retained_bytes_admits(
+    retained: usize,
+    added: usize,
+    released: usize,
+    ceiling: usize,
+) -> bool {
+    retained.saturating_sub(released).saturating_add(added) <= ceiling
+}
+
 /// One persisted data transformation profile: the metadata
 /// `CreateDataTransformationProfile` was given, plus its DRAFT and every
 /// version published from it.
@@ -1672,6 +1690,23 @@ impl DataTransformationProfile {
                 total.saturating_add(version.retained_bytes())
             })
     }
+
+    /// Whether THIS profile can retain `added` more BYTES of version content once
+    /// the `released` bytes a write replaces are given back — what
+    /// [`MAX_PROFILE_RETAINED_BYTES`] bounds.
+    ///
+    /// The ONE place the per-profile byte refusal is decided, so every operation
+    /// that grows what one profile retains charges it on the same terms: a publish
+    /// adds a snapshot and releases nothing, an update replaces the DRAFT and so
+    /// gives the DRAFT's bytes back.
+    pub fn admits_retained_bytes(&self, added: usize, released: usize) -> bool {
+        retained_bytes_admits(
+            self.retained_bytes(),
+            added,
+            released,
+            MAX_PROFILE_RETAINED_BYTES,
+        )
+    }
 }
 
 /// Refuse profile content the modelled `ProfileMapping` could not carry, with
@@ -1821,6 +1856,28 @@ impl ComAmazonawsHealthlakeHealthlakeState {
         self.profiles.values().fold(0usize, |total, profile| {
             total.saturating_add(profile.retained_bytes())
         })
+    }
+
+    /// Whether every data transformation profile TOGETHER can retain `added` more
+    /// BYTES of version content once the `released` bytes a write replaces are
+    /// given back — what [`MAX_PROFILE_RETAINED_BYTES_TOTAL`] bounds.
+    ///
+    /// The ONE place the store-wide profile byte refusal is decided, for the reason
+    /// [`Self::admits_fhir_resource_bytes`] is the one place the FHIR one is: every
+    /// operation that adds retained profile content charges the ceiling before it
+    /// writes, so none of them can push the store past a ceiling another one is
+    /// then refused for. Nothing is swept first: a profile's bytes come back
+    /// exactly by the record being dropped ([`Self::profile_retained_bytes_total`]
+    /// is summed over the records), and a profile leaves only when a caller deletes
+    /// it, so there is no terminal profile record lingering past its own
+    /// retention.
+    pub fn admits_profile_retained_bytes(&self, added: usize, released: usize) -> bool {
+        retained_bytes_admits(
+            self.profile_retained_bytes_total(),
+            added,
+            released,
+            MAX_PROFILE_RETAINED_BYTES_TOTAL,
+        )
     }
 
     /// Materialise every lifecycle transition the clock has ALREADY made due.
@@ -1994,13 +2051,13 @@ impl ComAmazonawsHealthlakeHealthlakeState {
 
     /// Whether the retained total AS IT STANDS admits `added` more bytes once
     /// `released` of the bytes it counts come back.
-    ///
-    /// `saturating_*`, so no arithmetic edge can wrap into an admission.
     fn fhir_resource_bytes_total_admits(&self, added: usize, released: usize) -> bool {
-        self.fhir_resource_bytes_total()
-            .saturating_sub(released)
-            .saturating_add(added)
-            <= MAX_FHIR_RESOURCE_BYTES_TOTAL
+        retained_bytes_admits(
+            self.fhir_resource_bytes_total(),
+            added,
+            released,
+            MAX_FHIR_RESOURCE_BYTES_TOTAL,
+        )
     }
 
     /// Materialise every export job transition the clock has ALREADY made due.

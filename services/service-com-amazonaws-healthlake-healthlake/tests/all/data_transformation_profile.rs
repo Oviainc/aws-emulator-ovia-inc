@@ -130,6 +130,35 @@ pub(crate) fn mapping_of_bytes(bytes: usize) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// A mapping whose keys and values hold EXACTLY `bytes` bytes together — the
+/// exact-size companion of [`mapping_of_bytes`], for a row that has to sit ON a
+/// byte ceiling rather than past it.
+///
+/// Every entry stays inside its own modelled bound (`smithy_query(query="shape",
+/// shape="ProfileMapping")`: 1..500 entries, keys `ProfileMappingKey` 1..500
+/// characters, values `ProfileMappingValue` 0..102400), so this is content the
+/// modelled shape carries.
+pub(crate) fn mapping_of_exactly(bytes: usize) -> BTreeMap<String, String> {
+    // Under the modelled 102 400-character maximum for one value.
+    const VALUE_LEN: usize = 100_000;
+    let mut content: BTreeMap<String, String> = BTreeMap::new();
+    let mut remaining = bytes;
+    let mut index = 0usize;
+    while remaining > 0 {
+        let key = format!("mappings/bulk-{index:04}.map");
+        assert!(
+            remaining >= key.len(),
+            "a mapping of {bytes} bytes must divide into entries whose keys fit, {remaining} \
+             bytes left over"
+        );
+        let value_len = (remaining - key.len()).min(VALUE_LEN);
+        remaining -= key.len() + value_len;
+        content.insert(key, "v".repeat(value_len));
+        index += 1;
+    }
+    content
+}
+
 /// The `ProfileMapping` a response reports, as a comparable map.
 pub(crate) fn reported_mapping(case: &str, body: &Value) -> BTreeMap<String, String> {
     body["ProfileMapping"]

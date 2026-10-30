@@ -208,11 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
-        // What the whole store retains, read before the profile this call writes is
-        // borrowed from it, so the ceiling below is charged against every profile
-        // together and not just this one.
-        let retained_total = store.profile_retained_bytes_total();
-        let Some(profile) = store.profiles.get_mut(&input.profile_id) else {
+        let Some(profile) = store.profiles.get(&input.profile_id) else {
             return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
         };
 
@@ -257,24 +253,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A published version is retained ALONGSIDE every other version of its
         // profile, so the bytes it adds are charged against what this profile retains
         // and against what the store retains, before it is written: a publish past
-        // either ceiling stores nothing.
+        // either ceiling stores nothing. A snapshot releases nothing — every version
+        // it is retained beside stays where it is.
         let bytes = crate::state::mapping_bytes(&mapping);
-        if profile.retained_bytes().saturating_add(bytes)
-            > crate::state::MAX_PROFILE_RETAINED_BYTES
-        {
+        if !profile.admits_retained_bytes(bytes, 0) {
             return Err(quota_exceeded(format!(
                 "Publishing this version would pass the {} bytes of profile content one \
                  profile retains",
                 crate::state::MAX_PROFILE_RETAINED_BYTES
             )));
         }
-        if retained_total.saturating_add(bytes) > crate::state::MAX_PROFILE_RETAINED_BYTES_TOTAL {
+        if !store.admits_profile_retained_bytes(bytes, 0) {
             return Err(quota_exceeded(format!(
                 "Publishing this version would pass the {} bytes of profile content every \
                  profile retains together",
                 crate::state::MAX_PROFILE_RETAINED_BYTES_TOTAL
             )));
         }
+
+        // The profile this call writes, now that every refusal it could answer has
+        // been decided against the store as it stands.
+        let Some(profile) = store.profiles.get_mut(&input.profile_id) else {
+            return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
+        };
 
         // The snapshot exists from this instant — nothing here outlives its own call —
         // so the profile owes the clock no transition and the new version is readable

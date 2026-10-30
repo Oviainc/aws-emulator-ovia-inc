@@ -267,18 +267,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store holds a bounded number of profiles; past the ceiling this
         // operation answers with the quota refusal it models.
         if store.profiles.len() >= crate::state::MAX_PROFILES {
-            return Err(
-                CreateDataTransformationProfileErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: Some(format!(
-                            "The maximum number of data transformation profiles ({}) \
-                             already exists",
-                            crate::state::MAX_PROFILES
-                        )),
-                    },
-                )
-                .into(),
-            );
+            return Err(quota_exceeded(format!(
+                "The maximum number of data transformation profiles ({}) already exists",
+                crate::state::MAX_PROFILES
+            )));
+        }
+
+        // A minted profile RETAINS its DRAFT's content alongside every version every
+        // other profile holds, so the bytes it adds are charged against the store-wide
+        // ceiling before anything is stored: a create past it mints nothing. The
+        // ceiling on what ONE profile retains cannot be reached here — a fresh profile
+        // holds exactly this one mapping, which `validate_profile_mapping` has already
+        // bounded well inside it — so the publish and the update that give a profile
+        // more content are where that one is charged.
+        let bytes = crate::state::mapping_bytes(&mapping);
+        if !store.admits_profile_retained_bytes(bytes, 0) {
+            return Err(quota_exceeded(format!(
+                "Creating this profile would pass the {} bytes of profile content every \
+                 profile retains together",
+                crate::state::MAX_PROFILE_RETAINED_BYTES_TOTAL
+            )));
         }
 
         let now = ::std::time::SystemTime::now();
@@ -411,6 +419,18 @@ fn validation(message: impl Into<String>) -> CreateDataTransformationProfileErro
     CreateDataTransformationProfileErrorModeled::ValidationException(ValidationException {
         message: Some(message.into()),
     })
+    .into()
+}
+
+/// This operation's quota refusal, as the modelled `ServiceQuotaExceededException` it
+/// declares — for a store that holds as many profiles, or retains as many bytes of
+/// profile content, as this emulator keeps.
+fn quota_exceeded(message: impl Into<String>) -> CreateDataTransformationProfileError {
+    CreateDataTransformationProfileErrorModeled::ServiceQuotaExceededException(
+        ServiceQuotaExceededException {
+            message: Some(message.into()),
+        },
+    )
     .into()
 }
 

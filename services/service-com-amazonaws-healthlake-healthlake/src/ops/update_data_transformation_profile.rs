@@ -13,7 +13,11 @@
 //! moves. A profile no record holds is a `ResourceNotFoundException`, and content the
 //! modelled `ProfileMapping` could not carry — or more bytes than this emulator
 //! retains for one mapping — is refused with `ValidationException` BEFORE anything is
-//! written, so a refused update leaves the stored DRAFT exactly as it was.
+//! written. Content this service cannot RETAIN beside what it already holds — past
+//! the bytes one profile keeps across its versions, or past the bytes every profile
+//! keeps together, counting the DRAFT this call replaces as given back — is refused
+//! with the modelled `ThrottlingException` before anything is written too, so a
+//! refused update leaves the stored DRAFT exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -184,6 +188,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::validate_profile_mapping(&mapping).map_err(validation)?;
 
         let mut store = state.lock();
+        let Some(profile) = store.profiles.get(&input.profile_id) else {
+            return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
+        };
+
+        // The new DRAFT content is RETAINED alongside every version this profile
+        // holds and every version every other profile holds, so its bytes are charged
+        // against both ceilings before anything is written: an update past either one
+        // leaves the stored DRAFT exactly as it was. The DRAFT this call REPLACES
+        // gives its own bytes back as it goes, so an update is charged only for what
+        // it adds to what is retained.
+        let bytes = crate::state::mapping_bytes(&mapping);
+        let released = profile.draft.retained_bytes();
+        if !profile.admits_retained_bytes(bytes, released) {
+            return Err(capacity_exceeded(format!(
+                "Updating this DRAFT would pass the {} bytes of profile content one \
+                 profile retains",
+                crate::state::MAX_PROFILE_RETAINED_BYTES
+            )));
+        }
+        if !store.admits_profile_retained_bytes(bytes, released) {
+            return Err(capacity_exceeded(format!(
+                "Updating this DRAFT would pass the {} bytes of profile content every \
+                 profile retains together",
+                crate::state::MAX_PROFILE_RETAINED_BYTES_TOTAL
+            )));
+        }
+
+        // The profile this call writes, now that every refusal it could answer has
+        // been decided against the store as it stands. The same lock has been held
+        // throughout, so this is the record the ceilings were charged against.
         let Some(profile) = store.profiles.get_mut(&input.profile_id) else {
             return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
         };
@@ -230,6 +264,25 @@ fn not_found(message: &str) -> UpdateDataTransformationProfileError {
             message: Some(message.to_string()),
         },
     )
+    .into()
+}
+
+/// This operation's capacity refusal, for content this emulator will not retain.
+///
+/// The modelled `ThrottlingException`. This operation declares no quota-shaped
+/// error, so the choice is between it and `ValidationException`, and the condition
+/// is not a bad request: the same content is stored happily by a store that holds
+/// less. It is the error the sibling writes that charge a retention ceiling without
+/// a quota-shaped one answer with (`CreateFHIRDatastore`, `RestoreFHIRDatastore`,
+/// `StartDataTransformationJob`), so one condition is reported one way across the
+/// service. A caller that retries it unchanged is refused again until content is
+/// deleted, and the message says which ceiling it has to free: a per-request bound
+/// the content itself violates stays a `ValidationException`, which names the
+/// member and the bound instead.
+fn capacity_exceeded(message: impl Into<String>) -> UpdateDataTransformationProfileError {
+    UpdateDataTransformationProfileErrorModeled::ThrottlingException(ThrottlingException {
+        message: Some(message.into()),
+    })
     .into()
 }
 
