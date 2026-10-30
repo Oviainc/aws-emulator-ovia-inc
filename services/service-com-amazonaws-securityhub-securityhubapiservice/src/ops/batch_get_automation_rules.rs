@@ -206,9 +206,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => unprocessed.push(UnprocessedAutomationRule {
                     rule_arn: Some(rule_arn.clone()),
                     error_code: Some(crate::state::RULE_ERROR_CODE_NOT_FOUND),
-                    error_message: Some(format!(
-                        "No automation rule with ARN {rule_arn} exists in this account and Region"
-                    )),
+                    error_message: Some(
+                        crate::state::RULE_ERROR_MESSAGE_NOT_FOUND.to_string(),
+                    ),
                 }),
             }
         }

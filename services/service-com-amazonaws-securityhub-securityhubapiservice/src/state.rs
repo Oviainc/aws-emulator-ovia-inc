@@ -1494,6 +1494,13 @@ pub const MAX_AUTOMATION_RULES_PER_HUB: usize = 100;
 /// that same condition carries when it refuses a whole request.
 pub const RULE_ERROR_CODE_NOT_FOUND: i32 = 404;
 
+/// The `UnprocessedAutomationRule$ErrorMessage` for that same condition: the batch
+/// reports the CLASS of the per-item failure — the name of the exception the condition
+/// raises when it refuses a whole request — and leaves the identifier to the sibling
+/// `RuleArn` member rather than repeating it in the text. One definition, so the three
+/// batch rule operations cannot word the same per-item failure differently.
+pub const RULE_ERROR_MESSAGE_NOT_FOUND: &str = "ResourceNotFoundException";
+
 /// The longest `RuleName` this store keeps for an automation rule. The model
 /// documents no bound for that member, so the cap mirrors the one this crate already
 /// applies to a finding's `Title` (`MAX_TITLE_LEN` in `ops/batch_import_findings.rs`):

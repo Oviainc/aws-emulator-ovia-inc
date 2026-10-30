@@ -224,7 +224,15 @@ pub enum Target {
     RootId(String),
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityhub#ConfigurationPolicyAssociationSummary")]
+/// `ConfigurationPolicyAssociationSummary`. Its schema and codec come from
+/// [`securityhub_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `UpdatedAt` targets `Timestamp`, which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="ConfigurationPolicyAssociationSummary")`, whose
+/// documentation also says "in UTC and ISO 8601 format"), and the derive does not put that
+/// trait on a member schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone, Default)]
 pub struct ConfigurationPolicyAssociationSummary {
     pub configuration_policy_id: Option<String>,
@@ -235,6 +243,49 @@ pub struct ConfigurationPolicyAssociationSummary {
     pub association_status: Option<String>,
     pub association_status_message: Option<String>,
 }
+
+securityhub_schema_and_codec!(
+    ConfigurationPolicyAssociationSummary,
+    CONFIGURATION_POLICY_ASSOCIATION_SUMMARY_SCHEMA,
+    "com.amazonaws.securityhub#ConfigurationPolicyAssociationSummary",
+    "com.amazonaws.securityhub",
+    "ConfigurationPolicyAssociationSummary",
+    (
+        M_CONFIGURATION_POLICY_ID,
+        configuration_policy_id,
+        "ConfigurationPolicyId",
+        0,
+        opt,
+        string
+    ),
+    (M_TARGET_ID, target_id, "TargetId", 1, opt, string),
+    (M_TARGET_TYPE, target_type, "TargetType", 2, opt, string),
+    (
+        M_ASSOCIATION_TYPE,
+        association_type,
+        "AssociationType",
+        3,
+        opt,
+        string
+    ),
+    (M_UPDATED_AT, updated_at, "UpdatedAt", 4, opt, date_time),
+    (
+        M_ASSOCIATION_STATUS,
+        association_status,
+        "AssociationStatus",
+        5,
+        opt,
+        string
+    ),
+    (
+        M_ASSOCIATION_STATUS_MESSAGE,
+        association_status_message,
+        "AssociationStatusMessage",
+        6,
+        opt,
+        string
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.securityhub#ParameterConfiguration")]
 #[derive(Debug, Clone, Default)]
@@ -6517,7 +6568,14 @@ pub struct OrganizationConfiguration {
     pub status_message: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityhub#Invitation")]
+/// `Invitation`. Its schema and codec come from [`securityhub_schema_and_codec!`] rather
+/// than `#[smithy_macros::smithy(shape = ...)]` because `InvitedAt` targets `Timestamp`,
+/// which carries `@timestampFormat("date-time")` (`smithy_query(query="shape",
+/// shape="Invitation")`), and the derive does not put that trait on a member schema — see
+/// `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone, Default)]
 pub struct Invitation {
     pub account_id: Option<String>,
@@ -6525,6 +6583,32 @@ pub struct Invitation {
     pub invited_at: Option<::aws_smithy_types::DateTime>,
     pub member_status: Option<String>,
 }
+
+securityhub_schema_and_codec!(
+    Invitation,
+    INVITATION_SCHEMA,
+    "com.amazonaws.securityhub#Invitation",
+    "com.amazonaws.securityhub",
+    "Invitation",
+    (M_ACCOUNT_ID, account_id, "AccountId", 0, opt, string),
+    (
+        M_INVITATION_ID,
+        invitation_id,
+        "InvitationId",
+        1,
+        opt,
+        string
+    ),
+    (M_INVITED_AT, invited_at, "InvitedAt", 2, opt, date_time),
+    (
+        M_MEMBER_STATUS,
+        member_status,
+        "MemberStatus",
+        3,
+        opt,
+        string
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.securityhub#HealthIssue")]
 #[derive(Debug, Clone, Default)]
@@ -6659,7 +6743,14 @@ pub struct OrganizationNotFoundException {
     pub code: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityhub#Member")]
+/// `Member`. Its schema and codec come from [`securityhub_schema_and_codec!`] rather than
+/// `#[smithy_macros::smithy(shape = ...)]` because `InvitedAt` and `UpdatedAt` target
+/// `Timestamp`, which carries `@timestampFormat("date-time")` (`smithy_query(query="shape",
+/// shape="Member")`), and the derive does not put that trait on a member schema — see
+/// `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone, Default)]
 pub struct Member {
     pub account_id: Option<String>,
@@ -6670,6 +6761,35 @@ pub struct Member {
     pub invited_at: Option<::aws_smithy_types::DateTime>,
     pub updated_at: Option<::aws_smithy_types::DateTime>,
 }
+
+securityhub_schema_and_codec!(
+    Member,
+    MEMBER_SCHEMA,
+    "com.amazonaws.securityhub#Member",
+    "com.amazonaws.securityhub",
+    "Member",
+    (M_ACCOUNT_ID, account_id, "AccountId", 0, opt, string),
+    (M_EMAIL, email, "Email", 1, opt, string),
+    (M_MASTER_ID, master_id, "MasterId", 2, opt, string),
+    (
+        M_ADMINISTRATOR_ID,
+        administrator_id,
+        "AdministratorId",
+        3,
+        opt,
+        string
+    ),
+    (
+        M_MEMBER_STATUS,
+        member_status,
+        "MemberStatus",
+        4,
+        opt,
+        string
+    ),
+    (M_INVITED_AT, invited_at, "InvitedAt", 5, opt, date_time),
+    (M_UPDATED_AT, updated_at, "UpdatedAt", 6, opt, date_time),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.securityhub#RemediationResource")]
 #[derive(Debug, Clone, Default)]

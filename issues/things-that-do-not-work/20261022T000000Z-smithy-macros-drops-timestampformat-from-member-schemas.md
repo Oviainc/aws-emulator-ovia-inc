@@ -64,6 +64,16 @@ shape's `Schema` + `SerializableStruct` out by hand with the modelled format, as
 does for `GetConnectionResponse`. That does not scale — it is one hand-maintained copy of
 generated code per affected shape — which is why this is filed rather than repeated.
 
+The cost is now visible in the tree: several service crates carry a near-identical
+`src/ops/types/date_time_wire.rs` holding the same ~280 lines of `macro_rules!` that emit
+the derive's output for one output shape plus the missing chain call
+(`novaact`, `bedrockagentruntime`, `verifiedpermissions`, `bedrock`, `codeguruprofiler`,
+`securityhub`, …), beside more shapes still written out longhand. Each copy has to be
+deleted when this is fixed. If the generator cannot be changed, the second-best shape of a
+fix is ONE of these macro sets in a shared crate under `services/` (e.g.
+`services/common/`), referenced as a path dependency, rather than another per-service
+clone — the macros are service-independent apart from the shape ids their callers pass in.
+
 ## Steps to Reproduce
 
 1. Pick any operation whose output has a timestamp member with an explicit

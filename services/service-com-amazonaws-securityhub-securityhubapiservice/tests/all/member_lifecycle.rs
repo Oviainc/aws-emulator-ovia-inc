@@ -130,10 +130,10 @@ fn detail(account_id: &str, email: Option<&str>) -> Value {
     }
 }
 
-/// The instant a modelled `Timestamp` member carries, in epoch seconds. This
-/// service's generated schema renders `Member$UpdatedAt` as epoch seconds on
-/// restJson1; a `date-time` string is read too, so the assertions below are about the
-/// instant and not its encoding.
+/// The instant a modelled `Timestamp` member carries, in epoch seconds. `Member$UpdatedAt`
+/// is `@timestampFormat("date-time")`, so it arrives as an RFC 3339 string (pinned by
+/// `tests/all/timestamp_wire_form.rs`); an epoch number is read too, so the assertions
+/// below are about the instant and not its encoding.
 fn instant_seconds(value: &Value) -> Option<f64> {
     if let Some(seconds) = value.as_f64() {
         return Some(seconds);

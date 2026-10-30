@@ -7,9 +7,10 @@
 //! modules, and `types/mod.rs` re-exports them all.
 //!
 //! `GetFindingHistoryInput` and `FindingHistoryRecord` are the TWO shapes here whose
-//! schemas are written out below rather than produced by
-//! `#[smithy_macros::smithy(shape = ...)]`, and the reason is a single trait the
-//! vendored codegen does not read: `@timestampFormat`.
+//! schemas are not produced by `#[smithy_macros::smithy(shape = ...)]`, and the reason is a
+//! single trait the vendored codegen does not read: `@timestampFormat`. The input shape's
+//! is written out below; the output shape's comes from the crate's shared output-shape
+//! macros in `types/date_time_wire.rs`.
 //!
 //! All three of this operation's timestamp members — `GetFindingHistoryRequest$StartTime`,
 //! `$EndTime` and `FindingHistoryRecord$UpdateTime` — target `Timestamp`, which the model
@@ -30,8 +31,11 @@
 //! the fix belongs in `vendor/smithy-macros` (chain `.with_timestamp_format(..)` when
 //! building a member schema), which a service crate may not change. REMOVE this block and
 //! put `#[smithy_macros::smithy(shape = ...)]` back on the two structs once the codegen
-//! learns the trait — `tests/all/finding_history.rs` pins the wire form, so it fails if the
-//! attribute does not carry it.
+//! learns the trait — `tests/all/finding_history.rs` and `tests/all/timestamp_wire_form.rs`
+//! pin the wire form, so they fail if the attribute does not carry it. `GetFindingHistoryInput`
+//! needs the long form either way, because it is an INPUT shape: its schema carries the
+//! `@range` trait map and the operation's `@http` binding, neither of which
+//! `types/date_time_wire.rs`' output-shape macros emit.
 #![allow(unused_imports)]
 
 use super::*;
@@ -226,8 +230,15 @@ pub struct GetFindingHistoryOutput {
     pub next_token: Option<String>,
 }
 
-/// `FindingHistoryRecord`, with its schema written out instead of derived; see the
-/// module docs for why.
+/// `FindingHistoryRecord`. Its schema and codec come from
+/// [`securityhub_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `UpdateTime` targets `Timestamp`, which carries `@timestampFormat("date-time")`;
+/// see the module docs for why that cannot be derived. It is an OUTPUT shape, so the shared
+/// macros in `types/date_time_wire.rs` emit everything it needs — unlike
+/// `GetFindingHistoryInput` above.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone, Default)]
 pub struct FindingHistoryRecord {
     pub finding_identifier: Option<AwsSecurityFindingIdentifier>,
@@ -238,172 +249,47 @@ pub struct FindingHistoryRecord {
     pub next_token: Option<String>,
 }
 
-#[allow(non_upper_case_globals)]
-impl FindingHistoryRecord {
-    pub const M_FINDING_IDENTIFIER: ::aws_smithy_schema::Schema =
-        ::aws_smithy_schema::Schema::new_member(
-            ::aws_smithy_schema::ShapeId::from_static(
-                "com.amazonaws.securityhub#FindingHistoryRecord$FindingIdentifier",
-                "com.amazonaws.securityhub",
-                "FindingIdentifier",
-            ),
-            ::aws_smithy_schema::ShapeType::Structure,
-            "FindingIdentifier",
-            0,
-        );
-
-    pub const M_UPDATE_TIME: ::aws_smithy_schema::Schema =
-        ::aws_smithy_schema::Schema::new_member(
-            ::aws_smithy_schema::ShapeId::from_static(
-                "com.amazonaws.securityhub#FindingHistoryRecord$UpdateTime",
-                "com.amazonaws.securityhub",
-                "UpdateTime",
-            ),
-            ::aws_smithy_schema::ShapeType::Timestamp,
-            "UpdateTime",
-            1,
-        )
-        // The one call the vendored codegen omits; see the module docs.
-        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
-
-    pub const M_FINDING_CREATED: ::aws_smithy_schema::Schema =
-        ::aws_smithy_schema::Schema::new_member(
-            ::aws_smithy_schema::ShapeId::from_static(
-                "com.amazonaws.securityhub#FindingHistoryRecord$FindingCreated",
-                "com.amazonaws.securityhub",
-                "FindingCreated",
-            ),
-            ::aws_smithy_schema::ShapeType::Boolean,
-            "FindingCreated",
-            2,
-        );
-
-    pub const M_UPDATE_SOURCE: ::aws_smithy_schema::Schema =
-        ::aws_smithy_schema::Schema::new_member(
-            ::aws_smithy_schema::ShapeId::from_static(
-                "com.amazonaws.securityhub#FindingHistoryRecord$UpdateSource",
-                "com.amazonaws.securityhub",
-                "UpdateSource",
-            ),
-            ::aws_smithy_schema::ShapeType::Structure,
-            "UpdateSource",
-            3,
-        );
-
-    pub const M_UPDATES: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.securityhub#FindingHistoryRecord$Updates",
-            "com.amazonaws.securityhub",
-            "Updates",
-        ),
-        ::aws_smithy_schema::ShapeType::List,
+securityhub_schema_and_codec!(
+    FindingHistoryRecord,
+    FINDING_HISTORY_RECORD_SCHEMA,
+    "com.amazonaws.securityhub#FindingHistoryRecord",
+    "com.amazonaws.securityhub",
+    "FindingHistoryRecord",
+    (
+        M_FINDING_IDENTIFIER,
+        finding_identifier,
+        "FindingIdentifier",
+        0,
+        opt,
+        struct_of(AwsSecurityFindingIdentifier)
+    ),
+    (M_UPDATE_TIME, update_time, "UpdateTime", 1, opt, date_time),
+    (
+        M_FINDING_CREATED,
+        finding_created,
+        "FindingCreated",
+        2,
+        opt,
+        boolean
+    ),
+    (
+        M_UPDATE_SOURCE,
+        update_source,
+        "UpdateSource",
+        3,
+        opt,
+        struct_of(FindingHistoryUpdateSource)
+    ),
+    (
+        M_UPDATES,
+        updates,
         "Updates",
         4,
-    );
-
-    pub const M_NEXT_TOKEN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.securityhub#FindingHistoryRecord$NextToken",
-            "com.amazonaws.securityhub",
-            "NextToken",
-        ),
-        ::aws_smithy_schema::ShapeType::String,
-        "NextToken",
-        5,
-    );
-
-    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.securityhub#FindingHistoryRecord",
-            "com.amazonaws.securityhub",
-            "FindingHistoryRecord",
-        ),
-        ::aws_smithy_schema::ShapeType::Structure,
-        &[
-            &Self::M_FINDING_IDENTIFIER,
-            &Self::M_UPDATE_TIME,
-            &Self::M_FINDING_CREATED,
-            &Self::M_UPDATE_SOURCE,
-            &Self::M_UPDATES,
-            &Self::M_NEXT_TOKEN,
-        ],
-    );
-}
-
-pub static FINDING_HISTORY_RECORD_SCHEMA: &::aws_smithy_schema::Schema =
-    &FindingHistoryRecord::SCHEMA;
-
-impl ::aws_smithy_schema::serde::SerializableStruct for FindingHistoryRecord {
-    fn serialize_members(
-        &self,
-        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
-    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
-        if let Some(value) = self.finding_identifier.as_ref() {
-            serializer.write_struct(&Self::M_FINDING_IDENTIFIER, value)?;
-        }
-        if let Some(value) = self.update_time.as_ref() {
-            serializer.write_timestamp(&Self::M_UPDATE_TIME, value)?;
-        }
-        if let Some(value) = self.finding_created.as_ref() {
-            serializer.write_boolean(&Self::M_FINDING_CREATED, *value)?;
-        }
-        if let Some(value) = self.update_source.as_ref() {
-            serializer.write_struct(&Self::M_UPDATE_SOURCE, value)?;
-        }
-        if let Some(value) = self.updates.as_ref() {
-            // A list of structures writes each element against the ELEMENT shape's
-            // own schema, as the codegen does.
-            serializer.write_list(&Self::M_UPDATES, &|elements| {
-                for update in value.iter() {
-                    elements.write_struct(&FindingHistoryUpdate::SCHEMA, update)?;
-                }
-                Ok(())
-            })?;
-        }
-        if let Some(value) = self.next_token.as_ref() {
-            serializer.write_string(&Self::M_NEXT_TOKEN, value.as_str())?;
-        }
-        Ok(())
-    }
-}
-
-impl ::aws_smithy_schema_server::DeserializableStruct for FindingHistoryRecord {
-    fn deserialize(
-        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
-    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
-        let mut out = Self::default();
-        deserializer.read_struct(&Self::SCHEMA, &mut |member, d| {
-            match member.member_index() {
-                Some(0) => {
-                    out.finding_identifier = Some(
-                        <AwsSecurityFindingIdentifier as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
-                    );
-                }
-                Some(1) => out.update_time = Some(d.read_timestamp(&Self::M_UPDATE_TIME)?),
-                Some(2) => out.finding_created = Some(d.read_boolean(&Self::M_FINDING_CREATED)?),
-                Some(3) => {
-                    out.update_source = Some(
-                        <FindingHistoryUpdateSource as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
-                    );
-                }
-                Some(4) => {
-                    let mut updates: Vec<FindingHistoryUpdate> = Vec::new();
-                    d.read_list(&Self::M_UPDATES, &mut |element| {
-                        updates.push(
-                            <FindingHistoryUpdate as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(element)?,
-                        );
-                        Ok(())
-                    })?;
-                    out.updates = Some(updates);
-                }
-                Some(5) => out.next_token = Some(d.read_string(&Self::M_NEXT_TOKEN)?),
-                _ => {}
-            }
-            Ok(())
-        })?;
-        Ok(out)
-    }
-}
+        opt,
+        list_of(FindingHistoryUpdate)
+    ),
+    (M_NEXT_TOKEN, next_token, "NextToken", 5, opt, string),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.securityhub#FindingHistoryUpdateSource")]
 #[derive(Debug, Clone, Default)]

@@ -24,7 +24,15 @@ pub struct BatchGetAutomationRulesOutput {
     pub unprocessed_automation_rules: Option<Vec<UnprocessedAutomationRule>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityhub#AutomationRulesConfig")]
+/// `AutomationRulesConfig`. Its schema and codec come from
+/// [`securityhub_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `CreatedAt` and `UpdatedAt` target `Timestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="shape",
+/// shape="AutomationRulesConfig")`), and the derive does not put that trait on a member
+/// schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone, Default)]
 pub struct AutomationRulesConfig {
     pub rule_arn: Option<String>,
@@ -39,4 +47,37 @@ pub struct AutomationRulesConfig {
     pub updated_at: Option<::aws_smithy_types::DateTime>,
     pub created_by: Option<String>,
 }
+
+securityhub_schema_and_codec!(
+    AutomationRulesConfig,
+    AUTOMATION_RULES_CONFIG_SCHEMA,
+    "com.amazonaws.securityhub#AutomationRulesConfig",
+    "com.amazonaws.securityhub",
+    "AutomationRulesConfig",
+    (M_RULE_ARN, rule_arn, "RuleArn", 0, opt, string),
+    (M_RULE_STATUS, rule_status, "RuleStatus", 1, opt, string),
+    (M_RULE_ORDER, rule_order, "RuleOrder", 2, opt, integer),
+    (M_RULE_NAME, rule_name, "RuleName", 3, opt, string),
+    (M_DESCRIPTION, description, "Description", 4, opt, string),
+    (M_IS_TERMINAL, is_terminal, "IsTerminal", 5, opt, boolean),
+    (
+        M_CRITERIA,
+        criteria,
+        "Criteria",
+        6,
+        opt,
+        struct_of(AutomationRulesFindingFilters)
+    ),
+    (
+        M_ACTIONS,
+        actions,
+        "Actions",
+        7,
+        opt,
+        list_of(AutomationRulesAction)
+    ),
+    (M_CREATED_AT, created_at, "CreatedAt", 8, opt, date_time),
+    (M_UPDATED_AT, updated_at, "UpdatedAt", 9, opt, date_time),
+    (M_CREATED_BY, created_by, "CreatedBy", 10, opt, string),
+);
 

@@ -38,6 +38,11 @@ const SCHEMA_VERSION: &str = "2018-10-08";
 /// also the identity a finding-history event names.
 const CREATED_BY: &str = "arn:aws:iam::000000000000:user/emulator";
 
+/// The `UnprocessedAutomationRule$ErrorMessage` every batch rule operation reports for a
+/// rule ARN that names no rule: the name of the exception the same condition raises, with
+/// the identifier carried in the sibling `RuleArn` member rather than in the text.
+const RULE_NOT_FOUND_MESSAGE: &str = "ResourceNotFoundException";
+
 /// One emulator with the Security Hub service mounted, driven over HTTP.
 struct Harness {
     router: MultiServiceRouter,
@@ -949,8 +954,11 @@ async fn list_automation_rules_reports_every_rule_in_rule_order_and_pages() {
 
 /// RULE: an ARN that names no rule of the calling account is reported in
 /// `UnprocessedAutomationRules` with the 404 of the `ResourceNotFoundException` the
-/// same condition raises — it never refuses the whole batch, and never reports the
-/// rule as processed.
+/// same condition raises, and with that exception's NAME as the per-item `ErrorMessage`
+/// — it never refuses the whole batch, and never reports the rule as processed.
+///
+/// The cases span the three operations that report the same per-item failure, so none of
+/// them can word it differently.
 #[tokio::test]
 async fn an_arn_that_names_no_rule_is_reported_unprocessed() {
     let harness = Harness::subscribed().await;
@@ -985,6 +993,11 @@ async fn an_arn_that_names_no_rule_is_reported_unprocessed() {
         json!(404),
         "BatchGet must report 404 for an ARN that names no rule: {body}"
     );
+    assert_eq!(
+        body["UnprocessedAutomationRules"][0]["ErrorMessage"].as_str(),
+        Some(RULE_NOT_FOUND_MESSAGE),
+        "BatchGet must report the not-found class as the ErrorMessage: {body}"
+    );
 
     let (status, body) = harness
         .update_rules(vec![
@@ -1002,6 +1015,11 @@ async fn an_arn_that_names_no_rule_is_reported_unprocessed() {
         json!(404),
         "BatchUpdate must report 404 for an ARN that names no rule: {body}"
     );
+    assert_eq!(
+        body["UnprocessedAutomationRules"][0]["ErrorMessage"].as_str(),
+        Some(RULE_NOT_FOUND_MESSAGE),
+        "BatchUpdate must report the not-found class as the ErrorMessage: {body}"
+    );
 
     let (status, body) = harness.delete_rules(vec![&unknown]).await;
     assert_eq!(status, 200, "BatchDelete got {status} with {body}");
@@ -1009,6 +1027,11 @@ async fn an_arn_that_names_no_rule_is_reported_unprocessed() {
         body["UnprocessedAutomationRules"][0]["ErrorCode"],
         json!(404),
         "BatchDelete must report 404 for an ARN that names no rule: {body}"
+    );
+    assert_eq!(
+        body["UnprocessedAutomationRules"][0]["ErrorMessage"].as_str(),
+        Some(RULE_NOT_FOUND_MESSAGE),
+        "BatchDelete must report the not-found class as the ErrorMessage: {body}"
     );
 }
 

@@ -25,7 +25,15 @@ pub struct ListAutomationRulesOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityhub#AutomationRulesMetadata")]
+/// `AutomationRulesMetadata`. Its schema and codec come from
+/// [`securityhub_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `CreatedAt` and `UpdatedAt` target `Timestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="shape",
+/// shape="AutomationRulesMetadata")`), and the derive does not put that trait on a member
+/// schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone, Default)]
 pub struct AutomationRulesMetadata {
     pub rule_arn: Option<String>,
@@ -38,4 +46,21 @@ pub struct AutomationRulesMetadata {
     pub updated_at: Option<::aws_smithy_types::DateTime>,
     pub created_by: Option<String>,
 }
+
+securityhub_schema_and_codec!(
+    AutomationRulesMetadata,
+    AUTOMATION_RULES_METADATA_SCHEMA,
+    "com.amazonaws.securityhub#AutomationRulesMetadata",
+    "com.amazonaws.securityhub",
+    "AutomationRulesMetadata",
+    (M_RULE_ARN, rule_arn, "RuleArn", 0, opt, string),
+    (M_RULE_STATUS, rule_status, "RuleStatus", 1, opt, string),
+    (M_RULE_ORDER, rule_order, "RuleOrder", 2, opt, integer),
+    (M_RULE_NAME, rule_name, "RuleName", 3, opt, string),
+    (M_DESCRIPTION, description, "Description", 4, opt, string),
+    (M_IS_TERMINAL, is_terminal, "IsTerminal", 5, opt, boolean),
+    (M_CREATED_AT, created_at, "CreatedAt", 6, opt, date_time),
+    (M_UPDATED_AT, updated_at, "UpdatedAt", 7, opt, date_time),
+    (M_CREATED_BY, created_by, "CreatedBy", 8, opt, string),
+);
 
