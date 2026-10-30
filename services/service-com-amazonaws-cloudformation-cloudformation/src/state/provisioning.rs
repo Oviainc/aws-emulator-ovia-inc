@@ -1271,9 +1271,13 @@ fn repoint(properties: &mut Value, minted: &[Minted], depth: usize) {
 }
 
 /// Record the identity an owning service ASSIGNED to a resource it created: the id its
-/// `Ref` resolves to from here on, and the `Id`/`<Type>Id` attributes read off that id
-/// ([`super::template::identity_attributes`]), which the naming rules had computed from the
-/// name instead.
+/// `Ref` resolves to from here on, and the `Id`/`<Type>Id` attributes read off that id,
+/// which the naming rules had computed from the name instead.
+///
+/// Taking an identifier over is [`super::template::adopt_identity`], the one place that
+/// step is written — the same one a binding's composite primary identifier goes through —
+/// so the attributes and the id a resource reports cannot drift apart whichever of them
+/// produced it.
 ///
 /// `None` is every type whose physical id CloudFormation computes, which the create already
 /// carried out to that service: nothing to adopt.
@@ -1281,19 +1285,7 @@ fn adopt_minted_identity(resource: &mut StoredResource, assigned: Option<String>
     let Some(assigned) = assigned else {
         return;
     };
-    for (attribute, value) in
-        super::template::identity_attributes(&resource.resource_type, &assigned)
-    {
-        // An attribute the convention already gave the resource is re-pointed; a new one
-        // is added only while the resource is under its attribute bound, which is what
-        // caps the map.
-        if resource.attributes.contains_key(&attribute)
-            || resource.attributes.len() < super::template::MAX_ATTRIBUTES_PER_RESOURCE
-        {
-            resource.attributes.insert(attribute, value);
-        }
-    }
-    resource.physical_resource_id = assigned;
+    super::template::adopt_identity(resource, assigned);
 }
 
 /// Record what an owning service already created: the resource exists there with the

@@ -2126,6 +2126,29 @@ pub fn arn_attributes(resource_type: &str, arn: &str) -> Vec<(String, String)> {
     ]
 }
 
+/// Give a resource the physical id `identity` and bring the attributes read off that id
+/// into step with it ([`identity_attributes`]).
+///
+/// The one place a resource TAKES OVER an identifier that is not the one the naming rules
+/// computed, so the `Id`/`<Type>Id` attributes a resource reports and the id its `Ref`
+/// resolves to cannot drift apart. Both ways that happens go through it: an identifier the
+/// OWNING service minted, which only
+/// [`super::provisioning`](crate::state::provisioning) learns, and the composite primary
+/// identifier a BINDING's own resolved properties make ([`composite_identity`]).
+pub fn adopt_identity(resource: &mut StoredResource, identity: String) {
+    for (attribute, value) in identity_attributes(&resource.resource_type, &identity) {
+        // An attribute the convention already gave the resource is re-pointed; a new one
+        // is added only while the resource is under its attribute bound, which is what
+        // caps the map.
+        if resource.attributes.contains_key(&attribute)
+            || resource.attributes.len() < MAX_ATTRIBUTES_PER_RESOURCE
+        {
+            resource.attributes.insert(attribute, value);
+        }
+    }
+    resource.physical_resource_id = identity;
+}
+
 /// The attributes the uniform convention reads off a resource's PHYSICAL ID: its
 /// `Id`/`<Type>Id` names, which are "the physical id `Ref` returns"
 /// ([`conventional_attributes`]).
@@ -2133,9 +2156,8 @@ pub fn arn_attributes(resource_type: &str, arn: &str) -> Vec<(String, String)> {
 /// Public because the physical id is not always CloudFormation's own to compute: where the
 /// OWNING service mints a resource's identity — AWS WAF Classic answers `CreateIPSet` with
 /// the `IPSetId` that type's `Ref` returns — the id is the one that service answered, which
-/// only [`super::provisioning`](crate::state::provisioning) learns. It re-points these
-/// attributes through this one function, so the `Id` a resource reports and the id its
-/// `Ref` resolves to cannot drift apart.
+/// only [`super::provisioning`](crate::state::provisioning) learns. [`adopt_identity`]
+/// re-points these attributes through this one function.
 pub fn identity_attributes(
     resource_type: &str,
     physical_resource_id: &str,
@@ -2296,10 +2318,14 @@ pub fn name_property(resource_type: &str, properties: &Value) -> Option<String> 
 ///
 /// A type with no entry has none beyond its name, so the name alone decides whether a
 /// re-deploy means the same resource ([`super::declared_name`]).
+///
+/// The parts of a COMPOSITE primary identifier are in that position by construction
+/// ([`composite_identity_properties`]): the resource IS the binding those values name, so
+/// stating one of them differently asks for a different resource.
 pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
     match resource_type {
         IAM_ACCESS_KEY => &["Serial", "UserName"],
-        _ => &[],
+        _ => composite_identity_properties(resource_type),
     }
 }
 
@@ -5000,6 +5026,89 @@ pub const WAFV2_RULE_GROUP: &str = "AWS::WAFv2::RuleGroup";
 pub const WAFV2_IP_SET: &str = "AWS::WAFv2::IPSet";
 pub const WAFV2_REGEX_PATTERN_SET: &str = "AWS::WAFv2::RegexPatternSet";
 
+/// The type that puts one of those web ACLs IN FRONT OF a protected resource (the same
+/// model, `cloudFormationName: WAFv2`).
+///
+/// It is no entity of AWS WAF's own: it is the BINDING `AssociateWebACL` makes and
+/// `DisassociateWebACL` removes, and what identifies the binding is the pair it binds — so
+/// its physical resource id is that pair rather than a name no call of that service takes
+/// ([`composite_identity_properties`]).
+pub const WAFV2_WEB_ACL_ASSOCIATION: &str = "AWS::WAFv2::WebACLAssociation";
+
+/// The type of an Amazon EKS access entry: the access one IAM principal has to one cluster
+/// (the Amazon EKS model's `awsService.cloudFormationName: EKS`).
+///
+/// Another binding identified by the pair it binds: every operation on an access entry
+/// addresses it by the cluster and the principal, which are that operation's two
+/// `@httpLabel`s, so this type's physical resource id is that pair too
+/// ([`composite_identity_properties`]).
+pub const EKS_ACCESS_ENTRY: &str = "AWS::EKS::AccessEntry";
+
+/// The separator CloudFormation joins the parts of a COMPOSITE physical resource id with.
+const COMPOSITE_IDENTITY_SEPARATOR: &str = "|";
+
+/// The properties whose values ARE a resource's physical resource id, in the order they are
+/// joined in, for a type whose primary identifier is COMPOSITE; the empty list for every
+/// type a single value identifies.
+///
+/// Such a type declares no resource of its own: it is a binding BETWEEN resources, and what
+/// identifies a binding is what it binds — so the physical resource id of one, which is
+/// what `Ref` returns, is those property values joined with
+/// [`COMPOSITE_IDENTITY_SEPARATOR`]:
+///
+/// * `AWS::WAFv2::WebACLAssociation` is `<ResourceArn>|<WebACLArn>`, the pair
+///   `AssociateWebACL` takes and `DisassociateWebACL` removes;
+/// * `AWS::EKS::AccessEntry` is `<ClusterName>|<PrincipalArn>`, the pair every Amazon EKS
+///   operation on an access entry addresses one by.
+///
+/// Because the identity IS the pair, a declaration that re-points either side of it names a
+/// DIFFERENT resource: the deployment replaces the one the stack has
+/// ([`super::provisioning::is_same_resource`]) and the new `Ref` names the new pair, and the
+/// record the stack's own deletion acts on carries exactly the pair to unbind. Every part is
+/// a create-only property of its type for that same reason
+/// ([`replacement_properties`]).
+pub fn composite_identity_properties(resource_type: &str) -> &'static [&'static str] {
+    match resource_type {
+        WAFV2_WEB_ACL_ASSOCIATION => &["ResourceArn", "WebACLArn"],
+        EKS_ACCESS_ENTRY => &["ClusterName", "PrincipalArn"],
+        _ => &[],
+    }
+}
+
+/// The physical resource id a type's composite primary identifier makes of one RESOLVED
+/// property document ([`composite_identity_properties`]).
+///
+/// `None` for a type that has no such identifier, and for a declaration that leaves one of
+/// its parts out or states it as something other than a scalar: that declaration names no
+/// pair at all, so the resource keeps the identity the naming rules computed and the owning
+/// service's own validation of the missing member is what judges it.
+pub fn composite_identity(resource_type: &str, properties: &Value) -> Option<String> {
+    let parts = composite_identity_properties(resource_type);
+    if parts.is_empty() {
+        return None;
+    }
+    let properties = properties.as_object()?;
+    let values: Option<Vec<String>> = parts
+        .iter()
+        .map(|part| properties.get(*part).and_then(scalar_text))
+        .collect();
+    Some(values?.join(COMPOSITE_IDENTITY_SEPARATOR))
+}
+
+/// Give a resource the physical id its type's composite primary identifier makes it, where
+/// its type has one.
+///
+/// A composite identity is a function of the resource's RESOLVED properties — the other
+/// resources the binding names resolve to their own identifiers first — so this is applied
+/// where those are filled in ([`resolve_properties`]) rather than where the naming rules run.
+/// A type with no composite identifier is left exactly as it is.
+fn adopt_composite_identity(resource: &mut StoredResource) {
+    let Some(identity) = composite_identity(&resource.resource_type, &resource.properties) else {
+        return;
+    };
+    adopt_identity(resource, identity);
+}
+
 /// The three AWS Backup resource types a stack creates in that service (the AWS Backup
 /// model: `cloudFormationName: Backup`).
 ///
@@ -5518,6 +5627,10 @@ pub fn resolve_properties(
         };
         resource.properties =
             resolved_value(&declared.properties, scope, 0, budget).unwrap_or(Value::Null);
+        // A type whose primary identifier is COMPOSITE takes its physical id from that
+        // resolved document: this is the first point at which the resources the binding
+        // names have resolved to the identifiers they really carry.
+        adopt_composite_identity(resource);
     }
 }
 

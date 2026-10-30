@@ -118,6 +118,11 @@
 //!   type's identity is WAF's own — its create assigns the entity `Id` and builds the ARN
 //!   that carries the scope, the name and that id — so its arm answers both, and what the
 //!   stack publishes for the resource is what `AssociateWebACL` and the `Get…` calls take.
+//! * `AWS::WAFv2::WebACLAssociation` is none of those: it is no entity of WAF's own but the
+//!   BINDING between a protected resource and one of those web ACLs, so its two properties
+//!   are `AssociateWebACL`'s own two members and that one call is its whole deployment
+//!   ([`associate_web_acl`]) — with the pair it bound as the resource's physical id, which
+//!   is what makes `Ref` name which resource is protected by which web ACL.
 //! * `AWS::Grafana::Workspace`'s properties are `CreateWorkspace`'s own members under
 //!   DIFFERENT names — the type spells the workspace's own fields without the `workspace`
 //!   prefix that API carries (`Name`/`Description`/`RoleArn`/`DataSources` against
@@ -461,7 +466,7 @@ use super::template::{
     CODEDEPLOY_DEPLOYMENT_CONFIG, CODEDEPLOY_DEPLOYMENT_GROUP,
     COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, EC2_SECURITY_GROUP, EC2_SUBNET,
     EC2_VOLUME, EC2_VPC,
-    ECR_PUBLIC_REPOSITORY, ECS_CLUSTER,
+    ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, EKS_ACCESS_ENTRY,
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
     ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, GUARDDUTY_IP_SET,
@@ -482,7 +487,7 @@ use super::template::{
     SNS_TOPIC, SQS_QUEUE, SQS_QUEUE_INLINE_POLICY, SQS_QUEUE_POLICY,
     SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY,
     TRANSFER_SERVER, WAFV2_IP_SET, WAFV2_REGEX_PATTERN_SET, WAFV2_RULE_GROUP, WAFV2_WEB_ACL,
-    WAF_REGIONAL_IP_SET,
+    WAFV2_WEB_ACL_ASSOCIATION, WAF_REGIONAL_IP_SET,
 };
 use super::StoredResource;
 
@@ -531,12 +536,6 @@ const RDS_DB_PARAMETER_GROUP: &str = "AWS::RDS::DBParameterGroup";
 /// the cluster-scoped sibling of the type above, which a DB cluster's
 /// `DBClusterParameterGroupName` names.
 const RDS_DB_CLUSTER_PARAMETER_GROUP: &str = "AWS::RDS::DBClusterParameterGroup";
-
-/// `AWS::EKS::AccessEntry`: the access entry that lets one IAM principal reach an Amazon
-/// EKS cluster. Amazon EKS keys one by the PAIR its two create-only properties name — the
-/// cluster and the principal ARN, the two `@httpLabel`s of every operation on it — so each
-/// call of this type's arm carries both, read off the resource's own declaration.
-const EKS_ACCESS_ENTRY: &str = "AWS::EKS::AccessEntry";
 
 /// `AWS::Glue::Job`: "Ref returns the job name" — the `Name` the declaration states, which
 /// is what `CreateJob` creates the job under and what every AWS Glue operation on a job
@@ -622,6 +621,10 @@ pub(super) enum Provisioner {
     Wafv2RuleGroup,
     Wafv2IpSet,
     Wafv2RegexPatternSet,
+    /// `AWS::WAFv2::WebACLAssociation`: not an entity of AWS WAF's own but the BINDING that
+    /// puts one of its web ACLs in front of a protected resource, which `AssociateWebACL`
+    /// makes and `DisassociateWebACL` removes.
+    Wafv2WebAclAssociation,
     GlueJob,
     GrafanaWorkspace,
     GuardDutyDetector,
@@ -744,6 +747,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         WAFV2_RULE_GROUP => Some(Provisioner::Wafv2RuleGroup),
         WAFV2_IP_SET => Some(Provisioner::Wafv2IpSet),
         WAFV2_REGEX_PATTERN_SET => Some(Provisioner::Wafv2RegexPatternSet),
+        WAFV2_WEB_ACL_ASSOCIATION => Some(Provisioner::Wafv2WebAclAssociation),
         GLUE_JOB => Some(Provisioner::GlueJob),
         GRAFANA_WORKSPACE => Some(Provisioner::GrafanaWorkspace),
         GUARDDUTY_DETECTOR => Some(Provisioner::GuardDutyDetector),
@@ -927,6 +931,10 @@ impl Provisioner {
                 )
                 .await
             }
+            // An association publishes no `Tags` property and `AssociateWebACL` takes none:
+            // the binding is not a taggable resource — AWS WAF holds tags on its own
+            // entities — so no tags are propagated to one.
+            Self::Wafv2WebAclAssociation => associate_web_acl(ctx, region, resource).await,
             // An `AWS::Glue::Job`'s properties ARE `CreateJob`'s own members, so the
             // declared document is the request, with the one member CloudFormation decides
             // (the job's name) set on the way out and the tag MAP that call takes merged
@@ -1702,6 +1710,10 @@ impl Provisioner {
             Self::Wafv2RegexPatternSet => {
                 delete_wafv2_entity(ctx, region, resource, WAFV2_REGEX_PATTERN_SET_CALLS).await
             }
+            // The binding is addressed by the PROTECTED resource alone — "a resource has at
+            // most one web ACL in front of it" — which the resource's own declaration
+            // carries.
+            Self::Wafv2WebAclAssociation => disassociate_web_acl(ctx, region, resource).await,
             Self::GlueJob => delete_glue_job(ctx, region, physical_resource_id).await,
             Self::GrafanaWorkspace => {
                 delete_workspace(ctx, region, physical_resource_id).await
@@ -2011,6 +2023,11 @@ impl Provisioner {
             }
             Self::Wafv2RegexPatternSet => {
                 describe_wafv2_entity(ctx, region, resource, WAFV2_REGEX_PATTERN_SET_CALLS).await
+            }
+            // Read back as the web ACL AWS WAF reports in front of the protected resource
+            // now, which is what the declared pair is compared against.
+            Self::Wafv2WebAclAssociation => {
+                describe_web_acl_association(ctx, region, resource).await
             }
             Self::GlueJob => describe_glue_job(ctx, region, physical_resource_id).await,
             Self::GrafanaWorkspace => {
@@ -10079,6 +10096,162 @@ async fn call_wafv2(
         request,
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// AWS WAF (WAFv2): AWS::WAFv2::WebACLAssociation
+// ---------------------------------------------------------------------------
+
+/// The two properties an `AWS::WAFv2::WebACLAssociation` binds, which are also the two
+/// members `AssociateWebACL` takes under exactly these names: the protected resource and
+/// the web ACL to put in front of it.
+const WAFV2_ASSOCIATION_RESOURCE_ARN: &str = "ResourceArn";
+const WAFV2_ASSOCIATION_WEB_ACL_ARN: &str = "WebACLArn";
+
+/// The calls that make, remove and read back a binding between a protected resource and a
+/// web ACL.
+const WAFV2_ASSOCIATE: &str = "AssociateWebACL";
+const WAFV2_DISASSOCIATE: &str = "DisassociateWebACL";
+const WAFV2_GET_FOR_RESOURCE: &str = "GetWebACLForResource";
+
+/// The member `GetWebACLForResource` answers the web ACL in front of a resource under, and
+/// the member of that web ACL carrying the ARN a declaration names it by.
+const WAFV2_WEB_ACL_MEMBER: &str = "WebACL";
+const WAFV2_ARN: &str = "ARN";
+
+/// Put the web ACL an `AWS::WAFv2::WebACLAssociation` declares in front of the resource it
+/// names.
+///
+/// This type is no entity of AWS WAF's own, so there is nothing to create: its two
+/// properties are `AssociateWebACL`'s own two members, and that call is the whole
+/// deployment of one. WAF is also what JUDGES the pair — "your request references an ARN
+/// that is malformed, or corresponds to a resource with which a web ACL can't be
+/// associated" is its `WAFInvalidParameterException`, and a `WebACLArn` naming no web ACL
+/// its `WAFNonexistentItemException` — so a declaration naming a resource kind a web ACL
+/// can never front is refused by that service and the resource fails, rather than being
+/// recorded as a protection nothing could apply.
+///
+/// What the resource IS, is the pair it bound, so the physical id answered here is that
+/// pair ([`super::template::composite_identity`]) read off the document the call was made
+/// with: a reference to a web ACL of the same stack carries the ARN AWS WAF minted for it,
+/// which no naming rule could have computed.
+async fn associate_web_acl(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let mut request = Map::new();
+    request.insert(
+        WAFV2_ASSOCIATION_RESOURCE_ARN.to_string(),
+        Value::String(required_property(
+            resource,
+            WAFV2_ASSOCIATION_RESOURCE_ARN,
+        )?),
+    );
+    request.insert(
+        WAFV2_ASSOCIATION_WEB_ACL_ARN.to_string(),
+        Value::String(required_property(resource, WAFV2_ASSOCIATION_WEB_ACL_ARN)?),
+    );
+    call_wafv2(ctx, region, WAFV2_ASSOCIATE, &Value::Object(request)).await?;
+    // The pair is computed again HERE, from the document the call was made with, because
+    // this pass is the one that owns the id: the declaration was resolved before AWS WAF
+    // had minted the web ACL's ARN, so the pair
+    // [`super::template::resolve_properties`] stamped on the record carries the stand-in
+    // the naming rules computed, and the pair this resource really bound is the one the
+    // re-pointed document names.
+    Ok(Created {
+        physical_resource_id: super::template::composite_identity(
+            &resource.resource_type,
+            &resource.properties,
+        ),
+        attributes: BTreeMap::new(),
+    })
+}
+
+/// Take the binding a stack made away again.
+///
+/// `DisassociateWebACL` addresses a binding by the PROTECTED resource alone — a resource
+/// carries at most one web ACL in front of it — and what this resource IS, is the PAIR it
+/// bound: so the binding is read back first and taken away only while the web ACL in front
+/// of the resource is still the one this record bound. A resource carrying another web ACL,
+/// or none at all, no longer carries the pair this record names — it is already in the state
+/// the delete asks for, and disassociating it would take away a binding this record never
+/// made, which is exactly what a replacement's cleanup must not do.
+async fn disassociate_web_acl(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let resource_arn = required_property(resource, WAFV2_ASSOCIATION_RESOURCE_ARN)?;
+    let web_acl_arn = required_property(resource, WAFV2_ASSOCIATION_WEB_ACL_ARN)?;
+    if web_acl_in_front_of(ctx, region, &resource_arn).await? != Some(web_acl_arn) {
+        return Ok(());
+    }
+    let mut request = Map::new();
+    request.insert(
+        WAFV2_ASSOCIATION_RESOURCE_ARN.to_string(),
+        Value::String(resource_arn),
+    );
+    match call_wafv2(ctx, region, WAFV2_DISASSOCIATE, &Value::Object(request)).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == WAFV2_NONEXISTENT_ITEM => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The binding as AWS WAF reports it, for drift detection: the protected resource the
+/// declaration names, and the ARN of the web ACL that service has in front of it NOW — so a
+/// binding re-pointed outside the stack is reported as modified and one taken away as
+/// deleted.
+async fn describe_web_acl_association(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let resource_arn = required_property(resource, WAFV2_ASSOCIATION_RESOURCE_ARN)?;
+    let Some(web_acl_arn) = web_acl_in_front_of(ctx, region, &resource_arn).await? else {
+        return Ok(None);
+    };
+    let mut reported = Map::new();
+    reported.insert(
+        WAFV2_ASSOCIATION_RESOURCE_ARN.to_string(),
+        Value::String(resource_arn),
+    );
+    reported.insert(
+        WAFV2_ASSOCIATION_WEB_ACL_ARN.to_string(),
+        Value::String(web_acl_arn),
+    );
+    Ok(Some(Value::Object(reported)))
+}
+
+/// The ARN of the web ACL AWS WAF has in front of `resource_arn` now, or `None` for a
+/// resource nothing is in front of.
+///
+/// `GetWebACLForResource` is the one read of a binding, and a resource with none is not an
+/// error: "the web ACL that is associated with the resource. If there is no associated
+/// resource, WAF returns a null web ACL" (`GetWebACLForResourceResponse$WebACL`). A resource
+/// that service no longer holds at all answers its own not-found code, which is the same
+/// absence.
+async fn web_acl_in_front_of(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource_arn: &str,
+) -> Result<Option<String>, Refusal> {
+    let mut request = Map::new();
+    request.insert(
+        WAFV2_ASSOCIATION_RESOURCE_ARN.to_string(),
+        Value::String(resource_arn.to_string()),
+    );
+    let answered =
+        match call_wafv2(ctx, region, WAFV2_GET_FOR_RESOURCE, &Value::Object(request)).await {
+            Ok(answered) => answered,
+            Err(refusal) if refusal.code == WAFV2_NONEXISTENT_ITEM => return Ok(None),
+            Err(refusal) => return Err(refusal),
+        };
+    Ok(answered
+        .get(WAFV2_WEB_ACL_MEMBER)
+        .and_then(|web_acl| web_acl.get(WAFV2_ARN))
+        .and_then(scalar_text))
 }
 
 // ---------------------------------------------------------------------------

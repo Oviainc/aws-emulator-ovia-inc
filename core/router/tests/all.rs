@@ -33,6 +33,9 @@ mod cloudformation_apigateway_custom_domains;
 // concurrently landing suites add their line to.
 #[path = "all/cloudformation_provisions_guardduty_ip_set.rs"]
 mod cloudformation_provisions_guardduty_ip_set;
+// Declared in this same head region, for the reason the entries above record.
+#[path = "all/cloudformation_provisions_wafv2_web_acl_associations.rs"]
+mod cloudformation_provisions_wafv2_web_acl_associations;
 // Declared here, at the head, for the reason the entry below records: the appended tail and
 // the sorted `k…` span are both regions concurrently landing suites add their line to.
 #[path = "all/kinesisvideo_signing_name_routing.rs"]
