@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes `AutoRenew` on the subscription record in [`crate::state`], which is what
+//! `DescribeSubscription` then reports.
 //!
 //! ## Shape of an operation
 //!
@@ -137,6 +131,14 @@ impl<Eng> UpdateSubscription<Eng> {
     }
 }
 
+/// How late in the subscription period `AutoRenew` may still be changed.
+///
+/// DOCUMENTED: `LockedSubscriptionException`'s own wording — "You can change the
+/// `AutoRenew` parameter during the last 30 days of your subscription. This exception
+/// indicates that you are attempting to change `AutoRenew` prior to that period."
+const AUTO_RENEW_CHANGE_WINDOW: ::std::time::Duration =
+    ::std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for UpdateSubscription<Eng>
 {
@@ -154,18 +156,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSubscription"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateSubscriptionErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some(
+                        "the shield emulator is mounted on an engine that holds no state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // "Updates the details of an EXISTING subscription": with none, there is no
+        // subscription to update.
+        let active = guard.subscription_state_at(now) == crate::state::SUBSCRIPTION_STATE_ACTIVE;
+        let Some(subscription) = guard.subscription.as_mut().filter(|_| active) else {
+            return Err(UpdateSubscriptionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::SUBSCRIPTION_NOT_FOUND_MESSAGE.to_string()),
+                    resource_type: Some(crate::state::SUBSCRIPTION_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "Only enter values for parameters you want to change. Empty parameters are not
+        // updated": a call naming no `AutoRenew` leaves the subscription exactly as it
+        // is, so nothing is locked either.
+        let Some(auto_renew) = input.auto_renew.as_deref() else {
+            return Ok(UpdateSubscriptionOutput {});
+        };
+
+        // The commitment runs for its whole term, and `AutoRenew` is settled only as the
+        // term ends: a change asked for before that window is refused as locked.
+        if subscription
+            .end_time
+            .duration_since(now)
+            .is_ok_and(|remaining| remaining > AUTO_RENEW_CHANGE_WINDOW)
+        {
+            return Err(UpdateSubscriptionErrorModeled::LockedSubscriptionException(
+                LockedSubscriptionException {
+                    message: Some(
+                        "You can change the AutoRenew parameter during the last 30 days of \
+                         your subscription."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        subscription.auto_renew = auto_renew.to_string();
+
+        Ok(UpdateSubscriptionOutput {})
     }
 }

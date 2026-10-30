@@ -188,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // asked for" is the only reading that terminates.
         let page_size = match input.max_results {
             Some(max_results) if max_results > 0 => max_results,
-            _ => crate::state::DEFAULT_LIST_PROTECTIONS_MAX_RESULTS,
+            _ => crate::state::DEFAULT_LIST_MAX_RESULTS,
         } as usize;
 
         // A token names the place the previous page stopped at: the page that follows it
@@ -201,10 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(ListProtectionsErrorModeled::InvalidPaginationTokenException(
                         InvalidPaginationTokenException {
                             message: Some(
-                                "The NextToken specified in the request is invalid. Submit the \
-                                 request using the NextToken value that was returned in the \
-                                 prior response."
-                                    .to_string(),
+                                crate::state::INVALID_PAGINATION_TOKEN_MESSAGE.to_string(),
                             ),
                         },
                     )
@@ -223,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(ListProtectionsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some("The subscription does not exist.".to_string()),
+                    message: Some(crate::state::SUBSCRIPTION_NOT_FOUND_MESSAGE.to_string()),
                     resource_type: Some(crate::state::SUBSCRIPTION_RESOURCE_TYPE.to_string()),
                 },
             )
@@ -279,20 +276,18 @@ fn matches_filters(
         )
 }
 
-/// The version marker an issued token carries, so a token from elsewhere — or from a
+/// The listing an issued token belongs to, so a token from another listing — or from a
 /// future encoding — is refused rather than half-understood.
-const TOKEN_PREFIX: &str = "protections/v1:";
+const TOKEN_KIND: &str = "protections";
 
 /// Encode the place a page stopped at (the creation-order position of the last
 /// protection it reported) as the opaque token the next call passes back.
 fn encode_token(sequence: u64) -> String {
-    ::hex::encode(format!("{TOKEN_PREFIX}{sequence}"))
+    crate::state::encode_page_token(TOKEN_KIND, sequence)
 }
 
 /// The creation-order position a token resumes after, or `None` when the token is not
 /// one [`encode_token`] produced.
 fn decode_token(token: &str) -> Option<u64> {
-    let decoded = ::hex::decode(token).ok()?;
-    let decoded = String::from_utf8(decoded).ok()?;
-    decoded.strip_prefix(TOKEN_PREFIX)?.parse().ok()
+    crate::state::decode_page_token(TOKEN_KIND, token)
 }

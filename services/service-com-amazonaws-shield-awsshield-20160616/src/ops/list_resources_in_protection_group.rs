@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourcesInProtectionGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourcesInProtectionGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourcesInProtectionGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read: it pages over the protected resources the stored protection group
+//! includes, derived from [`crate::state`] according to the group's `Pattern`.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +163,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourcesInProtectionGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourcesInProtectionGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourcesInProtectionGroup"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListResourcesInProtectionGroupErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some(
+                            "the shield emulator is mounted on an engine that holds no state"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The model documents the default page size as 20; see `ListProtections` for why
+        // a `MaxResults` of 0 is read as "none asked for" rather than an empty page.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results > 0 => max_results,
+            _ => crate::state::DEFAULT_LIST_MAX_RESULTS,
+        } as usize;
+
+        // The token is read before the store is: a token this listing did not issue says
+        // nothing about the group, so it is refused on its own terms.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(TOKEN_KIND, token) {
+                Some(position) => Some(position),
+                None => {
+                    return Err(
+                        ListResourcesInProtectionGroupErrorModeled::InvalidPaginationTokenException(
+                            InvalidPaginationTokenException {
+                                message: Some(
+                                    crate::state::INVALID_PAGINATION_TOKEN_MESSAGE.to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // A pure read of the store.
+        let guard = state.lock();
+
+        // The group is addressed by the call, so its absence is reported with the
+        // group-specific wording rather than the account-level one that shares the code.
+        // The addressed resource is resolved ahead of any account-level gate, and a
+        // stored group implies the subscription that had to exist to create it.
+        let Some(group) = guard.protection_group_by_id(&input.protection_group_id) else {
+            return Err(
+                ListResourcesInProtectionGroupErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::PROTECTION_GROUP_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                        resource_type: Some(
+                            crate::state::PROTECTION_GROUP_RESOURCE_TYPE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The membership is derived from the group's pattern; the position a token names
+        // is an index into that stable order. A token naming a position past the end is
+        // the last page rather than an error: the resources it already reported are gone.
+        let resources = guard.resources_in_protection_group(group);
+        let start = resume_after
+            .map_or(0, |last| {
+                usize::try_from(last)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(1)
+            })
+            .min(resources.len());
+        let end = start.saturating_add(page_size).min(resources.len());
+        let page = &resources[start..end];
+
+        Ok(ListResourcesInProtectionGroupOutput {
+            resource_arns: page.to_vec(),
+            // Omitted on the last page: the `@paginated` contract is that an absent
+            // token ends the iteration.
+            next_token: (end < resources.len())
+                .then(|| crate::state::encode_page_token(TOKEN_KIND, end.saturating_sub(1) as u64)),
+        })
     }
 }
+
+/// The listing an issued token belongs to, so a token from another listing — or from a
+/// future encoding — is refused rather than half-understood.
+const TOKEN_KIND: &str = "protection-group-resources";

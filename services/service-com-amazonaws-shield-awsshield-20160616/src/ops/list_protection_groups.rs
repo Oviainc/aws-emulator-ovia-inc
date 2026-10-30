@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProtectionGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProtectionGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProtectionGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read: it pages over the protection groups `CreateProtectionGroup` persisted
+//! in [`crate::state`], in the account's creation order.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +166,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProtectionGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProtectionGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProtectionGroups"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListProtectionGroupsErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some(
+                        "the shield emulator is mounted on an engine that holds no state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `MaxResults` is the greatest number of groups to report; the model documents
+        // the default as 20, which is also what a caller naming no page size gets. A
+        // `MaxResults` of 0 — which the member's `@range(0..10000)` admits — is read the
+        // same way rather than as an empty page: a page of nothing plus a `NextToken` is
+        // an iteration that can never advance.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results > 0 => max_results,
+            _ => crate::state::DEFAULT_LIST_MAX_RESULTS,
+        } as usize;
+
+        // The token is read before the store is: a token this listing did not issue says
+        // nothing about the account, so it is refused on its own terms.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(TOKEN_KIND, token) {
+                Some(sequence) => Some(sequence),
+                None => {
+                    return Err(
+                        ListProtectionGroupsErrorModeled::InvalidPaginationTokenException(
+                            InvalidPaginationTokenException {
+                                message: Some(
+                                    crate::state::INVALID_PAGINATION_TOKEN_MESSAGE.to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // A pure read of the store, in the creation order it keeps.
+        let guard = state.lock();
+
+        // Protection groups are what a Shield Advanced subscription grants, so there is
+        // no set to list for an account that holds none.
+        if guard.subscription_state_at(::std::time::SystemTime::now())
+            != crate::state::SUBSCRIPTION_STATE_ACTIVE
+        {
+            return Err(ListProtectionGroupsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::SUBSCRIPTION_NOT_FOUND_MESSAGE.to_string()),
+                    resource_type: Some(crate::state::SUBSCRIPTION_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let remaining: Vec<&crate::state::ProtectionGroupEntry> = guard
+            .protection_groups_in_creation_order()
+            .into_iter()
+            .filter(|entry| resume_after.is_none_or(|last| entry.sequence > last))
+            .filter(|entry| matches_filters(entry, input.inclusion_filters.as_ref()))
+            .collect();
+
+        let page = &remaining[..remaining.len().min(page_size)];
+
+        Ok(ListProtectionGroupsOutput {
+            protection_groups: page.iter().map(|entry| entry.to_modeled()).collect(),
+            // Omitted on the last page: the `@paginated` contract is that an absent
+            // token ends the iteration.
+            next_token: (remaining.len() > page.len())
+                .then(|| {
+                    page.last()
+                        .map(|entry| crate::state::encode_page_token(TOKEN_KIND, entry.sequence))
+                })
+                .flatten(),
+        })
     }
+}
+
+/// The listing an issued token belongs to, so a token from another listing — or from a
+/// future encoding — is refused rather than half-understood.
+const TOKEN_KIND: &str = "protection-groups";
+
+/// Whether this protection group satisfies every criterion the call provided.
+///
+/// `InclusionProtectionGroupFilters`' own documentation: "You can provide up to one
+/// criteria per filter type. Shield Advanced returns the protection groups that exactly
+/// match all of the search criteria that you provide." So an absent filter type
+/// constrains nothing, and the types that are present must all hold. Each filter list is
+/// modelled `len 1..1`, so a present type always carries exactly one criterion.
+fn matches_filters(
+    entry: &crate::state::ProtectionGroupEntry,
+    filters: Option<&InclusionProtectionGroupFilters>,
+) -> bool {
+    let Some(filters) = filters else {
+        return true;
+    };
+    let matches_any = |criteria: Option<&Vec<String>>, value: Option<&str>| match criteria {
+        None => true,
+        Some(criteria) => value.is_some_and(|value| criteria.iter().any(|want| want == value)),
+    };
+
+    matches_any(filters.protection_group_ids.as_ref(), Some(&entry.id))
+        && matches_any(filters.patterns.as_ref(), Some(&entry.pattern))
+        && matches_any(filters.aggregations.as_ref(), Some(&entry.aggregation))
+        && matches_any(filters.resource_types.as_ref(), entry.resource_type.as_deref())
 }

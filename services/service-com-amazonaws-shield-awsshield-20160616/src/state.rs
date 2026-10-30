@@ -2,11 +2,13 @@
 
 //! Engine state for the com-amazonaws-shield-awsshield-20160616 service.
 //!
-//! Shield Advanced's control plane is two resources: the account's *subscription*
-//! (there is at most one) and the *protections* it grants, each covering exactly one
-//! protected Amazon Web Services resource. Every value a handler answers with is
-//! derived from the records kept here, so a write made by one request is what the next
-//! request reads.
+//! Shield Advanced's control plane is a small set of resources: the account's
+//! *subscription* (there is at most one), the *protections* it grants — each covering
+//! exactly one protected Amazon Web Services resource — the *protection groups* that
+//! bundle protected resources so they are detected on as a collective, the account's
+//! emergency contacts, and the role the Shield Response Team is authorized through.
+//! Every value a handler answers with is derived from the records kept here, so a write
+//! made by one request is what the next request reads.
 
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
@@ -16,9 +18,10 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    ApplicationLayerAutomaticResponseConfiguration, Limit, Protection,
-    ProtectionGroupArbitraryPatternLimits, ProtectionGroupLimits, ProtectionGroupPatternTypeLimits,
-    ProtectionLimits, Subscription, SubscriptionLimits, Tag, PROTECTED_RESOURCE_TYPE_VALUES,
+    ApplicationLayerAutomaticResponseConfiguration, EmergencyContact, Limit, Protection,
+    ProtectionGroup, ProtectionGroupArbitraryPatternLimits, ProtectionGroupLimits,
+    ProtectionGroupPatternTypeLimits, ProtectionLimits, Subscription, SubscriptionLimits, Tag,
+    PROTECTED_RESOURCE_TYPE_VALUES,
 };
 
 /// The `SubscriptionState` an account with a live Shield Advanced subscription is in.
@@ -36,6 +39,10 @@ pub const AUTO_RENEW_ENABLED: &str = "ENABLED";
 /// `AssociateProactiveEngagementDetails`).
 pub const PROACTIVE_ENGAGEMENT_STATUS_DISABLED: &str = "DISABLED";
 
+/// The `ProactiveEngagementStatus` of an account that has asked the Shield Response Team
+/// to reach out to it (`EnableProactiveEngagement`).
+pub const PROACTIVE_ENGAGEMENT_STATUS_ENABLED: &str = "ENABLED";
+
 /// The length of a Shield Advanced subscription, which is also the commitment the
 /// account takes on (`Subscription$TimeCommitmentInSeconds`: "The length, in seconds,
 /// of the Shield Advanced subscription for the account").
@@ -50,9 +57,46 @@ pub const PROTECTION_RESOURCE_TYPE: &str = "protection";
 /// The `resourceType` this service reports for the account's subscription in an error
 /// body.
 pub const SUBSCRIPTION_RESOURCE_TYPE: &str = "subscription";
+/// The `resourceType` this service reports for a protection group in an error body.
+pub const PROTECTION_GROUP_RESOURCE_TYPE: &str = "protection-group";
 
 /// The `Type` a `LimitsExceededException` names when the account is out of protections.
 pub const PROTECTION_LIMIT_TYPE: &str = "protection";
+/// The `Type` a `LimitsExceededException` names when the account is out of protection
+/// groups.
+pub const PROTECTION_GROUP_LIMIT_TYPE: &str = "protection-group";
+
+/// How this service states that the account holds no Shield Advanced subscription, so
+/// the account-level resource every subscription operation addresses is absent. One
+/// sentence for the whole service: a client separates the same `ResourceNotFoundException`
+/// code's cases by this text.
+pub const SUBSCRIPTION_NOT_FOUND_MESSAGE: &str = "The subscription does not exist.";
+
+/// How this service states that the protection group a request addresses is absent —
+/// deliberately distinct from [`SUBSCRIPTION_NOT_FOUND_MESSAGE`], which shares the
+/// `ResourceNotFoundException` code.
+pub const PROTECTION_GROUP_NOT_FOUND_MESSAGE: &str =
+    "The referenced protection-group does not exist.";
+
+/// How this service states that a protection group's
+/// `Pattern`/`Members`/`ResourceType` combination is not one the service accepts. The
+/// text names no field and carries no value from the request.
+pub const PROTECTION_GROUP_FIELDS_MESSAGE: &str =
+    "One or more protection group input fields are incorrect.";
+
+/// How this service states that a `ResourceARN` names no Shield resource it holds.
+pub const INVALID_RESOURCE_MESSAGE: &str = "The referenced resource is invalid.";
+
+/// How this service states that a `NextToken` is not one it issued.
+pub const INVALID_PAGINATION_TOKEN_MESSAGE: &str = "Invalid pagination token.";
+
+/// The `ProtectionGroupPattern` that includes every protected resource of the account.
+pub const PROTECTION_GROUP_PATTERN_ALL: &str = "ALL";
+/// The `ProtectionGroupPattern` whose membership is the `Members` list the caller names.
+pub const PROTECTION_GROUP_PATTERN_ARBITRARY: &str = "ARBITRARY";
+/// The `ProtectionGroupPattern` whose membership is every protected resource of the
+/// group's `ResourceType`.
+pub const PROTECTION_GROUP_PATTERN_BY_RESOURCE_TYPE: &str = "BY_RESOURCE_TYPE";
 
 /// The most protections one account may hold at a time; a create beyond it is refused
 /// with the modelled `LimitsExceededException` (HTTP 400).
@@ -78,10 +122,16 @@ pub const MAX_PROTECTION_GROUPS: i64 = 1000;
 /// [`MAX_PROTECTIONS_PER_ACCOUNT`].
 pub const MAX_ARBITRARY_PATTERN_MEMBERS: i64 = 100;
 
-/// The page size `ListProtections` uses when the caller names no `MaxResults` — the
-/// model's own wording on `ListProtectionsRequest$MaxResults`: "The default setting
-/// is 20."
-pub const DEFAULT_LIST_PROTECTIONS_MAX_RESULTS: i32 = 20;
+/// The page size a listing uses when the caller names no `MaxResults` — the model's own
+/// wording on `ListProtectionsRequest$MaxResults`,
+/// `ListProtectionGroupsRequest$MaxResults` and
+/// `ListResourcesInProtectionGroupRequest$MaxResults` alike: "The default setting is
+/// 20."
+pub const DEFAULT_LIST_MAX_RESULTS: i32 = 20;
+
+/// The page size `ListProtections` uses when the caller names no `MaxResults`; see
+/// [`DEFAULT_LIST_MAX_RESULTS`], which every listing of this service shares.
+pub const DEFAULT_LIST_PROTECTIONS_MAX_RESULTS: i32 = DEFAULT_LIST_MAX_RESULTS;
 
 /// How many ids a mint tries before giving up, so no request can spin here. A candidate
 /// is a version-4 UUID, so the first one is free in every realistic run.
@@ -132,6 +182,52 @@ pub fn protection_arn(protection_id: &str) -> String {
 /// empty Region segment.
 pub fn subscription_arn(subscription_id: &str) -> String {
     ::engine::emulator_arn("shield", "", &format!("subscription/{subscription_id}"))
+}
+
+/// This service's ARN for a protection group, whose identifier is the name the caller
+/// chose. See [`protection_arn`] for the empty Region segment.
+pub fn protection_group_arn(protection_group_id: &str) -> String {
+    ::engine::emulator_arn(
+        "shield",
+        "",
+        &format!("protection-group/{protection_group_id}"),
+    )
+}
+
+/// Encode the place a page stopped at as the opaque `NextToken` the next call passes
+/// back. `kind` names the listing that issued it, so a token is only ever understood by
+/// the listing it came from, and `position` is that listing's own stable coordinate.
+pub fn encode_page_token(kind: &str, position: u64) -> String {
+    ::hex::encode(format!("{kind}/v1:{position}"))
+}
+
+/// The position a token resumes after, or `None` when the token is not one
+/// [`encode_page_token`] issued for this `kind` \u2014 the only thing a listing can say
+/// about a token it did not mint.
+pub fn decode_page_token(kind: &str, token: &str) -> Option<u64> {
+    let decoded = ::hex::decode(token).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    decoded.strip_prefix(&format!("{kind}/v1:"))?.parse().ok()
+}
+
+/// The most tags one Shield resource may carry at a time.
+///
+/// The modelled `TagList` is `@length 0..200`, and it is the shape of both a tagging
+/// request's `Tags` and the `Tags` a read answers with: a resource that held more could
+/// not be reported inside the bound the model declares, so 200 is the resource's ceiling
+/// and not merely one call's. A call that would take a resource past it is refused.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// Apply a tagging operation's tags to a resource's stored tags: a key the resource
+/// already carries takes the new value, a key it does not carry is added, and a key the
+/// request does not name is left alone.
+pub fn merge_tags(stored: &mut Vec<Tag>, incoming: &[Tag]) {
+    for tag in incoming {
+        match stored.iter_mut().find(|held| held.key == tag.key) {
+            Some(held) => held.value = tag.value.clone(),
+            None => stored.push(tag.clone()),
+        }
+    }
 }
 
 /// The `ProtectedResourceType` of the resource an ARN names, or `None` when the ARN is
@@ -286,9 +382,8 @@ pub struct ProtectionEntry {
     pub health_check_ids: Vec<String>,
     pub application_layer_automatic_response:
         Option<ApplicationLayerAutomaticResponseConfiguration>,
-    /// The tags `CreateProtection` was given. Stored for the tagging operations
-    /// (`ListTagsForResource`, `TagResource`, `UntagResource`), which are still
-    /// scaffolded, so no implemented operation reads this yet.
+    /// The tags the resource carries: what `CreateProtection` was given, as the
+    /// tagging operations (`TagResource`, `ListTagsForResource`) then read and write.
     pub tags: Vec<Tag>,
     /// When the protection was created. Stored for the same reason as `tags`: no member
     /// of the modelled `Protection` carries it, so no implemented read reports it.
@@ -314,6 +409,52 @@ impl ProtectionEntry {
     }
 }
 
+/// One protection group — a set of protected resources detected on as a collective —
+/// as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct ProtectionGroupEntry {
+    /// The `ProtectionGroupId` the caller chose, which is also this group's name.
+    pub id: String,
+    pub aggregation: String,
+    pub pattern: String,
+    /// Set only for a `BY_RESOURCE_TYPE` group, which is the one pattern whose
+    /// membership is a resource type.
+    pub resource_type: Option<String>,
+    /// The members an `ARBITRARY` group was given; empty for every other pattern, whose
+    /// membership is derived from the account's protections instead.
+    pub members: Vec<String>,
+    pub protection_group_arn: String,
+    /// The tags `CreateProtectionGroup` was given, as the tagging operations then read
+    /// and write.
+    pub tags: Vec<Tag>,
+    pub created_at: SystemTime,
+    /// Position in the account's creation order: what `ListProtectionGroups` pages
+    /// over, so its order is stable and a token keeps meaning the same place after a
+    /// delete.
+    pub sequence: u64,
+}
+
+impl ProtectionGroupEntry {
+    /// This record as the modelled `ProtectionGroup` a read answers with.
+    pub fn to_modeled(&self) -> ProtectionGroup {
+        ProtectionGroup {
+            protection_group_id: self.id.clone(),
+            aggregation: self.aggregation.clone(),
+            pattern: self.pattern.clone(),
+            resource_type: self.resource_type.clone(),
+            members: self.members.clone(),
+            protection_group_arn: Some(self.protection_group_arn.clone()),
+        }
+    }
+}
+
+/// Which of this service's taggable resources an ARN names.
+#[derive(Debug, Clone)]
+enum TaggableResource {
+    Protection(String),
+    ProtectionGroup(String),
+}
+
 /// Per-service state for com-amazonaws-shield-awsshield-20160616. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsShieldAwsshield20160616State {
@@ -324,7 +465,17 @@ pub struct ComAmazonawsShieldAwsshield20160616State {
     /// `ResourceArn` -> `ProtectionId`: the uniqueness index that refuses a second
     /// protection for one resource and resolves a describe-by-ARN.
     pub protections_by_resource_arn: HashMap<String, String>,
-    /// The creation order counter behind [`ProtectionEntry::sequence`].
+    /// Every live protection group, keyed by its `ProtectionGroupId` — which the caller
+    /// chooses, so the key is also the group's name.
+    pub protection_groups: HashMap<String, ProtectionGroupEntry>,
+    /// The account's emergency contacts, as `UpdateEmergencyContactSettings` last set
+    /// them: a subscription starts with none.
+    pub emergency_contacts: Vec<EmergencyContact>,
+    /// The role the Shield Response Team is authorized through (`AssociateDRTRole`):
+    /// `None` while the account has authorized none.
+    pub drt_role_arn: Option<String>,
+    /// The creation order counter behind [`ProtectionEntry::sequence`] and
+    /// [`ProtectionGroupEntry::sequence`].
     next_sequence: u64,
 }
 
@@ -379,6 +530,120 @@ impl ComAmazonawsShieldAwsshield20160616State {
         let mut ordered: Vec<&ProtectionEntry> = self.protections.values().collect();
         ordered.sort_by_key(|entry| entry.sequence);
         ordered
+    }
+
+    /// Store a protection group in creation order.
+    pub fn insert_protection_group(&mut self, mut entry: ProtectionGroupEntry) {
+        entry.sequence = self.next_sequence;
+        self.next_sequence += 1;
+        self.protection_groups.insert(entry.id.clone(), entry);
+    }
+
+    /// The protection group with this `ProtectionGroupId`.
+    pub fn protection_group_by_id(
+        &self,
+        protection_group_id: &str,
+    ) -> Option<&ProtectionGroupEntry> {
+        self.protection_groups.get(protection_group_id)
+    }
+
+    /// Every stored protection group in creation order — the stable order
+    /// `ListProtectionGroups` pages over.
+    pub fn protection_groups_in_creation_order(&self) -> Vec<&ProtectionGroupEntry> {
+        let mut ordered: Vec<&ProtectionGroupEntry> = self.protection_groups.values().collect();
+        ordered.sort_by_key(|entry| entry.sequence);
+        ordered
+    }
+
+    /// The protected resources a group currently includes, in the account's protection
+    /// creation order.
+    ///
+    /// Membership follows the group's `Pattern`, as `ProtectionGroup$Pattern` documents
+    /// it: an `ARBITRARY` group includes exactly the members it was given, a
+    /// `BY_RESOURCE_TYPE` group every protected resource of its type ("Newly protected
+    /// resources of this type are automatically added to the group"), and an `ALL`
+    /// group every protected resource of the account.
+    pub fn resources_in_protection_group(&self, group: &ProtectionGroupEntry) -> Vec<String> {
+        if group.pattern == PROTECTION_GROUP_PATTERN_ARBITRARY {
+            return group.members.clone();
+        }
+        self.protections_in_creation_order()
+            .into_iter()
+            .filter(|entry| {
+                group.pattern != PROTECTION_GROUP_PATTERN_BY_RESOURCE_TYPE
+                    || entry.resource_type.as_deref() == group.resource_type.as_deref()
+            })
+            .map(|entry| entry.resource_arn.clone())
+            .collect()
+    }
+
+    /// Whether a protection group's `Pattern`, `ResourceType` and `Members` are a
+    /// combination this service accepts.
+    ///
+    /// The three members constrain each other, in their own documented words.
+    /// `Members`: "You must set this when you set `Pattern` to `ARBITRARY` and you must
+    /// not set it for any other `Pattern` setting"; `ResourceType`: "You must set this
+    /// when you set `Pattern` to `BY_RESOURCE_TYPE` and you must not set it for any
+    /// other `Pattern` setting". A `Members` entry is an ARN of a resource to include,
+    /// and a protection group groups *protected* resources, so each named member must be
+    /// a resource the account protects. An empty list is not a set one: a group whose
+    /// membership is spelled out explicitly has at least one member.
+    pub fn protection_group_fields_accepted(
+        &self,
+        pattern: &str,
+        resource_type: Option<&str>,
+        members: &[String],
+    ) -> bool {
+        let wants_members = pattern == PROTECTION_GROUP_PATTERN_ARBITRARY;
+        let wants_resource_type = pattern == PROTECTION_GROUP_PATTERN_BY_RESOURCE_TYPE;
+        if members.is_empty() == wants_members || resource_type.is_some() != wants_resource_type {
+            return false;
+        }
+        members
+            .iter()
+            .all(|member| self.protection_by_resource_arn(member).is_some())
+    }
+
+    /// Which taggable resource of this service an ARN names, or `None` when the account
+    /// holds no such resource.
+    fn taggable_resource(&self, resource_arn: &str) -> Option<TaggableResource> {
+        if let Some(entry) = self
+            .protections
+            .values()
+            .find(|entry| entry.protection_arn == resource_arn)
+        {
+            return Some(TaggableResource::Protection(entry.id.clone()));
+        }
+        let group = self
+            .protection_groups
+            .values()
+            .find(|entry| entry.protection_group_arn == resource_arn)?;
+        Some(TaggableResource::ProtectionGroup(group.id.clone()))
+    }
+
+    /// The tags the resource this ARN names carries, or `None` when the account holds no
+    /// such resource.
+    pub fn tags_of(&self, resource_arn: &str) -> Option<&Vec<Tag>> {
+        match self.taggable_resource(resource_arn)? {
+            TaggableResource::Protection(id) => self.protections.get(&id).map(|entry| &entry.tags),
+            TaggableResource::ProtectionGroup(id) => {
+                self.protection_groups.get(&id).map(|entry| &entry.tags)
+            }
+        }
+    }
+
+    /// The tags the resource this ARN names carries, for a tagging operation to change;
+    /// `None` when the account holds no such resource.
+    pub fn tags_of_mut(&mut self, resource_arn: &str) -> Option<&mut Vec<Tag>> {
+        match self.taggable_resource(resource_arn)? {
+            TaggableResource::Protection(id) => {
+                self.protections.get_mut(&id).map(|entry| &mut entry.tags)
+            }
+            TaggableResource::ProtectionGroup(id) => self
+                .protection_groups
+                .get_mut(&id)
+                .map(|entry| &mut entry.tags),
+        }
     }
 }
 

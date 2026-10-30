@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEmergencyContactSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEmergencyContactSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEmergencyContactSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! PERSISTS the account's emergency contacts in [`crate::state`], replacing whatever
+//! was held before: `DescribeEmergencyContactSettings` reports exactly what this wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +141,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEmergencyContactSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEmergencyContactSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEmergencyContactSettings"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateEmergencyContactSettingsErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some(
+                            "the shield emulator is mounted on an engine that holds no state"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut guard = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // Emergency contacts belong to the subscription the Shield Response Team serves,
+        // so without one there is nothing to update.
+        if guard.subscription_state_at(now) != crate::state::SUBSCRIPTION_STATE_ACTIVE {
+            return Err(
+                UpdateEmergencyContactSettingsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::SUBSCRIPTION_NOT_FOUND_MESSAGE.to_string()),
+                        resource_type: Some(
+                            crate::state::SUBSCRIPTION_RESOURCE_TYPE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let contacts = input.emergency_contact_list.clone().unwrap_or_default();
+
+        // `EmergencyContactList`'s own wording: "If you have proactive engagement
+        // enabled, the contact list must include at least one phone number." An account
+        // that asked the team to reach out cannot leave it with no number to call.
+        let proactive_engagement_enabled = guard
+            .subscription
+            .as_ref()
+            .is_some_and(|subscription| {
+                subscription.proactive_engagement_status
+                    == crate::state::PROACTIVE_ENGAGEMENT_STATUS_ENABLED
+            });
+        if proactive_engagement_enabled
+            && !contacts
+                .iter()
+                .any(|contact| contact.phone_number.is_some())
+        {
+            return Err(
+                UpdateEmergencyContactSettingsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            "The emergency contact list must include at least one phone number \
+                             while proactive engagement is enabled."
+                                .to_string(),
+                        ),
+                        reason: None,
+                        fields: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Updates the details of the list": the submitted list is the whole list, so a
+        // call with none clears the contacts.
+        guard.emergency_contacts = contacts;
+
+        Ok(UpdateEmergencyContactSettingsOutput {})
     }
 }
