@@ -12,8 +12,10 @@
 //! * the listing reports the whole published catalog — one offering per instance type
 //!   the model's `OpenSearchPartitionInstanceType` enum declares, times each term,
 //!   times each value of `ReservedInstancePaymentOption` — each with a `GUID` of its
-//!   own, and each offering's price members holding together the way its payment
-//!   option bills (upfront charge, recurring hourly charge, or half of each);
+//!   own, each publishing the one hourly recurring charge every offering carries, and
+//!   each offering's price members holding together the way its payment option bills
+//!   (the whole term upfront and a zero hourly charge, nothing upfront and the whole
+//!   term hourly, or half of each);
 //! * the prices are ORDERED by what is reserved rather than equal to any one figure:
 //!   over a table of instance types, a longer term costs less per hour than a shorter
 //!   one, more upfront costs less than less upfront, a bigger size of one family costs
@@ -48,7 +50,7 @@ use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFI
 /// `DescribeReservedInstanceOfferings`:
 /// `GET /2021-01-01/opensearch/reservedInstanceOfferings`, with `query` as its
 /// `@httpQuery` members (empty for a request that sends none).
-async fn describe(emulator: &Emulator, query: &str) -> Answer {
+pub(crate) async fn describe(emulator: &Emulator, query: &str) -> Answer {
     let uri = if query.is_empty() {
         format!("{PREFIX}/opensearch/reservedInstanceOfferings")
     } else {
@@ -58,7 +60,7 @@ async fn describe(emulator: &Emulator, query: &str) -> Answer {
 }
 
 /// The `ReservedInstanceOfferings` list of an answer, with the case named on failure.
-fn offerings(answer: &Answer, case: &str) -> Vec<Value> {
+pub(crate) fn offerings(answer: &Answer, case: &str) -> Vec<Value> {
     assert_eq!(
         answer.status, 200,
         "case {case}: expected HTTP 200, got {} {:?}",
@@ -82,8 +84,9 @@ fn number_member(offering: &Value, member: &str, case: &str) -> f64 {
         .unwrap_or_else(|| panic!("case {case}: expected a numeric {member}, got {offering:?}"))
 }
 
-/// One offering's `RecurringCharges`, with the case named on failure. The member is
-/// always present: an offering with nothing left to bill reports an empty list.
+/// One offering's `RecurringCharges`, with the case named on failure. Every offering
+/// publishes one, whatever its payment option: an offering whose term is paid up front
+/// publishes a zero amount.
 fn recurring_charges(offering: &Value, case: &str) -> Vec<Value> {
     offering["RecurringCharges"]
         .as_array()
@@ -115,7 +118,7 @@ fn hourly_cost(offering: &Value, case: &str) -> f64 {
 /// The catalog holds more offerings than one page carries, so a request that names no
 /// `MaxResults` is still answered with a bounded page and a token: a reader that stops
 /// at the first answer sees only part of the catalog.
-async fn whole_catalog(emulator: &Emulator, case: &str) -> Vec<Value> {
+pub(crate) async fn whole_catalog(emulator: &Emulator, case: &str) -> Vec<Value> {
     let mut collected: Vec<Value> = Vec::new();
     let mut token: Option<String> = None;
     loop {
@@ -230,27 +233,36 @@ async fn catalog_spans_every_instance_type_term_and_payment_option() {
         );
 
         // How the three price members hold together is what the payment option MEANS.
+        // Every offering publishes exactly one hourly recurring charge; what the
+        // payment option decides is its AMOUNT.
         let fixed = number_member(offering, "FixedPrice", &case);
         let charges = recurring_charges(offering, &case);
+        assert_eq!(
+            charges.len(),
+            1,
+            "case {case}: expected the one recurring charge every offering publishes, got \
+             {charges:?}"
+        );
+        let recurring = number_member(&charges[0], "RecurringChargeAmount", &case);
         match payment_option.as_str() {
             PAYMENT_OPTION_ALL_UPFRONT => {
                 assert!(
-                    fixed > 0.0 && charges.is_empty(),
-                    "case {case}: paying the whole term upfront means a FixedPrice and no \
-                     recurring charge, got FixedPrice {fixed} and {charges:?}"
+                    fixed > 0.0 && recurring.abs() < f64::EPSILON,
+                    "case {case}: paying the whole term upfront means a FixedPrice and a \
+                     zero recurring charge, got FixedPrice {fixed} and {charges:?}"
                 );
             }
             PAYMENT_OPTION_PARTIAL_UPFRONT => {
                 assert!(
-                    fixed > 0.0 && charges.len() == 1,
-                    "case {case}: paying part of the term upfront means a FixedPrice AND one \
+                    fixed > 0.0 && recurring > 0.0,
+                    "case {case}: paying part of the term upfront means a FixedPrice AND a \
                      recurring charge, got FixedPrice {fixed} and {charges:?}"
                 );
             }
             PAYMENT_OPTION_NO_UPFRONT => {
                 assert!(
-                    fixed.abs() < f64::EPSILON && charges.len() == 1,
-                    "case {case}: paying nothing upfront means no FixedPrice and one \
+                    fixed.abs() < f64::EPSILON && recurring > 0.0,
+                    "case {case}: paying nothing upfront means no FixedPrice and a \
                      recurring charge, got FixedPrice {fixed} and {charges:?}"
                 );
             }
@@ -258,8 +270,8 @@ async fn catalog_spans_every_instance_type_term_and_payment_option() {
         }
         for charge in &charges {
             assert!(
-                number_member(charge, "RecurringChargeAmount", &case) > 0.0,
-                "case {case}: a recurring charge bills something, got {charge:?}"
+                number_member(charge, "RecurringChargeAmount", &case) >= 0.0,
+                "case {case}: a recurring charge bills nothing or more, got {charge:?}"
             );
             assert_eq!(
                 string_member(charge, "RecurringChargeFrequency", &case),

@@ -8,21 +8,20 @@
 //! [`super::domain_lifecycle`]; this suite adds no second copy of it.
 //!
 //! The tests assert the RULE over sets of inputs rather than one recorded call: the
-//! versions a source version can be upgraded to are the published versions of its
-//! own engine line that are LATER than it, plus the whole of the line that succeeds
-//! it once it has reached the last published version of its own — the OpenSearch line
-//! succeeding the Elasticsearch one, each line ordered by major then minor compared
-//! as numbers. So:
+//! versions a source version can be upgraded to are the published releases of its own
+//! LINE (its engine and major release) that are later than it, plus every release of
+//! the line that immediately succeeds its own — so an upgrade crosses at most one line
+//! boundary, the Elasticsearch majors preceding the OpenSearch ones, each line ordered
+//! by minor compared as a number. So:
 //!
-//! * the unfiltered answer is the whole published table, one entry per version of
-//!   `SUPPORTED_ENGINE_VERSIONS`, in that order, each with the targets the rule
-//!   gives it;
+//! * the unfiltered answer is the published upgrade table: a row per release the
+//!   service still offers an upgrade from — those at or after the published floor that
+//!   have somewhere to go — oldest first, each with the targets the rule gives it;
 //! * an upgrade only goes FORWARDS — no version is among its own targets, every
 //!   target ranks above its source, targets are ascending, and a version's
-//!   same-line targets are exactly the later published versions of that line;
-//! * crossing engine lines is the LAST published version of a line's privilege: only
-//!   the newest published Elasticsearch version reaches the OpenSearch line, and
-//!   every earlier Elasticsearch version's targets are Elasticsearch versions;
+//!   same-line targets are exactly the later published releases of that line;
+//! * crossing a line boundary reaches the NEXT line only: no target is two lines ahead
+//!   of its source, and the whole of the succeeding line is reachable;
 //! * `DomainName` limits the answer to the one version THAT domain runs, over a
 //!   table of domains spanning both engines, several majors, the newest published
 //!   version (which has no target), the default version a request omitting
@@ -36,6 +35,10 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
 };
 
 use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX, SETTLE_WAIT};
+
+/// The oldest release the published upgrade table has a row for — the suite's own
+/// expectation of the floor the service offers an upgrade from.
+const UPGRADE_FLOOR: &str = "Elasticsearch_7.7";
 
 /// `GetCompatibleVersions`: `GET /2021-01-01/opensearch/compatibleVersions`, with
 /// `DomainName` as its one `@httpQuery` member.
@@ -109,29 +112,54 @@ pub(crate) fn rank(version: &str) -> (u8, u32, u32) {
     (generation, parse(major, "major"), parse(minor, "minor"))
 }
 
-/// The newest published version of one engine line, as a rank.
-fn last_published_of(generation: u8) -> (u8, u32, u32) {
-    SUPPORTED_ENGINE_VERSIONS
-        .iter()
-        .map(|version| rank(version))
-        .filter(|candidate| candidate.0 == generation)
-        .max()
-        .unwrap_or_else(|| panic!("the published set covers engine line {generation}"))
+/// The release LINE of a version: its engine generation and major release number, the
+/// unit an upgrade path is published along.
+fn line(version: &str) -> (u8, u32) {
+    let (generation, major, _) = rank(version);
+    (generation, major)
 }
 
-/// The rule, applied to one source version: the later published versions of its own
-/// engine line, plus the whole of the succeeding line once it has reached the last
-/// published version of its own. Oldest first.
+/// Every release line the published catalog carries, oldest first and each once.
+fn published_lines() -> Vec<(u8, u32)> {
+    let mut lines: Vec<(u8, u32)> = SUPPORTED_ENGINE_VERSIONS.iter().map(|v| line(v)).collect();
+    lines.sort_unstable();
+    lines.dedup();
+    lines
+}
+
+/// The line that immediately succeeds one line, or `None` for the newest.
+fn succeeding_line(of: (u8, u32)) -> Option<(u8, u32)> {
+    published_lines().into_iter().find(|candidate| *candidate > of)
+}
+
+/// The rule, applied to one source version: the later published releases of its own
+/// line, plus every release of the line that immediately succeeds it. Oldest first.
 fn expected_targets(source_version: &str) -> Vec<String> {
     let source = rank(source_version);
-    let crosses_lines = source >= last_published_of(source.0);
+    let source_line = line(source_version);
+    let next_line = succeeding_line(source_line);
     SUPPORTED_ENGINE_VERSIONS
         .iter()
         .filter(|candidate| {
-            let candidate = rank(candidate);
-            candidate > source && (candidate.0 == source.0 || crosses_lines)
+            let candidate_line = line(candidate);
+            (candidate_line == source_line && rank(candidate) > source)
+                || Some(candidate_line) == next_line
         })
         .map(|candidate| (*candidate).to_string())
+        .collect()
+}
+
+/// The source versions the published table lists, oldest first: the releases at or
+/// after the published upgrade floor that have at least one target. The floor is
+/// restated here as the suite's OWN expectation rather than imported from
+/// `crate::state`, so moving it in the handler fails this suite instead of being
+/// asserted against itself.
+fn expected_sources() -> Vec<String> {
+    SUPPORTED_ENGINE_VERSIONS
+        .iter()
+        .filter(|version| rank(version) >= rank(UPGRADE_FLOOR))
+        .filter(|version| !expected_targets(version).is_empty())
+        .map(|version| (*version).to_string())
         .collect()
 }
 
@@ -152,15 +180,19 @@ async fn settled_domain(emulator: &Emulator, name: &str, engine_version: Option<
 }
 
 #[tokio::test]
-async fn table_reports_every_published_version_in_upgrade_order() {
+async fn table_reports_every_upgradable_version_in_upgrade_order() {
     let emulator = Emulator::new();
     let table = entries(&compatible(&emulator, None).await, "whole table");
 
+    let sources: Vec<String> = table
+        .iter()
+        .map(|entry| string_member(entry, "SourceVersion", "table entry"))
+        .collect();
     assert_eq!(
-        table.len(),
-        SUPPORTED_ENGINE_VERSIONS.len(),
-        "case whole table: expected one entry per published version, got {} entries",
-        table.len()
+        sources,
+        expected_sources(),
+        "case whole table: expected a row per release the service offers an upgrade from, \
+         oldest first, got {sources:?}"
     );
 
     // The published set is itself in upgrade order, so the table a caller walks is
@@ -177,35 +209,46 @@ async fn table_reports_every_published_version_in_upgrade_order() {
         );
     }
 
-    for (entry, published) in table.iter().zip(SUPPORTED_ENGINE_VERSIONS.iter()) {
+    for entry in &table {
         let source = string_member(entry, "SourceVersion", "table entry");
-        assert_eq!(
-            &source, published,
-            "case {published}: expected the published version at this place in the table, \
-             got {source}"
-        );
         let targets = target_versions(entry, &source);
         assert_eq!(
             targets,
             expected_targets(&source),
-            "case {source}: expected the published versions later than it, got {targets:?}"
+            "case {source}: expected the releases its line and the next one publish ahead \
+             of it, got {targets:?}"
+        );
+        // A table of "the versions you can upgrade to" has a row only where there is
+        // somewhere to go.
+        assert!(
+            !targets.is_empty(),
+            "case {source}: expected a listed source to have a target, got {entry:?}"
         );
     }
 
-    // The newest published version is the end of the path: nothing to upgrade to, and
-    // an empty list rather than a missing member.
+    // The newest published version is the end of the path: nothing to upgrade to, so
+    // the table has no row for it at all.
     let newest = SUPPORTED_ENGINE_VERSIONS[SUPPORTED_ENGINE_VERSIONS.len() - 1];
-    let last = &table[table.len() - 1];
-    assert_eq!(
-        string_member(last, "SourceVersion", "newest version"),
-        newest,
-        "case {newest}: expected the newest published version last in the table, got \
-         {last:?}"
-    );
     assert!(
-        target_versions(last, newest).is_empty(),
-        "case {newest}: the newest version has nothing to upgrade to, got {:?}",
-        last["TargetVersions"]
+        !sources.contains(&newest.to_string()),
+        "case {newest}: the newest published version has nothing to upgrade to, so the \
+         table lists no row for it, got {sources:?}"
+    );
+    // Nor has it a row through a release older than the published floor.
+    for retired in SUPPORTED_ENGINE_VERSIONS
+        .iter()
+        .filter(|version| rank(version) < rank(UPGRADE_FLOOR))
+    {
+        assert!(
+            !sources.contains(&(*retired).to_string()),
+            "case {retired}: expected no row for a release the service offers no upgrade \
+             from, got {sources:?}"
+        );
+    }
+    assert_eq!(
+        sources.first().map(String::as_str),
+        Some(UPGRADE_FLOOR),
+        "case the table's first row: expected the published floor, got {sources:?}"
     );
 }
 
@@ -251,58 +294,52 @@ async fn targets_only_ever_go_forwards() {
             );
         }
 
-        // Within one engine line, the targets are exactly the published versions of
+        // Within one release line, the targets are exactly the published releases of
         // that line after the source: no hop is missing and none is invented.
         let same_line: Vec<String> = targets
             .iter()
-            .filter(|target| rank(target).0 == rank(&source).0)
+            .filter(|target| line(target) == line(&source))
             .cloned()
             .collect();
         let expected_same_line: Vec<String> = published
             .iter()
             .filter(|candidate| {
-                rank(candidate).0 == rank(&source).0 && rank(candidate) > rank(&source)
+                line(candidate) == line(&source) && rank(candidate) > rank(&source)
             })
             .cloned()
             .collect();
         assert_eq!(
             same_line, expected_same_line,
-            "case {source}: expected every later published version of its own engine \
-             line, got {same_line:?}"
+            "case {source}: expected every later published release of its own line, got \
+             {same_line:?}"
         );
 
-        // Crossing to the succeeding line is the LAST published version of a line's
-        // privilege: an earlier version has to walk its own line first.
+        // Crossing a line boundary reaches the NEXT line only: the whole of the line
+        // that succeeds the source's, and nothing on any line beyond it.
         let crossed: Vec<String> = targets
             .iter()
-            .filter(|target| rank(target).0 != rank(&source).0)
+            .filter(|target| line(target) != line(&source))
             .cloned()
             .collect();
-        let last_of_line = last_published_of(rank(&source).0);
-        if rank(&source) < last_of_line {
-            assert!(
-                crossed.is_empty(),
-                "case {source}: a version short of the last published one of its line \
-                 reaches no other line, got {crossed:?}"
-            );
-        } else {
-            let expected_crossed: Vec<String> = published
+        let expected_crossed: Vec<String> = match succeeding_line(line(&source)) {
+            None => Vec::new(),
+            Some(next) => published
                 .iter()
-                .filter(|candidate| rank(candidate).0 > rank(&source).0)
+                .filter(|candidate| line(candidate) == next)
                 .cloned()
-                .collect();
-            assert_eq!(
-                crossed, expected_crossed,
-                "case {source}: the last published version of a line reaches the whole \
-                 of the line that succeeds it, got {crossed:?}"
-            );
-        }
+                .collect(),
+        };
+        assert_eq!(
+            crossed, expected_crossed,
+            "case {source}: a release reaches the whole of the line that succeeds its own \
+             and no line beyond it, got {crossed:?}"
+        );
 
-        // Within one line, each version's targets are the previous one's minus that
-        // version itself — the table is one monotone path, not a set of unrelated
+        // Within one line, each listed version's targets are the previous one's minus
+        // that version itself — the table is one monotone path, not a set of unrelated
         // answers.
         if let Some((earlier, earlier_targets)) = previous {
-            if rank(&earlier).0 == rank(&source).0 && rank(&source) < last_of_line {
+            if line(&earlier) == line(&source) {
                 assert_eq!(
                     earlier_targets.first().map(String::as_str),
                     Some(source.as_str()),
@@ -329,6 +366,7 @@ async fn domain_filter_reports_the_version_that_domain_runs() {
     // majors, a two-digit minor, the newest published version (no target at all), the
     // default a request omitting `EngineVersion` gets, and a pattern-valid version the
     // catalog does not publish.
+    let newest = SUPPORTED_ENGINE_VERSIONS[SUPPORTED_ENGINE_VERSIONS.len() - 1];
     let rows: [(&str, Option<&str>, &str); 7] = [
         ("filter-es-five", Some("Elasticsearch_5.6"), "Elasticsearch_5.6"),
         ("filter-es-six", Some("Elasticsearch_6.8"), "Elasticsearch_6.8"),
@@ -338,7 +376,7 @@ async fn domain_filter_reports_the_version_that_domain_runs() {
             "Elasticsearch_7.10",
         ),
         ("filter-os-one", Some("OpenSearch_1.3"), "OpenSearch_1.3"),
-        ("filter-os-newest", Some("OpenSearch_2.19"), "OpenSearch_2.19"),
+        ("filter-os-newest", Some(newest), newest),
         ("filter-default", None, DEFAULT_ENGINE_VERSION),
         (
             "filter-unpublished",
@@ -372,13 +410,15 @@ async fn domain_filter_reports_the_version_that_domain_runs() {
         );
     }
 
-    // The newest published version is a terminus even when it is a domain's version.
-    let newest = compatible(&emulator, Some("filter-os-newest")).await;
+    // The newest published version is a terminus even when it is a domain's version:
+    // the filtered answer reports its row with an empty target list, which the
+    // unfiltered table has no row for at all.
+    let terminus = compatible(&emulator, Some("filter-os-newest")).await;
     assert!(
-        target_versions(&entries(&newest, "filter-os-newest")[0], "filter-os-newest").is_empty(),
+        target_versions(&entries(&terminus, "filter-os-newest")[0], "filter-os-newest").is_empty(),
         "case filter-os-newest: a domain on the newest version has nothing to upgrade to, \
          got {:?}",
-        newest.body
+        terminus.body
     );
 
     // A pattern-valid name no domain has names no resource.

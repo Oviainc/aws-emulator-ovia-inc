@@ -72,7 +72,7 @@ const REPEATS: [Repeat; 5] = [
     Repeat {
         case: "three checks across the engine line crossing",
         source: "Elasticsearch_7.10",
-        targets: &["OpenSearch_1.0", "OpenSearch_2.19", "OpenSearch_1.2"],
+        targets: &["OpenSearch_1.0", "OpenSearch_1.3", "OpenSearch_1.2"],
     },
     Repeat {
         case: "two checks within the Elasticsearch line, a two-digit minor last",

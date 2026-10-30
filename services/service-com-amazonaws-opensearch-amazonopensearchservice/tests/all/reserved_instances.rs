@@ -112,9 +112,9 @@ fn number(value: &Value, member: &str, case: &str) -> f64 {
         .unwrap_or_else(|| panic!("case {case}: expected a {member} number, got {value:?}"))
 }
 
-/// The recurring charge of an offering or a reservation: its hourly amount, and
-/// `None` where the whole term is already paid up front and there is nothing left
-/// to bill.
+/// The recurring charge of an offering or a reservation: its hourly amount. Every
+/// offering publishes one, so this is `None` only where the member carries no charge
+/// at all.
 fn recurring_charge(value: &Value, case: &str) -> Option<f64> {
     let charges = value["RecurringCharges"]
         .as_array()
@@ -295,9 +295,10 @@ async fn the_catalog_carries_one_offering_per_type_term_and_payment_option() {
                 match *payment_option {
                     PAYMENT_OPTION_ALL_UPFRONT => {
                         assert!(
-                            fixed_price > 0.0 && recurring.is_none(),
-                            "case {case}: expected a fixed price and no recurring charge, got \
-                             {fixed_price} and {recurring:?}"
+                            fixed_price > 0.0
+                                && recurring.is_some_and(|amount| amount.abs() < EPSILON),
+                            "case {case}: expected a fixed price and a zero recurring charge, \
+                             got {fixed_price} and {recurring:?}"
                         );
                     }
                     PAYMENT_OPTION_NO_UPFRONT => {

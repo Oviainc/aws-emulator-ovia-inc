@@ -9,9 +9,10 @@
 //!
 //! The tests assert RULES over sets of inputs rather than one recorded call:
 //!
-//! * the answer is the engine-version catalog the service publishes, whole and in one
-//!   order, every entry a value `VersionString`'s pattern admits, spanning both engine
-//!   lines and several majors and minors of each, with no entry twice;
+//! * the answer is the engine-version catalog the service publishes, whole and in the
+//!   order the service publishes it — NEWEST release first — every entry a value
+//!   `VersionString`'s pattern admits, spanning both engine lines and several majors
+//!   and minors of each, with no entry twice;
 //! * it is the SAME catalog every other version-aware operation reports — the source
 //!   versions of the unfiltered `GetCompatibleVersions` table, and a version
 //!   `CreateDomain` accepts for a domain;
@@ -150,8 +151,9 @@ async fn reports_the_published_engine_version_catalog() {
     }
 
     // It is the catalog the OTHER version-aware operations report, not a second copy:
-    // the unfiltered `GetCompatibleVersions` table has one entry per published version,
-    // in the same order.
+    // every source version of the unfiltered `GetCompatibleVersions` table is one of
+    // the published versions, and that table is ordered the way the upgrade relation
+    // runs — oldest first — which is this catalog read from the other end.
     let compatible = emulator
         .call("GET", &format!("{PREFIX}/opensearch/compatibleVersions"), None)
         .await;
@@ -171,10 +173,29 @@ async fn reports_the_published_engine_version_catalog() {
                 .to_owned()
         })
         .collect();
+    assert!(
+        !sources.is_empty(),
+        "case compatibleVersions: expected the published upgrade table to have rows, got \
+         {:?}",
+        compatible.body
+    );
+    let oldest_first: Vec<String> = catalog.iter().rev().cloned().collect();
+    for source in &sources {
+        assert!(
+            catalog.contains(source),
+            "case {source}: expected an upgrade table source ListVersions publishes, got \
+             {catalog:?}"
+        );
+    }
+    let in_catalog_order: Vec<String> = oldest_first
+        .iter()
+        .filter(|version| sources.contains(version))
+        .cloned()
+        .collect();
     assert_eq!(
-        sources, catalog,
-        "case compatibleVersions: expected the same published versions ListVersions \
-         reports, got {sources:?}"
+        sources, in_catalog_order,
+        "case compatibleVersions: expected the table's sources in the published order, \
+         oldest first, got {sources:?}"
     );
 
     // A published version is one a domain can actually be created on — tested on the

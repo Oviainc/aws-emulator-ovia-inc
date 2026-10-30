@@ -104,8 +104,10 @@ use crate::ops::types::{
 /// can tell an upgrade forwards from one that goes nowhere.
 ///
 /// Order is the order of [`upgrade_rank`], and the list is iterated in place, which
-/// is what lets two reads report the same versions in the same order.
-pub const SUPPORTED_ENGINE_VERSIONS: [&str; 32] = [
+/// is what lets two reads report the same versions in the same order. The order a
+/// caller is SHOWN the catalog in is [`published_engine_versions`]'s, which is this
+/// set the other way round.
+pub const SUPPORTED_ENGINE_VERSIONS: [&str; 36] = [
     "Elasticsearch_1.5",
     "Elasticsearch_2.3",
     "Elasticsearch_5.1",
@@ -138,7 +140,26 @@ pub const SUPPORTED_ENGINE_VERSIONS: [&str; 32] = [
     "OpenSearch_2.15",
     "OpenSearch_2.17",
     "OpenSearch_2.19",
+    "OpenSearch_3.1",
+    "OpenSearch_3.3",
+    "OpenSearch_3.5",
+    "OpenSearch_3.7",
 ];
+
+/// The published catalog in the order the service PUBLISHES it: newest release first,
+/// so the OpenSearch line leads and each line's releases descend by major then minor,
+/// down to the oldest Elasticsearch release.
+///
+/// A catalog of supported releases is read top-down for the CURRENT release, so that is
+/// the end it is published from; [`SUPPORTED_ENGINE_VERSIONS`] is written the other way
+/// round because the upgrade relation is defined along it. This is the ONE reversal of
+/// that set, derived from [`upgrade_rank`] rather than written out a second time, so the
+/// catalog a caller lists and the catalog a version is resolved against stay one set.
+pub fn published_engine_versions() -> Vec<&'static str> {
+    let mut versions = SUPPORTED_ENGINE_VERSIONS.to_vec();
+    versions.sort_by_key(|version| ::std::cmp::Reverse(upgrade_rank(version)));
+    versions
+}
 
 /// The engine version a domain runs when `CreateDomain` names none.
 ///
@@ -181,48 +202,87 @@ pub fn upgrade_rank(engine_version: &str) -> Option<(u8, u32, u32)> {
     Some((generation, major.parse().ok()?, minor.parse().ok()?))
 }
 
-/// The newest published version of the engine line `generation` names, or `None`
-/// when [`SUPPORTED_ENGINE_VERSIONS`] publishes none for it.
-///
-/// Crossing from one engine line to the next starts HERE: the OpenSearch line forked
-/// from the LAST Elasticsearch release, so that release is the version a domain has
-/// to reach before it can cross.
-fn last_published_of(generation: u8) -> Option<(u8, u32, u32)> {
-    SUPPORTED_ENGINE_VERSIONS
+/// A version's RELEASE LINE: the engine generation it belongs to and its MAJOR release
+/// number — the `(0, 7)` of `Elasticsearch_7.10` — which is the unit an upgrade path is
+/// published along. `None` for a value [`upgrade_rank`] cannot read.
+fn release_line(engine_version: &str) -> Option<(u8, u32)> {
+    upgrade_rank(engine_version).map(|(generation, major, _)| (generation, major))
+}
+
+/// Every release line [`SUPPORTED_ENGINE_VERSIONS`] publishes, oldest first and each
+/// once: the Elasticsearch majors, then the OpenSearch ones.
+fn published_release_lines() -> Vec<(u8, u32)> {
+    let mut lines: Vec<(u8, u32)> = SUPPORTED_ENGINE_VERSIONS
         .iter()
-        .filter_map(|version| upgrade_rank(version))
-        .filter(|rank| rank.0 == generation)
-        .max()
+        .filter_map(|version| release_line(version))
+        .collect();
+    lines.sort_unstable();
+    lines.dedup();
+    lines
+}
+
+/// The release line that immediately SUCCEEDS `line` among the published ones, or
+/// `None` for the newest line, which nothing succeeds.
+fn succeeding_release_line(line: (u8, u32)) -> Option<(u8, u32)> {
+    published_release_lines()
+        .into_iter()
+        .find(|candidate| *candidate > line)
 }
 
 /// The versions a domain running `source_version` can be upgraded to, oldest first:
-/// every published version of the SAME engine line strictly LATER than it, plus —
-/// only once the domain has reached the last published version of its line — every
-/// published version of the line that succeeds it.
+/// every published release of its OWN line (engine and major) strictly later than it,
+/// plus every published release of the line that immediately succeeds its own.
 ///
-/// An upgrade only ever goes forwards, so a version is never among its own targets
-/// and the newest published version has none. The answer is derived from
-/// [`upgrade_rank`]'s comparison rather than from the source being published, so a
-/// domain running a version this emulator does not publish still reports the
-/// published versions ahead of it on its line.
-///
-/// This is the whole of the relation: within one line every later version is a
-/// target, because no published table of single hops exists to read a narrower
-/// within-line rule from. A narrower one belongs HERE when one does.
+/// So an upgrade crosses at most ONE line boundary — a domain reaches the next major
+/// line directly, but not the one after it, which it has to make a second upgrade to
+/// reach — and it only ever goes forwards, so a version is never among its own targets
+/// and a release on the newest line with nothing after it has none. The answer is
+/// derived from [`upgrade_rank`]'s comparison rather than from the source being
+/// published, so a domain running a version this emulator does not publish still
+/// reports the published versions ahead of it.
 pub fn compatible_target_versions(source_version: &str) -> Vec<String> {
     let Some(source) = upgrade_rank(source_version) else {
         return Vec::new();
     };
-    // A source at or past the last published version of its own line is as far along
-    // that line as the service goes, so the next line opens up.
-    let crosses_lines = last_published_of(source.0).is_none_or(|last| source >= last);
+    let line = (source.0, source.1);
+    let next_line = succeeding_release_line(line);
     SUPPORTED_ENGINE_VERSIONS
         .iter()
         .filter(|candidate| {
-            upgrade_rank(candidate)
-                .is_some_and(|rank| rank > source && (rank.0 == source.0 || crosses_lines))
+            let Some(rank) = upgrade_rank(candidate) else {
+                return false;
+            };
+            let candidate_line = (rank.0, rank.1);
+            (candidate_line == line && rank > source) || Some(candidate_line) == next_line
         })
         .map(|candidate| (*candidate).to_string())
+        .collect()
+}
+
+/// The oldest release the service still offers an UPGRADE from, which is the floor of
+/// the published upgrade table: a release older than this one is still supported to run
+/// — [`SUPPORTED_ENGINE_VERSIONS`] publishes it and a domain can be created on it — but
+/// the service publishes no upgrade path out of it.
+///
+/// Like [`DOMAIN_QUOTA`] and [`SUPPORTED_ENGINE_VERSIONS`] itself this is a PUBLISHED
+/// FIGURE this emulator states rather than a rule derived from something else: the
+/// model carries no record of which releases an upgrade is offered from. What it fixes
+/// is that the table has a floor and that every release at or above it with somewhere
+/// to go is listed.
+pub const UPGRADE_OFFERED_FROM: &str = "Elasticsearch_7.7";
+
+/// The source versions the published upgrade table lists, oldest first: the published
+/// releases at or after [`UPGRADE_OFFERED_FROM`] that have at least one target, since a
+/// table of "the versions you can upgrade to" has a row only where there is somewhere to
+/// go.
+pub fn upgradable_source_versions() -> Vec<&'static str> {
+    let floor = upgrade_rank(UPGRADE_OFFERED_FROM);
+    SUPPORTED_ENGINE_VERSIONS
+        .iter()
+        .copied()
+        .filter(|version| {
+            upgrade_rank(version) >= floor && !compatible_target_versions(version).is_empty()
+        })
         .collect()
 }
 
@@ -5598,7 +5658,7 @@ pub fn maintainable_data_node(domain: &Domain, node_id: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// `ReservedInstancePaymentOption`'s `ALL_UPFRONT` value: the whole term is paid as
-/// one upfront charge, so the reservation carries no recurring charge at all.
+/// one upfront charge, so the reservation's recurring charge is a zero amount.
 pub const PAYMENT_OPTION_ALL_UPFRONT: &str = "ALL_UPFRONT";
 
 /// `ReservedInstancePaymentOption`'s `PARTIAL_UPFRONT` value: part of the term is
@@ -5807,9 +5867,16 @@ fn offering_id(instance_type: &str, duration: i32, payment_option: &str) -> Stri
 /// The three price members hold together the way a reservation is billed: the upfront
 /// charge is `FixedPrice`, the rest of the term is a recurring hourly charge, and
 /// `UsagePrice` — the rate charged for USING the reserved capacity — is zero, because
-/// the reservation has already paid for the hours. So `ALL_UPFRONT` carries a fixed
-/// price and no recurring charge, `NO_UPFRONT` a recurring charge and no fixed price,
-/// and `PARTIAL_UPFRONT` half the term each way.
+/// the reservation has already paid for the hours. So `ALL_UPFRONT` carries the whole
+/// term as a fixed price and nothing hourly, `NO_UPFRONT` everything hourly and no
+/// fixed price, and `PARTIAL_UPFRONT` half the term each way.
+///
+/// `RecurringCharges` carries ONE entry whatever the payment option: "the recurring
+/// charge to your account" is billed per hour of the term for every offering, so an
+/// offering whose term is paid up front publishes that charge with a ZERO amount — the
+/// charge exists and is nothing — rather than publishing no charge at all, which would
+/// leave a caller summing an empty list to tell a prepaid offering from one whose
+/// hourly rate the answer simply did not report.
 fn reserved_instance_offering(
     instance_type: &str,
     duration: i32,
@@ -5826,17 +5893,10 @@ fn reserved_instance_offering(
         PAYMENT_OPTION_NO_UPFRONT => (0.0, effective_hourly),
         _ => return None,
     };
-    let recurring_charges = if recurring_hourly > 0.0 {
-        vec![RecurringCharge {
-            recurring_charge_amount: Some(hourly(recurring_hourly)),
-            recurring_charge_frequency: Some(RECURRING_CHARGE_HOURLY.to_string()),
-        }]
-    } else {
-        // An offering with nothing left to bill reports an EMPTY list rather than no
-        // member: the member is "the recurring charge to your account", and for this
-        // offering there is none.
-        Vec::new()
-    };
+    let recurring_charges = vec![RecurringCharge {
+        recurring_charge_amount: Some(hourly(recurring_hourly)),
+        recurring_charge_frequency: Some(RECURRING_CHARGE_HOURLY.to_string()),
+    }];
     Some(ReservedInstanceOffering {
         reserved_instance_offering_id: Some(offering_id(instance_type, duration, payment_option)),
         instance_type: Some(instance_type.to_string()),
@@ -6241,10 +6301,15 @@ const GP3_THROUGHPUT_RANGE_MIB: (i64, i64) = (125, 1_000);
 /// The fewest data nodes a domain runs: a single node is a whole domain.
 pub const MINIMUM_DATA_NODE_COUNT: i32 = 1;
 
-/// The most data nodes a domain runs. Like [`DOMAIN_QUOTA`] this is the emulator's OWN
-/// bound rather than one the model carries; what it fixes is that the data-node count
-/// is bounded and that the bound is above the master and warm ones.
-pub const MAXIMUM_DATA_NODE_COUNT: i32 = 80;
+/// The most data nodes the limit catalog publishes for the data role — the
+/// `MaximumInstanceCount` `DescribeInstanceTypeLimits` reports under it.
+///
+/// Like [`DOMAIN_QUOTA`] this is the emulator's OWN published figure rather than one the
+/// model carries, and it is ONE figure for every instance type: the service publishes a
+/// per-instance-type table, which is not part of the API and not in the model, so there
+/// is nothing to read a per-type ceiling from. What this fixes is that the data-node
+/// count is bounded and that the bound is above the master one and below the warm one.
+pub const MAXIMUM_DATA_NODE_COUNT: i32 = 20;
 
 /// The dedicated-master count a domain runs: a master quorum needs more than one node,
 /// and an odd count above five buys nothing, so five is the top.
@@ -6331,21 +6396,29 @@ fn additional_limit(name: &str, value: i32) -> AdditionalLimit {
 /// The `ebs` storage type `instance_type` publishes for one volume sub-type: the size
 /// range every sub-type has, plus the IOPS and throughput ranges of the sub-types those
 /// are provisioned for.
+///
+/// Each bound PAIR is published ceiling before floor — `MaximumVolumeSize` before
+/// `MinimumVolumeSize`, `MaximumIops` before `MinimumIops`, `MaximumThroughput` before
+/// `MinimumThroughput` — the order the service publishes a storage limit in, and the
+/// order `StorageTypeLimit$LimitName`'s own documentation lists the IOPS and the
+/// throughput pair in. A caller reading the block positionally therefore reads the
+/// ceiling first, which is what makes the pair's order part of the answer rather than a
+/// detail of how it is assembled.
 fn ebs_storage_type(instance_type: &str, sub_type: &str) -> StorageType {
     let mut limits = vec![
-        storage_type_limit(LIMIT_MINIMUM_VOLUME_SIZE, MINIMUM_VOLUME_SIZE_GIB),
         storage_type_limit(
             LIMIT_MAXIMUM_VOLUME_SIZE,
             maximum_volume_size(instance_type, sub_type),
         ),
+        storage_type_limit(LIMIT_MINIMUM_VOLUME_SIZE, MINIMUM_VOLUME_SIZE_GIB),
     ];
     if let Some((minimum, maximum)) = iops_range(sub_type) {
-        limits.push(storage_type_limit(LIMIT_MINIMUM_IOPS, minimum));
         limits.push(storage_type_limit(LIMIT_MAXIMUM_IOPS, maximum));
+        limits.push(storage_type_limit(LIMIT_MINIMUM_IOPS, minimum));
     }
     if let Some((minimum, maximum)) = throughput_range(sub_type) {
-        limits.push(storage_type_limit(LIMIT_MINIMUM_THROUGHPUT, minimum));
         limits.push(storage_type_limit(LIMIT_MAXIMUM_THROUGHPUT, maximum));
+        limits.push(storage_type_limit(LIMIT_MINIMUM_THROUGHPUT, minimum));
     }
     StorageType {
         storage_type_name: Some(STORAGE_TYPE_EBS.to_string()),
@@ -6354,13 +6427,14 @@ fn ebs_storage_type(instance_type: &str, sub_type: &str) -> StorageType {
     }
 }
 
-/// The storage types `instance_type` publishes.
+/// The storage types `instance_type` publishes for the role that holds the domain's
+/// DATA.
 ///
-/// A family whose data sits on instance storage publishes that one type and no volume
-/// limits; every other family publishes one `ebs` entry per `VolumeType` the model
-/// declares, in that enum's order. The warm tier's storage is not attached to the node
-/// at all, so an UltraWarm instance type publishes no storage type rather than an empty
-/// list of them.
+/// A family whose data sits on storage built into the instance publishes that one type
+/// and no volume limits; every other family publishes one `ebs` entry per `VolumeType`
+/// the model declares, in that enum's order. The warm tier's storage is not attached to
+/// the node at all, so an UltraWarm instance type publishes no storage type rather than
+/// an empty list of them.
 fn storage_types(instance_type: &str) -> Option<Vec<StorageType>> {
     let family = instance_family(instance_type).unwrap_or(instance_type);
     if family == ULTRAWARM_FAMILY {
@@ -6395,6 +6469,12 @@ fn data_nodes_supported_by_master(instance_type: &str) -> i32 {
 /// The limits `instance_type` publishes for ONE of its roles: how many instances of it
 /// a domain holds in that role, the storage it can attach, and the additional limit
 /// that applies to that role.
+///
+/// Storage is published for the role that HOLDS the domain's data and for no other: an
+/// EBS volume "specifies the type of EBS volumes attached to data nodes"
+/// (`EBSOptions$VolumeType`), so a dedicated master — which holds no data and whose
+/// configuration carries no volume — publishes no storage type rather than a copy of
+/// the data role's, exactly as the warm tier publishes none.
 fn role_limits(instance_type: &str, role: &str) -> Limits {
     let (minimum, maximum, additional) = match role {
         INSTANCE_ROLE_MASTER => (
@@ -6422,7 +6502,11 @@ fn role_limits(instance_type: &str, role: &str) -> Limits {
         ),
     };
     Limits {
-        storage_types: storage_types(instance_type),
+        // Only the data role attaches storage; every other role publishes none.
+        storage_types: match role {
+            INSTANCE_ROLE_DATA => storage_types(instance_type),
+            _ => None,
+        },
         instance_limits: Some(InstanceLimits {
             instance_count_limits: Some(InstanceCountLimits {
                 minimum_instance_count: minimum,

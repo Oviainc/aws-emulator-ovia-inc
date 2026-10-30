@@ -6,12 +6,13 @@
 //! versions a domain running it can be upgraded to.
 //!
 //! The compatibility rule lives in [`crate::state::compatible_target_versions`] —
-//! every published version of the source's own engine line that is later than it,
-//! plus the whole of the line that succeeds it once the source has reached the last
-//! published version of its own — so this handler only chooses WHICH source
-//! versions to report it for: the one version the named domain runs, or every version
-//! [`crate::state::SUPPORTED_ENGINE_VERSIONS`] publishes when the request names no
-//! domain.
+//! every published release of the source's own line (its engine and major) that is
+//! later than it, plus every release of the line that immediately succeeds its own —
+//! so this handler only chooses WHICH source versions to report it for: the one
+//! version the named domain runs, or, when the request names no domain, the published
+//! upgrade table's own source versions
+//! ([`crate::state::upgradable_source_versions`]), the releases the service still
+//! offers an upgrade from.
 //!
 //! Reporting an upgrade table changes nothing a later caller cannot see: the only
 //! write it can cause is the configuration change the clock already owed the named
@@ -177,19 +178,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })?;
                 vec![domain.engine_version.clone()]
             }
-            None => crate::state::SUPPORTED_ENGINE_VERSIONS
-                .iter()
-                .map(|version| (*version).to_string())
+            // Without it, the table is the published one: a row per release the
+            // service still offers an upgrade FROM, oldest first. A release it offers
+            // no upgrade from — one older than the published floor, or the newest
+            // release, which has nothing ahead of it — is no row of a table of "the
+            // possible versions that you can upgrade the domain to".
+            None => crate::state::upgradable_source_versions()
+                .into_iter()
+                .map(str::to_string)
                 .collect(),
         };
 
         let compatible_versions = source_versions
             .into_iter()
             .map(|source_version| CompatibleVersionsMap {
-                // A source with nothing ahead of it — the newest published version —
-                // reports an EMPTY list rather than no member: the member is "the
-                // versions you can upgrade this one to", and for that one there are
-                // none.
+                // A source the request named itself — the version a domain runs — can
+                // be one with nothing ahead of it, and it reports an EMPTY list rather
+                // than no member: the member is "the versions you can upgrade this one
+                // to", and for that one there are none.
                 target_versions: Some(crate::state::compatible_target_versions(&source_version)),
                 source_version: Some(source_version),
             })

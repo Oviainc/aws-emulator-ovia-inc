@@ -13,11 +13,12 @@
 //!   table spanning the families that serve one role, two roles, and the warm tier;
 //! * the instance-count range is the role's, and a role's range is the same whatever
 //!   the instance type;
-//! * an instance type with attachable volumes publishes one `ebs` storage type per
-//!   `VolumeType` the model declares, each with the same minimum size, a maximum that
-//!   grows with the instance's size, a flat cap for the magnetic sub-type, and the IOPS
-//!   and throughput ranges only the provisioned sub-types carry — over a table of eight
-//!   sizes from the smallest published to the largest;
+//! * an instance type with attachable volumes publishes, under the DATA role alone,
+//!   one `ebs` storage type per `VolumeType` the model declares, each with the same
+//!   minimum size, a maximum that grows with the instance's size, a flat cap for the
+//!   magnetic sub-type, and the IOPS and throughput ranges only the provisioned
+//!   sub-types carry — over a table of eight sizes from the smallest published to the
+//!   largest;
 //! * an instance type whose data sits on built-in storage publishes that one storage
 //!   type with no sub-type and no volume limits, and a warm-tier type publishes none;
 //! * the additional limit is the role's, and the data nodes a master supports grow with
@@ -76,7 +77,7 @@ const VOLUME_SIZE_BY_SIZE: [(&str, i64); 8] = [
 /// `DescribeInstanceTypeLimits`:
 /// `GET /2021-01-01/opensearch/instanceTypeLimits/{EngineVersion}/{InstanceType}`, with
 /// `query` as its one `@httpQuery` member (empty for a request that sends none).
-async fn describe_limits(
+pub(crate) async fn describe_limits(
     emulator: &Emulator,
     engine_version: &str,
     instance_type: &str,
@@ -92,7 +93,7 @@ async fn describe_limits(
 }
 
 /// The `LimitsByRole` map of a successful answer, with the case named on failure.
-fn limits_by_role(answer: &Answer, case: &str) -> Value {
+pub(crate) fn limits_by_role(answer: &Answer, case: &str) -> Value {
     assert_eq!(
         answer.status, 200,
         "case {case}: expected HTTP 200, got {} {:?}",
@@ -191,10 +192,10 @@ async fn the_instance_count_range_is_the_roles_own() {
     let version = "OpenSearch_2.19";
 
     // The suite's own expectation of each role's published range: a data tier is one
-    // node or more, a master quorum is two to five, and the warm tier is attached in a
-    // pair or more.
+    // node or more up to the published per-type ceiling, a master quorum is two to
+    // five, and the warm tier is attached in a pair or more.
     let expected: [(&str, (i64, i64)); 3] = [
-        ("data", (1, 80)),
+        ("data", (1, 20)),
         ("master", (2, 5)),
         ("ultra_warm", (2, 150)),
     ];
@@ -255,6 +256,17 @@ async fn ebs_storage_types_span_the_volume_enum_and_scale_with_the_instance_size
             &case,
         );
         for role in role_keys(&map) {
+            // A volume attaches to the domain's data nodes, so the storage limits are
+            // the data role's: no other role publishes them.
+            if role != "data" {
+                assert!(
+                    map[&role]["StorageTypes"].is_null(),
+                    "case {case} role {role}: expected no StorageTypes for a role that \
+                     attaches no volume, got {:?}",
+                    map[&role]
+                );
+                continue;
+            }
             let storage = map[&role]["StorageTypes"]
                 .as_array()
                 .unwrap_or_else(|| {
@@ -394,6 +406,15 @@ async fn built_in_storage_publishes_no_volume_limits() {
             &case,
         );
         for role in role_keys(&map) {
+            if role != "data" {
+                assert!(
+                    map[&role]["StorageTypes"].is_null(),
+                    "case {case} role {role}: expected no StorageTypes for a role that \
+                     attaches no volume, got {:?}",
+                    map[&role]
+                );
+                continue;
+            }
             let storage = map[&role]["StorageTypes"].as_array().cloned().unwrap_or_default();
             assert_eq!(
                 storage.len(),

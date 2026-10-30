@@ -4,8 +4,10 @@
 //!
 //! Reports the engine-version catalog this emulator publishes as supported:
 //! [`crate::state::SUPPORTED_ENGINE_VERSIONS`], the ONE statement of that set, in the
-//! upgrade order it is written in — the same set and order `GetCompatibleVersions`
-//! builds its table from, so a caller cannot read two different catalogs.
+//! order the service publishes it — NEWEST release first
+//! ([`crate::state::published_engine_versions`]) — the same set
+//! `GetCompatibleVersions` builds its table from, so a caller cannot read two
+//! different catalogs.
 //!
 //! Which versions the service supports is published BY the service, never created by a
 //! caller, so this is a pure read: it reaches no account state, writes nothing, and the
@@ -172,16 +174,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The whole catalog, in the one order it is written in. The recorded answers of
-        // this operation report every supported version and NO `NextToken`, including
-        // for a request that named a `MaxResults` smaller than the catalog and for one
-        // that carried a `NextToken`: this catalog is published complete in a single
-        // answer, so neither member bounds what is reported nor resumes it, and there is
-        // never a token to hand out — which is what tells a paginating client it has the
-        // whole set.
-        let versions: Vec<String> = crate::state::SUPPORTED_ENGINE_VERSIONS
-            .iter()
-            .map(|version| (*version).to_string())
+        // The whole catalog, newest release first — the order the service publishes it
+        // in. The recorded answers of this operation report every supported version and
+        // NO `NextToken`, including for a request that named a `MaxResults` smaller than
+        // the catalog and for one that carried a `NextToken`: this catalog is published
+        // complete in a single answer, so neither member bounds what is reported nor
+        // resumes it, and there is never a token to hand out — which is what tells a
+        // paginating client it has the whole set.
+        let versions: Vec<String> = crate::state::published_engine_versions()
+            .into_iter()
+            .map(str::to_string)
             .collect();
 
         Ok(ListVersionsOutput {

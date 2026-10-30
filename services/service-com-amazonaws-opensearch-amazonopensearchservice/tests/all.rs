@@ -127,6 +127,8 @@ mod package_version_history;
 mod package_versions;
 #[path = "all/pagination_contract.rs"]
 mod pagination_contract;
+#[path = "all/published_catalog_order.rs"]
+mod published_catalog_order;
 #[path = "all/reserved_instance_offerings.rs"]
 mod reserved_instance_offerings;
 #[path = "all/reserved_instances.rs"]
