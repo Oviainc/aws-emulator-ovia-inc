@@ -1563,19 +1563,21 @@ impl ComAmazonawsSesSimpleemailserviceState {
     /// The custom redirect domain a tracking-options request may be stored with,
     /// or the message Amazon SES refuses it as invalid tracking options with.
     ///
-    /// Both refusals are the ones `InvalidTrackingOptionsException` documents,
-    /// in the words it documents them with: the error "appears most often in the
-    /// following situations: When the tracking domain you specified is not
-    /// verified in Amazon SES. When the tracking domain you specified is not a
-    /// valid domain or subdomain." Neither sentence carries a value, so neither
-    /// message interpolates one. A tracking subdomain is covered by the verified
-    /// domain above it ([`Self::covers_verified_domain`]), which is how a custom
-    /// open-and-click domain is set up.
+    /// Two conditions, which `InvalidTrackingOptionsException` lists as the ones
+    /// it "appears most often in" — a value that is not "a valid domain or
+    /// subdomain", and a tracking domain that is "not verified in Amazon SES" —
+    /// and which the runtime reports apart, each in its own sentence NAMING the
+    /// value it rejected ([`invalid_tracking_domain_message`] and
+    /// [`unverified_tracking_domain_message`]): the submitted domain is the whole
+    /// diagnostic content of the refusal, so the message carries it rather than
+    /// the error shape's condition list. A tracking subdomain is covered by the
+    /// verified domain above it ([`Self::covers_verified_domain`]), which is how
+    /// a custom open-and-click domain is set up.
     ///
     /// Only a single trailing dot is taken off — the root label of a fully
-    /// qualified name, which names the same domain. Nothing else is normalised:
-    /// a padded or doubly dotted value is not a domain name and is refused as
-    /// one.
+    /// qualified name, which names the same domain — and that is what is STORED.
+    /// Nothing else is normalised: a padded or doubly dotted value is not a
+    /// domain name and is refused as one.
     ///
     /// Shared by `CreateConfigurationSetTrackingOptions` and
     /// `UpdateConfigurationSetTrackingOptions`, which read one rule between
@@ -1584,15 +1586,10 @@ impl ComAmazonawsSesSimpleemailserviceState {
         let given = custom_redirect_domain.unwrap_or_default();
         let domain = given.strip_suffix('.').unwrap_or(given);
         if !is_domain_name(domain) {
-            return Err(
-                "The tracking domain you specified is not a valid domain or subdomain."
-                    .to_string(),
-            );
+            return Err(invalid_tracking_domain_message(given));
         }
         if !self.covers_verified_domain(domain) {
-            return Err(
-                "The tracking domain you specified is not verified in Amazon SES.".to_string(),
-            );
+            return Err(unverified_tracking_domain_message(given));
         }
         Ok(domain.to_string())
     }
@@ -2750,6 +2747,31 @@ pub fn resolve_identity(value: &str, region: &str) -> Result<String, String> {
             ::engine::EMULATOR_ACCOUNT_ID
         )),
     }
+}
+
+/// The sentence Amazon SES refuses a tracking-options write with when the custom
+/// redirect domain it was given is not a domain name at all: fixed text around
+/// the value the request supplied.
+///
+/// The value is the one SUBMITTED, verbatim — a refusal for a value that is not a
+/// domain name has nothing normalised to name, and what the caller has to correct
+/// is what the caller sent. Angle brackets delimit it, the form every refusal of
+/// this surface names a value in.
+pub fn invalid_tracking_domain_message(custom_redirect_domain: &str) -> String {
+    format!("Domain <{custom_redirect_domain}> is not a valid domain.")
+}
+
+/// The sentence Amazon SES refuses a tracking-options write with when the custom
+/// redirect domain is a domain name, but no verified identity of this account
+/// covers it: the same form as [`invalid_tracking_domain_message`], for the other
+/// condition `InvalidTrackingOptionsException` lists.
+///
+/// The two conditions are worded apart because they are different problems — a
+/// typo'd value against a domain whose ownership the account has not proved — and
+/// the message names the one domain at fault, so a caller configuring several can
+/// tell which was rejected and why.
+pub fn unverified_tracking_domain_message(custom_redirect_domain: &str) -> String {
+    format!("Domain <{custom_redirect_domain}> is not verified under this account.")
 }
 
 /// Whether `value` is a domain name with at least two non-empty labels, the

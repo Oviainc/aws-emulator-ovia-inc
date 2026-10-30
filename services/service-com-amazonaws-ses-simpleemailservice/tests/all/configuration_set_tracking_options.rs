@@ -140,11 +140,24 @@ fn refusal(body: &str) -> (Option<String>, Option<String>) {
     )
 }
 
-/// The two sentences `InvalidTrackingOptionsException` documents, which are the
-/// messages a refused custom redirect domain carries: one for a value that is
-/// not a domain name, one for a domain no verified identity covers.
-const NOT_A_DOMAIN: &str = "The tracking domain you specified is not a valid domain or subdomain.";
-const NOT_VERIFIED: &str = "The tracking domain you specified is not verified in Amazon SES.";
+/// The two sentences a refused custom redirect domain carries, each naming the
+/// domain the request supplied: one for a value that is not a domain name, one
+/// for a domain no verified identity of the account covers.
+///
+/// The wording per condition is pinned by
+/// `tests/all/ses_tracking_options_refusal_message.rs`; here they are what every
+/// refusal in this suite is compared against.
+fn not_a_domain(domain: &str) -> String {
+    format!("Domain <{domain}> is not a valid domain.")
+}
+
+fn not_verified(domain: &str) -> String {
+    format!("Domain <{domain}> is not verified under this account.")
+}
+
+/// Which of those two sentences a case expects, as the function that builds it
+/// for the domain the request supplied.
+type Sentence = fn(&str) -> String;
 
 /// The refusal a tracking-options operation that needs an existing association
 /// answers for a set carrying none: the modelled
@@ -273,7 +286,7 @@ async fn a_write_naming_a_set_the_account_does_not_hold_is_refused() {
                 refusal(&body),
                 (
                     Some("InvalidTrackingOptions".to_string()),
-                    Some(NOT_VERIFIED.to_string())
+                    Some(not_verified("click.example.org"))
                 ),
                 "case {operation} {name:?} with an unverified domain: expected the \
                  invalid-tracking-options refusal, got {body}"
@@ -317,19 +330,22 @@ async fn a_domain_ses_would_not_redirect_through_is_refused() {
     // name at all — which a padded or doubly dotted name is, since only the one
     // root label of a fully qualified name is taken off — and a domain name no
     // verified identity covers.
-    let cases = [
-        ("", NOT_A_DOMAIN),
-        ("localhost", NOT_A_DOMAIN),
-        ("not a domain", NOT_A_DOMAIN),
-        (" click.example.com ", NOT_A_DOMAIN),
-        ("click.example.com..", NOT_A_DOMAIN),
-        ("click.example.com/path", NOT_A_DOMAIN),
-        ("10.0.0.1", NOT_A_DOMAIN),
-        ("click.example.org", NOT_VERIFIED),
-        ("other.example", NOT_VERIFIED),
-        ("example.com.evil.test", NOT_VERIFIED),
+    let cases: [(&str, Sentence); 10] = [
+        ("", not_a_domain),
+        ("localhost", not_a_domain),
+        ("not a domain", not_a_domain),
+        (" click.example.com ", not_a_domain),
+        ("click.example.com..", not_a_domain),
+        ("click.example.com/path", not_a_domain),
+        ("10.0.0.1", not_a_domain),
+        ("click.example.org", not_verified),
+        ("other.example", not_verified),
+        ("example.com.evil.test", not_verified),
     ];
-    for (domain, expected) in cases {
+    for (domain, sentence) in cases {
+        // Each refusal names the domain the request supplied, so the expected
+        // message is the case's own value in the case's own sentence.
+        let expected = sentence(domain);
         for operation in ["update", "create"] {
             let (status, body) = if operation == "update" {
                 update_tracking_options(&router, "tracked-set", domain).await
@@ -344,7 +360,7 @@ async fn a_domain_ses_would_not_redirect_through_is_refused() {
                 refusal(&body),
                 (
                     Some("InvalidTrackingOptions".to_string()),
-                    Some(expected.to_string())
+                    Some(expected.clone())
                 ),
                 "case {operation} to {domain:?}: expected the invalid-tracking-options refusal, \
                  got {body}"

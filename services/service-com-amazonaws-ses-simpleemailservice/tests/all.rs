@@ -107,6 +107,8 @@ mod ses_template_listing;
 mod ses_template_update;
 #[path = "all/ses_tracking_options_conflict_refusal.rs"]
 mod ses_tracking_options_conflict_refusal;
+#[path = "all/ses_tracking_options_refusal_message.rs"]
+mod ses_tracking_options_refusal_message;
 #[path = "all/ses_unverified_from_address_wording.rs"]
 mod ses_unverified_from_address_wording;
 #[path = "all/ses_unverified_sender_refusal.rs"]
