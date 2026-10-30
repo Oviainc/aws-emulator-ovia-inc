@@ -298,6 +298,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
             .collect(),
             minted_by_token: ::std::collections::BTreeMap::new(),
+            // A schema a caller created is published for no catalogue event: the event
+            // it describes is whatever its own document declares, which is where a
+            // keyword search reads it from.
+            published_event: None,
         };
         registry.schemas.insert(input.schema_name.clone(), schema);
 

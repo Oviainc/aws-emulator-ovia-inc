@@ -279,8 +279,8 @@ const DRAFT4_ROOT_REF: &str = "#";
 ///
 /// * the component the source document roots at — the event envelope every event
 ///   schema of this registry describes its event through, named once in
-///   `crate::state` as [`EVENT_ENVELOPE_COMPONENT`] and WRITTEN under that name by the
-///   catalogue and by schema discovery — is promoted to the root: its keywords are the
+///   `crate::state` as [`EVENT_ENVELOPE_COMPONENT`] and WRITTEN under that name by a
+///   document that declares an envelope — is promoted to the root: its keywords are the
 ///   document's own, which is what makes the translation say what the source says;
 /// * the remaining components become the draft-4 `definitions`, reachable from the
 ///   root by reference. A document that defines no envelope component names no root
@@ -292,7 +292,9 @@ const DRAFT4_ROOT_REF: &str = "#";
 ///   the promoted one;
 /// * `nullable: true`, OpenAPI 3.0's way of saying a member may be null, becomes
 ///   draft-04's way of saying it: the member's `type` turns into the union of that type
-///   and `"null"`, and the keyword itself — which draft-04 does not define — goes;
+///   and `"null"`;
+/// * a keyword of OpenAPI 3.0's OWN vocabulary does not travel — see
+///   [`OPENAPI_ONLY_KEYWORDS`];
 /// * the root carries draft-04's `$schema` and the source document's `info.title`, so
 ///   the translation says which event it describes. A JSON object carries one member
 ///   per name, so a keyword the root already states this way is not restated by the
@@ -372,16 +374,28 @@ fn to_json_schema_draft4(openapi: &str) -> Option<String> {
     Some(rendered.to_json())
 }
 
-/// `members` in the order the draft-04 export renders an object's members: by name.
+/// `members` in the order the draft-04 export renders an object's members: by name,
+/// comparing names WITHOUT regard to case, with case deciding only between two names
+/// that are otherwise the same text.
+///
+/// Source: the published documents' own member order. The CloudTrail record's
+/// `resources` entry declares `accountId` before `ARN` before `ARNPrefix` before `type`
+/// — an order a case-sensitive comparison could not produce, because every upper-case
+/// letter sorts before every lower-case one — so the service orders a schema's member
+/// names case-insensitively, and the export rendered from such a document does too.
+/// That last step is an INFERENCE from the source document's order: the recorded
+/// draft-04 export shows no mixed-case member set, so a later recording that does can
+/// correct it.
 fn in_name_order(mut members: Vec<(String, JsonNode)>) -> Vec<(String, JsonNode)> {
-    members.sort_by(|(left, _), (right, _)| left.cmp(right));
+    members.sort_by_cached_key(|(name, _)| (name.to_lowercase(), name.clone()));
     members
 }
 
 /// Translate one OpenAPI 3 schema value into the draft-4 value that says the same
 /// thing, recursively: `$ref`s follow the components this conversion moved — into
-/// `definitions`, or to the document root for the one it promoted (`rooted_at`) — and
-/// `nullable` becomes a type union. Everything else is left as it stands — the two
+/// `definitions`, or to the document root for the one it promoted (`rooted_at`) —
+/// `nullable` becomes a type union, and a keyword of OpenAPI 3.0's own vocabulary is
+/// dropped ([`OPENAPI_ONLY_KEYWORDS`]). Everything else is left as it stands — the two
 /// drafts share it — and the members are rendered in name order, as the published
 /// export renders them.
 ///
@@ -400,10 +414,10 @@ fn to_draft4(value: &::serde_json::Value, rooted_at: Option<&str>) -> JsonNode {
     let mut translated: Vec<(String, JsonNode)> = Vec::with_capacity(members.len());
     let nullable = members.get(OPENAPI_NULLABLE) == Some(&::serde_json::Value::Bool(true));
     for (key, member) in members {
-        // `nullable` is an OpenAPI 3.0 keyword with no draft-04 counterpart: what it
-        // says is carried by the member's `type` below, so the keyword itself does not
-        // travel.
-        if key == OPENAPI_NULLABLE {
+        // A keyword OpenAPI 3.0 defines and draft-04 does not says nothing in the
+        // translated document: what `nullable` says is carried by the member's `type`
+        // below, and the rest has no draft-04 counterpart at all.
+        if OPENAPI_ONLY_KEYWORDS.contains(&key.as_str()) {
             continue;
         }
         if key == "$ref" {
@@ -439,6 +453,32 @@ fn to_draft4(value: &::serde_json::Value, rooted_at: Option<&str>) -> JsonNode {
 
 /// The OpenAPI 3.0 keyword that says a member may be null — see [`to_draft4`].
 const OPENAPI_NULLABLE: &str = "nullable";
+
+/// The keywords OpenAPI 3.0 adds to the JSON Schema vocabulary, which draft-04 does not
+/// define — so none of them travels into the exported document.
+///
+/// Source: the OpenAPI 3.0 Schema Object's own fixed fields, the ones it states "are
+/// not supported by JSON Schema" and adds for its own purposes. `nullable` is one of
+/// them, and [`to_draft4`] says what it says in draft-04's own terms before dropping
+/// it; the others say nothing a draft-04 validator reads.
+///
+/// The translation applies this to EVERY object of the document it walks, and so does
+/// not tell a schema keyword apart from a member declared under the same name: a
+/// `properties` entry named for one of these keywords goes with them. That is how the
+/// published export renders the document the catalogue publishes for a
+/// CloudTrail-delivered event — the record's own `readOnly` member is absent from it —
+/// and a document whose shape made the distinction visible is not a document this
+/// service can tell apart either, both being plain JSON objects.
+const OPENAPI_ONLY_KEYWORDS: &[&str] = &[
+    OPENAPI_NULLABLE,
+    "readOnly",
+    "writeOnly",
+    "deprecated",
+    "discriminator",
+    "xml",
+    "example",
+    "externalDocs",
+];
 
 /// The draft-04 type a nullable member's type is unioned with.
 const DRAFT4_NULL_TYPE: &str = "null";

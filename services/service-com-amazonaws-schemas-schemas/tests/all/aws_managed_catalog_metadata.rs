@@ -30,6 +30,7 @@ use service_com_amazonaws_schemas_schemas::state::{
 
 use crate::registry_schema_lifecycle::{
     create_registry, export_uri, schema_names, schema_uri, Answer, Emulator,
+    OPENAPI_ONLY_KEYWORDS,
 };
 
 /// The listing of the AWS-managed registry's schemas.
@@ -149,17 +150,18 @@ async fn the_catalogue_publishes_the_whole_cloud_trail_family_of_a_source_it_hol
             let document: Value = serde_json::from_str(&described.str_at("Content"))
                 .unwrap_or_else(|e| panic!("case {expected:?}: Content must be JSON: {e}"));
             let component = &document["components"]["schemas"][*event_name];
-            assert_eq!(
-                component["x-amazon-events-detail-type"],
-                json!(detail_type),
-                "case {expected:?}: the document must declare the detail-type it \
-                 describes, got {component:?}"
+            assert!(
+                component["properties"].is_object(),
+                "case {expected:?}: the document must describe the event it is named \
+                 after, got {document:?}"
             );
+            // The document does not restate the event's identity anywhere in the
+            // components; it titles the event it describes.
             assert_eq!(
-                component["x-amazon-events-source"],
-                json!(source),
-                "case {expected:?}: the document must declare its publishing source, \
-                 got {component:?}"
+                document["info"]["title"],
+                json!(format!("{detail_type} published by {source}")),
+                "case {expected:?}: the document must title the event it describes, \
+                 got {document:?}"
             );
         }
     }
@@ -546,26 +548,21 @@ async fn the_published_document_titles_its_event_and_exports_to_draft_4() {
         let components = document["components"]["schemas"]
             .as_object()
             .unwrap_or_else(|| panic!("case {name:?}: the document has components"));
-        for component in components
-            .keys()
-            .filter(|component| *component != EVENT_ENVELOPE_COMPONENT)
-        {
+        for component in components.keys() {
             assert!(
                 converted["definitions"][component].is_object(),
                 "case {name:?}: component {component:?} must be a definition, \
                  got {converted:?}"
             );
         }
-        assert_eq!(
-            converted["required"],
-            document["components"]["schemas"][EVENT_ENVELOPE_COMPONENT]["required"],
-            "case {name:?}: the export must be rooted at the component the document is \
-             rooted at, got {converted:?}"
+        assert!(
+            document["components"]["schemas"][EVENT_ENVELOPE_COMPONENT].is_null(),
+            "case {name:?}: a published document declares no event envelope, got {document:?}"
         );
         assert!(
-            converted["definitions"][EVENT_ENVELOPE_COMPONENT].is_null(),
-            "case {name:?}: the promoted component is the root, not a definition, \
-             got {converted:?}"
+            converted["required"].is_null() && converted["properties"].is_null(),
+            "case {name:?}: the export promotes no component where the document names \
+             no root, got {converted:?}"
         );
         let rendered = serde_json::to_string(&converted).unwrap_or_default();
         assert!(
@@ -579,19 +576,25 @@ async fn the_published_document_titles_its_event_and_exports_to_draft_4() {
         );
 
         // Every member the source marked nullable is a union with "null" in the
-        // export, and every member it did not keeps its single type — in a definition
-        // as at the root the promoted component became.
+        // export, and every member it did not keeps its single type.
         for (component, schema) in components {
             let Some(properties) = schema["properties"].as_object() else {
                 continue;
             };
-            let rendered = if component == EVENT_ENVELOPE_COMPONENT {
-                &converted
-            } else {
-                &converted["definitions"][component]
-            };
+            let rendered = &converted["definitions"][component];
             for (member, declared) in properties {
                 let exported_member = &rendered["properties"][member];
+                // A member named for one of OpenAPI 3.0's own keywords is the one kind
+                // of member the conversion does not carry over — draft-04 defines none
+                // of them; every other member must be there, widened or as it stands.
+                if OPENAPI_ONLY_KEYWORDS.contains(&member.as_str()) {
+                    assert!(
+                        exported_member.is_null(),
+                        "case {name:?}: {component}.{member} is named for an \
+                         OpenAPI-only keyword and does not survive, got {exported_member:?}"
+                    );
+                    continue;
+                }
                 let Some(declared_type) = declared["type"].as_str() else {
                     continue;
                 };

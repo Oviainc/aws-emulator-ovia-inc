@@ -35,6 +35,8 @@ mod discovered_schema_inference;
 mod discoverer_deletion;
 #[path = "all/discoverer_state.rs"]
 mod discoverer_state;
+#[path = "all/draft4_openapi_vocabulary.rs"]
+mod draft4_openapi_vocabulary;
 #[path = "all/duplicate_create_refusals.rs"]
 mod duplicate_create_refusals;
 #[path = "all/empty_next_token.rs"]

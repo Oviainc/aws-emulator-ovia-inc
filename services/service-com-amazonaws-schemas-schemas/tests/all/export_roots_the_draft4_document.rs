@@ -268,13 +268,13 @@ async fn the_draft_4_export_is_rooted_at_the_component_the_document_roots_at() {
     }
 }
 
-/// RULE (the same rule, over the documents AWS publishes rather than a caller's): the
-/// draft-04 export of a published event schema is rooted at the envelope the published
-/// document roots at — so its root constrains the event, its `detail` names the
-/// event-specific component among the `definitions`, and the envelope is not a
-/// definition of its own export.
+/// RULE (the same rule, over the documents AWS publishes rather than a caller's): a
+/// published event document declares no envelope component, so it names no root among
+/// its co-equal components — its export promotes none of them, carries draft-04 and the
+/// document's title at its root, and renders every component the document defines as a
+/// definition.
 #[tokio::test]
-async fn a_published_event_schema_exports_rooted_at_its_envelope() {
+async fn a_published_event_schema_exports_with_its_components_as_definitions() {
     let emulator = Emulator::new();
 
     // A bounded, deterministic sample of the catalogue: every 149th entry, so the rows
@@ -318,41 +318,42 @@ async fn a_published_event_schema_exports_rooted_at_its_envelope() {
             .unwrap_or_else(|e| panic!("case {name:?}: the export must be JSON: {e}"));
         let source: Value = serde_json::from_str(&entry.content)
             .unwrap_or_else(|e| panic!("case {name:?}: the source must be JSON: {e}"));
-        let envelope = &source["components"]["schemas"][EVENT_ENVELOPE_COMPONENT];
+        assert!(
+            source["components"]["schemas"][EVENT_ENVELOPE_COMPONENT].is_null(),
+            "case {name:?}: a published document declares no envelope, got {source:?}"
+        );
 
         let constraining = constraining_keywords(&converted);
         assert!(
-            !constraining.is_empty(),
-            "case {name:?}: the export's root must constrain the event, got {converted:?}"
+            constraining.is_empty(),
+            "case {name:?}: a document that names no root to promote exports none, \
+             got {constraining:?} in {converted:?}"
         );
         assert_eq!(
-            converted["type"], envelope["type"],
-            "case {name:?}: the root is the envelope's schema, got {converted:?}"
+            converted["$schema"],
+            json!(JSON_SCHEMA_DRAFT4_URI),
+            "case {name:?}: expected the root to name draft-04, got {converted:?}"
         );
         assert_eq!(
-            converted["required"], envelope["required"],
-            "case {name:?}: the root requires what the envelope requires, got {converted:?}"
-        );
-        assert!(
-            converted["definitions"][EVENT_ENVELOPE_COMPONENT].is_null(),
-            "case {name:?}: the promoted envelope is no definition of its own export, \
-             got {converted:?}"
+            converted["title"], source["info"]["title"],
+            "case {name:?}: the export carries the document's title, got {converted:?}"
         );
 
-        // The envelope's `detail` named a component of the source document; it names
-        // where the conversion put that component.
-        let event_component = envelope["properties"]["detail"]["$ref"]
-            .as_str()
-            .and_then(|target| target.strip_prefix(OPENAPI_COMPONENT_REF))
-            .unwrap_or_else(|| panic!("case {name:?}: the envelope's detail names a component"));
-        assert_eq!(
-            converted["properties"]["detail"]["$ref"],
-            json!(format!("#/definitions/{event_component}")),
-            "case {name:?}: the root's detail must name the event's definition, got {converted:?}"
-        );
+        // Every component the published document defines is a definition of the export,
+        // and no `$ref` into the source's components survives.
+        let components = source["components"]["schemas"]
+            .as_object()
+            .unwrap_or_else(|| panic!("case {name:?}: the document has components"));
+        for component in components.keys() {
+            assert!(
+                converted["definitions"][component].is_object(),
+                "case {name:?}: component {component:?} must be a definition, got {converted:?}"
+            );
+        }
         assert!(
-            converted["definitions"][event_component].is_object(),
-            "case {name:?}: the event's component must be a definition, got {converted:?}"
+            !exported.str_at("Content").contains(OPENAPI_COMPONENT_REF),
+            "case {name:?}: no OpenAPI component ref may survive, got {}",
+            exported.str_at("Content")
         );
     }
 }

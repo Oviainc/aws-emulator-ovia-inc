@@ -286,10 +286,20 @@ async fn both_published_spellings_of_one_event_type_are_their_own_entries() {
                 .unwrap_or_else(|| panic!("case {name:?}: a catalogue name is <source>@<EventName>"))
                 .1;
             assert_eq!(
-                document["components"]["schemas"][event_name]["x-amazon-events-detail-type"],
-                json!(detail_type),
-                "case {name:?}: the document declares the detail-type this spelling was \
+                document["info"]["title"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .split(" published by ")
+                    .next()
+                    .unwrap_or_default(),
+                *detail_type,
+                "case {name:?}: the document titles the detail-type this spelling was \
                  published under, got {document:?}"
+            );
+            assert!(
+                document["components"]["schemas"][event_name]["properties"].is_object(),
+                "case {name:?}: the document defines the component it is published for, \
+                 got {document:?}"
             );
         }
 

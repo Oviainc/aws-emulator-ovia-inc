@@ -187,31 +187,35 @@ async fn every_catalogue_member_is_described_from_the_seeded_document() {
         described.value_at("LastModified");
         described.value_at("VersionCreatedDate");
 
-        // The document describes the event it is published for: the envelope carries
-        // the event's source and detail-type and references the detail component.
+        // The document describes the event it is published for: it defines the
+        // component named after the event, and nothing around it.
         let document: Value = serde_json::from_str(&seeded.content)
             .unwrap_or_else(|e| panic!("case {name:?}: the document must be JSON: {e}"));
-        let envelope = &document["components"]["schemas"]["AWSEvent"];
-        assert_eq!(
-            envelope["x-amazon-events-source"],
-            serde_json::json!(source),
-            "case {name:?}: the envelope names the publishing source, got {envelope:?}"
-        );
-        assert_eq!(
-            envelope["properties"]["detail"]["$ref"],
-            serde_json::json!(format!("#/components/schemas/{event_name}")),
-            "case {name:?}: the envelope's detail references the event component"
+        assert!(
+            document["components"]["schemas"][event_name]["properties"].is_object(),
+            "case {name:?}: the document defines the event component, got {document:?}"
         );
         assert!(
-            document["components"]["schemas"][event_name].is_object(),
-            "case {name:?}: the document defines the event component, got {document:?}"
+            document["components"]["schemas"][EVENT_ENVELOPE_COMPONENT].is_null(),
+            "case {name:?}: a published document declares no event envelope, got {document:?}"
+        );
+        assert_eq!(
+            document["info"]["title"]
+                .as_str()
+                .unwrap_or_default()
+                .rsplit(" published by ")
+                .next()
+                .unwrap_or_default(),
+            source,
+            "case {name:?}: the document titles the event its source publishes, \
+             got {document:?}"
         );
     }
 }
 
 /// RULE: every member of the catalogue exports — as the `OpenApi3` it is stored as
 /// (the stored document itself) and as the `JSONSchemaDraft4` the service converts it
-/// to (draft-04 named at the root, which is the envelope the document roots at).
+/// to (draft-04 named at the root, the document's components as its definitions).
 #[tokio::test]
 async fn every_catalogue_member_exports_in_both_schema_languages() {
     let emulator = Emulator::new();
@@ -264,19 +268,15 @@ async fn every_catalogue_member_exports_in_both_schema_languages() {
             "case {name:?}: the export must name draft-04, got {content:?}"
         );
         let event_name = name.split_once('@').map(|(_, event)| event).unwrap_or("");
-        assert_eq!(
-            content["properties"]["detail"]["$ref"],
-            serde_json::json!(format!("#/definitions/{event_name}")),
-            "case {name:?}: the root's detail ref must point into definitions, got {content:?}"
-        );
         assert!(
-            content["definitions"][event_name].is_object(),
-            "case {name:?}: every component but the promoted envelope is a definition, \
+            content["definitions"][event_name]["properties"].is_object(),
+            "case {name:?}: every component of the document is a definition, \
              got {content:?}"
         );
         assert!(
-            content["definitions"][EVENT_ENVELOPE_COMPONENT].is_null(),
-            "case {name:?}: the envelope the document roots at is the export's root, \
+            content["definitions"][EVENT_ENVELOPE_COMPONENT].is_null()
+                && content["properties"].is_null(),
+            "case {name:?}: a published document names no root to promote, \
              got {content:?}"
         );
     }

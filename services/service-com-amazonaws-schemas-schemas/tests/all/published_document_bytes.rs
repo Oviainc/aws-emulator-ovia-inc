@@ -4,16 +4,19 @@
 //! serve — `DescribeSchema`'s `Content` and `ExportSchema`'s conversion of it.
 //!
 //! RULE: a schema document is an opaque TEXT this service serves as the document it
-//! holds. So a read answers the published document itself — its members in the order the
-//! published document writes them (`openapi`, `info` with its `title` before its
-//! `version`, `paths`, `components`; a component's `type` before its `properties`) — and
-//! a conversion to another schema language renders the target document's own root order
-//! (`$schema`, `title`, the keywords of the component the document roots at, then the
-//! `definitions` of the components left) with every translated schema's keywords and
-//! property names in name order, which is how the draft-04 export is published. What a
-//! published document says about the event it describes is the publisher's: for the
-//! CloudTrail-delivered family that is the CloudTrail record, whose members, nested
-//! structures and formats the cases below hold every member of the family to.
+//! holds. The document the catalogue publishes for an event type describes that event's
+//! `detail` and nothing around it: its `components.schemas` are the component named
+//! after the event plus whatever that component references, with no EventBridge envelope
+//! and no `x-amazon-events-*` extension, served in the order the published document
+//! writes them (`openapi`, `info` with its `title` before its `version`, `paths`,
+//! `components`; a component's `type` before its `properties`). A conversion to another
+//! schema language renders the target document's own root order (`$schema`, `title`,
+//! then the `definitions` the components become) with every translated schema's keywords
+//! and property names in name order, OpenAPI's `nullable` lowered to a draft-04 type
+//! union, and none of OpenAPI 3.0's own keywords surviving. What a published document
+//! says about the event it describes is the publisher's: for the CloudTrail-delivered
+//! family that is the CloudTrail record, whose members, nested structures and formats
+//! the cases below hold every member of the family to.
 //!
 //! Every case drives the real wire path, through the harness in
 //! `registry_schema_lifecycle.rs` — nothing here touches the state struct directly.
@@ -25,7 +28,7 @@ use service_com_amazonaws_schemas_schemas::state::{
     JSON_SCHEMA_DRAFT4_URI,
 };
 
-use crate::registry_schema_lifecycle::{export_uri, schema_uri, Emulator};
+use crate::registry_schema_lifecycle::{export_uri, schema_uri, Emulator, OPENAPI_ONLY_KEYWORDS};
 
 /// The members the published document declares for a CloudTrail record, in the order it
 /// writes them.
@@ -53,7 +56,6 @@ const PUBLISHED_RECORD_MEMBERS: &[&str] = &[
     "eventTime",
     "eventType",
     "eventVersion",
-    "insightDetails",
     "managementEvent",
     "readOnly",
     "recipientAccountId",
@@ -69,18 +71,15 @@ const PUBLISHED_RECORD_MEMBERS: &[&str] = &[
     "userIdentity",
 ];
 
-/// The record members the published document marks `nullable` — the ones CloudTrail
-/// fills only for the records they apply to, which OpenAPI 3.0 spells as "may be present
-/// and null". Source: the same published document.
+/// The record members the published document marks `nullable`: its four free-form
+/// members, whose contents are the called API's rather than CloudTrail's, which OpenAPI
+/// 3.0 spells as "may be present and null". The published document marks nothing else
+/// nullable. Source: the same published document.
 const NULLABLE_RECORD_MEMBERS: &[&str] = &[
     "addendum",
     "additionalEventData",
-    "edgeDeviceDetails",
-    "eventContext",
-    "insightDetails",
     "requestParameters",
     "responseElements",
-    "tlsDetails",
 ];
 
 /// The catalogue entries the document cases run over.
@@ -144,38 +143,46 @@ fn components(case: &str, document: &JsonNode) -> Vec<(String, JsonNode)> {
 
 /// The member names the draft-04 export of the published document `source` carries at
 /// its ROOT, in the order it writes them: draft-04's `$schema`, the source document's
-/// title, then the keywords of the component the document roots at — the event envelope,
-/// which the export promotes to the root, in name order like every schema it renders —
-/// and last the `definitions` of the components left over.
+/// title, then the `definitions` its components become.
+///
+/// A published document declares no event envelope, so it names no root among its
+/// co-equal components and the export promotes none of them — which this also asserts,
+/// because a document that DID declare one would be exported with that component's
+/// keywords at the root instead.
 fn expected_root_members(case: &str, source: &JsonNode) -> Vec<String> {
     let carried = components(case, source);
-    let (_, envelope) = carried
-        .iter()
-        .find(|(component, _)| component == EVENT_ENVELOPE_COMPONENT)
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: a published document roots at {EVENT_ENVELOPE_COMPONENT}")
-        });
-    let mut names = vec!["$schema".to_string(), "title".to_string()];
-    let mut keywords: Vec<String> = member_names(envelope)
-        .into_iter()
-        .filter(|keyword| !names.contains(keyword))
-        .collect();
-    keywords.sort();
-    names.extend(keywords);
-    if carried.len() > 1 {
-        names.push("definitions".to_string());
-    }
-    names
+    assert!(
+        carried
+            .iter()
+            .all(|(component, _)| component != EVENT_ENVELOPE_COMPONENT),
+        "case {case:?}: a published document declares no {EVENT_ENVELOPE_COMPONENT} envelope, \
+         got {:?}",
+        carried
+            .iter()
+            .map(|(component, _)| component.clone())
+            .collect::<Vec<String>>()
+    );
+    assert!(
+        !carried.is_empty(),
+        "case {case:?}: a published document defines the component it describes"
+    );
+    vec![
+        "$schema".to_string(),
+        "title".to_string(),
+        "definitions".to_string(),
+    ]
 }
 
-/// The first object in `node` whose members are NOT in name order, named by the path to
-/// it — `None` when every object in the tree is ordered by name.
+/// The first object in `node` whose members are NOT in the order the export renders
+/// them — by name, compared without regard to case (the order the published documents
+/// themselves write a schema's members in: `accountId` before `ARN`) — named by the path
+/// to it. `None` when every object in the tree is ordered that way.
 fn first_unordered_object(path: &str, node: &JsonNode) -> Option<String> {
     match node {
         JsonNode::Object(members) => {
             let names: Vec<&str> = members.iter().map(|(name, _)| name.as_str()).collect();
             let mut sorted = names.clone();
-            sorted.sort_unstable();
+            sorted.sort_by_key(|name| (name.to_lowercase(), *name));
             if names != sorted {
                 return Some(format!("{path}: {names:?}"));
             }
@@ -212,7 +219,9 @@ async fn a_published_document_is_served_in_the_order_it_is_published() {
         );
         let content = described.str_at("Content");
 
-        // The document's opening bytes, as the published document writes them.
+        // The document's opening bytes, as the published document writes them: the
+        // dialect, the title, the empty `paths`, then the components it describes the
+        // event through.
         let opening = format!(
             r#"{{"openapi":"3.0.0","info":{{"title":{},"version":"1.0.0"}},"paths":{{}},"components":{{"schemas":{{"#,
             serde_json::to_string(&title).expect("a title encodes")
@@ -267,6 +276,55 @@ async fn a_published_document_is_served_in_the_order_it_is_published() {
     }
 }
 
+/// RULE: a published document describes the event type it is published for — the
+/// component named after the event and whatever that component references, and nothing
+/// else: no EventBridge envelope and no `x-amazon-events-*` extension, which the
+/// published document states nowhere.
+#[tokio::test]
+async fn a_published_document_describes_the_event_and_nothing_around_it() {
+    let emulator = Emulator::new();
+
+    for event in document_rows() {
+        let name = event.schema_name();
+        let described = emulator
+            .call("GET", &schema_uri(AWS_MANAGED_REGISTRY, &name), None)
+            .await;
+        assert_eq!(
+            described.status, 200,
+            "case {name:?}: expected 200, got {} {:?}",
+            described.status, described.body
+        );
+        let content = described.str_at("Content");
+        let document = ordered_document(&name, &content);
+
+        // The document defines the component named after the event, and every other
+        // component it carries is one the document itself references.
+        let carried: Vec<String> = components(&name, &document)
+            .into_iter()
+            .map(|(component, _)| component)
+            .collect();
+        assert!(
+            carried.iter().any(|component| component == event.event_name),
+            "case {name:?}: the document defines the component it describes, got {carried:?}"
+        );
+        for component in carried.iter().filter(|component| *component != event.event_name) {
+            assert!(
+                content.contains(&format!("#/components/schemas/{component}")),
+                "case {name:?}: the extra component {component:?} must be one the document \
+                 references, got {content}"
+            );
+        }
+        assert!(
+            !carried.iter().any(|component| component == EVENT_ENVELOPE_COMPONENT),
+            "case {name:?}: a published document carries no event envelope, got {carried:?}"
+        );
+        assert!(
+            !content.contains("x-amazon-events-"),
+            "case {name:?}: a published document declares no EventBridge extension, got {content}"
+        );
+    }
+}
+
 /// RULE: a published document describes the event its publisher publishes — for every
 /// member of the CloudTrail-delivered family, the CloudTrail record: its member set, the
 /// nested structures it declares inline, the members that may arrive null, and the
@@ -315,15 +373,20 @@ async fn a_cloud_trail_document_describes_the_published_record() {
             );
 
             // The record's nested structures are declared inline, so the document
-            // carries no component beside the event's own and the envelope's.
+            // carries the event's component and no other.
             let carried: Vec<String> = components(&name, &ordered)
                 .into_iter()
                 .map(|(component, _)| component)
                 .collect();
             assert_eq!(
                 carried,
-                vec![(*event_name).to_string(), EVENT_ENVELOPE_COMPONENT.to_string()],
+                vec![(*event_name).to_string()],
                 "case {name:?}: the published document's components, got {carried:?}"
+            );
+            assert_eq!(
+                document["info"]["title"],
+                serde_json::json!(format!("{detail_type} published by {source}")),
+                "case {name:?}: the document titles the event it describes, got {content}"
             );
 
             for member in NULLABLE_RECORD_MEMBERS {
@@ -396,30 +459,52 @@ async fn a_cloud_trail_document_describes_the_published_record() {
                 ],
                 "case {name:?}: the record's TLS details, got {tls_members:?}"
             );
-            assert!(
-                record["properties"]["userIdentity"]["properties"]["sessionContext"]
-                    ["properties"]["sessionIssuer"]
-                    .is_object(),
-                "case {name:?}: the identity's session context is declared inline, got {:?}",
-                record["properties"]["userIdentity"]
-            );
-
-            // And the detail-type the schema is named after is what the document says it
-            // describes.
+            let identity_members = ordered_record
+                .member("properties")
+                .and_then(|properties| properties.member("userIdentity"))
+                .and_then(|identity| identity.member("properties"))
+                .map(member_names)
+                .unwrap_or_else(|| panic!("case {name:?}: userIdentity declares properties"));
             assert_eq!(
-                record["x-amazon-events-detail-type"],
-                serde_json::json!(detail_type),
-                "case {name:?}: the record declares the event it describes, got {record:?}"
+                identity_members,
+                vec![
+                    "accessKeyId",
+                    "accountId",
+                    "arn",
+                    "credentialId",
+                    "identityProvider",
+                    "inScopeOf",
+                    "invokedBy",
+                    "invokedByDelegate",
+                    "onBehalfOf",
+                    "principalId",
+                    "sessionContext"
+                ],
+                "case {name:?}: the record's identity, got {identity_members:?}"
+            );
+            let on_behalf_of = ordered_record
+                .member("properties")
+                .and_then(|properties| properties.member("userIdentity"))
+                .and_then(|identity| identity.member("properties"))
+                .and_then(|members| members.member("onBehalfOf"))
+                .and_then(|on_behalf_of| on_behalf_of.member("properties"))
+                .map(member_names)
+                .unwrap_or_else(|| panic!("case {name:?}: onBehalfOf declares properties"));
+            assert_eq!(
+                on_behalf_of,
+                vec!["identityStoreArn", "userId"],
+                "case {name:?}: the identity the record acted on behalf of, got {on_behalf_of:?}"
             );
         }
     }
 }
 
 /// RULE: the draft-04 export is the published rendering of the same document — draft-04
-/// named first, then the source document's title, then the keywords of the component the
-/// document roots at, then the definitions of the components left, with every translated
-/// schema's keywords and property names in name order, OpenAPI's `nullable` lowered to a
-/// type union and every component ref following the component into `definitions`.
+/// named first, then the source document's title, then the definitions its components
+/// become, with every translated schema's keywords and property names in name order,
+/// OpenAPI's `nullable` lowered to a type union, every component ref following the
+/// component into `definitions`, and no keyword of OpenAPI 3.0's own vocabulary
+/// surviving.
 #[tokio::test]
 async fn the_draft_4_export_is_rendered_as_it_is_published() {
     let emulator = Emulator::new();
@@ -441,25 +526,19 @@ async fn the_draft_4_export_is_rendered_as_it_is_published() {
         );
         let content = exported.str_at("Content");
 
-        // The source document's components are the definitions — all but the one the
-        // document roots at, whose keywords ARE the export's root — and nothing of
+        // The source document's components are the definitions, and nothing of
         // OpenAPI's own vocabulary survives.
         let described = emulator
             .call("GET", &schema_uri(AWS_MANAGED_REGISTRY, &name), None)
             .await;
         let source = ordered_document(&name, &described.str_at("Content"));
 
-        // The document's opening bytes: the dialect, the title, then the first keyword
-        // of the component the published document roots at.
+        // The document's opening bytes: the dialect, the title, then the definitions.
         let root_members = expected_root_members(&name, &source);
-        let first_promoted = root_members
-            .get(2)
-            .unwrap_or_else(|| panic!("case {name:?}: the published root carries keywords"));
         let opening = format!(
-            r#"{{"$schema":{},"title":{},{}:"#,
+            r#"{{"$schema":{},"title":{},"definitions":{{"#,
             serde_json::to_string(JSON_SCHEMA_DRAFT4_URI).expect("the dialect encodes"),
-            serde_json::to_string(&title).expect("a title encodes"),
-            serde_json::to_string(first_promoted).expect("a keyword encodes")
+            serde_json::to_string(&title).expect("a title encodes")
         );
         assert!(
             content.starts_with(&opening),
@@ -481,43 +560,32 @@ async fn the_draft_4_export_is_rendered_as_it_is_published() {
                  but {unordered} is not"
             );
         }
-        let promoted = converted
-            .member("properties")
-            .unwrap_or_else(|| panic!("case {name:?}: the promoted component declares members"));
-        if let Some(unordered) = first_unordered_object("properties", promoted) {
-            panic!(
-                "case {name:?}: the export renders the promoted schema in name order, \
-                 but {unordered} is not"
-            );
-        }
 
         let expected: Vec<String> = components(&name, &source)
             .into_iter()
             .map(|(component, _)| component)
             .collect();
-        let mut expected_in_name_order: Vec<String> = expected
-            .iter()
-            .filter(|component| *component != EVENT_ENVELOPE_COMPONENT)
-            .cloned()
-            .collect();
-        expected_in_name_order.sort();
+        let mut expected_in_name_order: Vec<String> = expected.clone();
+        expected_in_name_order.sort_by_key(|component| component.to_lowercase());
         assert_eq!(
             member_names(definitions),
             expected_in_name_order,
-            "case {name:?}: every component but the promoted one is a definition, got {content}"
+            "case {name:?}: every component becomes a definition, got {content}"
         );
         assert!(
             !content.contains("#/components/schemas/"),
             "case {name:?}: no OpenAPI component ref may survive, got {content}"
         );
-        assert!(
-            !content.contains("\"nullable\""),
-            "case {name:?}: draft-04 has no `nullable` keyword, got {content}"
-        );
+        for keyword in OPENAPI_ONLY_KEYWORDS {
+            assert!(
+                !content.contains(&format!("\"{keyword}\"")),
+                "case {name:?}: draft-04 defines no {keyword:?} keyword, got {content}"
+            );
+        }
 
-        // A nullable member of the source is a union with "null" in the export, and one
-        // the source did not mark keeps its single type — in the definitions as at the
-        // root the promoted component became.
+        // A nullable member of the source is a union with "null" in the export, one the
+        // source did not mark keeps its single type, and a member named for an
+        // OpenAPI-only keyword is not in the export at all.
         let source_value: Value =
             serde_json::from_str(&described.str_at("Content")).expect("the source is JSON");
         let converted_value: Value = serde_json::from_str(&content).expect("the export is JSON");
@@ -527,12 +595,17 @@ async fn the_draft_4_export_is_rendered_as_it_is_published() {
             else {
                 continue;
             };
-            let rendered = if component == EVENT_ENVELOPE_COMPONENT {
-                &converted_value
-            } else {
-                &converted_value["definitions"][&component]
-            };
+            let rendered = &converted_value["definitions"][&component];
             for (member, declared) in properties {
+                let exported_member = &rendered["properties"][member];
+                if OPENAPI_ONLY_KEYWORDS.contains(&member.as_str()) {
+                    assert!(
+                        exported_member.is_null(),
+                        "case {name:?}: {component}.{member} is named for an OpenAPI-only \
+                         keyword and does not survive, got {exported_member:?}"
+                    );
+                    continue;
+                }
                 let Some(declared_type) = declared["type"].as_str() else {
                     continue;
                 };
@@ -541,7 +614,6 @@ async fn the_draft_4_export_is_rendered_as_it_is_published() {
                 } else {
                     serde_json::json!(declared_type)
                 };
-                let exported_member = &rendered["properties"][member];
                 assert_eq!(
                     exported_member["type"], expected_type,
                     "case {name:?}: {component}.{member} must export as {expected_type:?}, \
@@ -563,6 +635,76 @@ async fn the_draft_4_export_is_rendered_as_it_is_published() {
             same.str_at("Content"),
             described.str_at("Content"),
             "case {name:?}: an export in the stored language is the stored document"
+        );
+    }
+}
+
+/// RULE: the export orders a schema's member names WITHOUT regard to case. What pins
+/// the rule is the ORDER ITSELF, not a list written here: the expectation below is the
+/// stored document's own member names re-ordered case-insensitively, and the case asserts
+/// that this order is NOT the one a case-sensitive comparison produces — so a conversion
+/// that compared names by their bytes would fail it. (The published document's own order,
+/// `accountId` before `ARN` before `ARNPrefix`, is what says the comparison ignores case:
+/// every upper-case letter sorts before every lower-case one.)
+#[tokio::test]
+async fn the_export_orders_member_names_without_regard_to_case() {
+    let emulator = Emulator::new();
+
+    // Rows: two publishing sources and two kinds of CloudTrail record, whose shared
+    // record carries the one mixed-case member set — a resource of `resources`.
+    for name in [
+        "aws.events@AWSAPICallviaCloudTrail",
+        "aws.s3@AWSServiceEventviaCloudTrail",
+    ] {
+        let described = emulator
+            .call("GET", &schema_uri(AWS_MANAGED_REGISTRY, name), None)
+            .await;
+        let document = ordered_document(name, &described.str_at("Content"));
+        let event_name = name.split_once('@').map(|(_, event)| event).unwrap_or("");
+        let resource_of = |schemas: &JsonNode, record: &str| {
+            schemas
+                .member(record)
+                .and_then(|record| record.member("properties"))
+                .and_then(|properties| properties.member("resources"))
+                .and_then(|resources| resources.member("items"))
+                .and_then(|items| items.member("properties"))
+                .map(member_names)
+                .unwrap_or_else(|| panic!("case {name:?}: a resource declares properties"))
+        };
+        let schemas = document
+            .member("components")
+            .and_then(|components| components.member("schemas"))
+            .unwrap_or_else(|| panic!("case {name:?}: the document carries components"));
+        let stored = resource_of(schemas, event_name);
+
+        // What the export must write: the stored names, ordered without regard to case.
+        let mut expected = stored.clone();
+        expected.sort_by_key(|member| (member.to_lowercase(), member.clone()));
+        // And what a case-sensitive comparison would write instead — a different order,
+        // so this case cannot pass under one.
+        let mut by_bytes = stored.clone();
+        by_bytes.sort();
+        assert_ne!(
+            expected, by_bytes,
+            "case {name:?}: this member set must distinguish the two orders, got {stored:?}"
+        );
+
+        let exported = emulator
+            .call(
+                "GET",
+                &export_uri(AWS_MANAGED_REGISTRY, name, "JSONSchemaDraft4"),
+                None,
+            )
+            .await;
+        let converted = ordered_document(name, &exported.str_at("Content"));
+        let definitions = converted
+            .member("definitions")
+            .unwrap_or_else(|| panic!("case {name:?}: the export carries definitions"));
+        let rendered = resource_of(definitions, event_name);
+        assert_eq!(
+            rendered, expected,
+            "case {name:?}: the export orders member names without regard to case, \
+             got {rendered:?}"
         );
     }
 }

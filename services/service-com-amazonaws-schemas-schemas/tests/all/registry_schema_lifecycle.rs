@@ -200,6 +200,24 @@ pub(crate) fn export_uri(registry: &str, schema: &str, export_type: &str) -> Str
     )
 }
 
+/// The keywords OpenAPI 3.0 adds to the JSON Schema vocabulary, which draft-04 does not
+/// define — so neither a schema keyword of one of these names nor a `properties` member
+/// declared under one survives a conversion to draft-04.
+///
+/// Source: the fixed fields the OpenAPI 3.0 Schema Object adds for its own purposes.
+/// Shared with the sibling suites: every case that asserts what a draft-04 export does
+/// NOT carry reads the set from here, so two suites cannot disagree about it.
+pub(crate) const OPENAPI_ONLY_KEYWORDS: &[&str] = &[
+    "nullable",
+    "readOnly",
+    "writeOnly",
+    "deprecated",
+    "discriminator",
+    "xml",
+    "example",
+    "externalDocs",
+];
+
 /// The `ListSchemaVersions` URI of one schema.
 pub(crate) fn versions_uri(registry: &str, schema: &str) -> String {
     format!("{}/versions", schema_uri(registry, schema))

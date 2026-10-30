@@ -11,10 +11,12 @@
 //! only schemas that include the provided keywords" — so the base set a search reports
 //! is every schema of the named registry, and each keyword only narrows it. What a
 //! schema is indexed under is the EVENT IT DESCRIBES: the event `source` and
-//! `detail-type` its document declares, which an EventBridge schema records in the
-//! `x-amazon-events-source` / `x-amazon-events-detail-type` extensions of its event
-//! component (every schema AWS publishes in `aws.events` carries both; see
-//! [`crate::state::aws_managed_schemas`]).
+//! `detail-type`. A document a caller wrote declares them itself, which an EventBridge
+//! schema records in the `x-amazon-events-source` / `x-amazon-events-detail-type`
+//! extensions of its event component; a schema the service PUBLISHES states them
+//! nowhere in its document (that document describes the event's `detail` and nothing
+//! around it), so the identity the catalogue publishes it under is read from the store
+//! instead (see [`crate::state::Schema::published_event`]).
 //!
 //! A schema's NAME is not an index entry, and neither is the rest of its document text:
 //! a search is a search of the registry's EVENT index, not a lookup by name and not a
@@ -344,7 +346,7 @@ fn canonical_keywords(keywords: &[String]) -> String {
 /// Whether `keywords` match a schema.
 ///
 /// A schema is selected when EVERY requested keyword occurs in one of the values the
-/// schema is INDEXED under — the event keywords its document declares
+/// schema is INDEXED under — the event keywords it carries
 /// ([`declared_event_keywords`]), and nothing else — matched case-insensitively as a
 /// substring, because a search is not a lookup by exact value and adding a keyword only
 /// ever narrows the result.
@@ -369,21 +371,29 @@ fn matches_every_keyword(schema: &crate::state::Schema, keywords: &[String]) -> 
         .all(|keyword| indexed.iter().any(|value| value.contains(keyword.as_str())))
 }
 
-/// The event keywords a schema declares, folded to lower case: the event `source` and
-/// `detail-type` its document records, which is what the registry indexes a schema
-/// under.
+/// The event keywords a schema is indexed under, folded to lower case: the event
+/// `source` and `detail-type` the schema records, which is what the registry indexes a
+/// schema under.
 ///
-/// EventBridge records them as the `x-amazon-events-source` and
-/// `x-amazon-events-detail-type` extensions of the document's event component. They are
-/// read from the stored document of EVERY version this service holds for the schema and
-/// wherever in the document they sit — the extensions are a property of a component, and
-/// which component is the event one differs between a discovered document and a
-/// converted one — so a schema whose later version declares another source is found
-/// under both. Folded ONCE per schema here rather than once per keyword at the match.
-/// A document that is not JSON declares nothing: the content of a stored version is
-/// whatever `CreateSchema` accepted for the type it was created as.
+/// A document a caller wrote records them as the `x-amazon-events-source` and
+/// `x-amazon-events-detail-type` extensions of its event component. They are read from
+/// the stored document of EVERY version this service holds for the schema and wherever
+/// in the document they sit — the extensions are a property of a component, and which
+/// component is the event one differs between a discovered document and a converted one
+/// — so a schema whose later version declares another source is found under both.
+/// A PUBLISHED schema states its event nowhere in its document's text (the catalogue
+/// publishes the event's `detail` and nothing about the envelope it arrives in), so its
+/// identity is read from where the store holds it:
+/// [`crate::state::Schema::published_event`]. Folded ONCE per schema here rather than
+/// once per keyword at the match. A document that is not JSON declares nothing: the
+/// content of a stored version is whatever `CreateSchema` accepted for the type it was
+/// created as.
 fn declared_event_keywords(schema: &crate::state::Schema) -> Vec<String> {
     let mut declared: Vec<String> = Vec::new();
+    if let Some(published) = &schema.published_event {
+        declared.push(published.source.to_lowercase());
+        declared.push(published.detail_type.to_lowercase());
+    }
     for version in schema.versions.values() {
         let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(&version.content) else {
             continue;

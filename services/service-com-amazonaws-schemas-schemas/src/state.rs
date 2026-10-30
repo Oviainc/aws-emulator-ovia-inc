@@ -1261,6 +1261,12 @@ pub struct Schema {
     /// for: a binding is identified by that pair, so one schema version can carry a
     /// binding per language and one language a binding per version.
     pub code_bindings: BTreeMap<(u64, String), CodeBinding>,
+    /// The event this schema is PUBLISHED for, where the service publishes it: the
+    /// identity the registry indexes a catalogue entry under, held beside the document
+    /// because a published document's text does not state it (see [`PublishedEvent`]).
+    /// `None` for a schema a caller created — its event is whatever its own document
+    /// declares.
+    pub published_event: Option<PublishedEvent>,
 }
 
 /// One version of a schema: the content a caller sent for it.
@@ -2072,8 +2078,8 @@ pub const AWS_SERVICE_EVENT_TYPES: &[ManagedEventType] = &[
 /// the `detail` is a JSON object.
 const UNDOCUMENTED_DETAIL: &str = r##"{"{EventName}":{"type":"object"}}"##;
 
-/// The `components.schemas` of the tag-change event, excluding the envelope
-/// [`event_schema_document`] renders around them.
+/// The `components.schemas` of the tag-change event, as
+/// [`event_schema_document`] publishes them.
 ///
 /// Source: the `detail` AWS documents for the tag-change event (the EventBridge event
 /// reference for tag changes). The component is named by
@@ -2149,9 +2155,12 @@ pub const AWS_MANAGED_REGISTRY: &str = "aws.events";
 /// converts a document to JSON Schema draft 4.
 pub const OPENAPI_COMPONENT_REF: &str = "#/components/schemas/";
 
-/// The component an AWS event schema's OpenAPI document roots at: the event envelope,
-/// whose `detail` references the event-specific component. Shared with
-/// `ExportSchema`, which promotes this component to the root of its draft-4 export.
+/// The component an OpenAPI event document names its EventBridge envelope by, where it
+/// declares one: the envelope whose `detail` references the event-specific component.
+/// Shared with `ExportSchema`, which promotes this component to the root of its draft-4
+/// export — a document that declares no envelope names no root among its co-equal
+/// components, and the published catalogue documents are of that kind (see
+/// [`event_schema_document`]).
 pub const EVENT_ENVELOPE_COMPONENT: &str = "AWSEvent";
 
 /// The event name the CloudTrail-delivered API-call schema carries in the catalogue,
@@ -2207,10 +2216,9 @@ pub const CLOUD_TRAIL_EVENT_FAMILY: &[(&str, &str)] = &[
     ),
 ];
 
-/// The `components.schemas` of a CloudTrail-delivered event's document, excluding the
-/// envelope [`event_schema_document`] renders around them. The record component is
-/// named by [`EVENT_COMPONENT_PLACEHOLDER`], because the same record is published under
-/// each member of [`CLOUD_TRAIL_EVENT_FAMILY`].
+/// The `components.schemas` of a CloudTrail-delivered event's document. The record
+/// component is named by [`EVENT_COMPONENT_PLACEHOLDER`], because the same record is
+/// published under each member of [`CLOUD_TRAIL_EVENT_FAMILY`].
 ///
 /// Source: the document AWS PUBLISHES for a CloudTrail-delivered event, as the recorded
 /// `DescribeSchema` of `aws.events@AWSAPICallviaCloudTrail` serves it — the model states
@@ -2224,14 +2232,19 @@ pub const CLOUD_TRAIL_EVENT_FAMILY: &[(&str, &str)] = &[
 ///
 /// * it constrains the record's members but marks none of them required — CloudTrail
 ///   fills a member only for the records it applies to;
-/// * the record's nested structures (a resource of `resources`, the `tlsDetails`, the
-///   `userIdentity` and its `sessionContext`) are declared INLINE, so the document
-///   carries no component beside the event's own and the envelope's;
-/// * a member CloudTrail fills only for some records — the free-form
-///   `requestParameters`/`responseElements`/`additionalEventData`/`eventContext`
-///   objects, the `addendum` a late-delivered record carries, the TLS and edge-device
-///   details — is marked `nullable`, OpenAPI 3.0's way of saying the member may be
-///   present and null; `ExportSchema` lowers that to draft-04's type union;
+/// * the record's nested structures (a resource of `resources`, the `tlsDetails` and
+///   the `userIdentity`) are declared INLINE, so the document carries no component
+///   beside the event's own;
+/// * the four free-form members of a record — `addendum`, `additionalEventData`,
+///   `requestParameters` and `responseElements`, whose contents are the called API's
+///   rather than CloudTrail's — are marked `nullable`, OpenAPI 3.0's way of saying the
+///   member may be present and null; `ExportSchema` lowers that to draft-04's type
+///   union. The document marks nothing else nullable: a member of a declared shape is
+///   either written or absent;
+/// * a member whose own members the published document does not declare (the
+///   edge-device and event contexts, the session context, the identity an
+///   `inScopeOf`/`invokedByDelegate` names) is constrained to be an object and no
+///   further;
 /// * `eventTime` carries both the `date-time` format and the `yyyy-MM-dd'T'HH:mm:ss'Z'`
 ///   pattern the record writes it in, which is what a generated binding parses it with.
 ///
@@ -2246,18 +2259,17 @@ const CLOUD_TRAIL_COMPONENTS: &str = r##"{
       "annotation": {"type": "string"},
       "apiVersion": {"type": "string"},
       "awsRegion": {"type": "string"},
-      "edgeDeviceDetails": {"type": "object", "nullable": true},
+      "edgeDeviceDetails": {"type": "object"},
       "errorCode": {"type": "string"},
       "errorMessage": {"type": "string"},
       "eventCategory": {"type": "string"},
-      "eventContext": {"type": "object", "nullable": true},
+      "eventContext": {"type": "object"},
       "eventID": {"type": "string"},
       "eventName": {"type": "string"},
       "eventSource": {"type": "string"},
       "eventTime": {"pattern": "yyyy-MM-dd'T'HH:mm:ss'Z'", "type": "string", "format": "date-time"},
       "eventType": {"type": "string"},
       "eventVersion": {"type": "string"},
-      "insightDetails": {"type": "object", "nullable": true},
       "managementEvent": {"type": "boolean"},
       "readOnly": {"type": "boolean"},
       "recipientAccountId": {"type": "string"},
@@ -2281,7 +2293,6 @@ const CLOUD_TRAIL_COMPONENTS: &str = r##"{
       "sourceIPAddress": {"type": "string"},
       "tlsDetails": {
         "type": "object",
-        "nullable": true,
         "properties": {
           "cipherSuite": {"type": "string"},
           "clientProvidedHostHeader": {"type": "string"},
@@ -2297,43 +2308,19 @@ const CLOUD_TRAIL_COMPONENTS: &str = r##"{
           "accountId": {"type": "string"},
           "arn": {"type": "string"},
           "credentialId": {"type": "string"},
+          "identityProvider": {"type": "string"},
+          "inScopeOf": {"type": "object"},
           "invokedBy": {"type": "string"},
+          "invokedByDelegate": {"type": "object"},
           "onBehalfOf": {
             "type": "object",
-            "nullable": true,
             "properties": {
-              "backTraceId": {"type": "string"},
+              "identityStoreArn": {"type": "string"},
               "userId": {"type": "string"}
             }
           },
           "principalId": {"type": "string"},
-          "sessionContext": {
-            "type": "object",
-            "properties": {
-              "attributes": {
-                "type": "object",
-                "properties": {
-                  "creationDate": {"type": "string", "format": "date-time"},
-                  "mfaAuthenticated": {"type": "string"}
-                }
-              },
-              "ec2RoleDelivery": {"type": "string"},
-              "sessionIssuer": {
-                "type": "object",
-                "properties": {
-                  "accountId": {"type": "string"},
-                  "arn": {"type": "string"},
-                  "principalId": {"type": "string"},
-                  "type": {"type": "string"},
-                  "userName": {"type": "string"}
-                }
-              },
-              "sourceIdentity": {"type": "string"},
-              "webIdFederationData": {"type": "object", "nullable": true}
-            }
-          },
-          "type": {"type": "string"},
-          "userName": {"type": "string"}
+          "sessionContext": {"type": "object"}
         }
       }
     }
@@ -2624,8 +2611,8 @@ pub const AWS_MANAGED_REGISTRIES: &[&str] = &[AWS_MANAGED_REGISTRY];
 /// One AWS event type the service-owned catalogue holds a schema for.
 ///
 /// It is the event's IDENTITY plus the shape of its `detail`; the OpenAPI document
-/// itself is rendered from them by [`event_schema_document`], because the envelope
-/// around `detail` is the same for every AWS event.
+/// itself is rendered from them by [`event_schema_document`], because the header the
+/// catalogue publishes a document under is the same for every AWS event.
 #[derive(Debug, Clone, Copy)]
 pub struct ManagedEventType {
     /// The event source that publishes it: `aws.<service>`.
@@ -2635,9 +2622,9 @@ pub struct ManagedEventType {
     /// The name the catalogue publishes the event type under: the `<EventName>` half
     /// of `<source>@<EventName>`, which AWS derives from the `detail_type`.
     pub event_name: &'static str,
-    /// The document's `components.schemas` minus the envelope: the component the
-    /// envelope's `detail` references (the one named [`Self::event_name`]) together
-    /// with everything that component references in turn.
+    /// The document's `components.schemas`: the component describing the event's
+    /// `detail` (the one named [`Self::event_name`]) together with everything that
+    /// component references in turn.
     pub components: &'static str,
 }
 
@@ -2695,6 +2682,10 @@ impl ManagedEventType {
         let name = self.schema_name();
         Some(ManagedSchema {
             description: managed_schema_description(&name),
+            event: PublishedEvent {
+                source: self.source.to_string(),
+                detail_type: self.detail_type.to_string(),
+            },
             content: event_schema_document(
                 self.source,
                 self.detail_type,
@@ -2725,6 +2716,23 @@ pub struct ManagedSchema {
     /// How many versions the catalogue publishes for it — see
     /// [`managed_version_count`].
     pub version_count: u64,
+    /// The event this entry publishes a schema FOR — see [`PublishedEvent`].
+    pub event: PublishedEvent,
+}
+
+/// The event a published catalogue entry describes: the `source` that delivers it and
+/// the `detail-type` it is delivered under.
+///
+/// A published document describes the event's `detail` and states the event's identity
+/// nowhere in its text (see [`event_schema_document`]), so the identity is held beside
+/// the document — it is what `SearchSchemas` indexes a published schema under, the same
+/// two values a document a caller wrote declares as its own event keywords.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedEvent {
+    /// The event source that publishes it: `aws.<service>`.
+    pub source: String,
+    /// The `detail-type` the event is delivered under.
+    pub detail_type: String,
 }
 
 /// When the AWS-managed catalogue's entry named `schema_name` was last modified.
@@ -2846,25 +2854,22 @@ pub fn managed_schema_description(schema_name: &str) -> Option<String> {
     ))
 }
 
-/// Render the `OpenApi3` document of one AWS event type: the envelope every AWS event
-/// shares, wrapped around the `components` of its `detail`.
+/// Render the `OpenApi3` document of one AWS event type: the `components.schemas` of
+/// its `detail`, under the document header the catalogue publishes them with.
 ///
-/// The envelope is the same for every AWS event — the EventBridge event fields
-/// (`detail-type`, `source`, `time`, `region`, `account`, `id`, `resources`,
-/// `version`) with `detail` referencing the event-specific component — so it is
-/// rendered here rather than repeated per entry.
+/// A published catalogue document describes the EVENT TYPE, i.e. the `detail` AWS
+/// delivers for it: its `components.schemas` are the component named after the event
+/// together with whatever that component references in turn, and nothing else. It
+/// declares no EventBridge envelope around them and stamps no `x-amazon-events-*`
+/// extension on them — the document AWS publishes for a catalogue entry carries one
+/// component per schema the event's `detail` needs, with `type` before `properties`,
+/// and that is the whole of it.
 ///
 /// The document's `info.title` is the sentence the catalogue titles a published event
 /// schema with: the event's `detail-type`, then which source publishes it
 /// (`AWS API Call via CloudTrail published by aws.events`). It names the EVENT, not the
 /// schema's component, so a client that renders the title shows the event the document
 /// describes; `ExportSchema` carries the same title onto the draft-04 translation.
-///
-/// The `x-amazon-events-detail-type` and `x-amazon-events-source` extensions AWS's
-/// documents carry are stamped on BOTH the envelope and the event's own component: they
-/// record which event the document is for, and that is what the registry indexes a
-/// schema under (see `SearchSchemas`), so they travel with the component a converted
-/// document keeps.
 ///
 /// The document is assembled through [`JsonNode`], not [`serde_json::Value`], because
 /// the published document's MEMBER ORDER is part of it: it opens with `openapi`, then
@@ -2874,31 +2879,25 @@ pub fn managed_schema_description(schema_name: &str) -> Option<String> {
 /// and `Content` is text a client caches, diffs and hashes.
 ///
 /// `None` when `components` is not a JSON object, or does not define the component the
-/// envelope's `detail` must reference (the one named after the event) as an object:
-/// that is a document with nothing to describe, and the catalogue leaves it out rather
-/// than seeding a schema whose `detail` dangles.
+/// document is published for (the one named after the event) as an object: that is a
+/// document with nothing to describe, and the catalogue leaves it out rather than
+/// seeding a schema that describes no event.
 fn event_schema_document(
     source: &str,
     detail_type: &str,
     event_name: &str,
     components: &str,
 ) -> Option<String> {
-    let JsonNode::Object(mut schemas) = JsonNode::parse(components)? else {
+    let JsonNode::Object(schemas) = JsonNode::parse(components)? else {
         return None;
     };
     let event = schemas
-        .iter_mut()
+        .iter()
         .find(|(name, _)| name == event_name)
         .map(|(_, component)| component)?;
     if !matches!(event, JsonNode::Object(_)) {
         return None;
     }
-    event.set_member("x-amazon-events-detail-type", JsonNode::text(detail_type));
-    event.set_member("x-amazon-events-source", JsonNode::text(source));
-    schemas.push((
-        EVENT_ENVELOPE_COMPONENT.to_string(),
-        event_envelope(source, detail_type, event_name),
-    ));
     Some(
         JsonNode::Object(vec![
             ("openapi".to_string(), JsonNode::text(MANAGED_OPENAPI_VERSION)),
@@ -2928,76 +2927,6 @@ const MANAGED_OPENAPI_VERSION: &str = "3.0.0";
 /// The `info.version` every published event document carries: the document describes
 /// one event type, which the catalogue publishes one revision of at a time.
 const MANAGED_DOCUMENT_VERSION: &str = "1.0.0";
-
-/// The [`EVENT_ENVELOPE_COMPONENT`] of a published event document: the EventBridge
-/// event fields every AWS event carries, with `detail` referencing the component that
-/// describes THIS event's `detail`.
-///
-/// Its members are in the order the published documents write them — `type`, the
-/// `required` envelope fields, the two `x-amazon-events-*` extensions, then
-/// `properties` — because the document is served as written.
-fn event_envelope(source: &str, detail_type: &str, event_name: &str) -> JsonNode {
-    let string = || JsonNode::Object(vec![("type".to_string(), JsonNode::text("string"))]);
-    JsonNode::Object(vec![
-        ("type".to_string(), JsonNode::text("object")),
-        (
-            "required".to_string(),
-            JsonNode::List(
-                [
-                    "detail-type",
-                    "resources",
-                    "detail",
-                    "id",
-                    "source",
-                    "time",
-                    "region",
-                    "version",
-                    "account",
-                ]
-                .iter()
-                .map(|field| JsonNode::text(field))
-                .collect(),
-            ),
-        ),
-        (
-            "x-amazon-events-detail-type".to_string(),
-            JsonNode::text(detail_type),
-        ),
-        ("x-amazon-events-source".to_string(), JsonNode::text(source)),
-        (
-            "properties".to_string(),
-            JsonNode::Object(vec![
-                ("account".to_string(), string()),
-                (
-                    "detail".to_string(),
-                    JsonNode::Object(vec![(
-                        "$ref".to_string(),
-                        JsonNode::Text(format!("{OPENAPI_COMPONENT_REF}{event_name}")),
-                    )]),
-                ),
-                ("detail-type".to_string(), string()),
-                ("id".to_string(), string()),
-                ("region".to_string(), string()),
-                (
-                    "resources".to_string(),
-                    JsonNode::Object(vec![
-                        ("type".to_string(), JsonNode::text("array")),
-                        ("items".to_string(), string()),
-                    ]),
-                ),
-                ("source".to_string(), string()),
-                (
-                    "time".to_string(),
-                    JsonNode::Object(vec![
-                        ("type".to_string(), JsonNode::text("string")),
-                        ("format".to_string(), JsonNode::text("date-time")),
-                    ]),
-                ),
-                ("version".to_string(), string()),
-            ]),
-        ),
-    ])
-}
 
 /// The title the catalogue gives the document of one published event type:
 /// `<detail-type> published by <source>`.
@@ -3131,6 +3060,10 @@ fn aws_managed_registries() -> BTreeMap<String, Registry> {
                 versions,
                 minted_by_token: BTreeMap::new(),
                 code_bindings: BTreeMap::new(),
+                // A published entry's document does not state the event it describes,
+                // so the identity the catalogue publishes it under is stored beside the
+                // document: it is what a keyword search over this registry matches.
+                published_event: Some(entry.event.clone()),
             },
         );
     }
@@ -5031,6 +4964,7 @@ mod tests {
                         ))
                         .collect(),
                         minted_by_token: BTreeMap::new(),
+                        published_event: None,
                     },
                 );
             }
@@ -5172,9 +5106,9 @@ mod tests {
                 version.content, entry.content,
                 "case {schema_name:?}: the seeded content is stored verbatim"
             );
-            // The catalogue's documents are what ExportSchema converts, so each
-            // one has to BE an OpenAPI 3 document whose envelope's `detail`
-            // references a component the document defines.
+            // The catalogue's documents are what ExportSchema converts, so each one has
+            // to BE an OpenAPI 3 document that defines the component it is published
+            // for — the one named after the event — and no reference in it may dangle.
             let parsed: ::serde_json::Value = ::serde_json::from_str(&entry.content)
                 .unwrap_or_else(|e| panic!("case {schema_name:?}: must be JSON: {e}"));
             let components = &parsed["components"]["schemas"];
@@ -5182,20 +5116,50 @@ mod tests {
                 components.is_object(),
                 "case {schema_name:?}: must carry components.schemas, got {parsed:?}"
             );
-            let detail = components[EVENT_ENVELOPE_COMPONENT]["properties"]["detail"]["$ref"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            let referenced = detail
-                .strip_prefix(OPENAPI_COMPONENT_REF)
-                .unwrap_or_default()
-                .to_string();
+            let event_name = schema_name
+                .split_once('@')
+                .map(|(_, event_name)| event_name)
+                .unwrap_or_else(|| panic!("case {schema_name:?}: is <source>@<EventName>"));
             assert!(
-                !referenced.is_empty() && components[&referenced].is_object(),
-                "case {schema_name:?}: the envelope's detail must reference a defined \
-                 component, got {detail:?}"
+                components[event_name].is_object(),
+                "case {schema_name:?}: must define the component it is published for, \
+                 got {components:?}"
             );
+            for referenced in referenced_components(&parsed) {
+                assert!(
+                    components[&referenced].is_object(),
+                    "case {schema_name:?}: the reference to {referenced:?} must name a \
+                     defined component, got {components:?}"
+                );
+            }
         }
+    }
+
+    /// Every component a document references by `$ref`, at any depth.
+    fn referenced_components(value: &::serde_json::Value) -> Vec<String> {
+        let mut referenced: Vec<String> = Vec::new();
+        match value {
+            ::serde_json::Value::Object(members) => {
+                for (name, member) in members {
+                    if name == "$ref" {
+                        if let Some(component) = member
+                            .as_str()
+                            .and_then(|target| target.strip_prefix(OPENAPI_COMPONENT_REF))
+                        {
+                            referenced.push(component.to_string());
+                        }
+                    }
+                    referenced.extend(referenced_components(member));
+                }
+            }
+            ::serde_json::Value::Array(items) => {
+                for item in items {
+                    referenced.extend(referenced_components(item));
+                }
+            }
+            _ => {}
+        }
+        referenced
     }
 
     /// Every event type the catalogue names is published under `<source>@<EventName>`
@@ -5290,6 +5254,7 @@ mod tests {
             .collect(),
             minted_by_token: BTreeMap::new(),
             code_bindings: BTreeMap::new(),
+            published_event: None,
         };
 
         let mut minted = vec![1];

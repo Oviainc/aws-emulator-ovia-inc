@@ -578,9 +578,9 @@ fn render(
 ///
 /// That order is neither the sample's nor alphabetical. AWS holds a schema's required
 /// member names in a hash SET and writes them out in ITS iteration order, which groups
-/// the names by hash bucket — the order the `AWSEvent` envelope of every schema AWS
-/// publishes is listed in (see [`crate::state::aws_managed_schemas`], which the unit
-/// test below pins this function against). It is a deterministic function of the names
+/// the names by hash bucket — the order the `AWSEvent` envelope of a published AWS event
+/// document lists its nine members in (the unit test below pins this function against
+/// those names). It is a deterministic function of the names
 /// themselves, so it is reproduced rather than guessed: the document is the product of
 /// this operation, and clients hash, diff and generate code from its text.
 ///
@@ -589,8 +589,8 @@ fn render(
 /// that share a bucket.
 ///
 /// What this is pinned by, and what it therefore assumes: the published envelope is the
-/// one member set this repository holds AWS's own bytes for (every catalogue entry lists
-/// the same nine names), and reproducing it takes both the bucket grouping and that
+/// one member set this repository holds AWS's own bytes for, and reproducing it takes
+/// both the bucket grouping and that
 /// sorted insertion order. A set of names AWS inserted in some other order would be
 /// written in some other order than this, and nothing available here would show it; the
 /// envelope's nine names and the recorded three-member sample both come out exactly
@@ -856,42 +856,41 @@ mod tests {
     }
 
     /// The `required` order this operation writes is the one AWS's own documents
-    /// carry: the `AWSEvent` envelope of every schema the service-owned catalogue
-    /// publishes lists its nine members in it, and that list is AWS's own — so this
-    /// pins [`in_required_order`] against AWS's bytes rather than against this test's
+    /// carry: the `AWSEvent` envelope of an EventBridge event document lists its nine
+    /// members in this order, and that list is AWS's own — so this pins
+    /// [`in_required_order`] against AWS's bytes rather than against this test's
     /// expectation.
+    ///
+    /// Source: the `required` list of the `AWSEvent` component of the OpenAPI document
+    /// AWS publishes for an EventBridge event, as a recorded read of one serves it.
+    const PUBLISHED_ENVELOPE_REQUIRED: &[&str] = &[
+        "detail-type",
+        "resources",
+        "detail",
+        "id",
+        "source",
+        "time",
+        "region",
+        "version",
+        "account",
+    ];
+
+    /// [`in_required_order`] reproduces the order AWS writes a `required` list in, held
+    /// against the published envelope's nine names ([`PUBLISHED_ENVELOPE_REQUIRED`]).
     #[test]
     fn required_is_ordered_as_the_published_aws_event_envelope() {
-        let mut envelopes = 0;
-        for published in crate::state::aws_managed_schemas() {
-            let document: Value = serde_json::from_str(&published.content).unwrap_or_else(|e| {
-                panic!("case {}: the catalogue is JSON ({e})", published.name)
-            });
-            let envelope = &document["components"]["schemas"]
-                [crate::state::EVENT_ENVELOPE_COMPONENT]["required"];
-            let published_order: Vec<String> = envelope
-                .as_array()
-                .unwrap_or_else(|| {
-                    panic!("case {}: the envelope lists its members", published.name)
-                })
-                .iter()
-                .map(|name| name.as_str().unwrap_or_default().to_string())
-                .collect();
-            // The names as this operation holds them before it writes them: the
-            // keys of a sorted map.
-            let mut sorted = published_order.clone();
-            sorted.sort();
-            let ordered = in_required_order(sorted);
-            assert_eq!(
-                ordered, published_order,
-                "case {}: expected {published_order:?}, got {ordered:?}",
-                published.name
-            );
-            envelopes += 1;
-        }
-        assert!(
-            envelopes > 0,
-            "the catalogue must publish at least one envelope to pin the order against"
+        let published_order: Vec<String> = PUBLISHED_ENVELOPE_REQUIRED
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        // The names as this operation holds them before it writes them: the keys of a
+        // sorted map.
+        let mut sorted = published_order.clone();
+        sorted.sort();
+        let ordered = in_required_order(sorted);
+        assert_eq!(
+            ordered, published_order,
+            "the published envelope's order: expected {published_order:?}, got {ordered:?}"
         );
     }
 
