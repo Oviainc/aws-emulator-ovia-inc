@@ -188,9 +188,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(deny)?;
 
-        // 2. The campaign, and the recipe type this operation serves.
+        // 2. The campaign, and the recipe type this operation serves. WHICH operation
+        //    serves a campaign is the registry's rule, stated once in
+        //    [`RecipeType::operation`]: this handler asks it with its own name
+        //    ([`RecipeType::served_by`]) rather than naming the recipe type it expects,
+        //    so a recipe type added to the enum cannot leak into the wrong operation.
         let campaign = guard.campaign(campaign_arn).map_err(deny)?.clone();
-        if campaign.recipe_type != RecipeType::PersonalizedActions {
+        if !campaign.recipe_type.served_by(Self::NAME) {
             return Err(invalid(format!(
                 "Campaign {} deploys a solution version trained with the {} recipe type; this \
                  campaign must deploy a solution version trained with a {} recipe.",

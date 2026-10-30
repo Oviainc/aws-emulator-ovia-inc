@@ -134,6 +134,18 @@ impl RecipeType {
             Self::PersonalizedActions => "GetActionRecommendations",
         }
     }
+
+    /// Whether the runtime operation NAMED by `operation` serves a campaign of this
+    /// recipe type.
+    ///
+    /// A campaign is served by exactly the one operation [`RecipeType::operation`]
+    /// names, and refused by the other two, so every handler asks this with its own
+    /// `Operation::NAME` instead of re-stating the mapping as its own predicate: the
+    /// mapping lives in [`RecipeType::operation`]'s exhaustive `match` alone, which the
+    /// compiler forces a new recipe type to update.
+    pub fn served_by(self, operation: &str) -> bool {
+        self.operation() == operation
+    }
 }
 
 /// Which personalization input a resolved resource needs in the request.

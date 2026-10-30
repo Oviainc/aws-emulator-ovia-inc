@@ -130,7 +130,7 @@ use super::types::*;
 use std::time::SystemTime;
 
 use crate::state::{
-    self as registry, scoring, BoundFilter, Denied, Entity, Item, RecipeType, RequiredInput,
+    self as registry, scoring, BoundFilter, Denied, Entity, Item, RequiredInput,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -238,6 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // 2. Resolve the campaign or recommender this request recommends from.
         let resolved = resolve(
             &guard,
+            Self::NAME,
             registry::present(input.campaign_arn.as_deref()),
             registry::present(input.recommender_arn.as_deref()),
         )?;
@@ -409,8 +410,14 @@ struct Resolved {
 /// recommenders, the recommender's ARN is required": the two are ALTERNATIVES, so a
 /// request naming neither identifies nothing to recommend from and one naming both is
 /// contradictory.
+///
+/// `operation` is the caller's own `Operation::NAME`, which a resolved CAMPAIGN'S
+/// recipe type has to be served by ([`crate::state::RecipeType::served_by`]): the
+/// mapping from recipe type to operation is the registry's, so this function does not
+/// re-state which recipe types it refuses.
 fn resolve(
     state: &crate::state::ComAmazonawsPersonalizeruntimeAmazonpersonalizeruntimeState,
+    operation: &str,
     campaign_arn: Option<&str>,
     recommender_arn: Option<&str>,
 ) -> Result<Resolved, GetRecommendationsError> {
@@ -421,10 +428,7 @@ fn resolve(
         (None, None) => Err(invalid("Either campaignArn or recommenderArn is required.")),
         (Some(arn), None) => {
             let campaign = state.campaign(arn).map_err(deny)?;
-            if matches!(
-                campaign.recipe_type,
-                RecipeType::PersonalizedRanking | RecipeType::PersonalizedActions
-            ) {
+            if !campaign.recipe_type.served_by(operation) {
                 return Err(invalid(format!(
                     "Campaign {arn} deploys a solution version trained with the {} recipe type; \
                      use the {} API.",

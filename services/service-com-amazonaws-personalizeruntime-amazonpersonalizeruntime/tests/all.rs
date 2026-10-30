@@ -31,6 +31,8 @@ mod metadata_member_presence;
 mod optional_input_refusal_order;
 #[path = "all/promotion_share.rs"]
 mod promotion_share;
+#[path = "all/recipe_type_serving_operation.rs"]
+mod recipe_type_serving_operation;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/repeated_input_list_ids.rs"]

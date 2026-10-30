@@ -223,8 +223,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //    satisfies, so the boundary has already refused anything that names no
         //    campaign at all: every value reaching this line is an ARN the boundary
         //    admitted, which the registry either resolves or reports unresolvable.
+        //    WHICH operation serves a campaign is the registry's rule, stated once in
+        //    [`RecipeType::operation`] and asked here with this operation's own name
+        //    ([`RecipeType::served_by`]).
         let campaign = guard.campaign(&input.campaign_arn).map_err(deny)?.clone();
-        if campaign.recipe_type != RecipeType::PersonalizedRanking {
+        if !campaign.recipe_type.served_by(Self::NAME) {
             return Err(invalid(format!(
                 "Campaign {} deploys a solution version trained with the {} recipe type; the \
                  solution backing a GetPersonalizedRanking campaign must have been created using \
