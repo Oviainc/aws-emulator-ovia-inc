@@ -46,22 +46,35 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
-/// Reword a boundary constraint violation on a member whose OPERATION admits only a
-/// proper subset of the enum shape it targets.
+/// What Cost Explorer answers for a `Granularity` outside the modelled enum.
 ///
-/// The boundary validator can only check the shape, so its report enumerates the shape's
-/// whole value set — which, for such a member, advertises values the operation refuses.
-/// Cost Explorer answers those members with a fixed, operation-scoped sentence naming the
-/// values it does admit, echoing neither the rejected value nor the enum. One row per
-/// narrowed member; everything else keeps the framework's wording.
+/// A FIXED sentence: it states the granularities the service accepts in the service's own
+/// words and carries nothing from the request — neither the rejected value, nor the member
+/// path, nor the modelled value set — so it is the same sentence for every unsupported
+/// granularity and for every operation that takes the member. The boundary validator's
+/// generic enum report states all three of those, which is why `override_refusal` reroutes
+/// a `granularity` enum refusal to this text.
+pub const GRANULARITY_REJECTION_MESSAGE: &str = "Granularity can only be MONTHLY, DAILY or HOURLY";
+
+/// Reword a boundary constraint violation on an enum member this service states in its
+/// own fixed words rather than as a constraint report.
 ///
-/// A row matches on the member path AND on the narrowing itself — the value set the
-/// member was checked against must strictly contain the operation's admissible set (see
-/// [`narrows`]). The path alone would be enough today (`context` is the only
-/// `Context`-typed member in the whole service, `GetDimensionValuesRequest$Context`), but
-/// a same-named member of an UNRELATED enum added later would then silently inherit this
-/// operation's sentence; the narrowing test declines it instead.
-fn narrowed_enum_refusal(violation: &Violation) -> Option<Refused> {
+/// Two kinds of member qualify, and both are answered with a fixed sentence that echoes
+/// neither the rejected value nor the member path:
+///
+/// * a member whose OPERATION admits only a proper subset of the enum shape it targets —
+///   the boundary validator can only check the shape, so its report advertises values the
+///   operation refuses;
+/// * a member the service itself words, where the shape's whole value set is admissible
+///   but the service states the rule in its own vocabulary instead of the framework's.
+///
+/// One row per such member; everything else keeps the framework's wording.
+///
+/// A row matches on the member path AND on the value set the member was checked against,
+/// so the row is tied to the enum shape rather than to a name. The path alone would be
+/// enough today, but a same-named member of an UNRELATED enum added later would then
+/// silently inherit this service's sentence; the value-set test declines it instead.
+fn service_enum_refusal(violation: &Violation) -> Option<Refused> {
     let (code, message) = match (violation.path.as_str(), &violation.kind) {
         // `GetDimensionValuesRequest$Context`: documented as "This can be RESERVATIONS or
         // COST_AND_USAGE", while the `Context` enum also carries `SAVINGS_PLANS`. A value
@@ -78,8 +91,16 @@ fn narrowed_enum_refusal(violation: &Violation) -> Option<Refused> {
                 crate::ops::get_dimension_values::CONTEXT_REJECTION_MESSAGE,
             )
         }
-        // Every other refusal — including an enum member whose operation admits the whole
-        // shape — keeps the framework's generic constraint report.
+        // Any operation's `Granularity` member (`GetCostAndUsage`,
+        // `GetCostAndUsageWithResources`, the forecasts, the reservation and savings-plans
+        // reports): the whole modelled enum is a value set the service names itself, so a
+        // value outside it is refused with Cost Explorer's own sentence.
+        ("granularity", ViolationKind::EnumValue(checked))
+            if same_values(crate::ops::types::GRANULARITY_VALUES, checked) =>
+        {
+            ("ValidationException", GRANULARITY_REJECTION_MESSAGE)
+        }
+        // Every other refusal keeps the framework's generic constraint report.
         _ => return None,
     };
     Some(Refused {
@@ -94,6 +115,16 @@ fn narrowed_enum_refusal(violation: &Violation) -> Option<Refused> {
 fn narrows(admissible: &[&str], checked: &[String]) -> bool {
     checked.len() > admissible.len()
         && admissible
+            .iter()
+            .all(|value| checked.iter().any(|checked| checked == value))
+}
+
+/// Whether the `checked` value set the boundary validator reported is exactly `expected`,
+/// as a SET: the validator reports a shape's values in the model's order, which need not
+/// be the order the generated value list carries them in.
+fn same_values(expected: &[&str], checked: &[String]) -> bool {
+    checked.len() == expected.len()
+        && expected
             .iter()
             .all(|value| checked.iter().any(|checked| checked == value))
 }
@@ -152,13 +183,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service reword it. Cost Explorer keeps the framework's generic
-        // `ValidationException` report for almost everything — but not for a member
-        // whose operation admits only part of the enum shape it targets, where that
-        // report would name values the operation refuses. `narrowed_enum_refusal`
-        // holds one row per such member and declines the rest, so the generic
-        // validator stays in place for every other operation and member.
+        // `ValidationException` report for almost everything — but not for the enum
+        // members it states in its own fixed words: a member whose operation admits
+        // only part of the enum shape it targets, where that report would name values
+        // the operation refuses, and a member whose rule the service words itself.
+        // `service_enum_refusal` holds one row per such member and declines the rest,
+        // so the generic validator stays in place for every other operation and
+        // member.
         match refusal {
-            Refusal::Invalid(violations) => violations.iter().find_map(narrowed_enum_refusal),
+            Refusal::Invalid(violations) => violations.iter().find_map(service_enum_refusal),
             // Authentication refusals, and any refusal kind added later, keep the
             // framework's wording.
             _ => None,
@@ -215,10 +248,20 @@ mod tests {
         }
     }
 
+    /// The value set the boundary validator reports for the `Granularity` enum shape, in
+    /// the model's own order (`smithy_query(query="shape", shape="Granularity")`) — which
+    /// is NOT the order the generated value list carries.
+    fn granularity_enum() -> Vec<String> {
+        ["DAILY", "MONTHLY", "HOURLY"]
+            .iter()
+            .map(|value| value.to_string())
+            .collect()
+    }
+
     /// The narrowed member is reworded to the operation's fixed sentence.
     #[test]
     fn a_narrowed_enum_member_takes_the_operation_scoped_sentence() {
-        let refused = narrowed_enum_refusal(&violation(
+        let refused = service_enum_refusal(&violation(
             "context",
             ViolationKind::EnumValue(context_enum()),
         ))
@@ -230,6 +273,22 @@ mod tests {
                 crate::ops::get_dimension_values::CONTEXT_REJECTION_MESSAGE
             ),
             "case \"context against the whole Context enum\": got {refused:?}"
+        );
+    }
+
+    /// A `granularity` member checked against the whole `Granularity` enum is reworded to
+    /// the service's own sentence, whatever order the value set arrives in.
+    #[test]
+    fn a_granularity_member_takes_the_services_own_sentence() {
+        let refused = service_enum_refusal(&violation(
+            "granularity",
+            ViolationKind::EnumValue(granularity_enum()),
+        ))
+        .expect("case \"granularity against the Granularity enum\": expected a rewording");
+        assert_eq!(
+            (refused.code.as_str(), refused.message.as_str()),
+            ("ValidationException", GRANULARITY_REJECTION_MESSAGE),
+            "case \"granularity against the Granularity enum\": got {refused:?}"
         );
     }
 
@@ -264,8 +323,24 @@ mod tests {
                 violation("context", ViolationKind::MaxLength(8)),
             ),
             (
-                "another enum member this service does not narrow",
+                "another enum member this service does not word itself",
                 violation("dimension", ViolationKind::EnumValue(context_enum())),
+            ),
+            (
+                "a granularity member of an unrelated enum",
+                violation(
+                    "granularity",
+                    ViolationKind::EnumValue(
+                        ["HOURLY", "WEEKLY"]
+                            .iter()
+                            .map(|value| value.to_string())
+                            .collect(),
+                    ),
+                ),
+            ),
+            (
+                "a granularity member failing a constraint that is not the enum",
+                violation("granularity", ViolationKind::MaxLength(7)),
             ),
             (
                 "an absent required member",
@@ -278,7 +353,7 @@ mod tests {
         ];
         for (label, violation) in cases {
             assert_eq!(
-                narrowed_enum_refusal(&violation),
+                service_enum_refusal(&violation),
                 None,
                 "case {label:?}: expected the framework's own wording"
             );

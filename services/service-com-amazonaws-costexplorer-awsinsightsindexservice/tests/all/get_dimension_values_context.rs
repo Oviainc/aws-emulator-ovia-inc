@@ -194,14 +194,17 @@ async fn every_other_refusal_keeps_the_generic_constraint_report() {
             path: "timePeriod",
         },
         Case {
+            // `TermInYears` targets the `TermInYears` enum (values ONE_YEAR,
+            // THREE_YEARS) and this service words no sentence of its own for it, so the
+            // generic report stands. `GetCostAndUsage`'s `Granularity` used to sit here;
+            // it has its own fixed sentence now (see `granularity_refusal.rs`).
             label: "another operation's enum member, outside its enum",
-            operation: "GetCostAndUsage",
+            operation: "GetReservationPurchaseRecommendation",
             body: json!({
-                "TimePeriod": {"Start": "2024-01-01", "End": "2024-02-01"},
-                "Granularity": "NOT_A_GRANULARITY",
-                "Metrics": ["UnblendedCost"],
+                "Service": "Amazon Elastic Compute Cloud - Compute",
+                "TermInYears": "NOT_A_TERM",
             }),
-            path: "granularity",
+            path: "termInYears",
         },
     ];
 

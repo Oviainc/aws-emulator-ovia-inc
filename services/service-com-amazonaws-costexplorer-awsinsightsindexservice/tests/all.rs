@@ -15,6 +15,8 @@
 mod cost_category_definitions;
 #[path = "all/get_dimension_values_context.rs"]
 mod get_dimension_values_context;
+#[path = "all/granularity_refusal.rs"]
+mod granularity_refusal;
 // The shared HTTP harness every suite above drives the service through. Declared before
 // nothing in particular — a test-target crate root's `mod`s are order-independent — but
 // kept with the suites so a new suite sees it.
