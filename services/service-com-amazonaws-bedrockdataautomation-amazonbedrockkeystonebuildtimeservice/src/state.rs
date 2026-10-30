@@ -5,7 +5,8 @@
 //! This module owns the Blueprint record the control-plane operations
 //! (`CreateBlueprint`, `GetBlueprint`, `ListBlueprints`, `UpdateBlueprint`,
 //! `DeleteBlueprint`, `CreateBlueprintVersion`) share and the DataAutomationProject
-//! record `CreateDataAutomationProject` and `GetDataAutomationProject` share, plus
+//! record `CreateDataAutomationProject`, `GetDataAutomationProject` and
+//! `UpdateDataAutomationProject` share, plus
 //! the few helpers more than one of those handlers needs: minting a resource ARN,
 //! resolving the request's region, and the opaque `nextToken` codec used by the
 //! paginated list. Operation BEHAVIOUR stays in `src/ops/<operation>.rs`; only the
@@ -95,8 +96,10 @@ pub const PROJECT_IN_PROGRESS: &str = "IN_PROGRESS";
 /// See [`PROJECT_IN_PROGRESS`].
 pub const PROJECT_COMPLETED: &str = "COMPLETED";
 
-/// How long after `CreateDataAutomationProject` the clock owes the created
-/// project's `IN_PROGRESS` -> `COMPLETED` transition.
+/// How long after `CreateDataAutomationProject` — and after an
+/// `UpdateDataAutomationProject`, which re-specifies what the project produces and
+/// so re-starts the same build — the clock owes the project's `IN_PROGRESS` ->
+/// `COMPLETED` transition.
 ///
 /// AWS documents no duration for it — `CreateDataAutomationProjectResponse$status`
 /// is modelled as one of `IN_PROGRESS`/`COMPLETED`/`FAILED` precisely because the
@@ -133,16 +136,18 @@ pub struct DataAutomationProjectRecord {
     pub last_modified_time: ::aws_smithy_types::DateTime,
     pub kms_key_id: Option<String>,
     pub kms_encryption_context: Option<HashMap<String, String>>,
-    /// When the create this record came from stops being in progress. Set once, at
-    /// creation; every reader derives [`Self::status_at`] from it rather than
-    /// storing a status that a read would have to write.
+    /// When the build this record is currently running stops being in progress. Set
+    /// by the create and moved again by every update that re-specifies the
+    /// project's configuration; every reader derives [`Self::status_at`] from it
+    /// rather than storing a status that a read would have to write.
     pub completes_at: SystemTime,
     pub tags: Vec<Tag>,
 }
 
 impl DataAutomationProjectRecord {
     /// This project's modeled `status` as of `now`: `IN_PROGRESS` until the
-    /// transition the create owed falls due, `COMPLETED` from then on.
+    /// transition the create (or the latest update) owed falls due, `COMPLETED`
+    /// from then on.
     ///
     /// A pure function of the stored due instant, so reporting it writes nothing and
     /// two readers at the same instant agree.

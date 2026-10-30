@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDataAutomationProject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDataAutomationProject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDataAutomationProject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +163,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDataAutomationProject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDataAutomationProjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDataAutomationProject"))
+        // Only ARN minting needs the request's region, and this operation mints
+        // nothing: it keys on the ARN the caller supplies.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateDataAutomationProjectError::Modeled(
+                UpdateDataAutomationProjectErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the Bedrock Data Automation store is unavailable".to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // One clock read for both the instant the record records as its last
+        // modification and the instant its re-started build is measured from.
+        let (at, modified_at) = crate::state::now_pair();
+
+        let Some(record) = store.projects.get_mut(&input.project_arn) else {
+            return Err(
+                UpdateDataAutomationProjectErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no data automation project exists with ARN {}",
+                            input.project_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // This is an `@idempotent` PUT over the project's configuration, with
+        // `standardOutputConfiguration` modelled `@required`: the request carries the
+        // configuration the project is to HAVE, so every configuration member takes
+        // exactly the value the request carries and one the request omits is cleared.
+        // Repeating the same request therefore leaves the same project behind.
+        record.standard_output_configuration = Some(input.standard_output_configuration);
+        record.custom_output_configuration = input.custom_output_configuration;
+        record.override_configuration = input.override_configuration;
+        record.data_automation_library_configuration = input.data_automation_library_configuration;
+        record.project_description = input.project_description;
+        let (kms_key_id, kms_encryption_context) = match input.encryption_configuration {
+            Some(config) => (Some(config.kms_key_id), config.kms_encryption_context),
+            None => (None, None),
+        };
+        record.kms_key_id = kms_key_id;
+        record.kms_encryption_context = kms_encryption_context;
+
+        // `projectStage` is not part of that configuration but the stage to put the
+        // project IN, and the member carries no modelled default while a project is
+        // always in some stage — so a request that names none leaves the project where
+        // it is. The project's identity (ARN, name, type, `creationTime`) and its tags
+        // are not members of this request at all, so nothing here moves them.
+        if let Some(stage) = input.project_stage {
+            record.project_stage = stage;
+        }
+        record.last_modified_time = modified_at;
+
+        // The update re-specifies what the project produces, so it re-starts the
+        // project's build exactly as the create started it: the project is reported
+        // IN_PROGRESS until the transition the clock now owes falls due, and nothing
+        // sleeps for it.
+        record.completes_at = at + crate::state::PROJECT_CREATION_SPAN;
+
+        // Answered from the record that is now PERSISTED, so a later
+        // GetDataAutomationProject agrees with this response.
+        Ok(UpdateDataAutomationProjectOutput {
+            project_arn: record.project_arn.clone(),
+            project_stage: Some(record.project_stage.clone()),
+            status: Some(record.status_at(at).to_string()),
+        })
     }
 }
