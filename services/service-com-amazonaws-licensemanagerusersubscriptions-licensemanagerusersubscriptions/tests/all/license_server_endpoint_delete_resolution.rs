@@ -10,7 +10,7 @@
 //! * **The refusal of an unresolvable `LicenseServerEndpointArn` is this service's
 //!   recorded authorization refusal**, not a not-found: whatever class the ARN belongs to
 //!   (never created, another account, Region or partition, another resource kind, a near
-//!   miss on a live one, or an endpoint the store no longer holds), the answer is HTTP 400
+//!   miss on a live one, or an endpoint the store no longer holds), the answer is HTTP 401
 //!   with the `UnauthorizedException` code and its fixed sentence, discloses nothing about
 //!   the ARN, and changes nothing in the store. The error set a model declares for an
 //!   operation is the union of what that operation may return, not a mapping from a
@@ -96,7 +96,7 @@ fn forget_endpoint(h: &Harness, arn: &str) {
 }
 
 /// RULE: a `LicenseServerEndpointArn` that resolves to no endpoint this service holds is
-/// refused on the authorization gate — HTTP 400, the `UnauthorizedException` code, the
+/// refused on the authorization gate — HTTP 401, the `UnauthorizedException` code, the
 /// fixed sentence, nothing from the request disclosed — and never as the modelled 404,
 /// whatever class of unresolvable ARN it is; and the refusal changes nothing.
 #[tokio::test]

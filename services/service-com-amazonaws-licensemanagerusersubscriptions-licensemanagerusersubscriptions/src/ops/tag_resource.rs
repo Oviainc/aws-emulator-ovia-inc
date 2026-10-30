@@ -172,9 +172,10 @@ fn into_error(error: crate::state::StateError) -> TagResourceError {
             .into()
         }
         // Tagging addresses a resource by ARN, never an identity provider by reference, so
-        // the merge cannot report this; it is worded the way the identity-provider-plane
-        // operations word it.
-        crate::state::StateError::ProviderNotRegistered => {
+        // the merge cannot report either of these; they are worded the way the
+        // identity-provider-plane operations word an ARN that resolves to nothing.
+        crate::state::StateError::ProviderNotRegistered
+        | crate::state::StateError::ProviderNotAuthorized => {
             TagResourceErrorModeled::ValidationException(ValidationException {
                 message: Some(crate::state::IDENTITY_PROVIDER_NOT_VALID.to_string()),
             })

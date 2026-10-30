@@ -194,6 +194,17 @@ pub const UNAUTHORIZED_EXCEPTION_CODE: &str = "UnauthorizedException";
 pub const UNAUTHORIZED_EXCEPTION_MESSAGE: &str =
     "Unauthorized. Please check the request and access policy and try again.";
 
+/// The HTTP status [`UNAUTHORIZED_EXCEPTION_CODE`] is reported with.
+///
+/// 401, the status the recorded wire carries for it. This code is in NO model, so it
+/// inherits nothing from the 400 the service's modelled client errors default to: the
+/// refusal states that the caller may not act on the resource it named, which is the
+/// outcome a client branches on — an authorization branch (refresh credentials, re-authorize,
+/// pick another resource), not the malformed-request branch a 400 selects. It is still a
+/// client-fault status rather than a 5xx an SDK retry classifier would retry: the refusal is
+/// terminal until the caller changes the request or its access.
+pub const UNAUTHORIZED_EXCEPTION_STATUS: u16 = 401;
+
 /// The wire error code this service's TAGGING surface answers an unresolvable
 /// `ResourceArn` with — also not a shape in this service's model (`UntagResource` models
 /// only InternalServerException and ResourceNotFoundException).
@@ -214,13 +225,13 @@ pub const INVALID_INPUT_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn
 pub const INVALID_INPUT_RESOURCE_ARN_SYNTAX_MESSAGE: &str =
     "Invalid input resource arn: bad syntax";
 
-/// The HTTP status every [`ServiceRefusal`] is reported with.
+/// The HTTP status [`BAD_REQUEST_EXCEPTION_CODE`] is reported with.
 ///
-/// 400, the status this service's model gives its own client errors
-/// (`AccessDeniedException`, `ValidationException` and the rest are `@httpError 400`),
-/// and a client-fault status rather than a 5xx an SDK retry classifier would retry: both
-/// refusals are terminal — the caller has to change the request.
-pub const SERVICE_REFUSAL_STATUS: u16 = 400;
+/// 400: that refusal is about the `ResourceArn` the request carries — a value the caller has
+/// to correct — which is the malformed-request outcome, and the status this service's model
+/// gives its own client errors (`AccessDeniedException`, `ValidationException` and the rest
+/// are `@httpError 400`).
+pub const BAD_REQUEST_EXCEPTION_STATUS: u16 = 400;
 
 /// The `message` member of the synthetic shape a [`ServiceRefusal`] renders through.
 static SERVICE_REFUSAL_MESSAGE: Schema = Schema::new_member(
@@ -259,10 +270,17 @@ pub static SERVICE_REFUSAL_SCHEMA: Schema = Schema::new_struct(
 /// expressible as a modeled variant — the model has no shape for either code. The code is
 /// `&'static str` because [`OperationError::shape_name`] vends a `&'static str`, so a
 /// refusal can only name one of the constants above.
+///
+/// The STATUS travels with the code rather than being one constant for every such refusal:
+/// the two refusals are different outcomes to a client — one is about the caller's access to
+/// the resource it named, the other about a value in the request — and a client that
+/// branches on the status has to be able to tell them apart.
 #[derive(Debug, Clone)]
 pub struct ServiceRefusal {
     /// The wire error code (`__type` / `x-amzn-errortype`).
     pub code: &'static str,
+    /// The HTTP status this refusal is reported with.
+    pub status: u16,
     /// The sentence the body carries.
     pub message: String,
 }
@@ -273,6 +291,7 @@ impl ServiceRefusal {
     pub fn unauthorized() -> Self {
         Self {
             code: UNAUTHORIZED_EXCEPTION_CODE,
+            status: UNAUTHORIZED_EXCEPTION_STATUS,
             message: UNAUTHORIZED_EXCEPTION_MESSAGE.to_string(),
         }
     }
@@ -281,6 +300,7 @@ impl ServiceRefusal {
     pub fn invalid_input_resource_arn() -> Self {
         Self {
             code: BAD_REQUEST_EXCEPTION_CODE,
+            status: BAD_REQUEST_EXCEPTION_STATUS,
             message: INVALID_INPUT_RESOURCE_ARN_MESSAGE.to_string(),
         }
     }
@@ -310,7 +330,7 @@ pub enum Scaffolded<E> {
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
     /// A refusal this service answers with an error code its model does not declare —
-    /// see [`ServiceRefusal`]. Renders as [`SERVICE_REFUSAL_STATUS`] with that code.
+    /// see [`ServiceRefusal`]. Renders with that code and the status it carries.
     ServiceRefusal(ServiceRefusal),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
@@ -349,7 +369,7 @@ impl<E> Scaffolded<E> {
         Self::ValidationException(ValidationException::new(message))
     }
 
-    /// Fail closed on the authorization gate: HTTP 400 with the
+    /// Fail closed on the authorization gate: [`UNAUTHORIZED_EXCEPTION_STATUS`] with the
     /// [`UNAUTHORIZED_EXCEPTION_CODE`] code and its fixed sentence.
     ///
     /// Answer it where the caller's ownership of the resource the request names cannot
@@ -361,7 +381,8 @@ impl<E> Scaffolded<E> {
     }
 
     /// The tagging surface's refusal of a `ResourceArn` that resolves to no resource:
-    /// HTTP 400 with the [`BAD_REQUEST_EXCEPTION_CODE`] code and its fixed sentence.
+    /// [`BAD_REQUEST_EXCEPTION_STATUS`] with the [`BAD_REQUEST_EXCEPTION_CODE`] code and its
+    /// fixed sentence.
     pub fn invalid_input_resource_arn() -> Self {
         Self::ServiceRefusal(ServiceRefusal::invalid_input_resource_arn())
     }
@@ -436,7 +457,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
-            Self::ServiceRefusal(_) => SERVICE_REFUSAL_STATUS,
+            // The status the refusal itself carries; see `ServiceRefusal`.
+            Self::ServiceRefusal(e) => e.status,
             Self::ValidationException(_) => 400,
         }
     }

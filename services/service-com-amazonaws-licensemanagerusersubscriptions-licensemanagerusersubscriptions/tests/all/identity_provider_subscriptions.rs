@@ -467,6 +467,13 @@ pub(crate) fn provider_union(directory_id: &str) -> Value {
     json!({ "ActiveDirectoryIdentityProvider": { "DirectoryId": directory_id } })
 }
 
+/// The FIXED sentence this service fails a refusal closed with
+/// (`scaffolded::UNAUTHORIZED_EXCEPTION_MESSAGE`), spelled out here rather than read from
+/// the production constant so a change to it fails a test instead of silently changing what
+/// this suite accepts.
+const UNAUTHORIZED_MESSAGE: &str =
+    "Unauthorized. Please check the request and access policy and try again.";
+
 impl Registration {
     fn request(&self) -> Value {
         let mut body = json!({
@@ -950,7 +957,7 @@ async fn subscriptions_require_a_registration_and_are_unique_per_user() {
     )
     .await;
     assert_eq!(
-        reply.status, 400,
+        reply.status, 401,
         "an unregistered provider cannot subscribe a user, got {reply:?}"
     );
     assert_eq!(
@@ -969,7 +976,7 @@ async fn subscriptions_require_a_registration_and_are_unique_per_user() {
         )
         .await;
         assert_eq!(
-            reply.status, 400,
+            reply.status, 401,
             "case {product:?}: the provider is not registered for this product, got {reply:?}"
         );
         assert_eq!(
@@ -1438,7 +1445,8 @@ async fn deregistration_removes_the_registration_and_its_product_users() {
     // Half are addressed by ARN and half by (IdentityProvider, Product): the model lets a
     // caller name a registration either way.
     for (index, row) in REGISTRATIONS.iter().enumerate() {
-        let request = if index % 2 == 0 {
+        let by_arn = index % 2 == 0;
+        let request = if by_arn {
             json!({ "IdentityProviderArn": arns[index] })
         } else {
             json!({
@@ -1488,25 +1496,48 @@ async fn deregistration_removes_the_registration_and_its_product_users() {
         );
 
         let again = deregister(&h, &request).await;
-        assert_eq!(
-            again.status, 400,
-            "case {:?}: a second deregistration names an identifier that is no longer an \
-             identity provider of this account, got {again:?}",
-            row.case
-        );
-        assert_eq!(
-            again.error_type.as_deref(),
-            Some("ValidationException"),
-            "case {:?}: expected ValidationException, got {again:?}",
-            row.case
-        );
-        assert_eq!(
-            again.body.get("message").and_then(Value::as_str),
-            Some("Identity provider is not valid"),
-            "case {:?}: expected the service's own sentence for an identifier that names \
-             no registration, got {again:?}",
-            row.case
-        );
+        if by_arn {
+            // The ARN names no registration of this account any more: an invalid parameter.
+            assert_eq!(
+                again.status, 400,
+                "case {:?}: a second deregistration names an ARN that is no longer an \
+                 identity provider of this account, got {again:?}",
+                row.case
+            );
+            assert_eq!(
+                again.error_type.as_deref(),
+                Some("ValidationException"),
+                "case {:?}: expected ValidationException, got {again:?}",
+                row.case
+            );
+            assert_eq!(
+                again.body.get("message").and_then(Value::as_str),
+                Some("Identity provider is not valid"),
+                "case {:?}: expected the service's own sentence for an ARN that names \
+                 no registration, got {again:?}",
+                row.case
+            );
+        } else {
+            // The request named the identity provider ITSELF, which this account has no
+            // registration under any more: the fail-closed refusal.
+            assert_eq!(
+                again.status, 401,
+                "case {:?}: a pair that resolves to nothing fails closed, got {again:?}",
+                row.case
+            );
+            assert_eq!(
+                again.error_type.as_deref(),
+                Some("UnauthorizedException"),
+                "case {:?}: expected UnauthorizedException, got {again:?}",
+                row.case
+            );
+            assert_eq!(
+                again.body.get("message").and_then(Value::as_str),
+                Some(UNAUTHORIZED_MESSAGE),
+                "case {:?}: expected the fixed fail-closed sentence, got {again:?}",
+                row.case
+            );
+        }
     }
 
     let listed = list_providers(&h, &json!({})).await;
@@ -1529,14 +1560,14 @@ async fn deregistration_removes_the_registration_and_its_product_users() {
     )
     .await;
     assert_eq!(
-        orphaned.status, 400,
-        "listing through a provider that is no longer registered names an identifier that \
-         is not an identity provider of this account, got {orphaned:?}"
+        orphaned.status, 401,
+        "listing through a provider that is no longer registered names the identity \
+         provider itself, which fails closed, got {orphaned:?}"
     );
     assert_eq!(
         orphaned.error_type.as_deref(),
-        Some("ValidationException"),
-        "listing through a deregistered provider must be a ValidationException, got {orphaned:?}"
+        Some("UnauthorizedException"),
+        "listing through a deregistered provider must fail closed, got {orphaned:?}"
     );
     {
         let state = h

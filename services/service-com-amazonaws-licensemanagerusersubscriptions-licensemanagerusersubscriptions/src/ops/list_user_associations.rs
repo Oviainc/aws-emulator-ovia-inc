@@ -286,8 +286,12 @@ fn into_error(error: crate::state::StateError) -> ListUserAssociationsError {
         // sentence that plane states this refusal with — whether this handler resolved the
         // registration itself (the inline branch above, which comes through here) or a
         // lookup it called reported it, and exactly as the sibling `AssociateUser` does for
-        // the same resolution.
-        crate::state::StateError::ProviderNotRegistered => {
+        // the same resolution. It answers the same for a pair-addressed resolution (which
+        // this handler makes none of): by the time the directory is resolved the caller's
+        // ownership of the instance is established, so there is nothing this plane would
+        // withhold.
+        crate::state::StateError::ProviderNotRegistered
+        | crate::state::StateError::ProviderNotAuthorized => {
             ListUserAssociationsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::IDENTITY_PROVIDER_NOT_REGISTERED.to_string()),

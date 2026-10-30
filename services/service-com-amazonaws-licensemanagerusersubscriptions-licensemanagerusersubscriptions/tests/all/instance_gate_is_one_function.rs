@@ -44,13 +44,13 @@ const DIRECTORY: &str = "d-0123456789";
 
 /// The code, sentence and status this service fails the gate closed with
 /// (`scaffolded::UNAUTHORIZED_EXCEPTION_CODE`, `UNAUTHORIZED_EXCEPTION_MESSAGE` and
-/// `SERVICE_REFUSAL_STATUS`). Spelled out here rather than read from the production
+/// `UNAUTHORIZED_EXCEPTION_STATUS`). Spelled out here rather than read from the production
 /// constants, so a change to them fails a test instead of silently changing what this suite
 /// accepts.
 const UNAUTHORIZED_CODE: &str = "UnauthorizedException";
 const UNAUTHORIZED_MESSAGE: &str =
     "Unauthorized. Please check the request and access policy and try again.";
-const REFUSAL_STATUS: u16 = 400;
+const REFUSAL_STATUS: u16 = 401;
 
 /// The status a disassociation whose teardown was accepted carries, spelled out for the same
 /// reason.

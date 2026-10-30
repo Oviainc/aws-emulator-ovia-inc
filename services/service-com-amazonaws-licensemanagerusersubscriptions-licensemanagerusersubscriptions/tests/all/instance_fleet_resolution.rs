@@ -67,11 +67,12 @@ const STATUS_DISASSOCIATING: &str = "DISASSOCIATING";
 
 /// The sentence this service fails closed with
 /// (`scaffolded::UNAUTHORIZED_EXCEPTION_MESSAGE`), the code it carries and the status it is
-/// reported with (`scaffolded::SERVICE_REFUSAL_STATUS`), spelled out for the same reason.
+/// reported with (`scaffolded::UNAUTHORIZED_EXCEPTION_STATUS`), spelled out for the same
+/// reason.
 const UNAUTHORIZED_CODE: &str = "UnauthorizedException";
 const UNAUTHORIZED_MESSAGE: &str =
     "Unauthorized. Please check the request and access policy and try again.";
-const REFUSAL_STATUS: u16 = 400;
+const REFUSAL_STATUS: u16 = 401;
 
 /// Every operation that acts on the EC2 instance its request names, as the route a client
 /// reaches it at. Each one's request is addressed by the same

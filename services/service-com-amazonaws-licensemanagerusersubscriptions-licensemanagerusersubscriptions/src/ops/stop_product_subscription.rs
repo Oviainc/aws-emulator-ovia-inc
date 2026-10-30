@@ -220,7 +220,8 @@ fn into_error(error: crate::state::StateError) -> StopProductSubscriptionError {
         // fails such a call CLOSED rather than disclosing whether the provider exists —
         // the same answer `StartProductSubscription` gives, so a caller cannot learn from
         // one what the other withholds.
-        crate::state::StateError::ProviderNotRegistered => {
+        crate::state::StateError::ProviderNotRegistered
+        | crate::state::StateError::ProviderNotAuthorized => {
             crate::scaffolded::Scaffolded::unauthorized()
         }
         crate::state::StateError::NotFound(message) => {

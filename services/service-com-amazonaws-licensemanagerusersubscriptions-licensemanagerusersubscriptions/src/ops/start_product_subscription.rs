@@ -274,7 +274,8 @@ fn into_error(error: crate::state::StateError) -> StartProductSubscriptionError 
         // call, and this service fails such a call CLOSED rather than disclosing whether
         // the provider exists — a caller that is told "not found" would read it as "create
         // it and retry", a path that is not on offer.
-        crate::state::StateError::ProviderNotRegistered => {
+        crate::state::StateError::ProviderNotRegistered
+        | crate::state::StateError::ProviderNotAuthorized => {
             crate::scaffolded::Scaffolded::unauthorized()
         }
         crate::state::StateError::NotFound(message) => {

@@ -285,9 +285,13 @@ fn invalid_tags(error: crate::state::StateError) -> CreateLicenseServerEndpointE
         crate::state::StateError::NotFound(message)
         | crate::state::StateError::Conflict(message)
         | crate::state::StateError::Validation(message) => message,
-        // The tag rules address no identity provider, so the merge cannot report this; the
-        // arm keeps the wording this handler already uses for an unresolvable reference.
-        crate::state::StateError::ProviderNotRegistered => {
+        // The tag rules address no identity provider, so the merge cannot report either of
+        // these; the arms keep the wording this handler already uses for an unresolvable
+        // reference, and this operation addresses a registration by its ARN alone
+        // (`IdentityProviderArn` is its only identity-provider member), so there is no
+        // fail-closed answer it could give instead.
+        crate::state::StateError::ProviderNotRegistered
+        | crate::state::StateError::ProviderNotAuthorized => {
             crate::state::IDENTITY_PROVIDER_NOT_VALID.to_string()
         }
     };

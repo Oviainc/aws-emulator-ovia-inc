@@ -197,11 +197,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         if provider_arns.is_empty() {
             // Reached from the `Product`-omitted branch above, whose scan has no resolution
-            // of its own to refuse through: the identifier names no registration of this
-            // account, an invalid parameter reported exactly as the resolution reports it.
-            // Listing a provider's subscriptions is a call about the REGISTRATION, so it
-            // says so rather than failing closed the way the user-plane calls do.
-            return Err(into_error(crate::state::StateError::ProviderNotRegistered));
+            // of its own to refuse through. This operation addresses a registration only by
+            // the identity provider itself, so the refusal is the one that addressing gets
+            // — exactly as the resolution in the branch beside it reports it.
+            return Err(into_error(crate::state::StateError::ProviderNotAuthorized));
         }
 
         let mut matching = Vec::new();
@@ -275,13 +274,20 @@ fn into_error(error: crate::state::StateError) -> ListProductSubscriptionsError 
             })
             .into()
         }
-        // The identifier is not one of this account's identity providers: an invalid
-        // parameter, answered with the same code and status as every other invalid one.
+        // An `IdentityProviderArn` that is not one of this account's: an invalid parameter,
+        // answered with the same code and status as every other invalid one.
         crate::state::StateError::ProviderNotRegistered => {
             ListProductSubscriptionsErrorModeled::ValidationException(ValidationException {
                 message: Some(crate::state::IDENTITY_PROVIDER_NOT_VALID.to_string()),
             })
             .into()
+        }
+        // This operation addresses a registration only by the identity provider ITSELF
+        // (`IdentityProvider` is its one required identity-provider member, and it models no
+        // ARN), so a provider this account holds no registration for is the fail-closed
+        // refusal: nothing is said about what that directory is registered for.
+        crate::state::StateError::ProviderNotAuthorized => {
+            crate::scaffolded::Scaffolded::unauthorized()
         }
     }
 }

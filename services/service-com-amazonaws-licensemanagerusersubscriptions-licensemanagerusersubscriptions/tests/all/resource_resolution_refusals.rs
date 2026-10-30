@@ -18,8 +18,10 @@
 //!     service's ownership-scoped resources (a user association, a license server
 //!     endpoint) that state does not hold, fail CLOSED on the authorization gate:
 //!     `UnauthorizedException` with its fixed sentence;
-//!   - an identity-provider reference that resolves to no registration is a parameter
-//!     that is not valid: `ValidationException` / "Identity provider is not valid";
+//!   - an identity-provider reference that resolves to no registration is answered by the
+//!     ADDRESSING it was made with: an `IdentityProviderArn` of no registration is a
+//!     parameter that is not valid (`ValidationException` / "Identity provider is not
+//!     valid"), and a request that names the provider itself fails closed too;
 //!   - the tagging surface's `ResourceArn`, which may name any of this service's
 //!     resource kinds, is refused with `BadRequestException` / "Invalid input resource
 //!     arn".
@@ -162,13 +164,14 @@ pub(crate) async fn tag(h: &Harness, arn: &str, tags: &Value) -> Reply {
     .await
 }
 
-/// Every fail-closed refusal looks the same: HTTP 400, the `UnauthorizedException` code
-/// an SDK dispatches on, the fixed sentence, and a body that says nothing about the
-/// identifier it was asked about.
+/// Every fail-closed refusal looks the same: HTTP 401 — the status the recorded wire
+/// carries for this code, and the one an SDK reads as an authorization outcome — the
+/// `UnauthorizedException` code an SDK dispatches on, the fixed sentence, and a body that
+/// says nothing about the identifier it was asked about.
 pub(crate) fn assert_fails_closed(case: &str, identifier: &str, reply: &Reply) {
     assert_eq!(
-        reply.status, 400,
-        "case {case:?}: expected HTTP 400, got {} with body {:?}",
+        reply.status, 401,
+        "case {case:?}: expected HTTP 401, got {} with body {:?}",
         reply.status, reply.body
     );
     assert_eq!(
@@ -450,12 +453,13 @@ async fn disassociate_user_refuses_an_incomplete_identifier_before_any_lookup() 
     assert_fails_closed("the complete triple, nothing stored", "a.user", &reply);
 }
 
-/// RULE: an identity-provider reference that resolves to no registration is refused with
-/// `ValidationException` / "Identity provider is not valid" — on both surfaces that
-/// resolve one, and BEFORE the rest of the request is validated, so a payload that would
+/// RULE: an identity-provider reference that resolves to no registration is refused by the
+/// ADDRESSING it was made with — an ARN of no registration is `ValidationException` /
+/// "Identity provider is not valid", and a request naming the provider ITSELF fails closed
+/// — and either way BEFORE the rest of the request is validated, so a payload that would
 /// also be refused does not change the answer.
 #[tokio::test]
-async fn an_unresolvable_identity_provider_reference_is_a_validation_failure() {
+async fn an_unresolvable_identity_provider_reference_is_refused_by_its_addressing() {
     let h = harness();
     let real = register_provider(
         &h,
@@ -538,7 +542,9 @@ async fn an_unresolvable_identity_provider_reference_is_a_validation_failure() {
     }
 
     // Addressed by (IdentityProvider, Product) instead of by ARN: a directory with no
-    // registration for the product named resolves to nothing the same way.
+    // registration for the product named resolves to nothing the same way, and the request
+    // named the provider itself, so it is the fail-closed refusal rather than a statement
+    // about a parameter this service minted.
     for (class, product) in [
         ("a product the directory is not registered for", PRODUCTS[1]),
         ("another unregistered product", PRODUCTS[4]),
@@ -552,7 +558,7 @@ async fn an_unresolvable_identity_provider_reference_is_a_validation_failure() {
             }),
         )
         .await;
-        assert_identity_provider_not_valid(class, &reply);
+        assert_fails_closed(class, product, &reply);
     }
 }
 

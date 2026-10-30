@@ -171,8 +171,10 @@ fn invalid_tag_keys(error: crate::state::StateError) -> UntagResourceError {
         | crate::state::StateError::Conflict(message)
         | crate::state::StateError::Validation(message) => message,
         // The tag-key rules address no identity provider, so the check cannot report
-        // this; the arm keeps the wording the identity-provider plane uses.
-        crate::state::StateError::ProviderNotRegistered => {
+        // either of these; the arms keep the wording the identity-provider plane uses for
+        // an ARN that resolves to nothing.
+        crate::state::StateError::ProviderNotRegistered
+        | crate::state::StateError::ProviderNotAuthorized => {
             crate::state::IDENTITY_PROVIDER_NOT_VALID.to_string()
         }
     };

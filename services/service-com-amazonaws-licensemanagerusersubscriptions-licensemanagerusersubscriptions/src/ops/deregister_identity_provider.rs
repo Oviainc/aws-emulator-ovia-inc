@@ -219,13 +219,19 @@ fn into_error(error: crate::state::StateError) -> DeregisterIdentityProviderErro
             })
             .into()
         }
-        // The identifier is not one of this account's identity providers: an invalid
-        // parameter, answered with the same code and status as every other invalid one.
+        // An `IdentityProviderArn` that is not one of this account's: an invalid parameter,
+        // answered with the same code and status as every other invalid one.
         crate::state::StateError::ProviderNotRegistered => {
             DeregisterIdentityProviderErrorModeled::ValidationException(ValidationException {
                 message: Some(crate::state::IDENTITY_PROVIDER_NOT_VALID.to_string()),
             })
             .into()
+        }
+        // The request named the identity provider ITSELF and this account holds no
+        // registration under that pair: the fail-closed refusal, which says nothing about
+        // what the directory is registered for.
+        crate::state::StateError::ProviderNotAuthorized => {
+            crate::scaffolded::Scaffolded::unauthorized()
         }
     }
 }

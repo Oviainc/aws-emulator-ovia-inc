@@ -46,6 +46,13 @@ use super::identity_provider_subscriptions::{
 /// rather than read from the production constant so a change to it fails a test.
 const IDENTITY_PROVIDER_NOT_VALID: &str = "Identity provider is not valid";
 
+/// The sentence and status this service fails closed with
+/// (`scaffolded::UNAUTHORIZED_EXCEPTION_MESSAGE` / `UNAUTHORIZED_EXCEPTION_STATUS`), spelled
+/// out for the same reason.
+const UNAUTHORIZED_MESSAGE: &str =
+    "Unauthorized. Please check the request and access policy and try again.";
+const UNAUTHORIZED_STATUS: u16 = 401;
+
 async fn deregister(h: &Harness, body: &Value) -> Reply {
     call(h, "/identity-provider/DeregisterIdentityProvider", body).await
 }
@@ -225,7 +232,7 @@ async fn listed_status(h: &Harness, case: &str, arn: &str) -> Option<String> {
 }
 
 /// Assert `reply` is the modelled `ValidationException` (HTTP 400) carrying the sentence
-/// this service uses for an identity provider that resolves to no registration.
+/// this service uses for an `IdentityProviderArn` that resolves to no registration.
 fn refused_as_not_valid(case: &str, reply: &Reply) {
     assert_eq!(
         reply.status, 400,
@@ -242,6 +249,35 @@ fn refused_as_not_valid(case: &str, reply: &Reply) {
         "case {case:?}: expected the service's sentence for an unresolvable identity \
          provider, got {reply:?}"
     );
+}
+
+/// Assert `reply` is the fail-closed refusal: HTTP 401, the `UnauthorizedException` code and
+/// the fixed sentence, which says nothing about what the directory is registered for.
+fn refused_as_unauthorized(case: &str, reply: &Reply) {
+    assert_eq!(
+        reply.status, UNAUTHORIZED_STATUS,
+        "case {case:?}: expected HTTP {UNAUTHORIZED_STATUS}, got {reply:?}"
+    );
+    assert_eq!(
+        reply.error_type.as_deref(),
+        Some(UNAUTHORIZED_EXCEPTION_CODE),
+        "case {case:?}: expected {UNAUTHORIZED_EXCEPTION_CODE}, got {reply:?}"
+    );
+    assert_eq!(
+        reply.message(),
+        Some(UNAUTHORIZED_MESSAGE),
+        "case {case:?}: expected the fixed fail-closed sentence, got {reply:?}"
+    );
+}
+
+/// Assert `reply` is the refusal a reference that resolves to no registration gets when it
+/// was made the way `addressed_by` says: an ARN this service minted for nothing is an
+/// invalid parameter, and a request naming the identity provider ITSELF fails closed.
+fn refused_as_unresolvable(case: &str, reply: &Reply, addressed_by: AddressedBy) {
+    match addressed_by {
+        AddressedBy::Arn => refused_as_not_valid(case, reply),
+        AddressedBy::ProviderAndProduct => refused_as_unauthorized(case, reply),
+    }
 }
 
 /// RULE: a deregistration is accepted, not performed — the registration is REPORTED in the
@@ -290,9 +326,14 @@ async fn a_deregistration_is_observable_in_deregistering_and_then_gone() {
             "case {case:?}: the registration must stop being reported once the teardown \
              the clock owed completed"
         );
-        // The identifier now names no registration of this account, whichever way it is
-        // addressed — the same refusal a never-registered identifier gets.
-        refused_as_not_valid(&case, &deregister(&h, &row.deregistration(&arn)).await);
+        // The identifier now names no registration of this account; the refusal is the one
+        // the addressing this row used gets — the same one a never-registered identifier of
+        // that form gets.
+        refused_as_unresolvable(
+            &case,
+            &deregister(&h, &row.deregistration(&arn)).await,
+            row.addressed_by,
+        );
     }
 }
 
@@ -370,8 +411,10 @@ async fn a_registration_being_deregistered_is_not_a_live_registration() {
         deregister(&h, &row.deregistration(&arn)).await.ok(row.case);
 
         // Every operation that names a registration, each addressing it the way its own
-        // model lets it: all are told the identifier is not a valid identity provider.
-        let refusals = [
+        // model lets it: the ones that address it by ARN are told the ARN is not a valid
+        // identity provider, and the one that names the identity provider ITSELF is refused
+        // fail-closed, as every pair-addressed resolution is.
+        let by_arn = [
             (
                 "UpdateIdentityProviderSettings",
                 update_settings(
@@ -408,20 +451,24 @@ async fn a_registration_being_deregistered_is_not_a_live_registration() {
                 )
                 .await,
             ),
-            (
-                "ListProductSubscriptions",
-                list_subscriptions(
-                    &h,
-                    &json!({
-                        "IdentityProvider": row.provider(),
-                        "Product": row.product,
-                    }),
-                )
-                .await,
-            ),
         ];
-        for (surface, reply) in refusals {
+        for (surface, reply) in by_arn {
             refused_as_not_valid(&format!("{}/{surface}", row.case), &reply);
+        }
+
+        let by_the_provider = [(
+            "ListProductSubscriptions",
+            list_subscriptions(
+                &h,
+                &json!({
+                    "IdentityProvider": row.provider(),
+                    "Product": row.product,
+                }),
+            )
+            .await,
+        )];
+        for (surface, reply) in by_the_provider {
+            refused_as_unauthorized(&format!("{}/{surface}", row.case), &reply);
         }
 
         // The user plane fails CLOSED instead of saying so, which is the refusal it gives

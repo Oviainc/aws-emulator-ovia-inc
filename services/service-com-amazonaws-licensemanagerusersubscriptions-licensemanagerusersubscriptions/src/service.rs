@@ -61,6 +61,17 @@ struct InstanceGatedRoute {
     /// it — and the operation name a gated request is recorded under, so a refusal lands in
     /// the same telemetry series as the requests that reach the handler.
     operation: &'static str,
+    /// The member of this operation's input that addresses one of its own resources by ARN,
+    /// when the model declares one, as a client spells it on the wire.
+    ///
+    /// An operation whose input carries one can name the instance it acts on THAT way
+    /// instead of by `InstanceId` — the ARN identifies a user association on an instance —
+    /// so the gate resolves it for a request that names no instance of its own. Only
+    /// `DisassociateUser` declares such a member (`smithy_query(query="operation",
+    /// operation="AssociateUser,ListUserAssociations,DisassociateUser")`: `InstanceUserArn`,
+    /// and it is the only one of the three whose `InstanceId` is not required), so the other
+    /// two routes carry `None`.
+    arn_member: Option<&'static str>,
 }
 
 /// Every route the authorization gate covers.
@@ -79,20 +90,24 @@ struct InstanceGatedRoute {
 ///
 /// Whether the model marks the member `@required` changes only WHEN the gate applies, not
 /// whether it does: `DisassociateUser` marks nothing required and can address an
-/// association by `InstanceUserArn` alone, so a request of it that names no instance has
-/// nothing to authorize and goes on to the modelled operation ([`named_instance`]).
+/// association by `InstanceUserArn` alone, so a request of it that names no instance is
+/// gated on the association that ARN names instead ([`InstanceGatedRoute::arn_member`]);
+/// one that names neither has nothing to authorize and goes on to the modelled operation.
 static INSTANCE_GATED_ROUTES: &[InstanceGatedRoute] = &[
     InstanceGatedRoute {
         uri: "/user/AssociateUser",
         operation: "AssociateUser",
+        arn_member: None,
     },
     InstanceGatedRoute {
         uri: "/user/ListUserAssociations",
         operation: "ListUserAssociations",
+        arn_member: None,
     },
     InstanceGatedRoute {
         uri: "/user/DisassociateUser",
         operation: "DisassociateUser",
+        arn_member: Some("InstanceUserArn"),
     },
 ];
 
@@ -299,10 +314,9 @@ fn request_path(uri: &str) -> &str {
 /// refused. It is rendered through the service's own protocol envelope (`refusal_response`),
 /// so a fail-closed refusal is shaped exactly like every other refusal this service sends.
 ///
-/// The refusal travels as an `Invalid` protocol error with no violations, which is what
-/// gives it the 400 this service reports a refusal with
-/// ([`crate::scaffolded::SERVICE_REFUSAL_STATUS`]); the chosen code and message replace
-/// the wording that error would otherwise carry.
+/// The refusal travels through the service's own protocol envelope, with the STATUS the
+/// refusal itself carries ([`refusal_response`]), so a fail-closed refusal answered here is
+/// shaped exactly like the one a handler's error channel answers for the same fact.
 struct InstanceGate<Eng> {
     /// The route this gate covers: the path it is picked for and the modelled operation it
     /// hands an authorized request to.
@@ -321,16 +335,28 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for InstanceGate<Eng> {
     ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
         let started = std::time::Instant::now();
         Box::pin(async move {
-            // A body that is not readable as JSON, or that names no `InstanceId` at all,
-            // gives the gate nothing to authorize: there is no instance to resolve, so the
-            // request goes on to the modelled operation and the framework's own refusal
-            // stands.
-            let refusal = crate::state::ec2_fleet::instance_refusal(
-                &*self.engine,
-                ctx,
-                named_instance(req).as_deref(),
-            )
-            .await;
+            // THE DECISION, about whichever of the two ways this route's input can name the
+            // resource the request acts on the body actually uses. A body that is not
+            // readable as JSON, or that names neither, gives the gate nothing to authorize:
+            // there is nothing to resolve, so the request goes on to the modelled operation
+            // and the framework's own refusal stands.
+            let refusal = match named_instance(req) {
+                Some(instance_id) => {
+                    crate::state::ec2_fleet::instance_refusal(
+                        &*self.engine,
+                        ctx,
+                        Some(instance_id.as_str()),
+                    )
+                    .await
+                }
+                // No instance named: the association an `InstanceUserArn` identifies is on
+                // an instance too, so for a route that declares one THAT is what the request
+                // names, and it is resolved against this account's own associations.
+                None => crate::state::instance_user_refusal(
+                    &*self.engine,
+                    named_resource_arn(req, self.route.arn_member).as_deref(),
+                ),
+            };
             let Some(refusal) = refusal else {
                 // The modelled operation this route names, from this service's own
                 // model-derived routing table (keyed by operation name).
@@ -346,13 +372,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for InstanceGate<Eng> {
             // The code travels to the telemetry row below as well as onto the wire, so it is
             // read off the refusal once rather than named again here.
             let code = refusal.code;
-            let response = svc.definition().refusal_response(
-                aws_smithy_schema_server::ProtocolError::Invalid(Vec::new()),
-                Some(Refused {
-                    code: code.to_string(),
-                    message: refusal.message,
-                }),
-            );
+            let response = refusal_response(svc, &refusal);
             record_refusal(
                 ctx,
                 self.route.operation,
@@ -378,8 +398,73 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for InstanceGate<Eng> {
 /// `None` means the gate does not apply: the body is not readable as JSON, or it names no
 /// `InstanceId` at all, so there is nothing to authorize.
 fn named_instance(req: &aws_smithy_runtime_api::http::Request) -> Option<String> {
+    body_member(req, "InstanceId")
+}
+
+/// The ARN a gated request addresses one of this service's own resources by, read off the
+/// raw body exactly as [`named_instance`] reads the instance id, and for the same reason:
+/// the decision is taken before the framework has looked at the request at all, so the ARN
+/// is read here WHATEVER it says — a value outside the member's modelled `@pattern`
+/// included, which is the case that would otherwise be refused as a constraint violation
+/// before this decision was ever reached.
+///
+/// `None` when the route declares no such member, when the body is not readable as JSON, and
+/// when it carries no value for the member — nothing is then named this way.
+fn named_resource_arn(
+    req: &aws_smithy_runtime_api::http::Request,
+    member: Option<&'static str>,
+) -> Option<String> {
+    body_member(req, member?)
+}
+
+/// One top-level STRING member of the raw JSON request body, or `None` when the body is not
+/// readable as JSON or carries no string there.
+fn body_member(req: &aws_smithy_runtime_api::http::Request, member: &str) -> Option<String> {
     let body: serde_json::Value = serde_json::from_slice(req.body().bytes()?).ok()?;
-    Some(body.get("InstanceId")?.as_str()?.to_string())
+    Some(body.get(member)?.as_str()?.to_string())
+}
+
+/// Render `refusal` in this service's own protocol envelope, with the code, the sentence and
+/// the STATUS the refusal carries.
+///
+/// The status is why this does not go through `ErasedServiceDefinition::refusal_response`:
+/// that renderer states a pre-dispatch refusal, whose status the protocol fixes (400 for an
+/// invalid request), and the fail-closed refusal is reported with its own
+/// ([`crate::scaffolded::UNAUTHORIZED_EXCEPTION_STATUS`]). Serializing the refusal itself
+/// through the protocol is also what makes this answer identical to the one a handler's
+/// error channel produces for the same value: the same `__type`, the same
+/// `x-amzn-errortype` header and the same `message` body member.
+///
+/// A refusal that will not serialize still has to refuse: it falls back to the pre-dispatch
+/// renderer, which carries the code and the sentence in this service's envelope even though
+/// it cannot carry the status.
+fn refusal_response(
+    svc: &dyn Service,
+    refusal: &crate::scaffolded::ServiceRefusal,
+) -> aws_smithy_runtime_api::http::Response {
+    match svc.definition().protocol().serialize_error(
+        refusal,
+        &crate::scaffolded::SERVICE_REFUSAL_SCHEMA,
+        refusal.code,
+        refusal.status,
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(
+                code = refusal.code,
+                %error,
+                "the fail-closed refusal would not serialize; it is answered through the \
+                 pre-dispatch renderer instead"
+            );
+            svc.definition().refusal_response(
+                aws_smithy_schema_server::ProtocolError::Invalid(Vec::new()),
+                Some(Refused {
+                    code: refusal.code.to_string(),
+                    message: refusal.message.clone(),
+                }),
+            )
+        }
+    }
 }
 
 /// Record the refusal above as the operation row the framework's dispatch sequence would

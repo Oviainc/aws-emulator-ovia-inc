@@ -37,12 +37,13 @@ const DIRECTORY: &str = "d-0123456789";
 
 /// The sentence this service fails closed with
 /// (`scaffolded::UNAUTHORIZED_EXCEPTION_MESSAGE`), and the status it reports such a refusal
-/// with (`scaffolded::SERVICE_REFUSAL_STATUS`). Spelled out here rather than read from the
+/// with (`scaffolded::UNAUTHORIZED_EXCEPTION_STATUS`). Spelled out here rather than read
+/// from the
 /// production constants, so a change to them fails a test instead of silently changing what
 /// this suite accepts.
 const UNAUTHORIZED_MESSAGE: &str =
     "Unauthorized. Please check the request and access policy and try again.";
-const REFUSAL_STATUS: u16 = 400;
+const REFUSAL_STATUS: u16 = 401;
 
 /// One EC2 instance of this service's own fleet seam (`state::seed_account_instances`),
 /// which is what authorizes a request that acts on an instance in a harness that mounts no

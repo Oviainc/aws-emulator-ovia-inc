@@ -204,6 +204,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // failure from one addressing a registration that is not there: the
                     // caller is told which.
                     crate::state::StateError::Validation(message) => validation(&message),
+                    // And a request that named the identity provider ITSELF is refused
+                    // fail-closed rather than told its parameter is invalid — the one
+                    // refusal that addressing gets, wherever it is resolved.
+                    crate::state::StateError::ProviderNotAuthorized => {
+                        crate::scaffolded::Scaffolded::unauthorized()
+                    }
                     _ => identity_provider_not_valid(),
                 })?
         };
@@ -276,11 +282,17 @@ fn into_error(error: crate::state::StateError) -> UpdateIdentityProviderSettings
         crate::state::StateError::NotFound(message)
         | crate::state::StateError::Conflict(message)
         | crate::state::StateError::Validation(message) => message,
-        // The identity provider the request addressed is not a registration of this
+        // The `IdentityProviderArn` the request addressed is not a registration of this
         // account: an invalid parameter, which is the one client error this operation
         // models anyway.
         crate::state::StateError::ProviderNotRegistered => {
             crate::state::IDENTITY_PROVIDER_NOT_VALID.to_string()
+        }
+        // A request that named the identity provider ITSELF gets the fail-closed refusal
+        // instead, as it does at the resolution above: it is not a statement about a
+        // parameter this service minted.
+        crate::state::StateError::ProviderNotAuthorized => {
+            return crate::scaffolded::Scaffolded::unauthorized();
         }
     };
     validation(&message)

@@ -19,6 +19,8 @@ mod arn_and_members_address_one_resource;
 mod associations_follow_their_registration;
 #[path = "all/deregistration_spares_what_it_was_not_asked_about.rs"]
 mod deregistration_spares_what_it_was_not_asked_about;
+#[path = "all/fail_closed_refusals_answer_401.rs"]
+mod fail_closed_refusals_answer_401;
 #[path = "all/filter_operations.rs"]
 mod filter_operations;
 #[path = "all/identity_provider_deregistration.rs"]

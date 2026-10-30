@@ -8,8 +8,9 @@
 //! The RULE under test, asserted over a TABLE of inputs rather than one recorded request:
 //! an `(IdentityProvider, Product)` pair addresses exactly ONE registration and only a LIVE
 //! one resolves, so every operation that addresses a registration that way agrees on
-//! whether the pair resolves — each then reporting an unresolved pair in the refusal its own
-//! model gives it.
+//! whether the pair resolves — and a pair that resolves to nothing is refused by all of them
+//! the one way that addressing is refused: fail-closed, with `UnauthorizedException` and its
+//! fixed sentence.
 //!
 //! `ListProductSubscriptions` (which addresses a registration by the pair when `Product` is
 //! supplied) is driven beside `UpdateIdentityProviderSettings` and
@@ -30,15 +31,13 @@ use super::identity_provider_subscriptions::{
     start_subscription, Harness, Reply, PAST_THE_OWED_TRANSITION, PRODUCTS,
 };
 
-/// The sentence this service uses for an identity-provider reference that resolves to no
-/// registration of the account (`state::IDENTITY_PROVIDER_NOT_VALID`), spelled out here
-/// rather than read from the production constant so a change to it fails a test.
-const IDENTITY_PROVIDER_NOT_VALID: &str = "Identity provider is not valid";
-
 /// The FIXED sentence a fail-closed refusal carries
-/// (`scaffolded::UNAUTHORIZED_EXCEPTION_MESSAGE`), spelled out for the same reason.
+/// (`scaffolded::UNAUTHORIZED_EXCEPTION_MESSAGE`), and the status it is reported with
+/// (`UNAUTHORIZED_EXCEPTION_STATUS`), spelled out here rather than read from the production
+/// constants so a change to them fails a test.
 const UNAUTHORIZED_MESSAGE: &str =
     "Unauthorized. Please check the request and access policy and try again.";
+const UNAUTHORIZED_STATUS: u16 = 401;
 
 async fn update_settings(h: &Harness, body: &Value) -> Reply {
     call(h, "/identity-provider/UpdateIdentityProviderSettings", body).await
@@ -210,32 +209,12 @@ async fn arrange(h: &Harness, row: &Row) {
     }
 }
 
-/// Assert `reply` is the modelled `ValidationException` (HTTP 400) carrying the sentence
-/// this service uses for an identity provider that resolves to no registration.
-fn refused_as_not_valid(case: &str, operation: &str, reply: &Reply) {
-    assert_eq!(
-        reply.status, 400,
-        "case {case:?}: {operation} models ValidationException at HTTP 400, got {reply:?}"
-    );
-    assert_eq!(
-        reply.error_type.as_deref(),
-        Some("ValidationException"),
-        "case {case:?}: {operation} must answer ValidationException, got {reply:?}"
-    );
-    assert_eq!(
-        reply.message(),
-        Some(IDENTITY_PROVIDER_NOT_VALID),
-        "case {case:?}: {operation} must carry the service's sentence for an unresolvable \
-         identity provider, got {reply:?}"
-    );
-}
-
-/// Assert `reply` is the fail-closed refusal the user-plane answers an unresolved
-/// registration with.
+/// Assert `reply` is the fail-closed refusal every operation answers a pair that resolves to
+/// no registration with.
 fn refused_closed(case: &str, operation: &str, reply: &Reply) {
     assert_eq!(
-        reply.status, 400,
-        "case {case:?}: {operation} refuses at HTTP 400, got {reply:?}"
+        reply.status, UNAUTHORIZED_STATUS,
+        "case {case:?}: {operation} refuses at HTTP {UNAUTHORIZED_STATUS}, got {reply:?}"
     );
     assert_eq!(
         reply.error_type.as_deref(),
@@ -263,7 +242,8 @@ fn listed_usernames(case: &str, reply: &Reply) -> Vec<String> {
 /// RULE: an `(IdentityProvider, Product)` pair addresses exactly one registration and only
 /// a LIVE one resolves, so `ListProductSubscriptions` with `Product` supplied,
 /// `UpdateIdentityProviderSettings` and `StartProductSubscription` agree on whether the
-/// pair resolves — each reporting an unresolved pair in the refusal its own model gives it.
+/// pair resolves — and all three refuse an unresolved pair the one way that addressing is
+/// refused.
 #[tokio::test]
 async fn the_pair_resolves_the_same_registration_for_every_operation() {
     for row in ROWS {
@@ -321,8 +301,8 @@ async fn the_pair_resolves_the_same_registration_for_every_operation() {
                 row.case
             );
         } else {
-            refused_as_not_valid(row.case, "ListProductSubscriptions", &listed);
-            refused_as_not_valid(row.case, "UpdateIdentityProviderSettings", &updated);
+            refused_closed(row.case, "ListProductSubscriptions", &listed);
+            refused_closed(row.case, "UpdateIdentityProviderSettings", &updated);
             refused_closed(row.case, "StartProductSubscription", &started);
         }
     }

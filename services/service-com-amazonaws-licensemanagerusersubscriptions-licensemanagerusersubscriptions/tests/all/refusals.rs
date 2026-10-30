@@ -12,10 +12,10 @@
 //! * an `ActiveDirectoryIdentityProvider.DirectoryId` must name a directory of this
 //!   account, in the `Active` stage, and one that does not is a
 //!   `ValidationException` naming the requested id;
-//! * an identity provider that is addressed but not registered is an INVALID PARAMETER
-//!   ("Identity provider is not valid") to the operations that manage or report the
-//!   registration, and `UnauthorizedException` — failing closed — to the operations that
-//!   start or end a user's product subscription;
+//! * an identity provider that is addressed but not registered is answered by ADDRESSING:
+//!   an `IdentityProviderArn` of no registration is an INVALID PARAMETER ("Identity provider
+//!   is not valid"), and a request that names the provider ITSELF — the
+//!   `(IdentityProvider, Product)` pair — fails closed with `UnauthorizedException`;
 //! * a request that addresses a resource by none of the members that identify it is
 //!   refused by LISTING those members ("<members> must be provided");
 //! * a `ResourceArn` the service cannot use is a `BadRequestException`, whether the ARN is
@@ -61,9 +61,9 @@ const UNAUTHORIZED_MESSAGE: &str =
 /// request can be AUTHORIZED; no instance of the account has any other id used below.
 const AUTHORIZED_INSTANCE: &str = "i-0f1e2d3c4b5a69788";
 
-/// The status this service reports a refusal it answers with a non-modelled code with
-/// (`scaffolded::SERVICE_REFUSAL_STATUS`).
-const REFUSAL_STATUS: u16 = 400;
+/// The status this service reports a fail-closed refusal with
+/// (`scaffolded::UNAUTHORIZED_EXCEPTION_STATUS`), as the recorded wire carries it.
+const REFUSAL_STATUS: u16 = 401;
 
 fn settings() -> Value {
     json!({ "Subnets": ["subnet-0123456789abcdef0"], "SecurityGroupId": "sg-0123abcd" })
@@ -422,11 +422,11 @@ async fn a_directory_that_does_not_resolve_as_active_is_refused_naming_the_id() 
 }
 
 /// RULE: an identity provider that a request addresses but that is not a registration of
-/// this account is answered per PLANE — the operations that manage or report the
-/// registration report an invalid parameter (`ValidationException`, HTTP 400, "Identity
-/// provider is not valid"), and the operations that start or end a user's PRODUCT
-/// SUBSCRIPTION fail closed (`UnauthorizedException`) rather than disclose whether it
-/// exists.
+/// this account is answered per ADDRESSING — an `IdentityProviderArn` naming no registration
+/// is reported as an invalid parameter (`ValidationException`, HTTP 400, "Identity provider
+/// is not valid"), and a request that names the identity provider ITSELF (the
+/// `(IdentityProvider, Product)` pair) fails closed with `UnauthorizedException` rather than
+/// disclose what that directory is, or is not, registered for.
 ///
 /// `AssociateUser` is neither, and is not covered here: it resolves its registration after
 /// its own instance-authorization gate has already established what its authorization is
@@ -434,9 +434,11 @@ async fn a_directory_that_does_not_resolve_as_active_is_refused_naming_the_id() 
 /// operation landed with, which `resource_resolution_refusals` pins.
 ///
 /// The rows differ along the addressing form (an ARN, or the `(IdentityProvider, Product)`
-/// pair), the directory named, and the product.
+/// pair), the directory named, the product, and the operation asked — the registration
+/// plane's and the user plane's alike, because the addressing decides the answer and the
+/// plane does not.
 #[tokio::test]
-async fn an_unregistered_identity_provider_is_answered_per_plane() {
+async fn an_unregistered_identity_provider_is_answered_per_addressing() {
     let h = fixture::harness();
     // One real registration, so the refusals below are about the provider the request
     // names and not about an empty store.
@@ -452,12 +454,24 @@ async fn an_unregistered_identity_provider_is_answered_per_plane() {
         fixture::arn_prefix("identity-provider")
     );
 
-    // The registration plane: the identifier is reported as invalid input.
-    let provider_plane: [(&str, fixture::Reply); 4] = [
-        (
-            "DeregisterIdentityProvider by a never-registered ARN",
-            deregister(&h, &json!({ "IdentityProviderArn": never_registered_arn })).await,
-        ),
+    // Addressed by an ARN this service minted for nothing: the value is reported as invalid
+    // input.
+    let by_arn: [(&str, fixture::Reply); 1] = [(
+        "DeregisterIdentityProvider by a never-registered ARN",
+        deregister(&h, &json!({ "IdentityProviderArn": never_registered_arn })).await,
+    )];
+    for (case, reply) in by_arn {
+        refused(
+            &reply,
+            case,
+            400,
+            "ValidationException",
+            "Identity provider is not valid",
+        );
+    }
+
+    // Addressed by the provider itself: the same facts, and nothing is said about them.
+    let by_the_provider: [(&str, fixture::Reply); 6] = [
         (
             "DeregisterIdentityProvider by an unregistered directory",
             deregister(
@@ -491,19 +505,6 @@ async fn an_unregistered_identity_provider_is_answered_per_plane() {
             )
             .await,
         ),
-    ];
-    for (case, reply) in provider_plane {
-        refused(
-            &reply,
-            case,
-            400,
-            "ValidationException",
-            "Identity provider is not valid",
-        );
-    }
-
-    // The user plane: the same facts, and nothing is said about them.
-    let user_plane: [(&str, fixture::Reply); 3] = [
         (
             "StartProductSubscription through an unregistered provider",
             start_subscription(
@@ -541,7 +542,7 @@ async fn an_unregistered_identity_provider_is_answered_per_plane() {
             .await,
         ),
     ];
-    for (case, reply) in user_plane {
+    for (case, reply) in by_the_provider {
         refused(
             &reply,
             case,

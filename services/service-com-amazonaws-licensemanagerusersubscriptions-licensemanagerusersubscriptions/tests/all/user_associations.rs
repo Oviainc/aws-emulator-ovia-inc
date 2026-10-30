@@ -62,10 +62,11 @@ const STATUS_ASSOCIATED: &str = "ASSOCIATED";
 const STATUS_DISASSOCIATING: &str = "DISASSOCIATING";
 
 /// The sentence this service fails closed with (`scaffolded::UNAUTHORIZED_EXCEPTION_MESSAGE`),
-/// and the status it reports such a refusal with (`scaffolded::SERVICE_REFUSAL_STATUS`).
+/// and the status it reports such a refusal with
+/// (`scaffolded::UNAUTHORIZED_EXCEPTION_STATUS`), as the recorded wire carries both.
 const UNAUTHORIZED_MESSAGE: &str =
     "Unauthorized. Please check the request and access policy and try again.";
-const REFUSAL_STATUS: u16 = 400;
+const REFUSAL_STATUS: u16 = 401;
 
 async fn associate(h: &Harness, body: &Value) -> Reply {
     call(h, "/user/AssociateUser", body).await

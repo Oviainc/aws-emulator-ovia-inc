@@ -342,12 +342,15 @@ fn validate_tag_key(member: &str, key: &str) -> Result<(), StateError> {
     Ok(())
 }
 
-/// What the operations that RESOLVE an identity-provider reference say about one that
-/// resolves to no registration: the provider named is not a valid parameter value.
+/// What the operations that resolve an identity-provider reference by its `ARN` say about
+/// one that resolves to no registration: the ARN named is not a valid parameter value.
 ///
 /// One sentence in one place, because it is one resolution: `CreateLicenseServerEndpoint`
-/// and `UpdateIdentityProviderSettings` both refuse an unresolvable reference with it,
+/// and `UpdateIdentityProviderSettings` both refuse an unresolvable ARN with it,
 /// and neither models a not-found for this surface.
+///
+/// A request that names the identity provider ITSELF rather than an ARN is a different
+/// refusal and carries no sentence of its own — see [`StateError::ProviderNotAuthorized`].
 pub const IDENTITY_PROVIDER_NOT_VALID: &str = "Identity provider is not valid";
 
 /// What the USER-ASSOCIATION plane says about an identity provider that no LIVE
@@ -374,29 +377,31 @@ pub enum StateError {
     /// The request is malformed in a way the model cannot express — HTTP 400
     /// `ValidationException`.
     Validation(String),
-    /// The identity provider the request addressed — by `IdentityProviderArn`, or by the
-    /// `(IdentityProvider, Product)` pair it would have been registered under — is not a
-    /// registration of this account.
+    /// No LIVE registration resolves for the identity-provider reference the request made:
+    /// an `IdentityProviderArn` that is not one of this account's, or — on the
+    /// USER-ASSOCIATION plane — a directory no live registration of this account is for.
     ///
-    /// Carries no message, because the two planes of this service word it differently and
-    /// neither wording belongs to the lookup:
-    ///
-    /// * the operations that manage or report the REGISTRATION itself
-    ///   (`DeregisterIdentityProvider`, `ListProductSubscriptions`) report the identifier
-    ///   as an invalid parameter — the modelled `ValidationException` (HTTP 400) carrying
-    ///   [`IDENTITY_PROVIDER_NOT_VALID`];
-    /// * the operations that start or end a user's PRODUCT SUBSCRIPTION
-    ///   (`StartProductSubscription`, `StopProductSubscription`) fail closed with
-    ///   `UnauthorizedException` instead, disclosing nothing about whether the provider
-    ///   exists.
-    ///
-    /// The USER-ASSOCIATION plane (`AssociateUser`, `ListUserAssociations`) is neither: it
-    /// resolves the directory's registration itself and answers its own modelled
-    /// `ResourceNotFoundException` carrying [`IDENTITY_PROVIDER_NOT_REGISTERED`], because
-    /// the fact its authorization is about — the caller's ownership of the EC2 instance —
-    /// has already been established by the time the directory is resolved, so there is
-    /// nothing left to withhold.
+    /// A statement about the reference the caller wrote, so it carries no message: the two
+    /// planes word it differently and neither wording belongs to the lookup. The operations
+    /// that manage or report the REGISTRATION report the ARN as an invalid parameter — the
+    /// modelled `ValidationException` (HTTP 400) carrying [`IDENTITY_PROVIDER_NOT_VALID`] —
+    /// and `AssociateUser` / `ListUserAssociations` answer their own modelled
+    /// `ResourceNotFoundException` carrying [`IDENTITY_PROVIDER_NOT_REGISTERED`], because the
+    /// fact their authorization is about — the caller's ownership of the EC2 instance — has
+    /// already been established by the time the directory is resolved, so there is nothing
+    /// left to withhold.
     ProviderNotRegistered,
+    /// The request addressed a registration by the `(IdentityProvider, Product)` pair — the
+    /// identity provider ITSELF — and this account holds no registration under that pair.
+    ///
+    /// A different refusal from [`StateError::ProviderNotRegistered`], because the request
+    /// named a resource of ANOTHER service (the Active Directory the union carries) rather
+    /// than a value this service minted: whether the caller may act through that directory
+    /// is an authorization question, and this service answers it CLOSED — the non-modelled
+    /// `UnauthorizedException` with its fixed sentence
+    /// ([`crate::scaffolded::Scaffolded::unauthorized`]) — disclosing nothing about what the
+    /// directory is, or is not, registered for.
+    ProviderNotAuthorized,
 }
 
 /// The user-based subscription products this service admits.
@@ -2048,8 +2053,12 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// Resolve a registration from the two ways every operation can address one: its
     /// ARN, or the `(IdentityProvider, Product)` pair it was registered with.
     ///
-    /// `ValidationException` when neither addressing is complete, `ResourceNotFoundException`
-    /// when the addressed registration is not registered.
+    /// [`StateError::Validation`] when neither addressing is complete. An addressing that
+    /// resolves to no live registration is refused per ADDRESSING, because the two name
+    /// different things: an ARN is a value this service minted, so one it does not hold is
+    /// an invalid parameter ([`StateError::ProviderNotRegistered`]), while the pair names
+    /// the caller's own directory, so a pair this account has no registration under is an
+    /// authorization question answered closed ([`StateError::ProviderNotAuthorized`]).
     ///
     /// Whichever way a request addresses one, every member of a registration's identity it
     /// names has to be the stored registration's, for the reason the user plane resolves a
@@ -2093,9 +2102,9 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         let arn = self
             .identity_provider_index
             .get(&(key, product.to_string()))
-            .ok_or(StateError::ProviderNotRegistered)?;
+            .ok_or(StateError::ProviderNotAuthorized)?;
         self.live_identity_provider(arn)
-            .ok_or(StateError::ProviderNotRegistered)
+            .ok_or(StateError::ProviderNotAuthorized)
     }
 
     /// Fold an `UpdateSettings` payload onto the settings the registration `arn` holds AT
@@ -3153,4 +3162,38 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState>)
+}
+
+/// THE GATE for a request that names a user association by its `InstanceUserArn`: `None`
+/// when the request goes on — either because it names no association, or because the
+/// account's store holds the one it names — and the fail-closed refusal otherwise.
+///
+/// The ARN half of [`ec2_fleet::instance_refusal`], and the same decision about the same
+/// thing: an `InstanceUserArn` identifies a user association ON an EC2 instance, so a
+/// request that addresses one by ARN names that instance's association and nothing else,
+/// and an ARN this account's store holds no association for cannot be shown to be the
+/// caller's. The refusal is the value the handler returns on its own error channel for the
+/// same fact ([`crate::scaffolded::ServiceRefusal::unauthorized`]), so the code, the status
+/// and the sentence are not restated here and the two layers cannot answer one refusal two
+/// ways.
+///
+/// A READ: nothing is materialised and nothing is written. An association whose teardown the
+/// clock already owes is still held here, so the gate lets such a request through to the
+/// handler, which materialises what is due and answers this very refusal for it. `None` when
+/// this process holds no store for the service at all — there is then nothing to decide
+/// here, and the handler reports that as the server failure it is.
+pub fn instance_user_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    instance_user_arn: Option<&str>,
+) -> Option<crate::scaffolded::ServiceRefusal> {
+    let arn = instance_user_arn?;
+    let state = service_state(engine)?;
+    let held = state
+        .lock()
+        .resolve_instance_user(Some(arn), None, None, None, None)
+        .is_some();
+    if held {
+        return None;
+    }
+    Some(crate::scaffolded::ServiceRefusal::unauthorized())
 }

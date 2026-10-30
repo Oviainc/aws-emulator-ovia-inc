@@ -355,9 +355,11 @@ fn into_error(error: crate::state::StateError) -> RegisterIdentityProviderError 
         }
         crate::state::StateError::Validation(message) => validation(&message),
         // Nothing this handler resolves is addressed by an existing registration — it
-        // creates one — so the lookup cannot report this; it is worded the same way the
-        // other identity-provider-plane operations word it.
-        crate::state::StateError::ProviderNotRegistered => {
+        // creates one — so the lookup cannot report either of these; they are worded the
+        // same way the other identity-provider-plane operations word an ARN that resolves to
+        // nothing.
+        crate::state::StateError::ProviderNotRegistered
+        | crate::state::StateError::ProviderNotAuthorized => {
             validation(crate::state::IDENTITY_PROVIDER_NOT_VALID)
         }
     }
