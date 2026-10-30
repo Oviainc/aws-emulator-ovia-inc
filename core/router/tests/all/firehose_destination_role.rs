@@ -36,7 +36,7 @@ const REGION: &str = "us-west-2";
 /// stream (`crate::state::TRANSITION_DELAY` in the firehose crate, mirrored by its own
 /// suites' `PAST_THE_TRANSITION`): an `UpdateDestination` lands only on a settled stream,
 /// so the one update below waits this out first.
-const PAST_THE_TRANSITION: std::time::Duration = std::time::Duration::from_millis(1_200);
+const PAST_THE_TRANSITION: std::time::Duration = std::time::Duration::from_millis(3_400);
 
 /// The Firehose service principal a destination role must trust.
 const FIREHOSE_PRINCIPAL: &str = "\"firehose.amazonaws.com\"";

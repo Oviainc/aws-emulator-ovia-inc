@@ -1622,7 +1622,12 @@ async fn delete_pass(
 /// stack sits in until the resources are gone. The wait is BOUNDED — these attempts, one
 /// [`UNWIND_RETRY_DELAY`] apart — so a service that refuses the delete for any other
 /// reason is reported rather than waited on forever.
-const UNWIND_ATTEMPTS: usize = 6;
+///
+/// The count is what makes the bound cover a resource that is merely coming up: together
+/// with [`UNWIND_RETRY_DELAY`] it has to outlast the longest span a called service gives
+/// one of those (a few seconds — Amazon Data Firehose gives a stream three), or a rollback
+/// would report a resource it could have removed as one it could not.
+const UNWIND_ATTEMPTS: usize = 20;
 
 /// How long the unwind waits before asking again. Chosen: shorter than the status spans
 /// the services this emulator calls give a resource that is coming up, so the first

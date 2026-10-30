@@ -27,8 +27,9 @@ use smithy_server_runtime::MultiServiceRouter;
 pub(crate) const REGION: &str = "us-west-2";
 
 /// Long enough to cover the emulator's chosen `CREATING` -> `ACTIVE` /
-/// `DELETING` -> removed / `ENABLING` -> `ENABLED` span (`crate::state::TRANSITION_DELAY`).
-pub(crate) const PAST_THE_TRANSITION: Duration = Duration::from_millis(1_200);
+/// `DELETING` -> removed / `ENABLING` -> `ENABLED` span (`crate::state::TRANSITION_DELAY`),
+/// with margin for a loaded machine.
+pub(crate) const PAST_THE_TRANSITION: Duration = Duration::from_millis(3_400);
 
 /// One emulator: the firehose service mounted on a single shared engine, plus the engine
 /// itself so a test can read the record buffer no operation exposes yet.

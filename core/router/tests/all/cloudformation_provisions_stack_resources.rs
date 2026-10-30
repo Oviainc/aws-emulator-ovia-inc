@@ -42,8 +42,9 @@ const REGION: &str = "us-east-1";
 const ACCOUNT_ID: &str = "000000000000";
 
 /// Long enough for both clock-owed spans these services choose to come due: the stack's
-/// (`STATUS_TRANSITION_DELAY`, 500 ms) and the stream's (`TRANSITION_DELAY`, 600 ms).
-const PAST_BOTH_SPANS: Duration = Duration::from_millis(1_200);
+/// (`STATUS_TRANSITION_DELAY`, 500 ms) and the stream's (`TRANSITION_DELAY`, 3 s), with
+/// margin for a loaded machine.
+const PAST_BOTH_SPANS: Duration = Duration::from_millis(3_900);
 
 /// The emulator with the services this suite exercises, mounted on ONE engine exactly as
 /// `core/router/src/lib.rs` mounts them. Request authentication is off, as in every other

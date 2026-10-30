@@ -54,9 +54,9 @@ const ACCOUNT_ID: &str = "000000000000";
 
 /// Long enough for both clock-owed spans these services choose to come due: the stack's
 /// (`STATUS_TRANSITION_DELAY`, 500 ms) and the Firehose stream's (`TRANSITION_DELAY`,
-/// 600 ms). A metric stream has no transient state of its own — `PutMetricStream` creates
-/// it `running`.
-const PAST_BOTH_SPANS: Duration = Duration::from_millis(1_200);
+/// 3 s), with margin for a loaded machine. A metric stream has no transient state of its
+/// own — `PutMetricStream` creates it `running`.
+const PAST_BOTH_SPANS: Duration = Duration::from_millis(3_900);
 
 /// How often a deployment is asked whether it has settled, and how long it goes on being
 /// asked: a stack whose resource an owning service has not reported ready yet completes from

@@ -38,10 +38,15 @@ use crate::ops::types::{
 /// (`CREATING` -> `ACTIVE`, `DELETING` -> removed, `ENABLING` -> `ENABLED`,
 /// `DISABLING` -> `DISABLED`) comes due.
 ///
-/// AWS documents neither span, so this is a CHOSEN value, kept short enough for a test
-/// to wait for it and long enough that a caller acting immediately after the starting
-/// call still observes the transient status the real service shows.
-pub const TRANSITION_DELAY: Duration = Duration::from_millis(600);
+/// AWS documents neither span, so this is a CHOSEN value: a few seconds, which is short
+/// enough for a test to wait for it and long enough that a caller still observes the
+/// transient status the real service shows. The span has to outlast the work a caller does
+/// between the starting call and the read that follows it — a create resolves every role
+/// and key it names against IAM and KMS before it answers, so a client making a handful of
+/// control-plane calls spends far more than a few hundred milliseconds — or the transient
+/// status would be unobservable, which is a status this emulator never shows rather than
+/// an implementation detail.
+pub const TRANSITION_DELAY: Duration = Duration::from_secs(3);
 
 /// How long an ingested record stays in a stream's buffer WITHOUT being delivered.
 ///

@@ -107,8 +107,9 @@ async fn every_stream_reports_its_sse_state_whatever_the_create_asked_for() {
     let emulator = Emulator::new();
     let cases = encryption_cases();
 
-    // Create every stream first, so the describes below all land inside the enabling
-    // span rather than racing it.
+    // Each case is read back right after its OWN create: a create resolves the roles and
+    // keys it names against IAM and KMS before it answers, so creating every stream first
+    // would spend another case's enabling span before this one is read.
     for case in &cases {
         let mut request = json!({ "DeliveryStreamName": case.stream });
         request[case.destination_member] = case.destination.clone();
@@ -121,9 +122,7 @@ async fn every_stream_reports_its_sse_state_whatever_the_create_asked_for() {
             "case {:?}: create got {created:?}",
             case.stream
         );
-    }
 
-    for case in &cases {
         let encryption = encryption_of(&emulator, case.stream).await;
         assert!(
             encryption.is_object(),
