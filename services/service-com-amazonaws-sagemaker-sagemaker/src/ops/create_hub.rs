@@ -156,7 +156,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // BEFORE the quota: a call that would add no record cannot be over the limit.
         if store.hubs.contains_key(&input.hub_name) {
             return Err(CreateHubErrorModeled::ResourceInUse(ResourceInUse {
-                message: Some(format!("Cannot create already existing hub \"{arn}\".")),
+                // SageMaker words this refusal for the HUB: the resource type, the name
+                // the request submitted, and what the caller should do instead — not an
+                // ARN the service synthesised from that name.
+                message: Some(format!(
+                    "A hub with name {} already exists. Please use a different name and \
+                     try again.",
+                    input.hub_name
+                )),
             })
             .into());
         }

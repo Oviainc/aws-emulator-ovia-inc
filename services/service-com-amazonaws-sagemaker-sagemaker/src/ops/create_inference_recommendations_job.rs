@@ -175,8 +175,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         // The rules the model states in prose rather than in a constraint trait, so the
-        // centralized validation walk cannot have refused them already.
-        validate_input_config(&input.input_config)?;
+        // centralized validation walk cannot have refused them already. They judge the
+        // REQUEST — its members against each other — so they are decided before any
+        // reference in it is resolved against the store: a request that is not a
+        // well-formed job of its own `JobType` is refused for that, not for a resource it
+        // names.
+        validate_request(&input)?;
 
         let region = crate::state::request_region(ctx);
         let arn =
@@ -226,9 +230,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // necessarily a name in this account and Region.
         if let Some(model_name) = &input.input_config.model_name {
             if !store.models.contains_key(model_name) {
-                let model_arn = crate::state::resource_arn(&region, "model", model_name);
-                return Err(refuse(format!(
-                    "Could not find model \"{model_arn}\" named by InputConfig.ModelName."
+                return Err(refuse(crate::state::could_not_find(
+                    crate::state::MODEL_KIND_LABEL,
+                    model_name,
                 )));
             }
         }
@@ -243,10 +247,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             };
             if !store.endpoints.contains_key(endpoint_name) {
-                let endpoint_arn = crate::state::resource_arn(&region, "endpoint", endpoint_name);
-                return Err(refuse(format!(
-                    "Could not find endpoint \"{endpoint_arn}\" named by \
-                     InputConfig.Endpoints."
+                return Err(refuse(crate::state::could_not_find(
+                    crate::state::ENDPOINT_KIND_LABEL,
+                    endpoint_name,
                 )));
             }
         }
@@ -290,9 +293,28 @@ fn refuse(message: impl Into<String>) -> CreateInferenceRecommendationsJobError 
     crate::scaffolded::Scaffolded::validation(message.into())
 }
 
+/// The `JobType` that runs an instance recommendation rather than a load test, as
+/// `RecommendationJobType` spells it on the wire
+/// (`super::types::RECOMMENDATION_JOB_TYPE_VALUES`).
+const RECOMMENDATION_JOB_TYPE_DEFAULT: &str = "Default";
+
+/// How SageMaker states that a `Default` job carries an input member only a load test
+/// configures: the job type, then the member the request may not combine with it.
+fn default_job_type_rejects(member: &str) -> String {
+    format!("{RECOMMENDATION_JOB_TYPE_DEFAULT} JobType will not accept {member}")
+}
+
 /// Refuse an input configuration that breaks one of the documented rules the modelled
 /// constraints cannot express.
 ///
+/// * `JobType` "Defines the type of recommendation job. Specify `Default` to initiate an
+///   instance recommendation and `Advanced` to initiate a LOAD TEST", so an `InputConfig`
+///   member the model documents as belonging to the load test configures work a `Default`
+///   job does not do: `TrafficPattern` "defines the traffic pattern of the load test"
+///   (`smithy_query(query="shape",shape="TrafficPattern")`) and `ResourceLimit`
+///   "defines the maximum number of load tests"
+///   (`shape="RecommendationJobResourceLimit"`). A `Default` job carrying one is refused
+///   rather than accepted with a member nothing can honour.
 /// * `RecommendationJobInputConfig$ModelPackageVersionArn` is "the Amazon Resource Name
 ///   (ARN) of a versioned model package" and `$ModelName` is "the name of the created
 ///   model": they are the two ways one request names the model under test, so a request
@@ -301,9 +323,23 @@ fn refuse(message: impl Into<String>) -> CreateInferenceRecommendationsJobError 
 /// * `RecommendationJobInputConfig$JobDurationInSeconds`: "Specifies the maximum duration
 ///   of the job, in seconds. The maximum value is 18,000 seconds." The model bounds the
 ///   member only from below (`range 1..`), so the ceiling is refused here.
-fn validate_input_config(
-    config: &RecommendationJobInputConfig,
+fn validate_request(
+    input: &CreateInferenceRecommendationsJobInput,
 ) -> Result<(), CreateInferenceRecommendationsJobError> {
+    let config = &input.input_config;
+    if input.job_type == RECOMMENDATION_JOB_TYPE_DEFAULT {
+        // Each load-test-only member is named by the member name the request spells it
+        // with, so a caller can tell WHICH member to drop. `ResourceLimit` is decided
+        // first: it is the member that bounds the load test itself, the traffic pattern
+        // only shapes one.
+        if config.resource_limit.is_some() {
+            return Err(refuse(default_job_type_rejects("ResourceLimit")));
+        }
+        if config.traffic_pattern.is_some() {
+            return Err(refuse(default_job_type_rejects("TrafficPattern")));
+        }
+    }
+
     match (&config.model_package_version_arn, &config.model_name) {
         (Some(_), Some(_)) => {
             return Err(refuse(

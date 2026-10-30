@@ -132,8 +132,9 @@ fn str_field(body: &Value, member: &str) -> String {
         .to_string()
 }
 
-/// The constant message SageMaker's `ResourceInUse` carries (the service's own wording,
-/// mirrored by `state::RESOURCE_IN_USE_MESSAGE`).
+/// The message SageMaker's `ResourceInUse` carries for THIS resource (the sentence it
+/// shares with the other resources whose own refusal is this one, mirrored by
+/// `state::RESOURCE_IN_USE_MESSAGE`).
 const NAME_IN_USE_MESSAGE: &str = "The ID or Name specified is already in use.";
 
 /// The three optional app-configuration members and the tag list, as the modelled
@@ -472,8 +473,10 @@ async fn creating_an_app_image_config_whose_name_is_taken_is_refused_as_resource
             "ResourceInUse",
             "case {case}: expected the modelled ResourceInUse code, got {refusal:?}"
         );
-        // SageMaker's `ResourceInUse` message is a constant of the service, identical for
-        // every resource kind and name and repeating nothing from the request.
+        // For an app image config the sentence carries nothing from the request: it is
+        // the same whatever name the caller asked for and does not repeat the name back.
+        // (`create_refusal_message_fidelity` pins the per-resource wording rule this is
+        // one row of.)
         assert_eq!(
             message(&refusal),
             NAME_IN_USE_MESSAGE,

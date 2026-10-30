@@ -173,8 +173,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the quota check so a duplicate is answered as a duplicate even when the store
         // is full.
         if store.experiments.contains_key(&key) {
+            // SageMaker words this refusal for the EXPERIMENT: it restates the uniqueness
+            // scope the member documents and then names the experiment and the name the
+            // request submitted, in parentheses. The name is echoed AS SENT, not as the
+            // stored record spells it, because the fact being reported is that this
+            // request's name is taken.
             return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Experiment with name \"{}\" already exists.",
+                "Experiment names must be unique within an AWS account and region. \
+                 Experiment with name ({}) already exists.",
                 input.experiment_name
             )));
         }

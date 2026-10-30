@@ -176,8 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so a re-create of a stored name is told the specific reason even when the
         // store happens to sit at its bound.
         if store.algorithms.contains_key(&input.algorithm_name) {
+            // SageMaker words this refusal for the ALGORITHM: the resource type, a colon,
+            // then the ARN of the algorithm already holding the name — unquoted and with
+            // no closing period.
             return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Cannot create already existing algorithm \"{arn}\"."
+                "Algorithm already exists: {arn}"
             )));
         }
         // The store is bounded, so a caller varying `AlgorithmName` cannot grow it

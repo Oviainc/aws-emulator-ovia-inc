@@ -172,7 +172,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and the image it did create is gone.
         if store.images.contains_key(&input.image_name) {
             return Err(CreateImageErrorModeled::ResourceInUse(ResourceInUse {
-                message: Some(format!("Cannot create already existing image \"{arn}\".")),
+                // SageMaker words this refusal for the IMAGE: the resource type, the
+                // member it is addressed by with the name the request submitted, and what
+                // the caller should do instead — not an ARN synthesised from that name.
+                message: Some(format!(
+                    "The Image with ImageName {} already exists. Please use a different \
+                     ImageName.",
+                    input.image_name
+                )),
             })
             .into());
         }

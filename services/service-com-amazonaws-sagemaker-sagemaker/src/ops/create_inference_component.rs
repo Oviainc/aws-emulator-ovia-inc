@@ -225,24 +225,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // References are resolved OUTSIDE IN: `EndpointName` names the resource this
+        // component is hosted on and is the request's own top-level member, so an endpoint
+        // the account does not hold is what the request is refused for — before the models
+        // nested inside its specifications are looked at. Each refusal quotes the
+        // identifier the request carried; see `crate::state::could_not_find`.
+        if !store.endpoints.contains_key(&input.endpoint_name) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::could_not_find(
+                    crate::state::ENDPOINT_KIND_LABEL,
+                    &input.endpoint_name,
+                ),
+            ));
+        }
+
         // Every model a specification names must already exist, the way `CreateEndpoint`
         // requires the endpoint configuration it is handed.
         for specification in specifications {
             if let Some(model_name) = specification.model_name.as_deref() {
                 if !store.models.contains_key(model_name) {
-                    let model_arn = crate::state::resource_arn(&region, "model", model_name);
-                    return Err(crate::scaffolded::Scaffolded::validation(format!(
-                        "Could not find model \"{model_arn}\"."
-                    )));
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        crate::state::could_not_find(crate::state::MODEL_KIND_LABEL, model_name),
+                    ));
                 }
             }
         }
 
+        // Resolved again as a mutable borrow now that every reference holds: the endpoint
+        // is the record the clock-owed transition below is materialised on.
         let Some(endpoint) = store.endpoints.get_mut(&input.endpoint_name) else {
-            let endpoint_arn = crate::state::resource_arn(&region, "endpoint", &input.endpoint_name);
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Could not find endpoint \"{endpoint_arn}\"."
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::could_not_find(
+                    crate::state::ENDPOINT_KIND_LABEL,
+                    &input.endpoint_name,
+                ),
+            ));
         };
 
         // `VariantName` names "an existing production variant where you host the

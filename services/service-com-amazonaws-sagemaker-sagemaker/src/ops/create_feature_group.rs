@@ -223,10 +223,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record, so the limit is not what is wrong with it.
         if store.feature_groups.contains_key(&input.feature_group_name) {
             return Err(CreateFeatureGroupErrorModeled::ResourceInUse(ResourceInUse {
-                // The crate's one wording for this refusal: SageMaker answers the same
-                // sentence whatever resource kind and name the caller asked for, and
-                // does not repeat the name back.
-                message: Some(crate::state::RESOURCE_IN_USE_MESSAGE.to_string()),
+                // SageMaker words this refusal for the FEATURE GROUP: the
+                // `Resource Already Exists:` prefix, then the resource type with the name
+                // the request submitted, then what the caller should do instead.
+                message: Some(format!(
+                    "Resource Already Exists: FeatureGroup with name {} already exists. \
+                     Choose a different name.",
+                    input.feature_group_name
+                )),
             })
             .into());
         }

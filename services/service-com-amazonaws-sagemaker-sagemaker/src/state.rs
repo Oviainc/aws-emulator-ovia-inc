@@ -3405,16 +3405,16 @@ pub fn job_directory<Eng: Send + Sync + 'static>(
 pub const NO_STATE: &str =
     "SageMaker state is unavailable: this service is not mounted on the shared in-memory engine";
 
-/// The message SageMaker's `ResourceInUse` carries when a create names a resource whose
-/// name is already taken.
+/// The message SageMaker's `ResourceInUse` carries for the resources whose OWN refusal of
+/// a name already taken is this sentence.
 ///
-/// It is a CONSTANT of the service, not built from the request: SageMaker answers the
-/// same sentence whatever resource kind and whatever name the caller asked for, and the
-/// name is not repeated back. Stated once here so each create that MODELS
-/// `ResourceInUse` refuses with the same wording — today `CreateAppImageConfig`,
-/// `CreateAIWorkloadConfig` and `CreateFeatureGroup`; an operation whose model does not
-/// bind `ResourceInUse` (`CreateModel`, `CreateModelPackageGroup`) refuses with its own
-/// `ValidationException` text instead and does not use this.
+/// It carries nothing from the request: for these resources the service answers the same
+/// sentence whatever name the caller asked for, and does not repeat the name back. It is
+/// NOT a service-wide default — a name collision is worded per RESOURCE TYPE, and a create
+/// whose resource has its own sentence (`CreateAIWorkloadConfig`, `CreateFeatureGroup`,
+/// `CreateHub`, `CreateImage`) states that one in its own handler rather than borrowing
+/// this. Stated once here so the creates that DO share this sentence — the app image
+/// config and the AI job family — cannot word the same fact differently.
 pub const RESOURCE_IN_USE_MESSAGE: &str = "The ID or Name specified is already in use.";
 
 /// Whether `value` is a well-formed AWS region token: lowercase alphanumerics and
@@ -4004,10 +4004,7 @@ pub fn pipeline_definition_violation(definition: &str) -> Option<String> {
         );
     };
     if steps.is_empty() {
-        return Some(
-            "PipelineDefinition declares no steps: Steps must hold at least one step"
-                .to_string(),
-        );
+        return Some(PIPELINE_DEFINITION_NEEDS_A_STEP.to_string());
     }
     // The cheap pre-check, before any graph work: the step list alone is already past
     // the bound, so nothing below needs to look at it.
@@ -4078,6 +4075,15 @@ fn step_depends_on_unknown_step(step: &str, missing: &str) -> String {
 fn step_cannot_depend_on_step_kind(step: &str, target_type: &str, target: &str) -> String {
     format!("Step: {step} can not depends on {target_type}Step: {target}")
 }
+
+/// How SageMaker diagnoses a definition whose `Steps` list holds nothing.
+///
+/// FIXED text carrying nothing from the request: the sentence names the part of the
+/// request being judged (`Pipeline definition`) and the requirement it breaks — the
+/// minimum number of steps a pipeline must declare — with no closing period, because the
+/// requirement is quoted rather than written out as prose.
+const PIPELINE_DEFINITION_NEEDS_A_STEP: &str =
+    "Pipeline definition: At least 1 step must be provided";
 
 /// How SageMaker diagnoses a step graph that is not a DAG.
 ///

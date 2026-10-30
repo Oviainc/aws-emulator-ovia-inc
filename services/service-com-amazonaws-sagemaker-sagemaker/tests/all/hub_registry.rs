@@ -371,8 +371,7 @@ async fn a_hub_name_already_in_use_is_refused_with_resource_in_use() {
         ),
     ];
 
-    let created = emulator.ok("CreateHub", &minimal_hub("taken")).await;
-    let arn = str_field(&created, "HubArn");
+    emulator.ok("CreateHub", &minimal_hub("taken")).await;
     let before = emulator
         .ok("DescribeHub", &json!({ "HubName": "taken" }))
         .await;
@@ -389,9 +388,11 @@ async fn a_hub_name_already_in_use_is_refused_with_resource_in_use() {
             "case {case}: the refusal must use the operation's modelled error, \
              got {parsed:?}"
         );
-        assert!(
-            message(&parsed).contains(&arn),
-            "case {case}: the refusal must name the existing hub, got {parsed:?}"
+        assert_eq!(
+            message(&parsed),
+            "A hub with name taken already exists. Please use a different name and try \
+             again.",
+            "case {case}: the refusal must name the submitted HubName, got {parsed:?}"
         );
 
         let after = emulator

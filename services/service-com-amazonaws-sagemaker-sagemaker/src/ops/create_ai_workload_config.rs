@@ -170,9 +170,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .contains_key(&input.ai_workload_config_name)
         {
             return Err(CreateAIWorkloadConfigErrorModeled::ResourceInUse(ResourceInUse {
-                // The service's one in-use sentence, stated in `crate::state` so every
-                // create that models `ResourceInUse` refuses with the same wording.
-                message: Some(crate::state::RESOURCE_IN_USE_MESSAGE.to_string()),
+                // SageMaker words this refusal for the AI WORKLOAD CONFIGURATION: the
+                // resource type, the name the request submitted in single quotes, and the
+                // account the name is taken in. The generic in-use sentence
+                // (`crate::state::RESOURCE_IN_USE_MESSAGE`) belongs to the resources whose
+                // own refusal is that sentence, not to this one.
+                message: Some(format!(
+                    "AIWorkloadConfig with name '{}' already exists for this account.",
+                    input.ai_workload_config_name
+                )),
             })
             .into());
         }

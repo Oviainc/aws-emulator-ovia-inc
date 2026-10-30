@@ -224,7 +224,9 @@ async fn describe_replays_every_member_the_create_carried() {
         ),
         (
             "traffic-phases",
-            json!({}),
+            // A traffic pattern and a test budget configure the LOAD TEST, which only the
+            // `Advanced` job type runs, so this row asks for that type.
+            json!({ "JobType": "Advanced" }),
             json!({
                 "JobDurationInSeconds": 7200,
                 // `TrafficType` is `PHASES | STAIRS` (smithy_query shape=TrafficType).
@@ -239,7 +241,7 @@ async fn describe_replays_every_member_the_create_carried() {
         ),
         (
             "traffic-stairs",
-            json!({}),
+            json!({ "JobType": "Advanced" }),
             json!({
                 "TrafficPattern": {
                     "TrafficType": "STAIRS",
