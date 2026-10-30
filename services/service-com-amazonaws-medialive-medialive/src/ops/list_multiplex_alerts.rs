@@ -185,19 +185,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `NextToken` is the `Id` of the alert the next page starts at, which is
         // the form this operation hands out, so a value that is not an alert id
-        // at all cannot be one of its tokens and is a bad request rather than an
-        // empty page. A token whose own alert has since been evicted from the
-        // bounded store resumes at the next surviving alert instead of failing,
-        // the same tolerance `ListMultiplexPrograms` has for a token naming a
-        // program deleted since the previous page.
+        // at all — including one that spells a number some other way than the
+        // minting site renders it, which is the service's shared rule
+        // ([`crate::state::minted_number`]) — cannot be one of its tokens and is
+        // a bad request rather than an empty page. A token whose own alert has
+        // since been evicted from the bounded store resumes at the next
+        // surviving alert instead of failing, the same tolerance
+        // `ListMultiplexPrograms` has for a token naming a program deleted since
+        // the previous page.
         let first = match input.next_token.as_deref() {
             None => None,
-            Some(next_token) => Some(next_token.parse::<u64>().map_err(|_| {
-                bad_request(format!(
-                    "nextToken must be the alert id this operation hands out a page's token as, \
-                     got {next_token:?}"
-                ))
-            })?),
+            Some(next_token) => {
+                Some(crate::state::minted_number(next_token).ok_or_else(|| {
+                    bad_request(format!(
+                        "nextToken must be the alert id this operation hands out a page's token \
+                         as, got {next_token:?}"
+                    ))
+                })?)
+            }
         };
 
         let mut state = state.lock();

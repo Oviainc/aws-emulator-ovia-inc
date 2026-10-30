@@ -1242,6 +1242,27 @@ pub fn list_page_size(max_results: Option<i32>) -> Result<usize, String> {
     }))
 }
 
+/// The number a value spells when it is written the ONE way this service renders
+/// a number it minted — plain decimal digits, no sign and no leading zero — or
+/// `None` when it is spelled any other way.
+///
+/// ONE copy of this rule and for the reason [`bounded_length`] states: every
+/// `NextToken` and every numeric id this service hands out is rendered by
+/// `to_string()` over the number itself, so the only spellings it can ever have
+/// handed out are the ones that render back to the same string. A value whose
+/// digits do parse but whose spelling differs — a leading `+`, a padding zero —
+/// is a value this service never minted, so it continues no walk and names no
+/// resource, and the reader that is handed it refuses it instead of honouring it
+/// as the number it resembles. `str::parse` admits both of those spellings, so
+/// no reader of a token or of a minted id decodes one with `parse` alone.
+pub fn minted_number(value: &str) -> Option<u64> {
+    let number: u64 = value.parse().ok()?;
+    // The rendering the minting sites write is the only spelling of this number
+    // the service hands out, so a value that is not that rendering is not one of
+    // them, however it parses.
+    (number.to_string() == value).then_some(number)
+}
+
 /// Where a paginated request resumes in a sequence its `NextToken` walks by
 /// POSITION, and the page that cursor reports out of it.
 ///
@@ -1274,19 +1295,22 @@ impl ListPosition {
     ///
     /// A request naming no token asks for the first page. A token that is not a
     /// whole number is NOT read as the first page: it continues nothing this
-    /// service handed out, so it is refused. A position PAST the end is not
-    /// refused, because these sequences shrink on their own: a token handed out
-    /// for a page that has since been dropped resumes at the end of the sequence
-    /// instead of failing a walk that was valid when it began.
+    /// service handed out, so it is refused — and so is a token that spells a
+    /// whole number some other way than [`minted_number`] renders it, because
+    /// that spelling is not one this service ever handed out either. A position
+    /// PAST the end is not refused, because these sequences shrink on their own:
+    /// a token handed out for a page that has since been dropped resumes at the
+    /// end of the sequence instead of failing a walk that was valid when it
+    /// began.
     pub fn read(
         next_token: Option<&str>,
         page_size: usize,
         position_of: &str,
     ) -> Result<Self, String> {
         let already_reported = match next_token {
-            Some(token) => token
-                .parse::<usize>()
-                .map_err(|_| format!("nextToken {token} is not {position_of} position"))?,
+            Some(token) => minted_number(token)
+                .and_then(|position| usize::try_from(position).ok())
+                .ok_or_else(|| format!("nextToken {token} is not {position_of} position"))?,
             None => 0,
         };
         Ok(Self {

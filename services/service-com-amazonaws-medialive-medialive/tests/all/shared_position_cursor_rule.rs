@@ -40,8 +40,13 @@ use crate::wire::{call, error_code, error_message, medialive_with_engine, DEFAUL
 const ON_PREMISES: &str = "ON_PREMISES";
 
 /// The sequence a row of the table pages over, and so how this suite fills it.
+///
+/// Visible to the crate's other suites because the fixture below (which fills
+/// one of these sequences through the only path that writes it) is what
+/// `tests/all/shared_minted_token_spelling_rule.rs` drives these same three
+/// listings through, rather than filling three sequences of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Sequence {
+pub(crate) enum Sequence {
     /// A channel's alert log, in the order the service set the alerts.
     ChannelAlerts,
     /// A cluster's alert log, oldest first.
@@ -52,26 +57,26 @@ enum Sequence {
 
 /// One row of the table: a listing that pages by position, the sequence it
 /// reports and how a client reads that sequence back.
-struct Positional {
+pub(crate) struct Positional {
     /// The operation the row drives, as the model names it.
-    op: &'static str,
+    pub(crate) op: &'static str,
     /// The sequence it pages over.
-    sequence: Sequence,
+    pub(crate) sequence: Sequence,
     /// Its URI, from `smithy_query(query="operation", operation="<Operation>")`,
     /// built from the id of the resource the sequence hangs off.
-    uri: fn(&str) -> String,
+    pub(crate) uri: fn(&str) -> String,
     /// The member it reports its page in (the `jsonName` of the operation's
     /// output list member).
-    member: &'static str,
+    pub(crate) member: &'static str,
     /// The member of one reported entry this suite names that entry by.
-    identity: &'static str,
+    pub(crate) identity: &'static str,
 }
 
 /// Every listing of this service that resumes at a position rather than at an
 /// identifier: `smithy_query(query="operation", operation="ListAlerts,
 /// ListClusterAlerts,DescribeSchedule")` for the method, the URI and the output
 /// member of each.
-fn positional_listings() -> Vec<Positional> {
+pub(crate) fn positional_listings() -> Vec<Positional> {
     vec![
         Positional {
             op: "ListAlerts",
@@ -100,11 +105,11 @@ fn positional_listings() -> Vec<Positional> {
 /// How many entries this suite fills each sequence with — more than one page at
 /// every size the walk below asks for, so a row that reported its whole sequence
 /// whatever the token fails.
-const ENTRIES: usize = 5;
+pub(crate) const ENTRIES: usize = 5;
 
 /// The names the entries of a filled sequence carry, in the order the listing
 /// must report them.
-fn entry_names() -> Vec<String> {
+pub(crate) fn entry_names() -> Vec<String> {
     (0..ENTRIES).map(|index| format!("entry-{index}")).collect()
 }
 
@@ -164,7 +169,7 @@ async fn cluster(router: &MultiServiceRouter, case: &str) -> String {
 /// seeded through the store's own writers (the only way an alert enters a log)
 /// rather than by asking an operation to invent alerts. The schedule is filled
 /// the way a client fills it, through `BatchUpdateSchedule`.
-async fn filled_sequence(
+pub(crate) async fn filled_sequence(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     row: &Positional,
@@ -260,7 +265,7 @@ async fn page(
 }
 
 /// A row's listing called with `query` appended to its URI.
-async fn answer(
+pub(crate) async fn answer(
     router: &MultiServiceRouter,
     row: &Positional,
     owner: &str,
@@ -284,7 +289,7 @@ async fn answer(
 /// The entries a page reported, named by the row's identity member: an absent
 /// member and an empty list both mean "no entries" to a client, and which of the
 /// two the restJson1 codec writes is the serializer's choice.
-fn reported(case: &str, row: &Positional, body: &Value) -> Vec<String> {
+pub(crate) fn reported(case: &str, row: &Positional, body: &Value) -> Vec<String> {
     let entries = match body.get(row.member) {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(entries)) => entries.clone(),
@@ -307,7 +312,7 @@ fn reported(case: &str, row: &Positional, body: &Value) -> Vec<String> {
 }
 
 /// The continuation token a page carried, if it carried one.
-fn token(body: &Value) -> Option<String> {
+pub(crate) fn token(body: &Value) -> Option<String> {
     body.get("nextToken")
         .and_then(Value::as_str)
         .map(ToString::to_string)

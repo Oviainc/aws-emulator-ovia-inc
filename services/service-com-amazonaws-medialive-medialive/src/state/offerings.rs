@@ -217,9 +217,10 @@ pub fn offering_id(index: usize) -> String {
 
 /// The position in the catalog an `OfferingId` names, or `None` when the id
 /// names no offering this catalog holds — including every value that is not one
-/// of its ids at all.
+/// of its ids at all, and every value that spells one of them some other way
+/// than [`offering_id`] renders it ([`super::minted_number`] is that rule).
 pub fn offering_index(offering_id: &str) -> Option<usize> {
-    let id: u64 = offering_id.parse().ok()?;
+    let id = super::minted_number(offering_id)?;
     let index = usize::try_from(id.checked_sub(FIRST_OFFERING_ID)?).ok()?;
     (index < catalog().len()).then_some(index)
 }
