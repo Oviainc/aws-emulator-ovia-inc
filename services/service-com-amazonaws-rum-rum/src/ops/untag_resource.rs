@@ -19,7 +19,7 @@
 //! tagging frontend's `BadRequestException` before anything is removed, exactly as the
 //! sibling `TagResource` refuses the same key: the constraints are the key shape's, so
 //! they hold for a key a request NAMES as much as for one it writes (see
-//! [`BAD_REQUEST_ERROR_CODE`] and `crate::state::tag_key_list_refusal`).
+//! [`crate::state::TaggingRefusal`] and `crate::state::tag_key_list_refusal`).
 //!
 //! ## Shape of an operation
 //!
@@ -96,38 +96,17 @@ pub enum UntagResourceErrorModeled {
     ValidationException(ValidationException),
 }
 
-/// The error code RUM's tagging frontend names a resource it cannot find by on the wire,
-/// and the one it refuses an invalid request with.
-///
-/// The model declares `ResourceNotFoundException` for this operation, and that shape's
-/// `@httpError` 404 and its members are what the response carries — but the code the
-/// service puts in `x-amzn-errortype` / the body's `__type` for an ARN that resolves to
-/// nothing is the shorter `NotFoundException`, which the model does not declare at all.
-/// The recorded corpus unit `rum.untag-resource-unknown-resource-rejected` pins it
-/// (`err["Code"] == "NotFoundException"`), and it is specific to the ARN-addressed
-/// tagging operations: RUM's app-monitor operations, addressed by `Name`, do answer
-/// `ResourceNotFoundException`. A client branches on the code it is SENT, so the emulator
-/// sends the one the service sends rather than the one the model lists.
-const NOT_FOUND_ERROR_CODE: &str = "NotFoundException";
-
-/// The error code that same frontend refuses an invalid request with — the shorter
-/// `BadRequestException`, where the model declares `ValidationException` and an
-/// app-monitor call (addressed by `Name`) answers the modelled code. The recorded units
-/// `rum.tag-resource-invalid-key-rejected` and
-/// `rum.tag-resource-invalid-key-format-rejected` pin it for a tag key the frontend
-/// refuses, the sibling [`crate::ops::tag_resource`] names the same value, and
-/// `crate::service` words a tag refusal the BOUNDARY makes with it too — so a key this
-/// handler refuses is reported under the one code whichever path found it.
-const BAD_REQUEST_ERROR_CODE: &str = "BadRequestException";
-
-// The wire code, and the status, a request IAM does not allow is refused with: this
-// service's own pair, `crate::state::ACCESS_DENIED_ERROR_CODE` and
-// `crate::state::ACCESS_DENIED_STATUS`, defined there once rather than per operation.
-// They are carried by this channel's own variant because this operation's modelled error
-// list does not declare `AccessDeniedException` — it is a common error rather than one
-// specific to an operation — while the body is the modelled shape
-// (`crate::state::access_denied`).
-use crate::state::{ACCESS_DENIED_ERROR_CODE, ACCESS_DENIED_STATUS};
+// The refusals RUM's tagging frontend words itself, with the ONE (refusal class -> wire
+// code, HTTP status, carried schema, body) mapping the three ARN-addressed tagging
+// operations answer through: `crate::state::TaggingRefusal`. The model declares
+// `ResourceNotFoundException` and `ValidationException` for this operation, and those
+// shapes' `@httpError`s and members are what the responses carry, but the codes the
+// frontend puts in `x-amzn-errortype` / the body's `__type` are the shorter
+// `NotFoundException` and `BadRequestException`, which the model does not declare at all;
+// an IAM refusal's `AccessDeniedException` is a common error this operation's modelled
+// list does not declare either. All three are the frontend's rather than this operation's,
+// so they are declared once there and travel on this channel's own variant.
+use crate::state::TaggingRefusal;
 
 /// The Smithy member names of `UntagResourceRequest`, as
 /// `smithy_query(query="operation", operation="UntagResource")` lists them: `ResourceArn`
@@ -217,21 +196,17 @@ impl ::aws_smithy_schema::serde::SerializableStruct for UntagResourceWireInput {
 /// It is NOT `crate::scaffolded::Scaffolded` any more: this operation is implemented, so
 /// it needs neither the 501 (that variant is the stub signal) nor the framework's
 /// synthetic `ValidationException` (its own model declares one). What it does need, and
-/// what no generic wrapper can express, are the two wire codes above — so the channel is
-/// the modelled enum plus those two refusals, exactly as `TagResource` declares it.
+/// what no generic wrapper can express, are the frontend's own refusals — so the channel is
+/// the modelled enum plus the shared [`TaggingRefusal`], exactly as `TagResource` and
+/// `ListTagsForResource` declare it.
 #[derive(Debug)]
 pub enum UntagResourceError {
     /// One of the operation's modelled errors, rendered exactly as the model declares it.
     Modeled(UntagResourceErrorModeled),
-    /// "That ARN names no resource", carrying the modelled `ResourceNotFoundException`
-    /// payload and its 404 under the [`NOT_FOUND_ERROR_CODE`] the service answers with.
-    NotFound(ResourceNotFoundException),
-    /// "That request is not valid", carrying the modelled `ValidationException` payload
-    /// and its 400 under the [`BAD_REQUEST_ERROR_CODE`] the service answers with.
-    BadRequest(ValidationException),
-    /// "This caller may not perform this action on this resource", carrying the modelled
-    /// `AccessDeniedException` payload and its 403 (see [`ACCESS_DENIED_ERROR_CODE`]).
-    AccessDenied(AccessDeniedException),
+    /// One of the refusals the tagging frontend words itself: an ARN naming no resource, a
+    /// request this operation refuses, or an action IAM does not allow. The code, the
+    /// status and the carried body are the shared type's ([`TaggingRefusal`]).
+    Refused(TaggingRefusal),
 }
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so the handler
@@ -242,71 +217,61 @@ impl From<UntagResourceErrorModeled> for UntagResourceError {
     }
 }
 
+/// The same for a frontend refusal, so the handler writes `Err(TaggingRefusal::….into())`.
+impl From<TaggingRefusal> for UntagResourceError {
+    fn from(refusal: TaggingRefusal) -> Self {
+        Self::Refused(refusal)
+    }
+}
+
 impl ::std::fmt::Display for UntagResourceError {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
         match self {
             Self::Modeled(e) => write!(f, "{e}"),
-            Self::NotFound(e) => write!(f, "{NOT_FOUND_ERROR_CODE}: {}", e.message),
-            Self::BadRequest(e) => write!(f, "{BAD_REQUEST_ERROR_CODE}: {}", e.message),
-            Self::AccessDenied(e) => write!(f, "{ACCESS_DENIED_ERROR_CODE}: {}", e.message),
+            Self::Refused(refusal) => write!(f, "{refusal}"),
         }
     }
 }
 
 impl ::std::error::Error for UntagResourceError {}
 
-/// Every method delegates to the modelled error, so a modelled failure is rendered
-/// exactly as `#[operation_error]` renders it. The refusal variants differ in ONE
-/// respect — the wire code, which the framework reads from `shape_name` rather than from
-/// the schema — and are otherwise the modelled shapes: each one's schema decides which
-/// members the body carries, and its `@httpError` is the status.
+/// Every method delegates: a modelled failure to the modelled error, so it is rendered
+/// exactly as `#[operation_error]` renders it, and a frontend refusal to the shared
+/// [`TaggingRefusal`], so this operation answers one of those conditions exactly as its two
+/// siblings do.
 impl ::smithy_server_runtime::OperationError for UntagResourceError {
     fn as_serializable(&self) -> &dyn ::aws_smithy_schema::serde::SerializableStruct {
         match self {
             Self::Modeled(e) => ::smithy_server_runtime::OperationError::as_serializable(e),
-            Self::NotFound(e) => e,
-            Self::BadRequest(e) => e,
-            Self::AccessDenied(e) => e,
+            Self::Refused(refusal) => refusal.as_serializable(),
         }
     }
 
     fn variant_schema(&self) -> &'static ::aws_smithy_schema::Schema {
         match self {
             Self::Modeled(e) => ::smithy_server_runtime::OperationError::variant_schema(e),
-            Self::NotFound(_) => &super::types::SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
-            Self::BadRequest(_) => &super::types::SCHEMA_VALIDATION_EXCEPTION,
-            Self::AccessDenied(_) => &super::types::SCHEMA_ACCESS_DENIED_EXCEPTION,
+            Self::Refused(refusal) => refusal.variant_schema(),
         }
     }
 
     fn shape_name(&self) -> &'static str {
         match self {
             Self::Modeled(e) => ::smithy_server_runtime::OperationError::shape_name(e),
-            Self::NotFound(_) => NOT_FOUND_ERROR_CODE,
-            Self::BadRequest(_) => BAD_REQUEST_ERROR_CODE,
-            Self::AccessDenied(_) => ACCESS_DENIED_ERROR_CODE,
+            Self::Refused(refusal) => refusal.error_code(),
         }
     }
 
     fn http_status(&self) -> u16 {
         match self {
             Self::Modeled(e) => ::smithy_server_runtime::OperationError::http_status(e),
-            // Each modelled shape's own `@httpError`: the code on the wire changes, the
-            // status does not.
-            Self::NotFound(_) => 404,
-            Self::BadRequest(_) => 400,
-            Self::AccessDenied(_) => ACCESS_DENIED_STATUS,
+            Self::Refused(refusal) => refusal.http_status(),
         }
     }
 
     fn query_error_code(&self) -> Option<&'static str> {
         match self {
             Self::Modeled(e) => ::smithy_server_runtime::OperationError::query_error_code(e),
-            // restJson1 is this service's only protocol, and no shape here carries an
-            // `awsQueryError` trait to honour in any case.
-            Self::NotFound(_) => None,
-            Self::BadRequest(_) => None,
-            Self::AccessDenied(_) => None,
+            Self::Refused(refusal) => refusal.query_error_code(),
         }
     }
 }
@@ -375,13 +340,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(message) =
             crate::state::tag_key_list_refusal(input.tag_keys.iter().map(String::as_str))
         {
-            return Err(UntagResourceError::BadRequest(ValidationException { message }));
+            return Err(TaggingRefusal::bad_request(message).into());
         }
 
         // "Removes one or more tags from the specified resource": the resource is the one
         // whose stored ARN the request names, and an ARN naming none — including one
         // naming a monitor of another region, which this regional endpoint does not serve
-        // — is refused with 404 (see [`UntagResourceError::NotFound`]) rather than
+        // — is refused with 404 ([`crate::state::TaggingRefusal::NotFound`]) rather than
         // answered as a silent success. Resolved under a SHORT read lock, together with
         // the policy in force, because what comes next is the authorization decision,
         // which reads the IAM and STS stores and needs no lock of this service's.
@@ -389,9 +354,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (resource_arn, resource_policy) = {
             let store = state.lock();
             let Some(record) = store.app_monitor_by_arn(&region, &input.resource_arn) else {
-                return Err(UntagResourceError::NotFound(
-                    crate::state::tagged_resource_not_found(),
-                ));
+                return Err(TaggingRefusal::not_found().into());
             };
             (record.arn.clone(), record.resource_policy_document())
         };
@@ -406,18 +369,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resource_policy.as_deref(),
             &[],
         ) {
-            return Err(UntagResourceError::AccessDenied(
-                crate::state::access_denied(&denial),
-            ));
+            return Err(TaggingRefusal::denied(&denial).into());
         }
 
         let mut store = state.lock();
         // Resolved again under the WRITE lock: the decision above held no lock, so a
         // concurrent `DeleteAppMonitor` may have removed the resource in between.
         let Some(record) = store.app_monitor_by_arn_mut(&region, &resource_arn) else {
-            return Err(UntagResourceError::NotFound(
-                crate::state::tagged_resource_not_found(),
-            ));
+            return Err(TaggingRefusal::not_found().into());
         };
         // Each named key is dropped from the resource's tag map and every key NOT named
         // is left exactly as it was. Removal is by key, so a key the resource does not

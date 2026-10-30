@@ -104,7 +104,12 @@ use std::sync::Arc;
 /// an ARN and records `err["Code"] == "BadRequestException"`, where an app-monitor call
 /// refused on a modelled constraint answers `ValidationException`. The STATUS is the same
 /// 400 either way; the code a client branches on is not.
-const TAGGING_BAD_REQUEST_CODE: &str = "BadRequestException";
+///
+/// The one definition of that code is the frontend's own
+/// (`crate::state::TAGGING_BAD_REQUEST_ERROR_CODE`, which
+/// `crate::state::TaggingRefusal` answers a refusal the HANDLERS make with), so the
+/// boundary and the handlers cannot word one condition two ways.
+use crate::state::TAGGING_BAD_REQUEST_ERROR_CODE as TAGGING_BAD_REQUEST_CODE;
 
 /// The whole message that frontend reports a `ResourceArn` which is not an ARN with.
 ///

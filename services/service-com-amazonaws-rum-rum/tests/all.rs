@@ -95,6 +95,8 @@ mod resource_tags;
 mod shared_destination_arn_rule;
 #[path = "all/shared_page_size_rule.rs"]
 mod shared_page_size_rule;
+#[path = "all/shared_tagging_refusal_rule.rs"]
+mod shared_tagging_refusal_rule;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/support.rs"]

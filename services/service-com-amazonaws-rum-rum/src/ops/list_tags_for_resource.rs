@@ -13,10 +13,10 @@
 //! an exact comparison against the stored [`crate::state::AppMonitorRecord::arn`], so an
 //! ARN differing in any component — partition, service, region, account, resource type or
 //! name — names a resource this emulator does not hold and is refused with HTTP 404 under
-//! this frontend's own wire code (see `NOT_FOUND_ERROR_CODE`), exactly as the sibling
-//! `TagResource` and `UntagResource` refuse it. A `ResourceArn` that is not an ARN at all
-//! fails the member's modelled pattern at the boundary and is reworded for every tagging
-//! operation in [`crate::service`] as that frontend's 400 `BadRequestException`.
+//! this frontend's own wire code (see [`crate::state::TaggingRefusal`]), exactly as the
+//! sibling `TagResource` and `UntagResource` refuse it. A `ResourceArn` that is not an ARN
+//! at all fails the member's modelled pattern at the boundary and is reworded for every
+//! tagging operation in [`crate::service`] as that frontend's 400 `BadRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -108,28 +108,17 @@ pub enum ListTagsForResourceErrorModeled {
     ValidationException(ValidationException),
 }
 
-/// The error code RUM's tagging frontend names a resource it cannot find by on the wire.
-///
-/// The model declares `ResourceNotFoundException` for this operation, and that shape's
-/// `@httpError` 404 and its members are what the response carries — but the code the
-/// service puts in the body's `__type` for an ARN that resolves to nothing is the shorter
-/// `NotFoundException`, which the model does not declare at all. The recorded corpus unit
-/// `rum.untag-resource-unknown-resource-rejected` pins it (`err["Code"] ==
-/// "NotFoundException"`) for the sibling tagging operation, and it is specific to the
-/// ARN-addressed tagging operations: RUM's app-monitor operations, addressed by `Name`, do
-/// answer `ResourceNotFoundException`. A client branches on the code it is SENT, so this
-/// operation sends the one its frontend sends — the same one `TagResource` and
-/// `UntagResource` send, since one frontend cannot word one condition two ways.
-const NOT_FOUND_ERROR_CODE: &str = "NotFoundException";
-
-// The wire code, and the status, a request IAM does not allow is refused with: this
-// service's own pair, `crate::state::ACCESS_DENIED_ERROR_CODE` and
-// `crate::state::ACCESS_DENIED_STATUS`, defined there once rather than per operation.
-// They are carried by this channel's own variant because this operation's modelled error
-// list does not declare `AccessDeniedException` — it is a common error rather than one
-// specific to an operation — while the body is the modelled shape
-// (`crate::state::access_denied`).
-use crate::state::{ACCESS_DENIED_ERROR_CODE, ACCESS_DENIED_STATUS};
+// The refusals RUM's tagging frontend words itself, with the ONE (refusal class -> wire
+// code, HTTP status, carried schema, body) mapping the three ARN-addressed tagging
+// operations answer through: `crate::state::TaggingRefusal`. The model declares
+// `ResourceNotFoundException` for this operation, and that shape's `@httpError` 404 and its
+// members are what the response carries, but the code the service puts in the body's
+// `__type` for an ARN that resolves to nothing is the shorter `NotFoundException`, which
+// the model does not declare at all; an IAM refusal's `AccessDeniedException` is a common
+// error this operation's modelled list does not declare either. Both are the frontend's
+// rather than this operation's — one frontend cannot word one condition two ways — so they
+// are declared once there and travel on this channel's own variant.
+use crate::state::TaggingRefusal;
 
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`).
@@ -138,19 +127,19 @@ use crate::state::{ACCESS_DENIED_ERROR_CODE, ACCESS_DENIED_STATUS};
 /// it needs neither the 501 (that variant is the stub signal) nor the framework's
 /// synthetic `ValidationException` (its own model declares one, and a malformed
 /// `ResourceArn` is reworded for every tagging operation in `crate::service`). What it
-/// does need, and what no generic wrapper can express, is the one wire code above — so the
-/// channel is the modelled enum plus that single refusal, exactly as
+/// does need, and what no generic wrapper can express, are the frontend's own refusals — so
+/// the channel is the modelled enum plus the shared [`TaggingRefusal`], exactly as
 /// [`crate::ops::untag_resource::UntagResourceError`] is built.
 #[derive(Debug)]
 pub enum ListTagsForResourceError {
     /// One of the operation's modelled errors, rendered exactly as the model declares it.
     Modeled(ListTagsForResourceErrorModeled),
-    /// "That ARN names no resource", carrying the modelled `ResourceNotFoundException`
-    /// payload and its 404 under the [`NOT_FOUND_ERROR_CODE`] the service answers with.
-    NotFound(ResourceNotFoundException),
-    /// "This caller may not perform this action on this resource", carrying the modelled
-    /// `AccessDeniedException` payload and its 403 (see [`ACCESS_DENIED_ERROR_CODE`]).
-    AccessDenied(AccessDeniedException),
+    /// One of the refusals the tagging frontend words itself. This operation reaches two of
+    /// them — an ARN naming no resource and an action IAM does not allow; it refuses no
+    /// request of its own, since the one malformed `ResourceArn` is reworded at the
+    /// boundary. The code, the status and the carried body are the shared type's
+    /// ([`TaggingRefusal`]).
+    Refused(TaggingRefusal),
 }
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so the handler
@@ -161,65 +150,61 @@ impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     }
 }
 
+/// The same for a frontend refusal, so the handler writes `Err(TaggingRefusal::….into())`.
+impl From<TaggingRefusal> for ListTagsForResourceError {
+    fn from(refusal: TaggingRefusal) -> Self {
+        Self::Refused(refusal)
+    }
+}
+
 impl ::std::fmt::Display for ListTagsForResourceError {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
         match self {
             Self::Modeled(e) => write!(f, "{e}"),
-            Self::NotFound(e) => write!(f, "{NOT_FOUND_ERROR_CODE}: {}", e.message),
-            Self::AccessDenied(e) => write!(f, "{ACCESS_DENIED_ERROR_CODE}: {}", e.message),
+            Self::Refused(refusal) => write!(f, "{refusal}"),
         }
     }
 }
 
 impl ::std::error::Error for ListTagsForResourceError {}
 
-/// Every method delegates to the modelled error, so a modelled failure is rendered
-/// exactly as `#[operation_error]` renders it. The `NotFound` variant differs in ONE
-/// respect — the wire code, which the framework reads from `shape_name` rather than from
-/// the schema — and is otherwise the modelled `ResourceNotFoundException`: its schema
-/// decides which members the body carries, and its `@httpError` is the status.
+/// Every method delegates: a modelled failure to the modelled error, so it is rendered
+/// exactly as `#[operation_error]` renders it, and a frontend refusal to the shared
+/// [`TaggingRefusal`], so this operation answers one of those conditions exactly as its two
+/// siblings do.
 impl ::smithy_server_runtime::OperationError for ListTagsForResourceError {
     fn as_serializable(&self) -> &dyn ::aws_smithy_schema::serde::SerializableStruct {
         match self {
             Self::Modeled(e) => ::smithy_server_runtime::OperationError::as_serializable(e),
-            Self::NotFound(e) => e,
-            Self::AccessDenied(e) => e,
+            Self::Refused(refusal) => refusal.as_serializable(),
         }
     }
 
     fn variant_schema(&self) -> &'static ::aws_smithy_schema::Schema {
         match self {
             Self::Modeled(e) => ::smithy_server_runtime::OperationError::variant_schema(e),
-            Self::NotFound(_) => &super::types::SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
-            Self::AccessDenied(_) => &super::types::SCHEMA_ACCESS_DENIED_EXCEPTION,
+            Self::Refused(refusal) => refusal.variant_schema(),
         }
     }
 
     fn shape_name(&self) -> &'static str {
         match self {
             Self::Modeled(e) => ::smithy_server_runtime::OperationError::shape_name(e),
-            Self::NotFound(_) => NOT_FOUND_ERROR_CODE,
-            Self::AccessDenied(_) => ACCESS_DENIED_ERROR_CODE,
+            Self::Refused(refusal) => refusal.error_code(),
         }
     }
 
     fn http_status(&self) -> u16 {
         match self {
             Self::Modeled(e) => ::smithy_server_runtime::OperationError::http_status(e),
-            // `ResourceNotFoundException`'s own modelled `@httpError`: the code on the
-            // wire changes, the status does not.
-            Self::NotFound(_) => 404,
-            Self::AccessDenied(_) => ACCESS_DENIED_STATUS,
+            Self::Refused(refusal) => refusal.http_status(),
         }
     }
 
     fn query_error_code(&self) -> Option<&'static str> {
         match self {
             Self::Modeled(e) => ::smithy_server_runtime::OperationError::query_error_code(e),
-            // restJson1 is this service's only protocol, and the shape carries no
-            // `awsQueryError` trait to honour in any case.
-            Self::NotFound(_) => None,
-            Self::AccessDenied(_) => None,
+            Self::Refused(refusal) => refusal.query_error_code(),
         }
     }
 }
@@ -289,9 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (resource_arn, resource_policy, tags) = {
             let store = state.lock();
             let Some(record) = store.app_monitor_by_arn(&region, &input.resource_arn) else {
-                return Err(ListTagsForResourceError::NotFound(
-                    crate::state::tagged_resource_not_found(),
-                ));
+                return Err(TaggingRefusal::not_found().into());
             };
             (
                 // The ARN the resolved monitor was created with, read off the record rather
@@ -317,9 +300,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resource_policy.as_deref(),
             &[],
         ) {
-            return Err(ListTagsForResourceError::AccessDenied(
-                crate::state::access_denied(&denial),
-            ));
+            return Err(TaggingRefusal::denied(&denial).into());
         }
 
         Ok(ListTagsForResourceOutput { resource_arn, tags })
