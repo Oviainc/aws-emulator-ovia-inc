@@ -2437,7 +2437,9 @@ impl ComAmazonawsFisFaultinjectionsimulatorState {
     ///
     /// Call it right after settling, with the records the settle produced still parked,
     /// and then WRITE what it hands back with the state guard released
-    /// ([`experiment_logs::deliver`]). The records leave the store here, so two callers
+    /// ([`experiment_logs::deliver`]) — on the paths where that operation goes on to REFUSE
+    /// the caller as much as on the one where it answers, since the settle produced those
+    /// records either way. The records leave the store here, so two callers
     /// cannot deliver one record twice; an experiment with nothing parked contributes no
     /// delivery at all, which is every experiment whose template configured no
     /// destination.

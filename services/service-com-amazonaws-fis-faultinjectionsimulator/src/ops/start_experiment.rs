@@ -168,10 +168,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartExperiment<E
     /// releases: the settle, the idempotency check, the template lookup, the role checks,
     /// the quotas and the experiment this start persists.
     ///
-    /// It hands back the `Experiment` the response reports and the log records the start
-    /// left for the destination the template configured — written by the caller, with no
-    /// guard held (see [`crate::state::experiment_logs`]). Splitting it out is what keeps
-    /// the guard out of `handle`'s future, which has to be `Send`.
+    /// It hands back the `Experiment` the response reports — or the refusal this start
+    /// answers with — BESIDE the log records the start left for the destination each
+    /// template configured, written by the caller with no guard held (see
+    /// [`crate::state::experiment_logs`]). Splitting it out is what keeps the guard out of
+    /// `handle`'s future, which has to be `Send`.
+    ///
+    /// The outcome and the records travel together rather than the records being dropped
+    /// on a refusal: the settle below materialises the end of every run that elapsed, so
+    /// this call is the one that produced those runs' terminal records whatever it then
+    /// answers the caller.
     #[allow(clippy::type_complexity)]
     fn start_under_guard(
         &self,
@@ -179,17 +185,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartExperiment<E
         actions_mode: &str,
         region: &str,
         now: ::std::time::SystemTime,
-    ) -> Result<
-        (
-            Experiment,
-            Vec<crate::state::experiment_logs::PendingDelivery>,
-        ),
-        StartExperimentError,
-    > {
+    ) -> (
+        Result<Experiment, StartExperimentError>,
+        Vec<crate::state::experiment_logs::PendingDelivery>,
+    ) {
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(crate::scaffolded::Scaffolded::internal_failure(
-                crate::state::STORE_UNAVAILABLE,
-            ));
+            return (
+                Err(crate::scaffolded::Scaffolded::internal_failure(
+                    crate::state::STORE_UNAVAILABLE,
+                )),
+                Vec::new(),
+            );
         };
         let mut store = state.lock();
 
@@ -198,6 +204,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartExperiment<E
         // and not against ones the clock finished before this call.
         store.settle_experiments(now);
 
+        let outcome = self.mint_under_guard(&mut store, input, actions_mode, region, now);
+
+        // Every record this call made true — the settle above for a run that elapsed, and
+        // what a start it accepted parked on the experiment it minted — drained here, on
+        // the refusal paths as much as on the accepted one.
+        let deliveries = store.take_pending_log_deliveries();
+        (outcome, deliveries)
+    }
+
+    /// The experiment this start PERSISTS, on a store the caller has already settled and
+    /// holds the guard for: the idempotency check, the template lookup, the role checks,
+    /// the quotas and the record itself — or the refusal the start answers with.
+    ///
+    /// It drains no outbox: [`Self::start_under_guard`] does that once, for whatever this
+    /// answers.
+    fn mint_under_guard(
+        &self,
+        store: &mut crate::state::ComAmazonawsFisFaultinjectionsimulatorState,
+        input: &StartExperimentInput,
+        actions_mode: &str,
+        region: &str,
+        now: ::std::time::SystemTime,
+    ) -> Result<Experiment, StartExperimentError> {
         // The token is `@idempotencyToken`: replaying it with the SAME request reports
         // the experiment the first call started, while reusing it for a different request
         // is the parameter mismatch FIS answers with `ConflictException` rather than
@@ -215,13 +244,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartExperiment<E
             crate::state::TokenReplay::Replay(id) => {
                 if let Some(record) = store.experiments.get(&id) {
                     // Reported with every write the clock owed it materialised: the settle
-                    // above, and the report generation `handle` materialised before taking
-                    // this guard.
-                    let experiment = record.to_experiment();
-                    // A replay starts nothing, so it produces no record of its own; what
-                    // the settle above materialised is still delivered.
-                    let deliveries = store.take_pending_log_deliveries();
-                    return Ok((experiment, deliveries));
+                    // the caller performed, and the report generation `handle`
+                    // materialised before taking this guard.
+                    return Ok(record.to_experiment());
                 }
             }
             crate::state::TokenReplay::Mismatch => {
@@ -354,9 +379,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartExperiment<E
 
         // Every record the START of this run makes true — the experiment itself and what
         // its targets resolved to — is already parked on the record `from_template` built,
-        // beside anything the settle above materialised for a run already under way.
-        let deliveries = store.take_pending_log_deliveries();
-        Ok((experiment, deliveries))
+        // for the caller to drain beside anything the settle materialised for a run
+        // already under way.
+        Ok(experiment)
     }
 }
 
@@ -420,13 +445,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // experiment this call is about to mint, owe nothing.
         crate::state::materialise_experiment_reports(&*self.engine, ctx, &region, now).await;
 
-        let (experiment, deliveries) =
-            self.start_under_guard(&input, &actions_mode, &region, now)?;
+        let (outcome, deliveries) = self.start_under_guard(&input, &actions_mode, &region, now);
 
         // The run's first records, written with the state guard released, to the
-        // destination the template configured (see [`crate::state::experiment_logs`]).
+        // destination the template configured (see [`crate::state::experiment_logs`]) —
+        // beside the records the settle inside the start materialised for a run that had
+        // elapsed, which this call owes the destination whether or not it accepts the
+        // start.
         crate::state::experiment_logs::deliver(ctx, &region, deliveries).await;
 
+        // Only now is the refusal, if there was one, the caller's answer: the write this
+        // call owed the destination has already happened.
+        let experiment = outcome?;
         Ok(StartExperimentOutput {
             experiment: Some(experiment),
         })

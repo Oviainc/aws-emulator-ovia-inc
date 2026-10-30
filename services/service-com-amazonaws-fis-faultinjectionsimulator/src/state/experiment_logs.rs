@@ -54,8 +54,10 @@
 //! ([`crate::state::ExperimentRecord::pending_log_records`], bounded by
 //! [`MAX_PENDING_LOG_RECORDS`]). An operation that has just settled the store then drains
 //! the outbox ([`crate::state::ComAmazonawsFisFaultinjectionsimulatorState::take_pending_log_deliveries`])
-//! and writes what it drained, with the state guard already released. Nothing sleeps for a
-//! delivery and nothing is delivered before the event it reports fell due.
+//! and writes what it drained, with the state guard already released — whatever that
+//! operation then answers its caller, a refusal included: the transition is what produced
+//! the record, so the call that materialised it is the call that delivers it. Nothing
+//! sleeps for a delivery and nothing is delivered before the event it reports fell due.
 //!
 //! Delivery is BEST EFFORT, as it is for the real service: a destination that does not
 //! resolve (no such log group, no such bucket) or refuses the write loses the records and

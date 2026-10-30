@@ -19,7 +19,9 @@
 //! not anybody called, so it is materialised here as well, including on the path where
 //! this handler then REFUSES the stop for the run the settle ended: a caller that reads
 //! the experiment afterwards sees the same report state whichever operation observed the
-//! end.
+//! end. The run's log records are owed on the same terms — the settle that ends a run
+//! produces that run's terminal record, so this call drains the outbox and delivers what
+//! it drained whatever it answers the caller (see [`crate::state::experiment_logs`]).
 //!
 //! ## Shape of an operation
 //!
@@ -168,36 +170,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The guard is taken, spent and RELEASED inside this block, so the experiment's
         // log records are written after it rather than while the store is locked.
-        let (experiment, deliveries) = {
+        //
+        // The outcome is carried OUT of the block instead of returned from inside it: the
+        // settle below is what materialises a move the clock already owed, so it can be
+        // the call that produces the run's own terminal record, and the records a settle
+        // produced are drained and written by the operation that performed it whatever
+        // that operation then answers. A refusal that leaves them parked would hold the
+        // record of a run this very call ended until some other operation happened to
+        // drain the outbox.
+        let (outcome, deliveries) = {
             let mut store = state.lock();
             // Settled first, so a stop lands on the status the clock already owed rather
             // than on a stale one.
-            let Some(record) = store.settled_experiment_mut(&input.id, now) else {
-                return Err(StopExperimentErrorModeled::ResourceNotFoundException(
-                    crate::state::experiment_not_found(&input.id),
-                )
-                .into());
+            let outcome = match store.settled_experiment_mut(&input.id, now) {
+                None => Err(StopExperimentError::from(
+                    StopExperimentErrorModeled::ResourceNotFoundException(
+                        crate::state::experiment_not_found(&input.id),
+                    ),
+                )),
+                // An experiment that has already ended cannot be stopped: the call is
+                // refused and the record — its status, its reason and its `endTime` — is
+                // left exactly as the run left it, so a caller can tell a stop it
+                // performed from one the service would never have accepted.
+                Some(record) if record.status.is_terminal() => Err(StopExperimentError::from(
+                    StopExperimentErrorModeled::ValidationException(
+                        crate::state::final_state_refusal(&input.id),
+                    ),
+                )),
+                Some(record) => {
+                    record.request_stop(now);
+                    Ok(record.to_experiment())
+                }
             };
-            // An experiment that has already ended cannot be stopped: the call is refused
-            // and the record — its status, its reason and its `endTime` — is left exactly
-            // as the run left it, so a caller can tell a stop it performed from one the
-            // service would never have accepted.
-            if record.status.is_terminal() {
-                return Err(StopExperimentErrorModeled::ValidationException(
-                    crate::state::final_state_refusal(&input.id),
-                )
-                .into());
-            }
-            record.request_stop(now);
-            let experiment = record.to_experiment();
             let deliveries = store.take_pending_log_deliveries();
-            (experiment, deliveries)
+            (outcome, deliveries)
         };
 
         // The stop is part of the run, so it is one of the records the run delivers to the
-        // destination the template configured.
+        // destination the template configured — beside anything the settle above
+        // materialised, which is delivered on the refusal paths too.
         crate::state::experiment_logs::deliver(ctx, &region, deliveries).await;
 
+        // Only now is the refusal, if there was one, the caller's answer: the write this
+        // call owed the destination has already happened.
+        let experiment = outcome?;
         Ok(StopExperimentOutput {
             experiment: Some(experiment),
         })

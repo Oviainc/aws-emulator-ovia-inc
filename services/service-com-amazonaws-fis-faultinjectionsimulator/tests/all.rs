@@ -63,6 +63,8 @@ mod list_target_resource_types;
 mod modelled_map_key_bounds;
 #[path = "all/published_catalog_entries.rs"]
 mod published_catalog_entries;
+#[path = "all/refused_calls_deliver_their_own_settle.rs"]
+mod refused_calls_deliver_their_own_settle;
 #[path = "all/report_follows_whoever_ends_the_run.rs"]
 mod report_follows_whoever_ends_the_run;
 #[path = "all/resource_tagging.rs"]

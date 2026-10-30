@@ -51,10 +51,10 @@ const ACCOUNT_ID: &str = "000000000000";
 /// A role ARN the emulator's IAM store holds no role for, which is what every row here
 /// runs under: with no stored role there is nothing to show about its trust policy or its
 /// permissions, so the run goes ahead. (See `tests/all/experiment_run.rs`.)
-const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/fis-logging";
+pub(crate) const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/fis-logging";
 
 /// The bucket every S3 row delivers into.
-const BUCKET: &str = "fis-experiment-logs";
+pub(crate) const BUCKET: &str = "fis-experiment-logs";
 
 /// How long a row waits for its run to reach a terminal status: the emulator's whole
 /// compressed run window plus the transitions around it and slack for a loaded machine.
@@ -67,20 +67,20 @@ const ACTIVE_EXPERIMENTS_QUOTA: usize = 5;
 /// The `log_type` of the record a started experiment produces, as
 /// `src/state/experiment_logs.rs` names it. Spelled out here rather than imported, so a
 /// changed vocabulary fails this suite.
-const LOG_TYPE_EXPERIMENT_START: &str = "experiment-start";
+pub(crate) const LOG_TYPE_EXPERIMENT_START: &str = "experiment-start";
 /// See [`LOG_TYPE_EXPERIMENT_START`].
 const LOG_TYPE_TARGET_RESOLUTION: &str = "target-resolution";
 /// See [`LOG_TYPE_EXPERIMENT_START`].
 const LOG_TYPE_EXPERIMENT_STATE_CHANGE: &str = "experiment-state-change";
 /// See [`LOG_TYPE_EXPERIMENT_START`].
-const LOG_TYPE_EXPERIMENT_END: &str = "experiment-end";
+pub(crate) const LOG_TYPE_EXPERIMENT_END: &str = "experiment-end";
 
 /// The account's one safety lever, which is named by the account's own id.
 const LEVER_ID: &str = ACCOUNT_ID;
 
 /// One emulator carrying FIS, CloudWatch Logs and Amazon S3 over ONE shared engine,
 /// exactly as the production router builds them.
-fn emulator() -> smithy_server_runtime::MultiServiceRouter {
+pub(crate) fn emulator() -> smithy_server_runtime::MultiServiceRouter {
     let engine: std::sync::Arc<engine::InMemoryEngine> =
         std::sync::Arc::new(engine::InMemoryEngine::new());
     let mut router = smithy_server_runtime::MultiServiceRouter::new();
@@ -134,7 +134,7 @@ async fn logs(
 
 /// One path-style Amazon S3 call: S3 is a REST service, so the bucket and key live in the
 /// URI and the body is the object's own bytes.
-async fn s3(
+pub(crate) async fn s3(
     router: &smithy_server_runtime::MultiServiceRouter,
     method: &str,
     path: &str,
@@ -162,7 +162,7 @@ async fn s3(
 /// The log group ARN for `name`, in the form `with_suffix` asks for: CloudWatch Logs
 /// reports a group's ARN with a trailing `:*`, and the FIS documentation shows a logging
 /// destination written either way.
-fn log_group_arn(name: &str, with_suffix: bool) -> String {
+pub(crate) fn log_group_arn(name: &str, with_suffix: bool) -> String {
     let base = format!("arn:aws:logs:{FALLBACK_REGION}:{ACCOUNT_ID}:log-group:{name}");
     if with_suffix {
         format!("{base}:*")
@@ -175,7 +175,10 @@ fn log_group_arn(name: &str, with_suffix: bool) -> String {
 ///
 /// A group another case already created is accepted, and NOTHING else is: a refusal of any
 /// other kind would leave a case asserting against a destination that is not there.
-async fn given_log_group(router: &smithy_server_runtime::MultiServiceRouter, name: &str) {
+pub(crate) async fn given_log_group(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    name: &str,
+) {
     let (status, body) = logs(router, "CreateLogGroup", &json!({ "logGroupName": name })).await;
     if status == 200 {
         return;
@@ -189,7 +192,7 @@ async fn given_log_group(router: &smithy_server_runtime::MultiServiceRouter, nam
 }
 
 /// Create [`BUCKET`], so the S3 destination resolves.
-async fn given_bucket(router: &smithy_server_runtime::MultiServiceRouter) {
+pub(crate) async fn given_bucket(router: &smithy_server_runtime::MultiServiceRouter) {
     let (status, body) = s3(router, "PUT", &format!("/{BUCKET}")).await;
     assert!(
         status == 200 || status == 409,
@@ -232,7 +235,7 @@ async fn log_events(
 
 /// Every record delivered to `log_group` for the experiment `id`, oldest first, parsed —
 /// for a stream that must be readable.
-async fn records_in_log_group(
+pub(crate) async fn records_in_log_group(
     router: &smithy_server_runtime::MultiServiceRouter,
     log_group: &str,
     id: &str,
@@ -246,7 +249,7 @@ async fn records_in_log_group(
 }
 
 /// The keys of every object under `prefix` in [`BUCKET`], from `ListObjectsV2`.
-async fn keys_under(
+pub(crate) async fn keys_under(
     router: &smithy_server_runtime::MultiServiceRouter,
     prefix: &str,
 ) -> Vec<String> {
@@ -268,7 +271,7 @@ async fn keys_under(
 }
 
 /// The `log_type` of every record, in the order they were delivered.
-fn log_types(records: &[Value]) -> Vec<&str> {
+pub(crate) fn log_types(records: &[Value]) -> Vec<&str> {
     records
         .iter()
         .filter_map(|record| record["log_type"].as_str())
@@ -371,7 +374,7 @@ fn rows() -> Vec<Row> {
 
 /// A `clientToken`-safe rendering of a case label: `ClientToken` is modelled
 /// `^[\S]+$`, so a label's spaces and punctuation become `-`.
-fn slug(label: &str) -> String {
+pub(crate) fn slug(label: &str) -> String {
     label
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
