@@ -126,10 +126,25 @@ pub const UNSET_SESSION_SAMPLE_RATE: f64 = 0.0;
 
 /// Prefix of the CloudWatch Logs group an app monitor copies telemetry into when
 /// `CwLogEnabled` is set: RUM is a vended-logs service, so the group lives under
-/// `/aws/vendedlogs/RUMService_`. The suffix AWS appends is not in the model, so this
-/// emulator derives it from the monitor's own (account-unique) name, which keeps
-/// `DataStorage.CwLog.CwLogGroup` stable across reads and distinct per monitor.
+/// `/aws/vendedlogs/RUMService_`, followed by the app monitor's own name and then by a
+/// suffix the SERVICE chooses for that monitor ([`cw_log_group_name`]).
+///
+/// Recorded behaviour: the group name RUM advertises is not reconstructible from the
+/// request — the prefix and the monitor's name are followed by a per-monitor value only
+/// the service knows — which is why the vended name is MINTED once
+/// ([`ComAmazonawsRumRumState::mint_cw_log_group`]) and then held on the record
+/// ([`AppMonitorRecord::vended_log_group`]) rather than recomputed on every read.
 pub const CW_LOG_GROUP_PREFIX: &str = "/aws/vendedlogs/RUMService_";
+
+/// How many characters of the minted token the vended log group's service-chosen suffix
+/// carries ([`cw_log_group_name`]).
+///
+/// The model places no pattern and no length on `CwLog$CwLogGroup`, and the suffix's
+/// literal text is not documented anywhere, so the WIDTH is this emulator's own: twelve
+/// lowercase hex characters, which is wide enough that no caller can guess one monitor's
+/// group from another's and narrow enough to leave the whole name inside a CloudWatch Logs
+/// group name's 512-character bound for every `AppMonitorName` the model admits (1..255).
+pub const CW_LOG_GROUP_SUFFIX_LEN: usize = 12;
 
 /// The `resourceType` this service's `ConflictException` reports for an app monitor.
 ///
@@ -889,6 +904,22 @@ pub struct AppMonitorRecord {
     /// Whether RUM copies this monitor's telemetry into CloudWatch Logs; what
     /// `DataStorage.CwLog` reports.
     pub cw_log_enabled: bool,
+    /// The vended CloudWatch Logs group name RUM chose for THIS monitor, minted once by
+    /// the call that created it ([`ComAmazonawsRumRumState::mint_cw_log_group`]) and never
+    /// recomputed.
+    ///
+    /// It is held on the record because the service-chosen part of the name is STATE and
+    /// not a function of the request: a reader cannot rebuild it from the monitor's name,
+    /// so the name a read advertises ([`Self::cw_log_group`]) is the stored one, which is
+    /// also the one the handlers PROVISION in CloudWatch Logs and deliver copies to. That
+    /// keeps `DataStorage.CwLog.CwLogGroup` stable across reads, equal to the group that
+    /// actually exists, and distinct per monitor.
+    ///
+    /// Every monitor carries one, whatever [`Self::cw_log_enabled`] says: a monitor
+    /// created with delivery off is given the name it will advertise if an update later
+    /// turns delivery on, so toggling delivery off and on again addresses the one group
+    /// RUM vended for this monitor rather than vending a second.
+    pub vended_log_group: String,
     pub app_monitor_configuration: AppMonitorConfiguration,
     pub custom_events: CustomEvents,
     /// `DeobfuscationConfiguration`, materialised for every monitor: a create that named
@@ -940,7 +971,8 @@ impl AppMonitorRecord {
     /// `None` when `CwLogEnabled` is false — a monitor that stores no copy has no group
     /// (`CwLog$CwLogGroup` is "The name of the log group where the copies are stored").
     pub fn cw_log_group(&self) -> Option<String> {
-        self.cw_log_enabled.then(|| cw_log_group_name(&self.name))
+        self.cw_log_enabled
+            .then(|| self.vended_log_group.clone())
     }
 
     /// The resource policy document this monitor carries, for the authorization
@@ -1286,6 +1318,31 @@ impl ComAmazonawsRumRumState {
         }
     }
 
+    /// Mint the vended CloudWatch Logs group name for the app monitor named
+    /// `app_monitor_name` — the ONE place a monitor's `CwLogGroup` is chosen.
+    ///
+    /// The name is the documented vended-logs prefix and the monitor's name, then a
+    /// service-chosen suffix ([`cw_log_group_name`]): the hex characters of a token drawn
+    /// from this state's own id machinery, so the suffix is a value only the service knows
+    /// and no caller can derive from the request or from another monitor's group. The
+    /// caller stores the result on the record it creates
+    /// ([`AppMonitorRecord::vended_log_group`]); from then on the name is READ, never
+    /// recomputed.
+    ///
+    /// Two monitors cannot be handed one name: the name embeds the monitor's own name,
+    /// which is unique within the region that owns it, and each call advances this state's
+    /// counter, so even two monitors of one name in different regions draw different
+    /// suffixes.
+    pub fn mint_cw_log_group(&mut self, app_monitor_name: &str) -> String {
+        let token = self.mint_id(CW_LOG_GROUP_DOMAIN);
+        let suffix: String = token
+            .chars()
+            .filter(char::is_ascii_hexdigit)
+            .take(CW_LOG_GROUP_SUFFIX_LEN)
+            .collect();
+        cw_log_group_name(app_monitor_name, &suffix)
+    }
+
     /// Mint a fresh `MetricDefinitionId`.
     ///
     /// `MetricDefinitionId` is modelled as a 1..255-character string with no pattern and
@@ -1479,6 +1536,11 @@ const APP_MONITOR_ID_DOMAIN: &str = "rum/appmonitor";
 
 /// The id space [`ComAmazonawsRumRumState::mint_metric_definition_id`] draws from.
 const METRIC_DEFINITION_ID_DOMAIN: &str = "rum/metricdefinition";
+
+/// The value space [`ComAmazonawsRumRumState::mint_cw_log_group`] draws a vended log
+/// group's service-chosen suffix from — its own, so a monitor's group suffix is never a
+/// prefix of an id this state also handed out.
+const CW_LOG_GROUP_DOMAIN: &str = "rum/cwloggroup";
 
 /// One `(domain, seed, sequence)` triple as a canonical, lowercase, version-4-shaped
 /// UUID string.
@@ -2379,14 +2441,18 @@ pub fn metric_definitions_quota_exceeded(destination: &str) -> ServiceQuotaExcee
     }
 }
 
-/// The name of the CloudWatch Logs group an app monitor's telemetry is copied into.
+/// The name of the CloudWatch Logs group an app monitor's telemetry is copied into:
+/// the vended-logs prefix, the app monitor's own name, and the suffix the service chose
+/// for that monitor.
 ///
-/// One definition, used by the record's own [`AppMonitorRecord::cw_log_group`] (what
-/// `GetAppMonitor` reports) and by the handlers that PROVISION the group in CloudWatch
-/// Logs when delivery is turned on — so the name RUM advertises and the group it creates
-/// cannot differ.
-pub fn cw_log_group_name(app_monitor_name: &str) -> String {
-    format!("{CW_LOG_GROUP_PREFIX}{app_monitor_name}")
+/// One definition of the SHAPE of the name, used by the mint
+/// ([`ComAmazonawsRumRumState::mint_cw_log_group`]) whose result every reader of the name
+/// then goes through — the record's own [`AppMonitorRecord::cw_log_group`] (what
+/// `GetAppMonitor` reports) and the handlers that PROVISION the group in CloudWatch Logs
+/// when delivery is turned on — so the name RUM advertises and the group it creates cannot
+/// differ.
+pub fn cw_log_group_name(app_monitor_name: &str, suffix: &str) -> String {
+    format!("{CW_LOG_GROUP_PREFIX}{app_monitor_name}{suffix}")
 }
 
 /// The ARN of that log group, which is the resource the caller's

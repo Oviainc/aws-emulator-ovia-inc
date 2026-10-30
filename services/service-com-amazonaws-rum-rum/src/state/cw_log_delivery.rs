@@ -35,9 +35,10 @@
 //!   a router — `core/router`'s `build_router` registers every service crate in the
 //!   workspace — and this crate's own tests mount the pair explicitly;
 //! * the group is created before the record is written, so a call whose future is dropped
-//!   at that `.await` can leave the group behind. It is named after the app monitor
-//!   ([`super::cw_log_group_name`]), so the next call that turns delivery on for the same
-//!   monitor adopts that very group rather than colliding with it.
+//!   at that `.await` can leave the group behind. It is created under the name RUM vended
+//!   for that monitor ([`super::AppMonitorRecord::vended_log_group`]), so the next call
+//!   that turns delivery on for the same monitor adopts that very group rather than
+//!   colliding with it.
 //!
 //! Turning delivery OFF needs neither: no policy is installed, and the group is left
 //! alone, because the telemetry already in it belongs to the account (the same reason
@@ -134,18 +135,20 @@ fn logs_client(
 ///
 /// Identity-based only: the resource lives in CloudWatch Logs, so there is no RUM resource
 /// policy to consult for it.
+/// `log_group` is the name RUM vended for the monitor the call names
+/// ([`super::AppMonitorRecord::vended_log_group`]) — the group the policy would be
+/// installed on, and so the resource the decision is made about.
 pub fn caller_may_enable_delivery<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
-    app_monitor_name: &str,
+    log_group: &str,
 ) -> Result<(), authorization::Denied> {
-    let log_group = super::cw_log_group_name(app_monitor_name);
     authorization::authorize_identity(
         engine,
         ctx,
         authorization::LOGS_PUT_RESOURCE_POLICY,
-        &super::cw_log_group_arn(region, &log_group),
+        &super::cw_log_group_arn(region, log_group),
     )
 }
 
@@ -192,8 +195,12 @@ pub fn delivery_denied(doing: Doing, app_monitor_name: &str) -> AccessDeniedExce
     }
 }
 
-/// Create the vended log group for `app_monitor_name`, so the `CwLogGroup` RUM reports
-/// names a group `logs:DescribeLogGroups` finds.
+/// Create the vended log group `log_group`, so the `CwLogGroup` RUM reports names a group
+/// `logs:DescribeLogGroups` finds.
+///
+/// `log_group` is the name RUM vended for this monitor and holds on its record
+/// ([`super::AppMonitorRecord::vended_log_group`]), never a name rebuilt from the request:
+/// the group that exists is the group the read advertises.
 ///
 /// `Ok(())` once the group exists — whether this call created it or it was already there,
 /// since a group under that name is exactly what this step owes the caller. `Err` carries
@@ -201,12 +208,11 @@ pub fn delivery_denied(doing: Doing, app_monitor_name: &str) -> AccessDeniedExce
 pub async fn provision_log_group(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
-    app_monitor_name: &str,
+    log_group: &str,
 ) -> Result<(), String> {
-    let log_group = super::cw_log_group_name(app_monitor_name);
     match logs_client(ctx, region)
         .create_log_group()
-        .log_group_name(&log_group)
+        .log_group_name(log_group)
         .send()
         .await
     {

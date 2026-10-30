@@ -10,8 +10,9 @@
 //! advertises no group and provisions none.
 //!
 //! The rows span what the rule generalises over: which call turns delivery on (the create
-//! or a later update), the app monitor's name (which is what the group's name is derived
-//! from), and whether delivery is on at all.
+//! or a later update), the app monitor's name (which the group's name embeds), and whether
+//! delivery is on at all. The NAME the group carries is pinned by
+//! `vended_cw_log_group.rs`.
 //!
 //! The second rule, over the same side effect: when the caller may NOT have RUM install
 //! that group's delivery policy, RUM refuses the call in its OWN words — the operation it
@@ -88,8 +89,8 @@ async fn turning_cw_log_delivery_on_provisions_the_group_the_app_monitor_adverti
             TurnedOnBy::AnUpdate,
         ),
         (
-            // The group's name is derived from the monitor's, so a name carrying the
-            // other characters `AppMonitorName` admits must still resolve.
+            // The group's name embeds the monitor's, so a name carrying the other
+            // characters `AppMonitorName` admits must still resolve.
             "a monitor whose name carries the other characters the model admits",
             "vended_by-update.2",
             TurnedOnBy::AnUpdate,

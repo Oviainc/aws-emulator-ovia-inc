@@ -307,6 +307,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The vended CloudWatch Logs group this monitor will advertise, chosen ONCE here:
+        // its service-chosen suffix is state and not a function of the request
+        // (`crate::state::ComAmazonawsRumRumState::mint_cw_log_group`), so the name is
+        // minted before anything is decided about it, provisioned under exactly that name
+        // and then stored on the record the insert below writes. A create this call goes
+        // on to refuse stores nothing, so the name it drew is simply never used.
+        let vended_log_group = state.lock().mint_cw_log_group(&input.name);
+
         // Creating the monitor with CloudWatch Logs delivery already ON is the same
         // managed side effect `UpdateAppMonitor` performs when it turns delivery on: the
         // caller must hold `logs:PutResourcePolicy`, and the vended log group the
@@ -323,7 +331,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &*self.engine,
                 ctx,
                 &region,
-                &input.name,
+                &vended_log_group,
             )
             .is_err()
         {
@@ -383,9 +391,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // That is also why this step is `async` and takes no engine of its own —
             // CloudWatch Logs owns its own state in the shared engine and its handler
             // writes it, rather than this service reaching into another service's store.
-            if let Err(detail) =
-                crate::state::cw_log_delivery::provision_log_group(ctx, &region, &input.name)
-                    .await
+            if let Err(detail) = crate::state::cw_log_delivery::provision_log_group(
+                ctx,
+                &region,
+                &vended_log_group,
+            )
+            .await
             {
                 return Err(CreateAppMonitorErrorModeled::InternalServerException(
                     InternalServerException {
@@ -446,6 +457,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state: crate::state::CREATED_STATE.to_string(),
             platform,
             cw_log_enabled: input.cw_log_enabled.unwrap_or(false),
+            // The name minted above, which is the name the group provisioned in CloudWatch
+            // Logs carries: a read reports THIS value rather than rebuilding one from the
+            // monitor's name, so the advertised group and the existing group are one.
+            vended_log_group,
             // Each structure is SETTLED before it is stored: a member this request left
             // unset takes the value the model documents for it when omitted (a session
             // sample rate of 10%, custom events DISABLED), whether the request named the

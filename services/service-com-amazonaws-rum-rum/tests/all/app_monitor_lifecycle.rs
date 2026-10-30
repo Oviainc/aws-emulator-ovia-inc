@@ -182,8 +182,9 @@ async fn get_app_monitor_rebuilds_every_member_from_the_created_state() {
             monitor["Tags"]
         );
 
-        // `DataStorage.CwLog` is DERIVED from the stored `CwLogEnabled`: a monitor that
-        // keeps copies names the log group they go to, one that does not names none.
+        // `DataStorage.CwLog` is DERIVED from the stored record: a monitor that keeps
+        // copies names the group RUM VENDED for it, read off the record, and one that does
+        // not names none.
         let cw_log_enabled = request["CwLogEnabled"].as_bool().expect("a bool in the row");
         assert_eq!(
             monitor["DataStorage"]["CwLog"]["CwLogEnabled"].as_bool(),
@@ -191,12 +192,26 @@ async fn get_app_monitor_rebuilds_every_member_from_the_created_state() {
             "case {case:?}: expected DataStorage.CwLog.CwLogEnabled {cw_log_enabled}, got {:?}",
             monitor["DataStorage"]["CwLog"]["CwLogEnabled"]
         );
-        let expected_group = cw_log_enabled.then(|| format!("{CW_LOG_GROUP_PREFIX}{name}"));
+        let vended = engine
+            .state::<ComAmazonawsRumRumState>()
+            .lock()
+            .app_monitor(REGION, &name)
+            .map(|record| record.vended_log_group.clone())
+            .expect("the created monitor is stored");
+        let expected_group = cw_log_enabled.then(|| vended.clone());
         assert_eq!(
             monitor["DataStorage"]["CwLog"]["CwLogGroup"].as_str(),
             expected_group.as_deref(),
             "case {case:?}: expected DataStorage.CwLog.CwLogGroup {expected_group:?}, got {:?}",
             monitor["DataStorage"]["CwLog"]["CwLogGroup"]
+        );
+        // And that vended name is not reconstructible from the request: it carries the
+        // documented prefix and the monitor's name, then a suffix the service chose.
+        let named = format!("{CW_LOG_GROUP_PREFIX}{name}");
+        assert!(
+            vended.starts_with(&named) && vended.len() > named.len(),
+            "case {case:?}: expected the vended log group to extend {named:?} with a \
+             service-chosen suffix, got {vended:?}"
         );
 
         let created = monitor["Created"].as_str().unwrap_or_default();
@@ -527,7 +542,7 @@ async fn put_rum_events_appends_to_the_monitor_its_id_names() {
 
 #[tokio::test]
 async fn update_app_monitor_changes_only_the_members_the_request_carries() {
-    let (router, _engine) = emulator();
+    let (router, engine) = emulator();
     let name = "update-monitor";
     let id = create(
         &router,
@@ -568,6 +583,16 @@ async fn update_app_monitor_changes_only_the_members_the_request_carries() {
          exactly as it was, expected {before}, got {unchanged}"
     );
 
+    // The group RUM vended for this monitor when it was created: what the update that
+    // turns delivery on has to advertise, read off the record rather than rebuilt from the
+    // monitor's name, whose service-chosen suffix is state.
+    let vended_group = engine
+        .state::<ComAmazonawsRumRumState>()
+        .lock()
+        .app_monitor(REGION, name)
+        .map(|record| record.vended_log_group.clone())
+        .expect("the seeded monitor is stored");
+
     // Each row changes ONE updatable member and names what the stored monitor must then
     // report. Source: `smithy_query(query="operation", operation="UpdateAppMonitor")` —
     // Domain, DomainList, AppMonitorConfiguration, CwLogEnabled, CustomEvents,
@@ -589,7 +614,7 @@ async fn update_app_monitor_changes_only_the_members_the_request_carries() {
             "CwLogEnabled",
             json!({"CwLogEnabled": true}),
             "DataStorage",
-            json!({"CwLog": {"CwLogEnabled": true, "CwLogGroup": format!("{CW_LOG_GROUP_PREFIX}{name}")}}),
+            json!({"CwLog": {"CwLogEnabled": true, "CwLogGroup": vended_group}}),
         ),
         (
             "CustomEvents",

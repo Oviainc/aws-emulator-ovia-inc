@@ -245,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The monitor and the resource policy the decision reads, under a SHORT read
         // lock: everything between here and the write below — the authorization
         // decisions and provisioning the log group — holds no lock of this service's.
-        let (resource_arn, resource_policy) = {
+        let (resource_arn, resource_policy, vended_log_group) = {
             let store = state.lock();
             let Some(record) = store.app_monitor(&region, &input.name) else {
                 return Err(UpdateAppMonitorErrorModeled::ResourceNotFoundException(
@@ -253,7 +253,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
-            (record.arn.clone(), record.resource_policy_document())
+            (
+                record.arn.clone(),
+                record.resource_policy_document(),
+                // The group RUM vended for this monitor when it was created: the name
+                // this update provisions and the name a later read advertises are the
+                // same stored value, so turning delivery on cannot create a group under
+                // one name while `GetAppMonitor` reports another.
+                record.vended_log_group.clone(),
+            )
         };
 
         // May this caller change THIS app monitor at all? Evaluated per call against the
@@ -283,7 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &*self.engine,
                 ctx,
                 &region,
-                &input.name,
+                &vended_log_group,
             )
             .is_err()
             {
@@ -301,7 +309,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Err(detail) = crate::state::cw_log_delivery::provision_log_group(
                 ctx,
                 &region,
-                &input.name,
+                &vended_log_group,
             )
             .await
             {

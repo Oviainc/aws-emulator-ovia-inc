@@ -19,9 +19,6 @@ use serde_json::{json, Value};
 
 use crate::authorization::{Emulator, ACCOUNT_KEY};
 
-/// The prefix a RUM-managed log group's name carries: RUM is a vended-logs service.
-const CW_LOG_GROUP_PREFIX: &str = "/aws/vendedlogs/RUMService_";
-
 /// One instant a batch delivers, and what the stored (and reported, and copied) document
 /// must then carry for it.
 struct Row {
@@ -325,11 +322,28 @@ async fn every_delivered_instant_reaches_the_cloudwatch_logs_copy() {
     )
     .await;
 
+    // The group the copies land in is the one RUM ADVERTISES for this monitor: part of
+    // that name is chosen by the service, so it is read off the response rather than
+    // rebuilt from the monitor's name.
+    let read = emulator
+        .rum(ACCOUNT_KEY, "GET", &format!("/appmonitor/{monitor}"), None)
+        .await;
+    let advertised = read.json("the copies");
+    let log_group = advertised["AppMonitor"]["DataStorage"]["CwLog"]["CwLogGroup"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "case \"the copies\": expected GetAppMonitor to advertise a CwLogGroup, got \
+                 {advertised}"
+            )
+        })
+        .to_string();
+
     let (status, body) = emulator
         .logs(
             "GetLogEvents",
             &json!({
-                "logGroupName": format!("{CW_LOG_GROUP_PREFIX}{monitor}"),
+                "logGroupName": log_group,
                 "logStreamName": SESSION,
                 "startFromHead": true,
             }),

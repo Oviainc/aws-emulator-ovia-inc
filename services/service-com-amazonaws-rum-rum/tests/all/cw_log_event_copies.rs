@@ -418,10 +418,11 @@ async fn every_delivered_event_is_copied_into_the_vended_log_group() {
     let log_group = advertised_group(&emulator, "setup", monitor)
         .await
         .unwrap_or_else(|| panic!("a monitor with delivery on must advertise a log group"));
-    assert_eq!(
-        log_group,
-        format!("{CW_LOG_GROUP_PREFIX}{monitor}"),
-        "case \"setup\": expected the vended group of the monitor, got {log_group:?}"
+    let named = format!("{CW_LOG_GROUP_PREFIX}{monitor}");
+    assert!(
+        log_group.starts_with(&named) && log_group.len() > named.len(),
+        "case \"setup\": expected the vended group of the monitor to extend {named:?} with the \
+         suffix the service chose for it, got {log_group:?}"
     );
 
     // What each stream owes, in the order the batches were delivered.
@@ -499,7 +500,6 @@ async fn copies_are_stored_exactly_while_delivery_is_on() {
     let emulator = Emulator::new();
     let monitor = "copies-toggled";
     let monitor_id = create_monitor(&emulator, "setup", monitor, false).await;
-    let log_group = format!("{CW_LOG_GROUP_PREFIX}{monitor}");
 
     /// One batch per row, each carrying a single event whose `id` the row is identified by.
     fn batch(batch_id: &str, event_id: &str, timestamp: i64, monitor_id: &str) -> Value {
@@ -580,6 +580,14 @@ async fn copies_are_stored_exactly_while_delivery_is_on() {
     //    delivered before are not retro-copied — they were delivered while the monitor
     //    stored no copies.
     set_delivery(&emulator, "delivery on", monitor, true).await;
+    // The group RUM vended for this monitor, read off the monitor now that it advertises
+    // one: part of the name is the service's own choice, so it cannot be rebuilt from the
+    // monitor's name.
+    let log_group = advertised_group(&emulator, "delivery on", monitor)
+        .await
+        .unwrap_or_else(|| {
+            panic!("case \"delivery on\": a monitor with delivery on must advertise a log group")
+        });
     assert_eq!(
         streams_of(&emulator, "delivery on", &log_group).await,
         Vec::<String>::new(),

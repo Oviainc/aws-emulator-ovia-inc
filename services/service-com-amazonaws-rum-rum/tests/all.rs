@@ -103,3 +103,5 @@ mod tag_key_clauses;
 mod tagging_authorization;
 #[path = "all/tagging_no_content.rs"]
 mod tagging_no_content;
+#[path = "all/vended_cw_log_group.rs"]
+mod vended_cw_log_group;
