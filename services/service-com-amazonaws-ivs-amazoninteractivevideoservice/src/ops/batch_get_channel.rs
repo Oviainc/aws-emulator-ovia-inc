@@ -159,10 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ValidationException` before `handle` runs.
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            BatchGetChannelErrorModeled::ServiceUnavailable(ServiceUnavailable {
-                exception_message: Some("the IVS store is unavailable".to_string()),
-                ..Default::default()
-            })
+            crate::state::service_unavailable(BatchGetChannelErrorModeled::ServiceUnavailable)
         })?;
 
         let store = state.lock();

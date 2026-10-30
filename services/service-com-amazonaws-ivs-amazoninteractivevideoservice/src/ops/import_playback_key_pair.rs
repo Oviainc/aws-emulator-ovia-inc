@@ -159,22 +159,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            ImportPlaybackKeyPairErrorModeled::InternalServerException(InternalServerException {
-                exception_message: Some("the IVS store is unavailable".to_string()),
-                ..Default::default()
-            })
+            crate::state::store_unavailable(
+                ImportPlaybackKeyPairErrorModeled::InternalServerException,
+            )
         })?;
         let region = crate::state::request_region(ctx.parts());
 
         // `PlaybackPublicKeyMaterial` carries no modelled pattern, so the boundary
         // validator cannot have checked that the material really is a public key:
         // this handler is where that is decided.
-        let key_der = public_key_der(&input.public_key_material).map_err(|message| {
+        let key_der = public_key_der(&input.public_key_material).ok_or_else(|| {
             audit(ctx, "", "", "rejected-invalid-material");
-            ImportPlaybackKeyPairErrorModeled::ValidationException(ValidationException {
-                exception_message: Some(message),
-                ..Default::default()
-            })
+            crate::state::validation(
+                ImportPlaybackKeyPairErrorModeled::ValidationException,
+                crate::state::member_constraint_message(
+                    PUBLIC_KEY_MATERIAL_MEMBER,
+                    UNUSABLE_KEY_MATERIAL,
+                ),
+            )
         })?;
         let fingerprint = fingerprint(&key_der);
 
@@ -191,15 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let existing_arn = existing.arn.clone().unwrap_or_default();
             drop(store);
             audit(ctx, &fingerprint, &existing_arn, "rejected-conflict");
-            return Err(ImportPlaybackKeyPairErrorModeled::ConflictException(
-                ConflictException {
-                    exception_message: Some(format!(
-                        "a playback key pair with fingerprint {fingerprint} is already imported as {existing_arn}"
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
+            return Err(crate::state::already_exists(
+                ImportPlaybackKeyPairErrorModeled::ConflictException,
+                crate::state::DUPLICATE_PLAYBACK_KEY_MESSAGE,
+            ));
         }
         // The store grows by one key pair per call and lives for the life of the
         // process, so the growth is capped; past the cap the service answers the
@@ -207,18 +204,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.playback_key_pairs.len() >= crate::state::MAX_PLAYBACK_KEY_PAIRS {
             drop(store);
             audit(ctx, &fingerprint, "", "rejected-quota");
-            return Err(
-                ImportPlaybackKeyPairErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        exception_message: Some(format!(
-                            "the number of playback key pairs would exceed the limit of {}",
-                            crate::state::MAX_PLAYBACK_KEY_PAIRS
-                        )),
-                        ..Default::default()
-                    },
-                )
-                .into(),
-            );
+            return Err(crate::state::quota_exceeded(
+                ImportPlaybackKeyPairErrorModeled::ServiceQuotaExceededException,
+                PLAYBACK_KEY_QUOTA_RESOURCE,
+                crate::state::MAX_PLAYBACK_KEY_PAIRS,
+            ));
         }
 
         let id = store.mint_hex("playback-key", 6);
@@ -269,8 +259,8 @@ fn audit(
     );
 }
 
-/// The DER `SubjectPublicKeyInfo` a caller's `publicKeyMaterial` carries, or the
-/// reason to refuse the import.
+/// The DER `SubjectPublicKeyInfo` a caller's `publicKeyMaterial` carries, or `None` when
+/// the material is not one this service can use.
 ///
 /// The model documents the member as "the public portion of a customer-generated key
 /// pair", and IVS's private-channel setup produces exactly one form of it: an ECDSA
@@ -282,26 +272,31 @@ fn audit(
 /// refused with the operation's `ValidationException` rather than persisted and
 /// fingerprinted. The curve itself is NOT constrained: the model names no curve, so
 /// any EC key the caller generated is accepted.
-fn public_key_der(material: &str) -> Result<Vec<u8>, String> {
-    let block = pem::parse(material.trim())
-        .map_err(|error| format!("publicKeyMaterial is not a PEM block: {error}"))?;
+fn public_key_der(material: &str) -> Option<Vec<u8>> {
+    let block = pem::parse(material.trim()).ok()?;
     if block.tag() != "PUBLIC KEY" {
-        return Err(format!(
-            "publicKeyMaterial must be a PUBLIC KEY PEM block, got a {} block",
-            block.tag()
-        ));
+        return None;
     }
-    let key = spki::SubjectPublicKeyInfoRef::from_der(block.contents())
-        .map_err(|error| format!("publicKeyMaterial is not a DER-encoded public key: {error}"))?;
-    let algorithm = key.algorithm.oid.to_string();
-    if algorithm != EC_PUBLIC_KEY_OID {
-        return Err(format!(
-            "publicKeyMaterial must be an ECDSA public key (algorithm {EC_PUBLIC_KEY_OID}), \
-             got algorithm {algorithm}"
-        ));
+    let key = spki::SubjectPublicKeyInfoRef::from_der(block.contents()).ok()?;
+    if key.algorithm.oid.to_string() != EC_PUBLIC_KEY_OID {
+        return None;
     }
-    Ok(block.into_contents())
+    Some(block.into_contents())
 }
+
+/// The member a refused import names, as the request spells it.
+const PUBLIC_KEY_MATERIAL_MEMBER: &str = "publicKeyMaterial";
+
+/// What IVS states is wrong with material it cannot use, for every one of the four
+/// conditions [`public_key_der`] checks: the recorded refusal carries this one clause
+/// both for material that is no PEM block at all and for a PEM block holding a key of
+/// another algorithm, so the refusal does not say which of them it was.
+const UNUSABLE_KEY_MATERIAL: &str = "could not decode as a PEM file";
+
+/// The resource type the playback-key quota is on, as an IVS ARN spells it — the
+/// `playback-key` of `PlaybackKeyPairArn` — so the quota refusal names the resource the
+/// same way the service's other quota refusals do.
+const PLAYBACK_KEY_QUOTA_RESOURCE: &str = "playback-key";
 
 /// `id-ecPublicKey`, the `SubjectPublicKeyInfo` algorithm of every ECDSA public key
 /// (RFC 5480 §2.1.1), which is the kind of key a playback key pair holds.

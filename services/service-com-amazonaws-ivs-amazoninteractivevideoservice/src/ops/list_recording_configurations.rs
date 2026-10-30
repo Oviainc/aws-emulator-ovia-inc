@@ -150,11 +150,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            ListRecordingConfigurationsErrorModeled::InternalServerException(
-                InternalServerException {
-                    exception_message: Some("the IVS store is unavailable".to_string()),
-                    ..Default::default()
-                },
+            crate::state::store_unavailable(
+                ListRecordingConfigurationsErrorModeled::InternalServerException,
             )
         })?;
 
@@ -167,14 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     token,
                 )
                 .ok_or_else(|| {
-                    ListRecordingConfigurationsErrorModeled::ValidationException(
-                        ValidationException {
-                            exception_message: Some(
-                                "nextToken is not a pagination token this service issued"
-                                    .to_string(),
-                            ),
-                            ..Default::default()
-                        },
+                    crate::state::validation(
+                        ListRecordingConfigurationsErrorModeled::ValidationException,
+                        UNISSUED_PAGE_TOKEN.to_string(),
                     )
                 })?,
             ),
@@ -210,6 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// (`MaxRecordingConfigurationResults`, `range(min: 1, max: 100)`), and so also the
 /// page size an absent `maxResults` means.
 const MAX_RECORDING_CONFIGURATION_RESULTS: i32 = 100;
+
+/// What this operation states for a `nextToken` it did not issue for this list — the
+/// same sentence its sibling lists state, since the refusal is the same one.
+const UNISSUED_PAGE_TOKEN: &str = "nextToken is not a pagination token this service issued";
 
 /// The `RecordingConfigurationSummary` projection of a persisted recording
 /// configuration: every member `RecordingConfigurationSummary` declares, read off

@@ -166,30 +166,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // pattern, which the framework's constraint walk refuses with a 400
         // `ValidationException` before `handle` runs.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            GetStreamErrorModeled::InternalServerException(InternalServerException {
-                exception_message: Some("the IVS store is unavailable".to_string()),
-                ..Default::default()
-            })
+            crate::state::store_unavailable(GetStreamErrorModeled::InternalServerException)
         })?;
 
         let store = state.lock();
         if !store.channels.contains_key(&input.channel_arn) {
-            return Err(GetStreamErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    exception_message: Some(format!("Resource: {} not found", input.channel_arn)),
-                    ..Default::default()
-                },
-            )
-            .into());
+            return Err(crate::state::resource_not_found(
+                GetStreamErrorModeled::ResourceNotFoundException,
+                &input.channel_arn,
+            ));
         }
         let stream = crate::state::live_stream(&store, &input.channel_arn).ok_or_else(|| {
-            GetStreamErrorModeled::ChannelNotBroadcasting(ChannelNotBroadcasting {
-                exception_message: Some(format!(
-                    "Channel: {} is not currently online",
-                    input.channel_arn
-                )),
-                ..Default::default()
-            })
+            crate::state::channel_not_broadcasting(
+                GetStreamErrorModeled::ChannelNotBroadcasting,
+                &input.channel_arn,
+            )
         })?;
 
         Ok(GetStreamOutput {

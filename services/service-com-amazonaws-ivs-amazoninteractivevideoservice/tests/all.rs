@@ -23,6 +23,8 @@ mod batch_get_channel;
 mod batch_get_stream_key;
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
+#[path = "all/error_envelope.rs"]
+mod error_envelope;
 #[path = "all/live_stream_reads.rs"]
 mod live_stream_reads;
 #[path = "all/playback_key_pair_import.rs"]

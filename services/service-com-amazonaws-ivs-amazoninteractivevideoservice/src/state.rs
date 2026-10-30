@@ -10,6 +10,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
+use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use aws_smithy_schema::Schema;
+use aws_smithy_schema_server::constraints;
+use aws_smithy_types::{BigDecimal, BigInteger, DateTime, Document};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use smithy_server_runtime::{Violation, ViolationKind};
@@ -17,7 +21,7 @@ use smithy_server_runtime::{Violation, ViolationKind};
 use crate::ops::types::{
     AdConfiguration, Channel, ChannelNotBroadcasting, ConflictException, InternalServerException,
     MultitrackInputConfiguration, PlaybackKeyPair, RecordingConfiguration, RenditionConfiguration,
-    ResourceNotFoundException, ServiceQuotaExceededException, Stream, StreamKey,
+    ResourceNotFoundException, ServiceQuotaExceededException, ServiceUnavailable, Stream, StreamKey,
     ThumbnailConfiguration, ValidationException,
 };
 use crate::scaffolded::Scaffolded;
@@ -768,6 +772,12 @@ pub fn quota_exceeded_message(resource: &str, limit: usize) -> String {
     format!("Resource: {resource} quota exceeded limit: {limit}")
 }
 
+/// How IVS states an import of playback key material it already holds
+/// (`ConflictException`, HTTP 409): one fixed sentence naming the member whose value is
+/// already present, with nothing of the request in it.
+pub const DUPLICATE_PLAYBACK_KEY_MESSAGE: &str =
+    "A playback-key resource already exists with the given publicKeyMaterial";
+
 /// How IVS states a rejection of one member's VALUE for a reason the model cannot
 /// express — a pair of members that cannot hold together: it names the member and the
 /// constraint the request violated.
@@ -898,6 +908,22 @@ pub fn resource_referenced<E>(
     )
 }
 
+/// The `ConflictException` (HTTP 409) this service answers when the resource a create
+/// would mint is already there, with `message` from one of the rules above.
+pub fn already_exists<E>(
+    variant: fn(ConflictException) -> E,
+    message: impl Into<String>,
+) -> Scaffolded<E> {
+    let message = message.into();
+    Scaffolded::stated(
+        variant(ConflictException {
+            exception_message: Some(message.clone()),
+            ..Default::default()
+        }),
+        message,
+    )
+}
+
 /// The `ValidationException` (HTTP 400) this service answers for a request it refuses on
 /// its own, with `message` from one of the rules above.
 pub fn validation<E>(variant: fn(ValidationException) -> E, message: String) -> Scaffolded<E> {
@@ -926,6 +952,20 @@ pub fn store_unavailable<E>(variant: fn(InternalServerException) -> E) -> Scaffo
 /// The text [`store_unavailable`] states. AWS documents no message for this (it is an
 /// emulator fault, not a service behaviour), so it says plainly what failed.
 pub const STORE_UNAVAILABLE_MESSAGE: &str = "the IVS store is unavailable";
+
+/// The same fault as [`store_unavailable`] for the two BATCH reads, whose model declares
+/// `ServiceUnavailable` and not `InternalServerException`
+/// (`smithy_query(query="operation", operation="BatchGetChannel,BatchGetStreamKey")`).
+pub fn service_unavailable<E>(variant: fn(ServiceUnavailable) -> E) -> Scaffolded<E> {
+    let message = STORE_UNAVAILABLE_MESSAGE.to_string();
+    Scaffolded::stated(
+        variant(ServiceUnavailable {
+            exception_message: Some(message.clone()),
+            ..Default::default()
+        }),
+        message,
+    )
+}
 
 /// The not-found the TAGGING surface answers for an ARN naming no resource:
 /// [`TAGGING_NOT_FOUND_CODE`] with [`TAGGING_NOT_FOUND_STATUS`], which is not the
@@ -1041,6 +1081,244 @@ pub fn missing_member_violation(member_name: String) -> Violation {
         path: member_name,
         kind: ViolationKind::MissingRequiredMember,
         value: None,
+    }
+}
+
+// =============================================================================
+// How this service spells the dotted member path a refusal names
+// =============================================================================
+//
+// IVS names each step of that path the way the MODEL names the value at it, and names
+// an element of a list by its ZERO-based position: the recorded refusal for an element
+// of `CreateAdConfiguration`'s MediaTailor list reads
+// `CreateAdConfiguration.mediaTailorPlaybackConfiguration.0.playbackConfigurationArn`,
+// where `MediaTailorPlaybackConfiguration` is the shape the list's member targets
+// (`smithy_query(query="shape", shape="MediaTailorPlaybackConfigurationsList")`) and `0`
+// is the first element. The framework's walk spells the same position
+// `mediaTailorPlaybackConfigurations.1.member.playbackConfigurationArn`: it counts
+// elements from one and marks the step into a collection with the synthetic segment the
+// Smithy list shape names its member by, neither of which IVS carries.
+//
+// A list member's own segment and an element's leaf are already the model's names, so
+// only the step INTO an element is respelled — and the shape it steps into is the
+// element's own, which no `Schema` carries (a list member schema holds a sub-member
+// named `member`, not its target). It is read off the VALUE instead: the generated
+// serialization writes a structure element against that structure's own schema, so one
+// walk of the request records, per list, the shape its elements are.
+
+/// The segment the framework's walk marks a step from a collection into one of its
+/// elements with — `aws_smithy_schema_server::constraints::path`'s collection step, the
+/// Smithy default name of a list shape's member — and the one segment an IVS member path
+/// does not carry.
+const COLLECTION_STEP: &str = "member";
+
+/// What the model names the elements of each list ONE request carries, keyed by the list
+/// member's own path segment.
+///
+/// Built by [`element_steps`] from the request itself, so a list the request did not send
+/// has no entry and a path through it is left exactly as the walk spelled it.
+#[derive(Debug, Default)]
+pub struct ElementSteps {
+    steps: HashMap<String, String>,
+}
+
+impl ElementSteps {
+    /// `path` as IVS spells it: every step into a list element named by the element's
+    /// own shape and its zero-based position, with the walk's collection segment gone.
+    ///
+    /// A step whose list this request did not carry keeps the list member's own
+    /// segment — the model gives that element no shape of its own, which is the case for
+    /// a list of scalars — so the position is still restated from zero and nothing else
+    /// about the path changes.
+    pub fn respell(&self, path: &str) -> String {
+        let segments: Vec<&str> = path.split('.').collect();
+        let mut spelled: Vec<String> = Vec::with_capacity(segments.len());
+        let mut at = 0;
+        while at < segments.len() {
+            match element_position(&segments[at..]) {
+                Some(position) => {
+                    spelled.push(
+                        self.steps
+                            .get(segments[at])
+                            .cloned()
+                            .unwrap_or_else(|| segments[at].to_string()),
+                    );
+                    spelled.push(position.to_string());
+                    at += 3;
+                }
+                None => {
+                    spelled.push(segments[at].to_string());
+                    at += 1;
+                }
+            }
+        }
+        spelled.join(".")
+    }
+}
+
+/// The ZERO-based position `segments` begins a step into, when it begins one: a
+/// collection's own segment, then the position the walk counted from one, then the
+/// walk's [`COLLECTION_STEP`]. `None` for anything else — a plain member, or a map entry,
+/// whose segment is the caller's own key rather than a position.
+fn element_position(segments: &[&str]) -> Option<usize> {
+    let [_, position, step, ..] = segments else {
+        return None;
+    };
+    if *step != COLLECTION_STEP {
+        return None;
+    }
+    position.parse::<usize>().ok()?.checked_sub(1)
+}
+
+/// Read `input` for the shape the model gives the elements of every list it carries.
+///
+/// One walk of the request, driven exactly as a codec drives it, so the shapes recorded
+/// are the ones the model declares rather than anything restated here.
+pub fn element_steps(input: &dyn SerializableStruct, schema: &Schema) -> ElementSteps {
+    let mut recorder = ElementRecorder::default();
+    // The root input is a struct; drive it the way `constraints::validate` does.
+    let _ = recorder.write_struct(schema, input);
+    ElementSteps {
+        steps: recorder.steps,
+    }
+}
+
+/// The walk [`element_steps`] runs: it reads the request's shape and nothing of its
+/// values, so no value a caller sent can reach a message through it.
+#[derive(Debug, Default)]
+struct ElementRecorder {
+    /// The collections and structures currently open, innermost last.
+    open: Vec<OpenShape>,
+    /// What each list's elements are, keyed by the list member's path segment.
+    steps: HashMap<String, String>,
+}
+
+/// One shape the walk is inside, and what it names the values written directly in it.
+#[derive(Debug)]
+enum OpenShape {
+    /// A list, named by its member's own path segment: its elements are a step into it.
+    List(String),
+    /// A map: an entry is named by the key the caller chose, never by a shape.
+    Map,
+    /// A structure: its members name themselves.
+    Struct,
+}
+
+impl ElementRecorder {
+    /// Record `schema` as the shape of the elements of the list this value is an element
+    /// of — when it is one, and not a member of a structure or the value of a map entry.
+    fn record_element(&mut self, schema: &Schema) {
+        if let Some(OpenShape::List(member)) = self.open.last() {
+            let member = member.clone();
+            // The same lowerCamel spelling a path segment takes, applied to the shape
+            // the element IS rather than to a member name.
+            let element = constraints::path::member(schema.shape_id().shape_name());
+            self.steps.insert(member, element);
+        }
+    }
+}
+
+impl ShapeSerializer for ElementRecorder {
+    fn write_struct(
+        &mut self,
+        schema: &Schema,
+        value: &dyn SerializableStruct,
+    ) -> Result<(), SerdeError> {
+        self.record_element(schema);
+        self.open.push(OpenShape::Struct);
+        let walked = value.serialize_members(self);
+        self.open.pop();
+        walked
+    }
+
+    fn write_list(
+        &mut self,
+        schema: &Schema,
+        write_elements: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
+    ) -> Result<(), SerdeError> {
+        self.open.push(OpenShape::List(constraints::path::member(
+            schema.member_name().unwrap_or_default(),
+        )));
+        let walked = write_elements(self);
+        self.open.pop();
+        walked
+    }
+
+    fn write_map(
+        &mut self,
+        _schema: &Schema,
+        write_entries: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
+    ) -> Result<(), SerdeError> {
+        self.open.push(OpenShape::Map);
+        let walked = write_entries(self);
+        self.open.pop();
+        walked
+    }
+
+    // A leaf is never a shape this walk steps into, and its VALUE is not read at all:
+    // every scalar write is accepted and recorded nowhere.
+    fn write_boolean(&mut self, _schema: &Schema, _value: bool) -> Result<(), SerdeError> {
+        Ok(())
+    }
+
+    fn write_byte(&mut self, _schema: &Schema, _value: i8) -> Result<(), SerdeError> {
+        Ok(())
+    }
+
+    fn write_short(&mut self, _schema: &Schema, _value: i16) -> Result<(), SerdeError> {
+        Ok(())
+    }
+
+    fn write_integer(&mut self, _schema: &Schema, _value: i32) -> Result<(), SerdeError> {
+        Ok(())
+    }
+
+    fn write_long(&mut self, _schema: &Schema, _value: i64) -> Result<(), SerdeError> {
+        Ok(())
+    }
+
+    fn write_float(&mut self, _schema: &Schema, _value: f32) -> Result<(), SerdeError> {
+        Ok(())
+    }
+
+    fn write_double(&mut self, _schema: &Schema, _value: f64) -> Result<(), SerdeError> {
+        Ok(())
+    }
+
+    fn write_big_integer(
+        &mut self,
+        _schema: &Schema,
+        _value: &BigInteger,
+    ) -> Result<(), SerdeError> {
+        Ok(())
+    }
+
+    fn write_big_decimal(
+        &mut self,
+        _schema: &Schema,
+        _value: &BigDecimal,
+    ) -> Result<(), SerdeError> {
+        Ok(())
+    }
+
+    fn write_string(&mut self, _schema: &Schema, _value: &str) -> Result<(), SerdeError> {
+        Ok(())
+    }
+
+    fn write_blob(&mut self, _schema: &Schema, _value: &[u8]) -> Result<(), SerdeError> {
+        Ok(())
+    }
+
+    fn write_timestamp(&mut self, _schema: &Schema, _value: &DateTime) -> Result<(), SerdeError> {
+        Ok(())
+    }
+
+    fn write_document(&mut self, _schema: &Schema, _value: &Document) -> Result<(), SerdeError> {
+        Ok(())
+    }
+
+    fn write_null(&mut self, _schema: &Schema) -> Result<(), SerdeError> {
+        Ok(())
     }
 }
 

@@ -164,11 +164,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // runs, so reaching here means every pair is individually well formed.
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            BatchStartViewerSessionRevocationErrorModeled::InternalServerException(
-                InternalServerException {
-                    exception_message: Some("the IVS store is unavailable".to_string()),
-                    ..Default::default()
-                },
+            crate::state::store_unavailable(
+                BatchStartViewerSessionRevocationErrorModeled::InternalServerException,
             )
         })?;
 
