@@ -61,6 +61,8 @@ mod request_validation;
 mod reserved_tag_keys;
 #[path = "all/resource_policy_and_tagging.rs"]
 mod resource_policy_and_tagging;
+#[path = "all/resource_policy_entity_only.rs"]
+mod resource_policy_entity_only;
 #[path = "all/resource_policy_lifecycle.rs"]
 mod resource_policy_lifecycle;
 #[path = "all/resource_policy_reads.rs"]

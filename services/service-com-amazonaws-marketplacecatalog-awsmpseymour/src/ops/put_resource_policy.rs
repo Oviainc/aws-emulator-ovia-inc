@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! Attaches a resource-based policy to the resource a resource ARN names.
+//! Attaches a resource-based policy to the entity resource a resource ARN names.
 //!
 //! ## Shape of an operation
 //!
@@ -181,6 +181,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which is a change the clock owes rather than one this call makes.
         store.settle(now);
 
+        // This "attaches a resource-based policy to an ENTITY", and its
+        // `ResourceArn` is "the ARN of the entity resource you want to associate
+        // with a resource policy" — so an ARN naming a resource of this catalog
+        // of any other kind, or carrying a resource type the catalog does not
+        // have, names no resource for this operation to act on and is refused as
+        // absent, exactly as an ARN naming an entity the catalog does not hold
+        // is.
+        let Some(policy_key) = store.policy_key_for(&resource) else {
+            return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
+                crate::state::policy_resource_not_found(&resource),
+            )
+            .into());
+        };
+
         if !store.holds_resource(&resource) {
             return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(&resource),
@@ -190,9 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Attaching replaces whatever policy the resource carried: the operation
         // sets THE policy of a resource, of which there is one.
-        store
-            .resource_policies
-            .insert(resource.policy_key(), input.policy);
+        store.resource_policies.insert(policy_key, input.policy);
 
         Ok(PutResourcePolicyOutput {})
     }

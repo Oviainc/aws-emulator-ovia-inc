@@ -17,7 +17,10 @@
 //! The existence step binds an operation to the catalog's own record of the resource — the
 //! tagging surface throughout, and `PutResourcePolicy` — while reporting and clearing a
 //! resource POLICY are addressed by the ARN alone (`resource_policy_lifecycle.rs`), since
-//! a policy is recorded per ARN rather than on that record.
+//! a policy is recorded per ARN rather than on that record. Which resource KINDS an
+//! operation acts on at all is its own: the tagging surface acts on an entity or a change
+//! set, the resource-policy surface on an entity alone
+//! (`resource_policy_entity_only.rs`).
 //!
 //! The rows differ along what that rule generalises over: which operation, which resource
 //! kind (entity or change set), which entity type, how many tags, which keys, and which
@@ -540,10 +543,12 @@ async fn tags_are_reported_from_the_stored_record() {
     }
 }
 
-/// The resource-policy operations report what the store holds: `GetResourcePolicy`
-/// answers the attached document, `PutResourcePolicy` replaces it and
-/// `DeleteResourcePolicy` leaves the resource with none — after which there is no policy
-/// to report, exactly as for a resource that never had one.
+/// The resource-policy operations report what the store holds for the ENTITY resource they
+/// are documented for: `GetResourcePolicy` answers the attached document,
+/// `PutResourcePolicy` replaces it and `DeleteResourcePolicy` leaves the resource with none
+/// — after which there is no policy to report, exactly as for a resource that never had
+/// one. The change set that created that entity is a resource of the OTHER kind, which the
+/// same three operations refuse.
 ///
 /// The rows differ along the policy document put: its shape and its size.
 #[tokio::test]
@@ -605,7 +610,8 @@ async fn a_resource_policy_is_reported_from_what_was_attached() {
     let router = emulator();
     let (entity_arn, change_set_arn) = created_resources(&router, "AmiProduct").await;
 
-    for arn in [&entity_arn, &change_set_arn] {
+    {
+        let arn = &entity_arn;
         // A resource the catalog holds that carries no policy has no attached document to
         // report: `Policy` targets `ResourcePolicyJson` (`@length(min: 1)`), so what the
         // read answers is the EMPTY policy document, which grants what no attached policy
@@ -676,6 +682,49 @@ async fn a_resource_policy_is_reported_from_what_was_attached() {
             deleted_again.status, 200,
             "case {arn:?}: deleting an absent policy must answer 200, got {} with {:?}",
             deleted_again.status, deleted_again.body
+        );
+    }
+
+    // The change set that created that entity is a resource of the catalog's other kind,
+    // which no resource-policy operation is documented for: each refuses it as naming no
+    // entity resource, and nothing is stored under it (see
+    // `resource_policy_entity_only.rs` for the whole table).
+    let change_set_id = change_set_arn
+        .rsplit('/')
+        .next()
+        .unwrap_or(&change_set_arn)
+        .to_string();
+    for (operation, refused) in [
+        (
+            "PutResourcePolicy",
+            put_resource_policy(&router, &change_set_arn, MINIMAL_POLICY_DOCUMENT).await,
+        ),
+        (
+            "GetResourcePolicy",
+            get_resource_policy(&router, &change_set_arn).await,
+        ),
+        (
+            "DeleteResourcePolicy",
+            delete_resource_policy(&router, &change_set_arn).await,
+        ),
+    ] {
+        assert_eq!(
+            (
+                refused.status,
+                refused.error_code().to_string(),
+                refused.message(),
+            ),
+            (
+                404,
+                "ResourceNotFoundException".to_string(),
+                format!("Requested entity '{change_set_id}' does not exist."),
+            ),
+            "case {operation} on {change_set_arn:?}: a change set names no entity resource \
+             and must be refused 404 ResourceNotFoundException naming the id asked for, got \
+             {} {:?} with {:?}",
+            refused.status,
+            refused.error_code(),
+            refused.body
         );
     }
 

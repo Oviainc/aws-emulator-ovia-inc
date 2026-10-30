@@ -6,17 +6,18 @@
 //! deserialization, the boundary validator, the handler, the persisted state and
 //! serialization — the same path a client takes.
 //!
-//! The rule under test: a resource-based policy is recorded per RESOURCE ARN, so a report
-//! of one answers the document attached to that ARN — or the EMPTY policy document when
-//! none is attached — and is refused with the modelled `ResourceNotFoundException` (HTTP
-//! 404) only for an ARN that identifies no resource of this catalog. The catalog's own
-//! record of a resource gates ATTACHING a policy, not reporting or clearing one, and
-//! nothing a read answers makes a later read answer differently.
+//! The rule under test: a resource-based policy is recorded per ENTITY resource ARN — the
+//! kind every resource-policy operation is documented for — so a report of one answers the
+//! document attached to that ARN, or the EMPTY policy document when none is attached, and
+//! is refused with the modelled `ResourceNotFoundException` (HTTP 404) for an ARN that
+//! identifies no entity resource of this catalog (including one naming its other resource
+//! kind, a change set — see `resource_policy_entity_only.rs`). The catalog's own record of a
+//! resource gates ATTACHING a policy, not reporting or clearing one, and nothing a read
+//! answers makes a later read answer differently.
 //!
-//! The rows differ along the resource kind (entity or change set), the entity type, the
-//! policy document attached (shape and size), the region and partition the ARN naming the
-//! resource is written with, and the lifecycle point the read happens at (never attached,
-//! attached, cleared).
+//! The rows differ along the entity type, the policy document attached (shape and size),
+//! the region and partition the ARN naming the resource is written with, and the lifecycle
+//! point the read happens at (never attached, attached, cleared).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -327,17 +328,17 @@ fn policy_document(statements: usize) -> String {
 /// attachment, and after the attachment is cleared, the resource carries no document and
 /// the read answers the empty policy document instead of one no caller attached.
 ///
-/// The rows differ along the entity type, the resource kind (the entity and the change set
-/// that created it), the number of statements in the attached document, and the partition
-/// and region the ARN addressing the resource is written with.
+/// The rows differ along the entity type, the number of statements in the attached
+/// document, and the partition and region the ARN addressing the resource is written with.
 #[tokio::test]
 async fn a_policy_read_reports_only_what_was_attached() {
     let router = emulator();
 
     for (index, entity_type) in PRODUCT_ENTITY_TYPES.iter().enumerate() {
-        let (entity_arn, change_set_arn) = created_resources(&router, entity_type).await;
+        let (entity_arn, _) = created_resources(&router, entity_type).await;
 
-        for arn in [&entity_arn, &change_set_arn] {
+        {
+            let arn = &entity_arn;
             let case = format!("{entity_type} {arn}");
             let id = resource_id_of(arn);
 
@@ -450,40 +451,48 @@ async fn a_policy_read_reports_only_what_was_attached() {
 }
 
 /// The catalog's own record of a resource gates ATTACHING a policy and nothing else: for
-/// an ARN of this catalog naming a resource the store holds no record of,
+/// an ARN of this catalog naming an ENTITY the store holds no record of,
 /// `PutResourcePolicy` is refused 404 `ResourceNotFoundException` naming that resource,
 /// while reporting answers the empty policy document and clearing answers the same empty
-/// 200 it answers for a resource that carries none.
+/// 200 it answers for a resource that carries none. An ARN naming the catalog's other
+/// resource KIND is a different matter: a change set is no entity resource, so all three
+/// operations refuse it.
 ///
 /// The rows differ along the resource kind and type the ARN names, and the id.
 #[tokio::test]
 async fn the_catalogs_record_gates_attaching_a_policy_and_not_reporting_one() {
-    // (case, resource type segment, id, the sentence this service states that resource
-    // kind missing in) — ids of `ResourceId`'s `^[\w\-]+$` that nothing ever created.
-    let rows: Vec<(&str, &str, &str, String)> = vec![
+    // (case, resource type segment, id, the sentence the refusal states, whether the report
+    // and the clear are served for it) — ids of `ResourceId`'s `^[\w\-]+$` that nothing ever
+    // created. Every sentence names an ENTITY: that is the resource kind these operations
+    // are documented for, so it is what such a call asked for and did not find.
+    let rows: Vec<(&str, &str, &str, String, bool)> = vec![
         (
             "an AmiProduct entity",
             "AmiProduct",
             "prod-b2c3d4e5f6g7h",
             "Requested entity 'prod-b2c3d4e5f6g7h' does not exist.".to_string(),
+            true,
         ),
         (
             "a SaaSProduct entity",
             "SaaSProduct",
             "prod-c3d4e5f6g7h8i",
             "Requested entity 'prod-c3d4e5f6g7h8i' does not exist.".to_string(),
+            true,
         ),
         (
             "an entity of a type nothing created",
             "Offer",
             "offer-1a2b3c4d5e6f7",
             "Requested entity 'offer-1a2b3c4d5e6f7' does not exist.".to_string(),
+            true,
         ),
         (
             "a change set",
             CHANGE_SET_RESOURCE_TYPE,
             "cs-000000000009",
-            "Requested change set 'cs-000000000009' does not exist.".to_string(),
+            "Requested entity 'cs-000000000009' does not exist.".to_string(),
+            false,
         ),
     ];
 
@@ -500,7 +509,7 @@ async fn the_catalogs_record_gates_attaching_a_policy_and_not_reporting_one() {
         attached.status, attached.body
     );
 
-    for (case, resource_type, id, missing) in rows {
+    for (case, resource_type, id, missing, reads_served) in rows {
         let arn = absent_arn(resource_type, id);
 
         let refused = put_resource_policy(&router, &arn, &policy_document(1)).await;
@@ -527,28 +536,52 @@ async fn the_catalogs_record_gates_attaching_a_policy_and_not_reporting_one() {
             refused.body
         );
 
-        // Reporting and clearing are not gated on that record: nothing is attached, which
-        // the report says with the empty policy document and the clear with its empty 200.
+        // For an entity, reporting and clearing are not gated on that record: nothing is
+        // attached, which the report says with the empty policy document and the clear with
+        // its empty 200. For an ARN naming no entity resource at all they are refused like
+        // the attach.
         for round in 0..2 {
             let read = get_resource_policy(&router, &arn).await;
-            assert_eq!(
-                (read.status, read.text("/Policy")),
-                (200, EMPTY_POLICY_DOCUMENT.to_string()),
-                "case {case:?} round {round}: the report must answer the empty policy \
-                 document, got {} with {:?}",
-                read.status,
-                read.body
-            );
-
             let cleared = delete_resource_policy(&router, &arn).await;
-            assert_eq!(
-                (cleared.status, &cleared.body),
-                (200, &json!({})),
-                "case {case:?} round {round}: the clear must answer an empty 200, got {} \
-                 with {:?}",
-                cleared.status,
-                cleared.body
-            );
+            if reads_served {
+                assert_eq!(
+                    (read.status, read.text("/Policy")),
+                    (200, EMPTY_POLICY_DOCUMENT.to_string()),
+                    "case {case:?} round {round}: the report must answer the empty policy \
+                     document, got {} with {:?}",
+                    read.status,
+                    read.body
+                );
+                assert_eq!(
+                    (cleared.status, &cleared.body),
+                    (200, &json!({})),
+                    "case {case:?} round {round}: the clear must answer an empty 200, got {} \
+                     with {:?}",
+                    cleared.status,
+                    cleared.body
+                );
+            } else {
+                for (operation, answer) in [("report", &read), ("clear", &cleared)] {
+                    assert_eq!(
+                        (
+                            answer.status,
+                            answer.error_code().to_string(),
+                            answer.message()
+                        ),
+                        (
+                            404,
+                            "ResourceNotFoundException".to_string(),
+                            missing.clone()
+                        ),
+                        "case {case:?} round {round}: the {operation} of an ARN naming no \
+                         entity resource must be refused 404 ResourceNotFoundException \
+                         naming the id asked for, got {} {:?} with {:?}",
+                        answer.status,
+                        answer.error_code(),
+                        answer.body
+                    );
+                }
+            }
         }
 
         // Neither answer made the resource exist, and the held resource's own policy is

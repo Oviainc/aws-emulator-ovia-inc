@@ -1549,6 +1549,10 @@ pub struct ComAmazonawsMarketplacecatalogAwsmpseymourState {
     /// by [`CatalogResource::policy_key`] — the resource's type and id, which
     /// is what identifies it whatever region or partition the ARN naming it was
     /// written with. A resource absent from the map has no policy attached.
+    ///
+    /// Only an ENTITY resource is ever a key here: a resource-based policy is
+    /// attached to, reported for and cleared on an entity
+    /// ([`Self::policy_key_for`]).
     pub resource_policies: BTreeMap<String, String>,
 }
 
@@ -1643,36 +1647,43 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
         }
     }
 
-    /// Whether the resource a resource ARN named is a resource of this catalog
-    /// that a resource-based policy can be attached to, reported for and
+    /// The key [`Self::resource_policies`] holds the resource-based policy of
+    /// the resource a resource ARN named under, or `None` when that ARN names no
+    /// resource a resource-based policy can be attached to, reported for and
     /// cleared on.
     ///
-    /// A resource policy is recorded per resource in
-    /// [`Self::resource_policies`] rather than on this catalog's own record of
-    /// the resource, and the records here are only the resources this
-    /// emulator's own change sets created — an account's catalog holds entities
-    /// no change set of this run created — so absence from them is not evidence
-    /// that an ARN names no resource. What IS such evidence: a resource type
-    /// this catalog does not have at all ([`ENTITY_TYPES`] and
-    /// [`CHANGE_SET_RESOURCE_TYPE`] are every type one of its resource ARNs
-    /// carries), and an id this catalog does hold a record of under a DIFFERENT
+    /// Such a resource is an ENTITY: each resource-policy operation is
+    /// documented for one, and names its `ResourceArn` "the ARN of the entity
+    /// resource". So an ARN naming a resource of this catalog of any OTHER kind
+    /// — [`CHANGE_SET_RESOURCE_TYPE`] is the one the catalog has besides its
+    /// entities, and the tagging surface is what is documented for "either an
+    /// entity or change set" — names no resource of this surface at all, as
+    /// does an ARN carrying a resource type this catalog does not have
+    /// ([`ENTITY_TYPES`] is every entity type one of its ARNs names).
+    ///
+    /// A policy is recorded per resource in [`Self::resource_policies`] rather
+    /// than on this catalog's own record of the resource, and the records here
+    /// are only the resources this emulator's own change sets created — an
+    /// account's catalog holds entities no change set of this run created — so
+    /// absence from them is not evidence that an ARN names no resource. What IS
+    /// such evidence: an id this catalog holds a record of under a DIFFERENT
     /// resource kind or entity type, which the ARN then contradicts.
-    pub fn may_carry_policy(&self, resource: &CatalogResource) -> bool {
-        match resource {
-            CatalogResource::Entity { entity_type, id } => {
-                is_entity_type(entity_type)
-                    // An id this catalog holds as a CHANGE SET is not an entity
-                    // of any type, whatever type the ARN carries.
-                    && !self.change_sets.contains_key(id)
-                    && self
-                        .entities
-                        .get(id)
-                        .is_none_or(|held| &held.entity_type == entity_type)
-            }
-            // And the same the other way: an id this catalog holds as an entity
-            // is not a change set.
-            CatalogResource::ChangeSet { id } => !self.entities.contains_key(id),
+    pub fn policy_key_for(&self, resource: &CatalogResource) -> Option<String> {
+        let CatalogResource::Entity { entity_type, id } = resource else {
+            return None;
+        };
+        let names_an_entity = is_entity_type(entity_type)
+            // An id this catalog holds as a CHANGE SET is not an entity of any
+            // type, whatever type the ARN carries.
+            && !self.change_sets.contains_key(id)
+            && self
+                .entities
+                .get(id)
+                .is_none_or(|held| &held.entity_type == entity_type);
+        if !names_an_entity {
+            return None;
         }
+        resource.policy_key()
     }
 
     /// The ARN the stored record carries for the resource a resource ARN named,
@@ -2849,7 +2860,11 @@ pub fn assessment_not_found(assessment_id: &str) -> ResourceNotFoundException {
 ///
 /// `ListTagsForResource` is documented for "a resource (either an entity or
 /// change set)", and [`entity_arn`] / [`change_set_arn`] write both in the one
-/// form `<catalog>/<type>/<id>`, so one parse covers both.
+/// form `<catalog>/<type>/<id>`, so one parse covers both. Which KINDS an
+/// operation then acts on is the operation's own: the tagging surface acts on
+/// either, while the resource-policy surface is documented for an entity and
+/// acts on that alone
+/// ([`ComAmazonawsMarketplacecatalogAwsmpseymourState::policy_key_for`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogResource {
     /// A catalog entity: its `EntityType` and its `ResourceId`.
@@ -2870,10 +2885,14 @@ impl CatalogResource {
     /// holds this resource's policy under: its type and id, so a policy
     /// attached through an ARN written for one region is the policy read back
     /// through an ARN written for another — the resource is the same resource.
-    pub fn policy_key(&self) -> String {
+    ///
+    /// A resource of a kind the resource-policy operations are not documented
+    /// for carries no resource-based policy at all, so it has no such key:
+    /// `None`.
+    pub fn policy_key(&self) -> Option<String> {
         match self {
-            Self::Entity { entity_type, id } => format!("{entity_type}/{id}"),
-            Self::ChangeSet { id } => format!("{CHANGE_SET_RESOURCE_TYPE}/{id}"),
+            Self::Entity { entity_type, id } => Some(format!("{entity_type}/{id}")),
+            Self::ChangeSet { .. } => None,
         }
     }
 }
@@ -3822,6 +3841,18 @@ pub fn resource_not_found(resource: &CatalogResource) -> ResourceNotFoundExcepti
         CatalogResource::Entity { id, .. } => entity_not_found(id),
         CatalogResource::ChangeSet { id } => change_set_not_found(id),
     }
+}
+
+/// The modelled `ResourceNotFoundException` payload a resource-policy operation
+/// refuses a resource ARN with.
+///
+/// Each of those operations is documented for an ENTITY, so what such a call
+/// asked for and did not find is an entity — whatever kind of resource the ARN
+/// it was given names — and the refusal states that about the id the ARN named,
+/// in the one form this service words a missing resource in
+/// ([`entity_missing_message`]).
+pub fn policy_resource_not_found(resource: &CatalogResource) -> ResourceNotFoundException {
+    entity_not_found(resource.id())
 }
 
 /// The modelled `AccessDeniedException` payload for an action on a resource ARN

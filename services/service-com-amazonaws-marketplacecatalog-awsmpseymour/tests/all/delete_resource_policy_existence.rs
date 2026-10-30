@@ -6,16 +6,18 @@
 //! deserialization, the boundary validator, the handler, the persisted state and
 //! serialization — the same path a client takes.
 //!
-//! The rule under test: a resource-based policy is recorded per RESOURCE ARN, so clearing
-//! one asks for an end state (no policy attached) and answers 200 with an empty document
-//! whether or not one was attached, for any ARN of this catalog's own form. What is refused
-//! with the modelled `ResourceNotFoundException` (HTTP 404), naming the resource asked for,
-//! is an ARN that identifies no resource of this catalog at all: a resource type this
-//! catalog does not have, or an id this catalog holds a record of under ANOTHER resource
-//! type or kind, since the type is part of what the ARN names. An id this catalog simply
-//! holds no record of is not such an ARN — the catalog's own records are the resources this
-//! emulator's change sets created, not every resource an account holds — and a refused call
-//! changes nothing another caller can see.
+//! The rule under test: a resource-based policy is recorded per ENTITY resource ARN — the
+//! kind this operation is documented for — so clearing one asks for an end state (no policy
+//! attached) and answers 200 with an empty document whether or not one was attached, for
+//! any ARN of this catalog naming an entity. What is refused with the modelled
+//! `ResourceNotFoundException` (HTTP 404), naming the id asked for, is an ARN that
+//! identifies no entity resource of this catalog: a resource type this catalog does not
+//! have, a resource of its other KIND (a change set, which only the tagging surface is
+//! documented for — see `resource_policy_entity_only.rs`), or an id this catalog holds a
+//! record of under ANOTHER entity type, since the type is part of what the ARN names. An id
+//! this catalog simply holds no record of is not such an ARN — the catalog's own records are
+//! the resources this emulator's change sets created, not every resource an account holds —
+//! and a refused call changes nothing another caller can see.
 //!
 //! The rows differ along the resource kind the ARN names (entity or change set), the
 //! entity type, whether the id is held at all, whether it is held under ANOTHER type or
@@ -301,15 +303,11 @@ fn entity_missing(id: &str) -> String {
     format!("Requested entity '{id}' does not exist.")
 }
 
-/// The same sentence for a missing change set.
-fn change_set_missing(id: &str) -> String {
-    format!("Requested change set '{id}' does not exist.")
-}
 
-/// An ARN of this catalog's form that identifies no resource of this catalog is refused by
-/// `DeleteResourcePolicy` with 404 `ResourceNotFoundException` naming the resource asked
-/// for — an ARN whose ID IS held, but under another resource type or another resource kind,
-/// since the type is part of what the ARN names, and an ARN whose type this catalog does
+/// An ARN of this catalog's form that identifies no ENTITY resource of this catalog is
+/// refused by `DeleteResourcePolicy` with 404 `ResourceNotFoundException` naming the id
+/// asked for — an ARN whose ID IS held, but under another entity type, an ARN naming the
+/// catalog's other resource kind (a change set), and an ARN whose type this catalog does
 /// not have at all — and such a refusal leaves the policy of a resource the catalog does
 /// hold exactly as it was. An ARN whose id this catalog merely holds no record of is NOT
 /// refused: the clear asks for an end state that ARN is already in.
@@ -317,7 +315,7 @@ fn change_set_missing(id: &str) -> String {
 /// The rows differ along the resource kind, the resource type, and whether the id is held
 /// at all, held under another entity type, or held as the other kind of resource.
 #[tokio::test]
-async fn delete_resource_policy_refuses_an_arn_naming_no_resource_of_this_catalog() {
+async fn delete_resource_policy_refuses_an_arn_naming_no_entity_of_this_catalog() {
     let router = emulator();
     let (entity_arn, change_set_arn) = created_resources(&router, "AmiProduct").await;
     let held_entity_id = resource_id_of(&entity_arn);
@@ -342,7 +340,17 @@ async fn delete_resource_policy_refuses_an_arn_naming_no_resource_of_this_catalo
         (
             "the held entity's id as a change set",
             catalog_arn(CHANGE_SET_RESOURCE_TYPE, &held_entity_id),
-            change_set_missing(&held_entity_id),
+            entity_missing(&held_entity_id),
+        ),
+        (
+            "the held change set itself",
+            change_set_arn.clone(),
+            entity_missing(&held_change_set_id),
+        ),
+        (
+            "a change set id nothing started",
+            catalog_arn(CHANGE_SET_RESOURCE_TYPE, "cs-000000000009"),
+            entity_missing("cs-000000000009"),
         ),
         (
             "the held change set's id as an entity",
@@ -425,10 +433,6 @@ async fn delete_resource_policy_refuses_an_arn_naming_no_resource_of_this_catalo
             "an id of an entity type nothing created",
             catalog_arn("Offer", "offer-1a2b3c4d5e6f7"),
         ),
-        (
-            "a change set id nothing started",
-            catalog_arn(CHANGE_SET_RESOURCE_TYPE, "cs-000000000009"),
-        ),
     ];
 
     for (case, arn) in served_rows {
@@ -458,18 +462,18 @@ async fn delete_resource_policy_refuses_an_arn_naming_no_resource_of_this_catalo
     }
 }
 
-/// For a resource the catalog DOES hold, `DeleteResourcePolicy` answers 200 with an empty
+/// For an ENTITY the catalog DOES hold, `DeleteResourcePolicy` answers 200 with an empty
 /// document and leaves the resource carrying no policy — the end state it asks for — so a
 /// resource that carried none is the same success as one that carried a document, and the
 /// resource itself survives the call.
 ///
-/// The rows differ along the resource kind and entity type, and along whether a policy was
-/// attached before the clear.
+/// The rows differ along the entity type, and along whether a policy was attached before
+/// the clear.
 #[tokio::test]
 async fn delete_resource_policy_clears_the_policy_of_a_resource_the_catalog_holds() {
     let router = emulator();
-    let (ami_entity_arn, ami_change_set_arn) = created_resources(&router, "AmiProduct").await;
-    let (saas_entity_arn, saas_change_set_arn) = created_resources(&router, "SaaSProduct").await;
+    let (ami_entity_arn, _) = created_resources(&router, "AmiProduct").await;
+    let (saas_entity_arn, _) = created_resources(&router, "SaaSProduct").await;
 
     // (case, the held resource's ARN, whether a policy is attached before the clear)
     let rows: Vec<(&str, &str, bool)> = vec![
@@ -477,16 +481,6 @@ async fn delete_resource_policy_clears_the_policy_of_a_resource_the_catalog_hold
         ("an AmiProduct entity carrying none", &ami_entity_arn, false),
         ("a SaaSProduct entity carrying a policy", &saas_entity_arn, true),
         ("a SaaSProduct entity carrying none", &saas_entity_arn, false),
-        (
-            "the change set that created it, carrying a policy",
-            &ami_change_set_arn,
-            true,
-        ),
-        (
-            "the change set that created it, carrying none",
-            &saas_change_set_arn,
-            false,
-        ),
     ];
 
     for (case, arn, attach_first) in rows {

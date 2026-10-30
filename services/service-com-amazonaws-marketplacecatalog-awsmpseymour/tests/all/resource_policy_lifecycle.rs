@@ -6,14 +6,15 @@
 //! deserialization, the boundary validator, the handler, the persisted state and
 //! serialization — the same path a client takes.
 //!
-//! The rule under test: a resource-based policy is recorded per RESOURCE ARN, so
-//! reporting one and clearing one are refused only for an ARN that identifies no resource
-//! of this catalog — a resource type the catalog does not have, or an id it holds a record
-//! of under another type — and never for the mere absence of a stored policy or of this
-//! catalog's own record of the resource. A report of a resource carrying no policy answers
-//! 200 with the EMPTY policy document (a JSON object with no statements, which is what no
-//! attached policy grants and what `PutResourcePolicy` refuses to store), and a clear
-//! answers 200 with an empty body whether or not a document was attached.
+//! The rule under test: a resource-based policy is recorded per ENTITY resource ARN — the
+//! resource kind every one of these operations is documented for — so reporting one and
+//! clearing one are refused for an ARN that identifies no entity resource of this catalog
+//! (a resource type the catalog does not have, its other resource KIND, or an id it holds a
+//! record of under another type) and never for the mere absence of a stored policy or of
+//! this catalog's own record of the resource. A report of a resource carrying no policy
+//! answers 200 with the EMPTY policy document (a JSON object with no statements, which is
+//! what no attached policy grants and what `PutResourcePolicy` refuses to store), and a
+//! clear answers 200 with an empty body whether or not a document was attached.
 //!
 //! The rows differ along the resource kind the ARN names (entity or change set), the entity
 //! type, whether this catalog holds a record of the resource, the id's form, the document
@@ -325,13 +326,13 @@ async fn created_resources(router: &MultiServiceRouter, entity_type: &str) -> (S
     (entity_arn, change_set_arn)
 }
 
-/// Reporting and clearing the policy of a resource this catalog holds no record of are
+/// Reporting and clearing the policy of an ENTITY this catalog holds no record of are
 /// served, not refused: the report answers the empty policy document, the clear answers an
 /// empty 200, and neither call materialises the resource or a policy for it.
 ///
 /// The rows span every entity type this catalog has ([`ENTITY_TYPES`], the source of the
-/// per-type ARNs) crossed with four forms of `ResourceId`, plus a change set ARN, and each
-/// row is also addressed through an ARN written for another partition and region.
+/// per-type ARNs) crossed with four forms of `ResourceId`, and each row is also addressed
+/// through an ARN written for another partition and region.
 #[tokio::test]
 async fn a_policy_report_of_a_resource_without_one_answers_the_empty_document() {
     // Ids of `ResourceId`'s `^[\w\-]+$` that no change set of this emulator created, each
@@ -349,12 +350,6 @@ async fn a_policy_report_of_a_resource_without_one_answers_the_empty_document() 
                 catalog_arn(entity_type, id),
             ));
         }
-    }
-    for id in ids {
-        rows.push((
-            format!("a change set {id}"),
-            catalog_arn(CHANGE_SET_RESOURCE_TYPE, &format!("cs-{id}")),
-        ));
     }
 
     for (case, arn) in rows {
@@ -421,13 +416,13 @@ async fn a_policy_report_of_a_resource_without_one_answers_the_empty_document() 
     }
 }
 
-/// The whole lifecycle on a resource this catalog created: the report before any
+/// The whole lifecycle on an ENTITY this catalog created: the report before any
 /// attachment is the empty document, an attached document is reported verbatim through
 /// every ARN naming that resource, clearing answers an empty 200 and returns the report to
 /// the empty document — and the cycle can run again.
 ///
-/// The rows differ along the entity type, the resource kind (the entity and the change set
-/// that created it) and the number of statements in the attached document.
+/// The rows differ along the entity type and the number of statements in the attached
+/// document.
 #[tokio::test]
 async fn the_policy_lifecycle_of_a_created_resource_round_trips() {
     let router = emulator();
@@ -435,9 +430,10 @@ async fn the_policy_lifecycle_of_a_created_resource_round_trips() {
     // Two of the catalog's entity types, one of them an entity type the recorded lifecycle
     // did not name.
     for entity_type in ["SaaSProduct", "ContainerProduct"] {
-        let (entity_arn, change_set_arn) = created_resources(&router, entity_type).await;
+        let (entity_arn, _) = created_resources(&router, entity_type).await;
 
-        for arn in [&entity_arn, &change_set_arn] {
+        {
+            let arn = &entity_arn;
             let case = format!("{entity_type} {arn}");
 
             let fresh = get_resource_policy(&router, arn).await;
@@ -530,14 +526,15 @@ async fn the_policy_lifecycle_of_a_created_resource_round_trips() {
     }
 }
 
-/// An ARN that identifies no resource of this catalog is refused 404
-/// `ResourceNotFoundException` naming the resource it asked for, by the report and the
-/// clear alike: a resource type this catalog does not have, and an id this catalog holds a
-/// record of under ANOTHER type or resource kind.
+/// An ARN that identifies no ENTITY resource of this catalog is refused 404
+/// `ResourceNotFoundException` naming the id it asked for, by the report and the clear
+/// alike: a resource type this catalog does not have, a resource of its other KIND (a
+/// change set, whatever its id names), and an id this catalog holds a record of under
+/// ANOTHER type.
 ///
-/// The rows differ along why the ARN names no resource, and along the type segment's form
-/// (a type of another service, a plural, a different case, a near-miss of a type this
-/// catalog has).
+/// The rows differ along why the ARN names no entity resource, and along the type segment's
+/// form (a type of another service, a plural, a different case, a near-miss of a type this
+/// catalog has, the change-set type).
 #[tokio::test]
 async fn an_arn_naming_no_resource_of_this_catalog_is_refused() {
     let router = emulator();
@@ -586,6 +583,12 @@ async fn an_arn_naming_no_resource_of_this_catalog_is_refused() {
             "the held change set id under an entity type".to_string(),
             with_resource_type(&held_change_set_arn, "AmiProduct"),
         ),
+        // And the held change set under its OWN type: a change set is a resource of this
+        // catalog, but not one of the kind these operations act on.
+        (
+            "the held change set itself".to_string(),
+            held_change_set_arn.clone(),
+        ),
     ];
     // The held entity's own id, addressed under every OTHER entity type: this catalog's
     // record of that id contradicts the ARN, so the ARN names no resource of it.
@@ -601,11 +604,9 @@ async fn an_arn_naming_no_resource_of_this_catalog_is_refused() {
 
     for (case, arn) in rows {
         let id = resource_id_of(&arn);
-        let missing = if arn.contains(&format!("/{CHANGE_SET_RESOURCE_TYPE}/")) {
-            format!("Requested change set '{id}' does not exist.")
-        } else {
-            format!("Requested entity '{id}' does not exist.")
-        };
+        // Whatever kind of resource the ARN names, what a resource-policy operation asked
+        // for and did not find is an ENTITY — the kind each of them is documented for.
+        let missing = format!("Requested entity '{id}' does not exist.");
 
         for operation in ["GetResourcePolicy", "DeleteResourcePolicy"] {
             let refused = match operation {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
-//! Deletes the resource-based policy attached to the resource a resource ARN names.
+//! Deletes the resource-based policy attached to the entity resource a resource ARN names.
 //!
 //! ## Shape of an operation
 //!
@@ -163,22 +163,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which is a change the clock owes rather than one this call makes.
         store.settle(now);
 
-        // An ARN that identifies no resource of this catalog at all — a resource
-        // type the catalog does not have, or an id it holds under another type —
+        // This "deletes a resource-based policy on an ENTITY that is identified
+        // by its resource ARN", so an ARN that identifies no entity resource of
+        // this catalog — a resource of another kind the catalog has, a resource
+        // type it does not have, or an id it holds under another type —
         // identifies no resource to clear a policy on; the catalog's own record
         // of a resource is NOT what a policy is attached to, so an id no change
         // set of this emulator created is not an ARN to refuse.
-        if !store.may_carry_policy(&resource) {
+        let Some(policy_key) = store.policy_key_for(&resource) else {
             return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(&resource),
+                crate::state::policy_resource_not_found(&resource),
             )
             .into());
-        }
+        };
 
         // Deleting asks for an END STATE — no policy attached — which a resource
         // that carries none is already in, so clearing an absent policy is the
         // same success and the answer carries no members either way.
-        store.resource_policies.remove(&resource.policy_key());
+        store.resource_policies.remove(&policy_key);
 
         Ok(DeleteResourcePolicyOutput {})
     }

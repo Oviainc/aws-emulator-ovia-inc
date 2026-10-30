@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourcePolicy
-//! Gets the resource-based policy attached to the resource a resource ARN names.
+//! Gets the resource-based policy attached to the entity resource a resource ARN names.
 //!
 //! ## Shape of an operation
 //!
@@ -168,16 +168,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which is a change the clock owes rather than one a reader makes.
         store.settle(now);
 
-        // This reports "a resource-based policy of an entity that is identified
-        // by its resource ARN", so the only thing it refuses as not found is an
-        // ARN that identifies no resource of this catalog at all — a resource
-        // type the catalog does not have, or an id it holds under another type.
-        if !store.may_carry_policy(&resource) {
+        // This reports "a resource-based policy of an ENTITY that is identified
+        // by its resource ARN", so what it refuses as not found is an ARN that
+        // identifies no entity resource of this catalog: a resource of another
+        // kind the catalog has, a resource type it does not have, or an id it
+        // holds under another type.
+        let Some(policy_key) = store.policy_key_for(&resource) else {
             return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(&resource),
+                crate::state::policy_resource_not_found(&resource),
             )
             .into());
-        }
+        };
 
         // What the resource carries is what the resource-POLICY store holds for
         // it, which holds an entry only for a resource one was attached to: a
@@ -187,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store.
         let policy = store
             .resource_policies
-            .get(&resource.policy_key())
+            .get(&policy_key)
             .cloned()
             .unwrap_or_else(|| crate::state::EMPTY_RESOURCE_POLICY.to_string());
 
