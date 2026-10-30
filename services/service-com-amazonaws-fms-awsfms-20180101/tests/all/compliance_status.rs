@@ -108,15 +108,17 @@ fn at(secs: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
 }
 
-/// The `message` member of an awsJson1_1 error envelope, under either casing: the
-/// modelled error shapes of this service spell it `Message`, the synthetic
-/// authorization refusal `message`.
+/// The message member of an awsJson1_1 error envelope. Every client error this
+/// service answers — the modelled shapes and the synthetic authorization and
+/// request-shape refusals alike — spells it `Message`, the name this service's
+/// error shapes declare; the lowercase fallback is only for the emulator's own
+/// HTTP 501 scaffold signal, which is not an error the service has.
 ///
 /// `pub(crate)` so a sibling suite in this test target reads a refusal's text
 /// through this one reader rather than a second copy of it.
 pub(crate) fn error_message(body: &Value) -> String {
-    body.get("message")
-        .or_else(|| body.get("Message"))
+    body.get("Message")
+        .or_else(|| body.get("message"))
         .and_then(Value::as_str)
         .unwrap_or("<no message>")
         .to_string()

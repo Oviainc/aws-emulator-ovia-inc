@@ -53,18 +53,20 @@ const UNKNOWN_RESOURCE_SET_ID: &str = "0123456789AbCdEfGhIjKl";
 /// matching `^[a-z0-9A-Z-]{36}$`) that names no policy.
 const UNKNOWN_POLICY_ID: &str = "109c24c6-0d5e-407e-98b5-8619b6cf4907";
 
-/// The `message` member of an awsJson1_1 error envelope, under either casing: the
-/// modelled error shapes of this service spell it `Message`, the synthetic
-/// authorization and request-shape refusals `message`.
+/// The message member of an awsJson1_1 error envelope. Every client error this
+/// service answers — the modelled shapes and the synthetic authorization and
+/// request-shape refusals alike — spells it `Message`, the name this service's
+/// error shapes declare; the lowercase fallback is only for the emulator's own
+/// HTTP 501 scaffold signal, which is not an error the service has.
 ///
 /// `pub(crate)` so a sibling suite in this test target reads an error's message
-/// under either casing through this one helper rather than keeping its own copy.
-/// A suite asserting the member NAME itself uses
+/// through this one helper rather than keeping its own copy. A suite asserting
+/// the member NAME itself uses
 /// [`crate::error_message_members::message_member`], which is deliberately
 /// intolerant of other casings.
 pub(crate) fn error_message(body: &Value) -> String {
-    body.get("message")
-        .or_else(|| body.get("Message"))
+    body.get("Message")
+        .or_else(|| body.get("message"))
         .and_then(Value::as_str)
         .unwrap_or("<no message>")
         .to_string()

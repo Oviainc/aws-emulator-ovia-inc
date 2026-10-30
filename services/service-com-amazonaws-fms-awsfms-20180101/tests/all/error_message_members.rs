@@ -23,8 +23,14 @@
 //! spans every operation that can answer not-found today and three kinds of
 //! lookup key (a policy UUID, a list/resource-set id, a resource ARN) plus the
 //! two "nothing is configured at all" lookups, with two distinct keys per key
-//! kind so an invariant text can be told from an interpolated one; the refusal
-//! table spans several gated operations in several Regions.
+//! kind so an invariant text can be told from an interpolated one; the
+//! authorization-refusal table spans several gated operations in several
+//! Regions; and the request-shape refusal table spans every operation that
+//! refuses a request the model cannot refuse — the six paginated listings, over
+//! four forms of unminted `NextToken`, and the three resource-level tagging
+//! operations, over the three conditions of the ARN form — because rule 1 holds
+//! for every kind of client error this service answers, modelled or not, and the
+//! KIND of the error is what a lowercase spelling used to vary with.
 //!
 //! The wire harness is `policy_lifecycle`'s, so these assertions are about the
 //! same deserialize → handle → serialize walk a client drives.
@@ -82,6 +88,22 @@ const REGIONS: &[&str] = &[REGION, "eu-central-1", "ap-southeast-4"];
 pub(crate) fn message_member(body: &Value) -> Option<&str> {
     body.get("Message").and_then(Value::as_str)
 }
+
+/// A `PaginationToken` (the model's `com.amazonaws.fms#PaginationToken`: length
+/// 1..4096 matching `^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`) that no page class of
+/// this service ever minted, in four forms the boundary validator accepts and
+/// the decode rule refuses: not hex at all, hex of an odd number of digits, hex
+/// of bytes that are not UTF-8, and hex of a key no page holds.
+const UNMINTED_TOKENS: &[&str] = &["zzzz", "abc", "ff", "0f13c2a4"];
+
+/// Strings the model's `ResourceArn` pattern accepts but that are not Amazon
+/// Resource Names, one per condition of the ARN form (no `arn:` prefix, fewer
+/// than six colon-separated fields, an empty required field).
+const MALFORMED_ARNS: &[&str] = &[
+    "this-is-not-an-arn-at-all",
+    "arn:aws:fms",
+    "arn::fms:us-east-1:123456789012:policy/x",
+];
 
 /// One row of a table: a name for the assertion messages, the operation, the
 /// request, and the identifier the request looked up (if any), which must NOT
@@ -449,5 +471,192 @@ async fn the_authorization_refusal_carries_a_message_built_from_the_request() {
         REGIONS.len(),
         "the refusal is composed from the request, so each Region gets its own message, got \
          {per_region:?}"
+    );
+}
+
+/// One request this service refuses on its SHAPE: a name for the assertion
+/// messages, the operation, the request, and the text the refusal must name
+/// back, which is what the caller needs to correct the request.
+struct ShapeRefusal {
+    case: String,
+    operation: &'static str,
+    body: Value,
+    must_name: String,
+}
+
+/// Every request-shape refusal this service answers: a `NextToken` naming no
+/// boundary of the page it was sent to, on each paginated listing whose model
+/// declares no client-input error, over four forms of unminted token; and a
+/// `ResourceArn` that is not an Amazon Resource Name at all, on each
+/// resource-level tagging operation, over the three conditions of the ARN form.
+///
+/// `policy_id` names a STORED policy: the policy-narrowed listing resolves its
+/// `PolicyId` before it examines the token, so a row of that operation reaches
+/// the refusal only for a policy that exists.
+fn request_shape_refusals(policy_id: &str) -> Vec<ShapeRefusal> {
+    let mut rows: Vec<ShapeRefusal> = Vec::new();
+    // Each listing with the members it REQUIRES beside the token: `MaxResults`
+    // on the two list-namespace listings and `PolicyId` on the compliance
+    // listing (`smithy_query(query="operation",
+    // operation="ListAppsLists,ListProtocolsLists,ListComplianceStatus")`).
+    let paginated: Vec<(&'static str, Value)> = vec![
+        ("ListAdminAccountsForOrganization", json!({})),
+        ("ListPolicies", json!({})),
+        ("ListMemberAccounts", json!({})),
+        (
+            "ListAppsLists",
+            json!({ "MaxResults": 1, "DefaultLists": false }),
+        ),
+        (
+            "ListProtocolsLists",
+            json!({ "MaxResults": 100, "DefaultLists": true }),
+        ),
+        ("ListComplianceStatus", json!({ "PolicyId": policy_id })),
+    ];
+    for (operation, base) in paginated {
+        for token in UNMINTED_TOKENS {
+            let mut body = base.clone();
+            body["NextToken"] = json!(token);
+            rows.push(ShapeRefusal {
+                case: format!("{operation} with the unminted NextToken {token:?}"),
+                operation,
+                body,
+                // The refusal names the member that was wrong; the token itself
+                // is the caller's own value and is not echoed.
+                must_name: "NextToken".to_string(),
+            });
+        }
+    }
+    for operation in ["ListTagsForResource", "TagResource", "UntagResource"] {
+        for arn in MALFORMED_ARNS {
+            let mut body = json!({ "ResourceArn": arn });
+            // The two writers carry a required second member each; the reader
+            // carries none.
+            match operation {
+                "TagResource" => body["TagList"] = json!([{ "Key": "stage", "Value": "test" }]),
+                "UntagResource" => body["TagKeys"] = json!(["stage"]),
+                _ => {}
+            }
+            rows.push(ShapeRefusal {
+                case: format!("{operation} with the malformed ResourceArn {arn:?}"),
+                operation,
+                body,
+                must_name: (*arn).to_string(),
+            });
+        }
+    }
+    rows
+}
+
+/// The HTTP 400 `ValidationException` this service answers a request it refuses
+/// on its SHAPE with carries its message under `Message` — the member name this
+/// service's error shapes declare, and on awsJson1_1 the JSON key a client reads
+/// an exception message from — and under no other spelling, on every operation
+/// that answers it and for every form of offending value.
+#[tokio::test]
+async fn the_request_shape_refusal_carries_its_message_under_the_declared_member_name() {
+    let router = emulator();
+    // The listings are organisation-scoped, so the association is what lets a
+    // request of theirs reach the token check at all.
+    associate_admin(&router).await;
+    let policy_id = crate::compliance_status::put_policy(
+        &router,
+        "request.shape.refusal.policy",
+        None,
+        None,
+    )
+    .await;
+
+    for row in request_shape_refusals(&policy_id) {
+        let (status, body) = call(&router, row.operation, &row.body).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ValidationException"),
+            "case {:?}: expected the request-shape refusal, got {status} with {body}",
+            row.case
+        );
+        let Some(message) = message_member(&body) else {
+            panic!(
+                "case {:?}: the refusal must carry its message under the member name this \
+                 service's error shapes declare (`Message`), got {body}",
+                row.case
+            );
+        };
+        assert!(
+            message.contains(&row.must_name),
+            "case {:?}: the refusal must say what was wrong with the request, naming {:?}, got \
+             {message:?}",
+            row.case,
+            row.must_name
+        );
+        assert!(
+            body.get("message").is_none(),
+            "case {:?}: the body must carry exactly one message member, named `Message`, got \
+             {body}",
+            row.case
+        );
+    }
+}
+
+/// The member name does not vary with the KIND of client error: the modelled
+/// not-found, the synthetic authorization refusal and the synthetic
+/// request-shape refusal all spell it `Message`, so one client reads every
+/// error of this service the same way.
+#[tokio::test]
+async fn the_message_member_name_does_not_vary_with_the_kind_of_client_error() {
+    // The authorization refusal is answered while nothing is associated, so it
+    // needs an emulator of its own.
+    let ungated = emulator();
+    let (denied_status, denied) = call(&ungated, "ListPolicies", &json!({})).await;
+
+    let router = emulator();
+    associate_admin(&router).await;
+    let (not_found_status, not_found) =
+        call(&router, "GetPolicy", &json!({ "PolicyId": UNKNOWN_POLICY_ID })).await;
+    let (refused_status, refused) = call(
+        &router,
+        "ListAdminAccountsForOrganization",
+        &json!({ "NextToken": UNMINTED_TOKENS[0] }),
+    )
+    .await;
+
+    let answers = [
+        ("AccessDeniedException", denied_status, denied),
+        ("ResourceNotFoundException", not_found_status, not_found),
+        ("ValidationException", refused_status, refused),
+    ];
+    let mut spellings: BTreeSet<String> = BTreeSet::new();
+    for (expected_code, status, body) in &answers {
+        assert_eq!(
+            (*status, error_code(body).as_str()),
+            (400, *expected_code),
+            "case {expected_code}: expected that error, got {status} with {body}"
+        );
+        let named: Vec<String> = body
+            .as_object()
+            .map(|members| {
+                members
+                    .keys()
+                    .filter(|name| name.eq_ignore_ascii_case("message"))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            named,
+            vec!["Message".to_string()],
+            "case {expected_code}: the body must carry exactly one message member, named \
+             `Message`, got {body}"
+        );
+        assert!(
+            message_member(body).is_some_and(|message| !message.is_empty()),
+            "case {expected_code}: that member must carry the text the caller reads, got {body}"
+        );
+        spellings.extend(named);
+    }
+    assert_eq!(
+        spellings.len(),
+        1,
+        "every kind of client error must spell the member one way, got {spellings:?}"
     );
 }
