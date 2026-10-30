@@ -215,12 +215,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // A name this bucket already holds an index under is the modelled 409, worded
+        // as the service words it: the one fixed sentence for this resource kind,
+        // carrying neither the index name nor the bucket name the request named.
         if bucket.indexes.contains_key(&input.index_name) {
             return Err(CreateIndexErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "vector index already exists: {} in vector bucket {bucket_name}",
-                    input.index_name
-                ),
+                message: crate::state::INDEX_ALREADY_EXISTS.to_string(),
             })
             .into());
         }

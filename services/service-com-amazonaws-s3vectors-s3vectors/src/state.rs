@@ -292,20 +292,47 @@ impl LookupError {
 /// The `NotFoundException` message for a vector bucket this account does not hold,
 /// as the service words it: ONE fixed sentence per resource kind, carrying no value
 /// from the request. A client branching on the resource that is missing reads the
-/// kind from the sentence, so the two kinds say different things. This one is the
-/// sentence the real service answered in the recorded response; the status (404) and
-/// the error code (`NotFoundException`) are the requirements either way.
+/// kind from the sentence, so the two kinds say different things, and the kind a
+/// refusal names is the one the OPERATION resolves — not whichever lookup missed on
+/// the way to it (see [`ComAmazonawsS3vectorsS3vectorsState::index`]). This one is
+/// the sentence the real service answered in the recorded response; the status (404)
+/// and the error code (`NotFoundException`) are the requirements either way.
 pub const BUCKET_NOT_FOUND: &str = "The specified vector bucket could not be found";
 
-/// See [`BUCKET_NOT_FOUND`]: the same sentence for the other resource kind, by
-/// analogy with it — no recording of this corpus carries the index wording.
-pub const INDEX_NOT_FOUND: &str = "The specified vector index could not be found";
+/// See [`BUCKET_NOT_FOUND`]: the sentence for the other resource kind, as the real
+/// service answered it in the recorded response. The service names this kind "index"
+/// where it names the other one "vector bucket", so the index wording is NOT the
+/// bucket sentence with the kind swapped — it is this sentence, verbatim.
+pub const INDEX_NOT_FOUND: &str = "The specified index could not be found";
 
 /// See [`BUCKET_NOT_FOUND`]: the same sentence for the third resource kind a
 /// `NotFoundException` can be about — the policy of a vector bucket that exists
 /// but carries none — so a client reads the missing kind from the sentence and a
 /// bucket that is missing cannot be confused with a policy that is.
 pub const POLICY_NOT_FOUND: &str = "The specified vector bucket policy could not be found";
+
+/// The `ConflictException` message for a create whose name a resource of that kind
+/// already carries, as the service words it: ONE fixed sentence per resource kind,
+/// saying only that a resource of that kind with "the specified name" exists. The
+/// name the request asked for is NOT interpolated — the caller already holds it, and
+/// the real service's sentence is the same for every name — so a client that
+/// tolerates duplicate-create by inspecting the text matches one constant string.
+/// These are the sentences the real service answered in the recorded responses; the
+/// status (409) and the error code (`ConflictException`) are the requirements either
+/// way.
+pub const BUCKET_ALREADY_EXISTS: &str = "A vector bucket with the specified name already exists";
+
+/// See [`BUCKET_ALREADY_EXISTS`]: the sentence for the other resource kind. As with
+/// the not-found sentences, the service names this kind "index" where it names the
+/// other one "vector bucket".
+pub const INDEX_ALREADY_EXISTS: &str = "An index with the specified name already exists";
+
+/// The `ConflictException` message for deleting a vector bucket that still holds
+/// vector indexes. The same shape as the sentences above: ONE fixed sentence about
+/// the state the bucket is in, interpolating neither the bucket name the request
+/// carried nor how many indexes the store holds for it, so a teardown routine that
+/// tells "delete the children first" from "already gone" matches one constant string.
+pub const BUCKET_NOT_EMPTY: &str = "The specified vector bucket is not empty";
 
 /// The `ConflictException` message for a tag mutation that raced another mutation of the
 /// same resource: ONE fixed sentence, carrying no value from the request, saying what the
@@ -644,22 +671,29 @@ impl ComAmazonawsS3vectorsS3vectorsState {
     }
 
     /// The index `index` of bucket `bucket`, or `NotFoundException`.
+    ///
+    /// The refusal names the resource the CALLER asked for, which is the index: an
+    /// index of a vector bucket that does not exist is as absent as one of a bucket
+    /// that does, so both answer [`INDEX_NOT_FOUND`] rather than reporting the
+    /// intermediate bucket lookup. Only an operation whose own target IS the bucket
+    /// resolves it through [`Self::bucket`] and so reports [`BUCKET_NOT_FOUND`].
     pub fn index(&self, bucket: &str, index: &str) -> Result<&VectorIndexRecord, LookupError> {
-        self.bucket(bucket)?
-            .indexes
-            .get(index)
+        self.buckets
+            .get(bucket)
+            .and_then(|bucket| bucket.indexes.get(index))
             .ok_or_else(|| LookupError::not_found(INDEX_NOT_FOUND))
     }
 
     /// The index `index` of bucket `bucket` for mutation, or `NotFoundException`.
+    /// Refused exactly as [`Self::index`] is.
     pub fn index_mut(
         &mut self,
         bucket: &str,
         index: &str,
     ) -> Result<&mut VectorIndexRecord, LookupError> {
-        self.bucket_mut(bucket)?
-            .indexes
-            .get_mut(index)
+        self.buckets
+            .get_mut(bucket)
+            .and_then(|bucket| bucket.indexes.get_mut(index))
             .ok_or_else(|| LookupError::not_found(INDEX_NOT_FOUND))
     }
 
@@ -693,17 +727,22 @@ impl ComAmazonawsS3vectorsS3vectorsState {
     /// What the authorization decision for a request against `bucket` — and, when it
     /// addresses one, `index` — is made from: the bucket's stored resource policy and the
     /// ARNs the request acts on. See [`authorization`].
+    ///
+    /// A request that addresses an index resolves the INDEX first, so a target it
+    /// cannot resolve is refused as the index the caller asked for rather than as its
+    /// parent bucket — the same rule [`Self::index`] follows. A resolved index implies
+    /// its parent bucket, so the bucket lookup below cannot then miss.
     pub fn authorization_target(
         &self,
         bucket: &str,
         index: Option<&str>,
     ) -> Result<authorization::Target, LookupError> {
-        let record = self.bucket(bucket)?;
         // The resource the action is taken on comes first: see `authorization::Target`.
         let mut resources = match index {
             Some(index) => vec![self.index(bucket, index)?.arn.clone()],
             None => Vec::new(),
         };
+        let record = self.bucket(bucket)?;
         resources.push(record.arn.clone());
         Ok(authorization::Target {
             policy: record.policy.clone(),

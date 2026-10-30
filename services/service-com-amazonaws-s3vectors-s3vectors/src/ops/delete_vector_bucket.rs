@@ -181,14 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "All vector indexes in the vector bucket must be deleted before the vector
         // bucket can be deleted" — so a non-empty bucket is refused rather than
-        // silently dropping the indexes it holds.
+        // silently dropping the indexes it holds. The refusal is the service's one
+        // fixed sentence for that state: neither the bucket name nor the number of
+        // indexes it holds belongs in it.
         if !bucket.indexes.is_empty() {
             return Err(DeleteVectorBucketErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "vector bucket {bucket_name} still holds {} vector index(es); \
-                     delete them before deleting the vector bucket",
-                    bucket.indexes.len()
-                ),
+                message: crate::state::BUCKET_NOT_EMPTY.to_string(),
             })
             .into());
         }

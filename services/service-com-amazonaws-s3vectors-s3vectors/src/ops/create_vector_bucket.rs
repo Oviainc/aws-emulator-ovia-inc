@@ -183,12 +183,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = crate::state::bucket_arn(&region, &input.vector_bucket_name);
 
         let mut store = state.lock();
+        // A name this account already holds a vector bucket under is the modelled 409,
+        // worded as the service words it: the one fixed sentence for this resource
+        // kind, carrying no value from the request.
         if store.buckets.contains_key(&input.vector_bucket_name) {
             return Err(CreateVectorBucketErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "vector bucket already exists: {}",
-                    input.vector_bucket_name
-                ),
+                message: crate::state::BUCKET_ALREADY_EXISTS.to_string(),
             })
             .into());
         }

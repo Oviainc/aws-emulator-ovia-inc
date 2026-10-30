@@ -19,6 +19,8 @@ mod bucket_policy_enforcement;
 mod policy_not_found_message;
 #[path = "all/query_candidate_slots.rs"]
 mod query_candidate_slots;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/resource_tagging.rs"]

@@ -530,8 +530,10 @@ async fn the_resource_arn_a_tagging_call_names_must_resolve_to_a_stored_resource
 /// asserting the constant would agree with any wording the handler chose.
 const RECORDED_BUCKET_NOT_FOUND: &str = "The specified vector bucket could not be found";
 
-/// The same sentence for the other resource kind.
-const EXPECTED_INDEX_NOT_FOUND: &str = "The specified vector index could not be found";
+/// The sentence the real service answered for a missing index, as the recorded
+/// response carried it — the service's own wording for this kind, which is not the
+/// bucket sentence with the kind swapped.
+const RECORDED_INDEX_NOT_FOUND: &str = "The specified index could not be found";
 
 /// The `NotFoundException` a tagging call answers for a resource this account does not
 /// hold carries ONE fixed sentence per resource KIND: it names the kind of resource
@@ -561,22 +563,24 @@ async fn the_not_found_message_names_the_resource_kind_and_no_request_value() {
         (
             "an index that was deleted",
             expected_index_arn(BUCKET, GONE_INDEX),
-            EXPECTED_INDEX_NOT_FOUND,
+            RECORDED_INDEX_NOT_FOUND,
         ),
         (
             "an index the live bucket does not hold",
             expected_index_arn(BUCKET, "never-created"),
-            EXPECTED_INDEX_NOT_FOUND,
+            RECORDED_INDEX_NOT_FOUND,
         ),
         (
-            // The bucket is resolved first, so the missing resource is the BUCKET.
+            // The ARN names an INDEX, so that is the resource the request asked
+            // for and the kind the refusal names, whether the index or its parent
+            // vector bucket is what the store does not hold.
             "an index of a bucket that does not exist",
             expected_index_arn("never-created", INDEX),
-            RECORDED_BUCKET_NOT_FOUND,
+            RECORDED_INDEX_NOT_FOUND,
         ),
     ];
     assert_ne!(
-        RECORDED_BUCKET_NOT_FOUND, EXPECTED_INDEX_NOT_FOUND,
+        RECORDED_BUCKET_NOT_FOUND, RECORDED_INDEX_NOT_FOUND,
         "the two resource kinds must be reported with different sentences"
     );
 
