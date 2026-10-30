@@ -379,19 +379,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// the policy template." What is compared is the SCOPE Cedar reports for each
 /// template ([`crate::state::cedar::template_scope`]), so a position holding a
 /// placeholder compares equal to the same placeholder and a position naming an
-/// entity only compares equal to the same entity. The elements the operation
-/// does allow to change — "The action referenced by the policy template. Any
-/// conditional clauses" — are deliberately not compared.
+/// entity only compares equal to the same entity — and the two cases are
+/// distinct references, whatever entity the statement names. The elements the
+/// operation does allow to change — "The action referenced by the policy
+/// template. Any conditional clauses" — are deliberately not compared.
 ///
 /// A scope position is compared as the WHOLE reference Cedar reports for it
-/// ([`crate::state::cedar::ScopeReference`]): the entity type an `is T`
+/// ([`crate::state::cedar::TemplateScopeReference`]): the entity type an `is T`
 /// constraint restricts the position to is part of the principal (or the
 /// resource) the template references, so a replacement that keeps the form and
 /// changes the type changes that element and is refused like any other change
 /// to it.
 fn immutable_changes(
-    stored: &crate::state::cedar::StaticScope,
-    replacement: &crate::state::cedar::StaticScope,
+    stored: &crate::state::cedar::TemplateScope,
+    replacement: &crate::state::cedar::TemplateScope,
 ) -> Vec<crate::ops::InvalidInput> {
     let mut changes = Vec::new();
     if stored.effect != replacement.effect {

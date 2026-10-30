@@ -89,6 +89,8 @@ mod store_validation_settings;
 mod tagging;
 #[path = "all/template_linked_policies.rs"]
 mod template_linked_policies;
+#[path = "all/template_placeholder_immutability.rs"]
+mod template_placeholder_immutability;
 #[path = "all/update_and_delete_lifecycle.rs"]
 mod update_and_delete_lifecycle;
 #[path = "all/validation_exception_contents.rs"]

@@ -401,11 +401,7 @@ pub fn parse_static_policy(statement: &str) -> Result<StaticScope, InvalidInput>
 /// references, so it is read off the constraint rather than dropped, and the
 /// entity the position names is reported beside it.
 fn scope_of(policy: &cedar_policy::Policy) -> StaticScope {
-    let effect = match policy.effect() {
-        cedar_policy::Effect::Permit => "Permit",
-        cedar_policy::Effect::Forbid => "Forbid",
-    }
-    .to_string();
+    let effect = effect_name(policy.effect());
 
     let principal = match policy.principal_constraint() {
         cedar_policy::PrincipalConstraint::Any => ScopeReference::default(),
@@ -439,17 +435,35 @@ fn scope_of(policy: &cedar_policy::Policy) -> StaticScope {
             entity: Some(scope_entity(&uid)),
         },
     };
-    let actions = match policy.action_constraint() {
-        cedar_policy::ActionConstraint::Any => Vec::new(),
-        cedar_policy::ActionConstraint::Eq(uid) => vec![scope_entity(&uid)],
-        cedar_policy::ActionConstraint::In(uids) => uids.iter().map(scope_entity).collect(),
-    };
+    let actions = actions_of(policy.action_constraint());
 
     StaticScope {
         effect,
         principal,
         resource,
         actions,
+    }
+}
+
+/// `Permit` or `Forbid`, as the API words a policy's (or a policy template's)
+/// effect. One function, so a static policy and a template cannot word the same
+/// effect differently.
+fn effect_name(effect: cedar_policy::Effect) -> String {
+    match effect {
+        cedar_policy::Effect::Permit => "Permit",
+        cedar_policy::Effect::Forbid => "Forbid",
+    }
+    .to_string()
+}
+
+/// Every action a scope names, empty for a bare `action`. Cedar has no
+/// placeholder in the action position, so a template's action constraint is read
+/// exactly as a static policy's is.
+fn actions_of(constraint: cedar_policy::ActionConstraint) -> Vec<ScopeEntity> {
+    match constraint {
+        cedar_policy::ActionConstraint::Any => Vec::new(),
+        cedar_policy::ActionConstraint::Eq(uid) => vec![scope_entity(&uid)],
+        cedar_policy::ActionConstraint::In(uids) => uids.iter().map(scope_entity).collect(),
     }
 }
 
@@ -652,10 +666,10 @@ enum LinkFailure {
 /// scope of the policy that results — plus the set itself, which a caller that
 /// validates against a schema needs.
 ///
-/// This is the mechanics [`link_template`] and [`template_scope`] share (add the
-/// template, link it under `link_id`, read the scope off the LINKED policy), in
-/// one place so the two cannot drift; what each caller decides for itself is how
-/// the slots are bound and how a failure is reported.
+/// The mechanics of instantiating a template (add the template, link it under
+/// `link_id`, read the scope off the LINKED policy) kept apart from how a
+/// failure is reported, because the step that failed is what the caller needs to
+/// word its own refusal.
 fn link_one(
     template: cedar_policy::Template,
     template_id: cedar_policy::PolicyId,
@@ -674,69 +688,130 @@ fn link_one(
     Ok((set, scope))
 }
 
-/// The entity every `?principal` / `?resource` SLOT is bound to while a
-/// template's OWN scope is read ([`template_scope`]).
+/// What ONE scope position of a policy TEMPLATE NAMES.
 ///
-/// It stands for "whatever the policy that instantiates this template will bind
-/// here", so two templates that both leave a scope position open compare EQUAL
-/// in that position while one that names a concrete entity there does not. It is
-/// private to this module and never reaches a response: `template_scope` reports
-/// the scope, not the entity.
-const SLOT_SENTINEL_TYPE: &str = "EmulatorInternal::TemplateSlot";
-const SLOT_SENTINEL_ID: &str = "unbound";
+/// A template's position has one case a static policy's does not: it can hold
+/// the `?principal` / `?resource` PLACEHOLDER the instantiating policy binds,
+/// which is a case of its own beside naming an entity and naming none. Cedar's
+/// template parser reports exactly that distinction — a constraint carrying no
+/// entity is a slot — so it is carried here as a case of its own and never
+/// stood in for by some entity: any entity chosen to stand in for a placeholder
+/// is one a caller's own statement may name, and the two cases would then
+/// compare equal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TemplateScopeName {
+    /// The position names nothing (`principal`, `principal is T`).
+    #[default]
+    Nothing,
+    /// The position names this entity (`principal == E`, `principal in E`).
+    Entity(ScopeEntity),
+    /// The position holds the template's placeholder
+    /// (`principal == ?principal`), which the policy that instantiates the
+    /// template binds.
+    Placeholder,
+}
 
-/// The effect and scope of one Cedar policy TEMPLATE, read off the parsed form —
-/// the template counterpart of [`parse_static_policy`]'s result.
+/// Everything ONE scope position of a policy TEMPLATE references: the entity
+/// type the position is restricted to, and what it names.
 ///
-/// A template's scope can name an entity (`principal == User::"erin"`), leave a
+/// The template counterpart of [`ScopeReference`], and the same rule — two
+/// positions are the same reference only when they agree on BOTH members.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TemplateScopeReference {
+    /// The entity type the position is restricted to — `T` of `is T` and of
+    /// `is T in E`; `None` for a position that restricts no type.
+    pub entity_type: Option<String>,
+    /// What the position names.
+    pub named: TemplateScopeName,
+}
+
+/// The effect and scope of one Cedar policy TEMPLATE, read off the parsed
+/// template — the template counterpart of [`StaticScope`].
+///
+/// A template's scope can name an entity (`principal == User::"erin"`), hold a
 /// placeholder for the instantiating policy (`principal == ?principal`) or name
-/// nothing at all (`principal`), and Cedar reports the scope of a LINKED policy
-/// rather than of a template. So the template is linked against
-/// [`SLOT_SENTINEL_TYPE`] in each slot it uses and the scope is read off that
-/// link: a position holding a placeholder then reports the sentinel, which is
-/// equal across templates, and one naming an entity reports that entity.
-///
-/// That is what lets `UpdatePolicyTemplate` hold the replacement to the elements
-/// its own documentation makes immutable — "You can't change the following
-/// elements: The effect (permit or forbid) of the policy template. The principal
+/// nothing at all (`principal`), and those three are distinct references. That
+/// is what lets `UpdatePolicyTemplate` hold a replacement to the elements its
+/// own documentation makes immutable — "You can't change the following elements:
+/// The effect (permit or forbid) of the policy template. The principal
 /// referenced by the policy template. The resource referenced by the policy
 /// template." — by comparing two scopes rather than two strings.
-pub fn template_scope(statement: &str) -> Result<StaticScope, InvalidInput> {
-    let refuse = |reason: String| InvalidInput::new(paths::TEMPLATE_STATEMENT, reason);
-    let template_id = cedar_policy::PolicyId::new(LINK_TEMPLATE_ID);
-    let link_id = cedar_policy::PolicyId::new(LINK_POLICY_ID);
-    let template = parse_template(Some(template_id.clone()), statement).map_err(refuse)?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateScope {
+    /// `Permit` or `Forbid`.
+    pub effect: String,
+    /// Everything the scope's principal position references.
+    pub principal: TemplateScopeReference,
+    /// Same rule as `principal`, for the resource position.
+    pub resource: TemplateScopeReference,
+    /// Every action the scope names; empty when the scope is a bare `action`.
+    pub actions: Vec<ScopeEntity>,
+}
 
-    let slots: BTreeSet<String> = template.slots().map(ToString::to_string).collect();
-    let sentinel = entity_uid(
-        &ScopeEntity {
-            entity_type: SLOT_SENTINEL_TYPE.to_string(),
-            entity_id: SLOT_SENTINEL_ID.to_string(),
+/// The effect and scope of one Cedar policy TEMPLATE, read off the parsed form.
+///
+/// Each position comes from the TEMPLATE's own constraint, which Cedar reports
+/// with the slot left as a slot, so a placeholder is never confused with an
+/// entity some statement could name. `Err` names
+/// [`paths::TEMPLATE_STATEMENT`] and carries the template parser's own
+/// diagnostic, exactly as [`parse_policy_template`] does.
+pub fn template_scope(statement: &str) -> Result<TemplateScope, InvalidInput> {
+    let template = parse_template(None, statement)
+        .map_err(|reason| InvalidInput::new(paths::TEMPLATE_STATEMENT, reason))?;
+
+    let principal = match template.principal_constraint() {
+        cedar_policy::TemplatePrincipalConstraint::Any => TemplateScopeReference::default(),
+        cedar_policy::TemplatePrincipalConstraint::Is(entity_type) => TemplateScopeReference {
+            entity_type: Some(entity_type.to_string()),
+            named: TemplateScopeName::Nothing,
         },
-        paths::TEMPLATE_STATEMENT,
-    )?;
-    let mut values: HashMap<cedar_policy::SlotId, cedar_policy::EntityUid> = HashMap::new();
-    for slot in [
-        cedar_policy::SlotId::principal(),
-        cedar_policy::SlotId::resource(),
-    ] {
-        if slots.contains(&slot.to_string()) {
-            values.insert(slot, sentinel.clone());
+        cedar_policy::TemplatePrincipalConstraint::Eq(uid)
+        | cedar_policy::TemplatePrincipalConstraint::In(uid) => TemplateScopeReference {
+            entity_type: None,
+            named: scope_name(uid.as_ref()),
+        },
+        cedar_policy::TemplatePrincipalConstraint::IsIn(entity_type, uid) => {
+            TemplateScopeReference {
+                entity_type: Some(entity_type.to_string()),
+                named: scope_name(uid.as_ref()),
+            }
         }
-    }
+    };
+    let resource = match template.resource_constraint() {
+        cedar_policy::TemplateResourceConstraint::Any => TemplateScopeReference::default(),
+        cedar_policy::TemplateResourceConstraint::Is(entity_type) => TemplateScopeReference {
+            entity_type: Some(entity_type.to_string()),
+            named: TemplateScopeName::Nothing,
+        },
+        cedar_policy::TemplateResourceConstraint::Eq(uid)
+        | cedar_policy::TemplateResourceConstraint::In(uid) => TemplateScopeReference {
+            entity_type: None,
+            named: scope_name(uid.as_ref()),
+        },
+        cedar_policy::TemplateResourceConstraint::IsIn(entity_type, uid) => {
+            TemplateScopeReference {
+                entity_type: Some(entity_type.to_string()),
+                named: scope_name(uid.as_ref()),
+            }
+        }
+    };
 
-    let (_set, scope) = link_one(template, template_id, link_id, values).map_err(|failure| {
-        match failure {
-            LinkFailure::Load(e) => refuse(format!("the policy template could not be loaded: {e}")),
-            LinkFailure::Link(e) => {
-                refuse(format!("the policy template's scope could not be read: {e}"))
-            }
-            LinkFailure::Unreadable => {
-                refuse("the policy template's scope could not be read".to_string())
-            }
-        }
-    })?;
-    Ok(scope)
+    Ok(TemplateScope {
+        effect: effect_name(template.effect()),
+        principal,
+        resource,
+        actions: actions_of(template.action_constraint()),
+    })
+}
+
+/// What a template scope position that CARRIES an entity reference names: the
+/// entity, or — when Cedar reports the reference without one — the template's
+/// placeholder in that position.
+fn scope_name(uid: Option<&cedar_policy::EntityUid>) -> TemplateScopeName {
+    match uid {
+        Some(uid) => TemplateScopeName::Entity(scope_entity(uid)),
+        None => TemplateScopeName::Placeholder,
+    }
 }
 
 /// The Cedar slot environment one template link binds: an entity per
