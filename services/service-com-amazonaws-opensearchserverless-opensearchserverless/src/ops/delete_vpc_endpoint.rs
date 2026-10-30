@@ -4,7 +4,8 @@
 //! IMPLEMENTED: accepts the deletion of the stored endpoint the request's `id` names —
 //! reporting it in the non-terminal `DELETING` status it stays readable in until the clock
 //! makes its purge due — and refuses an id that names no endpoint and an endpoint that is
-//! not in a status it may be deleted from.
+//! not in a status it may be deleted from. A retry carrying a `clientToken` the accepted
+//! delete already spent replays that answer instead of being refused.
 //!
 //! ## Shape of an operation
 //!
@@ -158,9 +159,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_due_transitions();
 
-        // A `clientToken` on a delete is not a replay index: the endpoint this request
-        // addresses is named by `id`, and the second delete of an endpoint already gone is
-        // the 404 below whatever token it carries.
+        // A replayed `clientToken` is a retry of the delete this service already ACCEPTED,
+        // so it answers the record that call left rather than falling through to the status
+        // precondition below — which would refuse the retry of an accepted delete as a
+        // conflict, since the `DELETING` the first call left is not a status a delete may
+        // start from. The replay is scoped to the id THIS request addresses: a token spent
+        // again on another endpoint is a request for that other endpoint, served on its own
+        // terms. Once the purge removes the record the token named, there is nothing to
+        // replay and a retry falls through to the not-found refusal below.
+        if let Some(token) = input.client_token.as_deref() {
+            let replayed = store
+                .replayed_vpc_endpoint(Self::NAME, token)
+                .filter(|record| record.id == input.id)
+                .map(crate::state::VpcEndpointRecord::delete_detail);
+            if let Some(detail) = replayed {
+                return Ok(DeleteVpcEndpointOutput {
+                    delete_vpc_endpoint_detail: Some(detail),
+                });
+            }
+        }
+
         let Some(record) = store.vpc_endpoints.get(&input.id) else {
             return Err(DeleteVpcEndpointErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -201,11 +219,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         record.begin_deletion();
+        let detail = record.delete_detail();
+        // The accepted delete is what the token now names, so a retry carrying it replays
+        // this answer instead of being refused.
+        if let Some(token) = input.client_token.as_deref() {
+            store.remember_token(Self::NAME, token, &input.id);
+        }
 
         // Answered from the STORED record, so the delete cannot report anything a read
         // straight after it would not.
         Ok(DeleteVpcEndpointOutput {
-            delete_vpc_endpoint_detail: Some(record.delete_detail()),
+            delete_vpc_endpoint_detail: Some(detail),
         })
     }
 }

@@ -7,7 +7,8 @@
 //! `collectionErrorDetails`, `ListCollections` no longer lists it and its name is free
 //! again. Refuses a collection whose deletion protection is on (`ValidationException`, a
 //! configuration refusal) and one not in a state it may be deleted from
-//! (`ConflictException`).
+//! (`ConflictException`). A retry carrying a `clientToken` the accepted delete already
+//! spent replays that answer instead of being refused.
 //!
 //! ## Shape of an operation
 //!
@@ -168,6 +169,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_due_transitions();
 
+        // A replayed `clientToken` is a retry of the delete this service already ACCEPTED,
+        // so it answers the record that call left rather than falling through to the status
+        // precondition below — which would refuse the retry of an accepted delete as a
+        // conflict, since the `DELETING` the first call left is not a status a delete may
+        // start from. The replay is scoped to the id THIS request addresses: a token spent
+        // again on another collection is a request for that other collection, served on its
+        // own terms. Once the purge removes the record the token named, there is nothing to
+        // replay and a retry falls through to the not-found refusal below.
+        if let Some(token) = input.client_token.as_deref() {
+            let replayed = store
+                .replayed_collection(Self::NAME, token)
+                .filter(|record| record.id == input.id)
+                .map(crate::state::CollectionRecord::delete_detail);
+            if let Some(detail) = replayed {
+                return Ok(DeleteCollectionOutput {
+                    delete_collection_detail: Some(detail),
+                });
+            }
+        }
+
         let Some(record) = store.collections.get(&input.id) else {
             return Err(DeleteCollectionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -223,9 +244,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         record.begin_deletion(deleted_at);
+        let detail = record.delete_detail();
+        // The accepted delete is what the token now names, so a retry carrying it replays
+        // this answer instead of being refused.
+        if let Some(token) = input.client_token.as_deref() {
+            store.remember_token(Self::NAME, token, &input.id);
+        }
 
+        // Answered from the STORED record, so the delete cannot report anything a read
+        // straight after it would not.
         Ok(DeleteCollectionOutput {
-            delete_collection_detail: Some(record.delete_detail()),
+            delete_collection_detail: Some(detail),
         })
     }
 }

@@ -35,6 +35,8 @@ mod collection_group_lifecycle;
 mod collection_group_membership;
 #[path = "all/collection_lifecycle.rs"]
 mod collection_lifecycle;
+#[path = "all/delete_token_replay.rs"]
+mod delete_token_replay;
 #[path = "all/effective_lifecycle_policy.rs"]
 mod effective_lifecycle_policy;
 #[path = "all/encryption_indexes_and_tagging.rs"]
