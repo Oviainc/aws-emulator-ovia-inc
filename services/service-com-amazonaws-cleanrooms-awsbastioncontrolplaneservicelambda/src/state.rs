@@ -951,6 +951,55 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
             .find_map(|rule_type| self.configured_table_analysis_rule(configured_table_id, rule_type))
     }
 
+    /// Drop the analysis rule `analysis_rule_type` of configured table
+    /// `configured_table_id`, and stop reporting that type on the table.
+    ///
+    /// The mirror of [`Self::insert_configured_table_analysis_rule`]: the type leaves
+    /// `ConfiguredTable$analysisRuleTypes` ("The types of analysis rules associated with
+    /// this configured table") with the rule, and the configured table's `updateTime`
+    /// moves to `at` because that member of it has changed. `None` means the pair held no
+    /// rule, so nothing was dropped.
+    pub fn remove_configured_table_analysis_rule(
+        &mut self,
+        configured_table_id: &str,
+        analysis_rule_type: &str,
+        at: ::aws_smithy_types::DateTime,
+    ) -> Option<ConfiguredTableAnalysisRule> {
+        let removed = self
+            .configured_table_analysis_rules
+            .remove(&(configured_table_id.to_string(), analysis_rule_type.to_string()))?;
+        if let Some(table) = self.configured_tables.get_mut(configured_table_id) {
+            table
+                .analysis_rule_types
+                .retain(|held| held != analysis_rule_type);
+            table.update_time = at;
+        }
+        Some(removed)
+    }
+
+    /// Replace the policy of the analysis rule `analysis_rule_type` of configured table
+    /// `configured_table_id`, and move the rule's `updateTime` to `at`.
+    ///
+    /// Answers `None` when the pair holds no rule, so a caller refuses the update rather
+    /// than minting one: `UpdateConfiguredTableAnalysisRule` "updates a configured table
+    /// analysis rule", and `CreateConfiguredTableAnalysisRule` is what mints one. The
+    /// rule's `createTime` and the configured table's `analysisRuleTypes` are untouched —
+    /// the set of types the table holds a rule for has not changed.
+    pub fn update_configured_table_analysis_rule_policy(
+        &mut self,
+        configured_table_id: &str,
+        analysis_rule_type: &str,
+        policy: ConfiguredTableAnalysisRulePolicy,
+        at: ::aws_smithy_types::DateTime,
+    ) -> Option<&ConfiguredTableAnalysisRule> {
+        let rule = self
+            .configured_table_analysis_rules
+            .get_mut(&(configured_table_id.to_string(), analysis_rule_type.to_string()))?;
+        rule.policy = policy;
+        rule.update_time = at;
+        Some(rule)
+    }
+
     /// Persist `rule` and record its type on the configured table it belongs to.
     ///
     /// `ConfiguredTable$analysisRuleTypes` is "The types of analysis rules associated
@@ -1936,6 +1985,24 @@ pub fn table_reference_type(reference: &TableReference) -> &'static str {
         TableReference::Athena(_) => TABLE_TYPE_ATHENA,
         TableReference::Databricks(_) => TABLE_TYPE_DATABRICKS,
     }
+}
+
+/// What the service says when the `(configured table, analysis rule type)` pair a
+/// request addresses holds no analysis rule.
+///
+/// The two variable parts are the identifier and the type the REQUEST carried, echoed as
+/// sent: the pair is the rule's identity ("Configured table analysis rules are uniquely
+/// identified by their configured table identifier and analysis rule type"), so the
+/// refusal names the pair that resolved to nothing rather than describing the table.
+/// Every analysis-rule operation that addresses a rule through that pair refuses a miss
+/// with this one sentence.
+pub fn no_such_configured_table_analysis_rule_message(
+    configured_table_identifier: &str,
+    analysis_rule_type: &str,
+) -> String {
+    format!(
+        "No such analysis rule with configuredTableId: {configured_table_identifier} and type {analysis_rule_type}"
+    )
 }
 
 /// The `ConfiguredTableAnalysisRuleType` a `ConfiguredTableAnalysisRulePolicy` carries:

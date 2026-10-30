@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConfiguredTableAnalysisRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConfiguredTableAnalysisRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Replaces the policy of ONE stored analysis rule — the rule the
+//! `(configuredTableIdentifier, analysisRuleType)` pair addresses, since "configured
+//! table analysis rules are uniquely identified by their configured table identifier and
+//! analysis rule type" — and reports the persisted rule, so a later
+//! `GetConfiguredTableAnalysisRule` reports the new policy and nothing else about the
+//! rule moved but its `updateTime`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConfiguredTableAnalysisRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This operation UPDATES: a pair the store holds no rule for is a
+//! `ResourceNotFoundException`, not a create. The rules the model cannot express are the
+//! two `CreateConfiguredTableAnalysisRule` enforces on the policy it stores, because the
+//! new policy has to satisfy what any stored policy satisfies:
+//!
+//! * each member of the `ConfiguredTableAnalysisRulePolicyV1` union is the policy of
+//!   exactly one rule type, so a policy that is not the addressed type's is a
+//!   `ValidationException` (`crate::state::configured_table_analysis_rule_policy_type`);
+//! * the table's `allowedColumns` are "the columns of the underlying table that can be
+//!   used by collaborations or analysis rules", so a policy naming a column the stored
+//!   table does not expose is a `ValidationException`
+//!   (`crate::state::analysis_rule_columns_outside_allowed`).
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +134,28 @@ impl From<UpdateConfiguredTableAnalysisRuleErrorModeled> for UpdateConfiguredTab
     }
 }
 
+/// The `(configuredTableIdentifier, analysisRuleType)` pair holds no rule, so there is
+/// nothing to update. The model's `ResourceType` catalog (COLLABORATION |
+/// CONFIGURED_TABLE | CONFIGURED_TABLE_ASSOCIATION | MEMBERSHIP) names no analysis rule,
+/// so the required `resourceType` reports the configured table that would own it.
+fn not_found(
+    configured_table_identifier: &str,
+    analysis_rule_type: &str,
+) -> UpdateConfiguredTableAnalysisRuleError {
+    use crate::state as st;
+    UpdateConfiguredTableAnalysisRuleErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: st::no_such_configured_table_analysis_rule_message(
+                configured_table_identifier,
+                analysis_rule_type,
+            ),
+            resource_id: configured_table_identifier.to_string(),
+            resource_type: st::RESOURCE_TYPE_CONFIGURED_TABLE.to_string(),
+        },
+    )
+    .into()
+}
+
 /// The `UpdateConfiguredTableAnalysisRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -158,20 +190,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConfiguredTableAnalysisRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConfiguredTableAnalysisRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConfiguredTableAnalysisRule"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                UpdateConfiguredTableAnalysisRuleErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("cleanrooms state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+
+        // The rule belongs to a configured table, so an identifier the store does not
+        // hold holds no rule either: the pair resolves to nothing.
+        let Some(table) = store
+            .configured_tables
+            .get(&input.configured_table_identifier)
+        else {
+            return Err(not_found(
+                &input.configured_table_identifier,
+                &input.analysis_rule_type,
+            ));
+        };
+        let configured_table_id = table.id.clone();
+        let table_allowed_columns = table.allowed_columns.clone();
+
+        // Each member of the policy union carries the policy of exactly one analysis rule
+        // type, so an `analysisRuleType` naming another type is a combination the model
+        // cannot refuse at the boundary but the service can.
+        let policy_type =
+            st::configured_table_analysis_rule_policy_type(&input.analysis_rule_policy);
+        if input.analysis_rule_type != policy_type {
+            return Err(
+                UpdateConfiguredTableAnalysisRuleErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "analysisRulePolicy carries a {policy_type} policy, which does not match analysisRuleType {}",
+                            input.analysis_rule_type
+                        )),
+                        reason: Some(st::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "analysisRulePolicy".to_string(),
+                            message: format!(
+                                "must carry the policy of analysisRuleType {}",
+                                input.analysis_rule_type
+                            ),
+                        }]),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A policy may only name columns the table exposes — the same rule the create
+        // keeps, because the policy this update stores is read back by the same readers.
+        let outside = st::analysis_rule_columns_outside_allowed(
+            &input.analysis_rule_policy,
+            &table_allowed_columns,
+        );
+        if !outside.is_empty() {
+            let listed = outside.join(", ");
+            let detail = format!(
+                "Cannot update a {} analysis rule to reference columns outside the configured \
+                 table's allowedColumns: {listed}",
+                input.analysis_rule_type
+            );
+            return Err(
+                UpdateConfiguredTableAnalysisRuleErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(detail.clone()),
+                        reason: Some(st::VALIDATION_REASON_INVALID_CONFIGURATION.to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "analysisRulePolicy".to_string(),
+                            message: detail,
+                        }]),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Persist the new policy on the addressed rule, and answer from the store, so
+        // the response is the persisted rule rather than a value computed beside it.
+        let updated_at = st::now();
+        match store.update_configured_table_analysis_rule_policy(
+            &configured_table_id,
+            &input.analysis_rule_type,
+            input.analysis_rule_policy,
+            updated_at,
+        ) {
+            Some(analysis_rule) => Ok(UpdateConfiguredTableAnalysisRuleOutput {
+                analysis_rule: analysis_rule.clone(),
+            }),
+            None => Err(not_found(
+                &configured_table_id,
+                &input.analysis_rule_type,
+            )),
+        }
     }
 }

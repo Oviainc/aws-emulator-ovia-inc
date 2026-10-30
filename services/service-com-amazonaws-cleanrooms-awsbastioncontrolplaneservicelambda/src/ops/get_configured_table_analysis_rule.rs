@@ -168,17 +168,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .cloned()
         {
             Some(analysis_rule) => Ok(GetConfiguredTableAnalysisRuleOutput { analysis_rule }),
-            // A configured table the store does not hold and a configured table holding
-            // no rule of this type are one answer: the rule the pair names does not
-            // exist. The model's `ResourceType` catalog (COLLABORATION | CONFIGURED_TABLE
-            // | CONFIGURED_TABLE_ASSOCIATION | MEMBERSHIP) names no analysis rule, so the
+            // A configured table the store does not hold, a configured table holding no
+            // rule of this type, and a type no configured table could hold a rule for
+            // are one answer: the rule the pair names does not exist. The model's
+            // `ResourceType` catalog (COLLABORATION | CONFIGURED_TABLE |
+            // CONFIGURED_TABLE_ASSOCIATION | MEMBERSHIP) names no analysis rule, so the
             // missing resource is reported as the configured table that would own it.
             None => Err(
                 GetConfiguredTableAnalysisRuleErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "configured table {} has no {} analysis rule",
-                            input.configured_table_identifier, input.analysis_rule_type
+                        message: st::no_such_configured_table_analysis_rule_message(
+                            &input.configured_table_identifier,
+                            &input.analysis_rule_type,
                         ),
                         resource_id: input.configured_table_identifier,
                         resource_type: st::RESOURCE_TYPE_CONFIGURED_TABLE.to_string(),
