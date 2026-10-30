@@ -10,6 +10,27 @@ Issue-Commit: bbbd5f0b3425ac8a27c3dccbe4215ebaac702410
 
 > _Note: this issue was identified against the code base at commit `bbbd5f0b3425ac8a27c3dccbe4215ebaac702410`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+
+The CORS leg of this report's `Fix` is implemented: an HTTP api's stored `CorsConfiguration`
+now decorates whatever its deployed stage answers — an `Origin` its `AllowOrigins` admits is
+echoed in `access-control-allow-origin` (the wildcard when that is what admitted it), a
+preflight asking about an admitted method additionally carries `AllowMethods`, `AllowHeaders`
+and `MaxAge`, an actual request additionally carries `ExposeHeaders`, either carries
+`access-control-allow-credentials` when `AllowCredentials` is set, and a request whose origin
+or asked-about method the configuration does not admit carries no `Access-Control-*` header
+at all
+(`services/service-com-amazonaws-apigatewayv2-apigatewayv2/src/service/invoke.rs`,
+`cors_decoration`; pinned end to end by `tests/all/http_api_cors_data_plane.rs`). Before it,
+nothing on the data-plane path read that member at all, so a browser could not tell a
+configured api from one that had never been given a configuration.
+
+What this report asked for and did NOT get: the `200` with the integration Lambda's body that
+its check polls the stage endpoint for, and the `404 {"message": "Not Found"}` the same URL
+must answer after the stack is deleted. Its replay key is therefore CARRIED FORWARD, so it
+stays attributed to a cause instead of being lost:
+`20261027T192238Z-apigatewayv2-lambda-cloudformation-a-cdk-synthesised-httpapi-stack-cannot-serve.md`.
+
 ## Operation
 Invoke (execute-api data plane)
 

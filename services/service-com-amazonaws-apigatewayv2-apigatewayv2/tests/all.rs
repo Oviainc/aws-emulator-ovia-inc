@@ -61,6 +61,8 @@ mod domain_name_endpoint_required;
 mod domain_name_lifecycle;
 #[path = "all/domain_name_pagination.rs"]
 mod domain_name_pagination;
+#[path = "all/http_api_cors_data_plane.rs"]
+mod http_api_cors_data_plane;
 #[path = "all/http_api_integration_fault_status.rs"]
 mod http_api_integration_fault_status;
 #[path = "all/http_api_jwt_data_plane.rs"]

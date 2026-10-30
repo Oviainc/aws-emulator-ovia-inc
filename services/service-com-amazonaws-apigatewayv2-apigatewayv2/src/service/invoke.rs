@@ -56,6 +56,28 @@
 //!    authorizer, and the credential an `AWS_IAM` route needs;
 //! 6. the route's integration decides the response.
 //!
+//! On top of those, the api's own `CorsConfiguration` decorates whatever is answered for it
+//! ([`cors_decoration`]): `Cors` is a member of the API rather than of a backend
+//! ("Represents a CORS configuration. Supported only for HTTP APIs"), so the gateway
+//! applies it to the answer it returns — an allow-listed `Origin` is echoed back, a
+//! preflight asking about an allow-listed method additionally carries the configured
+//! allow-lists, and a request the configuration admits nothing of carries no CORS header at
+//! all.
+//!
+//! A preflight is DECORATED rather than answered in place of the route: it walks steps 1-6
+//! like any other request, and the decoration is put on what they answered. That is what the
+//! recorded behaviour of a configured api shows — a preflight carrying an allow-listed
+//! origin and method reaches the `$default` catch-all and is answered by the route's own
+//! backend, with the CORS headers on that answer — so an `OPTIONS` request is not
+//! short-circuited here. The consequence to know about: for an api whose routes match no
+//! `OPTIONS` request, a preflight meets step 4 and is answered `404` with the decoration,
+//! rather than a status the gateway chose on its own.
+//!
+//! An origin and a method are both matched EXACTLY against the collection that admits them
+//! (or through its wildcard entry): `AllowOrigins` is "a collection of allowed origins", and
+//! neither the model nor the recorded behaviour of a configured api admits a spelling the
+//! collection does not hold.
+//!
 //! # What it does not do, and what it answers instead
 //!
 //! Step 6 is the one step this emulator cannot perform as AWS does. Every integration type
@@ -172,6 +194,50 @@ const TEMPORARY_REDIRECT_STATUS: u16 = 307;
 
 /// The header that redirect carries the upstream in (RFC 7231 §7.1.2).
 const LOCATION_HEADER: &str = "location";
+
+/// The request header that makes a request CROSS-ORIGIN: the origin the user agent took it
+/// from (RFC 6454 §7). A request carrying none asks for no CORS decoration, so none is
+/// added to its answer.
+const ORIGIN_HEADER: &str = "origin";
+
+/// The method a CORS PREFLIGHT is made with (Fetch, "CORS-preflight request").
+const PREFLIGHT_METHOD: &str = "OPTIONS";
+
+/// The request header a preflight names the method it is asking about in; a preflight is an
+/// [`PREFLIGHT_METHOD`] request that carries it.
+const REQUEST_METHOD_HEADER: &str = "access-control-request-method";
+
+/// The response header that names the origin the answer may be read by —
+/// `Cors$AllowOrigins`, "a collection of allowed origins".
+const ALLOW_ORIGIN_HEADER: &str = "access-control-allow-origin";
+
+/// The response header that names the methods a preflight's origin may use —
+/// `Cors$AllowMethods`, "a collection of allowed HTTP methods".
+const ALLOW_METHODS_HEADER: &str = "access-control-allow-methods";
+
+/// The response header that names the request headers a preflight's origin may send —
+/// `Cors$AllowHeaders`, "a collection of allowed headers".
+const ALLOW_HEADERS_HEADER: &str = "access-control-allow-headers";
+
+/// The response header that names the response headers the origin's script may read —
+/// `Cors$ExposeHeaders`, "a collection of exposed headers".
+const EXPOSE_HEADERS_HEADER: &str = "access-control-expose-headers";
+
+/// The response header that admits a CREDENTIALED cross-origin request —
+/// `Cors$AllowCredentials`, "whether credentials are included in the CORS request".
+const ALLOW_CREDENTIALS_HEADER: &str = "access-control-allow-credentials";
+
+/// The only value [`ALLOW_CREDENTIALS_HEADER`] carries (Fetch): the header is sent when the
+/// configuration allows credentials and omitted when it does not.
+const ALLOW_CREDENTIALS_VALUE: &str = "true";
+
+/// The response header that caps how long a preflight's answer may be reused —
+/// `Cors$MaxAge`, "the number of seconds that the browser should cache preflight request
+/// results".
+const MAX_AGE_HEADER: &str = "access-control-max-age";
+
+/// How a CORS response header carries a LIST: one comma-separated value (RFC 9110 §5.3).
+const CORS_LIST_SEPARATOR: &str = ",";
 
 /// The parts of a request this data plane reads: the method, and the host and path it is
 /// addressed at.
@@ -440,6 +506,21 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
         return forbidden();
     };
     let api = resolved.api;
+    // The api's own CORS configuration decides the decoration of WHATEVER is answered
+    // below, so it is computed once, from the api and the request alone, before the stage
+    // and the route are resolved; see [`cors_decoration`].
+    let decoration = cors_decoration(api, req);
+    decorated(serve_resolved(&resolved, &addressed, req), &decoration)
+}
+
+/// The answer for a request whose api this data plane HAS resolved: the stage, the
+/// deployment released to it, the route and its authorization, then the integration.
+fn serve_resolved(
+    resolved: &Resolved<'_, '_>,
+    addressed: &Addressed<'_>,
+    req: &RtRequest,
+) -> RtResponse {
+    let api = resolved.api;
     // The stage: the path's first segment when it names one, and otherwise the stage that
     // serves the api's root. A path that names neither is an endpoint that serves nothing.
     let Some((stage, route_path)) = stage_of(api, resolved.invoke_path) else {
@@ -484,6 +565,152 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
         return refusal;
     }
     serve_integration(api, stage, &deployment.configuration, route)
+}
+
+/// The decoration an HTTP api's stored `CorsConfiguration` puts on the answer to this
+/// request, as response headers, or no headers at all for a request the configuration says
+/// nothing about.
+///
+/// CORS is the api's OWN rule rather than the backend's: `Cors` is a member of the api
+/// (`Api$CorsConfiguration`, "a CORS configuration. Supported only for HTTP APIs"), so the
+/// gateway applies it to the answer it returns for that api, whatever produced that answer.
+/// That is why it is computed here, from the api and the request alone, and applied to the
+/// whole answer below ([`decorated`]) — an integration's response, and equally a refusal the
+/// gateway itself decided.
+///
+/// What each member decides, from its own documentation:
+///
+/// * `AllowOrigins` ("a collection of allowed origins") admits the request's `Origin`, and
+///   the admitted origin is what [`ALLOW_ORIGIN_HEADER`] carries — the request's own origin
+///   when the collection names it, and [`crate::state::CORS_WILDCARD`] when that is what
+///   the collection holds. An origin the collection does not admit gets NO CORS header at
+///   all: a user agent that is told nothing refuses the read, which is the configuration's
+///   answer for an origin it does not allow;
+/// * `AllowMethods` ("a collection of allowed HTTP methods") decides a PREFLIGHT — the
+///   [`PREFLIGHT_METHOD`] request that carries [`REQUEST_METHOD_HEADER`], the method the
+///   user agent is asking about. A preflight asking about a method the collection does not
+///   admit is likewise answered with no CORS header; one it admits carries the collection
+///   itself in [`ALLOW_METHODS_HEADER`], beside `AllowHeaders` and `MaxAge`, which are a
+///   preflight's answer alone;
+/// * `ExposeHeaders` ("a collection of exposed headers") is the ACTUAL response's, since it
+///   names what a script may read off that response;
+/// * `AllowCredentials` ("whether credentials are included in the CORS request") carries
+///   [`ALLOW_CREDENTIALS_VALUE`] on either when it is set, and nothing when it is not —
+///   Fetch defines no other value for the header, and the control plane already refuses the
+///   pair that would answer a credentialed request with a wildcard
+///   (`crate::state::validate_cors_configuration`).
+///
+/// An origin is compared EXACTLY, as a method is: `AllowOrigins` is "a collection of allowed
+/// origins" and nothing in the model or the recorded behaviour of a configured api admits an
+/// origin the collection does not hold, so a spelling that differs in any byte — including
+/// case — is an origin the configuration did not allow. A collection holding
+/// [`crate::state::CORS_WILDCARD`] admits every value, and the origin header then carries the
+/// wildcard rather than the request's own origin — the collection named no origin to echo.
+fn cors_decoration(api: &Api, req: &RtRequest) -> Vec<(&'static str, String)> {
+    let Some(cors) = api.cors_configuration.as_ref() else {
+        return Vec::new();
+    };
+    let origin = req
+        .headers()
+        .get(ORIGIN_HEADER)
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty());
+    let Some(origin) = origin else {
+        return Vec::new();
+    };
+    let Some(allowed_origin) = admitted_origin(cors.allow_origins.as_deref(), origin) else {
+        return Vec::new();
+    };
+    // A preflight is an OPTIONS request that names the method it is asking about; an
+    // OPTIONS request that names none is an ordinary request to the route. The method is
+    // compared exactly, because an HTTP method is case-sensitive (RFC 9110 §9.1).
+    let asked_about = (req.method() == PREFLIGHT_METHOD)
+        .then(|| req.headers().get(REQUEST_METHOD_HEADER))
+        .flatten()
+        .map(str::trim)
+        .filter(|method| !method.is_empty());
+    let mut decoration = Vec::new();
+    if let Some(asked_about) = asked_about {
+        if !admits_method(cors.allow_methods.as_deref(), asked_about) {
+            return Vec::new();
+        }
+        decoration.push((ALLOW_ORIGIN_HEADER, allowed_origin.to_string()));
+        if let Some(methods) = joined(cors.allow_methods.as_deref()) {
+            decoration.push((ALLOW_METHODS_HEADER, methods));
+        }
+        if let Some(headers) = joined(cors.allow_headers.as_deref()) {
+            decoration.push((ALLOW_HEADERS_HEADER, headers));
+        }
+        if let Some(max_age) = cors.max_age {
+            decoration.push((MAX_AGE_HEADER, max_age.to_string()));
+        }
+    } else {
+        decoration.push((ALLOW_ORIGIN_HEADER, allowed_origin.to_string()));
+        if let Some(exposed) = joined(cors.expose_headers.as_deref()) {
+            decoration.push((EXPOSE_HEADERS_HEADER, exposed));
+        }
+    }
+    if cors.allow_credentials == Some(true) {
+        decoration.push((ALLOW_CREDENTIALS_HEADER, ALLOW_CREDENTIALS_VALUE.to_string()));
+    }
+    decoration
+}
+
+/// The origin [`ALLOW_ORIGIN_HEADER`] answers `origin` with, or `None` for an origin
+/// `allowed` does not admit: the request's own origin when the collection names it, and the
+/// wildcard when the wildcard is what admitted it.
+fn admitted_origin<'r>(allowed: Option<&[String]>, origin: &'r str) -> Option<&'r str> {
+    let allowed = allowed?;
+    if allowed.iter().any(|entry| entry == origin) {
+        return Some(origin);
+    }
+    allowed
+        .iter()
+        .any(|entry| entry == crate::state::CORS_WILDCARD)
+        .then_some(crate::state::CORS_WILDCARD)
+}
+
+/// Whether `allowed` admits the method a preflight asks about — by naming it, or through
+/// [`crate::state::CORS_WILDCARD`], "the entry a CORS list carries to stand for every
+/// value". A collection that is absent or empty admits no method at all.
+///
+/// The comparison is exact, because an HTTP method is case-sensitive (RFC 9110 §9.1).
+fn admits_method(allowed: Option<&[String]>, method: &str) -> bool {
+    allowed.is_some_and(|allowed| {
+        allowed
+            .iter()
+            .any(|entry| entry == crate::state::CORS_WILDCARD || entry == method)
+    })
+}
+
+/// One CORS list as the single header value it is sent as, or `None` for a list with
+/// nothing in it — a header naming no value says less than no header.
+fn joined(values: Option<&[String]>) -> Option<String> {
+    values
+        .filter(|values| !values.is_empty())
+        .map(|values| values.join(CORS_LIST_SEPARATOR))
+}
+
+/// `response` with `decoration`'s headers on it.
+///
+/// The decoration states the api's CORS rule and nothing below it sets one of these
+/// headers, so each one is set here for the first time; a value the HTTP layer refuses sets
+/// nothing, which fails closed.
+fn decorated(mut response: RtResponse, decoration: &[(&'static str, String)]) -> RtResponse {
+    let headers = response.headers_mut();
+    for (name, value) in decoration {
+        if headers.try_insert(*name, value.clone()).is_err() {
+            // A stored value that cannot be a header value decorates nothing, which fails
+            // closed; the header is named so the dropped decoration is diagnosable, as the
+            // unreachable upstream in `redirect` is.
+            tracing::debug!(
+                header = %name,
+                "the api's CORS configuration holds a value that cannot be a header value, \
+                 so this header is left off the answer"
+            );
+        }
+    }
+    response
 }
 
 /// The stage of `api` that `invoke_path` names, and the path WITHIN that stage.
