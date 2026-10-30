@@ -212,13 +212,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // position and the `nextToken` — is the one rule every paginated list in this
         // service shares ([`crate::state::page_of`]), applied here to the endpoints this
         // cluster holds that the request's filters kept. The cursor's scope is this
-        // cluster's endpoint listing, so a cursor another listing minted (another cluster's
-        // endpoints, or the same cluster's job runs) is refused as an invalid request, as is
-        // a page of fewer than one endpoint.
+        // cluster's endpoint listing at this region's endpoint, so a cursor another listing
+        // minted (another cluster's endpoints, the same cluster's job runs, or another
+        // region's endpoint) is refused as an invalid request, as is a page of fewer than
+        // one endpoint.
         let page = crate::state::page_of(
-            &crate::state::list_managed_endpoints_scope(&input.virtual_cluster_id),
+            &crate::state::list_managed_endpoints_scope(&region, &input.virtual_cluster_id),
             state
-                .cluster_managed_endpoints(&input.virtual_cluster_id)
+                .cluster_managed_endpoints(&region, &input.virtual_cluster_id)
                 .filter(|record| matches_filters(record, &input)),
             input.max_results,
             input.next_token.as_deref(),

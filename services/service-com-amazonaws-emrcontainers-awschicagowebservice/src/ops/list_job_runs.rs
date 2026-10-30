@@ -194,14 +194,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The page itself — the `maxResults` bound, the newest-first order, the cursor
         // position and the `nextToken` — is the one rule every paginated list in this
         // service shares ([`crate::state::page_of`]), applied here to the runs this cluster
-        // holds that the request's filters kept. The cursor's scope is the virtual cluster
-        // this listing pages, so a token cannot be carried from one cluster's pagination to
-        // another's; a token outside that scope, like a page of fewer than one run, is
-        // refused as an invalid request.
+        // holds that the request's filters kept. The cursor's scope is this cluster's
+        // job-run listing at this region's endpoint, so a token cannot be carried from one
+        // cluster's pagination to another's, nor between two regions' endpoints; a token
+        // outside that scope, like a page of fewer than one run, is refused as an invalid
+        // request.
         let page = crate::state::page_of(
-            &input.virtual_cluster_id,
+            &crate::state::list_job_runs_scope(&region, &input.virtual_cluster_id),
             state
-                .cluster_job_runs(&input.virtual_cluster_id)
+                .cluster_job_runs(&region, &input.virtual_cluster_id)
                 .filter(|record| matches_filters(record, &input)),
             input.max_results,
             input.next_token.as_deref(),

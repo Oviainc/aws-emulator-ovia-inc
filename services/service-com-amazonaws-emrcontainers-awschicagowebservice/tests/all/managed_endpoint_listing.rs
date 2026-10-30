@@ -853,9 +853,13 @@ async fn unanswerable_managed_endpoint_requests_are_refused() {
     // A page of fewer than one endpoint is not a page, and a `nextToken` this listing
     // never issued is not a position in its order. The foreign cursors come from the one
     // encoder every paginated list here uses, so these rows cannot drift from the format.
-    let job_run_cursor = state::encode_list_cursor(&cluster, 1, 2);
-    let other_cluster_cursor =
-        state::encode_list_cursor(&state::list_managed_endpoints_scope(&other), 1, 2);
+    let job_run_cursor =
+        state::encode_list_cursor(&state::list_job_runs_scope(REGION, &cluster), 1, 2);
+    let other_cluster_cursor = state::encode_list_cursor(
+        &state::list_managed_endpoints_scope(REGION, &other),
+        1,
+        2,
+    );
     for (label, query) in [
         ("maxResults below one", "?maxResults=0".to_string()),
         ("a negative maxResults", "?maxResults=-3".to_string()),

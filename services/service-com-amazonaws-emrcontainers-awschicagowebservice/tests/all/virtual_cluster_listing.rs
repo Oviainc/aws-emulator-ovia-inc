@@ -680,7 +680,11 @@ async fn an_unanswerable_virtual_cluster_listing_is_refused() {
     // issued for THIS listing is not a position in its order. The scoped cursor of another
     // listing comes from the one encoder every paginated list here uses
     // (`state::encode_list_cursor`), so this row cannot drift from the format.
-    let foreign_cursor = state::encode_list_cursor(state::LIST_SECURITY_CONFIGURATIONS_SCOPE, 1, 2);
+    let foreign_cursor = state::encode_list_cursor(
+        &state::list_security_configurations_scope(REGION),
+        1,
+        2,
+    );
     for (label, query) in [
         ("maxResults below one", "?maxResults=0".to_string()),
         ("a negative maxResults", "?maxResults=-3".to_string()),

@@ -187,10 +187,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service shares ([`crate::state::page_of`]), applied here to the configurations
         // THIS region holds that the request's filters kept: one created at another
         // region's endpoint is not one this endpoint lists. The cursor carries this
-        // operation's scope, so a cursor another listing minted is refused as an invalid
-        // request, as is a page of fewer than one configuration.
+        // operation's scope AT THIS REGION'S endpoint, so a cursor another listing minted —
+        // or one another region's endpoint minted over its own records — is refused as an
+        // invalid request, as is a page of fewer than one configuration.
         let page = crate::state::page_of(
-            crate::state::LIST_SECURITY_CONFIGURATIONS_SCOPE,
+            &crate::state::list_security_configurations_scope(&region),
             state
                 .region_security_configurations(&region)
                 .filter(|record| matches_filters(record, &input)),

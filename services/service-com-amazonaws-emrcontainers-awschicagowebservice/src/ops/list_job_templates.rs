@@ -173,10 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service shares ([`crate::state::page_of`]), applied here to the templates THIS
         // region holds that the request's filters kept: a template created at another
         // region's endpoint is not one this endpoint lists. The cursor carries this
-        // operation's scope, so a cursor another listing minted is refused as an invalid
-        // request, as is a page of fewer than one template.
+        // operation's scope AT THIS REGION'S endpoint, so a cursor another listing minted —
+        // or one another region's endpoint minted over its own records — is refused as an
+        // invalid request, as is a page of fewer than one template.
         let page = crate::state::page_of(
-            crate::state::LIST_JOB_TEMPLATES_SCOPE,
+            &crate::state::list_job_templates_scope(&region),
             state
                 .region_job_templates(&region)
                 .filter(|record| matches_filters(record, &input)),

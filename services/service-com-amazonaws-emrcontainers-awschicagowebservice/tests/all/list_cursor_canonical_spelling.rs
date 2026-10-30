@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_emrcontainers_awschicagowebservice::state;
 
 use crate::managed_endpoint_listing::{create_endpoint, endpoint_body};
-use crate::virtual_cluster_job_run_loop::{field, text, Answer, Emr};
+use crate::virtual_cluster_job_run_loop::{field, text, Answer, Emr, REGION};
 use crate::virtual_cluster_scheduler_status::run_id;
 
 /// The one wording every listing here refuses an unissued token with
@@ -98,7 +98,7 @@ async fn fixture(which: Which) -> (Emr, Listing) {
                 label: "ListVirtualClusters",
                 path: "/virtualclusters".to_string(),
                 member: "/virtualClusters",
-                scope: state::LIST_VIRTUAL_CLUSTERS_SCOPE.to_string(),
+                scope: state::list_virtual_clusters_scope(REGION),
                 stored,
             }
         }
@@ -120,8 +120,9 @@ async fn fixture(which: Which) -> (Emr, Listing) {
                 label: "ListJobRuns",
                 path: format!("/virtualclusters/{cluster}/jobruns"),
                 member: "/jobRuns",
-                // A job-run listing scopes its cursors by the cluster id alone.
-                scope: cluster,
+                // A job-run listing scopes its cursors by the cluster it pages, at the
+                // region's endpoint that pages it.
+                scope: state::list_job_runs_scope(REGION, &cluster),
                 stored,
             }
         }
@@ -145,7 +146,7 @@ async fn fixture(which: Which) -> (Emr, Listing) {
                 label: "ListJobTemplates",
                 path: "/jobtemplates".to_string(),
                 member: "/templates",
-                scope: state::LIST_JOB_TEMPLATES_SCOPE.to_string(),
+                scope: state::list_job_templates_scope(REGION),
                 stored,
             }
         }
@@ -173,7 +174,7 @@ async fn fixture(which: Which) -> (Emr, Listing) {
                 label: "ListSecurityConfigurations",
                 path: "/securityconfigurations".to_string(),
                 member: "/securityConfigurations",
-                scope: state::LIST_SECURITY_CONFIGURATIONS_SCOPE.to_string(),
+                scope: state::list_security_configurations_scope(REGION),
                 stored,
             }
         }
@@ -201,7 +202,7 @@ async fn fixture(which: Which) -> (Emr, Listing) {
                 label: "ListManagedEndpoints",
                 path: format!("/virtualclusters/{cluster}/endpoints"),
                 member: "/endpoints",
-                scope: state::list_managed_endpoints_scope(&cluster),
+                scope: state::list_managed_endpoints_scope(REGION, &cluster),
                 stored,
             }
         }

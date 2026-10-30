@@ -223,10 +223,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service shares ([`crate::state::page_of`]), applied here to the clusters THIS
         // region holds that the request's filters kept: a cluster created at another
         // region's endpoint is not one this endpoint lists. The cursor carries this
-        // operation's scope, so a cursor another listing minted is refused as an invalid
-        // request, as is a page of fewer than one cluster.
+        // operation's scope AT THIS REGION'S endpoint, so a cursor another listing minted —
+        // or one another region's endpoint minted over its own records — is refused as an
+        // invalid request, as is a page of fewer than one cluster.
         let page = crate::state::page_of(
-            crate::state::LIST_VIRTUAL_CLUSTERS_SCOPE,
+            &crate::state::list_virtual_clusters_scope(&region),
             state
                 .region_virtual_clusters(&region)
                 .filter(|record| matches_filters(record, &input)),

@@ -401,14 +401,15 @@ pub fn millis_of(value: &::aws_smithy_types::DateTime) -> i64 {
 
 /// The opaque `nextToken` a `@paginated` list in this service hands back: the place
 /// `(createdAt, creation sequence)` in a newest-first order the next page starts at,
-/// prefixed with the SCOPE that issued it, so a cursor one listing minted is never read as
-/// a position in another's order.
+/// prefixed with the SCOPE that issued it ([`list_cursor_scope`]), so a cursor one listing
+/// at one region's endpoint minted is never read as a position in any other order.
 ///
-/// One encoder for every paginated list here, so the three cannot drift apart. The
-/// components are joined by `:`, which neither a scope (a `ResourceIdString` or a fixed
-/// label) nor a decimal millisecond (it may carry a leading `-`) nor a sequence can
-/// contain, so the split in [`decode_list_cursor`] is unambiguous whatever the stored
-/// instant is. A client must not read a cursor; the service only has to resume from it.
+/// One encoder for every paginated list here, so the five cannot drift apart. The
+/// components are joined by `:`, which neither a decimal millisecond (it may carry a
+/// leading `-`) nor a sequence can contain, so the split in [`decode_list_cursor`] is
+/// unambiguous whatever the stored instant is: a scope may carry `:` itself, and is matched
+/// as a whole prefix, which leaves exactly the two numeric components after it. A client
+/// must not read a cursor; the service only has to resume from it.
 pub fn encode_list_cursor(scope: &str, created_at_millis: i64, sequence: u64) -> String {
     format!("{scope}:{created_at_millis}:{sequence}")
 }
@@ -416,7 +417,8 @@ pub fn encode_list_cursor(scope: &str, created_at_millis: i64, sequence: u64) ->
 /// The place in a newest-first order a `nextToken` names.
 ///
 /// `None` — refused as an invalid request — when the token is not a cursor this `scope`
-/// issued, so a token cannot be carried from one listing to another's.
+/// issued, so a token cannot be carried from one listing to another's, nor from one
+/// region's endpoint to another's ([`list_cursor_scope`]).
 ///
 /// A token is one this `scope` issued only when it is byte for byte what
 /// [`encode_list_cursor`] writes for the position it decodes to. Parsing a decimal is
@@ -435,20 +437,63 @@ pub fn decode_list_cursor(scope: &str, token: &str) -> Option<(i64, u64)> {
     (encode_list_cursor(scope, position.0, position.1) == token).then_some(position)
 }
 
+/// The scope [`encode_list_cursor`] tags a cursor with: the `listing` that minted it AND
+/// the `region` of the endpoint that minted it.
+///
+/// A cursor is a POSITION in one newest-first order, not the identity of a row, so it names
+/// a place only in the record set that order was computed over — and every record set paged
+/// here is one region's, because a resource of this regional service exists only at the
+/// endpoint that created it (see the module docs). A position computed over one region's
+/// records therefore names a different place, or no place at all, in another's order, so the
+/// region belongs in the scope exactly as the listing does: with it there,
+/// [`decode_list_cursor`] refuses a token offered to an endpoint that did not issue it,
+/// instead of resuming a listing it never positioned.
+///
+/// One builder for every scope below, so no listing's cursor can come to be read anywhere
+/// but in the one order it names.
+///
+/// A scope may therefore contain the `:` the cursor's components are joined by, which costs
+/// the decode nothing: [`decode_list_cursor`] matches the scope as a WHOLE prefix and then
+/// requires exactly the two numeric components after it. Where a scope carries a parent
+/// resource as well, that part is a `ResourceIdString` (`^[0-9a-z]+$`), so only the region
+/// can hold a `:` and a scope is still the one string the listing it belongs to builds.
+fn list_cursor_scope(listing: &str, region: &str) -> String {
+    format!("{listing}:{region}")
+}
+
 /// The scope [`encode_list_cursor`] tags a `ListJobTemplates` cursor with.
-pub const LIST_JOB_TEMPLATES_SCOPE: &str = "jobtemplates";
+pub fn list_job_templates_scope(region: &str) -> String {
+    list_cursor_scope("jobtemplates", region)
+}
 
 /// The scope [`encode_list_cursor`] tags a `ListSecurityConfigurations` cursor with.
-pub const LIST_SECURITY_CONFIGURATIONS_SCOPE: &str = "securityconfigurations";
+pub fn list_security_configurations_scope(region: &str) -> String {
+    list_cursor_scope("securityconfigurations", region)
+}
 
 /// The scope [`encode_list_cursor`] tags a `ListVirtualClusters` cursor with.
-pub const LIST_VIRTUAL_CLUSTERS_SCOPE: &str = "virtualclusters";
+pub fn list_virtual_clusters_scope(region: &str) -> String {
+    list_cursor_scope("virtualclusters", region)
+}
 
 /// The scope [`encode_list_cursor`] tags a `ListManagedEndpoints` cursor with: one cluster's
-/// endpoint listing, so a cursor is never read as a position in another cluster's order, nor
-/// in the SAME cluster's job-run listing (which scopes its cursors by the cluster id alone).
-pub fn list_managed_endpoints_scope(virtual_cluster_id: &str) -> String {
-    format!("endpoints:{virtual_cluster_id}")
+/// endpoint listing at one region's endpoint, so a cursor is never read as a position in
+/// another cluster's order, nor in the SAME cluster's job-run listing.
+pub fn list_managed_endpoints_scope(region: &str, virtual_cluster_id: &str) -> String {
+    format!(
+        "{}:{virtual_cluster_id}",
+        list_cursor_scope("endpoints", region)
+    )
+}
+
+/// The scope [`encode_list_cursor`] tags a `ListJobRuns` cursor with: one cluster's job-run
+/// listing at one region's endpoint, on the same terms as
+/// [`list_managed_endpoints_scope`].
+pub fn list_job_runs_scope(region: &str, virtual_cluster_id: &str) -> String {
+    format!(
+        "{}:{virtual_cluster_id}",
+        list_cursor_scope("jobruns", region)
+    )
 }
 
 /// The place one listed record occupies in the newest-first order every `@paginated` list
@@ -533,7 +578,9 @@ pub struct ListPage<'a, R> {
 ///   a row, so a record whose state changed between pages cannot invalidate a token the
 ///   client already holds: resuming reports everything ordered at or after the cursor, with
 ///   no repeats and no gaps. A token no [`decode_list_cursor`] of this `scope` accepts is
-///   refused, so a cursor one listing minted is never read as a position in another's order;
+///   refused, so a cursor minted by another listing — or by another region's endpoint,
+///   whose records are a different set in a different order — is never read as a position
+///   in this one ([`list_cursor_scope`]);
 /// * a `nextToken` comes back only while records remain after the page.
 ///
 /// One rule for every paginated list here, beside the one cursor encoder, so the two halves
@@ -1977,9 +2024,20 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
 
     /// How many of this cluster's stored job runs are in a state `wanted` accepts, as the
     /// `NonNegativeInteger` the model counts them in.
+    ///
+    /// The runs are read with the region of the cluster itself, so a count is taken over
+    /// exactly the runs that cluster's endpoint holds; an id that names no cluster holds no
+    /// run to count.
     fn cluster_run_count(&self, virtual_cluster_id: &str, wanted: fn(&str) -> bool) -> i32 {
+        let Some(region) = self
+            .virtual_clusters
+            .get(virtual_cluster_id)
+            .map(|record| record.region.as_str())
+        else {
+            return 0;
+        };
         let counted = self
-            .cluster_job_runs(virtual_cluster_id)
+            .cluster_job_runs(region, virtual_cluster_id)
             .filter(|record| wanted(&record.state))
             .count();
         i32::try_from(counted).unwrap_or(i32::MAX)
@@ -2059,7 +2117,7 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
                 .filter(|record| {
                     record.state == CLUSTER_TERMINATED
                         && self
-                            .cluster_job_runs(&record.id)
+                            .cluster_job_runs(&record.region, &record.id)
                             .all(|run| job_state_is_terminal(&run.state))
                 })
                 .min_by_key(|record| (record.created_at_millis, record.sequence))
@@ -2259,20 +2317,24 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
         })
     }
 
-    /// This cluster's stored managed endpoints, in creation order.
+    /// This cluster's stored managed endpoints at `region`'s endpoint, in creation order:
+    /// what a `ListManagedEndpoints` against that endpoint reports on.
     ///
-    /// Keyed by the cluster alone: an endpoint is created through the endpoint of the
-    /// region its cluster exists in, so every id in a cluster's index names an endpoint
-    /// of that cluster's region. Callers resolve the cluster region-scoped first.
-    pub fn cluster_managed_endpoints(
-        &self,
+    /// The region is part of the read, not only of the caller's cluster lookup, so the
+    /// records a listing pages are keyed exactly as the cluster that gates it and as the
+    /// cursor that positions into them: a record of another region's endpoint is never one
+    /// this endpoint reports, whatever a request's cluster id resolves to.
+    pub fn cluster_managed_endpoints<'a>(
+        &'a self,
+        region: &'a str,
         virtual_cluster_id: &str,
-    ) -> impl Iterator<Item = &ManagedEndpointRecord> {
+    ) -> impl Iterator<Item = &'a ManagedEndpointRecord> {
         self.managed_endpoints_by_cluster
             .get(virtual_cluster_id)
             .into_iter()
             .flatten()
             .filter_map(|id| self.managed_endpoints.get(id))
+            .filter(move |record| record.region == region)
     }
 
     /// The virtual cluster a `virtualClusterIdentifier` names, for a request signed for
@@ -2587,14 +2649,14 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
         // The children are read out of the store before anything is written, so the walk
         // borrows the records it decides on and the moves below borrow them mutably.
         let endpoints: Vec<String> = self
-            .cluster_managed_endpoints(id)
+            .cluster_managed_endpoints(region, id)
             .filter(|record| {
                 !endpoint_state_is_terminal(&record.state) && record.state != ENDPOINT_TERMINATING
             })
             .map(|record| record.id.clone())
             .collect();
         let runs: Vec<String> = self
-            .cluster_job_runs(id)
+            .cluster_job_runs(region, id)
             .filter(|record| {
                 !job_state_is_terminal(&record.state) && record.state != JOB_CANCEL_PENDING
             })
@@ -2826,17 +2888,20 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
         }
     }
 
-    /// This cluster's stored job runs, in creation order.
-    ///
-    /// Keyed by the cluster alone: a run is submitted through the endpoint of the region
-    /// its cluster exists in, so every id in a cluster's index names a run of that
-    /// cluster's region. Callers resolve the cluster region-scoped first.
-    pub fn cluster_job_runs(&self, virtual_cluster_id: &str) -> impl Iterator<Item = &JobRunRecord> {
+    /// This cluster's stored job runs at `region`'s endpoint, in creation order: what a
+    /// `ListJobRuns` against that endpoint reports on, keyed by the region as well as the
+    /// cluster on the same terms as [`Self::cluster_managed_endpoints`].
+    pub fn cluster_job_runs<'a>(
+        &'a self,
+        region: &'a str,
+        virtual_cluster_id: &str,
+    ) -> impl Iterator<Item = &'a JobRunRecord> {
         self.job_runs_by_cluster
             .get(virtual_cluster_id)
             .into_iter()
             .flatten()
             .filter_map(|id| self.job_runs.get(id))
+            .filter(move |record| record.region == region)
     }
 
     /// Whether there is room for one more security configuration.

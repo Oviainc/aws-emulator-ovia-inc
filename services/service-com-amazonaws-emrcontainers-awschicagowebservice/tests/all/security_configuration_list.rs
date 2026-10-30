@@ -31,7 +31,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_emrcontainers_awschicagowebservice::state;
 
 use crate::virtual_cluster_job_run_loop::{
-    field, instant_millis, query_instant, text, Answer, Emr,
+    field, instant_millis, query_instant, text, Answer, Emr, REGION,
 };
 
 /// `GET /securityconfigurations{query}` — `ListSecurityConfigurations`.
@@ -466,7 +466,8 @@ async fn a_deleted_security_configuration_leaves_the_list_and_bad_requests_are_r
     // service never issued for THIS listing is not a position in its order. The scoped
     // cursor of another listing comes from the one encoder every paginated list here uses
     // (`state::encode_list_cursor`), so this row cannot drift from the format.
-    let foreign_cursor = state::encode_list_cursor(state::LIST_JOB_TEMPLATES_SCOPE, 1, 2);
+    let foreign_cursor =
+        state::encode_list_cursor(&state::list_job_templates_scope(REGION), 1, 2);
     for (label, query) in [
         ("maxResults below one", "?maxResults=0".to_string()),
         ("a negative maxResults", "?maxResults=-3".to_string()),
