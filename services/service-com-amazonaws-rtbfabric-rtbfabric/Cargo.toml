@@ -22,6 +22,10 @@ tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
+# Hex renders and reads back the opaque `nextToken` a paginated listing hands
+# out, so a cursor survives any transport and no client mistakes it for a value
+# it may construct itself.
+hex = { workspace = true }
 # SHA-256 for the fixed-size digests the idempotency store is keyed and compared
 # by, so a caller-chosen clientToken cannot grow the bytes retained per record.
 sha2 = { workspace = true }
@@ -32,7 +36,6 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
