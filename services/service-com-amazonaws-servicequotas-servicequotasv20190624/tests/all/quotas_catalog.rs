@@ -261,10 +261,27 @@ async fn a_quota_record_carries_the_members_its_row_publishes() {
                     .and_then(Value::as_object)
                     .map_or(0, serde_json::Map::len);
                 assert!(
-                    (1..=MAX_METRIC_DIMENSIONS).contains(&dimensions),
-                    "case {case}: MetricDimensions must hold 1..={MAX_METRIC_DIMENSIONS} \
-                     entries, got {dimensions} in {quota}"
+                    dimensions <= MAX_METRIC_DIMENSIONS,
+                    "case {case}: MetricDimensions must hold at most \
+                     {MAX_METRIC_DIMENSIONS} entries, got {dimensions} in {quota}"
                 );
+                // A dimension the metric does carry is a name/value pair that is part
+                // of the metric's identity, so neither half may be empty. The map
+                // itself is modelled `@length 0..10`: a service that publishes the
+                // account's usage under ONE metric of its own namespace identifies it
+                // without any dimension, and reports none.
+                for (name, value) in metric
+                    .get("MetricDimensions")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flatten()
+                {
+                    assert!(
+                        !name.is_empty() && value.as_str().is_some_and(|value| !value.is_empty()),
+                        "case {case}: a metric dimension is a name/value pair, got \
+                         {name:?}={value}"
+                    );
+                }
             }
         }
 

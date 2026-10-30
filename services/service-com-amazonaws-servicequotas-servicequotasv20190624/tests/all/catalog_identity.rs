@@ -70,7 +70,10 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("lambda", "L-B82A30EA"),
     ("lambda", "L-B99A9384"),
     ("lambda", "L-F55076EC"),
+    ("monitoring", "L-6FCAAA2E"),
     ("s3", "L-DC2B2D3D"),
+    ("ses", "L-804C8AE8"),
+    ("ses", "L-CDEF9B6B"),
     ("signin", "L-42359A23"),
     ("vpc", "L-045E6E9C"),
     ("vpc", "L-085A6257"),
@@ -118,7 +121,9 @@ const CODES_WITHOUT_A_CITED_DISPLAY_NAME: &[&str] = &[
 
 /// Whether `code` has the shape of a code AWS MINTS: `L-` and eight upper-case hex
 /// characters, the form every `QuotaCode` in AWS's published catalog has.
-fn is_aws_minted_shape(code: &str) -> bool {
+///
+/// `pub(crate)` so another suite asks this question through the one copy of it.
+pub(crate) fn is_aws_minted_shape(code: &str) -> bool {
     code.strip_prefix("L-").is_some_and(|rest| {
         rest.len() == 8
             && rest
@@ -547,7 +552,11 @@ async fn a_minted_code_this_catalog_does_not_cite_resolves_nothing() {
     // no AWS code — each resolves the quota whose name it was built from.
     for (service_code, quota_code, quota_name) in [
         ("athena", "WorkgroupsPerRegion", "Workgroups per Region"),
-        ("monitoring", "AlarmsPerRegion", "Alarms per Region"),
+        (
+            "logs",
+            "MetricFiltersPerLogGroup",
+            "Metric filters per log group",
+        ),
         ("vpc", "PrefixListsPerRegion", "Prefix lists per Region"),
         // The one row whose code the SERVICE's own refusal publishes.
         ("b2bi", "ProfilesPerAccount", "Customer profiles per account"),

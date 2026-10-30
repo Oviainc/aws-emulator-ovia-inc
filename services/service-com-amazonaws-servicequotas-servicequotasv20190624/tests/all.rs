@@ -47,6 +47,8 @@ mod history_filter_chain;
 mod open_request_plane_scope;
 #[path = "all/pagination_token_scope.rs"]
 mod pagination_token_scope;
+#[path = "all/published_quota_codes.rs"]
+mod published_quota_codes;
 #[path = "all/quota_plane_rule.rs"]
 mod quota_plane_rule;
 #[path = "all/quota_request_template.rs"]

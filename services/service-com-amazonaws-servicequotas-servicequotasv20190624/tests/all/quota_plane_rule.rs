@@ -116,8 +116,8 @@ async fn a_call_is_served_on_exactly_the_planes_the_published_level_has() {
         ),
         (
             "a measured quota of a third service adjustable account-wide only",
-            "monitoring",
-            "Alarms per Region",
+            "lambda",
+            "Concurrent executions",
             LEVEL_ACCOUNT,
         ),
     ];

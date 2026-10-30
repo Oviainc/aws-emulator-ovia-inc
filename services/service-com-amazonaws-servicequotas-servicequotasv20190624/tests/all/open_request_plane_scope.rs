@@ -117,8 +117,8 @@ fn rows() -> Vec<Row> {
         },
         Row {
             why: "a PER-REGION quota of another service: the control, raised elsewhere",
-            service_code: "monitoring",
-            quota_name: "Alarms per Region",
+            service_code: "lambda",
+            quota_name: "Concurrent executions",
             global: false,
             first_at: "ap-south-1",
             second_at: "us-west-1",

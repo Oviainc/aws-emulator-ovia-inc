@@ -3101,6 +3101,23 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         // evidence RE-KEYED three other rows onto AWS's own codes instead of
         // dropping them (`codecommit`, `config`, `kinesis` below), each of which AWS
         // publishes with no usage metric or window.
+        //
+        // The same evidence covers ten further services, whose recorded
+        // default-quota listings report this catalog's descriptive row as a surplus
+        // entry and publish their own quotas under codes in AWS's minted namespace:
+        // `memorydb/NodesPerRegion`, `mgn/SourceServersPerAccount`,
+        // `monitoring/AlarmsPerRegion`, `monitoring/DashboardsPerAccount`,
+        // `monitoring/MetricStreamsPerAccount`, `mq/BrokersPerRegion`,
+        // `neptune/Clusters`, `personalize/DatasetGroupsPerAccount`,
+        // `securityhub/MemberAccountsPerAdministratorAccount`,
+        // `servicecatalog/Portfolios`, `ses/DailySendingQuota`, `ses/SendingRate`
+        // and `signer/SigningProfilesPerAccount`. Where that evidence states AWS's
+        // own code for the quota, the row is RE-KEYED onto it and carries the
+        // members AWS publishes with it (`monitoring` and `ses` below); the rest are
+        // dropped, since a quota served under a code AWS never minted is what makes
+        // a documented code resolve the wrong record. Each of those services stays
+        // in [`SEED_SERVICE_CATALOG`], so its code still resolves and its listing
+        // still answers 200.
         service(
             "b2bi",
             "AWS B2B Data Interchange",
@@ -3754,11 +3771,6 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             ],
         ),
         service(
-            "memorydb",
-            "Amazon MemoryDB",
-            vec![quota("Nodes per Region", 300.0)],
-        ),
-        service(
             "mediaconvert",
             "AWS Elemental MediaConvert",
             vec![quota("Queues per Region", 10.0)],
@@ -3773,22 +3785,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "AWS Elemental MediaPackage",
             vec![quota("Channels per Region", 200.0)],
         ),
-        service(
-            "mgn",
-            "AWS Application Migration Service",
-            vec![quota("Source servers per account", 3000.0)],
-        ),
         service("monitoring", "Amazon CloudWatch", monitoring_quotas()),
-        service(
-            "mq",
-            "Amazon MQ",
-            vec![quota("Brokers per Region", 50.0)],
-        ),
-        service(
-            "neptune",
-            "Amazon Neptune",
-            vec![quota("Clusters", 40.0)],
-        ),
         service(
             "notifications-contacts",
             "AWS User Notifications Contacts",
@@ -3821,11 +3818,6 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "organizations",
             "AWS Organizations",
             vec![quota("Default maximum number of accounts", 10.0).global()],
-        ),
-        service(
-            "personalize",
-            "Amazon Personalize",
-            vec![quota("Dataset groups per account", 50.0)],
         ),
         service(
             "pinpoint",
@@ -3924,32 +3916,59 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             vec![quota("Secrets per Region", 500000.0)],
         ),
         service(
-            "securityhub",
-            "AWS Security Hub",
-            vec![quota("Member accounts per administrator account", 5000.0)],
-        ),
-        service(
-            "servicecatalog",
-            "AWS Service Catalog",
-            vec![quota("Portfolios", 100.0)],
-        ),
-        service(
             "servicediscovery",
             "AWS Cloud Map",
             vec![quota("Namespaces per Region", 100.0)],
         ),
         service(
             "ses",
-            "Amazon Simple Email Service (Amazon SES)",
+            // The display name Service Quotas reports for this code, as its recorded
+            // default-quota listing carries it: the product name follows the service
+            // name with no space between them.
+            "Amazon Simple Email Service(Amazon SES)",
+            // Both sending quotas are published over a WINDOW rather than as a
+            // count, and under AWS's own codes, which the recorded listing of this
+            // service states together with their names and the sending rate's usage
+            // metric.
             vec![
-                quota("Daily sending quota", 200.0),
-                quota("Sending rate", 1.0),
+                quota("Sending rate", 1.0)
+                    .code("L-CDEF9B6B")
+                    .period(1, "SECOND")
+                    .metric(ses_send_metric())
+                    .describe(
+                        "The maximum number of emails that Amazon SES can accept each second \
+                         for this account in the current Region.",
+                    ),
+                // The daily quota is measured over a 24-HOUR window, and against the
+                // account's send usage rather than the per-second rate's own metric:
+                // SES publishes that usage in `AWS/Usage` as a call count whose
+                // LARGEST value in the window is the one that matters. The `Resource`
+                // dimension is this catalog's own naming of the series the quota
+                // counts (its published name as one identifier): no source available
+                // here states the value SES publishes it under, and the other three
+                // dimensions are the ones every `AWS/Usage` series carries.
+                quota("Sending quota", 200.0)
+                    .code("L-804C8AE8")
+                    .period(24, "HOUR")
+                    .metric(aws_usage_metric(
+                        "CallCount",
+                        "Maximum",
+                        "SES",
+                        &[
+                            ("Class", "None"),
+                            ("Resource", "SendingQuota"),
+                            ("Type", "API"),
+                        ],
+                    ))
+                    // AWS's own text for this row is not among the data available
+                    // here, so the description is this catalog's own wording, in the
+                    // form the service's published descriptions take (the window and
+                    // the scope the quota applies to).
+                    .describe(
+                        "The maximum number of emails that Amazon SES can accept from this \
+                         account in the current Region in a 24-hour period.",
+                    ),
             ],
-        ),
-        service(
-            "signer",
-            "AWS Signer",
-            vec![quota("Signing profiles per account", 100.0)],
         ),
         service(
             "signin",
@@ -4501,7 +4520,9 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("servicecatalog", "AWS Service Catalog"),
     ("servicediscovery", "AWS Cloud Map Service Discovery"),
     ("servicequotas", "Service Quotas"),
-    ("ses", "Amazon Simple Email Service (Amazon SES)"),
+    // The product name follows the service name with no space between them, the
+    // form Service Quotas' own recorded data reports this code under.
+    ("ses", "Amazon Simple Email Service(Amazon SES)"),
     ("shield", "AWS Shield Advanced"),
     ("signer", "AWS Signer"),
     // Two codes of AWS's inventory report the same display name, the way `es` and
@@ -4665,12 +4686,18 @@ fn vpc_quotas() -> Vec<QuotaRow> {
 
 /// Amazon CloudWatch's published quota catalog, under the `ServiceCode` its API
 /// endpoint uses.
+///
+/// CloudWatch publishes most of its quotas as per-API REQUEST RATES, each over a
+/// one-second window and measured with the `AWS/Usage` `CallCount` metric of the API
+/// it throttles. The row below is the one whose AWS code this catalog can cite; the
+/// rest of the service's published rows are left to the default-quota-set gap rather
+/// than published under a code AWS does not mint (see
+/// [`descriptive_quota_code`]).
 fn monitoring_quotas() -> Vec<QuotaRow> {
-    vec![
-        quota("Alarms per Region", 5000.0),
-        quota("Dashboards per account", 5000.0),
-        quota("Metric streams per account", 100.0),
-    ]
+    vec![quota("Rate of GetMetricWidgetImage requests", 20.0)
+        .code("L-6FCAAA2E")
+        .period(1, "SECOND")
+        .metric(call_count_metric("CloudWatch", "GetMetricWidgetImage"))]
 }
 
 /// Amazon OpenSearch Service's published quota catalog, under the `ServiceCode` its
@@ -4748,6 +4775,22 @@ pub(crate) fn vpcs_per_region_usage_metric() -> MetricInfo {
             ("Type", "Resource"),
         ],
     )
+}
+
+/// The `UsageMetric` of the Amazon SES per-second sending rate.
+///
+/// SES publishes the messages it accepted for an account in its OWN metric namespace
+/// rather than in `AWS/Usage`, under one metric that needs no dimension to identify
+/// the series the rate is measured on, so the metric carries the EMPTY dimension map
+/// the model's `@length 0..10` allows. Its statistic is `Sum`, because a rate is the
+/// messages ADDED UP over the window.
+fn ses_send_metric() -> MetricInfo {
+    MetricInfo {
+        metric_namespace: Some("AWS/SES".to_string()),
+        metric_name: Some("Send".to_string()),
+        metric_dimensions: Some(std::collections::HashMap::new()),
+        metric_statistic_recommendation: Some("Sum".to_string()),
+    }
 }
 
 /// The `UsageMetric` of an API REQUEST-RATE quota: the `AWS/Usage` `CallCount`

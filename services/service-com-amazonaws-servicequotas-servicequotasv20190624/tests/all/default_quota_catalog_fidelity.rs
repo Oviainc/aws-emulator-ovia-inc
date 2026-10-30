@@ -260,6 +260,8 @@ const USAGE_METRIC_SERVICE_NAMES: &[(&str, &str)] = &[
     ("ec2", "EC2"),
     ("kinesis", "Kinesis Data Streams"),
     ("lambda", "Lambda"),
+    ("monitoring", "CloudWatch"),
+    ("ses", "SES"),
     ("vpc", "EC2"),
 ];
 
@@ -394,6 +396,12 @@ async fn every_usage_metric_names_the_service_as_aws_usage_publishes_it() {
 
     for (service_code, quotas) in &catalog {
         for quota in quotas {
+            // The rule is about the metrics `AWS/Usage` publishes: a service that
+            // publishes the account's usage in its OWN namespace identifies the
+            // series the way that namespace does, so it is not judged here.
+            if quota["UsageMetric"]["MetricNamespace"] != json!("AWS/Usage") {
+                continue;
+            }
             let Some(dimensions) = quota["UsageMetric"]["MetricDimensions"].as_object() else {
                 continue;
             };
