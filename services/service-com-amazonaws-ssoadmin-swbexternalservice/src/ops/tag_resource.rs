@@ -213,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
-                    message: Some(crate::state::tag_ceiling_message(&input.resource_arn)),
+                    message: Some(crate::state::tag_ceiling_message()),
                 },
             )
             .into());

@@ -26,6 +26,7 @@
 //! `MultiServiceRouter::dispatch`.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_ssoadmin_swbexternalservice::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{
@@ -387,11 +388,11 @@ async fn a_reused_client_token_replays_only_the_same_name_and_tag_multiset() {
                 status,
                 &refused,
             );
-            assert!(
-                refused["Message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("ClientToken")),
-                "case {case:?}: the refusal must name the parameter mismatch, got {refused}"
+            assert_eq!(
+                refused["Message"].as_str(),
+                Some(state::CLIENT_TOKEN_MISMATCH_MESSAGE),
+                "case {case:?}: the refusal must carry the parameter-mismatch sentence, \
+                 got {refused}"
             );
             assert_eq!(
                 reported_tags(&router, &instance_arn).await,

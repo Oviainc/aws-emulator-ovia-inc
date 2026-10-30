@@ -71,12 +71,18 @@ mod application_grants_list;
 mod application_list;
 #[path = "all/application_provider_describe.rs"]
 mod application_provider_describe;
+#[path = "all/application_provider_resolution.rs"]
+mod application_provider_resolution;
+#[path = "all/application_refusal_wording.rs"]
+mod application_refusal_wording;
 #[path = "all/application_providers.rs"]
 mod application_providers;
 #[path = "all/application_session_configuration.rs"]
 mod application_session_configuration;
 #[path = "all/application_update.rs"]
 mod application_update;
+#[path = "all/client_token_conflict_message.rs"]
+mod client_token_conflict_message;
 #[path = "all/create_tag_fingerprint.rs"]
 mod create_tag_fingerprint;
 #[path = "all/customer_managed_policy_reference_independence.rs"]

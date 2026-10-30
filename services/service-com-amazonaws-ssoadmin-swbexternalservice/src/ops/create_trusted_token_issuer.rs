@@ -258,14 +258,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     });
                 }
                 // The same token carrying a DIFFERENT request is not a retry, so it is
-                // refused rather than answered with the other request's issuer.
+                // refused rather than answered with the other request's issuer. The
+                // refusal says only that the parameters differ from the earlier
+                // request's: the issuer that request created is not the caller's to
+                // learn from a token clash.
                 return Err(CreateTrustedTokenIssuerErrorModeled::ConflictException(
                     ConflictException {
-                        message: Some(format!(
-                            "This ClientToken was already used for a different \
-                             CreateTrustedTokenIssuer request, which created {}",
-                            existing.trusted_token_issuer_arn
-                        )),
+                        message: Some(crate::state::CLIENT_TOKEN_MISMATCH_MESSAGE.to_string()),
                     },
                 )
                 .into());

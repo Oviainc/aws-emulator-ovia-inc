@@ -19,6 +19,12 @@
 //!    created is refused with the modelled `ConflictException`, while the REPORT of its
 //!    tags is served.
 //!
+//! One detail of the refusal is NOT shared: a tag WRITE names the resource kind and the id
+//! it was asked for, while the REPORT words a missing APPLICATION as the application's own
+//! reads do (`state::taggable_resource_not_found_message` /
+//! `state::tag_report_not_found_message`). Every other taggable kind reads the same on
+//! both paths.
+//!
 //! Each refusal is asserted on its wire code AND on its message, over a table spanning the
 //! four resource kinds and every way the resolution can fail, so the three operations are
 //! pinned to one answer rather than to three that happen to agree today.
@@ -291,13 +297,15 @@ async fn fixture(suffix: &str) -> Fixture {
     }
 }
 
-/// One row of the resolution table: the ARNs a tag request names, and the refusal EVERY
-/// tag operation must answer it with.
+/// One row of the resolution table: the ARNs a tag request names, the refusal the two
+/// WRITES must answer it with, and the one the REPORT must answer it with (the same
+/// sentence for every kind but an application).
 struct Unresolvable {
     label: String,
     instance_arn: Option<String>,
     resource_arn: String,
-    message: String,
+    write_message: String,
+    report_message: String,
 }
 
 /// The rows, spanning the four resource kinds and every way the resolution can fail: an
@@ -311,33 +319,37 @@ fn unresolvable_rows(fixture: &Fixture) -> Vec<Unresolvable> {
             label: format!("{kind} under an InstanceArn this account holds no instance for"),
             instance_arn: Some(UNKNOWN_INSTANCE_ARN.to_string()),
             resource_arn: resource_arn.clone(),
-            message: state::instance_not_found_message(UNKNOWN_INSTANCE_ARN),
+            write_message: state::instance_not_found_message(UNKNOWN_INSTANCE_ARN),
+            report_message: state::instance_not_found_message(UNKNOWN_INSTANCE_ARN),
         });
         rows.push(Unresolvable {
             label: format!("{kind} under an InstanceArn that holds another instance's resources"),
             instance_arn: Some(fixture.other_instance_arn.clone()),
             resource_arn: resource_arn.clone(),
-            message: state::taggable_resource_not_found_message(resource_arn),
+            write_message: state::taggable_resource_not_found_message(resource_arn),
+            report_message: state::tag_report_not_found_message(resource_arn),
         });
         rows.push(Unresolvable {
             label: format!("a {kind} ARN nothing was created under, scoped to the instance"),
             instance_arn: Some(fixture.instance_arn.clone()),
             resource_arn: never_created_arn.clone(),
-            message: state::taggable_resource_not_found_message(never_created_arn),
+            write_message: state::taggable_resource_not_found_message(never_created_arn),
+            report_message: state::tag_report_not_found_message(never_created_arn),
         });
         rows.push(Unresolvable {
             label: format!("a {kind} ARN nothing was created under, with no InstanceArn"),
             instance_arn: None,
             resource_arn: never_created_arn.clone(),
-            message: state::taggable_resource_not_found_message(never_created_arn),
+            write_message: state::taggable_resource_not_found_message(never_created_arn),
+            report_message: state::tag_report_not_found_message(never_created_arn),
         });
     }
     rows
 }
 
 /// Steps 1 and 2: the write, the removal and the report resolve the resource a request
-/// names by the SAME rule, so an unresolvable request earns the same refusal — code and
-/// message — from all three, and none of them writes.
+/// names by the SAME rule, so an unresolvable request earns the same refusal CODE from all
+/// three — and the message each surface words it with — and none of them writes.
 #[tokio::test]
 async fn every_tag_operation_refuses_an_unresolvable_resource_identically() {
     let fixture = fixture("unresolvable").await;
@@ -357,7 +369,7 @@ async fn every_tag_operation_refuses_an_unresolvable_resource_identically() {
             case,
             "TagResource",
             "ResourceNotFoundException",
-            &row.message,
+            &row.write_message,
             status,
             &body,
         );
@@ -368,7 +380,7 @@ async fn every_tag_operation_refuses_an_unresolvable_resource_identically() {
             case,
             "UntagResource",
             "ResourceNotFoundException",
-            &row.message,
+            &row.write_message,
             status,
             &body,
         );
@@ -378,7 +390,7 @@ async fn every_tag_operation_refuses_an_unresolvable_resource_identically() {
             case,
             "ListTagsForResource",
             "ResourceNotFoundException",
-            &row.message,
+            &row.report_message,
             status,
             &body,
         );

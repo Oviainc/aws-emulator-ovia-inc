@@ -237,7 +237,7 @@ async fn listed_arns(router: &MultiServiceRouter, instance_arn: &str, case: &str
 /// The refusal an `ApplicationArn` this account holds no application for earns, as the
 /// service words it for every operation that resolves one.
 fn not_found_message(application_arn: &str) -> String {
-    format!("Could not find Application with arn {application_arn}.")
+    format!("No resource found for application arn: {application_arn}")
 }
 
 /// Assert one call was refused `ResourceNotFoundException` naming `application_arn`.

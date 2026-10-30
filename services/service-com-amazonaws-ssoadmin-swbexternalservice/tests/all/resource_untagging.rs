@@ -52,8 +52,10 @@ const ISSUER_TYPE: &str = "OIDC_JWT";
 const JWKS_RETRIEVAL_OPTION: &str = "OPEN_ID_DISCOVERY";
 
 /// The number of members the model's `TagKeyList` admits at most
-/// (`smithy_query(query="shape",shape="TagKeyList")`: `length(min: 1, max: 75)`), which is
-/// also the number of tags one resource can carry (`state::MAX_TAGS_PER_RESOURCE`).
+/// (`smithy_query(query="shape",shape="TagKeyList")`: `length(min: 1, max: 75)`). It is
+/// WIDER than the number of tags one resource can carry
+/// (`state::MAX_TAGS_PER_RESOURCE`), so an `UntagResource` call may name keys a resource
+/// could never all hold.
 const MAX_TAG_KEYS: usize = 75;
 
 /// The longest `TagKey` the model admits (`smithy_query(query="shape",shape="TagKey")`:
@@ -744,8 +746,9 @@ async fn a_tag_keys_list_outside_its_published_bounds_is_refused() {
     let (router, instance_arn) = organization_router();
 
     for (kind, resource_arn) in taggable_resources(&router, &instance_arn, "bounds").await {
-        // A full tag set, which `TagKeyList` at its maximum can name in one call.
-        let full: Vec<(String, String)> = (0..MAX_TAG_KEYS)
+        // A full tag set — every tag a resource can carry — which one `TagKeyList` can
+        // still name in a single call.
+        let full: Vec<(String, String)> = (0..state::MAX_TAGS_PER_RESOURCE)
             .map(|index| (format!("key-{index:03}"), format!("value-{index:03}")))
             .collect();
         let (status, body) = tag_resource(&router, Some(&instance_arn), &resource_arn, &full).await;
@@ -778,9 +781,10 @@ async fn a_tag_keys_list_outside_its_published_bounds_is_refused() {
             );
             assert_eq!(
                 reported(&listed).len(),
-                MAX_TAG_KEYS,
-                "case {case:?}: a refused removal removes nothing, so {MAX_TAG_KEYS} tags \
-                 must remain, got {listed}"
+                state::MAX_TAGS_PER_RESOURCE,
+                "case {case:?}: a refused removal removes nothing, so {} tags must \
+                 remain, got {listed}",
+                state::MAX_TAGS_PER_RESOURCE
             );
         }
 
@@ -804,22 +808,23 @@ async fn a_tag_keys_list_outside_its_published_bounds_is_refused() {
         let left = reported(&listed);
         assert_eq!(
             left.len(),
-            MAX_TAG_KEYS - 1,
+            state::MAX_TAGS_PER_RESOURCE - 1,
             "case {kind:?}: expected {} tags left, got {listed}",
-            MAX_TAG_KEYS - 1
+            state::MAX_TAGS_PER_RESOURCE - 1
         );
         assert!(
             !left.iter().any(|(key, _)| key == "key-000"),
             "case {kind:?}: the named key must be gone, got {listed}"
         );
 
-        // `TagKeys` at its maximum, naming every key the set still has plus the one
-        // already removed: the whole set goes and the absent key is no obstacle.
+        // `TagKeys` naming every key the set still has plus the one already removed: the
+        // whole set goes and the absent key is no obstacle.
         let (status, body) =
             untag_resource(&router, Some(&instance_arn), &resource_arn, &all_keys).await;
         assert_eq!(
             status, 200,
-            "case {kind:?}: a TagKeys list at its maximum must answer 200, got {status} {body}"
+            "case {kind:?}: a TagKeys list naming the whole set must answer 200, got \
+             {status} {body}"
         );
         let (status, listed) = list_tags(&router, Some(&instance_arn), &resource_arn).await;
         assert_eq!(

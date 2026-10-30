@@ -9,8 +9,11 @@
 //! A pure read: application providers are AWS-owned (the modelled
 //! `ApplicationProviderArn` pins the owner segment to the literal `aws`) and this
 //! service models no operation that creates, updates or deletes one, so the catalog is
-//! fixed and this handler writes nothing. Paged by `MaxResults` with a `NextToken` that
-//! resumes from the ARN the previous page ended on, and absent on the last page.
+//! fixed and this handler writes nothing. Reported in the catalog's OWN order — the order
+//! of a service-published catalog is the service's data, not something this read imposes
+//! — in ONE page holding every entry when the caller named no `MaxResults`, and otherwise
+//! paged by it with a `NextToken` that resumes from the entry the previous page ended on,
+//! absent on the last page.
 //!
 //! ## Shape of an operation
 //!
@@ -180,22 +183,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The catalog `DescribeApplicationProvider` answers from, projected through the
         // SAME `to_shape`, so a listed entry and a described one agree member for
-        // member. Keyed by `ApplicationProviderArn` and sorted by it, so the order is
-        // stable across calls and the next page resumes from the key this one ends on
-        // whatever order the catalog is written in.
-        let mut ordered: Vec<(String, ApplicationProvider)> =
-            crate::state::BUILT_IN_APPLICATION_PROVIDERS
-                .iter()
-                .map(|provider| (provider.arn(), provider.to_shape()))
-                .collect();
-        ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
+        // member. Keyed by `ApplicationProviderArn` — the key a cursor resumes from — and
+        // enumerated in the order the catalog itself holds, which is the catalog's own
+        // data and is therefore stable across calls without this read sorting it.
+        let catalog = crate::state::BUILT_IN_APPLICATION_PROVIDERS
+            .iter()
+            .map(|provider| (provider.arn(), provider.to_shape()));
 
-        let (application_providers, next_token) = crate::state::page(
+        // A caller that named no `MaxResults` asked for no page size, so the whole
+        // catalog comes back in one page; a cursor whose entry the catalog no longer
+        // holds is the same bad request as a cursor of another enumeration.
+        let (application_providers, next_token) = crate::state::page_in_published_order(
             crate::state::CURSOR_APPLICATION_PROVIDERS,
-            ordered,
+            catalog,
             after.as_deref(),
             input.max_results,
-        );
+        )
+        .ok_or_else(|| {
+            ListApplicationProvidersErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::BAD_CURSOR_MESSAGE.to_string()),
+                reason: None,
+            })
+        })?;
         Ok(ListApplicationProvidersOutput {
             application_providers: Some(application_providers),
             next_token,

@@ -322,16 +322,12 @@ async fn each_of_many_grants_reports_its_own_row_in_any_order() {
         status,
         &body,
     );
-    // The refusal is built from the request: it names the tuple that resolved to nothing,
-    // which is what tells it from a refusal about some other resource of the call.
-    let message = body["Message"]
-        .as_str()
-        .or_else(|| body["message"].as_str())
-        .unwrap_or_default();
+    // The refusal is the error CLASS alone: a principal that holds no direct assignment to
+    // a known application is reported with no detail text, so the refusal discloses
+    // nothing about the rows the store does hold.
     assert!(
-        message.contains(&near_miss) && message.contains(&application_arn),
-        "the refusal must name the principal and the application it was looked for on, \
-         got {message:?}"
+        body["Message"].is_null() && body["message"].is_null(),
+        "a missing assignment on a known application carries no detail text, got {body}"
     );
 
     // Nothing the refusal touched: the 24 grants are all still there.

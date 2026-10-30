@@ -234,16 +234,21 @@ pub fn instance_quota_exceeded_message() -> String {
     )
 }
 
-/// The refusal a repeated `ClientToken` earns when the rest of the `CreateInstance`
-/// request differs from the call that token belongs to, as the message of the modelled
+/// The refusal a repeated `@idempotencyToken` earns when the rest of the request differs
+/// from the call that token belongs to, as the message of the modelled
 /// `ConflictException` (HTTP 409).
 ///
-/// The rule is the `ClientToken` member's own documentation: "Passing the same value to
-/// a later call to an operation requires that you also pass the same value for all other
-/// parameters".
+/// The rule is the token member's own documentation: "Passing the same value to a later
+/// call to an operation requires that you also pass the same value for all other
+/// parameters... If you retry the operation with the same ClientToken, but with different
+/// parameters, the retry fails". The sentence AWS answers that refusal with is FIXED for
+/// the error class — it carries no variable part, naming neither the token nor the
+/// resource the first call created — so it is a constant here, and every create of this
+/// service that carries an `@idempotencyToken` (`CreateInstance`, `CreateApplication`,
+/// `CreateTrustedTokenIssuer`) refuses through this one constant: one condition reads ONE
+/// way whichever operation the client called.
 pub const CLIENT_TOKEN_MISMATCH_MESSAGE: &str =
-    "The ClientToken was already used for a CreateInstance request with different \
-     parameters.";
+    "The request parameters are different from that of a previous request";
 
 /// The refusal an `InstanceArn` this account holds no instance for earns, as the message
 /// of whichever not-found the calling operation models — the `ResourceNotFoundException`
@@ -325,6 +330,19 @@ pub fn instance_creation_in_progress_message(instance_arn: &str) -> String {
     )
 }
 
+/// A refusal of the APPLICATION surface: `what` was not found under the application the
+/// request named.
+///
+/// `No <what> found for application arn: <arn>` is how this service words every not-found
+/// of that surface — the application itself, and each of the singleton children a caller
+/// configures on it (an access scope, an authentication method, a grant) — so one
+/// condition reads ONE way whichever operation the client called, and the caller learns
+/// WHAT was missing and the application it was looked for under. Built from the request:
+/// both parts are the caller's own values.
+fn application_surface_not_found_message(what: &str, application_arn: &str) -> String {
+    format!("No {what} found for application arn: {application_arn}")
+}
+
 /// The refusal a `Scope` an application does not carry earns, as the message of the
 /// modelled `ResourceNotFoundException`.
 ///
@@ -332,7 +350,7 @@ pub fn instance_creation_in_progress_message(instance_arn: &str) -> String {
 /// on, because an unknown scope on a known application is a different failure from an
 /// unknown application.
 pub fn access_scope_not_found_message(application_arn: &str, scope: &str) -> String {
-    format!("Could not find access scope {scope} for application {application_arn}.")
+    application_surface_not_found_message(&format!("access scope {scope}"), application_arn)
 }
 
 /// The refusal a `TrustedTokenIssuerArn` nothing holds earns, as the message of the
@@ -345,32 +363,32 @@ pub fn trusted_token_issuer_not_found_message(trusted_token_issuer_arn: &str) ->
     format!("Could not find TrustedTokenIssuer with arn {trusted_token_issuer_arn}.")
 }
 
+/// What an application is called in the refusals of its own surface: the application is
+/// the RESOURCE the request named, where a scope or a grant is one thing configured on it
+/// ([`application_surface_not_found_message`]).
+const APPLICATION_SURFACE_RESOURCE: &str = "resource";
+
 /// The refusal an `ApplicationArn` this account holds no application for earns, as the
 /// message of the modelled `ResourceNotFoundException`.
 ///
-/// Built from the request, like [`trusted_token_issuer_not_found_message`]: it names the
-/// ARN that resolved to nothing, which is what tells "this application is gone" from
-/// "some other resource of this call is missing".
+/// Built from the request: it names the ARN that resolved to nothing, which is what tells
+/// "this application is gone" from "some other resource of this call is missing". Never
+/// created, already deleted, or gone with the instance that held it — the same answer
+/// either way.
 pub fn application_not_found_message(application_arn: &str) -> String {
-    format!("Could not find Application with arn {application_arn}.")
+    application_surface_not_found_message(APPLICATION_SURFACE_RESOURCE, application_arn)
 }
 
-/// The refusal a `DescribeApplicationAssignment` of a principal that holds no DIRECT
-/// assignment to the application earns, as the message of the modelled
-/// `ResourceNotFoundException`.
+/// The detail text a `DescribeApplicationAssignment` or `DeleteApplicationAssignment` of a
+/// principal that holds no DIRECT assignment to the application answers with: NONE.
 ///
-/// Built from the request: the assignment's identity is the whole tuple, so the refusal
-/// names all three parts rather than the application alone.
-pub fn application_assignment_not_found_message(
-    application_arn: &str,
-    principal_type: &str,
-    principal_id: &str,
-) -> String {
-    format!(
-        "Could not find an assignment of {principal_type} {principal_id} to application \
-         {application_arn}."
-    )
-}
+/// SOURCE: recorded behavior — this refusal is the modelled `ResourceNotFoundException`
+/// with no detail text at all, so the handlers report none rather than wording one of
+/// their own. The condition is fully described by the request the caller already holds (an
+/// application, a principal type and a principal id), and nothing of the store is
+/// disclosed. An `ApplicationArn` this account holds no application for is a DIFFERENT
+/// condition and keeps its own message ([`application_not_found_message`]).
+pub const APPLICATION_ASSIGNMENT_NOT_FOUND_MESSAGE: Option<&str> = None;
 
 /// The refusal a delete of an account assignment that is not granted earns, as the
 /// message of the modelled `ResourceNotFoundException`.
@@ -790,39 +808,96 @@ pub fn region_ceiling_message(instance_arn: &str) -> String {
     )
 }
 
-/// The maximum number of TAGS this emulator keeps on any ONE taggable resource (an
-/// instance, a permission set, an application or a trusted token issuer).
+/// The maximum number of TAGS a taggable resource of this service (an instance, a
+/// permission set, an application or a trusted token issuer) can carry.
 ///
-/// Taken from the model rather than chosen: `TagList` — the shape of both
-/// `TagResource$Tags` and `ListTagsForResource$Tags` — is declared `length(min: 0,
-/// max: 75)`, so a resource that held more tags than this could not be reported by the
-/// read at all. It doubles as the per-resource memory ceiling: a stored tag lives until
-/// a caller removes it, and a write that would push a resource past it is refused with
-/// the modelled `ServiceQuotaExceededException`.
-pub const MAX_TAGS_PER_RESOURCE: usize = 75;
+/// AWS's published tagging limit — a resource carries at most 50 user-created tags, the
+/// number IAM Identity Center publishes for its taggable resources — so a write that would
+/// push a resource past it is refused with the modelled `ServiceQuotaExceededException`,
+/// which AWS documents as "the principal has crossed the permitted number of resources
+/// that can be created". It is NOT the model's `TagList` bound, which is wider
+/// (`length(min: 0, max: 75)` — the most one REQUEST can carry and one page can report)
+/// and therefore admits a request this ceiling refuses.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// The message a tagging write refuses with once a resource would carry more than
-/// [`MAX_TAGS_PER_RESOURCE`] distinct keys; built from the request, which names the
-/// resource the ceiling was reached on, and worded as the modelled
-/// `ServiceQuotaExceededException` describes itself ("the principal has crossed the
-/// permitted number of resources that can be created").
-pub fn tag_ceiling_message(resource_arn: &str) -> String {
+/// [`MAX_TAGS_PER_RESOURCE`] distinct keys, as the message of the modelled
+/// `ServiceQuotaExceededException`.
+///
+/// The wording for this refusal is FIXED apart from the limit it states twice: it reports
+/// the ceiling, and that the tag set the write would LEAVE BEHIND may not cross it, and
+/// names neither the resource nor the tags. The limit is [`MAX_TAGS_PER_RESOURCE`], so the
+/// sentence always states the ceiling the write was judged against.
+pub fn tag_ceiling_message() -> String {
     format!(
-        "The principal has crossed the permitted number of resources that can be \
-         created: a resource carries at most {MAX_TAGS_PER_RESOURCE} tags, and \
-         {resource_arn} cannot carry the requested ones as well"
+        "{MAX_TAGS_PER_RESOURCE} user tags are allowed for a resource at maximum, The \
+         resultant tag set must not have more than {MAX_TAGS_PER_RESOURCE} user tags."
     )
 }
 
 /// The refusal a `ResourceArn` this account holds no TAGGABLE resource for earns, as the
 /// message of the modelled `ResourceNotFoundException`.
 ///
-/// Built from the request, like [`application_not_found_message`]: it names the ARN that
-/// resolved to nothing. An ARN held under a different instance than the `InstanceArn`
-/// the request carried resolves to nothing too — see
+/// Built from the request: it names the resource TYPE the ARN declares and the id the
+/// caller sent. An ARN held under a different instance than the `InstanceArn` the request
+/// carried resolves to nothing too — see
 /// [`ComAmazonawsSsoadminSwbexternalserviceState::tag_target`].
+///
+/// `Could not find <Type> with id <arn>.` — the tagging surface reaches all four taggable
+/// kinds through one `ResourceArn`, so the refusal says WHICH kind the ARN named, which is
+/// the only thing known about a resource nothing is held under.
 pub fn taggable_resource_not_found_message(resource_arn: &str) -> String {
-    format!("Could not find a taggable resource with arn {resource_arn}.")
+    match taggable_resource_type(resource_arn) {
+        Some(kind) => format!("Could not find {kind} with id {resource_arn}."),
+        None => format!("Could not find a taggable resource with arn {resource_arn}."),
+    }
+}
+
+/// The resource TYPE a `TaggableResourceArn` declares, named as a refusal names it, or
+/// `None` for an ARN of none of the four kinds.
+///
+/// The model's `TaggableResourceArn` puts the kind in the segment that FOLLOWS the
+/// account (`^arn:aws(-[a-z]{1,5}){0,3}:sso::` then `:instance/`, `:permissionSet/`, or a
+/// 12-digit account and then `:application/` or `:trustedTokenIssuer/`), so the kind is
+/// readable from the ARN itself — which is what lets a refusal name it even when nothing
+/// is held under the ARN. Matched THERE and nowhere else: a resource id that happens to
+/// hold one of those words is still the kind its own segment declares.
+fn taggable_resource_type(resource_arn: &str) -> Option<&'static str> {
+    let (prefix, rest) = resource_arn.split_once(":sso::")?;
+    if !prefix.starts_with("arn:") {
+        return None;
+    }
+    // What stands between `:sso::` and the kind is the owning account, which two of the
+    // four kinds carry and two leave empty.
+    let (_account, resource) = rest.split_once(':')?;
+    [
+        ("instance/", "Instance"),
+        ("permissionSet/", "PermissionSet"),
+        ("application/", TAGGABLE_TYPE_APPLICATION),
+        ("trustedTokenIssuer/", "TrustedTokenIssuer"),
+    ]
+    .into_iter()
+    .find_map(|(segment, kind)| resource.starts_with(segment).then_some(kind))
+}
+
+/// The resource type [`taggable_resource_type`] answers for an `ApplicationArn`.
+const TAGGABLE_TYPE_APPLICATION: &str = "Application";
+
+/// The refusal a tag REPORT answers a `ResourceArn` nothing is held under with, as the
+/// message of the modelled `ResourceNotFoundException`.
+///
+/// SOURCE: recorded behavior for an APPLICATION, which is the one kind the two paths of
+/// this surface word differently: `ListTagsForResource` answers the sentence the
+/// application's own reads answer ([`application_not_found_message`]), while
+/// `TagResource` and `UntagResource` name the resource KIND and the id they were asked
+/// for ([`taggable_resource_not_found_message`]). Nothing is recorded for the other three
+/// kinds, so they keep ONE wording across the whole surface rather than an asymmetry
+/// extended by analogy.
+pub fn tag_report_not_found_message(resource_arn: &str) -> String {
+    if taggable_resource_type(resource_arn) == Some(TAGGABLE_TYPE_APPLICATION) {
+        return application_not_found_message(resource_arn);
+    }
+    taggable_resource_not_found_message(resource_arn)
 }
 
 /// Why a tag WRITE could not reach the resource its `ResourceArn` named, as resolved by
@@ -958,9 +1033,9 @@ pub fn authentication_method_not_found_message(
     application_arn: &str,
     authentication_method_type: &str,
 ) -> String {
-    format!(
-        "Could not find authentication method {authentication_method_type} for \
-         application {application_arn}."
+    application_surface_not_found_message(
+        &format!("authentication method {authentication_method_type}"),
+        application_arn,
     )
 }
 
@@ -1054,7 +1129,7 @@ pub fn grant_member_required_message(member: &str, grant_type: &str) -> String {
 /// the grant type and the application it was looked for on, because an unconfigured grant
 /// type on a known application is a different failure from an unknown application.
 pub fn grant_not_found_message(application_arn: &str, grant_type: &str) -> String {
-    format!("Could not find grant {grant_type} for application {application_arn}.")
+    application_surface_not_found_message(&format!("grant {grant_type}"), application_arn)
 }
 
 /// The attribute-based access control (ABAC) configuration of an instance, as the
@@ -3554,7 +3629,7 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     ) -> Result<&Vec<Tag>, String> {
         self.tag_request_instance_scope(instance_arn)?;
         self.taggable_resource_tags(instance_arn, resource_arn)
-            .ok_or_else(|| taggable_resource_not_found_message(resource_arn))
+            .ok_or_else(|| tag_report_not_found_message(resource_arn))
     }
 
     /// The same resolution for an operation that CHANGES the tag set, which withholds one
@@ -4850,6 +4925,71 @@ pub fn cursor_after(
     }
 }
 
+/// Where a page RESUMES after the cursor key the previous page ended on, which is the one
+/// thing a sequence's order decides about its paging ([`page_from`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resume {
+    /// By the ORDER of the keys: this page is the items whose key sorts strictly after the
+    /// cursor. For a sequence that is ascending by key, so a create that lands before the
+    /// cursor cannot shift the enumeration.
+    AfterKeysUpTo,
+    /// By the cursor's own ENTRY: this page is the items that FOLLOW it in the sequence.
+    /// For a sequence served in the order its source publishes it, where a key says
+    /// nothing about position — so a cursor the sequence does not hold cannot be resumed
+    /// at all.
+    AfterTheEntry,
+}
+
+/// One page of `sequence`, resuming after `after` as `resume` decides, at most `limit`
+/// items (every remaining item when `None`), with the cursor the NEXT page resumes from.
+///
+/// `None` only for [`Resume::AfterTheEntry`] with a cursor the sequence does not hold:
+/// there is no position to resume at, and an empty page would silently end a caller's
+/// enumeration early.
+fn page_from<T>(
+    scope: &str,
+    sequence: impl IntoIterator<Item = (String, T)>,
+    after: Option<&str>,
+    limit: Option<usize>,
+    resume: Resume,
+) -> Option<(Vec<T>, Option<String>)> {
+    let mut resumed = after.is_none();
+    let mut items = Vec::new();
+    let mut last_key: Option<String> = None;
+    let mut truncated = false;
+    for (key, item) in sequence {
+        if !resumed {
+            match resume {
+                Resume::AfterKeysUpTo => {
+                    if after.is_some_and(|cursor| key.as_str() <= cursor) {
+                        continue;
+                    }
+                    resumed = true;
+                }
+                Resume::AfterTheEntry => {
+                    resumed = after == Some(key.as_str());
+                    continue;
+                }
+            }
+        }
+        if limit.is_some_and(|limit| items.len() == limit) {
+            truncated = true;
+            break;
+        }
+        last_key = Some(key);
+        items.push(item);
+    }
+    if !resumed {
+        return None;
+    }
+    let next_token = if truncated {
+        last_key.as_deref().map(|key| encode_page_token(scope, key))
+    } else {
+        None
+    };
+    Some((items, next_token))
+}
+
 /// One page of a key-ordered sequence.
 ///
 /// `ordered` is ascending by key; `after` is the key the previous page ended on, so
@@ -4862,26 +5002,34 @@ pub fn page<T>(
     max_results: Option<i32>,
 ) -> (Vec<T>, Option<String>) {
     let limit = max_results.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE) as usize;
-    let mut items = Vec::new();
-    let mut last_key: Option<String> = None;
-    let mut truncated = false;
-    for (key, item) in ordered {
-        if after.is_some_and(|cursor| key.as_str() <= cursor) {
-            continue;
-        }
-        if items.len() == limit {
-            truncated = true;
-            break;
-        }
-        last_key = Some(key);
-        items.push(item);
-    }
-    let next_token = if truncated {
-        last_key.as_deref().map(|key| encode_page_token(scope, key))
-    } else {
-        None
-    };
-    (items, next_token)
+    // Resuming by key order needs no entry to resume AT, so this page always exists; the
+    // empty default is unreachable and still answers a page rather than panicking.
+    page_from(scope, ordered, after, Some(limit), Resume::AfterKeysUpTo).unwrap_or_default()
+}
+
+/// One page of a sequence served in the order its SOURCE publishes it.
+///
+/// For a FIXED, service-published catalog the order its entries come back in is the
+/// service's own data, so this read reports them in the order the source holds them and
+/// imposes none of its own: `sequence` need not be key-ordered, and a page resumes at the
+/// entry that FOLLOWS the key the previous page ended on rather than at the first key
+/// that sorts after it. `max_results` absent is NO page size at all — every remaining
+/// entry in one page — because a page size the caller did not ask for is service
+/// behavior and not something a read may invent; a value the caller did ask for is
+/// honoured up to [`MAX_PAGE_SIZE`], the ceiling the model's `MaxResults` declares.
+///
+/// `None` when `after` names a key the sequence does not hold: that cursor cannot be
+/// resumed, and an empty page would silently end a caller's enumeration early, so the
+/// caller refuses it with [`BAD_CURSOR_MESSAGE`] exactly as it refuses a cursor of
+/// another scope.
+pub fn page_in_published_order<T>(
+    scope: &str,
+    sequence: impl IntoIterator<Item = (String, T)>,
+    after: Option<&str>,
+    max_results: Option<i32>,
+) -> Option<(Vec<T>, Option<String>)> {
+    let limit = max_results.map(|requested| requested.clamp(1, MAX_PAGE_SIZE) as usize);
+    page_from(scope, sequence, after, limit, Resume::AfterTheEntry)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

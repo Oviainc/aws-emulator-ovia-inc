@@ -8,13 +8,16 @@
 //! operation of this service creates one — so `ListApplicationProviders` REPORTS the
 //! service's application-provider catalogue
 //! ([`state::BUILT_IN_APPLICATION_PROVIDERS`], the same records
-//! `DescribeApplicationProvider` answers from): every entry exactly once, in
-//! `ApplicationProviderArn` order, every entry carrying the COMPLETE `DisplayData` the
-//! shape declares (`DisplayName`, `Description` and an `https` `IconUrl`) and a
-//! `ResourceServerConfig` exactly when the entry publishes access scopes, paged by ANY
-//! `MaxResults` the model's `range(1..100)` admits with a `NextToken` reported whenever
-//! entries remain and ABSENT on the last page. A `NextToken` this enumeration did not
-//! issue is refused with the modelled `ValidationException` (400), and it writes nothing.
+//! `DescribeApplicationProvider` answers from): every entry exactly once, in the
+//! CATALOGUE'S OWN order (the order of a service-published catalogue is the service's
+//! data, not something this read imposes), every entry carrying the COMPLETE `DisplayData`
+//! the shape declares (`DisplayName`, `Description` and an `https` `IconUrl`) and a
+//! `ResourceServerConfig` exactly when the entry publishes access scopes. A caller that
+//! names no `MaxResults` asked for no page size, so the whole catalogue comes back in ONE
+//! page; any `MaxResults` the model's `range(1..100)` admits pages it, with a `NextToken`
+//! reported whenever entries remain and ABSENT on the last page. A `NextToken` this
+//! enumeration did not issue is refused with the modelled `ValidationException` (400),
+//! and it writes nothing.
 //!
 //! The tables span what the rule generalises over: the page size (both published bounds,
 //! one past each bound, sizes that divide the catalogue and sizes that do not, and the
@@ -76,16 +79,16 @@ async fn list(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
     call(router, "ListApplicationProviders", request).await
 }
 
-/// The ARNs of the catalogue, ascending — what EVERY enumeration of it must report, in
-/// this order. Built from the crate's own catalogue, so a provider added to it is
-/// covered here without editing this test.
-fn expected_arns() -> Vec<String> {
-    let mut arns: Vec<String> = state::BUILT_IN_APPLICATION_PROVIDERS
+/// The ARNs of the catalogue, in the order the catalogue publishes them — what EVERY
+/// enumeration of it must report, in this order. Built from the crate's own catalogue, so
+/// a provider added to it is covered here without editing this test. Shared with
+/// `application_provider_resolution.rs`, which asserts the same projection over a single
+/// unparameterised call.
+pub(crate) fn expected_arns() -> Vec<String> {
+    state::BUILT_IN_APPLICATION_PROVIDERS
         .iter()
         .map(|provider| format!("arn:aws:sso::aws:applicationProvider/{}", provider.id))
-        .collect();
-    arns.sort();
-    arns
+        .collect()
 }
 
 /// The ARN of each provider in `providers`, in the order reported.
@@ -104,8 +107,8 @@ fn arns(providers: &[Value]) -> Vec<String> {
 }
 
 /// Every entry of the catalogue, read by paging the enumeration to its end with
-/// `max_results` per page (or the service's own page size when `None`), plus the number
-/// of pages it took.
+/// `max_results` per page (or in the single page a call that names no `MaxResults` is
+/// answered with), plus the number of pages it took.
 async fn enumerate(
     router: &MultiServiceRouter,
     max_results: Option<i64>,
@@ -114,7 +117,6 @@ async fn enumerate(
     let mut entries: Vec<Value> = Vec::new();
     let mut next_token: Option<String> = None;
     let mut pages = 0usize;
-    let limit = max_results.unwrap_or(MAX_RESULTS_MAX) as usize;
     loop {
         let mut request = json!({});
         if let Some(size) = max_results {
@@ -132,11 +134,13 @@ async fn enumerate(
             .as_array()
             .unwrap_or_else(|| panic!("case {case:?}: no ApplicationProviders in {body}"))
             .clone();
-        assert!(
-            page.len() <= limit,
-            "case {case:?}: a page holds at most {limit} providers, got {} in {body}",
-            page.len()
-        );
+        if let Some(limit) = max_results.map(|size| size as usize) {
+            assert!(
+                page.len() <= limit,
+                "case {case:?}: a page holds at most {limit} providers, got {} in {body}",
+                page.len()
+            );
+        }
         entries.extend(page.iter().cloned());
         pages += 1;
         assert!(
@@ -150,6 +154,12 @@ async fn enumerate(
                     "case {case:?}: NextToken must satisfy the modelled Token pattern, \
                      got {token:?}"
                 );
+                let limit = max_results.unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: a call that names no MaxResults must answer the \
+                         whole catalogue in one page, got a NextToken: {body}"
+                    )
+                }) as usize;
                 assert_eq!(
                     page.len(),
                     limit,
@@ -165,18 +175,24 @@ async fn enumerate(
     (entries, pages)
 }
 
-/// RULE — a full enumeration reports exactly the catalogue, once per entry, ascending by
-/// ARN.
+/// RULE — a single call that names no `MaxResults` reports exactly the catalogue, once
+/// per entry, in the catalogue's own order, in ONE page.
 #[tokio::test]
-async fn the_catalogue_is_reported_once_per_entry_in_arn_order() {
+async fn the_whole_catalogue_is_reported_once_per_entry_in_catalogue_order() {
     let router = router();
-    let (entries, _) = enumerate(&router, None, "the service's own page size").await;
+    let (entries, pages) = enumerate(&router, None, "no MaxResults").await;
     let reported = arns(&entries);
     assert_eq!(
         reported,
         expected_arns(),
-        "the enumeration must report exactly the catalogue, ascending by ARN, got {} \
-         entries",
+        "the enumeration must report exactly the catalogue, in the catalogue's own order, \
+         got {} entries",
+        reported.len()
+    );
+    assert_eq!(
+        pages, 1,
+        "a call that names no MaxResults must answer the whole catalogue in one page, got \
+         {pages} pages for {} entries",
         reported.len()
     );
 }
@@ -187,7 +203,7 @@ async fn the_catalogue_is_reported_once_per_entry_in_arn_order() {
 #[tokio::test]
 async fn the_catalogue_holds_both_provider_forms_and_more_than_one_page() {
     let router = router();
-    let (entries, pages) = enumerate(&router, None, "the service's own page size").await;
+    let (entries, pages) = enumerate(&router, Some(MAX_RESULTS_MAX), "the largest page").await;
     let reported = arns(&entries);
 
     let catalog_entries: Vec<&String> = reported
@@ -226,7 +242,8 @@ async fn the_catalogue_holds_both_provider_forms_and_more_than_one_page() {
 }
 
 /// RULE — over every page size the model admits: paging enumerates exactly the
-/// catalogue, once per entry, in ARN order, and only a FULL page carries a `NextToken`.
+/// catalogue, once per entry, in the catalogue's own order, and only a FULL page carries
+/// a `NextToken`.
 #[tokio::test]
 async fn paging_enumerates_the_whole_catalogue_once_for_every_page_size() {
     let router = router();
@@ -257,7 +274,8 @@ async fn paging_enumerates_the_whole_catalogue_once_for_every_page_size() {
         assert_eq!(
             arns(&entries),
             expected,
-            "case {case:?}: paging must report exactly the catalogue, in ARN order"
+            "case {case:?}: paging must report exactly the catalogue, in the catalogue's \
+             own order"
         );
     }
 }
@@ -269,7 +287,7 @@ async fn paging_enumerates_the_whole_catalogue_once_for_every_page_size() {
 #[tokio::test]
 async fn every_listed_entry_matches_the_catalogue_and_its_describe() {
     let router = router();
-    let (listed, _) = enumerate(&router, None, "the service's own page size").await;
+    let (listed, _) = enumerate(&router, None, "no MaxResults").await;
 
     for provider in state::BUILT_IN_APPLICATION_PROVIDERS {
         let arn = format!("arn:aws:sso::aws:applicationProvider/{}", provider.id);

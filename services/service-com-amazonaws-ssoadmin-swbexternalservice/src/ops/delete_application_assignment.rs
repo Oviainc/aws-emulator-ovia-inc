@@ -189,18 +189,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.principal_id,
         ) else {
             let message = if store.application(&input.application_arn).is_none() {
-                crate::state::application_not_found_message(&input.application_arn)
-            } else {
-                crate::state::application_assignment_not_found_message(
+                Some(crate::state::application_not_found_message(
                     &input.application_arn,
-                    &input.principal_type,
-                    &input.principal_id,
-                )
+                ))
+            } else {
+                crate::state::APPLICATION_ASSIGNMENT_NOT_FOUND_MESSAGE.map(str::to_string)
             };
             return Err(
                 DeleteApplicationAssignmentErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(message),
+                        message,
                         // The model's `ResourceNotFoundExceptionReason` enum carries only
                         // KMS key states, none of which this refusal is.
                         reason: None,
