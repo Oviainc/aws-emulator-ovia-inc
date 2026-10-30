@@ -59,6 +59,8 @@ mod campaign_state_batch;
 mod campaign_stop;
 #[path = "all/common.rs"]
 mod common;
+#[path = "all/communication_limit_range.rs"]
+mod communication_limit_range;
 #[path = "all/communication_limits_refusal_wording.rs"]
 mod communication_limits_refusal_wording;
 #[path = "all/communication_time_window_constraints.rs"]

@@ -371,6 +371,16 @@ pub const MAX_COMMUNICATION_LIMITS: usize = 2;
 /// `aws_smithy_schema_server::constraints::envelope` — the one place that wording
 /// lives — so this handler refusal and a boundary refusal of the same `@length` read
 /// identically.
+///
+/// The list's LENGTH is the whole of what is weighed here, and that is not a partial
+/// compensation: the ELEMENTS arrive already checked. The walk descends through the
+/// union member into each `CommunicationLimit` and judges it against that structure's
+/// generated schema, whose member schemas carry the model's own constraints — the
+/// `@range` of `maxCountPerRecipient` and of `frequency`, and the
+/// `CommunicationLimitTimeUnit` catalog of `unit` — reporting a failure at
+/// `<member>.<position>.member.<name>`. Only the union MEMBER's own traits are missing
+/// from that walk (a union's generated member schemas carry none), which is exactly the
+/// `@length` below. Pinned end to end by `tests/all/communication_limit_range.rs`.
 pub fn communication_limits_violation(
     member: &str,
     limits: Option<&CommunicationLimits>,
