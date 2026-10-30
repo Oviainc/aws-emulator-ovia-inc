@@ -44,7 +44,7 @@ use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::api_lifecycle::{as_str, call, emulator, error_code};
+use crate::api_lifecycle::{as_str, assert_minted_id, call, emulator, error_code};
 
 /// The stage name the fixture's api carries. "Stage names can only contain alphanumeric
 /// characters, hyphens, and underscores" (`CreateStage$StageName`).
@@ -56,8 +56,8 @@ fn max_results_refusal(raw: &str) -> String {
     format!("Invalid value for MaxResults: '{raw}'. MaxResults must be a positive integer.")
 }
 
-/// Identifiers nothing minted, spanning the forms a client can send: the service's own
-/// ten-character shape, a single character, the longest id any member of this model
+/// Identifiers nothing minted, spanning the forms a client can send: an eleven-character
+/// lowercase-alphanumeric one, a single character, the longest id any member of this model
 /// admits (`__stringMin10Max30PatternAZ09`), and a mixed-case one.
 fn unminted_identifiers() -> Vec<String> {
     vec![
@@ -814,19 +814,11 @@ async fn an_identifier_minted_for_one_kind_addresses_nothing_of_another_kind() {
     let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
     for (kind, id) in &fixture.minted {
         // Folding the kind into the id changes WHICH id each kind gets, not its shape:
-        // every minted id is still ten lowercase alphanumerics, the form `Id` carries
-        // throughout this service (and the `^[a-z0-9]+$`, len 10..30 the portal-product
-        // and portal members are modelled with).
-        assert_eq!(
-            id.chars().count(),
-            10,
-            "case {kind:?}: expected a ten-character minted id, got {id:?}"
-        );
-        assert!(
-            id.chars()
-                .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit()),
-            "case {kind:?}: expected a lowercase alphanumeric minted id, got {id:?}"
-        );
+        // every minted id is still lowercase alphanumerics, as many of them as its kind's
+        // convention gives it (`minted_id_len`) — and the account-level ids still satisfy
+        // the `^[a-z0-9]+$`, len 10..30 the portal-product and portal members are
+        // modelled with.
+        assert_minted_id(kind, kind, id);
         if let Some(other) = seen.insert(id.as_str(), kind.as_ref()) {
             panic!(
                 "case {kind:?}: the id {id:?} is also the {other:?} id — a minted \

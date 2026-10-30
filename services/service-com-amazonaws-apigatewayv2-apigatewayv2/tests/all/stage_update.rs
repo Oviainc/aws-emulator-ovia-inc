@@ -48,8 +48,9 @@ const MAX_STAGE_VARIABLE_VALUE_LEN: usize = 2048;
 /// `DeploymentStatus` declares — `PENDING | FAILED | DEPLOYED`.
 const DEPLOYED: &str = "DEPLOYED";
 
-/// A `DeploymentId` of the service's own shape (ten lowercase alphanumerics) that no api
-/// ever minted, for the row that names a deployment which is not there.
+/// A `DeploymentId` drawn from the alphabet this service mints ids from (lowercase
+/// alphanumerics) that no api ever minted, for the row that names a deployment which is
+/// not there.
 const UNMINTED_DEPLOYMENT_ID: &str = "zzzzzzzzzz";
 
 /// The placeholder a row writes where a real, service-minted `DeploymentId` has to go:

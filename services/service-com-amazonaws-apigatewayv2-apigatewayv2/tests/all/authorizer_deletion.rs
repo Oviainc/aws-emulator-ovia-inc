@@ -16,8 +16,8 @@
 //!   route's `AuthorizerId` and the same delete then succeeds.
 //! * **An identifier that resolves to nothing is a 404**: an api that does not exist, an
 //!   authorizer id nothing minted, and an authorizer addressed through another api — and
-//!   an `AuthorizerId` is unique only within its own api, so a route of ANOTHER api
-//!   carrying the same id blocks nothing.
+//!   an `AuthorizerId` resolves only through its own api, so a route of ANOTHER api
+//!   naming an authorizer of that api blocks nothing here.
 //!
 //! The rows vary what the rules generalise over: the owning api's protocol type (`HTTP`,
 //! `WEBSOCKET`), the authorizer type (`JWT`, `REQUEST`), how many routes reference the
@@ -539,9 +539,9 @@ async fn delete_authorizer_is_refused_while_a_route_of_its_api_names_it() {
     }
 }
 
-/// An `AuthorizerId` is unique only within the api that owns it, so a route of ANOTHER
-/// api naming the same id references nothing here: only the routes of the authorizer's
-/// OWN api can block its delete.
+/// An `AuthorizerId` resolves only through the api that owns it, so a route of ANOTHER
+/// api naming an authorizer of its own blocks nothing here: only the routes of the
+/// authorizer's OWN api can block its delete.
 #[tokio::test]
 async fn a_route_of_another_api_does_not_block_the_delete() {
     let emulator = emulator();
@@ -555,10 +555,10 @@ async fn a_route_of_another_api_does_not_block_the_delete() {
     )
     .await;
 
-    // A route of a DIFFERENT api, naming the very same `AuthorizerId`. That api holds an
-    // authorizer of its own under the same id — an `AuthorizerId` is unique only within
-    // its api, and both apis mint from their own sequence — so the reference resolves
-    // there, against the bystander's OWN authorizer.
+    // A DIFFERENT api, holding an authorizer of its own — a minted `AuthorizerId` denotes
+    // ONE authorizer, so the bystander's carries an id of its own — named by a route of
+    // that api. A route may only name an authorizer of its own api, so this is the
+    // blocking reference that exists anywhere but in the owner's api.
     let bystander = create_api(&emulator, "the bystander api", "scoped-other-api", "HTTP").await;
     let bystander_authorizer = create_authorizer(
         &emulator,
@@ -567,10 +567,10 @@ async fn a_route_of_another_api_does_not_block_the_delete() {
         jwt_authorizer("scoped-bystander-authorizer"),
     )
     .await;
-    assert_eq!(
+    assert_ne!(
         bystander_authorizer, authorizer_id,
-        "each api mints its authorizer ids from its own sequence, so the first authorizer \
-         of either api carries the same id; got {bystander_authorizer} and {authorizer_id}"
+        "a minted AuthorizerId denotes one authorizer, so the bystander api's must differ \
+         from the owner's; got {bystander_authorizer} and {authorizer_id}"
     );
     let bystander_route = create_route(
         &emulator,
@@ -578,7 +578,7 @@ async fn a_route_of_another_api_does_not_block_the_delete() {
         &bystander,
         "GET /scoped",
         "JWT",
-        Some(authorizer_id.clone()),
+        Some(bystander_authorizer.clone()),
     )
     .await;
 
@@ -601,7 +601,7 @@ async fn a_route_of_another_api_does_not_block_the_delete() {
     );
     assert_eq!(
         route.get("authorizerId"),
-        Some(&json!(authorizer_id)),
+        Some(&json!(bystander_authorizer)),
         "expected the other api's route to keep its AuthorizerId, got {route}"
     );
 

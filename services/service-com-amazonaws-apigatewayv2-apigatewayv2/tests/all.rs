@@ -93,6 +93,8 @@ mod integration_update;
 mod integration_validation;
 #[path = "all/iso8601_timestamp_members.rs"]
 mod iso8601_timestamp_members;
+#[path = "all/minted_id_shape.rs"]
+mod minted_id_shape;
 #[path = "all/model_lifecycle.rs"]
 mod model_lifecycle;
 #[path = "all/model_template.rs"]

@@ -243,35 +243,40 @@ async fn each_product_holds_its_own_pages_with_distinct_ids() {
         );
     }
 
-    // A page id is only unique WITHIN the product that owns it, so each product's first
-    // page carries the same id: what the FIRST product reports for that id is its OWN
-    // page, never the second product's.
-    assert_eq!(
-        other_id,
-        first_ids[0],
-        "a ProductPageId is minted per product, so each product's first page carries the \
-         same id; got {other_id:?} against the first product's {:?}",
-        first_ids[0]
+    // A page id denotes ONE page: the second product's first page carries an id the first
+    // product never minted, so what the FIRST product reports under its own id is its own
+    // page, and the second product's id names no page of the first.
+    assert!(
+        !first_ids.contains(&other_id),
+        "the second product's page id {other_id:?} must be one the first product did not \
+         mint, got the first product's {first_ids:?}"
     );
-    let (shared_status, shared) =
-        call(&emulator, "GET", &format!("{}/{other_id}", pages_of(&first)), None).await;
+    let own_id = first_ids[0].clone();
+    let (own_status, own) =
+        call(&emulator, "GET", &format!("{}/{own_id}", pages_of(&first)), None).await;
     assert_eq!(
-        shared_status, 200,
-        "expected 200 reading the first product's own page {other_id:?}, got {shared_status} {shared}"
+        own_status, 200,
+        "expected 200 reading the first product's own page {own_id:?}, got {own_status} {own}"
     );
     assert_eq!(
-        as_str(&shared, "productPageArn"),
-        expected_arn(REGION, &first, &other_id),
+        as_str(&own, "productPageArn"),
+        expected_arn(REGION, &first, &own_id),
         "a page read under the first product must be the first product's own, got {:?}",
-        as_str(&shared, "productPageArn")
+        as_str(&own, "productPageArn")
     );
     assert_eq!(
-        shared
-            .get("displayContent")
+        own.get("displayContent")
             .and_then(|content| content.get("title"))
             .and_then(Value::as_str),
         Some("Page 0"),
-        "the first product must report its own page, not the second product's: {shared}"
+        "the first product must report its own page, not the second product's: {own}"
+    );
+    let (foreign_status, foreign) =
+        call(&emulator, "GET", &format!("{}/{other_id}", pages_of(&first)), None).await;
+    assert_eq!(
+        foreign_status, 404,
+        "expected 404 reading the second product's page under the first, got \
+         {foreign_status} {foreign}"
     );
 
     // An id only the SECOND product minted names no page of the first: the fourth page of

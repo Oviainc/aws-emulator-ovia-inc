@@ -328,10 +328,8 @@ async fn a_schema_that_is_no_schema_document_of_its_content_type_is_refused() {
         );
     }
 
-    // Every create above was refused, so the api persisted nothing AND minted nothing:
-    // the first model it accepts carries the FIRST id of its own id bijection, which is
-    // the id a fresh api's first model carries too. A refused create that had minted an
-    // id, or stored a record, would have moved this api's sequence on.
+    // Every create above was refused, so the api persisted nothing: the one model it then
+    // accepts is the ONLY model it holds, with nothing a refused create left behind.
     let (status, created) = call(
         &emulator,
         "POST",
@@ -348,29 +346,23 @@ async fn a_schema_that_is_no_schema_document_of_its_content_type_is_refused() {
         "expected 201 for a well-formed model after the refusals, got {status} {created}"
     );
     let after_refusals = as_str(&created, "modelId");
+    assert_minted_id("after the refusals", "modelId", &after_refusals);
 
-    let fresh = create_api(&emulator, "a fresh api", "model-refusals-fresh-api").await;
-    let (status, first) = call(
-        &emulator,
-        "POST",
-        &format!("/v2/apis/{fresh}/models"),
-        Some(json!({
-            "name": "WellFormed",
-            "contentType": "application/json",
-            "schema": draft4_schema()
-        })),
-    )
-    .await;
+    let (status, listed) = call(&emulator, "GET", &format!("/v2/apis/{api_id}/models"), None).await;
     assert_eq!(
-        status, 201,
-        "expected 201 for the fresh api's first model, got {status} {first}"
+        status, 200,
+        "expected 200 from GetModels after the refusals, got {status} {listed}"
     );
+    let held: Vec<String> = listed
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().map(|item| as_str(item, "modelId")).collect())
+        .unwrap_or_default();
     assert_eq!(
-        after_refusals,
-        as_str(&first, "modelId"),
-        "expected the refused creates to have minted nothing, so the api's first \
-         accepted model carries the same id a fresh api's first model does, got \
-         {after_refusals:?} and {first}"
+        held,
+        vec![after_refusals.clone()],
+        "expected the refused creates to have persisted nothing, so the api holds only the \
+         model it accepted ({after_refusals:?}), got {listed}"
     );
 
     // And that one model is the ONLY model the api holds: an id nothing minted is not

@@ -607,7 +607,8 @@ async fn an_authorizer_is_addressed_by_the_api_that_owns_it_and_its_own_id() {
     let authorizer_id = as_str(&created, "authorizerId");
     let rename = json!({ "name": "renamed" });
 
-    // Ten lowercase alphanumerics, this service's own id form, that no record carries.
+    // Lowercase alphanumerics, the alphabet this service mints an id from, that no record
+    // carries.
     const ABSENT_ID: &str = "zzzz999zzz";
     for (case, api, id) in [
         ("an api no record holds", ABSENT_ID, authorizer_id.as_str()),

@@ -484,9 +484,9 @@ async fn an_auto_released_deployment_a_stage_serves_cannot_be_deleted_either() {
     );
 }
 
-/// A `DeploymentId` is unique only within the api that owns it, so a stage of ANOTHER api
-/// serving the same id references nothing here: only the stages of the deployment's OWN
-/// api can block its delete.
+/// A `DeploymentId` resolves only through the api that owns it, so a stage of ANOTHER api
+/// serving a deployment of its own blocks nothing here: only the stages of the
+/// deployment's OWN api can block its delete.
 #[tokio::test]
 async fn a_stage_of_another_api_does_not_block_the_delete() {
     let emulator = emulator();
@@ -495,8 +495,8 @@ async fn a_stage_of_another_api_does_not_block_the_delete() {
     let deployment_id =
         create_deployment(&emulator, "the owning api's deployment", &owner, json!({})).await;
 
-    // A DIFFERENT api, whose own first deployment carries the very same id — each api
-    // mints from its own sequence — with a stage serving it.
+    // A DIFFERENT api, with a deployment of its own — a minted id denotes ONE deployment,
+    // so the bystander's carries an id of its own — and a stage serving it.
     let bystander = create_api(&emulator, "the bystander api", &http_api("scoped-other-api")).await;
     let bystander_deployment = create_deployment(
         &emulator,
@@ -505,10 +505,10 @@ async fn a_stage_of_another_api_does_not_block_the_delete() {
         json!({}),
     )
     .await;
-    assert_eq!(
+    assert_ne!(
         bystander_deployment, deployment_id,
-        "each api mints its deployment ids from its own sequence, so the first deployment \
-         of either api carries the same id; got {bystander_deployment} and {deployment_id}"
+        "a minted DeploymentId denotes one deployment, so the bystander api's must differ \
+         from the owner's; got {bystander_deployment} and {deployment_id}"
     );
     create_stage(
         &emulator,

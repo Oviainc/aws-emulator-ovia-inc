@@ -336,9 +336,9 @@ async fn delete_integration_removes_the_record_and_a_later_read_reports_not_foun
     }
 }
 
-/// An `IntegrationId` is unique only within the api that owns it, so a route of ANOTHER
-/// api naming the same id references nothing here: only the routes of the integration's
-/// OWN api can block its delete.
+/// An `IntegrationId` resolves only through the api that owns it, so a route of ANOTHER
+/// api targeting an integration of its own blocks nothing here: only the routes of the
+/// integration's OWN api can block its delete.
 #[tokio::test]
 async fn a_route_of_another_api_does_not_block_the_delete() {
     let emulator = emulator();
@@ -356,10 +356,10 @@ async fn a_route_of_another_api_does_not_block_the_delete() {
     )
     .await;
 
-    // A route of a DIFFERENT api, carrying the very same target string. That api holds
-    // an integration of its own under the same id — an `IntegrationId` is unique only
-    // within its api, and both apis mint from their own sequence — so the target
-    // resolves there, against the bystander's OWN integration.
+    // A DIFFERENT api, holding an integration of its own — a minted `IntegrationId`
+    // denotes ONE integration, so the bystander's carries an id of its own — targeted by a
+    // route of that api. A route may only target an integration of its own api, so this is
+    // the blocking reference that exists anywhere but in the owner's api.
     let bystander = create_api(&emulator, "the bystander api", &http_api("scoped-other-api")).await;
     let bystander_integration = create_integration(
         &emulator,
@@ -372,18 +372,17 @@ async fn a_route_of_another_api_does_not_block_the_delete() {
         }),
     )
     .await;
-    assert_eq!(
+    assert_ne!(
         bystander_integration, integration_id,
-        "each api mints its integration ids from its own sequence, so the first \
-         integration of either api carries the same id; got {bystander_integration} and \
-         {integration_id}"
+        "a minted IntegrationId denotes one integration, so the bystander api's must \
+         differ from the owner's; got {bystander_integration} and {integration_id}"
     );
     let bystander_route = create_route(
         &emulator,
         "the bystander api's route",
         &bystander,
         "GET /scoped",
-        Some(integration_target(&integration_id)),
+        Some(integration_target(&bystander_integration)),
     )
     .await;
 
@@ -406,8 +405,15 @@ async fn a_route_of_another_api_does_not_block_the_delete() {
     );
     assert_eq!(
         route.get("target"),
-        Some(&json!(integration_target(&integration_id))),
+        Some(&json!(integration_target(&bystander_integration))),
         "expected the other api's route to keep its target, got {route}"
+    );
+
+    // And the bystander's own integration, which its route targets, is still refused.
+    let (status, body) = delete_integration(&emulator, &bystander, &bystander_integration).await;
+    assert_eq!(
+        status, 409,
+        "expected 409 for the integration the bystander's route targets, got {status} {body}"
     );
 }
 

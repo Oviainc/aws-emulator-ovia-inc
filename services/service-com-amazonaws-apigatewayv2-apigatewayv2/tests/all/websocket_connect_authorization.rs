@@ -559,8 +559,8 @@ async fn a_route_must_name_an_authorizer_its_api_holds() {
     .await;
     assert_eq!(status, 201, "CreateApi must answer 201, got {created}");
     let api_id = as_str(&created, "apiId");
-    // Ten lowercase alphanumerics, this service's own id form, that no authorizer of this
-    // api carries.
+    // Lowercase alphanumerics, the alphabet this service mints an id from, that no
+    // authorizer of this api carries.
     let (status, refused) = call(
         &emulator,
         "POST",

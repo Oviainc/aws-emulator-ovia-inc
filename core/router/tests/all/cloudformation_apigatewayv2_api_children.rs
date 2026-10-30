@@ -47,10 +47,10 @@ use crate::cloudformation_provisions_stack_resources::{xml_text, xml_texts};
 /// The account id every ARN this emulator mints carries.
 const ACCOUNT_ID: &str = "000000000000";
 
-/// How many characters an identifier API Gateway v2 mints carries, and the alphabet it
-/// draws them from: ten lowercase alphanumerics, the shape this service's own
-/// `Id`-targeting members are minted in (`api_lifecycle.rs` pins it for `CreateApi`).
-const MINTED_ID_LEN: usize = 10;
+/// How many characters an identifier API Gateway v2 mints for an API itself carries, and
+/// the alphabet every minted id draws from: ten lowercase alphanumerics (`api_lifecycle.rs`
+/// in that service's own suite pins it for `CreateApi`).
+const API_ID_LEN: usize = 10;
 
 /// The status a stack that created everything it declared reports.
 const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
@@ -433,9 +433,21 @@ const ROWS: &[Row] = &[
     },
 ];
 
-/// Whether `value` is an identifier of the shape API Gateway v2 mints one in.
-fn is_minted_id(value: &str) -> bool {
-    value.chars().count() == MINTED_ID_LEN
+/// How many characters the identifier of a resource nested INSIDE an api carries, by the
+/// collection it lives in: the short opaque form API Gateway v2 answers for those
+/// (`minted_id_shape.rs` in that service's own suite pins the shape per kind).
+fn nested_id_len(collection: &str) -> usize {
+    match collection {
+        "routes" | "integrations" => 7,
+        "authorizers" | "deployments" | "models" => 6,
+        other => panic!("this suite knows no minted-id length for the {other:?} collection"),
+    }
+}
+
+/// Whether `value` is an identifier of the shape API Gateway v2 mints one in, `expected_len`
+/// characters long.
+fn is_minted_id(value: &str, expected_len: usize) -> bool {
+    value.chars().count() == expected_len
         && value
             .chars()
             .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
@@ -506,7 +518,7 @@ async fn a_stack_creates_the_resources_that_live_inside_the_api_it_declares() {
             .unwrap_or_else(|| panic!("case {case:?}: expected an ApiRef output in {outputs:?}"))
             .clone();
         assert!(
-            is_minted_id(&api_id),
+            is_minted_id(&api_id, API_ID_LEN),
             "case {case:?}: expected the api's Ref to be an id API Gateway v2 minted, got \
              {api_id:?}"
         );
@@ -526,7 +538,7 @@ async fn a_stack_creates_the_resources_that_live_inside_the_api_it_declares() {
             match &expected.name {
                 None => {
                     assert!(
-                        is_minted_id(published),
+                        is_minted_id(published, nested_id_len(expected.collection)),
                         "case {case:?}/{logical_id}: expected the Ref to be an id API Gateway \
                          v2 minted, got {published:?}"
                     );
@@ -692,7 +704,7 @@ async fn an_api_declared_with_an_inline_definition_is_imported_and_readable() {
         .unwrap_or_else(|| panic!("case {case:?}: expected an ApiRef output in {outputs:?}"))
         .clone();
     assert!(
-        is_minted_id(&api_id),
+        is_minted_id(&api_id, API_ID_LEN),
         "case {case:?}: expected the api's Ref to be an id API Gateway v2 minted, got {api_id:?}"
     );
 

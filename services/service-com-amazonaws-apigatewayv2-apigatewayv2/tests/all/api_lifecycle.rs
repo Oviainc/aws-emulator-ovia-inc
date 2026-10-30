@@ -22,9 +22,19 @@ use smithy_server_runtime::MultiServiceRouter;
 /// `us-east-1` default, so an `ApiEndpoint` built from a hardcoded region fails.
 const REGION: &str = "eu-west-1";
 
-/// `Id` is an unconstrained string in the model, so this is the service's own
-/// convention for a minted id: ten lowercase alphanumerics.
-const ID_LEN: usize = 10;
+/// How many characters the id of a resource the ACCOUNT holds carries (and of the pages
+/// and mappings nested in one). `Id` is an unconstrained string in the model, so the
+/// length of a minted id is this service's own convention per kind of resource.
+const ACCOUNT_ID_LEN: usize = 10;
+
+/// How many characters the id of a resource nested inside an api carries: the short
+/// opaque form API Gateway v2 answers for an authorizer, a model, a deployment, a route
+/// response and an integration response.
+const NESTED_ID_LEN: usize = 6;
+
+/// How many characters a `RouteId` and an `IntegrationId` carry: one more than
+/// [`NESTED_ID_LEN`].
+const ROUTE_ID_LEN: usize = 7;
 
 /// A fresh emulator holding only this service, with request authentication off.
 pub(crate) fn emulator() -> MultiServiceRouter {
@@ -318,12 +328,32 @@ pub(crate) fn strip_nulls(value: &Value) -> Value {
     }
 }
 
-/// A minted id is ten lowercase alphanumerics.
+/// How many characters the id this service mints for `kind` carries.
+///
+/// `kind` is the member a response reports the id under (`authorizerId`, `RouteId`) or the
+/// resource kind itself, in any case. An unknown kind panics rather than being waved
+/// through on a default, so a member added here without a length is a failure.
+pub(crate) fn minted_id_len(kind: &str) -> usize {
+    let lowered = kind.to_ascii_lowercase();
+    match lowered.strip_suffix("id").unwrap_or(&lowered) {
+        "api" | "portal" | "portalproduct" | "productpage" | "productrestendpointpage"
+        | "vpclink" | "domainname" | "apimapping" | "routingrule" => ACCOUNT_ID_LEN,
+        "route" | "integration" => ROUTE_ID_LEN,
+        "model" | "deployment" | "authorizer" | "routeresponse" | "integrationresponse" => {
+            NESTED_ID_LEN
+        }
+        other => panic!("this suite knows no minted-id length for {other:?}"),
+    }
+}
+
+/// A minted id is lowercase alphanumerics, as many of them as its kind's convention gives
+/// it ([`minted_id_len`]).
 pub(crate) fn assert_minted_id(case: &str, member: &str, id: &str) {
+    let expected = minted_id_len(member);
     assert_eq!(
         id.len(),
-        ID_LEN,
-        "case {case:?}: expected a {ID_LEN}-character {member}, got {id:?}"
+        expected,
+        "case {case:?}: expected a {expected}-character {member}, got {id:?}"
     );
     assert!(
         id.chars().all(|c| c.is_ascii_digit() || c.is_ascii_lowercase()),

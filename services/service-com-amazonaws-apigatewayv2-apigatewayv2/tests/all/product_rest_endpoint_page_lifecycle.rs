@@ -677,9 +677,9 @@ async fn a_request_that_identifies_no_endpoint_is_refused_and_persists_nothing()
         );
     }
 
-    // Every create above was refused, so nothing was persisted AND no id was minted: the
-    // first page this product accepts carries the FIRST id of the product's own id
-    // bijection, which is the id a fresh product's first page carries too.
+    // Every create above was refused, so the only page this product holds is the one it
+    // then accepts: it reads back under the id that create answered, carrying the
+    // endpoint the ACCEPTED request named and none of the refused ones'.
     let accepted = json!({
         "restEndpointIdentifier": {
             "identifierParts": {
@@ -690,30 +690,29 @@ async fn a_request_that_identifies_no_endpoint_is_refused_and_persists_nothing()
             }
         }
     });
-    let (status, created) = call(&emulator, "POST", &collection, Some(accepted.clone())).await;
+    let (status, created) = call(&emulator, "POST", &collection, Some(accepted)).await;
     assert_eq!(
         status, 201,
         "expected 201 for a valid page after the refusals, got {status} {created}"
     );
+    let page_id = as_str(&created, "productRestEndpointPageId");
+    assert_minted_id("after the refusals", "productRestEndpointPageId", &page_id);
 
-    let fresh = emulator;
-    let other_product = product(&fresh, "Fresh product").await;
-    let (status, first) = call(
-        &fresh,
-        "POST",
-        &pages_of(&other_product),
-        Some(accepted),
-    )
-    .await;
+    let (status, fetched) = call(&emulator, "GET", &format!("{collection}/{page_id}"), None).await;
     assert_eq!(
-        status, 201,
-        "expected 201 for a fresh product's first page, got {status} {first}"
+        status, 200,
+        "expected 200 from GetProductRestEndpointPage for the accepted page, got {status} \
+         {fetched}"
     );
     assert_eq!(
-        as_str(&created, "productRestEndpointPageId"),
-        as_str(&first, "productRestEndpointPageId"),
-        "expected the refused creates to have minted nothing, so the first accepted page \
-         carries the id a fresh product's first page does, got {created} and {first}"
+        fetched.get("restEndpointIdentifier"),
+        created.get("restEndpointIdentifier"),
+        "expected the accepted page to read back as it was created, got {fetched}"
+    );
+    assert!(
+        content_member(&fetched, "endpoint")
+            .is_some_and(|endpoint| endpoint.contains("accepted01")),
+        "expected the page to carry the accepted request's endpoint, got {fetched}"
     );
 }
 

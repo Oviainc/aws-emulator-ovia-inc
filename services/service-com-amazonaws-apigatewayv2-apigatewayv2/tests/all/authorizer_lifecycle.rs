@@ -570,9 +570,8 @@ async fn a_configuration_its_type_or_protocol_does_not_admit_is_refused() {
     }
 
     // Every create above was refused under its own api. Repeating them all against ONE
-    // api persists nothing and mints nothing there: the first authorizer that api
-    // accepts carries the FIRST id of its own id bijection, which is the id a fresh
-    // api's first authorizer carries too.
+    // api persists nothing there: after the refusals that api holds exactly the one
+    // authorizer it then accepts, and nothing a refused create left behind.
     let shared = create_api(&emulator, "the shared api", "authorizer-refusal-shared", "HTTP").await;
     for refusal in config_refusals() {
         if refusal.protocol != "HTTP" {
@@ -602,7 +601,7 @@ async fn a_configuration_its_type_or_protocol_does_not_admit_is_refused() {
         &emulator,
         "POST",
         &format!("/v2/apis/{shared}/authorizers"),
-        Some(accepted.clone()),
+        Some(accepted),
     )
     .await;
     assert_eq!(
@@ -610,25 +609,34 @@ async fn a_configuration_its_type_or_protocol_does_not_admit_is_refused() {
         "expected 201 for a well-formed authorizer after the refusals, got {status} {created}"
     );
     let after_refusals = as_str(&created, "authorizerId");
+    assert_minted_id("after the refusals", "authorizerId", &after_refusals);
 
-    let fresh = create_api(&emulator, "a fresh api", "authorizer-refusal-fresh", "HTTP").await;
-    let (status, first) = call(
+    let (status, listed) = call(
         &emulator,
-        "POST",
-        &format!("/v2/apis/{fresh}/authorizers"),
-        Some(accepted),
+        "GET",
+        &format!("/v2/apis/{shared}/authorizers"),
+        None,
     )
     .await;
     assert_eq!(
-        status, 201,
-        "expected 201 for the fresh api's first authorizer, got {status} {first}"
+        status, 200,
+        "expected 200 from GetAuthorizers after the refusals, got {status} {listed}"
     );
+    let held: Vec<String> = listed
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| as_str(item, "authorizerId"))
+                .collect()
+        })
+        .unwrap_or_default();
     assert_eq!(
-        after_refusals,
-        as_str(&first, "authorizerId"),
-        "expected the refused creates to have minted nothing, so the api's first accepted \
-         authorizer carries the same id a fresh api's first authorizer does, got \
-         {after_refusals:?} and {first}"
+        held,
+        vec![after_refusals.clone()],
+        "expected the refused creates to have persisted nothing, so the api holds only the \
+         authorizer it accepted ({after_refusals:?}), got {listed}"
     );
 }
 

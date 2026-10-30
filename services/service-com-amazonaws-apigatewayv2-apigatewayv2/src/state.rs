@@ -30,20 +30,27 @@ use crate::ops::types as wire;
 /// an invariant, and [`mint_id`] guarantees it by construction.
 const ID_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
-/// How many characters a minted id carries.
-const ID_LEN: u32 = 10;
+/// How many characters an id of a resource the ACCOUNT holds carries: an api, a VPC
+/// link, a custom domain name, a portal, a portal product, and the pages and mappings
+/// nested in those. It is also the shortest the portal and portal-product members admit
+/// (`__stringMin10Max30PatternAZ09`: len 10..30, pattern `^[a-z0-9]+$`), so an id of this
+/// length satisfies that constraint by construction.
+const ACCOUNT_ID_LEN: u32 = 10;
 
-/// The number of distinct ids [`mint_id`] can render: `36^10`.
-const ID_SPACE: u128 = 36u128.pow(ID_LEN);
+/// How many characters the id of a resource NESTED INSIDE AN API carries — an
+/// authorizer, a model, a deployment, a route response, an integration response: a short
+/// opaque token, which is the form API Gateway v2 answers for those resources.
+const NESTED_ID_LEN: u32 = 6;
 
-/// Scrambles consecutive seeds across [`ID_SPACE`]. Prime, so it is coprime with
-/// `36^10 = 2^20 * 3^20`, which makes `seed -> seed * MULTIPLIER + OFFSET (mod ID_SPACE)`
-/// a BIJECTION: two distinct seeds can never mint the same id, so no collision retry
-/// and no random source is needed.
-const ID_MULTIPLIER: u128 = 1_000_000_007;
+/// How many characters the id of a route or an integration carries: one more than
+/// [`NESTED_ID_LEN`], the form API Gateway v2 answers for the two api children a route
+/// target names (`integrations/{IntegrationId}`).
+const ROUTE_ID_LEN: u32 = 7;
 
-/// The bijection's constant term, so the first id minted is not a run of leading `a`s.
-const ID_OFFSET: u128 = 734_291;
+/// The scope of an id the account holds DIRECTLY rather than inside another resource.
+/// There is one such collection of each kind per store, so it needs no discriminator
+/// beyond its [`IdKind`]; see [`mint_id`].
+const ACCOUNT_SCOPE: &str = "";
 
 /// Which KIND of resource an id is minted for.
 ///
@@ -52,7 +59,7 @@ const ID_OFFSET: u128 = 734_291;
 /// one resource, though — a client that reads an `IntegrationId` out of a refusal must
 /// not get a string that is also a `RouteId` — so the kind is folded into the id's
 /// pre-image (see [`mint_id`]) and ids of two different kinds are never equal, whatever
-/// their seeds.
+/// their seeds. The kind also says how LONG an id is ([`IdKind::id_len`]).
 #[derive(Debug, Clone, Copy)]
 enum IdKind {
     Api,
@@ -104,6 +111,33 @@ impl IdKind {
     /// This kind's residue class in the id space, below [`ID_KIND_STRIDE`].
     const fn ordinal(self) -> u128 {
         self as u128
+    }
+
+    /// How many characters an id of this kind carries.
+    ///
+    /// `Id` is unconstrained in the model, so the LENGTH of a minted id is this service's
+    /// convention per kind of resource: [`ACCOUNT_ID_LEN`] for a resource the account
+    /// holds and for the pages and mappings nested in one, and the short opaque form —
+    /// [`NESTED_ID_LEN`], [`ROUTE_ID_LEN`] for a route and an integration — for a
+    /// resource nested inside an api, which is the form API Gateway v2 answers for those.
+    const fn id_len(self) -> u32 {
+        match self {
+            IdKind::Api
+            | IdKind::Portal
+            | IdKind::PortalProduct
+            | IdKind::VpcLink
+            | IdKind::DomainName
+            | IdKind::ProductPage
+            | IdKind::ProductRestEndpointPage
+            | IdKind::ApiMapping
+            | IdKind::RoutingRule => ACCOUNT_ID_LEN,
+            IdKind::Route | IdKind::Integration => ROUTE_ID_LEN,
+            IdKind::Model
+            | IdKind::Deployment
+            | IdKind::Authorizer
+            | IdKind::RouteResponse
+            | IdKind::IntegrationResponse => NESTED_ID_LEN,
+        }
     }
 }
 
@@ -852,14 +886,14 @@ pub struct ComAmazonawsApigatewayv2Apigatewayv2State {
     /// resumable.
     pub apis: BTreeMap<String, Api>,
     /// Drives [`ComAmazonawsApigatewayv2Apigatewayv2State::mint_api_id`]; see
-    /// [`ID_MULTIPLIER`] for how an id is derived from it.
+    /// [`mint_id`] for how an id is derived from it.
     pub api_id_seed: u64,
     /// Every persisted portal, keyed by `PortalId`. A portal is an account-level
     /// resource, not a child of an api, so it lives beside [`Self::apis`] rather than
     /// inside one; `BTreeMap` for the same stable key order `ListPortals` pages over.
     pub portals: BTreeMap<String, Portal>,
     /// Drives [`ComAmazonawsApigatewayv2Apigatewayv2State::mint_portal_id`]; see
-    /// [`ID_MULTIPLIER`] for how an id is derived from it.
+    /// [`mint_id`] for how an id is derived from it.
     pub portal_id_seed: u64,
     /// Every persisted portal product, keyed by `PortalProductId`. A portal product is
     /// an ACCOUNT-level resource, not a child of an api, so it is stored here beside
@@ -875,7 +909,7 @@ pub struct ComAmazonawsApigatewayv2Apigatewayv2State {
     /// and not inside one. `BTreeMap` for the same stable key order [`Self::apis`] has.
     pub vpc_links: BTreeMap<String, VpcLink>,
     /// Drives [`ComAmazonawsApigatewayv2Apigatewayv2State::mint_vpc_link_id`]; see
-    /// [`ID_MULTIPLIER`] for how an id is derived from it.
+    /// [`mint_id`] for how an id is derived from it.
     pub vpc_link_id_seed: u64,
     /// Every persisted custom domain name, keyed by its `DomainName` — the name IS the
     /// resource's identifier on the wire (`GET|PATCH|DELETE /v2/domainnames/{DomainName}`),
@@ -883,25 +917,26 @@ pub struct ComAmazonawsApigatewayv2Apigatewayv2State {
     /// api store relies on.
     pub domain_names: BTreeMap<String, DomainName>,
     /// Drives [`ComAmazonawsApigatewayv2Apigatewayv2State::mint_domain_name_id`]; see
-    /// [`ID_MULTIPLIER`] for how an id is derived from it.
+    /// [`mint_id`] for how an id is derived from it.
     pub domain_name_id_seed: u64,
 }
 
 impl ComAmazonawsApigatewayv2Apigatewayv2State {
-    /// Mint a fresh `ApiId`: ten lowercase alphanumerics, never one already minted.
+    /// Mint a fresh `ApiId`: [`ACCOUNT_ID_LEN`] lowercase alphanumerics, never one
+    /// already minted.
     pub fn mint_api_id(&mut self) -> String {
         self.api_id_seed = self.api_id_seed.wrapping_add(1);
-        mint_id(IdKind::Api, self.api_id_seed)
+        mint_id(IdKind::Api, ACCOUNT_SCOPE, self.api_id_seed)
     }
 
     /// Mint a fresh `PortalId`: ten lowercase alphanumerics, never one already minted.
     ///
     /// `PortalId` is modelled as `__stringMin10Max30PatternAZ09` (len 10..30, pattern
-    /// `^[a-z0-9]+$`), and [`mint_id`] renders exactly ten characters of
+    /// `^[a-z0-9]+$`), and [`mint_id`] renders exactly [`ACCOUNT_ID_LEN`] characters of
     /// [`ID_ALPHABET`], so every minted id satisfies that constraint by construction.
     pub fn mint_portal_id(&mut self) -> String {
         self.portal_id_seed = self.portal_id_seed.wrapping_add(1);
-        mint_id(IdKind::Portal, self.portal_id_seed)
+        mint_id(IdKind::Portal, ACCOUNT_SCOPE, self.portal_id_seed)
     }
 
     /// Mint a fresh `PortalProductId`: ten lowercase alphanumerics, never one already
@@ -910,13 +945,18 @@ impl ComAmazonawsApigatewayv2Apigatewayv2State {
     /// alphanumeric id satisfies.
     pub fn mint_portal_product_id(&mut self) -> String {
         self.portal_product_id_seed = self.portal_product_id_seed.wrapping_add(1);
-        mint_id(IdKind::PortalProduct, self.portal_product_id_seed)
+        mint_id(
+            IdKind::PortalProduct,
+            ACCOUNT_SCOPE,
+            self.portal_product_id_seed,
+        )
     }
 
-    /// Mint a fresh `VpcLinkId`: ten lowercase alphanumerics, never one already minted.
+    /// Mint a fresh `VpcLinkId`: [`ACCOUNT_ID_LEN`] lowercase alphanumerics, never one
+    /// already minted.
     pub fn mint_vpc_link_id(&mut self) -> String {
         self.vpc_link_id_seed = self.vpc_link_id_seed.wrapping_add(1);
-        mint_id(IdKind::VpcLink, self.vpc_link_id_seed)
+        mint_id(IdKind::VpcLink, ACCOUNT_SCOPE, self.vpc_link_id_seed)
     }
 
     /// Drop every VPC link whose deprovisioning the CLOCK has already finished (see
@@ -930,12 +970,12 @@ impl ComAmazonawsApigatewayv2Apigatewayv2State {
         self.vpc_links.retain(|_, link| !link.is_deprovisioned());
     }
 
-    /// Mint the id of the regional host a custom domain name is served on: ten
-    /// lowercase alphanumerics, never one already minted. Drawn from a seed of its own,
-    /// so minting a domain name never shifts the ids apis get.
+    /// Mint the id of the regional host a custom domain name is served on:
+    /// [`ACCOUNT_ID_LEN`] lowercase alphanumerics, never one already minted. Drawn from a
+    /// seed of its own, so minting a domain name never shifts the ids apis get.
     pub fn mint_domain_name_id(&mut self) -> String {
         self.domain_name_id_seed = self.domain_name_id_seed.wrapping_add(1);
-        mint_id(IdKind::DomainName, self.domain_name_id_seed)
+        mint_id(IdKind::DomainName, ACCOUNT_SCOPE, self.domain_name_id_seed)
     }
 }
 
@@ -988,39 +1028,44 @@ pub struct Api {
 }
 
 impl Api {
-    /// Mint a fresh `RouteId` for this api: ten lowercase alphanumerics, never one
-    /// this api already minted.
+    /// Mint a fresh `RouteId` for this api: [`ROUTE_ID_LEN`] lowercase alphanumerics,
+    /// never one this api already minted, and never one another api minted either — the
+    /// api's own id is the SCOPE the id is drawn within (see [`mint_id`]).
     pub fn mint_route_id(&mut self) -> String {
         self.route_id_seed = self.route_id_seed.wrapping_add(1);
-        mint_id(IdKind::Route, self.route_id_seed)
+        mint_id(IdKind::Route, &self.api_id, self.route_id_seed)
     }
 
-    /// Mint a fresh `IntegrationId` for this api: ten lowercase alphanumerics, never
-    /// one this api already minted.
+    /// Mint a fresh `IntegrationId` for this api: [`ROUTE_ID_LEN`] lowercase
+    /// alphanumerics, never one this api already minted, and never one another api
+    /// minted either — the api's own id is the SCOPE the id is drawn within.
     pub fn mint_integration_id(&mut self) -> String {
         self.integration_id_seed = self.integration_id_seed.wrapping_add(1);
-        mint_id(IdKind::Integration, self.integration_id_seed)
+        mint_id(IdKind::Integration, &self.api_id, self.integration_id_seed)
     }
 
-    /// Mint a fresh `ModelId` for this api: ten lowercase alphanumerics, never one
-    /// this api already minted.
+    /// Mint a fresh `ModelId` for this api: [`NESTED_ID_LEN`] lowercase alphanumerics,
+    /// never one this api already minted, and never one another api minted either — the
+    /// api's own id is the SCOPE the id is drawn within.
     pub fn mint_model_id(&mut self) -> String {
         self.model_id_seed = self.model_id_seed.wrapping_add(1);
-        mint_id(IdKind::Model, self.model_id_seed)
+        mint_id(IdKind::Model, &self.api_id, self.model_id_seed)
     }
 
-    /// Mint a fresh `DeploymentId` for this api: ten lowercase alphanumerics, never
-    /// one this api already minted.
+    /// Mint a fresh `DeploymentId` for this api: [`NESTED_ID_LEN`] lowercase
+    /// alphanumerics, never one this api already minted, and never one another api
+    /// minted either — the api's own id is the SCOPE the id is drawn within.
     pub fn mint_deployment_id(&mut self) -> String {
         self.deployment_id_seed = self.deployment_id_seed.wrapping_add(1);
-        mint_id(IdKind::Deployment, self.deployment_id_seed)
+        mint_id(IdKind::Deployment, &self.api_id, self.deployment_id_seed)
     }
 
-    /// Mint a fresh `AuthorizerId` for this api: ten lowercase alphanumerics, never
-    /// one this api already minted.
+    /// Mint a fresh `AuthorizerId` for this api: [`NESTED_ID_LEN`] lowercase
+    /// alphanumerics, never one this api already minted, and never one another api
+    /// minted either — the api's own id is the SCOPE the id is drawn within.
     pub fn mint_authorizer_id(&mut self) -> String {
         self.authorizer_id_seed = self.authorizer_id_seed.wrapping_add(1);
-        mint_id(IdKind::Authorizer, self.authorizer_id_seed)
+        mint_id(IdKind::Authorizer, &self.api_id, self.authorizer_id_seed)
     }
 
     /// Release a deployment of this api's current configuration BY THE SERVICE, for a
@@ -1281,11 +1326,16 @@ impl Route {
         self.target.as_deref().and_then(target_integration_id)
     }
 
-    /// Mint a fresh `RouteResponseId` for this route: ten lowercase alphanumerics,
-    /// never one this route already minted.
+    /// Mint a fresh `RouteResponseId` for this route: [`NESTED_ID_LEN`] lowercase
+    /// alphanumerics, never one this route already minted, and never one another route
+    /// minted either — the route's own id is the SCOPE the id is drawn within.
     pub fn mint_route_response_id(&mut self) -> String {
         self.route_response_id_seed = self.route_response_id_seed.wrapping_add(1);
-        mint_id(IdKind::RouteResponse, self.route_response_id_seed)
+        mint_id(
+            IdKind::RouteResponse,
+            &self.route_id,
+            self.route_response_id_seed,
+        )
     }
 
     /// Project the record onto the modelled `Route` shape.
@@ -1403,11 +1453,17 @@ pub struct Integration {
 }
 
 impl Integration {
-    /// Mint a fresh `IntegrationResponseId` for this integration: ten lowercase
-    /// alphanumerics, never one this integration already minted.
+    /// Mint a fresh `IntegrationResponseId` for this integration: [`NESTED_ID_LEN`]
+    /// lowercase alphanumerics, never one this integration already minted, and never one
+    /// another integration minted either — the integration's own id is the SCOPE the id
+    /// is drawn within.
     pub fn mint_integration_response_id(&mut self) -> String {
         self.integration_response_id_seed = self.integration_response_id_seed.wrapping_add(1);
-        mint_id(IdKind::IntegrationResponse, self.integration_response_id_seed)
+        mint_id(
+            IdKind::IntegrationResponse,
+            &self.integration_id,
+            self.integration_response_id_seed,
+        )
     }
 
     /// Project the record onto the modelled `Integration` shape.
@@ -3402,26 +3458,35 @@ impl PortalProduct {
             .clone()
             .unwrap_or_else(|| EMPTY_SHARING_POLICY.to_string())
     }
-    /// Mint a fresh `ProductRestEndpointPageId` for this product: ten lowercase
-    /// alphanumerics, never one this product already minted. The member targets
-    /// `__stringMin10Max30PatternAZ09` (len 10..30, pattern `^[a-z0-9]+$`), which
-    /// [`mint_id`]'s ten-character lowercase alphanumeric id satisfies by construction.
+    /// Mint a fresh `ProductRestEndpointPageId` for this product: [`ACCOUNT_ID_LEN`]
+    /// lowercase alphanumerics, never one this product already minted, and never one
+    /// another product minted either — the product's own id is the SCOPE the id is drawn
+    /// within. The member targets `__stringMin10Max30PatternAZ09` (len 10..30, pattern
+    /// `^[a-z0-9]+$`), which [`mint_id`]'s lowercase alphanumeric id of that length
+    /// satisfies by construction.
     pub fn mint_product_rest_endpoint_page_id(&mut self) -> String {
         self.product_rest_endpoint_page_id_seed =
             self.product_rest_endpoint_page_id_seed.wrapping_add(1);
         mint_id(
             IdKind::ProductRestEndpointPage,
+            &self.portal_product_id,
             self.product_rest_endpoint_page_id_seed,
         )
     }
 
-    /// Mint a fresh `ProductPageId` for this product: ten lowercase alphanumerics, never
-    /// one this product already minted. The member targets
-    /// `__stringMin10Max30PatternAZ09` (len 10..30, pattern `^[a-z0-9]+$`), which
-    /// [`mint_id`]'s ten-character lowercase alphanumeric id satisfies by construction.
+    /// Mint a fresh `ProductPageId` for this product: [`ACCOUNT_ID_LEN`] lowercase
+    /// alphanumerics, never one this product already minted, and never one another
+    /// product minted either — the product's own id is the SCOPE the id is drawn within.
+    /// The member targets `__stringMin10Max30PatternAZ09` (len 10..30, pattern
+    /// `^[a-z0-9]+$`), which [`mint_id`]'s lowercase alphanumeric id of that length
+    /// satisfies by construction.
     pub fn mint_product_page_id(&mut self) -> String {
         self.product_page_id_seed = self.product_page_id_seed.wrapping_add(1);
-        mint_id(IdKind::ProductPage, self.product_page_id_seed)
+        mint_id(
+            IdKind::ProductPage,
+            &self.portal_product_id,
+            self.product_page_id_seed,
+        )
     }
 
     /// Project the record onto the modelled `PortalProductSummary` shape the collection
@@ -4037,11 +4102,17 @@ impl DomainName {
             .collect()
     }
 
-    /// Mint a fresh `RoutingRuleId` for this domain name: ten lowercase alphanumerics,
-    /// never one this domain name already minted.
+    /// Mint a fresh `RoutingRuleId` for this domain name: [`ACCOUNT_ID_LEN`] lowercase
+    /// alphanumerics, never one this domain name already minted, and never one another
+    /// domain name minted either — the domain name's own id is the SCOPE the id is drawn
+    /// within.
     pub fn mint_routing_rule_id(&mut self) -> String {
         self.routing_rule_id_seed = self.routing_rule_id_seed.wrapping_add(1);
-        mint_id(IdKind::RoutingRule, self.routing_rule_id_seed)
+        mint_id(
+            IdKind::RoutingRule,
+            &self.domain_name_id,
+            self.routing_rule_id_seed,
+        )
     }
 
     /// Whether this record is the domain name a request addressing it by name ALSO
@@ -4058,11 +4129,17 @@ impl DomainName {
 }
 
 impl DomainName {
-    /// Mint a fresh `ApiMappingId` for this domain name: ten lowercase alphanumerics,
-    /// never one this domain name already minted.
+    /// Mint a fresh `ApiMappingId` for this domain name: [`ACCOUNT_ID_LEN`] lowercase
+    /// alphanumerics, never one this domain name already minted, and never one another
+    /// domain name minted either — the domain name's own id is the SCOPE the id is drawn
+    /// within.
     pub fn mint_api_mapping_id(&mut self) -> String {
         self.api_mapping_id_seed = self.api_mapping_id_seed.wrapping_add(1);
-        mint_id(IdKind::ApiMapping, self.api_mapping_id_seed)
+        mint_id(
+            IdKind::ApiMapping,
+            &self.domain_name_id,
+            self.api_mapping_id_seed,
+        )
     }
 
     /// This domain name's mapping whose base path is `key`, if it holds one.
@@ -4751,19 +4828,65 @@ pub fn to_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
 }
 
-/// Mint one id from `kind` and `seed`: [`ID_LEN`] characters drawn from
-/// [`ID_ALPHABET`].
+/// How many ids of `len` characters [`mint_id`] can render: `36^len`.
+const fn id_space(len: u32) -> u128 {
+    36u128.pow(len)
+}
+
+/// The step [`mint_id`] takes through an id space of `space` values per seed: about
+/// 0.618 of it — the golden ratio, which spreads an additive walk most evenly over a
+/// range, so two consecutive seeds differ in every character of the id rather than only
+/// in its lowest ones and no position of a minted id is stuck on one character.
 ///
-/// `(kind, seed) -> seed * ID_KIND_STRIDE + kind` is injective, and
-/// `preimage -> preimage * ID_MULTIPLIER + ID_OFFSET (mod ID_SPACE)` is a bijection (see
-/// [`ID_MULTIPLIER`]), so consecutive seeds give unpredictable-looking ids that never
-/// repeat AND two kinds never mint the same id. That makes uniqueness structural: no
-/// collision retry, no exhaustion branch and no random source.
-fn mint_id(kind: IdKind, seed: u64) -> String {
-    let preimage = u128::from(seed) * ID_KIND_STRIDE + kind.ordinal();
-    let mut scrambled = (preimage * ID_MULTIPLIER + ID_OFFSET) % ID_SPACE;
-    let mut id = Vec::with_capacity(ID_LEN as usize);
-    for _ in 0..ID_LEN {
+/// Raised to the next value coprime with 36: `36^n = 2^2n * 3^2n`, so a step divisible by
+/// neither 2 nor 3 makes `seed -> seed * step + offset (mod 36^n)` a BIJECTION, and two
+/// seeds of one scope can never mint the same id — no collision retry, no exhaustion
+/// branch and no random source.
+const fn id_step(space: u128) -> u128 {
+    let mut step = space / 1_000 * 618 + 1;
+    while step.is_multiple_of(2) || step.is_multiple_of(3) {
+        step += 1;
+    }
+    step
+}
+
+/// Where in the id space the ids of ONE scope begin: a stable mixing of the id of the
+/// resource that owns the collection ([`ACCOUNT_SCOPE`] for a collection the account
+/// holds directly).
+///
+/// A seed counts within its own collection — the first route of one api and the first
+/// route of another are both seed 1 — so an id derived from the seed alone would be the
+/// SAME string for two unrelated resources, which collides in any client keyed on it.
+/// Starting each scope at its own point separates them. The mixing is
+/// [`::service_common::stable_hex_id`], the tree's one derived-id mixer, so a scope
+/// always begins at the same point across reads and builds.
+fn scope_offset(scope: &str, space: u128) -> u128 {
+    let mixed = ::service_common::stable_hex_id(&[scope]);
+    u128::from(u64::from_str_radix(&mixed, 16).unwrap_or_default()) % space
+}
+
+/// Mint one id for `kind` within `scope` from `seed`: [`IdKind::id_len`] characters drawn
+/// from [`ID_ALPHABET`].
+///
+/// `(kind, seed) -> seed * ID_KIND_STRIDE + kind` is injective and
+/// `preimage -> preimage * id_step + scope_offset (mod 36^len)` is a bijection (see
+/// [`id_step`]), so WITHIN one scope consecutive seeds give unpredictable-looking ids that
+/// never repeat and two kinds of one length never mint the same id — uniqueness inside a
+/// scope is structural, for every seed a store can reach (the space is `36^6` ids at its
+/// smallest, and `ID_KIND_STRIDE` seeds short of that is more resources than a collection
+/// here can hold), with no collision retry, no exhaustion branch and no random source.
+///
+/// ACROSS scopes the separation is the starting point each scope is given
+/// ([`scope_offset`]) rather than a structural one: two collections walk the space from
+/// different points, so the n-th resource of one and the n-th of another differ, and a
+/// coincidence needs two walks to land on the same value — one id in `36^len`.
+fn mint_id(kind: IdKind, scope: &str, seed: u64) -> String {
+    let len = kind.id_len();
+    let space = id_space(len);
+    let preimage = (u128::from(seed) * ID_KIND_STRIDE + kind.ordinal()) % space;
+    let mut scrambled = (preimage * id_step(space) + scope_offset(scope, space)) % space;
+    let mut id = Vec::with_capacity(len as usize);
+    for _ in 0..len {
         let digit = usize::try_from(scrambled % 36).unwrap_or(0);
         id.push(ID_ALPHABET[digit]);
         scrambled /= 36;
