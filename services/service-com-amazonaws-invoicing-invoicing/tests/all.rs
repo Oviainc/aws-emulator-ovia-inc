@@ -25,6 +25,8 @@ mod invoice_profiles;
 mod invoice_summaries;
 #[path = "all/invoice_unit_lifecycle.rs"]
 mod invoice_unit_lifecycle;
+#[path = "all/marketplace_punch_out_config_follows_the_flag.rs"]
+mod marketplace_punch_out_config_follows_the_flag;
 #[path = "all/message_fits_the_modelled_bound.rs"]
 mod message_fits_the_modelled_bound;
 #[path = "all/modelled_enum_value_set.rs"]

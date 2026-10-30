@@ -716,7 +716,10 @@ pub const STATUS_PENDING_VERIFICATION: &str = "PENDING_VERIFICATION";
 /// reached it by different paths. The one write that states a status without stating a
 /// configuration — `UpdateProcurementPortalPreferenceStatus` — holds to the same rule
 /// through [`check_plane_enabled_for_status`], so no write can leave a preference
-/// reporting the state this function says cannot exist.
+/// reporting the state this function says cannot exist. The Marketplace PunchOut flag and
+/// its configuration are the same shape of dependent pair, held by
+/// [`resolve_marketplace_punch_out`] because a write resolves that flag before it builds
+/// the preference.
 pub fn apply_plane_verification_statuses(preference: &mut ProcurementPortalPreference) {
     // Each plane as the triple the rule acts on: whether the configuration enables it,
     // and the status and reason it reports. The fields are disjoint, so both planes are
@@ -929,7 +932,7 @@ pub fn caller_requested_transition_violations(
 /// combination of an input member and the STORED resource, which the model cannot express
 /// — every status member of that input is optional on its own — so it is refused here
 /// rather than by the boundary validator, the way
-/// [`resolve_marketplace_punch_out_enabled`] refuses the combination a single request
+/// [`resolve_marketplace_punch_out`] refuses the combination a single request
 /// cannot express.
 ///
 /// Both faces of the rule live beside the preference registry, for the reason
@@ -972,9 +975,22 @@ pub fn check_plane_enabled_for_status(
 /// refuses the same combination.
 pub const PORTAL_COUPA: &str = "COUPA";
 
+/// The Marketplace PunchOut pair a write of a procurement portal preference stores: the
+/// `MarketplacePunchOutEnabled` flag and the `MarketplacePunchOutPreference` that belongs
+/// with it, resolved together by [`resolve_marketplace_punch_out`] so no write can take
+/// half of the pair.
+#[derive(Debug, Clone)]
+pub struct MarketplacePunchOut {
+    /// What the write stores in `MarketplacePunchOutEnabled`.
+    pub enabled: bool,
+    /// What the write stores in `MarketplacePunchOutPreference`: the configuration an
+    /// ENABLED feature has, and nothing at all for a disabled one.
+    pub preference: Option<MarketplacePunchOutPreference>,
+}
+
 /// The Marketplace PunchOut rule a write of a procurement portal preference applies, in
-/// one place: the `MarketplacePunchOutEnabled` the write stores, or the modelled 400 it
-/// is refused with when it enables Marketplace PunchOut for a portal whose required
+/// one place: the flag and the configuration the write stores, or the modelled 400 it is
+/// refused with when it enables Marketplace PunchOut for a portal whose required
 /// configuration it did not state.
 ///
 /// `MarketplacePunchOutEnabled` "defaults to false if not provided" — so an omitted
@@ -987,6 +1003,17 @@ pub const PORTAL_COUPA: &str = "COUPA";
 /// keyed the way this plane's recorded bodies key it ([`MessageKey::Capitalised`]) —
 /// every write that reaches this rule is a write of a procurement portal preference.
 ///
+/// The CONFIGURATION is part of the same rule, the way a disabled plane's status and
+/// reason are part of [`apply_plane_verification_statuses`]:
+/// `MarketplacePunchOutPreference` is "the Marketplace PunchOut configuration for this
+/// procurement portal preference. This is present when `MarketplacePunchOutEnabled` is
+/// `true`" (`smithy_query(query="shape", shape="ProcurementPortalPreference")`), so it
+/// describes the feature an ENABLED flag has and a write that leaves the feature DISABLED
+/// stores none of it — whether the request stated one or an earlier write left one behind,
+/// because there is no enabled feature for it to configure. A write that leaves the
+/// feature enabled stores the configuration it states, and keeps the one already stored
+/// when it states none (`stored`, which a create has nothing for).
+///
 /// Both the DEFAULT and the combination that is refused live here, beside the preference
 /// registry, rather than in one operation's module, for the reason [`PORTAL_COUPA`]
 /// states: they are one rule about the RESOURCE, which every write that sets a
@@ -994,16 +1021,14 @@ pub const PORTAL_COUPA: &str = "COUPA";
 /// whole, so neither path can drift from the other. The portal is the only part a caller
 /// can reach differently: a create states it on the input, an update takes it off the
 /// stored preference, whose portal no update can change.
-pub fn resolve_marketplace_punch_out_enabled(
+pub fn resolve_marketplace_punch_out(
     procurement_portal_name: &str,
     marketplace_punch_out_enabled: Option<bool>,
-    marketplace_punch_out_preference: Option<&MarketplacePunchOutPreference>,
-) -> Result<bool, ValidationException> {
+    requested_preference: Option<MarketplacePunchOutPreference>,
+    stored_preference: Option<MarketplacePunchOutPreference>,
+) -> Result<MarketplacePunchOut, ValidationException> {
     let enabled = marketplace_punch_out_enabled.unwrap_or(false);
-    if enabled
-        && procurement_portal_name == PORTAL_COUPA
-        && marketplace_punch_out_preference.is_none()
-    {
+    if enabled && procurement_portal_name == PORTAL_COUPA && requested_preference.is_none() {
         return Err(ValidationException {
             message: Some(format!(
                 "MarketplacePunchOutPreference is required when MarketplacePunchOutEnabled is \
@@ -1016,7 +1041,12 @@ pub fn resolve_marketplace_punch_out_enabled(
             ..Default::default()
         });
     }
-    Ok(enabled)
+    let preference = if enabled {
+        requested_preference.or(stored_preference)
+    } else {
+        None
+    };
+    Ok(MarketplacePunchOut { enabled, preference })
 }
 
 /// The identity of a procurement portal preference: its portal, buyer domain and

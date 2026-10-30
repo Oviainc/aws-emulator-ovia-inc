@@ -18,8 +18,9 @@
 //!   instant it changed — asserted over rows differing in which members they state and
 //!   over several successive updates of one preference;
 //! * a configuration member the update omits keeps its stored value, except
-//!   `MarketplacePunchOutEnabled`, the one member the model documents a default for —
-//!   asserted with one row per optional member, omitted in turn;
+//!   `MarketplacePunchOutEnabled`, the one member the model documents a default for, and
+//!   `MarketplacePunchOutPreference`, which the model documents as present only while that
+//!   flag is true — asserted with one row per optional member, omitted in turn;
 //! * once a delete succeeds the resource is gone: every reader answers the modelled
 //!   not-found, the listing omits it, its tags go with it and the identity it held is
 //!   free again — asserted over several portals and identities;
@@ -72,6 +73,12 @@ const NOT_COMPARED_WHOLE: &[&str] = &[
     "ClientToken",
     "EinvoiceDeliveryPreference",
 ];
+
+/// The configuration member the model documents as "present when
+/// `MarketplacePunchOutEnabled` is `true`" (`smithy_query(query="shape",
+/// shape="ProcurementPortalPreference")`), so it follows that flag rather than the
+/// keep-what-the-update-omits rule the other optional members follow.
+const PUNCH_OUT_CONFIG_MEMBER: &str = "MarketplacePunchOutPreference";
 
 /// A router carrying only this service, over one shared engine — the same assembly the
 /// production router performs, minus the other services.
@@ -395,12 +402,13 @@ async fn a_put_applies_what_it_states_and_advances_the_version() {
 
 /// RULE: a configuration member an update does not state keeps the value the resource
 /// already holds — except a member the model documents a default for, which takes that
-/// default. (`MarketplacePunchOutEnabled` is the one such member of this input:
-/// "Defaults to false if not provided", `smithy_query(query="operation",
-/// operation="PutProcurementPortalPreference")`.)
+/// default (`MarketplacePunchOutEnabled`: "Defaults to false if not provided",
+/// `smithy_query(query="operation", operation="PutProcurementPortalPreference")`), and a
+/// member the model documents as present only while a flag is true, which goes with that
+/// flag ([`PUNCH_OUT_CONFIG_MEMBER`]).
 ///
 /// One row per optional member, omitted in turn while every other optional member is
-/// stated with a NEW value — so each row asserts both halves of the rule at once.
+/// stated with a NEW value — so each row asserts every part of the rule at once.
 #[tokio::test]
 async fn a_put_leaves_the_members_it_does_not_state_alone() {
     let router = emulator();
@@ -476,13 +484,41 @@ async fn a_put_leaves_the_members_it_does_not_state_alone() {
         .await;
         let after = get_preference(&router, &arn).await;
 
+        // The member this row omits keeps the value the create stored — unless it is the
+        // one the model ties to a flag these updates leave false, which the assertions
+        // below cover instead.
+        if omitted != PUNCH_OUT_CONFIG_MEMBER {
+            assert_eq!(
+                after.get(omitted.as_str()),
+                before.get(omitted.as_str()),
+                "case omitting {omitted}: an unstated member keeps its stored value, got {:?}",
+                after.get(omitted.as_str())
+            );
+        }
+        // The flag-dependent member is asserted below rather than echoed back: a row that
+        // STATES it states it for a feature these updates leave disabled.
+        let mut echoed = update.clone();
+        if let Some(members) = echoed.as_object_mut() {
+            members.remove(PUNCH_OUT_CONFIG_MEMBER);
+        }
+        assert_states_were_applied(&format!("omitting {omitted}"), &echoed, &after);
+        // `MarketplacePunchOutEnabled` is stated by none of these updates, and the model
+        // documents it as defaulting to false when it is not provided.
         assert_eq!(
-            after.get(omitted.as_str()),
-            before.get(omitted.as_str()),
-            "case omitting {omitted}: an unstated member keeps its stored value, got {:?}",
-            after.get(omitted.as_str())
+            after.get("MarketplacePunchOutEnabled").and_then(Value::as_bool),
+            Some(false),
+            "case omitting {omitted}: the documented default applies, got {:?}",
+            after.get("MarketplacePunchOutEnabled")
         );
-        assert_states_were_applied(&format!("omitting {omitted}"), &update, &after);
+        // That default leaves Marketplace PunchOut DISABLED, and its configuration is
+        // documented as present only while the feature is enabled — so every row reports
+        // it alike, whether it stated one or omitted it: not at all.
+        assert_eq!(
+            after.get(PUNCH_OUT_CONFIG_MEMBER),
+            None,
+            "case omitting {omitted}: a disabled feature reports no configuration, got {:?}",
+            after.get(PUNCH_OUT_CONFIG_MEMBER)
+        );
         // `MarketplacePunchOutEnabled` is stated by none of these updates, and the model
         // documents it as defaulting to false when it is not provided.
         assert_eq!(

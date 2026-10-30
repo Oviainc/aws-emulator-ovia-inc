@@ -232,18 +232,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })?;
 
             // The same Marketplace PunchOut rule the create applies — the member's
-            // default and the combination it refuses, both held by
-            // `crate::state::resolve_marketplace_punch_out_enabled` — read against the
-            // portal the STORED preference routes to: this operation's input does not
-            // carry `ProcurementPortalName`, because a preference's portal is not
-            // something an update can change.
-            let marketplace_punch_out_enabled =
-                crate::state::resolve_marketplace_punch_out_enabled(
-                    &stored.preference.procurement_portal_name,
-                    input.marketplace_punch_out_enabled,
-                    input.marketplace_punch_out_preference.as_ref(),
-                )
-                .map_err(PutProcurementPortalPreferenceErrorModeled::ValidationException)?;
+            // default, the combination it refuses and the configuration that belongs with
+            // an enabled flag, all held by
+            // `crate::state::resolve_marketplace_punch_out` — read against the portal the
+            // STORED preference routes to: this operation's input does not carry
+            // `ProcurementPortalName`, because a preference's portal is not something an
+            // update can change. The configuration already stored is what an update that
+            // keeps the feature enabled without restating it keeps.
+            let marketplace_punch_out = crate::state::resolve_marketplace_punch_out(
+                &stored.preference.procurement_portal_name,
+                input.marketplace_punch_out_enabled,
+                input.marketplace_punch_out_preference,
+                stored.preference.marketplace_punch_out_preference.clone(),
+            )
+            .map_err(PutProcurementPortalPreferenceErrorModeled::ValidationException)?;
 
             let preference = &mut stored.preference;
 
@@ -252,7 +254,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             preference.contacts = Some(input.contacts);
             preference.einvoice_delivery_enabled = input.einvoice_delivery_enabled;
             preference.purchase_order_retrieval_enabled = input.purchase_order_retrieval_enabled;
-            preference.marketplace_punch_out_enabled = Some(marketplace_punch_out_enabled);
+            preference.marketplace_punch_out_enabled = Some(marketplace_punch_out.enabled);
+            // The configuration is resolved WITH that flag, so an update that disables
+            // Marketplace PunchOut takes the configuration an earlier write stored off the
+            // preference as well.
+            preference.marketplace_punch_out_preference = marketplace_punch_out.preference;
 
             // An optional member the request states replaces that part of the
             // configuration; one it omits leaves it as it was.
@@ -267,9 +273,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             if let Some(delivery) = input.einvoice_delivery_preference {
                 preference.einvoice_delivery_preference = Some(delivery);
-            }
-            if let Some(punch_out) = input.marketplace_punch_out_preference {
-                preference.marketplace_punch_out_preference = Some(punch_out);
             }
             if let Some(test) = input.test_env_preference {
                 // `TestEnvPreference$PurchaseOrderRetrievalEndpoint` is a member of the

@@ -201,16 +201,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
-        // `MarketplacePunchOutEnabled`'s default, and the combination no modelled
-        // constraint can express — enabled for a portal without the configuration that
-        // portal requires, refused as the modelled 400 — are the one rule every write of
-        // a preference applies, which this create and the configuration update both reach
-        // at `crate::state::resolve_marketplace_punch_out_enabled`. A create states the
-        // portal on its own input.
-        let marketplace_punch_out_enabled = crate::state::resolve_marketplace_punch_out_enabled(
+        // `MarketplacePunchOutEnabled`'s default, the combination no modelled constraint
+        // can express — enabled for a portal without the configuration that portal
+        // requires, refused as the modelled 400 — and the configuration that belongs with
+        // an enabled flag are the one rule every write of a preference applies, which this
+        // create and the configuration update both reach at
+        // `crate::state::resolve_marketplace_punch_out`. A create states the portal on its
+        // own input, and has no stored configuration a write could keep.
+        let marketplace_punch_out = crate::state::resolve_marketplace_punch_out(
             &input.procurement_portal_name,
             input.marketplace_punch_out_enabled,
-            input.marketplace_punch_out_preference.as_ref(),
+            input.marketplace_punch_out_preference,
+            None,
         )
         .map_err(CreateProcurementPortalPreferenceErrorModeled::ValidationException)?;
 
@@ -334,8 +336,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             einvoice_delivery_enabled: input.einvoice_delivery_enabled,
             einvoice_delivery_preference: input.einvoice_delivery_preference,
             purchase_order_retrieval_enabled: input.purchase_order_retrieval_enabled,
-            marketplace_punch_out_enabled: Some(marketplace_punch_out_enabled),
-            marketplace_punch_out_preference: input.marketplace_punch_out_preference,
+            marketplace_punch_out_enabled: Some(marketplace_punch_out.enabled),
+            // The configuration is the one the rule above resolved WITH that flag, so a
+            // create that leaves Marketplace PunchOut disabled stores no configuration for
+            // it.
+            marketplace_punch_out_preference: marketplace_punch_out.preference,
             contacts: Some(input.contacts),
             // The verification state of each plane is what
             // `crate::state::apply_plane_verification_statuses` applies below, from the
