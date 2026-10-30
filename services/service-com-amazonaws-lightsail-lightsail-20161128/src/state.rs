@@ -12864,12 +12864,14 @@ impl StoredDistribution {
 // Released attachments
 // ---------------------------------------------------------------------------
 
-/// One attachment a resource's removal released: everything the operation log
-/// needs to record the detachment that removal performed.
+/// One reference a resource's removal released: everything the operation log
+/// needs to record the release that removal performed.
 ///
-/// A release is a MUTATION of the record that held the attachment, so it is
-/// logged like any other, under the modelled `OperationType` member for
-/// detaching that kind of resource and located where that resource lives.
+/// A release is a MUTATION of the record that held the reference, so it is
+/// logged like any other, under the modelled `OperationType` member for the
+/// call that makes the same change by hand — the detach for an attachment, the
+/// delete for a record whose reference is required and so cannot be left empty
+/// — and located where the record that changed lives.
 #[derive(Debug, Clone)]
 pub struct ReleasedAttachment {
     /// The `Operation$operationType` this release is logged under, from the
@@ -12892,12 +12894,26 @@ pub struct ReleasedAttachment {
 pub struct RemovedInstance {
     /// The instance record that was removed.
     pub instance: StoredInstance,
-    /// One entry per attachment the removal released, in the store's own
+    /// One entry per reference the removal released, in the store's own
     /// stable order: disks by name, then static IPs by name, then load
-    /// balancers by region and name, then buckets by region and name — every
-    /// one of those maps is a `BTreeMap`, so the order is the same on every
-    /// call.
+    /// balancers by region and name, then buckets by region and name, then the
+    /// alarms that monitored the removed instance by alarm name — every one of
+    /// those maps is a `BTreeMap`, so the order is the same on every call.
     pub released_attachments: Vec<ReleasedAttachment>,
+}
+
+/// The outcome of removing one managed relational database: the record itself,
+/// and every reference another record held to it that the removal released
+/// (see
+/// [`ComAmazonawsLightsailLightsail20161128State::remove_relational_database`]).
+#[derive(Debug)]
+pub struct RemovedRelationalDatabase {
+    /// The database record that was removed.
+    pub database: StoredRelationalDatabase,
+    /// One entry per reference the removal released, in the store's own stable
+    /// order: the alarms that monitored the removed database, by alarm name
+    /// (that map is a `BTreeMap`, so the order is the same on every call).
+    pub released_references: Vec<ReleasedAttachment>,
 }
 
 /// The outcome of removing one bucket: the record itself, and every reference
@@ -13926,12 +13942,14 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// reference its removal released. `None` when nothing matched.
     ///
     /// Removing a resource also releases every live reference another stored
-    /// record holds to it — an attachment or an access grant: each of those
-    /// names a resource this account holds (the modelled `Disk$attachedTo` and
-    /// `StaticIp$attachedTo` name "the resources to which" one resource "is
-    /// attached"; `Bucket$resourcesReceivingAccess` describes "Lightsail
-    /// instances that have access to the bucket"), and a resource this account
-    /// no longer holds is not one of them — so the removal and the release are
+    /// record holds to it — an attachment, an access grant or an alarm's
+    /// monitored resource: each of those names a resource this account holds
+    /// (the modelled `Disk$attachedTo` and `StaticIp$attachedTo` name "the
+    /// resources to which" one resource "is attached";
+    /// `Bucket$resourcesReceivingAccess` describes "Lightsail instances that
+    /// have access to the bucket"; an alarm's `monitoredResourceName` resolves
+    /// through [`Self::monitored_resource`]), and a resource this account no
+    /// longer holds is not one of them — so the removal and the release are
     /// one step, and no read can observe a reference to a record that is gone.
     pub fn remove_instance(&mut self, name: &str) -> Option<RemovedInstance> {
         let instance = self.instances.remove(name)?;
@@ -13950,15 +13968,20 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// Release every reference the store holds to the instance `name`,
     /// answering one entry per release so the caller can log it.
     ///
-    /// Four kinds of record can hold one: a block storage disk (`attachedTo`
-    /// plus the device `path` it is mounted at), a static IP (`attachedTo`), a
-    /// load balancer (the instance registered with it), and a bucket (the
-    /// instance it reports in `resourcesReceivingAccess`, which "describe
-    /// Lightsail instances that have access to the bucket"). Each returns to the
-    /// state it has while it holds nothing — for a disk that is `available`, the
-    /// modelled `DiskState` value for a disk that "exists and is attached to
-    /// nothing" next to `in-use`; for a bucket, one fewer resource receiving
-    /// access.
+    /// Five kinds of record can hold one. Four of them keep the reference in a
+    /// member they can also hold EMPTY, so the release is a rewrite of that
+    /// member: a block storage disk (`attachedTo` plus the device `path` it is
+    /// mounted at), a static IP (`attachedTo`), a load balancer (the instance
+    /// registered with it), and a bucket (the instance it reports in
+    /// `resourcesReceivingAccess`, which "describe Lightsail instances that have
+    /// access to the bucket"). Each returns to the state it has while it holds
+    /// nothing — for a disk that is `available`, the modelled `DiskState` value
+    /// for a disk that "exists and is attached to nothing" next to `in-use`; for
+    /// a bucket, one fewer resource receiving access.
+    ///
+    /// The fifth is an ALARM, whose reference is required rather than optional,
+    /// so it is removed with the resource instead — see
+    /// [`Self::release_alarms_monitoring`].
     ///
     /// A DISTRIBUTION's origin is not among them: a distribution cannot be left
     /// holding none, so the reference is not released here but stands in the
@@ -13967,8 +13990,8 @@ impl ComAmazonawsLightsailLightsail20161128State {
     ///
     /// Every walk is bounded: the disks by [`MAX_DISKS`], the static IPs by
     /// [`MAX_STATIC_IPS`], the load balancers by
-    /// [`MAX_LOAD_BALANCERS_PER_REGION`] per region, and the buckets by
-    /// [`MAX_BUCKETS`].
+    /// [`MAX_LOAD_BALANCERS_PER_REGION`] per region, the buckets by
+    /// [`MAX_BUCKETS`] and the alarms by [`MAX_ALARMS`].
     fn release_attachments_to_instance(&mut self, name: &str) -> Vec<ReleasedAttachment> {
         let mut released = Vec::new();
         for disk in self.disks.values_mut() {
@@ -14045,6 +14068,57 @@ impl ComAmazonawsLightsailLightsail20161128State {
                 resource_name: bucket.name.clone(),
                 location: bucket.location.clone(),
             });
+        }
+        released.extend(self.release_alarms_monitoring(RESOURCE_TYPE_INSTANCE, name));
+        released
+    }
+
+    /// Remove every alarm the store holds that monitors the resource `name` of
+    /// kind `resource_type`, answering one entry per removal so the caller can
+    /// log it.
+    ///
+    /// An alarm NAMES the resource it watches: `monitoredResourceName` is a
+    /// required member of the put that creates one, the record keeps what that
+    /// name resolved to ([`Self::monitored_resource`], which resolves only a
+    /// resource this account holds) and every read reports it as
+    /// `Alarm$monitoredResourceInfo`, "an object that lists information about
+    /// the resource monitored by the alarm". That reference cannot be left
+    /// empty the way a disk's `attachedTo` can, so an alarm whose monitored
+    /// resource is removed goes with it rather than being rewritten — which is
+    /// also the only outcome the put itself admits, since it refuses to create
+    /// an alarm on a name that resolves to nothing. Each removal is logged as
+    /// that alarm's own `DeleteAlarm`, against the alarm whose record went, so
+    /// the per-metric alarm budget [`Self::alarms_on_metric`] counts and the
+    /// `GetAlarms` listing hold only alarms watching resources the account
+    /// still has.
+    ///
+    /// The walk is bounded by [`MAX_ALARMS`].
+    fn release_alarms_monitoring(
+        &mut self,
+        resource_type: &'static str,
+        name: &str,
+    ) -> Vec<ReleasedAttachment> {
+        let monitoring: Vec<String> = self
+            .alarms
+            .values()
+            .filter(|alarm| {
+                alarm.monitored_resource.resource_type == resource_type
+                    && alarm.monitored_resource.name == name
+            })
+            .map(|alarm| alarm.name.clone())
+            .collect();
+        let mut released = Vec::with_capacity(monitoring.len());
+        for alarm_name in monitoring {
+            // The names were just read out of this map under the same guard, so
+            // every one of them is still there.
+            if let Some(alarm) = self.alarms.remove(&alarm_name) {
+                released.push(ReleasedAttachment {
+                    operation_type: OPERATION_TYPE_DELETE_ALARM,
+                    resource_type: RESOURCE_TYPE_ALARM,
+                    resource_name: alarm.name,
+                    location: alarm.location,
+                });
+            }
         }
         released
     }
@@ -14277,20 +14351,30 @@ impl ComAmazonawsLightsailLightsail20161128State {
         self.relational_databases.get_mut(name)
     }
 
-    /// Remove the managed relational database `name` names, answering the record
-    /// it removed. `None` when nothing matched.
+    /// Remove the managed relational database `name` names, answering the
+    /// record it removed together with every reference the removal released.
+    /// `None` when nothing matched.
     ///
-    /// Nothing else in the store names a database it is attached to — a database
-    /// attaches to no instance, disk or load balancer — so this removes exactly
-    /// one record. A SNAPSHOT of it is deliberately left where it is: a snapshot
-    /// is a point-in-time copy that carries its own copy of everything it reports
-    /// about its source ([`StoredRelationalDatabaseSnapshot`]), which is what lets
-    /// the final snapshot a delete takes outlive the database it was taken of.
+    /// No attachment names a database — a database attaches to no instance,
+    /// disk or load balancer — so the one kind of record that can hold a live
+    /// reference to it is an ALARM, which a database can be the monitored
+    /// resource of: see [`Self::release_alarms_monitoring`] for why that
+    /// reference is removed with the database rather than rewritten. A SNAPSHOT
+    /// of it is deliberately left where it is: a snapshot is a point-in-time
+    /// copy that carries its own copy of everything it reports about its source
+    /// ([`StoredRelationalDatabaseSnapshot`]), which is what lets the final
+    /// snapshot a delete takes outlive the database it was taken of.
     pub fn remove_relational_database(
         &mut self,
         name: &str,
-    ) -> Option<StoredRelationalDatabase> {
-        self.relational_databases.remove(name)
+    ) -> Option<RemovedRelationalDatabase> {
+        let database = self.relational_databases.remove(name)?;
+        let released_references =
+            self.release_alarms_monitoring(RESOURCE_TYPE_RELATIONAL_DATABASE, name);
+        Some(RemovedRelationalDatabase {
+            database,
+            released_references,
+        })
     }
 
     /// The managed relational database snapshot `name` names, for a reporting

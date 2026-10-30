@@ -2,8 +2,8 @@
 
 //! @op DeleteInstance
 //! Removes the stored instance so no later read reports it, releases every
-//! attachment and access grant another stored resource held to it, and appends
-//! the operations that record the removal and each release.
+//! attachment, access grant and alarm another stored resource held to it, and
+//! appends the operations that record the removal and each release.
 //!
 //! The delete is refused while a distribution of this account still pulls its
 //! content from the instance: a distribution's origin names a resource the
@@ -205,15 +205,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // Removing the instance also releases every live reference another
             // stored resource holds to it — a block storage disk, a static IP,
-            // a load balancer's registration, a bucket's access grant — because
-            // each of those names a resource this account holds: an attachment
-            // names "the resources to which" a resource "is attached" (the
-            // modelled `Disk$attachedTo`) and the grant describes "Lightsail
-            // instances that have access to the bucket" (the modelled
-            // `Bucket$resourcesReceivingAccess`), and this instance is about to
-            // be none of them. The release is part of the same step, so no read
-            // can observe an attachment to, or an access held by, an instance
-            // this account no longer holds.
+            // a load balancer's registration, a bucket's access grant, an
+            // alarm's monitored resource — because each of those names a
+            // resource this account holds: an attachment names "the resources
+            // to which" a resource "is attached" (the modelled
+            // `Disk$attachedTo`), the grant describes "Lightsail instances that
+            // have access to the bucket" (the modelled
+            // `Bucket$resourcesReceivingAccess`), and an alarm watches the
+            // resource its `monitoredResourceName` resolved to, which is one
+            // this account holds. This instance is about to be none of them.
+            // The release is part of the same step, so no read can observe an
+            // attachment to, an access held by, or an alarm watching, an
+            // instance this account no longer holds.
             let Some(deleted) = store.remove_instance(&name) else {
                 return Err(not_found(&name));
             };
@@ -231,7 +234,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // several resources at once, and this one did: each reference the
             // removal released is a mutation of the record that held it, so it
             // is logged as that record's own release — a detachment for an
-            // attachment, the access-setting call for a bucket's grant —
+            // attachment, the access-setting call for a bucket's grant, the
+            // delete for an alarm whose monitored resource has gone —
             // already done when this call returns, and so terminal too.
             let mut operations = vec![operation.view()];
             for released in &deleted.released_attachments {

@@ -2,8 +2,8 @@
 
 //! @op DeleteRelationalDatabase
 //! Removes ONE managed relational database from this service's store, taking the
-//! final snapshot of it the request asked for first, and answers the
-//! operation-log entries those writes appended.
+//! final snapshot of it the request asked for first, releasing every alarm that
+//! monitored it, and answers the operation-log entries those writes appended.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -211,19 +211,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             // The record leaves the store in the same step the snapshot of it is
-            // taken in, so no read can observe the database gone without its
-            // final snapshot, or the snapshot without the database gone. The
-            // `None` arm cannot be reached — the database was just found above,
-            // under this same guard — and answers the same refusal rather than
-            // panicking.
-            let Some(database) = store.remove_relational_database(&name) else {
+            // taken in, and in the same step every reference another record held
+            // to it is released — an alarm that monitored it watches a resource
+            // this account holds, and this database is about to be none — so no
+            // read can observe the database gone without its final snapshot, the
+            // snapshot without the database gone, or an alarm watching a
+            // database the account no longer holds. The `None` arm cannot be
+            // reached — the database was just found above, under this same
+            // guard — and answers the same refusal rather than panicking.
+            let Some(deleted) = store.remove_relational_database(&name) else {
                 return Err(not_found(&name));
             };
+            let database = deleted.database;
             // `operations` is a list because a Lightsail call can act on several
             // resources at once, and this one does when it is asked for a final
             // snapshot: that snapshot is a resource of its own, logged as its own
             // create and left non-terminal until the copy the clock owes it is
-            // due.
+            // due. The alarms the removal released are logged the same way,
+            // after the removal itself: each is a mutation of the record that
+            // held the reference, so it is logged as that alarm's own delete,
+            // already done when this call returns and so terminal.
             let mut operations = Vec::new();
             if let Some(snapshot_name) = final_snapshot_name {
                 let snapshot = store.snapshot_relational_database(
@@ -255,6 +262,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None,
             );
             operations.push(operation.view());
+            for released in &deleted.released_references {
+                let entry = store.start_operation(
+                    now,
+                    released.operation_type,
+                    released.resource_type,
+                    &released.resource_name,
+                    &released.location,
+                    None,
+                );
+                operations.push(entry.view());
+            }
             Ok(DeleteRelationalDatabaseOutput {
                 operations: Some(operations),
             })

@@ -253,6 +253,8 @@ mod load_balancer_tls_certificate_tags;
 mod load_balancer_tls_certificate_validation;
 #[path = "all/load_balancer_tls_policies.rs"]
 mod load_balancer_tls_policies;
+#[path = "all/monitored_resource_delete_alarms.rs"]
+mod monitored_resource_delete_alarms;
 #[path = "all/operations_for_resource.rs"]
 mod operations_for_resource;
 #[path = "all/operations_log.rs"]
