@@ -31,6 +31,8 @@ mod findings_reports_listing;
 mod frame_metric_data;
 #[path = "all/get_profile_interval.rs"]
 mod get_profile_interval;
+#[path = "all/get_profile_latest_profile.rs"]
+mod get_profile_latest_profile;
 #[path = "all/get_profile_window_companion.rs"]
 mod get_profile_window_companion;
 #[path = "all/get_profile_window_length.rs"]

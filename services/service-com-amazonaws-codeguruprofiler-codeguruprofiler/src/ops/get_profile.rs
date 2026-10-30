@@ -7,7 +7,11 @@
 //! representation the request accepts and bounded to the call-stack depth it asks for.
 //! The aggregated profile of the window is EVERY profile the group holds in it combined
 //! into one document: the window's profiles were collected into one aggregated profile,
-//! so the answer carries the frames and counts of all of them ([`combined`]). A window
+//! so the answer carries the frames and counts of all of them ([`combined`]). A request
+//! that names the window's LENGTH and neither of its bounds names no window at all, and
+//! is answered with the group's LATEST aggregated profile of that length — the profiles of
+//! the last window of that length the group has anything aggregated in, and not those of
+//! every window it retains. A window
 //! holding ONE readable profile is that profile: its bytes exactly as `PostAgentProfile`
 //! uploaded them when the caller accepts the representation their bytes are a document in
 //! and asks for no depth bound, and otherwise the same document re-encoded in an accepted
@@ -173,8 +177,23 @@ fn companion_required_message(named: &str, companion: &str) -> String {
     )
 }
 
-/// The time window a `GetProfile` request selects over, as (start, end) bounds either
-/// of which may be open.
+/// WHICH aggregated profile of a group a `GetProfile` request asks for.
+#[derive(Debug, Clone, Copy)]
+enum Requested {
+    /// The aggregated profile of a time RANGE, either side of which may be open — every
+    /// aggregated profile the range holds, combined ([`served_aggregate`]).
+    Range {
+        start: Option<::aws_smithy_types::DateTime>,
+        end: Option<::aws_smithy_types::DateTime>,
+    },
+    /// The group's LATEST aggregated profile at an aggregation period this long: the
+    /// profile of the last window of that length the group has anything aggregated in
+    /// ([`crate::state::ProfilingGroup::latest_aggregated_profiles`]).
+    Latest { span: Duration },
+}
+
+/// Which aggregated profile a `GetProfile` request asks for, read off the window members
+/// it named.
 ///
 /// The rule is this service's one reading of the `startTime`/`endTime`/`period` trio
 /// ([`crate::state::requested_window`]), which the operation's own doc states: "Specify
@@ -182,10 +201,16 @@ fn companion_required_message(named: &str, companion: &str) -> String {
 /// parameters: startTime, endTime, period. The maximum time range allowed is 7 days. If
 /// you specify all 3 parameters, an exception is thrown. If you specify only period, the
 /// latest aggregated profile is returned." So `period` completes whichever single bound
-/// was given, and on its own leaves both bounds open — which is how this operation selects
-/// the LATEST profile — and the range the request ends up naming is no longer than
+/// was given, and the range the request ends up naming is no longer than
 /// [`MAX_TIME_RANGE`], which the service's one window-length rule
 /// ([`crate::state::validate_window_length`]) bounds it by.
+///
+/// A `period` on its own completes no bound: it says how LONG the aggregated profile
+/// wanted is, not where it sits, and the sentence above fixes which one of that length is
+/// served — the group's LATEST, i.e. the profile of the last window of that length the
+/// group has anything aggregated in, and not the combination of every window it retains.
+/// That is [`Requested::Latest`], the one naming that selects a profile rather than a
+/// range.
 ///
 /// On top of that shared reading, THIS operation's bound members carry a mutual-companion
 /// rule the others' do not ([`companion_required_message`]): a request that names one
@@ -193,17 +218,9 @@ fn companion_required_message(named: &str, companion: &str) -> String {
 /// bound — so the only member this operation serves on its own is `period`. A bound on its
 /// own is refused rather than served as a half-open range, which is also what keeps every
 /// window this operation selects over inside [`MAX_TIME_RANGE`]: a request that got past
-/// here either names a PAIR of bounds, whose distance is bounded, or no bound at all.
-#[allow(clippy::type_complexity)]
-fn requested_window(
-    input: &GetProfileInput,
-) -> Result<
-    (
-        Option<::aws_smithy_types::DateTime>,
-        Option<::aws_smithy_types::DateTime>,
-    ),
-    GetProfileError,
-> {
+/// here either names a PAIR of bounds, whose distance is bounded, or a length alone, which
+/// is bounded itself.
+fn requested_window(input: &GetProfileInput) -> Result<Requested, GetProfileError> {
     // Decided on the members as the REQUEST gave them, before the trio is read into a
     // window: it is about which members were named, not about the instants they name.
     match (input.start_time, input.end_time, input.period.as_deref()) {
@@ -234,7 +251,12 @@ fn requested_window(
         TIME_RANGE_SUBJECT,
     )
     .map_err(validation)?;
-    Ok((window.start, window.end))
+    Ok(match (window.start, window.end, window.span) {
+        // A length and NEITHER bound: no range was named, so the profile asked for is the
+        // latest one of that length.
+        (None, None, Some(span)) => Requested::Latest { span },
+        (start, end, _) => Requested::Range { start, end },
+    })
 }
 
 /// The stored profile `profile` read as a document, together with the representation its
@@ -532,8 +554,9 @@ fn written(
 }
 
 /// The bytes to serve and the media type to announce them under, for the aggregated
-/// profile the stored profiles `profiles` — every profile the requested range holds,
-/// oldest first — were collected into, read with the request's `accept` and `max_depth`.
+/// profile the stored profiles `profiles` — every profile the request's aggregated profile
+/// holds, oldest first — were collected into, read with the request's `accept` and
+/// `max_depth`.
 ///
 /// The aggregated profile of a range is ALL of them, not one of them: the service
 /// "collects posted agent profiles for a profiling group into aggregated profiles", an
@@ -1156,7 +1179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let (start, end) = requested_window(&input)?;
+        let requested = requested_window(&input)?;
 
         // The stored profiles are taken out of the store and the guard released before any
         // document is read or written: re-encoding, combining or bounding documents a
@@ -1169,19 +1192,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: crate::state::group_not_found_message(&input.profiling_group_name),
                 })
             })?;
-            // The group IS there; what is missing is an AGGREGATED profile covering the
-            // requested range. Collecting posted agent profiles into aggregated profiles
+            // The group IS there; what is missing is an AGGREGATED profile the request
+            // selects. Collecting posted agent profiles into aggregated profiles
             // is work the service does after the fact, so a profile this group received
             // is servable only once the aggregation it belongs to is due — before that,
             // and for a window the group holds nothing in, this operation reports the
             // same absence. That is a different refusal from a missing group, and the
             // service states it with its own fixed text — the only thing distinguishing
             // the two, since both are 404 `ResourceNotFoundException`.
-            let profiles: Vec<crate::state::AgentProfile> = group
-                .aggregated_profiles_in(start, end, crate::state::now())
-                .into_iter()
-                .cloned()
-                .collect();
+            let at = crate::state::now();
+            let profiles: Vec<crate::state::AgentProfile> = match requested {
+                Requested::Range { start, end } => group.aggregated_profiles_in(start, end, at),
+                Requested::Latest { span } => group.latest_aggregated_profiles(span, at),
+            }
+            .into_iter()
+            .cloned()
+            .collect();
             if profiles.is_empty() {
                 return Err(GetProfileErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

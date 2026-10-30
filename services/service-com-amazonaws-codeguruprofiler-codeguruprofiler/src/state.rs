@@ -200,15 +200,37 @@ pub fn shifted(at: DateTime, nanos: i128) -> DateTime {
 /// 5-minute, 1-hour and 1-day periods past UTC midnight, so flooring against it aligns
 /// each of the three the same way.
 ///
-/// Whole seconds, like [`instant_key`], rather than `f64` epoch seconds, whose
-/// granularity at current instants is coarser than a microsecond; `div_euclid` floors
-/// towards the past on both sides of the epoch. A period that is not positive names no
-/// window, so the instant is its own window start.
+/// The modelled `AggregationPeriod` values are whole numbers of seconds long, so this is
+/// that one alignment ([`aligned_window_start`]) named in the unit they are stated in. A
+/// period that is not positive names no window, so the instant is its own window start.
 pub fn aggregation_window_start(at: DateTime, period_seconds: i64) -> DateTime {
-    if period_seconds <= 0 {
+    aligned_window_start(
+        at,
+        Duration::from_secs(u64::try_from(period_seconds).unwrap_or(0)),
+    )
+}
+
+/// The start of the `span`-long window, aligned to the UTC epoch, that contains the
+/// instant `at` — [`aggregation_window_start`] at the resolution a FREE-FORM window
+/// length is stated in, since such a length may carry a sub-second part
+/// ([`iso8601_period`]) and must then align exactly rather than being rounded to whole
+/// seconds.
+///
+/// Exact nanoseconds, like [`instant_key`], rather than `f64` epoch seconds, whose
+/// granularity at current instants is coarser than a microsecond; `div_euclid` floors
+/// towards the past on both sides of the epoch, so the window containing a pre-epoch
+/// instant starts before it like any other. A span that is not positive names no window,
+/// so the instant is its own window start.
+pub fn aligned_window_start(at: DateTime, span: Duration) -> DateTime {
+    const NANOS_PER_SECOND: i128 = 1_000_000_000;
+    let length = span_nanos(span);
+    if length <= 0 {
         return at;
     }
-    DateTime::from_secs(at.secs().div_euclid(period_seconds) * period_seconds)
+    let total = i128::from(at.secs()) * NANOS_PER_SECOND + i128::from(at.subsec_nanos());
+    // Measured from the epoch, which is what "aligned to UTC" means for a window length,
+    // and converted back into an instant by the one reader of that arithmetic.
+    shifted(DateTime::from_secs(0), total.div_euclid(length) * length)
 }
 
 /// The SHORTEST aggregation period this service aggregates at, in whole seconds: the
@@ -1477,6 +1499,39 @@ impl ProfilingGroup {
                     && lower.is_none_or(|s| received >= s)
                     && upper.is_none_or(|e| received <= e)
             })
+            .collect()
+    }
+
+    /// The AGGREGATED profiles this group's LATEST aggregated profile of a `span`-long
+    /// aggregation period holds as of `at`, oldest first: every aggregated profile of the
+    /// last `span`-long window aligned to UTC that the group has anything aggregated in.
+    /// Empty when it holds no aggregated profile at all.
+    ///
+    /// This is what a request that names a window's LENGTH and neither of its bounds asks
+    /// for: a length says how long the aggregated profile wanted is, not where it sits, and
+    /// the `GetProfile` doc fixes which one is then served — "If you specify only period,
+    /// the latest aggregated profile is returned." A posted profile belongs to the one
+    /// window of that length containing its receipt ([`aligned_window_start`] — the same
+    /// alignment [`ProfilingGroup::aggregated_profile_starts`] reports a profile time by),
+    /// so the latest aggregated profile is the one of the LAST such window, and not the
+    /// profiles of every window the group retains.
+    ///
+    /// Windows are compared through [`instant_key`], exactly, so two windows a fraction of
+    /// a microsecond apart — which a sub-second length can name — still order by window.
+    pub fn latest_aggregated_profiles(
+        &self,
+        span: Duration,
+        at: DateTime,
+    ) -> Vec<&AgentProfile> {
+        let aggregated = self.aggregated_profiles_in(None, None, at);
+        let window =
+            |profile: &AgentProfile| instant_key(aligned_window_start(profile.received_at, span));
+        let Some(latest) = aggregated.iter().map(|profile| window(profile)).max() else {
+            return Vec::new();
+        };
+        aggregated
+            .into_iter()
+            .filter(|profile| window(profile) == latest)
             .collect()
     }
 }
