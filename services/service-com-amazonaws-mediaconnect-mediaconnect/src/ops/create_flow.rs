@@ -348,19 +348,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         for (index, entitlement) in input.entitlements.iter().flatten().enumerate() {
-            let member = format!("Entitlements[{index}]");
-            if let Some(rejection) =
-                crate::state::tag_set_rejection(&member, entitlement.entitlement_tags.as_ref())
-            {
-                return Err(bad_request(rejection));
-            }
-            // An entitlement's `Subscribers` holds the ACCOUNTS the flow's content is
-            // shared with, so each entry has to be able to be an account ID — the one rule
-            // GrantFlowEntitlements and UpdateFlowEntitlement write the list under too (see
-            // `crate::state::subscribers_rejection`).
-            if let Some(rejection) =
-                crate::state::subscribers_rejection(&member, &entitlement.subscribers)
-            {
+            // An entitlement this create grants is judged by exactly the rules
+            // GrantFlowEntitlements grants one under — its own tag map, its `Subscribers`
+            // (the ACCOUNTS the flow's content is shared with) and the percentage range its
+            // `DataTransferSubscriberFeePercent` documents — read from the one place both
+            // operations read them (see `crate::state::entitlement_request_rejection`), so a
+            // refused request creates no flow.
+            if let Some(rejection) = crate::state::entitlement_request_rejection(
+                &format!("Entitlements[{index}]"),
+                entitlement,
+            ) {
                 return Err(bad_request(rejection));
             }
         }

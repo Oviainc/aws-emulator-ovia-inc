@@ -225,3 +225,5 @@ mod flow_ndi_discovery_servers;
 mod required_query_parameters;
 #[path = "all/gateway_deletion_counts_placed_bridges.rs"]
 mod gateway_deletion_counts_placed_bridges;
+#[path = "all/entitlement_fee_percent.rs"]
+mod entitlement_fee_percent;

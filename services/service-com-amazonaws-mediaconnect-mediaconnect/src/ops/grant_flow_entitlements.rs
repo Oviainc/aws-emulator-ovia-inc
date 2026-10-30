@@ -250,23 +250,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // An entitlement carries a tag member of its own
-        // (`GrantEntitlementRequest$EntitlementTags`) and an ARN of its own, so it is a
-        // resource the tagging operations address: its tag map is bounded by the same rules
-        // a tag write is (see `crate::state::tag_set_rejection`), checked before anything is
-        // stored. `Subscribers` holds the ACCOUNTS the content is shared with, so each entry
-        // has to be able to be an account ID (see `crate::state::subscribers_rejection`) —
-        // the same rule UpdateFlowEntitlement applies when it replaces the list.
+        // Every member of a requested entitlement is judged before anything is stored, by
+        // the one rule each member is written under wherever it is accepted (see
+        // `crate::state::entitlement_request_rejection`): its tag map by the rules a tag
+        // write obeys, its `Subscribers` by what an account ID can be, and its
+        // `DataTransferSubscriberFeePercent` by the percentage range the member documents.
+        // CreateFlow's `Entitlements` reads the same rules from the same place, so neither
+        // operation can store an entitlement the other refuses.
         for (index, entitlement) in input.entitlements.iter().enumerate() {
-            let member = format!("Entitlements[{index}]");
-            if let Some(rejection) =
-                crate::state::tag_set_rejection(&member, entitlement.entitlement_tags.as_ref())
-            {
-                return Err(bad_request(rejection));
-            }
-            if let Some(rejection) =
-                crate::state::subscribers_rejection(&member, &entitlement.subscribers)
-            {
+            if let Some(rejection) = crate::state::entitlement_request_rejection(
+                &format!("Entitlements[{index}]"),
+                entitlement,
+            ) {
                 return Err(bad_request(rejection));
             }
         }

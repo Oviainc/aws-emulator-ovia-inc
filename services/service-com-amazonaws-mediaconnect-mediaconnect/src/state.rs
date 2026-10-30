@@ -7272,6 +7272,73 @@ pub fn subscribers_rejection(prefix: &str, subscribers: &[String]) -> Option<Str
         })
 }
 
+/// The lowest value a member stated as a percentage of a cost may carry.
+///
+/// `GrantEntitlementRequest$DataTransferSubscriberFeePercent` is "percentage from 0-100 of
+/// the data transfer cost to be billed to the subscriber"
+/// (`smithy_query(query="shape",shape="GrantEntitlementRequest")`), so 0 and 100 are the
+/// INCLUSIVE ends of what it may hold — a share of a cost is neither negative nor more than
+/// the whole of it. The model attaches no `@range` to the member, so the framework's
+/// constraint walk cannot judge it and the bound is applied where the value is accepted (see
+/// [`data_transfer_subscriber_fee_percent_rejection`]).
+pub const MIN_SUBSCRIBER_FEE_PERCENT: i32 = 0;
+
+/// The highest value a member stated as a percentage of a cost may carry — the other end of
+/// [`MIN_SUBSCRIBER_FEE_PERCENT`]'s documented range.
+pub const MAX_SUBSCRIBER_FEE_PERCENT: i32 = 100;
+
+/// Why `percent` is not a percentage of the data transfer cost, as the detail the refusal
+/// carries, or `None` when it is one (including when the request left the member out, which
+/// asks for no fee share at all). `prefix` is the request member that nests the entitlement,
+/// if any (see [`qualified_member`]).
+///
+/// The documented range [`MIN_SUBSCRIBER_FEE_PERCENT`]..=[`MAX_SUBSCRIBER_FEE_PERCENT`] is
+/// what a stored entitlement may report, so a value outside it describes an entitlement this
+/// service will not grant: the caller refuses it with `BadRequestException`, the error the
+/// model describes for "a semantic error" in the request, and nothing is stored. Every
+/// operation that accepts the member reads the bound from here, so a percentage one of them
+/// refuses cannot reach the store through another.
+pub fn data_transfer_subscriber_fee_percent_rejection(
+    prefix: &str,
+    percent: Option<i32>,
+) -> Option<String> {
+    let percent = percent?;
+    if (MIN_SUBSCRIBER_FEE_PERCENT..=MAX_SUBSCRIBER_FEE_PERCENT).contains(&percent) {
+        return None;
+    }
+    Some(format!(
+        "{} is {percent}, which is not a percentage from {MIN_SUBSCRIBER_FEE_PERCENT}-\
+         {MAX_SUBSCRIBER_FEE_PERCENT} of the data transfer cost to be billed to the \
+         subscriber.",
+        qualified_member(prefix, "DataTransferSubscriberFeePercent")
+    ))
+}
+
+/// Why this service will not grant the entitlement `request` describes, as the detail the
+/// refusal carries, or `None` when every member it carries is acceptable. `member` is the
+/// request member the entitlement sits in (`Entitlements[0]`, say).
+///
+/// The ONE encoding of what an entitlement REQUEST may hold, beside [`mint_entitlement`]'s
+/// encoding of what granting one stores: CreateFlow's `Entitlements` and
+/// GrantFlowEntitlements' `Entitlements` both grant entitlements from this shape, so both
+/// judge it here and neither can admit a record the other refuses. Each member is judged by
+/// the rule that member is written under anywhere else — the tag map by
+/// [`tag_set_rejection`], the subscribers by [`subscribers_rejection`], the fee share by
+/// [`data_transfer_subscriber_fee_percent_rejection`].
+pub fn entitlement_request_rejection(
+    member: &str,
+    request: &GrantEntitlementRequest,
+) -> Option<String> {
+    tag_set_rejection(member, request.entitlement_tags.as_ref())
+        .or_else(|| subscribers_rejection(member, &request.subscribers))
+        .or_else(|| {
+            data_transfer_subscriber_fee_percent_rejection(
+                member,
+                request.data_transfer_subscriber_fee_percent,
+            )
+        })
+}
+
 /// The name a `GrantEntitlementRequest` takes on a flow whose entitlement names are
 /// `taken`, resolved exactly as [`resolve_output_name`] resolves an output's.
 ///
@@ -7314,6 +7381,11 @@ pub fn resolve_entitlement_name(
 /// tag and organize the entitlement" — is kept beside the projection: the entitlement's
 /// ARN is a `ResourceArn` the tag operations resolve, so those pairs are what a later
 /// ListTagsForResource on that ARN reports.
+///
+/// The request this mints from has already been judged by
+/// [`entitlement_request_rejection`], which both granting paths run before they store
+/// anything, so each member is copied onto the record as given: what the caller asked for is
+/// what every reader reports.
 pub fn mint_entitlement(
     request: &GrantEntitlementRequest,
     name: String,

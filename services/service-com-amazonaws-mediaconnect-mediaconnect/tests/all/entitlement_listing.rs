@@ -173,10 +173,11 @@ fn entitlement_cases() -> Vec<EntitlementCase> {
             case: "granted to several other accounts only",
             name: "shared-elsewhere-twice",
             subscribers: vec![OTHER_ACCOUNT.to_string(), THIRD_ACCOUNT.to_string()],
-            // The model puts no range on the member (it targets `Integer`), so a value
-            // past the documented 0-100 is stored and reported as given rather than
-            // refused or clamped.
-            fee_percent: Some(101),
+            // The member is documented as a "Percentage from 0-100 of the data transfer
+            // cost to be billed to the subscriber", so a value inside that range is stored
+            // and reported as given; a value outside it is refused before anything is
+            // stored (see `tests/all/entitlement_fee_percent.rs`).
+            fee_percent: Some(99),
             held: false,
         },
     ]
