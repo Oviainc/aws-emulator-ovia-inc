@@ -1292,6 +1292,16 @@ fn validate_scaling_instruction(
 
 /// A resource id has to identify a resource of the kind its scalable dimension scales.
 ///
+/// "This string consists of the resource type and unique identifier"
+/// (`ScalingInstruction$ResourceId`), so an id names a resource only when the resource
+/// type prefix of its scalable dimension is followed by a unique identifier that is not
+/// empty — a bare prefix carries no identifier and names nothing, exactly as a present
+/// but empty value names nothing everywhere else in this module. Where that identifier
+/// addresses a resource THROUGH a parent — a DynamoDB global secondary index, whose
+/// identifier is its table then its index ("the unique identifier is the resource ID.
+/// Example: `table/my-table/index/my-table-index`") — neither part may be empty either,
+/// since each one names a resource of its own.
+///
 /// `pub` so the forecast read applies the same rule to its own `ResourceId` as the two
 /// write paths apply to a scaling instruction's.
 pub fn validate_resource_id(resource_id: &str, dimension: &str) -> Result<(), String> {
@@ -1300,13 +1310,16 @@ pub fn validate_resource_id(resource_id: &str, dimension: &str) -> Result<(), St
         return Ok(());
     };
     let resource_type = dimension.split(':').nth(1).unwrap_or_default();
-    let identifies = resource_id.starts_with(prefix)
-        && match resource_type {
+    let identifies = resource_id
+        .strip_prefix(prefix)
+        .is_some_and(|identifier| match resource_type {
             // A global secondary index is addressed through its table, a table is not.
-            "index" => resource_id.contains(INDEX_SEGMENT),
-            "table" => !resource_id.contains(INDEX_SEGMENT),
-            _ => true,
-        };
+            "index" => identifier
+                .split_once(INDEX_SEGMENT)
+                .is_some_and(|(table, index)| !table.is_empty() && !index.is_empty()),
+            "table" => !identifier.is_empty() && !resource_id.contains(INDEX_SEGMENT),
+            _ => !identifier.is_empty(),
+        });
     if !identifies {
         return Err(UNSUPPORTED_RESOURCE.to_string());
     }
