@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVpnConcentrator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteVpnConcentrator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteVpnConcentrator::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the VPN concentrator a `VpnConcentratorId` names: the record leaves the store
+//! through [`crate::state::ComAmazonawsEc2Amazonec2State::remove_vpn_concentrator`], so what
+//! a later caller sees of that id is this write itself — nothing.
+//!
+//! `DeleteVpnConcentratorResult` carries a `Return` flag and no state member
+//! (`smithy_query(query="operation",operation="DeleteVpnConcentrator")`), so there is no
+//! non-terminal state for this call to report and none for the clock to owe: the
+//! concentrator is gone when the call answers, the way `DeleteVpc` and
+//! `DeleteCarrierGateway` take their resource away at the call rather than parking it in a
+//! state a result member would have to name.
+//!
+//! An id the account holds no concentrator for is refused rather than answered as a no-op,
+//! and nothing is written: the concentrator the account DOES hold is untouched.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +142,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteVpnConcentrator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteVpnConcentratorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteVpnConcentrator"))
+        // `ctx` carries request metadata only; this operation reads none of it — a VPN
+        // concentrator is named by id. The store is reached through the engine held on
+        // `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of the VPN concentrator to delete"
+        // (`DeleteVpnConcentratorRequest$VpnConcentratorId`) is `@required` AND
+        // `@clientOptional`, so a request that sends the field empty reaches this handler
+        // rather than the boundary's refusal. EC2 answers that with `MissingParameter`,
+        // which is a different claim from "no such concentrator".
+        if input.vpn_concentrator_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter vpnConcentratorId",
+            ));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "Deletes the specified VPN concentrator" (`DeleteVpnConcentrator`): an id this
+        // account holds no concentrator for is a refusal, not a no-op — a caller that
+        // deletes twice has to be able to tell the deletion it performed from one it did
+        // not. Resolved through the one place this crate resolves the concentrator an
+        // operation acts on.
+        store.require_vpn_concentrator(&input.vpn_concentrator_id)?;
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation"
+        // (`DeleteVpnConcentratorRequest$DryRun`). Nothing has been removed yet, and
+        // nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The write itself: the record the lookup above found leaves the store.
+        // `remove_vpn_concentrator` is what gives its caller-supplied bytes back to the
+        // store's budget along with it. The removal is unconditional — the lookup resolved
+        // the id under this same lock, so the record is still there.
+        let removed = store.remove_vpn_concentrator(&input.vpn_concentrator_id);
+        debug_assert!(
+            removed.is_some(),
+            "the concentrator resolved under this lock is the one removed"
+        );
+
+        Ok(DeleteVpnConcentratorOutput {
+            // "Returns true if the request succeeds; otherwise, it returns an error"
+            // (`DeleteVpnConcentratorResult$Return`).
+            r#return: Some(true),
+        })
     }
 }

@@ -3730,6 +3730,18 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// terminal state yet (see that type, and the "Site-to-Site VPN connections" section of
     /// this module). Ordered by id, which is the order `DescribeVpnConnections` reports in.
     pub vpn_connections: BTreeMap<String, VpnConnectionRecord>,
+    /// Every VPN concentrator the account holds, by `VpnConcentratorId`, as the modelled
+    /// [`crate::ops::types::VpnConcentrator`] shape itself — the shape every operation that
+    /// reports one answers with, so no member a writer set can be dropped on the way out
+    /// (see the "VPN concentrators" section of this module). Ordered by id, the stable
+    /// order a reader of them reports and pages over.
+    ///
+    /// `CreateVpnConcentrator` is the operation that adds one and `DeleteVpnConcentrator`
+    /// the one that takes it away; the create is still a scaffold under its own issue, so a
+    /// fresh account holds none — which is why `DeleteVpnConcentrator` answers
+    /// [`INVALID_VPN_CONCENTRATOR_ID_NOT_FOUND`] for every id until it is written, exactly
+    /// as the real service does for a concentrator that does not exist.
+    pub vpn_concentrators: BTreeMap<String, crate::ops::types::VpnConcentrator>,
     /// Every transit gateway attachment the account holds, by
     /// `TransitGatewayAttachmentId` — ONE map for every kind of attachment, because one id
     /// space serves them all and an id therefore identifies at most one attachment of one
@@ -4263,6 +4275,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_endpoint_associations: BTreeMap::new(),
             customer_gateways: BTreeMap::new(),
             vpn_connections: BTreeMap::new(),
+            // A fresh account has created no VPN concentrator.
+            vpn_concentrators: BTreeMap::new(),
             transit_gateway_attachments: BTreeMap::new(),
             transit_gateway_multicast_domains: BTreeMap::new(),
             transit_gateway_route_table_announcements: BTreeMap::new(),
@@ -39558,6 +39572,121 @@ impl ComAmazonawsEc2Amazonec2State {
             self.add_stored_bytes(destination_cidr_block.len());
         }
         Some(route)
+    }
+}
+
+// =============================================================================
+// VPN concentrators
+// =============================================================================
+
+use crate::ops::types::VpnConcentrator;
+
+/// The id prefix a `VpnConcentratorId` carries: `vcn`, followed by the 17 lowercase
+/// hexadecimal digits [`ComAmazonawsEc2Amazonec2State::next_id`] appends to every long EC2
+/// resource id. The prefix is the one the recorded wire corpus shows this resource's ids in.
+pub const VPN_CONCENTRATOR_ID_PREFIX: &str = "vcn";
+
+/// The code EC2 answers a request that names a VPN concentrator id this account holds no
+/// concentrator for: the resource's own `Invalid<Kind>ID.NotFound`, as the recorded wire
+/// corpus shows a `DeleteVpnConcentrator` of an id nothing holds being refused with.
+pub const INVALID_VPN_CONCENTRATOR_ID_NOT_FOUND: &str = "InvalidVpnConcentratorID.NotFound";
+
+/// Refuse a request that named a VPN concentrator id this account holds no concentrator
+/// for: HTTP 400 [`INVALID_VPN_CONCENTRATOR_ID_NOT_FOUND`], worded by the one place this
+/// module words a missing resource id ([`id_not_found`]) from the id the REQUEST carried.
+///
+/// One code covers an id of any shape: `smithy_query(query="shape",shape="VpnConcentratorId")`
+/// is a plain string with no pattern, so nothing here knows the form of an id this service
+/// did not mint and every value that resolves to no concentrator is answered the same way —
+/// as it is for a VPN connection ([`invalid_vpn_connection_id_not_found`]).
+pub fn invalid_vpn_concentrator_id_not_found<E>(vpn_concentrator_id: &str) -> Scaffolded<E> {
+    id_not_found(
+        INVALID_VPN_CONCENTRATOR_ID_NOT_FOUND,
+        "vpn-concentrator ID",
+        vpn_concentrator_id,
+    )
+}
+
+/// The caller-chosen bytes one stored concentrator holds: its tags, the only member of
+/// `VpnConcentrator` whose size a caller decides.
+fn vpn_concentrator_payload_bytes(view: &VpnConcentrator) -> usize {
+    tag_list_bytes(view.tags.as_deref().unwrap_or_default())
+}
+
+/// The store's VPN concentrators, and the one way one is written and taken away. Kept in
+/// this section, beside the resource they are about, rather than in one of the module's
+/// shared `impl` blocks.
+///
+/// [`Self::has_vpn_concentrator_capacity`] and [`Self::insert_vpn_concentrator`] are the one
+/// write path for a concentrator, and nothing in `src/ops/` reaches them yet: the operation
+/// that will is `CreateVpnConcentrator`, still a scaffold under its own issue, so today the
+/// only caller is the test harness that seeds a concentrator for the delete path. A reader
+/// should not take their existence for "an operation already mints concentrators".
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another VPN concentrator fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_vpn_connection_capacity`] — asked by the writer that mints one.
+    pub fn has_vpn_concentrator_capacity(&self) -> bool {
+        self.vpn_concentrators.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// The VPN concentrator `vpn_concentrator_id` names, if this account holds one.
+    pub fn vpn_concentrator(&self, vpn_concentrator_id: &str) -> Option<&VpnConcentrator> {
+        self.vpn_concentrators.get(vpn_concentrator_id)
+    }
+
+    /// The VPN concentrator `vpn_concentrator_id` names — or the one refusal the operations
+    /// that act on a concentrator answer for a value they cannot resolve:
+    /// [`invalid_vpn_concentrator_id_not_found`].
+    ///
+    /// The one place an operation resolves the concentrator it is about, on the contract of
+    /// [`Self::require_vpn_connection_mut`], so "no such concentrator" cannot be worded or
+    /// coded two ways.
+    pub fn require_vpn_concentrator<E>(
+        &self,
+        vpn_concentrator_id: &str,
+    ) -> Result<&VpnConcentrator, Scaffolded<E>> {
+        self.vpn_concentrators
+            .get(vpn_concentrator_id)
+            .ok_or_else(|| invalid_vpn_concentrator_id_not_found(vpn_concentrator_id))
+    }
+
+    /// Store a VPN concentrator and answer the `VpnConcentratorId` it was given — or `None`
+    /// when the store is at [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING was stored.
+    ///
+    /// The id is minted here rather than taken from `view`, the way
+    /// [`Self::insert_vpn_connection`] mints a connection id, and the caller-chosen bytes
+    /// the record holds are charged on top of the fixed [`STORED_RECORD_OVERHEAD_BYTES`]
+    /// every stored record costs.
+    pub fn insert_vpn_concentrator(&mut self, mut view: VpnConcentrator) -> Option<String> {
+        if !self.has_vpn_concentrator_capacity() {
+            return None;
+        }
+        let vpn_concentrator_id = self.next_id(VPN_CONCENTRATOR_ID_PREFIX);
+        view.vpn_concentrator_id = Some(vpn_concentrator_id.clone());
+        self.add_stored_bytes(STORED_RECORD_OVERHEAD_BYTES + vpn_concentrator_payload_bytes(&view));
+        self.vpn_concentrators
+            .insert(vpn_concentrator_id.clone(), view);
+        Some(vpn_concentrator_id)
+    }
+
+    /// Take the VPN concentrator `vpn_concentrator_id` names out of the store and answer it
+    /// as it was last reported, or `None` when this account holds no such concentrator.
+    ///
+    /// The bytes the record held go back to the store's budget on the terms
+    /// [`vpn_concentrator_payload_bytes`] took them on, the way
+    /// [`Self::remove_carrier_gateway`] gives a removed gateway's back. The ONE place a
+    /// concentrator leaves the store, so the delete path cannot drop a record while leaving
+    /// its bytes charged.
+    pub fn remove_vpn_concentrator(
+        &mut self,
+        vpn_concentrator_id: &str,
+    ) -> Option<VpnConcentrator> {
+        let view = self.vpn_concentrators.remove(vpn_concentrator_id)?;
+        self.release_stored_bytes(
+            STORED_RECORD_OVERHEAD_BYTES + vpn_concentrator_payload_bytes(&view),
+        );
+        Some(view)
     }
 }
 
