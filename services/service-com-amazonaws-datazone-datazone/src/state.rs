@@ -392,8 +392,8 @@ pub struct DeletionBlocker {
 /// deleted `type Form#<domainId>#<formTypeName>`.
 pub const GRAPH_TAG_FORM_TYPE: &str = "Form";
 
-/// The dependency-graph tag an asset-domain object — an asset type, or an asset of one —
-/// is named by in a deletion refusal.
+/// The dependency-graph tag an asset-domain object — an asset type, an asset of one, or
+/// a filter that is a view of an asset — is named by in a deletion refusal.
 ///
 /// SOURCE: the same recorded wording, which names the asset type that prevented a form
 /// type's deletion `type asset#<domainId>#<assetTypeName>`. The third field is the
@@ -2771,10 +2771,11 @@ impl ResourceKind {
     /// echo the request back.
     pub fn not_found_message(self) -> String {
         match self {
-            // Recorded behaviour: a metadata form type DataZone cannot find is reported
-            // with its own sentence rather than the "<Kind> not found" form. Still a
+            // Recorded behaviour: some kinds DataZone cannot find are reported with a
+            // sentence of their own rather than the "<Kind> not found" form. Still a
             // fixed text naming only the kind, so it echoes nothing back either.
             Self::FormType => FORM_TYPE_NOT_FOUND_MESSAGE.to_string(),
+            Self::Asset => ASSET_NOT_FOUND_MESSAGE.to_string(),
             _ => format!("{} not found", self.as_str()),
         }
     }
@@ -2786,6 +2787,15 @@ impl ResourceKind {
 /// the same text, so the two cannot drift.
 pub const FORM_TYPE_NOT_FOUND_MESSAGE: &str =
     "The given FormType doesn't exist. Try creating FormType before accessing it.";
+
+/// The `ResourceNotFoundException` message DataZone answers for a catalog asset it
+/// cannot find — [`ResourceKind::Asset`]'s not-found text, recorded from the service and
+/// worded the same way a missing form type is ([`FORM_TYPE_NOT_FOUND_MESSAGE`]): the
+/// resource is named by its API type name, and nothing the caller sent appears in it.
+/// Every handler that addresses an asset (`GetAsset`, `DeleteAsset`,
+/// `CreateAssetFilter`) answers this one text, so they cannot drift.
+pub const ASSET_NOT_FOUND_MESSAGE: &str =
+    "The given Asset doesn't exist. Try creating Asset before accessing it.";
 
 impl std::fmt::Display for ResourceKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

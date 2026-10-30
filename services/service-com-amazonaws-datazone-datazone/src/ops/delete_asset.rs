@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAsset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAsset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAsset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a stored catalog asset — every recorded revision of it — from its domain in
+//! [`crate::state`], so the next `GetAsset` answers `ResourceNotFoundException` and a
+//! second `DeleteAsset` on the same identifier does too.
+//!
+//! The documented prerequisites (`smithy_query(query="doc",shape="DeleteAsset")`) are
+//! what this handler enforces: the domain "must refer to a valid and existing domain",
+//! the identifier "must refer to an existing asset in the specified domain", and the
+//! "Asset must not be referenced in any existing asset filters". An asset some stored
+//! asset filter is a view of is refused with the `ConflictException` the operation
+//! models, naming the asset and the stored filter that prevented the delete
+//! ([`crate::state::deletion_prevented_message`]), and the refusal stores nothing: the
+//! asset is still readable afterwards. The other documented prerequisite — "Asset must
+//! not be linked to any draft or published data product" — can block nothing here:
+//! `CreateDataProduct` is still a scaffold, so this store holds no data product for an
+//! asset to be linked to.
+//!
+//! The operation's output carries no status member, so there is no in-progress state to
+//! report and nothing for the clock to settle: the removal is complete when the call
+//! returns 204.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +161,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAsset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAssetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAsset"))
+        let _ = ctx;
+        use crate::state::{
+            deletion_prevented_message, graph_object, now_ms, ResourceKind, DOMAIN_STATUS_DELETING,
+            GRAPH_TAG_ASSET,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteAssetErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_clock(now_ms());
+
+        // A domain already being deleted is gone as far as its contents go — the same
+        // liveness rule `GetAsset` and `CreateAssetFilter` reach an asset through.
+        let domain = store
+            .domains
+            .get_mut(&input.domain_identifier)
+            .filter(|domain| domain.status != DOMAIN_STATUS_DELETING)
+            .ok_or_else(|| {
+                DeleteAssetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: ResourceKind::Domain.not_found_message(),
+                })
+            })?;
+
+        // The identifier "must refer to an existing asset in the specified domain": an
+        // asset is stored under the `AssetId` that IS the `identifier` addressing it, so
+        // the lookup is the one `GetAsset` makes — an identifier that reads an asset is
+        // the identifier that deletes it, and no other.
+        let asset = domain.assets.get(&input.identifier).ok_or_else(|| {
+            DeleteAssetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: ResourceKind::Asset.not_found_message(),
+            })
+        })?;
+        // "Asset must not be referenced in any existing asset filters." A filter is a
+        // view OF one asset, so every filter stored on this asset references it.
+        // Checked BEFORE the removal, so a refused delete leaves the store exactly as it
+        // was, and the refusal names the stored filter that prevented it: the filters
+        // are keyed by id in a `BTreeMap`, so an asset carrying several reports the same
+        // one on every call.
+        if let Some(blocking_filter) = asset.filters.values().next() {
+            let object = graph_object(GRAPH_TAG_ASSET, &domain.id, &asset.id);
+            let blocker = graph_object(GRAPH_TAG_ASSET, &domain.id, &blocking_filter.id);
+            return Err(DeleteAssetErrorModeled::ConflictException(ConflictException {
+                message: deletion_prevented_message(&object, &blocker),
+            })
+            .into());
+        }
+
+        // Nothing addresses one revision of an asset — `DeleteAsset` takes no `revision`
+        // member (smithy_query operation="DeleteAsset") — so the whole record goes,
+        // revisions and all. The listing an asset was published into is a record of the
+        // asset as it was at that instant, not a part of the asset, so it stays.
+        domain.assets.remove(&input.identifier);
+        Ok(DeleteAssetOutput {})
     }
 }

@@ -15,6 +15,8 @@
 mod account_pool_listing;
 #[path = "all/account_pools.rs"]
 mod account_pools;
+#[path = "all/asset_deletion.rs"]
+mod asset_deletion;
 #[path = "all/asset_filters.rs"]
 mod asset_filters;
 #[path = "all/asset_lifecycle.rs"]

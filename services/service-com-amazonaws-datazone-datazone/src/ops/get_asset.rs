@@ -187,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{date_time, now_ms, ENTITY_TYPE_ASSET};
+        use crate::state::{date_time, now_ms, ResourceKind, ENTITY_TYPE_ASSET};
         let _ = ctx;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -200,22 +200,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let domain = store.live_domain(&input.domain_identifier).ok_or_else(|| {
             GetAssetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("Domain {} was not found", input.domain_identifier),
+                message: ResourceKind::Domain.not_found_message(),
             })
         })?;
         let asset = domain.assets.get(&input.identifier).ok_or_else(|| {
             GetAssetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("Asset {} was not found", input.identifier),
+                message: ResourceKind::Asset.not_found_message(),
             })
         })?;
         // The revision read: the one the request addresses, or the asset's latest when
         // it addresses none. A revision the asset has no record of names no stored
-        // resource — and a revision superseded by a later one is still a record this
-        // store holds, so it reads back as it was recorded.
+        // resource — reported as the asset itself being unfindable, the way a revision
+        // an asset type has no record of is — and a revision superseded by a later one
+        // is still a record this store holds, so it reads back as it was recorded.
         let revision = match input.revision.as_deref() {
             Some(wanted) => asset.revision(wanted).ok_or_else(|| {
                 GetAssetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!("Asset {} has no revision {wanted}", input.identifier),
+                    message: ResourceKind::Asset.not_found_message(),
                 })
             })?,
             None => asset.latest_revision().ok_or_else(|| {
