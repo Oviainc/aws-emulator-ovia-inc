@@ -1019,6 +1019,17 @@ pub struct Table {
     /// The supplied point-in-time-recovery setting, or the modelled default; `None` for a
     /// service-managed table, which no backup setting applies to.
     pub point_in_time_recovery: Option<PointInTimeRecovery>,
+    /// When the continuous backups point-in-time recovery takes of this table began — the
+    /// instant the setting above was last turned ON — and `None` while it is off, which is
+    /// every table no call has enabled it for and every table the service itself owns.
+    ///
+    /// Stored beside the setting because the setting alone does not say WHEN those backups
+    /// start: a table created with point-in-time recovery off and switched on later has no
+    /// backup covering the span before the switch, so
+    /// [`Table::earliest_restorable_timestamp`] opens the restorable window here and not at
+    /// the table's creation. Turning the setting off clears it, so a later re-enable opens
+    /// a NEW window instead of reaching back across the span it was off for.
+    pub continuous_backups_since: Option<SystemTime>,
     /// The supplied custom TTL setting, if any.
     pub ttl: Option<TimeToLive>,
     /// The supplied default TTL in seconds, if any.
@@ -1169,24 +1180,47 @@ impl Table {
         }
     }
 
-    /// The earliest instant a restore of this table may target —
-    /// `PointInTimeRecoverySummary$earliestRestorableTimestamp` — or `None` when the table
-    /// has no restorable window at all, which is every table point-in-time recovery is not
-    /// `ENABLED` on and every table the service itself owns.
+    /// Whether point-in-time recovery is `ENABLED` on this table — the ONE reading of the
+    /// stored setting, so every operation that asks answers the same way.
+    pub fn point_in_time_recovery_enabled(&self) -> bool {
+        self.point_in_time_recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.status == POINT_IN_TIME_RECOVERY_ENABLED)
+    }
+
+    /// Apply `recovery` as this table's point-in-time-recovery setting at `now`, moving
+    /// the instant its continuous backups began with it.
     ///
-    /// Continuous backups begin when the table is created, reach back at most
+    /// Turning the setting ON starts those backups at `now`; turning it OFF stops them, so
+    /// nothing covers the span it stays off for and a later enable starts a new span. A
+    /// request that re-sets the status the table already holds starts and stops nothing, so
+    /// it leaves the instant where it is rather than reopening a window that never closed.
+    pub fn set_point_in_time_recovery(&mut self, recovery: PointInTimeRecovery, now: SystemTime) {
+        let was_enabled = self.point_in_time_recovery_enabled();
+        let enabled = recovery.status == POINT_IN_TIME_RECOVERY_ENABLED;
+        self.point_in_time_recovery = Some(recovery);
+        if enabled != was_enabled {
+            self.continuous_backups_since = enabled.then_some(now);
+        }
+    }
+
+    /// The earliest instant a restore of this table may target —
+    /// `PointInTimeRecoverySummary$earliestRestorableTimestamp`, "the earliest possible
+    /// restore point of the table" — or `None` when the table has no restorable window at
+    /// all, which is every table point-in-time recovery is not `ENABLED` on and every table
+    /// the service itself owns.
+    ///
+    /// Continuous backups begin when point-in-time recovery is turned ON
+    /// ([`Self::continuous_backups_since`]) — at the table's creation only for a table
+    /// created with it already enabled — reach back at most
     /// [`POINT_IN_TIME_RECOVERY_WINDOW`], and can only reproduce settings the store still
     /// holds a revision for ([`MAX_RETAINED_TABLE_REVISIONS`]), so the earliest restorable
     /// instant is the latest of those three.
     pub fn earliest_restorable_timestamp(&self, now: SystemTime) -> Option<SystemTime> {
-        if self
-            .point_in_time_recovery
-            .as_ref()
-            .is_none_or(|recovery| recovery.status != POINT_IN_TIME_RECOVERY_ENABLED)
-        {
+        if !self.point_in_time_recovery_enabled() {
             return None;
         }
-        let mut earliest = self.creation_timestamp?;
+        let mut earliest = self.continuous_backups_since?;
         if let Some(window_start) = now.checked_sub(POINT_IN_TIME_RECOVERY_WINDOW) {
             earliest = earliest.max(window_start);
         }
@@ -1195,6 +1229,23 @@ impl Table {
         }
         Some(earliest)
     }
+}
+
+/// When the continuous backups of a table CREATED at `now` with the point-in-time-recovery
+/// setting `recovery` begin: `now` while that setting is `ENABLED` — a table created with
+/// point-in-time recovery on is backed up from the instant it exists — and `None`
+/// otherwise, since a table it is off on has no continuous backups at all.
+///
+/// Every operation that creates a table stamps [`Table::continuous_backups_since`] through
+/// this, so a created and a restored table open their restorable window by the one rule
+/// [`Table::set_point_in_time_recovery`] moves it by afterwards.
+pub fn continuous_backups_start(
+    recovery: Option<&PointInTimeRecovery>,
+    now: SystemTime,
+) -> Option<SystemTime> {
+    recovery
+        .filter(|recovery| recovery.status == POINT_IN_TIME_RECOVERY_ENABLED)
+        .map(|_| now)
 }
 
 /// A table's warm throughput configuration: "Pre-warming a table by specifying warm
@@ -1623,6 +1674,9 @@ fn service_managed_keyspace(region: &str, keyspace_name: &str, table_names: &[&s
                     last_update_to_pay_per_request: None,
                     encryption_specification: None,
                     point_in_time_recovery: None,
+                    // No backup setting applies to a table the service owns, so it has no
+                    // continuous backups and no restorable window.
+                    continuous_backups_since: None,
                     ttl: None,
                     default_time_to_live: None,
                     comment: None,

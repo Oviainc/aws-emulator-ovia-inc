@@ -570,6 +570,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // no update has moved it to `PAY_PER_REQUEST`.
                 last_update_to_pay_per_request: None,
                 encryption_specification,
+                // The restored table is a new table, so its own continuous backups begin
+                // with this restore when point-in-time recovery is on for it — the source
+                // table's backups cover the source table, not this one.
+                continuous_backups_since: crate::state::continuous_backups_start(
+                    point_in_time_recovery.as_ref(),
+                    now,
+                ),
                 point_in_time_recovery,
                 ttl: restored.ttl,
                 default_time_to_live: restored.default_time_to_live,

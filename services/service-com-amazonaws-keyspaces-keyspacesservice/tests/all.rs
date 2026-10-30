@@ -55,6 +55,8 @@ mod name_conflict_precedes_type_resolution;
 mod page_token_codec;
 #[path = "all/pagination_window.rs"]
 mod pagination_window;
+#[path = "all/point_in_time_recovery_window.rs"]
+mod point_in_time_recovery_window;
 #[path = "all/region_scoped_page_tokens.rs"]
 mod region_scoped_page_tokens;
 #[path = "all/regional_partitioning.rs"]

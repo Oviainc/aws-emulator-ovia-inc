@@ -730,7 +730,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             table.encryption_specification = Some(encryption);
         }
         if let Some(point_in_time_recovery) = input.point_in_time_recovery {
-            table.point_in_time_recovery = Some(point_in_time_recovery);
+            // Point-in-time recovery is what takes the continuous backups a restore reads,
+            // so enabling it starts them at this instant and disabling it stops them: the
+            // setting and the instant it changed move together
+            // (`crate::state::Table::set_point_in_time_recovery`), and the span the table
+            // had it off for stays outside every restorable window.
+            table.set_point_in_time_recovery(point_in_time_recovery, now);
         }
         // `TimeToLiveStatus` and `ClientSideTimestampsStatus` each model exactly one
         // value, `ENABLED` (`crate::ops::types::TIME_TO_LIVE_STATUS_VALUES`,

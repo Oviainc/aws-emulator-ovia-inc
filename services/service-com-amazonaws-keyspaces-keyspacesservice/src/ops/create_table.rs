@@ -506,6 +506,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // this; a table created in a mode was never updated into it.
                 last_update_to_pay_per_request: None,
                 encryption_specification: Some(encryption_specification),
+                // Continuous backups of this table begin now when the create asked for
+                // point-in-time recovery, and not at all while it is off: the restorable
+                // window opens when the backups start, never before.
+                continuous_backups_since: crate::state::continuous_backups_start(
+                    Some(&point_in_time_recovery),
+                    now,
+                ),
                 point_in_time_recovery: Some(point_in_time_recovery),
                 ttl: input.ttl,
                 default_time_to_live: input.default_time_to_live,
