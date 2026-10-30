@@ -455,6 +455,16 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// ([`IndexingConfiguration::disabled`]). That is what makes the read a pure
     /// read — it never has to create the record it reports.
     pub indexing_configuration: IndexingConfiguration,
+    /// The BUILD each fleet index is in, keyed by index name
+    /// ([`FLEET_INDEX_NAMES`]).
+    ///
+    /// Which indexes EXIST is the configuration's business
+    /// ([`ComAmazonawsIotAwsiotserviceState::fleet_index_enabled`]); this records the
+    /// one thing the configuration cannot say, which is how far the build that the
+    /// last configuration change started has got — the transition the clock owes an
+    /// index a caller has just enabled or changed. An index with no record here is
+    /// one no change is outstanding for, so it reports [`INDEX_STATUS_ACTIVE`].
+    pub index_builds: BTreeMap<String, FleetIndexBuild>,
 }
 
 impl ComAmazonawsIotAwsiotserviceState {
@@ -566,6 +576,109 @@ impl ComAmazonawsIotAwsiotserviceState {
                 .insert(region.to_string(), identifier.clone());
         }
         identifier
+    }
+
+    /// Whether the account's fleet-indexing configuration has the index
+    /// `index_name` names.
+    ///
+    /// An index exists for the account exactly while the configuration section that
+    /// drives it is not [`INDEXING_MODE_OFF`] — "OFF - ... indexing is disabled" —
+    /// so this is derived from the stored configuration and never recorded beside
+    /// it. A name that is no fleet index at all ([`FLEET_INDEX_NAMES`]) is no index
+    /// either.
+    pub fn fleet_index_enabled(&self, index_name: &str) -> bool {
+        match index_name {
+            THING_INDEX_NAME => {
+                self.indexing_configuration.thing.thing_indexing_mode != INDEXING_MODE_OFF
+            }
+            THING_GROUP_INDEX_NAME => {
+                self.indexing_configuration
+                    .thing_group
+                    .thing_group_indexing_mode
+                    != INDEXING_MODE_OFF
+            }
+            _ => false,
+        }
+    }
+
+    /// The fleet index `index_name` names, as a reader describes it at `now`, or
+    /// `None` when the account has no such index.
+    ///
+    /// A pure function of the stored configuration, the recorded build and the
+    /// clock: nothing is written, so describing an index leaves every later caller
+    /// seeing what this one saw.
+    pub fn fleet_index(&self, index_name: &str, now: SystemTime) -> Option<FleetIndexDescription> {
+        if !self.fleet_index_enabled(index_name) {
+            return None;
+        }
+        Some(FleetIndexDescription {
+            index_name: index_name.to_string(),
+            index_status: self.fleet_index_status(index_name, now).to_string(),
+            schema: fleet_index_schema(index_name, &self.indexing_configuration)
+                .map(str::to_string),
+        })
+    }
+
+    /// The status the index `index_name` names holds at `now`.
+    ///
+    /// The build its last configuration change started is reported until the clock
+    /// makes it due, and [`INDEX_STATUS_ACTIVE`] from then on; an index no change is
+    /// outstanding for is active.
+    pub fn fleet_index_status(&self, index_name: &str, now: SystemTime) -> &str {
+        self.index_builds
+            .get(index_name)
+            .map_or(INDEX_STATUS_ACTIVE, |build| build.status_at(now))
+    }
+
+    /// Record `supplied` as the account's THING indexing configuration and start the
+    /// build that change owes ([`ComAmazonawsIotAwsiotserviceState::index_builds`]).
+    pub fn set_thing_indexing_configuration(
+        &mut self,
+        supplied: ThingIndexingConfiguration,
+        now: SystemTime,
+    ) {
+        let was_enabled = self.fleet_index_enabled(THING_INDEX_NAME);
+        self.indexing_configuration.set_thing(supplied);
+        self.start_fleet_index_build(THING_INDEX_NAME, was_enabled, now);
+    }
+
+    /// Record `supplied` as the account's THING GROUP indexing configuration and
+    /// start the build that change owes, under the same rule as
+    /// [`ComAmazonawsIotAwsiotserviceState::set_thing_indexing_configuration`].
+    pub fn set_thing_group_indexing_configuration(
+        &mut self,
+        supplied: ThingGroupIndexingConfiguration,
+        now: SystemTime,
+    ) {
+        let was_enabled = self.fleet_index_enabled(THING_GROUP_INDEX_NAME);
+        self.indexing_configuration.set_thing_group(supplied);
+        self.start_fleet_index_build(THING_GROUP_INDEX_NAME, was_enabled, now);
+    }
+
+    /// Start the build the configuration change just recorded for `index_name` owes,
+    /// given whether that index existed BEFORE the change.
+    ///
+    /// A section a request supplies replaces the stored one in full
+    /// ([`IndexingConfiguration::set_thing`]), so every supplied section is a
+    /// configuration change: it either brings an index into existence — which is
+    /// built from nothing ([`INDEX_STATUS_BUILDING`]) — or re-indexes the data an
+    /// existing index already held ([`INDEX_STATUS_REBUILDING`]). A change that
+    /// turned the index OFF leaves no index to build, so it clears the record
+    /// instead.
+    fn start_fleet_index_build(&mut self, index_name: &str, was_enabled: bool, now: SystemTime) {
+        if !self.fleet_index_enabled(index_name) {
+            self.index_builds.remove(index_name);
+            return;
+        }
+        let pending_status = if was_enabled {
+            INDEX_STATUS_REBUILDING
+        } else {
+            INDEX_STATUS_BUILDING
+        };
+        self.index_builds.insert(
+            index_name.to_string(),
+            FleetIndexBuild::new(pending_status, now),
+        );
     }
 }
 
@@ -1843,6 +1956,160 @@ impl Default for IndexingConfiguration {
     fn default() -> Self {
         Self::disabled()
     }
+}
+
+/// The name of the fleet index built from the THING registry: the index every
+/// thing-level search names.
+///
+/// The model names it as the only index its thing-level operations take —
+/// `CreateDynamicThingGroup$indexName` is "The dynamic thing group index name.
+/// Currently one index is supported: AWS_Things" and `GetStatistics$indexName` is
+/// "The name of the index to search. The default value is AWS_Things"
+/// (`smithy_query(query="doc",shape="CreateDynamicThingGroupRequest",member="indexName")`).
+pub const THING_INDEX_NAME: &str = "AWS_Things";
+
+/// The name of the fleet index built from the THING GROUP registry.
+///
+/// It is the index the model's second indexing section drives:
+/// `ThingGroupIndexingConfiguration` is "Thing group indexing configuration", a
+/// configuration of its own beside the thing one, and AWS IoT serves group-level
+/// search from the separate index named here.
+pub const THING_GROUP_INDEX_NAME: &str = "AWS_ThingGroups";
+
+/// Every fleet index an account can have — the two the indexing configuration's two
+/// sections drive, in the order a lister reports them.
+pub const FLEET_INDEX_NAMES: &[&str] = &[THING_INDEX_NAME, THING_GROUP_INDEX_NAME];
+
+/// The status a fleet index holds once its build has finished: one of
+/// [`crate::ops::types::INDEX_STATUS_VALUES`].
+pub const INDEX_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The status an index holds while it is first being built, after the configuration
+/// change that brought it into existence.
+pub const INDEX_STATUS_BUILDING: &str = "BUILDING";
+
+/// The status an index that already existed holds while it is re-indexed, after a
+/// configuration change replaced the section that drives it.
+pub const INDEX_STATUS_REBUILDING: &str = "REBUILDING";
+
+/// How long a fleet index spends building after the configuration change that
+/// started the build.
+///
+/// An index is reported in a NON-TERMINAL status ([`INDEX_STATUS_BUILDING`] /
+/// [`INDEX_STATUS_REBUILDING`]) while it builds, so the clock owes its move to
+/// [`INDEX_STATUS_ACTIVE`]; the span is the emulator's own, chosen so a caller
+/// describing the index straight after the change still observes the build, and the
+/// due instant is recorded rather than slept for.
+pub const INDEX_BUILD_SPAN: Duration = Duration::from_secs(3);
+
+/// The build one fleet index is in, as this service persists it.
+#[derive(Debug, Clone)]
+pub struct FleetIndexBuild {
+    /// The non-terminal status the index reports until the build finishes: one of
+    /// [`INDEX_STATUS_BUILDING`] / [`INDEX_STATUS_REBUILDING`].
+    pub pending_status: String,
+    /// When the build finishes — the transition the clock already owes, whether or
+    /// not anybody describes the index.
+    pub active_at: SystemTime,
+}
+
+impl FleetIndexBuild {
+    /// A build started at `started_at`, reporting `pending_status` until it is due
+    /// [`INDEX_BUILD_SPAN`] later.
+    pub fn new(pending_status: &str, started_at: SystemTime) -> Self {
+        Self {
+            pending_status: pending_status.to_string(),
+            active_at: started_at + INDEX_BUILD_SPAN,
+        }
+    }
+
+    /// The status the index holds at `now`: the build's own while it is still
+    /// running, and [`INDEX_STATUS_ACTIVE`] from the instant it was due.
+    pub fn status_at(&self, now: SystemTime) -> &str {
+        if now >= self.active_at {
+            INDEX_STATUS_ACTIVE
+        } else {
+            &self.pending_status
+        }
+    }
+}
+
+/// One fleet index as a reader describes it: the three members
+/// `DescribeIndexResponse` declares.
+#[derive(Debug, Clone)]
+pub struct FleetIndexDescription {
+    /// The index's name — its identity, and the `@httpLabel` of
+    /// `/indices/{indexName}`.
+    pub index_name: String,
+    /// Where the index stands: one of [`crate::ops::types::INDEX_STATUS_VALUES`].
+    pub index_status: String,
+    /// What the index contains ([`thing_index_schema`]), for an index whose contents
+    /// the model gives a value for.
+    pub schema: Option<String>,
+}
+
+/// The `schema` a reader reports for the index `index_name` names, under
+/// `configuration`.
+///
+/// Only the THING index has one: `DescribeIndexResponse$schema`'s value list
+/// describes what a THING index holds (registry, shadow and connectivity data), so
+/// the thing-group index reports no schema rather than a token the model gives no
+/// value for.
+fn fleet_index_schema(
+    index_name: &str,
+    configuration: &IndexingConfiguration,
+) -> Option<&'static str> {
+    match index_name {
+        THING_INDEX_NAME => thing_index_schema(&configuration.thing),
+        _ => None,
+    }
+}
+
+/// What the THING index contains under `configuration`, as
+/// `DescribeIndexResponse$schema` reports it, or `None` while thing indexing is
+/// disabled and there is no index to describe.
+///
+/// The schema is the configuration's data sources added up, in the terms the member
+/// documents
+/// (`smithy_query(query="doc",shape="DescribeIndexResponse",member="schema")`):
+/// `REGISTRY` is "only registry data", `REGISTRY_AND_SHADOW` adds "shadow data",
+/// `REGISTRY_AND_CONNECTIVITY_STATUS` adds "thing connectivity status data",
+/// `REGISTRY_AND_SHADOW_AND_CONNECTIVITY_STATUS` adds both, and
+/// `MULTI_INDEXING_MODE` is "multiple data sources" — which is what a configuration
+/// that also indexes a source none of those four names (a named shadow, or Device
+/// Defender violations) adds up to.
+pub fn thing_index_schema(configuration: &ThingIndexingConfiguration) -> Option<&'static str> {
+    let enabled =
+        |mode: Option<&String>| mode.is_some_and(|mode| mode.as_str() != INDEXING_MODE_OFF);
+    if configuration.thing_indexing_mode == INDEXING_MODE_OFF {
+        return None;
+    }
+    // `ThingIndexingMode` is `OFF | REGISTRY | REGISTRY_AND_SHADOW`
+    // ([`crate::ops::types::THING_INDEXING_MODE_VALUES`]), so shadow data is in the
+    // index exactly when the mode is the one that names it.
+    let shadow = configuration.thing_indexing_mode == "REGISTRY_AND_SHADOW";
+    let connectivity = enabled(configuration.thing_connectivity_indexing_mode.as_ref());
+    let other_sources = enabled(configuration.named_shadow_indexing_mode.as_ref())
+        || enabled(configuration.device_defender_indexing_mode.as_ref());
+    Some(match (other_sources, shadow, connectivity) {
+        (true, _, _) => "MULTI_INDEXING_MODE",
+        (false, true, true) => "REGISTRY_AND_SHADOW_AND_CONNECTIVITY_STATUS",
+        (false, true, false) => "REGISTRY_AND_SHADOW",
+        (false, false, true) => "REGISTRY_AND_CONNECTIVITY_STATUS",
+        (false, false, false) => "REGISTRY",
+    })
+}
+
+/// The `ResourceNotFoundException` message for a fleet index the account does not
+/// have — one it has not enabled, or a name that is no fleet index at all.
+///
+/// AWS IoT words a missing resource as "<resource> <name> does not exist", which is
+/// the sentence this service already answers with for the resources it serves (see
+/// [`missing_ota_update_message`] and the missing thing group
+/// [`resolve_job_targets`] refuses a job with), so the index this request named is
+/// what fills it — never a name from any one call's recording.
+pub fn missing_fleet_index_message(index_name: &str) -> String {
+    format!("Index {index_name} does not exist")
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

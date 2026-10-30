@@ -21,6 +21,8 @@ mod command_execution_read;
 mod command_registry;
 #[path = "all/describe_endpoint.rs"]
 mod describe_endpoint;
+#[path = "all/fleet_index_description.rs"]
+mod fleet_index_description;
 #[path = "all/indexing_configuration.rs"]
 mod indexing_configuration;
 #[path = "all/job_document_read.rs"]

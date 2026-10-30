@@ -258,16 +258,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         {
             let mut store = state.lock();
+            // A supplied section replaces the stored one in full, so recording it
+            // also starts the build the change owes on the index it drives — which
+            // is what `DescribeIndex` reports until the clock makes it due.
+            let now = ::std::time::SystemTime::now();
             if let Some(configuration) = input.thing_indexing_configuration {
-                store.indexing_configuration.set_thing(configuration);
+                store.set_thing_indexing_configuration(configuration, now);
             }
             // A request that supplies neither section changes nothing: both members
             // are optional, and an omitted section is one the caller did not ask to
             // change.
             if let Some(configuration) = input.thing_group_indexing_configuration {
-                store
-                    .indexing_configuration
-                    .set_thing_group(configuration);
+                store.set_thing_group_indexing_configuration(configuration, now);
             }
         }
 
