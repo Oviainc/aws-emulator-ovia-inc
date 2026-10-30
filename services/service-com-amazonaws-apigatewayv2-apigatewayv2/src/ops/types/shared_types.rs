@@ -146,12 +146,43 @@ pub struct PortalContent {
     pub theme: PortalTheme,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.apigatewayv2#PortalTheme")]
+/// `LogoLastUploaded` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so
+/// this shape's schema comes from `apigwv2_schema_and_codec!` — see
+/// `types/date_time_wire.rs`. Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="PortalTheme")`. This is the one shape here a
+/// request also carries (nested under `PortalContent`); neither of its two members
+/// declares a constraint trait, so the validating walk reads nothing off them — the
+/// constrained members of a portal's content sit on `CustomColors` and `PortalContent`,
+/// which keep the derive.
 #[derive(Debug, Clone, Default)]
 pub struct PortalTheme {
     pub custom_colors: CustomColors,
     pub logo_last_uploaded: Option<::aws_smithy_types::DateTime>,
 }
+
+apigwv2_schema_and_codec!(
+    PortalTheme,
+    PORTAL_THEME_SCHEMA,
+    "PortalTheme",
+    (
+        M_CUSTOM_COLORS,
+        custom_colors,
+        "CustomColors",
+        "customColors",
+        0,
+        req,
+        struct_of(CustomColors)
+    ),
+    (
+        M_LOGO_LAST_UPLOADED,
+        logo_last_uploaded,
+        "LogoLastUploaded",
+        "logoLastUploaded",
+        1,
+        opt,
+        date_time
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.apigatewayv2#CustomColors")]
 #[derive(Debug, Clone, Default)]

@@ -25,7 +25,11 @@ pub struct GetVpcLinksOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.apigatewayv2#VpcLink")]
+/// `CreatedDate` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `apigwv2_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="VpcLink")`; `VpcLinkStatus` and `VpcLinkVersion`
+/// are enum shapes, which the generator writes as `ShapeType::String`.
 #[derive(Debug, Clone, Default)]
 pub struct VpcLink {
     pub created_date: Option<::aws_smithy_types::DateTime>,
@@ -38,4 +42,43 @@ pub struct VpcLink {
     pub vpc_link_status_message: Option<String>,
     pub vpc_link_version: Option<String>,
 }
+
+apigwv2_schema_and_codec!(
+    VpcLink,
+    VPC_LINK_SCHEMA,
+    "VpcLink",
+    (M_CREATED_DATE, created_date, "CreatedDate", "createdDate", 0, opt, date_time),
+    (M_NAME, name, "Name", "name", 1, req, string),
+    (
+        M_SECURITY_GROUP_IDS,
+        security_group_ids,
+        "SecurityGroupIds",
+        "securityGroupIds",
+        2,
+        req,
+        list_of_string
+    ),
+    (M_SUBNET_IDS, subnet_ids, "SubnetIds", "subnetIds", 3, req, list_of_string),
+    (M_TAGS, tags, "Tags", "tags", 4, opt, map_of_string),
+    (M_VPC_LINK_ID, vpc_link_id, "VpcLinkId", "vpcLinkId", 5, req, string),
+    (M_VPC_LINK_STATUS, vpc_link_status, "VpcLinkStatus", "vpcLinkStatus", 6, opt, string),
+    (
+        M_VPC_LINK_STATUS_MESSAGE,
+        vpc_link_status_message,
+        "VpcLinkStatusMessage",
+        "vpcLinkStatusMessage",
+        7,
+        opt,
+        string
+    ),
+    (
+        M_VPC_LINK_VERSION,
+        vpc_link_version,
+        "VpcLinkVersion",
+        "vpcLinkVersion",
+        8,
+        opt,
+        string
+    ),
+);
 

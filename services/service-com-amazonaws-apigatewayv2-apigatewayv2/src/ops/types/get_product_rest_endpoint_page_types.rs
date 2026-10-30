@@ -20,7 +20,12 @@ pub struct GetProductRestEndpointPageInput {
     pub resource_owner_account_id: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.apigatewayv2#GetProductRestEndpointPageResponse")]
+/// `LastModified` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `apigwv2_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="GetProductRestEndpointPageResponse")`;
+/// `Status` and `TryItState` are enum shapes, which the generator writes as
+/// `ShapeType::String`.
 #[derive(Debug, Clone, Default)]
 pub struct GetProductRestEndpointPageOutput {
     pub display_content: Option<EndpointDisplayContentResponse>,
@@ -33,4 +38,67 @@ pub struct GetProductRestEndpointPageOutput {
     pub status_exception: Option<StatusException>,
     pub try_it_state: Option<String>,
 }
+
+apigwv2_schema_and_codec!(
+    GetProductRestEndpointPageOutput,
+    GET_PRODUCT_REST_ENDPOINT_PAGE_OUTPUT_SCHEMA,
+    "GetProductRestEndpointPageResponse",
+    (
+        M_DISPLAY_CONTENT,
+        display_content,
+        "DisplayContent",
+        "displayContent",
+        0,
+        opt,
+        struct_of(EndpointDisplayContentResponse)
+    ),
+    (M_LAST_MODIFIED, last_modified, "LastModified", "lastModified", 1, opt, date_time),
+    (
+        M_PRODUCT_REST_ENDPOINT_PAGE_ARN,
+        product_rest_endpoint_page_arn,
+        "ProductRestEndpointPageArn",
+        "productRestEndpointPageArn",
+        2,
+        opt,
+        string
+    ),
+    (
+        M_PRODUCT_REST_ENDPOINT_PAGE_ID,
+        product_rest_endpoint_page_id,
+        "ProductRestEndpointPageId",
+        "productRestEndpointPageId",
+        3,
+        opt,
+        string
+    ),
+    (
+        M_RAW_DISPLAY_CONTENT,
+        raw_display_content,
+        "RawDisplayContent",
+        "rawDisplayContent",
+        4,
+        opt,
+        string
+    ),
+    (
+        M_REST_ENDPOINT_IDENTIFIER,
+        rest_endpoint_identifier,
+        "RestEndpointIdentifier",
+        "restEndpointIdentifier",
+        5,
+        opt,
+        struct_of(RestEndpointIdentifier)
+    ),
+    (M_STATUS, status, "Status", "status", 6, opt, string),
+    (
+        M_STATUS_EXCEPTION,
+        status_exception,
+        "StatusException",
+        "statusException",
+        7,
+        opt,
+        struct_of(StatusException)
+    ),
+    (M_TRY_IT_STATE, try_it_state, "TryItState", "tryItState", 8, opt, string),
+);
 

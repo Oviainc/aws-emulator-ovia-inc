@@ -25,7 +25,11 @@ pub struct ListPortalsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.apigatewayv2#PortalSummary")]
+/// `LastModified` and `LastPublished` target `__timestampIso8601`
+/// (`@timestampFormat("date-time")`), so this shape's schema comes from
+/// `apigwv2_schema_and_codec!` — see `types/date_time_wire.rs`. Member set, order, wire
+/// names and requiredness from `smithy_query(query="shape", shape="PortalSummary")`;
+/// `PublishStatus` is an enum shape, which the generator writes as `ShapeType::String`.
 #[derive(Debug, Clone)]
 pub struct PortalSummary {
     pub authorization: Authorization,
@@ -43,4 +47,80 @@ pub struct PortalSummary {
     pub status_exception: Option<StatusException>,
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
+
+apigwv2_schema_and_codec!(
+    PortalSummary,
+    PORTAL_SUMMARY_SCHEMA,
+    "PortalSummary",
+    (
+        M_AUTHORIZATION,
+        authorization,
+        "Authorization",
+        "authorization",
+        0,
+        req,
+        struct_of(Authorization)
+    ),
+    (
+        M_ENDPOINT_CONFIGURATION,
+        endpoint_configuration,
+        "EndpointConfiguration",
+        "endpointConfiguration",
+        1,
+        req,
+        struct_of(EndpointConfigurationResponse)
+    ),
+    (
+        M_INCLUDED_PORTAL_PRODUCT_ARNS,
+        included_portal_product_arns,
+        "IncludedPortalProductArns",
+        "includedPortalProductArns",
+        2,
+        req,
+        list_of_string
+    ),
+    (M_LAST_MODIFIED, last_modified, "LastModified", "lastModified", 3, req, date_time),
+    (M_LAST_PUBLISHED, last_published, "LastPublished", "lastPublished", 4, opt, date_time),
+    (
+        M_LAST_PUBLISHED_DESCRIPTION,
+        last_published_description,
+        "LastPublishedDescription",
+        "lastPublishedDescription",
+        5,
+        opt,
+        string
+    ),
+    (M_PORTAL_ARN, portal_arn, "PortalArn", "portalArn", 6, req, string),
+    (
+        M_PORTAL_CONTENT,
+        portal_content,
+        "PortalContent",
+        "portalContent",
+        7,
+        req,
+        struct_of(PortalContent)
+    ),
+    (M_PORTAL_ID, portal_id, "PortalId", "portalId", 8, req, string),
+    (M_PREVIEW, preview, "Preview", "preview", 9, opt, struct_of(Preview)),
+    (M_PUBLISH_STATUS, publish_status, "PublishStatus", "publishStatus", 10, opt, string),
+    (
+        M_RUM_APP_MONITOR_NAME,
+        rum_app_monitor_name,
+        "RumAppMonitorName",
+        "rumAppMonitorName",
+        11,
+        opt,
+        string
+    ),
+    (
+        M_STATUS_EXCEPTION,
+        status_exception,
+        "StatusException",
+        "statusException",
+        12,
+        opt,
+        struct_of(StatusException)
+    ),
+    (M_TAGS, tags, "Tags", "tags", 13, opt, map_of_string),
+);
 

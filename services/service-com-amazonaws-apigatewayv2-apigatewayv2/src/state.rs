@@ -4675,13 +4675,12 @@ fn checked_enum(
 
 /// Render a stored instant as the modelled `__timestampIso8601` member.
 ///
-/// Truncated to whole seconds: `createdDate` is rendered as an ISO-8601
-/// `date-time` and the service reports it at second granularity.
+/// Sub-second precision is kept: `__timestampIso8601` carries
+/// `@timestampFormat("date-time")`, whose RFC 3339 rendering states fractional seconds
+/// when the instant has them, so truncating here would drop ordering a client uses to
+/// tell two revisions of one resource apart.
 pub fn to_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
-    let secs = at
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs());
-    ::aws_smithy_types::DateTime::from_secs(i64::try_from(secs).unwrap_or(i64::MAX))
+    ::aws_smithy_types::DateTime::from(at)
 }
 
 /// Mint one id from `kind` and `seed`: [`ID_LEN`] characters drawn from

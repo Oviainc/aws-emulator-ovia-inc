@@ -20,7 +20,12 @@ pub struct UpdateProductRestEndpointPageInput {
     pub try_it_state: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.apigatewayv2#UpdateProductRestEndpointPageResponse")]
+/// `LastModified` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `apigwv2_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="UpdateProductRestEndpointPageResponse")`;
+/// `Status` and `TryItState` are enum shapes, which the generator writes as
+/// `ShapeType::String`.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateProductRestEndpointPageOutput {
     pub display_content: Option<EndpointDisplayContentResponse>,
@@ -32,4 +37,58 @@ pub struct UpdateProductRestEndpointPageOutput {
     pub status_exception: Option<StatusException>,
     pub try_it_state: Option<String>,
 }
+
+apigwv2_schema_and_codec!(
+    UpdateProductRestEndpointPageOutput,
+    UPDATE_PRODUCT_REST_ENDPOINT_PAGE_OUTPUT_SCHEMA,
+    "UpdateProductRestEndpointPageResponse",
+    (
+        M_DISPLAY_CONTENT,
+        display_content,
+        "DisplayContent",
+        "displayContent",
+        0,
+        opt,
+        struct_of(EndpointDisplayContentResponse)
+    ),
+    (M_LAST_MODIFIED, last_modified, "LastModified", "lastModified", 1, opt, date_time),
+    (
+        M_PRODUCT_REST_ENDPOINT_PAGE_ARN,
+        product_rest_endpoint_page_arn,
+        "ProductRestEndpointPageArn",
+        "productRestEndpointPageArn",
+        2,
+        opt,
+        string
+    ),
+    (
+        M_PRODUCT_REST_ENDPOINT_PAGE_ID,
+        product_rest_endpoint_page_id,
+        "ProductRestEndpointPageId",
+        "productRestEndpointPageId",
+        3,
+        opt,
+        string
+    ),
+    (
+        M_REST_ENDPOINT_IDENTIFIER,
+        rest_endpoint_identifier,
+        "RestEndpointIdentifier",
+        "restEndpointIdentifier",
+        4,
+        opt,
+        struct_of(RestEndpointIdentifier)
+    ),
+    (M_STATUS, status, "Status", "status", 5, opt, string),
+    (
+        M_STATUS_EXCEPTION,
+        status_exception,
+        "StatusException",
+        "statusException",
+        6,
+        opt,
+        struct_of(StatusException)
+    ),
+    (M_TRY_IT_STATE, try_it_state, "TryItState", "tryItState", 7, opt, string),
+);
 

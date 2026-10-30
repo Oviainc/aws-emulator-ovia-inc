@@ -89,6 +89,8 @@ mod integration_response_lifecycle;
 mod integration_update;
 #[path = "all/integration_validation.rs"]
 mod integration_validation;
+#[path = "all/iso8601_timestamp_members.rs"]
+mod iso8601_timestamp_members;
 #[path = "all/model_lifecycle.rs"]
 mod model_lifecycle;
 #[path = "all/model_template.rs"]

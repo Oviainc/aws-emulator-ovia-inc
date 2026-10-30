@@ -18,7 +18,10 @@ pub struct CreateProductPageInput {
     pub portal_product_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.apigatewayv2#CreateProductPageResponse")]
+/// `LastModified` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `apigwv2_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="CreateProductPageResponse")`.
 #[derive(Debug, Clone, Default)]
 pub struct CreateProductPageOutput {
     pub display_content: Option<DisplayContent>,
@@ -26,4 +29,30 @@ pub struct CreateProductPageOutput {
     pub product_page_arn: Option<String>,
     pub product_page_id: Option<String>,
 }
+
+apigwv2_schema_and_codec!(
+    CreateProductPageOutput,
+    CREATE_PRODUCT_PAGE_OUTPUT_SCHEMA,
+    "CreateProductPageResponse",
+    (
+        M_DISPLAY_CONTENT,
+        display_content,
+        "DisplayContent",
+        "displayContent",
+        0,
+        opt,
+        struct_of(DisplayContent)
+    ),
+    (M_LAST_MODIFIED, last_modified, "LastModified", "lastModified", 1, opt, date_time),
+    (
+        M_PRODUCT_PAGE_ARN,
+        product_page_arn,
+        "ProductPageArn",
+        "productPageArn",
+        2,
+        opt,
+        string
+    ),
+    (M_PRODUCT_PAGE_ID, product_page_id, "ProductPageId", "productPageId", 3, opt, string),
+);
 

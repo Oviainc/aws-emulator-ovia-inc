@@ -20,7 +20,10 @@ pub struct UpdatePortalProductInput {
     pub portal_product_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.apigatewayv2#UpdatePortalProductResponse")]
+/// `LastModified` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `apigwv2_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="UpdatePortalProductResponse")`.
 #[derive(Debug, Clone, Default)]
 pub struct UpdatePortalProductOutput {
     pub description: Option<String>,
@@ -31,4 +34,41 @@ pub struct UpdatePortalProductOutput {
     pub portal_product_id: Option<String>,
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
+
+apigwv2_schema_and_codec!(
+    UpdatePortalProductOutput,
+    UPDATE_PORTAL_PRODUCT_OUTPUT_SCHEMA,
+    "UpdatePortalProductResponse",
+    (M_DESCRIPTION, description, "Description", "description", 0, opt, string),
+    (M_DISPLAY_NAME, display_name, "DisplayName", "displayName", 1, opt, string),
+    (
+        M_DISPLAY_ORDER,
+        display_order,
+        "DisplayOrder",
+        "displayOrder",
+        2,
+        opt,
+        struct_of(DisplayOrder)
+    ),
+    (M_LAST_MODIFIED, last_modified, "LastModified", "lastModified", 3, opt, date_time),
+    (
+        M_PORTAL_PRODUCT_ARN,
+        portal_product_arn,
+        "PortalProductArn",
+        "portalProductArn",
+        4,
+        opt,
+        string
+    ),
+    (
+        M_PORTAL_PRODUCT_ID,
+        portal_product_id,
+        "PortalProductId",
+        "portalProductId",
+        5,
+        opt,
+        string
+    ),
+    (M_TAGS, tags, "Tags", "tags", 6, opt, map_of_string),
+);
 

@@ -27,7 +27,12 @@ pub struct ListProductRestEndpointPagesOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.apigatewayv2#ProductRestEndpointPageSummaryNoBody")]
+/// `LastModified` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `apigwv2_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="ProductRestEndpointPageSummaryNoBody")`;
+/// `Status` and `TryItState` are enum shapes, which the generator writes as
+/// `ShapeType::String`.
 #[derive(Debug, Clone)]
 pub struct ProductRestEndpointPageSummaryNoBody {
     pub endpoint: String,
@@ -40,4 +45,51 @@ pub struct ProductRestEndpointPageSummaryNoBody {
     pub status_exception: Option<StatusException>,
     pub try_it_state: String,
 }
+
+apigwv2_schema_and_codec!(
+    ProductRestEndpointPageSummaryNoBody,
+    PRODUCT_REST_ENDPOINT_PAGE_SUMMARY_NO_BODY_SCHEMA,
+    "ProductRestEndpointPageSummaryNoBody",
+    (M_ENDPOINT, endpoint, "Endpoint", "endpoint", 0, req, string),
+    (M_LAST_MODIFIED, last_modified, "LastModified", "lastModified", 1, req, date_time),
+    (M_OPERATION_NAME, operation_name, "OperationName", "operationName", 2, opt, string),
+    (
+        M_PRODUCT_REST_ENDPOINT_PAGE_ARN,
+        product_rest_endpoint_page_arn,
+        "ProductRestEndpointPageArn",
+        "productRestEndpointPageArn",
+        3,
+        req,
+        string
+    ),
+    (
+        M_PRODUCT_REST_ENDPOINT_PAGE_ID,
+        product_rest_endpoint_page_id,
+        "ProductRestEndpointPageId",
+        "productRestEndpointPageId",
+        4,
+        req,
+        string
+    ),
+    (
+        M_REST_ENDPOINT_IDENTIFIER,
+        rest_endpoint_identifier,
+        "RestEndpointIdentifier",
+        "restEndpointIdentifier",
+        5,
+        req,
+        struct_of(RestEndpointIdentifier)
+    ),
+    (M_STATUS, status, "Status", "status", 6, req, string),
+    (
+        M_STATUS_EXCEPTION,
+        status_exception,
+        "StatusException",
+        "statusException",
+        7,
+        opt,
+        struct_of(StatusException)
+    ),
+    (M_TRY_IT_STATE, try_it_state, "TryItState", "tryItState", 8, req, string),
+);
 
