@@ -477,20 +477,27 @@ async fn the_identity_token_s_role_claims_follow_the_groups_roles_and_precedence
              {actual_preferred:?}"
         );
 
-        // Both claims belong to the identity token alone.
-        for member in ["AccessToken", "RefreshToken"] {
-            let token = result[member].as_str().unwrap_or_else(|| {
-                panic!("case {case:?}: {member} must be issued, got {result}")
-            });
-            let other = claims_of(token);
-            for claim in ["cognito:roles", "cognito:preferred_role"] {
-                assert!(
-                    other.get(claim).is_none(),
-                    "case {case:?}: the {member} carries no {claim} claim, got {:?}",
-                    other.get(claim)
-                );
-            }
+        // Both claims belong to the identity token alone, and the opaque refresh
+        // credential beside it states no claim at all.
+        let access = result["AccessToken"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: AccessToken must be issued, got {result}"));
+        let other = claims_of(access);
+        for claim in ["cognito:roles", "cognito:preferred_role"] {
+            assert!(
+                other.get(claim).is_none(),
+                "case {case:?}: the AccessToken carries no {claim} claim, got {:?}",
+                other.get(claim)
+            );
         }
+        let refresh = result["RefreshToken"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: RefreshToken must be issued, got {result}"));
+        assert!(
+            !refresh.contains('.'),
+            "case {case:?}: the refresh token is opaque, so it carries no claim to read at \
+             all, got {refresh}"
+        );
 
         // The claims are read from STORED state, not minted once: a second sign-in renders
         // the same two claims.

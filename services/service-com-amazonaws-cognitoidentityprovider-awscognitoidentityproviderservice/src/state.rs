@@ -184,6 +184,95 @@ pub fn auth_flow_not_enabled_message(auth_flow: &str) -> String {
     format!("{auth_flow} flow not enabled for this client")
 }
 
+/// The `ChallengeParameters` of a successful authentication response that leaves
+/// NO challenge outstanding: the empty map.
+///
+/// `InitiateAuth`, `AdminInitiateAuth`, `RespondToAuthChallenge` and
+/// `AdminRespondToAuthChallenge` all model `ChallengeParameters` as a
+/// `ChallengeParametersType` map (this service's model), and a successful
+/// response carries it whether or not a challenge is outstanding: the parameters
+/// of the challenge the caller must answer, or no parameters at all once
+/// authentication is complete. A caller therefore reads the map unconditionally
+/// and finds it empty rather than absent, so every one of those operations asks
+/// this one function for the completed case and none of them can drop the member.
+#[must_use]
+pub fn completed_challenge_parameters() -> HashMap<String, String> {
+    HashMap::new()
+}
+
+/// The `ChallengeParameters` of a `NEW_PASSWORD_REQUIRED` challenge for `username`:
+/// the user it is for, the attributes the challenge response must supply, and the
+/// values the user already has.
+///
+/// `ChallengeResponses` documents the response this challenge takes as
+/// `{"NEW_PASSWORD": "[new_password]", "USERNAME": "[username]"}` plus
+/// `"userAttributes.[attribute_name]": "[attribute_value]"` (this service's model),
+/// so the parameters report the names under that same `userAttributes.` prefix and
+/// the current values as a JSON object.
+///
+/// `userAttributes` reports the user's OWN attributes: `sub` is minted by the pool
+/// for every user, is immutable, and is not an attribute any challenge response can
+/// carry — the same reason it is never among the required attributes a challenge asks
+/// for ([`UserPool::unset_required_attributes`]) — so it is not reported among them,
+/// and a user with no other attribute is reported with an empty object.
+///
+/// Both `InitiateAuth` and `AdminInitiateAuth` start this challenge, and both read
+/// its parameters here, so the two cannot report it differently.
+#[must_use]
+pub fn new_password_required_challenge_parameters(
+    username: &str,
+    required_attributes: &[String],
+    user_attributes: &BTreeMap<String, String>,
+) -> HashMap<String, String> {
+    let mut parameters = HashMap::new();
+    parameters.insert(USER_ID_FOR_SRP.to_string(), username.to_string());
+    parameters.insert(
+        REQUIRED_ATTRIBUTES.to_string(),
+        ::serde_json::Value::Array(
+            required_attributes
+                .iter()
+                .map(|name| {
+                    ::serde_json::Value::String(format!("{USER_ATTRIBUTES_PREFIX}{name}"))
+                })
+                .collect(),
+        )
+        .to_string(),
+    );
+    parameters.insert(
+        USER_ATTRIBUTES.to_string(),
+        ::serde_json::Value::Object(
+            user_attributes
+                .iter()
+                .filter(|(name, _)| name.as_str() != SUB_ATTRIBUTE)
+                .map(|(name, value)| (name.clone(), ::serde_json::Value::String(value.clone())))
+                .collect(),
+        )
+        .to_string(),
+    );
+    parameters
+}
+
+/// The `ChallengeParameters` entry naming the user a challenge is outstanding for.
+const USER_ID_FOR_SRP: &str = "USER_ID_FOR_SRP";
+
+/// The `ChallengeParameters` entry listing the attributes a challenge response must
+/// supply.
+const REQUIRED_ATTRIBUTES: &str = "requiredAttributes";
+
+/// The `ChallengeParameters` entry carrying the values the user already has.
+const USER_ATTRIBUTES: &str = "userAttributes";
+
+/// The `ChallengeResponses` key prefix an attribute value is submitted under:
+/// `"userAttributes.[attribute_name]": "[attribute_value]"` (this service's model),
+/// which is how `requiredAttributes` names the attributes it asks for — and how
+/// `AdminRespondToAuthChallenge` reads them back off a response, so the asking and
+/// the answering side cannot disagree.
+pub const USER_ATTRIBUTES_PREFIX: &str = "userAttributes.";
+
+/// The attribute every user pool mints for its users and no caller sets: "the user's
+/// unique identifier" the pool assigns (`sub` in this service's standard schema).
+pub const SUB_ATTRIBUTE: &str = "sub";
+
 /// The scope an access token has to carry to authorize the user self-service
 /// operations: each one is authorized "with a signed-in user's access token. It
 /// must include the scope `aws.cognito.signin.user.admin`" (`GetUser`,
@@ -1155,11 +1244,13 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// Every claim comes from stored state: the `sub` and `username` from the
     /// stored user, its `cognito:groups` from the groups the stored user belongs
     /// to, `client_id` from the stored app client, the issuer from the stored
-    /// pool, and each lifetime from the app client's validity settings. Each of
-    /// the three is signed with the POOL's key pair, so a verifier can check it
-    /// against the key set that pool publishes. `None` when the pool, the client
-    /// or the user is gone, or when the signature could not be computed — never
-    /// a token nothing signed.
+    /// pool, and each lifetime from the app client's validity settings. The
+    /// access and id tokens are signed with the POOL's key pair, so a verifier
+    /// can check them against the key set that pool publishes; the refresh token
+    /// is an OPAQUE credential ([`mint_refresh_token`]) that carries no claims at
+    /// all. `None` when the pool, the client or the user is gone, when the
+    /// signature could not be computed, or when no refresh credential was minted
+    /// — never a token nothing signed.
     ///
     /// Tokens the clock has already expired are swept first, and the oldest are
     /// evicted if the store is still at [`MAX_ISSUED_TOKENS`], so repeated
@@ -1170,8 +1261,17 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         client_id: &str,
         username: &str,
         now: SystemTime,
+        credentials: &::emulator_server::CredentialStore,
     ) -> Option<AuthenticationResultType> {
-        self.mint_tokens(user_pool_id, client_id, username, now, true, None)
+        let refresh_token = mint_refresh_token(credentials)?;
+        self.mint_tokens(
+            user_pool_id,
+            client_id,
+            username,
+            now,
+            Some(refresh_token),
+            None,
+        )
     }
 
     /// Issue a fresh triple that CONTINUES the sign-in lineage of
@@ -1187,9 +1287,18 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         username: &str,
         now: SystemTime,
         presented_refresh_token: &str,
+        credentials: &::emulator_server::CredentialStore,
     ) -> Option<AuthenticationResultType> {
         let lineage = self.token_lineage(presented_refresh_token);
-        self.mint_tokens(user_pool_id, client_id, username, now, true, lineage)
+        let refresh_token = mint_refresh_token(credentials)?;
+        self.mint_tokens(
+            user_pool_id,
+            client_id,
+            username,
+            now,
+            Some(refresh_token),
+            lineage,
+        )
     }
 
     /// Issue the access / id token pair for a sign-in that REUSES the refresh token the
@@ -1210,7 +1319,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         presented_refresh_token: &str,
     ) -> Option<AuthenticationResultType> {
         let lineage = self.token_lineage(presented_refresh_token);
-        self.mint_tokens(user_pool_id, client_id, username, now, false, lineage)
+        self.mint_tokens(user_pool_id, client_id, username, now, None, lineage)
     }
 
     /// The sign-in lineage ([`TokenRecord::origin`]) of the token `token`, or
@@ -1328,12 +1437,16 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     }
 
     /// The one token-minting path behind [`issue_tokens`] and [`refresh_tokens`]:
-    /// `with_refresh_token` decides whether a refresh token is minted beside the access
-    /// and id tokens, so the two entry points cannot disagree about a claim.
+    /// `refresh_token` is the opaque refresh credential to record and report beside the
+    /// access and id tokens, and `None` for a refresh that reuses the one the caller
+    /// already holds, so the two entry points cannot disagree about a claim.
     ///
-    /// Every token it mints is signed with the POOL's key pair and names that key by
+    /// Every token it SIGNS is signed with the POOL's key pair and names that key by
     /// `kid`, so a verifier can check it against the key set the pool publishes; a token
-    /// whose signature could not be computed is not issued at all ([`signed_jws`]).
+    /// whose signature could not be computed is not issued at all ([`signed_jws`]). The
+    /// refresh credential is signed by nothing and carries no claims: it is opaque to
+    /// its holder, and the record this writes for it is the only place its sign-in is
+    /// stated.
     ///
     /// `lineage` is the `origin_jti` the minted tokens join — the sign-in of the
     /// refresh token a refresh presented — and `None` starts a new one, which is
@@ -1344,7 +1457,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         client_id: &str,
         username: &str,
         now: SystemTime,
-        with_refresh_token: bool,
+        refresh_token: Option<String>,
         lineage: Option<String>,
     ) -> Option<AuthenticationResultType> {
         let TokenInputs {
@@ -1474,26 +1587,8 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
 
         let access_token = signed_jws(&access_claims, &signing_key)?;
         let id_token = signed_jws(&id_claims, &signing_key)?;
-        // A refresh sign-in reuses the token the caller presented, so no refresh claims
-        // are built on that path at all.
-        let refresh_token = if with_refresh_token {
-            let refresh_claims = serde_json::json!({
-                "sub": sub,
-                "iss": issuer,
-                "client_id": client_id,
-                "username": stored_username,
-                "token_use": "refresh",
-                "iat": issued_at,
-                "exp": expiry_claim(issued_at, refresh_ttl)?,
-                "jti": new_uuid(),
-                "origin_jti": origin_jti,
-            });
-            Some(signed_jws(&refresh_claims, &signing_key)?)
-        } else {
-            None
-        };
 
-        let minted = 2 + usize::from(with_refresh_token);
+        let minted = 2 + usize::from(refresh_token.is_some());
         self.issued_tokens
             .retain(|_, record| record.expires_at > now);
         evict_oldest_until(
@@ -2592,7 +2687,7 @@ impl UserPool {
             .iter()
             .filter(|entry| entry.required == Some(true))
             .filter_map(|entry| entry.name.clone())
-            .filter(|name| name != "sub" && !attributes.contains_key(name))
+            .filter(|name| name != SUB_ATTRIBUTE && !attributes.contains_key(name))
             .collect()
     }
 
@@ -7080,10 +7175,52 @@ fn new_device_key(region: &str) -> String {
 /// separator is 36 characters long.
 const MAX_DEVICE_KEY_PREFIX: usize = 55 - 1 - 36;
 
-/// A fresh `DeviceGroupKey` for a user pool: 9 characters, inside the modelled
-/// length 0..131072.
+/// A fresh `DeviceGroupKey` for a user pool: a v4 UUID, the shape Amazon Cognito
+/// issues this identifier in, inside the modelled length 0..131072.
 fn new_device_group_key() -> String {
-    random_token(9)
+    new_uuid()
+}
+
+/// A fresh refresh token: the opaque credential a completed sign-in hands its
+/// caller, and the value a later refresh presents back.
+///
+/// "Your user's refresh token" (`AuthenticationResultType.RefreshToken` in this
+/// service's model) is a bearer credential and nothing else: unlike the access
+/// and id tokens beside it, it states no claim its holder can read, and
+/// everything this service knows about it lives in the [`TokenRecord`] keyed by
+/// it. It is therefore minted by the one component that generates secrets — the
+/// emulator's credential store — and then removed from that store again: the
+/// caller gets the secret, the emulator keeps no credential it would accept as a
+/// request signature, and nothing accumulates per sign-in.
+///
+/// The minted secret is rendered base64url with [`base64_url`], the codec this
+/// crate already uses for every opaque value it puts on the wire, so the
+/// credential satisfies the modelled `TokenModelType` pattern
+/// `^[A-Za-z0-9-_=.]+$` whatever alphabet the store drew it from, and keeps every
+/// bit of its randomness.
+///
+/// `None` when the store minted no session-token secret, or when the minted
+/// credential could not be removed from the store again — a credential the
+/// emulator would still accept as a request signature is not the token a sign-in
+/// promises, so it is refused rather than handed out, and the failed removal is
+/// logged. Either way the sign-in refuses rather than reporting a credential
+/// nothing issued.
+pub fn mint_refresh_token(store: &::emulator_server::CredentialStore) -> Option<String> {
+    let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let token = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .map(|secret| base64_url(secret.as_bytes()));
+    // The refresh token authenticates to this service's own token exchange, not
+    // to the emulator's request signing; see above.
+    if let Err(error) = store.delete(&minted.id) {
+        ::tracing::warn!(
+            access_key_id = %minted.id,
+            error = ?error,
+            "a credential minted for a refresh token could not be deleted"
+        );
+        return None;
+    }
+    token
 }
 
 /// `len` random hex characters, drawn from v4 UUIDs (122 bits of entropy each)

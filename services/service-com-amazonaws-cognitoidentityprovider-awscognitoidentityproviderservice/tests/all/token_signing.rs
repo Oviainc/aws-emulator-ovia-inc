@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The tokens this service issues, as a verifier sees them: three NON-EMPTY
-//! base64url segments whose third one is an ES256 signature that checks out
-//! against the PUBLIC key the issuing pool's key set publishes, and whose
-//! claims come from stored state.
+//! The tokens this service issues, as a verifier sees them: the access and id
+//! tokens are three NON-EMPTY base64url segments whose third one is an ES256
+//! signature that checks out against the PUBLIC key the issuing pool's key set
+//! publishes, and whose claims come from stored state. The refresh token beside
+//! them is an opaque credential and is checked to be exactly that.
 //!
 //! The encoding of a segment is pinned by PUBLISHED vectors rather than by this
 //! emulator's own output: RFC 4648 §10's base64 test strings, plus inputs whose
@@ -17,7 +18,7 @@
 //! advertises (ES256 — ECDSA on P-256 with SHA-256, RFC 7518 §3.4). Nothing
 //! here touches a private key — the verification path uses only the `x`/`y`
 //! curve coordinates the key set publishes — so a token that passes is one a
-//! third party could have verified. The rows span the three tokens of a
+//! third party could have verified. The rows span the signed tokens of a
 //! sign-in, users with and without groups and an email, two pools, a table of
 //! tamperings each of which must FAIL to verify, and the key set as served over
 //! the wire at the pool's `/.well-known/jwks.json`.
@@ -41,13 +42,11 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 /// A password satisfying a default pool's password policy.
 const GOOD_PASSWORD: &str = "Passw0rd!2024";
 
-/// The members of `AuthenticationResult` that carry a token, with the
-/// `token_use` claim each one's token states.
-const TOKEN_MEMBERS: [(&str, &str); 3] = [
-    ("AccessToken", "access"),
-    ("IdToken", "id"),
-    ("RefreshToken", "refresh"),
-];
+/// The members of `AuthenticationResult` that carry a SIGNED token, with the
+/// `token_use` claim each one's token states. The refresh token beside them is an
+/// opaque credential that states no claim at all, so it is not signed and not
+/// among these.
+const TOKEN_MEMBERS: [(&str, &str); 2] = [("AccessToken", "access"), ("IdToken", "id")];
 
 /// One emulator with just this service mounted, beside the engine its state
 /// lives in.
@@ -504,9 +503,8 @@ async fn an_issued_token_is_signed_and_verifies_against_its_pools_key_set() {
             // `AdminAddUserToGroup`: a user in a group "populates a
             // `cognito:groups` claim to their access and identity tokens", so
             // the claim the signature covers is the stored membership on those
-            // two, and absent on the refresh token and for a user in no group.
-            let expected_groups =
-                (member != "RefreshToken" && !row.groups.is_empty()).then(|| json!(row.groups));
+            // two, and absent for a user in no group.
+            let expected_groups = (!row.groups.is_empty()).then(|| json!(row.groups));
             match expected_groups {
                 Some(expected) => assert_eq!(
                     claims["cognito:groups"], expected,
@@ -520,9 +518,28 @@ async fn an_issued_token_is_signed_and_verifies_against_its_pools_key_set() {
             }
         }
         assert!(
-            signatures[0] != signatures[1] && signatures[1] != signatures[2],
+            signatures[0] != signatures[1],
             "case {case:?}: each token is signed over its own claims, so no two of a \
              sign-in's signatures are equal, got {signatures:?}"
+        );
+        // The refresh token beside them is a credential, not a statement: it is
+        // NOT a JWS, so nothing in it is readable by its holder.
+        let refresh = row.result["RefreshToken"].as_str().unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: the sign-in must return RefreshToken, got {}",
+                row.result
+            )
+        });
+        assert!(
+            !refresh.contains('.'),
+            "case {case:?}: a refresh token is opaque, not a compact-serialized JWS, \
+             got {refresh}"
+        );
+        assert!(
+            try_decode_base64url(refresh)
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_none(),
+            "case {case:?}: a refresh token decodes to no readable document, got {refresh}"
         );
     }
 

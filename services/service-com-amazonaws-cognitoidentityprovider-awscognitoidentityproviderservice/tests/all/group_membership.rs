@@ -351,9 +351,9 @@ async fn an_added_membership_is_persisted_and_shows_up_in_the_issued_tokens() {
             .as_str()
             .unwrap_or_else(|| panic!("case {label:?}: RefreshToken must be issued"));
         assert!(
-            groups_claim(refresh).is_none(),
-            "case {label:?}: the refresh token carries no cognito:groups claim, got {:?}",
-            groups_claim(refresh)
+            !refresh.contains('.'),
+            "case {label:?}: the refresh token is an opaque credential that states no \
+             claim, got {refresh}"
         );
 
         // The membership is STORED, not an artefact of the first sign-in: a

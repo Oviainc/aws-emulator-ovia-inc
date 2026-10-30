@@ -205,10 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only: the app client in the body names the pool, and
-        // `ClientMetadata` is input for the Lambda triggers this action would invoke,
-        // which this emulator invokes none of.
-        let _ = ctx;
+        // The app client in the body names the pool, and `ClientMetadata` is input for
+        // the Lambda triggers this action would invoke, which this emulator invokes none
+        // of; the credential store is what mints the refresh credential a rotation hands
+        // back.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
@@ -242,6 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &username,
                         now,
                         &input.refresh_token,
+                        ctx.credential_store(),
                     )
                     .ok_or_else(internal_error)?
             }

@@ -305,7 +305,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
@@ -458,14 +457,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The session answered its challenge, so it is spent.
         guard.end_session(&session_token);
         let authentication_result = guard
-            .issue_tokens(&input.user_pool_id, &input.client_id, &username, now)
+            .issue_tokens(
+                &input.user_pool_id,
+                &input.client_id,
+                &username,
+                now,
+                ctx.credential_store(),
+            )
             .ok_or_else(internal_error)?;
         Ok(AdminRespondToAuthChallengeOutput {
             // Authentication is complete, so there is no next challenge and no
-            // session to carry into one.
+            // session to carry into one — and the challenge parameter map is
+            // present and empty.
             challenge_name: None,
             session: None,
-            challenge_parameters: None,
+            challenge_parameters: Some(crate::state::completed_challenge_parameters()),
             authentication_result: Some(authentication_result),
             available_challenges: None,
         })
@@ -484,8 +490,10 @@ const NEW_PASSWORD: &str = "NEW_PASSWORD";
 const USERNAME: &str = "USERNAME";
 
 /// The `ChallengeResponses` key prefix an attribute value is submitted under:
-/// `"userAttributes.[attribute_name]": "[attribute_value]"`.
-const USER_ATTRIBUTES_PREFIX: &str = "userAttributes.";
+/// `"userAttributes.[attribute_name]": "[attribute_value]"`. The challenge that
+/// ASKS for those attributes names them under the same prefix, so both sides read
+/// it from the one place.
+const USER_ATTRIBUTES_PREFIX: &str = crate::state::USER_ATTRIBUTES_PREFIX;
 
 /// This operation's `ResourceNotFoundException` for an absent user pool.
 fn user_pool_not_found(user_pool_id: &str) -> AdminRespondToAuthChallengeError {

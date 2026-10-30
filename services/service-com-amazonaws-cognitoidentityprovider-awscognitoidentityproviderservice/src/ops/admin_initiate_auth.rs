@@ -297,7 +297,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
@@ -411,28 +410,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         code: None,
                     },
                 );
-                let mut challenge_parameters = ::std::collections::HashMap::new();
-                challenge_parameters.insert("USER_ID_FOR_SRP".to_string(), username);
-                challenge_parameters.insert(
-                    "requiredAttributes".to_string(),
-                    serde_json::Value::Array(
-                        required_attributes
-                            .into_iter()
-                            .map(|name| serde_json::Value::String(format!("userAttributes.{name}")))
-                            .collect(),
-                    )
-                    .to_string(),
-                );
-                challenge_parameters.insert(
-                    "userAttributes".to_string(),
-                    serde_json::Value::Object(
-                        user_attributes
-                            .into_iter()
-                            .map(|(name, value)| (name, serde_json::Value::String(value)))
-                            .collect(),
-                    )
-                    .to_string(),
-                );
+                let challenge_parameters =
+                    crate::state::new_password_required_challenge_parameters(
+                        &username,
+                        &required_attributes,
+                        &user_attributes,
+                    );
                 Ok(AdminInitiateAuthOutput {
                     challenge_name: Some(NEW_PASSWORD_REQUIRED.to_string()),
                     session: Some(session),
@@ -443,7 +426,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             Outcome::Authenticate { username } => {
                 let mut authentication_result = guard
-                    .issue_tokens(&input.user_pool_id, &input.client_id, &username, now)
+                    .issue_tokens(
+                        &input.user_pool_id,
+                        &input.client_id,
+                        &username,
+                        now,
+                        ctx.credential_store(),
+                    )
                     .ok_or_else(internal_error)?;
                 // The sign-in is complete, so the device it came from is now part
                 // of this user's state on a pool that remembers devices, and the
@@ -460,7 +449,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Ok(AdminInitiateAuthOutput {
                     challenge_name: None,
                     session: None,
-                    challenge_parameters: None,
+                    // No challenge is outstanding, so the map is present and
+                    // empty rather than absent.
+                    challenge_parameters: Some(crate::state::completed_challenge_parameters()),
                     authentication_result: Some(authentication_result),
                     available_challenges: None,
                 })

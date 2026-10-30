@@ -451,10 +451,12 @@ async fn the_admin_lifecycle_round_trips_through_stored_state() {
         id_claims["email"], "alice@example.com",
         "the id token must carry the stored email attribute, got {id_claims}"
     );
-    assert_eq!(
-        jwt_claims(result["RefreshToken"].as_str().expect("a refresh token"))["token_use"],
-        "refresh",
-        "a refresh token says so"
+    // The refresh token beside them states nothing: it is an opaque credential,
+    // not a readable token.
+    let refresh = result["RefreshToken"].as_str().expect("a refresh token");
+    assert!(
+        !refresh.contains('.'),
+        "a refresh token is opaque, not a compact-serialized JWS, got {refresh}"
     );
 
     // The wrong password is refused.

@@ -305,10 +305,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only: the app client in the body names the pool, and
-        // `ClientMetadata` is input for the Lambda triggers this action would invoke,
-        // which this emulator invokes none of.
-        let _ = ctx;
+        // The app client in the body names the pool, and `ClientMetadata` is input for
+        // the Lambda triggers this action would invoke, which this emulator invokes none
+        // of; the credential store is what mints the refresh credential a completed
+        // sign-in hands back.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
@@ -417,14 +417,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // complete a second sign-in.
         guard.end_session(&session_token);
         let authentication_result = guard
-            .issue_tokens(&user_pool_id, &input.client_id, &username, now)
+            .issue_tokens(
+                &user_pool_id,
+                &input.client_id,
+                &username,
+                now,
+                ctx.credential_store(),
+            )
             .ok_or_else(internal_error)?;
         Ok(RespondToAuthChallengeOutput {
             // Authentication is complete, so there is no next challenge and no session
-            // to carry into one.
+            // to carry into one — and the challenge parameter map is present and empty.
             challenge_name: None,
             session: None,
-            challenge_parameters: None,
+            challenge_parameters: Some(crate::state::completed_challenge_parameters()),
             authentication_result: Some(authentication_result),
             available_challenges: None,
         })

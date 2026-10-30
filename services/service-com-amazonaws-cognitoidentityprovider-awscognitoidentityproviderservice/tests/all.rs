@@ -41,6 +41,8 @@ mod admin_user_global_sign_out;
 mod admin_user_pool_lifecycle;
 #[path = "all/auth_flow_not_enabled.rs"]
 mod auth_flow_not_enabled;
+#[path = "all/authentication_success_shape.rs"]
+mod authentication_success_shape;
 #[path = "all/clock_dependent_state.rs"]
 mod clock_dependent_state;
 #[path = "all/constraint_refusal_values.rs"]

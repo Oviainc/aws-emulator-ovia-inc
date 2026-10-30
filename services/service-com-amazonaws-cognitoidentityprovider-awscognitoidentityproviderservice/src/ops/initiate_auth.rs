@@ -290,7 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
@@ -303,9 +303,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `AuthFlow` is an enumerated member, so the boundary validator has already
         // refused any value outside `AuthFlowType`.
         match input.auth_flow.as_str() {
-            USER_PASSWORD_AUTH => {
-                password_sign_in(&mut guard, &input.client_id, &auth_parameters, now)
-            }
+            USER_PASSWORD_AUTH => password_sign_in(
+                &mut guard,
+                &input.client_id,
+                &auth_parameters,
+                now,
+                ctx.credential_store(),
+            ),
             USER_AUTH => email_otp_sign_in(&mut guard, &input.client_id, &auth_parameters, now),
             REFRESH_TOKEN_AUTH | REFRESH_TOKEN => refresh_sign_in(
                 &mut guard,
@@ -389,6 +393,7 @@ fn password_sign_in(
     client_id: &str,
     auth_parameters: &::std::collections::HashMap<String, String>,
     now: ::std::time::SystemTime,
+    credentials: &::emulator_server::CredentialStore,
 ) -> Result<InitiateAuthOutput, InitiateAuthError> {
     let username = auth_parameters
         .get("USERNAME")
@@ -478,27 +483,10 @@ fn password_sign_in(
                     code: None,
                 },
             );
-            let mut challenge_parameters = ::std::collections::HashMap::new();
-            challenge_parameters.insert("USER_ID_FOR_SRP".to_string(), username);
-            challenge_parameters.insert(
-                "requiredAttributes".to_string(),
-                serde_json::Value::Array(
-                    required_attributes
-                        .into_iter()
-                        .map(|name| serde_json::Value::String(format!("userAttributes.{name}")))
-                        .collect(),
-                )
-                .to_string(),
-            );
-            challenge_parameters.insert(
-                "userAttributes".to_string(),
-                serde_json::Value::Object(
-                    user_attributes
-                        .into_iter()
-                        .map(|(name, value)| (name, serde_json::Value::String(value)))
-                        .collect(),
-                )
-                .to_string(),
+            let challenge_parameters = crate::state::new_password_required_challenge_parameters(
+                &username,
+                &required_attributes,
+                &user_attributes,
             );
             Ok(InitiateAuthOutput {
                 challenge_name: Some(NEW_PASSWORD_REQUIRED.to_string()),
@@ -513,7 +501,7 @@ fn password_sign_in(
             username,
         } => {
             let mut authentication_result = state
-                .issue_tokens(&user_pool_id, client_id, &username, now)
+                .issue_tokens(&user_pool_id, client_id, &username, now, credentials)
                 .ok_or_else(internal_error)?;
             // The sign-in is complete, so the device it came from is now part of
             // this user's state on a pool that remembers devices, and the key of a
@@ -746,12 +734,13 @@ fn refuse_unusable_user(user: &crate::state::User) -> Result<(), InitiateAuthErr
 
 /// A completed sign-in: the tokens, and none of the challenge members, which are "only
 /// returned if the user doesn't need to pass another challenge"
-/// (`InitiateAuthResponse.AuthenticationResult`).
+/// (`InitiateAuthResponse.AuthenticationResult`) — beside the `ChallengeParameters` map,
+/// which is present and EMPTY because no challenge is outstanding.
 fn authenticated(authentication_result: AuthenticationResultType) -> InitiateAuthOutput {
     InitiateAuthOutput {
         challenge_name: None,
         session: None,
-        challenge_parameters: None,
+        challenge_parameters: Some(crate::state::completed_challenge_parameters()),
         authentication_result: Some(authentication_result),
         available_challenges: None,
     }
