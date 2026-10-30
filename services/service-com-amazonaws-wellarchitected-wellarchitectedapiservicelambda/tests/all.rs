@@ -451,3 +451,8 @@ mod lens_share_token_lens_identity;
 // here so a new suite does not collide with another insertion.
 #[path = "all/tag_family_envelopes.rs"]
 mod tag_family_envelopes;
+
+// Appended at the end of this list for the reason the notes above give: the sorted position
+// for an agent suite is the one gap of this list every new agent suite lands in.
+#[path = "all/agent_recommendation_status_idempotence.rs"]
+mod agent_recommendation_status_idempotence;

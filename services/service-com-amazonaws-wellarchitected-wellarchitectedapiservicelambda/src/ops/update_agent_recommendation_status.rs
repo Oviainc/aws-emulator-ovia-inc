@@ -193,24 +193,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // The whole update: the new status, and the reason THIS update was made for.
-        // `updateReason` is "the free-text reason associated with the recommendation's most
-        // recent status update" (`AgentRecommendationSummary$updateReason`), so it is
-        // replaced by what this request carried — including by nothing, when the request
-        // gives no reason: the member describes the LATEST update, so an earlier update's
-        // reason must not be left standing as if it belonged to this one.
-        record.status = input.status;
-        record.update_reason = input.update_reason;
-        // "The identifier of the user or system that last modified this recommendation":
-        // every request this emulator serves is attributed to its one account, exactly as
-        // the generation that produced the recommendation is.
-        record.last_modified_by = Some(::engine::emulator_account_id().to_string());
-        record.last_modified_at = Some(now);
+        // `@idempotent` with NO client token: nothing outside the handler can tell a retry
+        // from the request it retries, so a request that asks for the state the
+        // recommendation ALREADY holds writes nothing at all — the instant the
+        // recommendation reports as last modified included — and a later report of it cannot
+        // tell the retry from the request it retries. Only an update that differs in a member
+        // the caller sent is a new update. This is the rule the sibling write of this same
+        // record applies to the feedback it puts.
+        let already_held =
+            record.status == input.status && record.update_reason == input.update_reason;
+        if !already_held {
+            // The whole update: the new status, and the reason THIS update was made for.
+            // `updateReason` is "the free-text reason associated with the recommendation's
+            // most recent status update" (`AgentRecommendationSummary$updateReason`), so it
+            // is replaced by what this request carried — including by nothing, when the
+            // request gives no reason: the member describes the LATEST update, so an earlier
+            // update's reason must not be left standing as if it belonged to this one.
+            record.status = input.status;
+            record.update_reason = input.update_reason;
+            // "The identifier of the user or system that last modified this recommendation":
+            // every request this emulator serves is attributed to its one account, exactly
+            // as the generation that produced the recommendation is.
+            record.last_modified_by = Some(::engine::emulator_account_id().to_string());
+            record.last_modified_at = Some(now);
+        }
 
         // The response carries no members (`UpdateAgentRecommendationStatusResponse` is an
         // empty structure), so the recorded status is observed through the operations that
-        // report the recommendation. `@idempotent`: re-sending the same status leaves the
-        // recommendation in the state it already reached.
+        // report the recommendation.
         Ok(UpdateAgentRecommendationStatusOutput {})
     }
 }
