@@ -3,28 +3,31 @@
 //! WHICH periods a metric alarm's evaluation grades, and the watermark its decision record
 //! reports, end to end over the wire.
 //!
-//! ONE rule, asserted over a table: **an alarm evaluation grades only the periods that have
-//! CLOSED, so the instant it reports as the one it queried the series at is never earlier than the
-//! END of the newest period it says it graded** — `queryDate >= max(evaluatedDatapoints[]
-//! .timestamp) + period` in the machine-readable half of the decision ("An explanation for the
-//! alarm state, in JSON format.", `smithy_query(query="shape",shape="MetricAlarm")`), and in the
+//! ONE rule, asserted over a table: **a period an evaluation reports as graded is one whose
+//! observations it really had, so the instant it reports as the one it queried the series at is
+//! never earlier than the END of a period it says it graded** — `queryDate >=
+//! max(evaluatedDatapoints[].timestamp) + period` in the machine-readable half of the decision
+//! ("An explanation for the alarm state, in JSON format.",
+//! `smithy_query(query="shape",shape="MetricAlarm")`), and in the
 //! same document as `DescribeAlarmHistory` records it ("Data about the alarm, in JSON format.",
 //! `smithy_query(query="shape",shape="AlarmHistoryItem")`).
 //!
 //! A period is aggregated into one datapoint out of EVERY observation stamped inside it —
 //! "CloudWatch aggregates all data points with time stamps that fall within each one-hour period"
-//! (`smithy_query(query="doc",shape="GetMetricStatistics")`) — so a period the clock is still
-//! inside has not received all the observations it will hold, and no statistic over it is final:
-//! the newest period an evaluation can grade is the newest one that is over. That is what makes
-//! the query instant a watermark a client can reconcile an alarm decision against the metric data
-//! with, and what keeps an alarm from firing on a part of a period.
+//! (`smithy_query(query="doc",shape="GetMetricStatistics")`) — so which period an observation
+//! belongs to is decided by its own time stamp, and a period an evaluation grades is one its
+//! rolling range has already reached. That is what makes the query instant a watermark a client
+//! can reconcile an alarm decision against the metric data with. Every row below publishes into
+//! periods that are OVER, which is why each of them names a closed period as the newest it
+//! graded.
 //!
 //! The rows differ along what the rule generalises over: the length of the period (10, 20, 30 and
 //! 60 seconds — the high-resolution cadences and the regular one), the statistic that aggregates
 //! a window, the comparison operator, the state the evaluation computed, how many windows it
 //! grades and how many of them hold a real datapoint, and the `TreatMissingData` arm. The second
-//! test is the other side of the same rule: the period the clock is in is graded by the evaluation
-//! that follows its CLOSE, not before.
+//! test is the other side of the same rule for a HIGH-RESOLUTION alarm, whose rolling range lags
+//! the clock by its own period: the period the clock is in is graded by the evaluation that
+//! follows its CLOSE, not before.
 
 use std::time::Duration;
 
@@ -265,9 +268,9 @@ fn assert_query_is_the_watermark(case: &str, what: &str, record: &Value, period:
         );
         assert!(
             query_date >= instant + period,
-            "case {case:?}: {what} grades only periods that have closed, so its queryDate \
-             ({query_date}) must be at or after the end of the bucket it names ({}), got \
-             {record}",
+            "case {case:?}: {what} must not report a period as graded before that period is \
+             over, so its queryDate ({query_date}) must be at or after the end of the bucket it \
+             names ({}), got {record}",
             instant + period
         );
     }
@@ -381,7 +384,8 @@ async fn an_alarms_query_instant_is_never_before_the_end_of_the_newest_period_it
 /// The alarm the second test drives: the shortest period an alarm may be evaluated on ("Valid
 /// values are 10, 20, 30, and any multiple of 60.",
 /// `smithy_query(query="doc",shape="PutMetricAlarmInput",member="Period")`), so the close of a
-/// period is a span a test can wait out.
+/// period is a span a test can wait out — and a HIGH-RESOLUTION period, whose rolling range lags
+/// the clock by the period itself, so the period the clock is in is graded only once it is over.
 const SHORTEST_PERIOD_SECS: i32 = 10;
 
 /// How much of the period must still be ahead when the datapoint is published: enough for the
