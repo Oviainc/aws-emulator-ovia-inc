@@ -477,24 +477,28 @@ fn response_for(run: &crate::state::WorkflowRun) -> StartWorkflowRunOutput {
 /// [`crate::state::DigestFields`] groups announcing their own extent, so a
 /// parameter's value can never be read as the version member's and two different
 /// requests never digest alike.
+///
+/// Every field of the sequence comes from the request's VALUES, never from a
+/// container's iteration order: the parameter map is walked in key order, and each
+/// parameter's `Document` value is walked by
+/// [`crate::state::DigestFields::document`], which does the same at every level
+/// inside it. Rendering a value with `Debug` would not do — a document object is a
+/// `HashMap`, which iterates in the order its own instance chose — and then the same
+/// bytes, deserialised twice, would digest two ways and a retry carrying the
+/// identical request would be refused as a token reused for a different one.
 fn request_fingerprint(input: &StartWorkflowRunInput) -> String {
     // `OverrideParameters` is an unordered map on the wire, so digest it in key order.
-    let mut parameters: Vec<(String, String)> = input
-        .override_parameters
-        .clone()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(key, value)| (key, format!("{value:?}")))
-        .collect();
-    parameters.sort();
+    let mut parameters: Vec<(&String, &::aws_smithy_types::Document)> =
+        input.override_parameters.iter().flatten().collect();
+    parameters.sort_unstable_by_key(|(key, _)| *key);
 
     let mut fields = crate::state::DigestFields::new();
     fields
         .field(input.workflow_arn.as_str())
         .optional(input.workflow_version.as_deref())
         .group(|entries| {
-            for (key, value) in &parameters {
-                entries.field(key.as_str()).field(value.as_str());
+            for (key, value) in parameters {
+                entries.field(key.as_str()).document(value);
             }
         });
     fields.digest()

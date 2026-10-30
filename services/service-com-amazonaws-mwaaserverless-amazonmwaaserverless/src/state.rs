@@ -1485,10 +1485,91 @@ impl DigestFields {
         })
     }
 
+    /// A caller-supplied `document` member, as ONE group whose fields are determined
+    /// by the document's VALUE and by nothing else.
+    ///
+    /// A document's own `Debug` rendering is NOT usable here: an object inside it is a
+    /// [`std::collections::HashMap`], which iterates in the order its own instance
+    /// chose, so two deserializations of the same bytes render differently and the
+    /// same request would digest two ways. The walk below therefore emits an object's
+    /// members in sorted key order, and leads every node with its KIND and every
+    /// collection with its SIZE, so one node's fields can never be read as another's:
+    /// two documents digest alike exactly when they are the same document.
+    ///
+    /// Iterative, over an explicit worklist, so the walk costs heap rather than stack
+    /// however deeply the caller nested the document.
+    pub fn document(&mut self, value: &::aws_smithy_types::Document) -> &mut Self {
+        self.group(|group| append_document(group, value))
+    }
+
     /// The digest of the sequence built so far.
     pub fn digest(&self) -> String {
         let borrowed: Vec<&str> = self.fields.iter().map(String::as_str).collect();
         digest(&borrowed)
+    }
+}
+
+/// [`DigestFields::document`]'s walk: append `value`'s canonical field sequence to
+/// `fields`.
+fn append_document(fields: &mut DigestFields, value: &::aws_smithy_types::Document) {
+    use ::aws_smithy_types::{Document, Number};
+
+    /// One entry of the worklist: a node still to be walked, or an object member's
+    /// key, which is appended immediately before that member's value.
+    enum Step<'a> {
+        Node(&'a Document),
+        Key(&'a str),
+    }
+
+    let mut pending = vec![Step::Node(value)];
+    while let Some(step) = pending.pop() {
+        match step {
+            Step::Key(key) => {
+                fields.field(key);
+            }
+            // Every node leads with the kind of value it is, so a string carrying a
+            // number's text and that number never digest alike.
+            Step::Node(Document::Null) => {
+                fields.field("null");
+            }
+            Step::Node(Document::Bool(flag)) => {
+                fields.field("boolean").field(flag.to_string());
+            }
+            Step::Node(Document::Number(Number::PosInt(number))) => {
+                fields.field("positive-integer").field(number.to_string());
+            }
+            Step::Node(Document::Number(Number::NegInt(number))) => {
+                fields.field("negative-integer").field(number.to_string());
+            }
+            Step::Node(Document::Number(Number::Float(number))) => {
+                // The kind field is what keeps a float apart from an integer of the same
+                // value: the text below is `f64`'s own rendering, deterministic for a
+                // given value but no canonical encoding of one (every NaN renders alike).
+                fields.field("float").field(number.to_string());
+            }
+            Step::Node(Document::String(text)) => {
+                fields.field("string").field(text.as_str());
+            }
+            // A collection announces how many children follow, and its children are
+            // walked in order — an array's own order, which belongs to the value.
+            Step::Node(Document::Array(items)) => {
+                fields.field("array").field(items.len().to_string());
+                pending.extend(items.iter().rev().map(Step::Node));
+            }
+            // An object's members are walked in SORTED KEY ORDER, because the order
+            // the wire carried them in, and the order the map iterates them in, are
+            // no part of the value.
+            Step::Node(Document::Object(members)) => {
+                fields.field("object").field(members.len().to_string());
+                let mut sorted: Vec<(&String, &Document)> = members.iter().collect();
+                sorted.sort_unstable_by_key(|(key, _)| *key);
+                for (key, member) in sorted.into_iter().rev() {
+                    // Pushed last-first, so the key is popped before its value.
+                    pending.push(Step::Node(member));
+                    pending.push(Step::Key(key.as_str()));
+                }
+            }
+        }
     }
 }
 

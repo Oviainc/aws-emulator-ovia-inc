@@ -35,6 +35,8 @@ mod list_page_size;
 mod missing_resource_lookups;
 #[path = "all/not_found_resource_identity.rs"]
 mod not_found_resource_identity;
+#[path = "all/override_parameter_fingerprint.rs"]
+mod override_parameter_fingerprint;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
 #[path = "all/resource_tag_listing.rs"]
