@@ -27,6 +27,11 @@
 //! Each row polls ONLY its own observer (and Amazon S3, to see whether the object is there),
 //! so the report it finds can only have been written by that operation: no row ever reads
 //! the experiment until the object has appeared.
+//!
+//! The harness this suite needs is shared rather than copied: the sibling
+//! [`crate::safety_lever_settles_and_reports`] suite, which takes `UpdateSafetyLeverState`'s
+//! store-wide sweep on its own, drives the same lever request, report configuration and
+//! post-read generation assertions from here.
 
 use std::time::Duration;
 
@@ -34,14 +39,14 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::experiment_lifecycle::{
-    get_experiment, send, start_experiment, stop_experiment, token, FALLBACK_REGION,
+    get_experiment, send, start_experiment, stop_experiment, token, Answer, FALLBACK_REGION,
 };
 use crate::experiment_state_reason_and_report::{
-    emulator_with_object_storage, s3, start_from, template_for, Ending, BUCKET,
+    emulator_with_object_storage, given_report_bucket, s3, start_from, template_for, Ending, BUCKET,
 };
 
 /// The id of the account's one safety lever, which is the emulator account's own id.
-const LEVER_ID: &str = "000000000000";
+pub(crate) const LEVER_ID: &str = "000000000000";
 
 /// How long a row may take to have its report written: the compressed run window plus the
 /// transitions around it and slack for a loaded machine.
@@ -109,12 +114,101 @@ fn rows() -> Vec<Row> {
 }
 
 /// The `experimentReportConfiguration` a row's template carries.
-fn report_configuration(prefix: Option<&str>, bucket: &str) -> Value {
+pub(crate) fn report_configuration(prefix: Option<&str>, bucket: &str) -> Value {
     let mut s3_configuration = json!({ "bucketName": bucket });
     if let Some(prefix) = prefix {
         s3_configuration["prefix"] = json!(prefix);
     }
     json!({ "outputs": { "s3Configuration": s3_configuration } })
+}
+
+/// Engage the account's one safety lever once, under `reason`.
+pub(crate) async fn engage_lever(router: &MultiServiceRouter, reason: &str) -> Answer {
+    send(
+        router,
+        "PATCH",
+        &format!("/safetyLevers/{LEVER_ID}/state"),
+        Some(json!({ "state": { "status": "engaged", "reason": reason } })),
+        FALLBACK_REGION,
+    )
+    .await
+}
+
+/// The lever answered, and reports `expected`: the transient `engaging` while the engage is
+/// still taking effect, and `engaged` once the clock says it has.
+pub(crate) fn assert_engaged(case: &str, answer: &Answer, expected: &str) {
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: expected the lever to be engaged, got {} with {:?}",
+        answer.status, answer.body
+    );
+    let state = answer.member("safetyLever")["state"].clone();
+    assert_eq!(
+        state["status"].as_str().unwrap_or_default(),
+        expected,
+        "case {case:?}: expected the engaged lever to report {expected:?}, got {state:?}"
+    );
+}
+
+/// The report object at `key`, or `None` when the bucket holds no such object.
+///
+/// Absence is the modelled absence and nothing else: a status that is neither the object nor
+/// `NoSuchKey` (404) panics here, so a case asserting that no report was written cannot pass
+/// on a call that merely failed.
+pub(crate) async fn report_object(
+    router: &MultiServiceRouter,
+    case: &str,
+    key: &str,
+) -> Option<Value> {
+    let (status, body) = s3(router, "GET", &format!("/{BUCKET}/{key}")).await;
+    if status != 200 {
+        assert_eq!(
+            status,
+            404,
+            "case {case:?}: reading s3://{BUCKET}/{key} must answer the object or report that \
+             there is none, got {status} with {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        return None;
+    }
+    Some(
+        serde_json::from_slice::<Value>(&body).unwrap_or_else(|error| {
+            panic!(
+                "case {case:?}: the report at s3://{BUCKET}/{key} is not JSON ({error}): {:?}",
+                String::from_utf8_lossy(&body)
+            )
+        }),
+    )
+}
+
+/// Assert that `report` is the generation the end of a run made due, as the experiment itself
+/// reports it: completed, with no error, naming exactly the one object at `key` that was
+/// written.
+pub(crate) fn assert_generation_names_object(case: &str, report: &Value, key: &str) {
+    assert_eq!(
+        report["state"]["status"].as_str().unwrap_or_default(),
+        "completed",
+        "case {case:?}: expected the generation to be completed, got {report:?}"
+    );
+    assert!(
+        report["state"]["error"].is_null(),
+        "case {case:?}: a generated report reports no error, got {report:?}"
+    );
+    let s3_reports = report["s3Reports"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: no s3Reports in {report:?}"))
+        .clone();
+    assert_eq!(
+        s3_reports.len(),
+        1,
+        "case {case:?}: expected the one object that was written to be named, got {s3_reports:?}"
+    );
+    assert_eq!(
+        s3_reports[0]["arn"].as_str().unwrap_or_default(),
+        format!("arn:aws:s3:::{BUCKET}/{key}"),
+        "case {case:?}: expected the report arn to name the object that was written, got \
+         {s3_reports:?}"
+    );
 }
 
 /// Make this row's observing call once. Its answer is deliberately unused: the row asserts
@@ -132,16 +226,7 @@ async fn observe(router: &MultiServiceRouter, row: &Row, id: &str, replayed_star
             start_experiment(router, replayed_start.clone()).await;
         }
         Observer::EngageSafetyLever => {
-            send(
-                router,
-                "PATCH",
-                &format!("/safetyLevers/{LEVER_ID}/state"),
-                Some(json!({
-                    "state": { "status": "engaged", "reason": "report follows the end" }
-                })),
-                FALLBACK_REGION,
-            )
-            .await;
+            engage_lever(router, "report follows the end").await;
         }
     }
 }
@@ -154,14 +239,7 @@ async fn the_operation_that_ends_a_run_writes_the_report_that_end_makes_due() {
         // One emulator per row: the rows differ in which single operation the client calls,
         // so a row must not see a call another row made.
         let router = emulator_with_object_storage();
-        let (status, body) = s3(&router, "PUT", &format!("/{BUCKET}")).await;
-        assert_eq!(
-            status,
-            200,
-            "case {:?}: expected the report bucket to be created, got {status} with {:?}",
-            row.case,
-            String::from_utf8_lossy(&body)
-        );
+        given_report_bucket(&router).await;
 
         let template_id = template_for(
             &router,
@@ -276,35 +354,7 @@ async fn the_operation_that_ends_a_run_writes_the_report_that_end_makes_due() {
             row.case,
             row.terminal
         );
-        let report = read["experimentReport"].clone();
-        assert_eq!(
-            report["state"]["status"].as_str().unwrap_or_default(),
-            "completed",
-            "case {:?}: expected the generation to be completed, got {report:?}",
-            row.case
-        );
-        assert!(
-            report["state"]["error"].is_null(),
-            "case {:?}: a generated report reports no error, got {report:?}",
-            row.case
-        );
-        let s3_reports = report["s3Reports"]
-            .as_array()
-            .unwrap_or_else(|| panic!("case {:?}: no s3Reports in {report:?}", row.case))
-            .clone();
-        assert_eq!(
-            s3_reports.len(),
-            1,
-            "case {:?}: expected one written report, got {s3_reports:?}",
-            row.case
-        );
-        assert_eq!(
-            s3_reports[0]["arn"].as_str().unwrap_or_default(),
-            format!("arn:aws:s3:::{BUCKET}/{key}"),
-            "case {:?}: expected the report arn to name the object that was written, \
-             got {s3_reports:?}",
-            row.case
-        );
+        assert_generation_names_object(row.case, &read["experimentReport"], &key);
     }
 }
 
@@ -318,13 +368,7 @@ async fn the_operation_that_ends_a_run_writes_the_report_that_end_makes_due() {
 #[tokio::test]
 async fn a_read_after_a_listing_finds_the_generation_the_listing_performed() {
     let router = emulator_with_object_storage();
-    let (status, body) = s3(&router, "PUT", &format!("/{BUCKET}")).await;
-    assert_eq!(
-        status,
-        200,
-        "expected the report bucket to be created, got {status} with {:?}",
-        String::from_utf8_lossy(&body)
-    );
+    given_report_bucket(&router).await;
 
     let case = "listing-then-reading";
     let template_id = template_for(
@@ -380,23 +424,6 @@ async fn a_read_after_a_listing_finds_the_generation_the_listing_performed() {
     );
 
     let report = get_experiment(&router, &id).await.member("experiment")["experimentReport"].clone();
-    assert_eq!(
-        report["state"]["status"].as_str().unwrap_or_default(),
-        "completed",
-        "case {case:?}: expected the read to find the generation the listing performed, \
-         got {report:?}"
-    );
-    assert_eq!(
-        report["s3Reports"]
-            .as_array()
-            .unwrap_or_else(|| panic!("case {case:?}: no s3Reports in {report:?}"))
-            .len(),
-        1,
-        "case {case:?}: expected the one object the listing wrote to be named, got {report:?}"
-    );
-    assert_eq!(
-        report["s3Reports"][0]["arn"].as_str().unwrap_or_default(),
-        format!("arn:aws:s3:::{BUCKET}/{key}"),
-        "case {case:?}: expected the named object to be the one that was written, got {report:?}"
-    );
+    assert_generation_names_object(case, &report, &key);
 }
+

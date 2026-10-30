@@ -67,6 +67,8 @@ mod report_follows_whoever_ends_the_run;
 mod resource_tagging;
 #[path = "all/safety_lever.rs"]
 mod safety_lever;
+#[path = "all/safety_lever_settles_and_reports.rs"]
+mod safety_lever_settles_and_reports;
 #[path = "all/start_experiment_replay.rs"]
 mod start_experiment_replay;
 #[path = "all/start_experiment_token_normalization.rs"]

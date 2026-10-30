@@ -122,6 +122,18 @@ pub(crate) async fn s3(router: &MultiServiceRouter, method: &str, path: &str) ->
     )
 }
 
+/// Create [`BUCKET`], the bucket every report in these suites is written to, tolerating one
+/// that is already there so a suite may call it per case.
+pub(crate) async fn given_report_bucket(router: &MultiServiceRouter) {
+    let (status, body) = s3(router, "PUT", &format!("/{BUCKET}")).await;
+    assert!(
+        status == 200 || status == 409,
+        "creating s3://{BUCKET} must succeed or report the bucket is already there, got \
+         {status} with {:?}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
 /// How a row's run ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Ending {
@@ -465,13 +477,7 @@ fn report_configuration(row: &ReportRow, bucket: &str) -> Value {
 #[tokio::test]
 async fn an_ended_experiments_report_is_written_to_the_configured_output() {
     let router = emulator_with_object_storage();
-    let (status, body) = s3(&router, "PUT", &format!("/{BUCKET}")).await;
-    assert_eq!(
-        status,
-        200,
-        "expected the report bucket to be created, got {status} with {:?}",
-        String::from_utf8_lossy(&body)
-    );
+    given_report_bucket(&router).await;
 
     let rows = report_rows();
     let mut started = Vec::new();
@@ -744,13 +750,7 @@ async fn an_experiment_that_configured_no_report_carries_no_experiment_report() 
     let router = emulator_with_object_storage();
     // The bucket a configured report WOULD go to exists, so the closing assertion below
     // tests the handler rather than the absence of a bucket.
-    let (status, body) = s3(&router, "PUT", &format!("/{BUCKET}")).await;
-    assert_eq!(
-        status,
-        200,
-        "expected the report bucket to be created, got {status} with {:?}",
-        String::from_utf8_lossy(&body)
-    );
+    given_report_bucket(&router).await;
     let case = "no-report-configuration";
     let template_id = template_for(&router, case, Ending::Elapses, json!({})).await;
     let started = start_from(&router, case, &template_id).await;
