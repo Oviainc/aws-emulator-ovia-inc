@@ -75,6 +75,8 @@ mod comment_reactions_read;
 mod comment_replies;
 #[path = "all/comment_thread_traversal.rs"]
 mod comment_thread_traversal;
+#[path = "all/commit_folder_and_diff_members.rs"]
+mod commit_folder_and_diff_members;
 #[path = "all/commit_reads.rs"]
 mod commit_reads;
 #[path = "all/compared_commit_comments.rs"]

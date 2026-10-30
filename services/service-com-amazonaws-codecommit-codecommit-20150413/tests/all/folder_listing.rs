@@ -283,10 +283,13 @@ async fn get_folder_reports_the_immediate_entries_of_the_stored_folder() {
         let request = get_folder("folders", folder_path);
         let payload = ok(&router, "GetFolder", &request).await;
 
+        // `folderPath` is the folder this call read, named the way the tree names
+        // it — the spelling this answer's own `absolutePath` entries use — so the
+        // repository root is the empty string and no separator is echoed back.
         assert_eq!(
             string_at(&payload, "/folderPath"),
-            folder_path,
-            "case {case}: folderPath must be the folder the request named"
+            canonical(folder_path),
+            "case {case}: folderPath must be the canonical path of the folder read"
         );
         assert_eq!(
             string_at(&payload, "/commitId"),

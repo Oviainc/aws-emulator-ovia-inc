@@ -180,6 +180,9 @@ fn rows() -> Vec<Row> {
 #[tokio::test]
 async fn get_commit_reports_the_commit_the_object_id_names() {
     let router = emulator();
+    // The principal these calls are signed by: the identity a commit records where
+    // the write names no author.
+    let caller = crate::wire::caller_arn(crate::wire::DEFAULT_ACCESS_KEY_ID);
     let started = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("the clock is after the epoch")
@@ -271,17 +274,21 @@ async fn get_commit_reports_the_commit_the_object_id_names() {
                 let user = commit
                     .get(role)
                     .unwrap_or_else(|| panic!("case {case:?}: no {role} in {commit}"));
+                // "If no name is specified, the user's ARN is used as the author
+                // name and committer name", and an email the write does not carry
+                // is that same calling principal — so both members are REPORTED
+                // whatever the write named.
+                let expected_name = write.name.unwrap_or(caller.as_str());
                 assert_eq!(
                     user.get("name").and_then(Value::as_str),
-                    write.name,
-                    "case {case:?}: expected {role} name {:?}, got {user}",
-                    write.name
+                    Some(expected_name),
+                    "case {case:?}: expected {role} name {expected_name:?}, got {user}"
                 );
+                let expected_email = write.email.unwrap_or(caller.as_str());
                 assert_eq!(
                     user.get("email").and_then(Value::as_str),
-                    write.email,
-                    "case {case:?}: expected {role} email {:?}, got {user}",
-                    write.email
+                    Some(expected_email),
+                    "case {case:?}: expected {role} email {expected_email:?}, got {user}"
                 );
                 // `UserInfo.date` is "the date when the specified commit was
                 // commited, in timestamp format with GMT offset" — the unix seconds

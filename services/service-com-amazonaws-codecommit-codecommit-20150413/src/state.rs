@@ -1460,17 +1460,20 @@ impl Commit {
     /// `parents` is always present, empty for a root commit, because the model's
     /// `ParentList` is a list of the full ids of the commits this one was built
     /// on. `additionalData` carries whatever a git host records beyond the
-    /// modelled members; this emulator's commit objects record none, so it is
-    /// absent rather than empty.
+    /// modelled members; a commit object this service stores records nothing
+    /// beyond them, so it is the EMPTY string — a caller can then tell "no other
+    /// data" from a member a reader did not report at all. The author's and the
+    /// committer's name, email and date are reported the same way
+    /// ([`identity_info`]).
     pub fn info(&self) -> crate::ops::types::Commit {
         crate::ops::types::Commit {
             commit_id: Some(self.commit_id.clone()),
             tree_id: Some(self.tree_id.clone()),
             parents: Some(self.parents.clone()),
             message: self.message.clone(),
-            author: Some(self.author.clone()),
-            committer: Some(self.committer.clone()),
-            additional_data: None,
+            author: Some(identity_info(&self.author)),
+            committer: Some(identity_info(&self.committer)),
+            additional_data: Some(String::new()),
         }
     }
 
@@ -4585,8 +4588,61 @@ fn git_identity(user: &UserInfo) -> String {
     git_object::join_identity(
         user.name.as_deref().unwrap_or(""),
         user.email.as_deref().unwrap_or(""),
-        user.date.as_deref().unwrap_or("0 +0000"),
+        user.date.as_deref().unwrap_or(EPOCH_GIT_DATE),
     )
+}
+
+/// The git date of a commit whose stored identity carries none: the epoch at GMT,
+/// the form [`git_date`] writes.
+const EPOCH_GIT_DATE: &str = "0 +0000";
+
+/// A stored commit identity as the modeled `UserInfo`.
+///
+/// A git identity line always carries a name field, an email field and a date, so
+/// all three are REPORTED — empty where the stored line records nothing there —
+/// rather than omitted: the members are part of the shape a reader of a commit
+/// sees, not a function of what the write happened to name.
+fn identity_info(user: &UserInfo) -> UserInfo {
+    UserInfo {
+        name: Some(user.name.clone().unwrap_or_default()),
+        email: Some(user.email.clone().unwrap_or_default()),
+        date: Some(
+            user.date
+                .clone()
+                .unwrap_or_else(|| EPOCH_GIT_DATE.to_string()),
+        ),
+    }
+}
+
+/// The identity a commit this service writes is attributed to, from the identity
+/// members the request carried and the principal that made the call.
+///
+/// "If no name is specified, the user's ARN is used as the author name and
+/// committer name" (`DeleteFileInput`'s `name`, the member the model states the
+/// rule on): a commit is never authored by nobody, so an identity member the
+/// request leaves out is the calling principal — the ARN this service records for
+/// everything a caller creates, and the only identity of a caller it holds. An
+/// operation whose model says a member of ITS OWN is left blank instead passes
+/// that blank explicitly.
+///
+/// `caller` is the principal the request was signed by ([`caller_identity_arn`]),
+/// and `at` the instant the commit is written.
+pub fn commit_identity(
+    name: Option<String>,
+    email: Option<String>,
+    caller: &str,
+    at: SystemTime,
+) -> UserInfo {
+    UserInfo {
+        // A name of nothing but whitespace specifies no name at all: it would
+        // leave the commit's identity line naming nobody.
+        name: Some(
+            name.filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| caller.to_string()),
+        ),
+        email: Some(email.unwrap_or_else(|| caller.to_string())),
+        date: Some(git_date(at)),
+    }
 }
 
 /// Why a `filePath` cannot address a file.

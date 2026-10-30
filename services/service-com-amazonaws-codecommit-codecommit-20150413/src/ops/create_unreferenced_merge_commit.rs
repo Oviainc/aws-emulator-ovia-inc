@@ -382,7 +382,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
 
         // The merge option decides what this call writes, so it is read first.
         // `MergeOptionTypeEnum` is enforced at the request boundary; the value the
@@ -761,11 +760,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The name of the author who created the unreferenced commit. This
         // information is used as both the author and committer for the commit."
         let now = std::time::SystemTime::now();
-        let user = UserInfo {
-            name: input.author_name.clone(),
-            email: input.email.clone(),
-            date: Some(crate::state::git_date(now)),
-        };
+        // The identity whose call writes the commit, which the commit records where
+        // the request names no author.
+        let actor = crate::state::caller_identity_arn(&*self.engine, ctx);
+        let user = crate::state::commit_identity(
+            input.author_name.clone(),
+            input.email.clone(),
+            &actor,
+            now,
+        );
         // The merge option decides the PARENTS, not the tree: a three-way merge
         // records both tips, with the destination — the side being merged into —
         // first, while a squash merge collapses the source history and records the

@@ -303,8 +303,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetFolderOutput {
             commit_id: commit.commit_id.clone(),
             // The fully qualified path of the folder whose contents are returned:
-            // the path the request named this folder by.
-            folder_path: input.folder_path.clone(),
+            // the folder this call read, named as the tree names it — the spelling
+            // every `absolutePath` in this very answer uses, so concatenating the
+            // two cannot build a path the entries do not report. The repository
+            // root is named by no segment at all, so it is the EMPTY string.
+            folder_path: folder.clone(),
             // The git tree object name of this folder's own tree, which for the
             // root folder is the commit's tree id.
             tree_id: Some(tree_id_of(&entries)?),

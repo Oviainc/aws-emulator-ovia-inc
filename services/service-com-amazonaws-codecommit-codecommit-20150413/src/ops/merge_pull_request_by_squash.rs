@@ -920,11 +920,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The name of the author who created the commit. This information is used
         // as both the author and committer for the commit."
-        let user = UserInfo {
-            name: input.author_name.clone(),
-            email: input.email.clone(),
-            date: Some(crate::state::git_date(now)),
-        };
+        let user = crate::state::commit_identity(
+            input.author_name.clone(),
+            input.email.clone(),
+            &merged_by,
+            now,
+        );
         for content in new_blobs {
             repository.insert_blob(content);
         }

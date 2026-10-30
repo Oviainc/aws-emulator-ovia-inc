@@ -198,6 +198,9 @@ fn line_number(index: usize) -> i32 {
     count(index.saturating_add(1))
 }
 
+/// The first line of a blob: the smallest value a 1-based `LineNumber` can take.
+const FIRST_LINE: i32 = 1;
+
 /// The lines of a text blob: its content split at the line feed that terminates a
 /// line, each line without that terminator ("The text content of the line, without
 /// the trailing newline"), and no empty final line for content that ends with one.
@@ -334,16 +337,21 @@ fn aligned_lines(
 /// covers on each side, including the context, and the lines themselves.
 fn hunk_of(lines: &[Aligned]) -> DiffHunk {
     // A hunk that holds no line of one side at all (an insertion into an empty
-    // before blob, or either side with no context) begins after the lines of that
-    // side that precede it, which is 0 at the start of the blob.
-    let before_start = lines
-        .iter()
-        .find_map(|line| line.before_number)
-        .unwrap_or_else(|| lines.first().map_or(0, |line| line.before_preceding));
-    let after_start = lines
-        .iter()
-        .find_map(|line| line.after_number)
-        .unwrap_or_else(|| lines.first().map_or(0, |line| line.after_preceding));
+    // before blob, a deletion of the first lines, or either side with no context)
+    // still begins somewhere on that side: after the lines of that side that
+    // precede it. `beforeStartLine` and `afterStartLine` are 1-BASED line numbers
+    // ("the 1-based line number in the before blob where this hunk begins"), so the
+    // smallest one either can take is the first line, 1 — never 0, which numbers no
+    // line of a blob.
+    let start_of = |numbered: fn(&Aligned) -> Option<i32>, preceding: fn(&Aligned) -> i32| {
+        lines
+            .iter()
+            .find_map(numbered)
+            .unwrap_or_else(|| lines.first().map_or(0, preceding))
+            .max(FIRST_LINE)
+    };
+    let before_start = start_of(|line| line.before_number, |line| line.before_preceding);
+    let after_start = start_of(|line| line.after_number, |line| line.after_preceding);
     DiffHunk {
         before_start_line: Some(before_start),
         before_line_count: Some(count(

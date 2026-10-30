@@ -197,7 +197,9 @@ fn comparison_cases() -> Vec<Case> {
             label: "a line inserted before the first",
             before: "beta\n",
             after: "alpha\nbeta\n",
-            expected: vec!["@@ -0,0 +1,1 @@ A-/1:alpha"],
+            // The hunk covers no line of the before blob, and a start line is a
+            // 1-based line number, so it begins at the first line rather than at 0.
+            expected: vec!["@@ -1,0 +1,1 @@ A-/1:alpha"],
         },
         Case {
             label: "a line deleted from the middle",
@@ -673,7 +675,7 @@ async fn an_unspecified_before_blob_compares_against_an_empty_before_state() {
         let got = ok(&router, "GetBlobDifferences", &input).await;
         assert_eq!(
             rendered(&got),
-            vec!["@@ -0,0 +1,3 @@ A-/1:alpha A-/2:beta A-/3:gamma"],
+            vec!["@@ -1,0 +1,3 @@ A-/1:alpha A-/2:beta A-/3:gamma"],
             "beforeBlobId {label}: every line of the after blob is an addition, got {got}"
         );
         assert_eq!(

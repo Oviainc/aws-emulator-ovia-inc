@@ -516,11 +516,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The identity whose call writes the commit, which is the actor a pull
         // request reading from this branch attributes the source update to.
         let actor = crate::state::caller_identity_arn(&*self.engine, ctx);
-        let user = UserInfo {
-            name: input.name.clone(),
-            email: input.email.clone(),
-            date: Some(crate::state::git_date(now)),
-        };
+        // The commit records an identity whatever the request named: the name it
+        // carried, or this caller's ARN where it carried none.
+        let user =
+            crate::state::commit_identity(input.name.clone(), input.email.clone(), &actor, now);
 
         // Store the blob, then the whole tree and the commit, as git objects: the
         // ids reported here are those objects' names, and the objects themselves

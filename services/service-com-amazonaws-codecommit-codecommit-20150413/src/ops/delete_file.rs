@@ -418,12 +418,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let actor = crate::state::caller_identity_arn(&*self.engine, ctx);
         // "If no name is specified, the user's ARN is used as the author name and
         // committer name" — the caller this request was signed by — and "if no email
-        // address is specified, the email address is left blank".
-        let user = UserInfo {
-            name: Some(input.name.clone().unwrap_or_else(|| actor.clone())),
-            email: input.email.clone(),
-            date: Some(crate::state::git_date(now)),
-        };
+        // address is specified, the email address is left blank", which is this
+        // operation's own rule for its email member, so the blank is passed
+        // explicitly through the one place this crate attributes a written commit.
+        let user = crate::state::commit_identity(
+            input.name.clone(),
+            Some(input.email.clone().unwrap_or_default()),
+            &actor,
+            now,
+        );
         // "If no message is specified, a default message is used." AWS documents no
         // text for it, so this is the emulator's own default, built from the path the
         // commit deleted.
