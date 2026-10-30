@@ -54,7 +54,7 @@ pub(crate) fn emulator() -> MultiServiceRouter {
 }
 
 /// [`emulator`], keeping the shared engine so a test can inspect the store directly.
-fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The tests exercise the service, not SigV4: the request carries a credential scope so

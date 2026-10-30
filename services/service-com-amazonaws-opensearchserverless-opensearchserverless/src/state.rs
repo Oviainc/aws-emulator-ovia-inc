@@ -2889,15 +2889,29 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
         }
     }
 
-    /// [`Self::tags_by_arn`], mutably — what a tag write stores through.
-    pub fn tags_by_arn_mut(&mut self, arn: &str) -> Option<&mut Vec<Tag>> {
+    /// [`Self::tags_by_arn`], mutably — what a tag write stores through, with the
+    /// record's `lastModifiedDate` stamped `written_at` by the same call.
+    ///
+    /// A resource's tags are part of the resource, so storing a new tag set MODIFIES it:
+    /// `lastModifiedDate` is "the date and time when the resource was last modified", and
+    /// it has to answer that for an accepted tag write as much as for a configuration
+    /// write — [`CollectionRecord::begin_update`], [`CollectionGroupRecord::apply_update`],
+    /// [`PolicyWrite::apply`] and [`SecurityConfigRecord::apply`] all stamp the write they
+    /// apply. The tags are reachable for writing ONLY through this stamping accessor, so a
+    /// tag write cannot leave the field behind the record it changed, whichever KIND of
+    /// resource the ARN addresses.
+    pub fn tags_by_arn_for_write(&mut self, arn: &str, written_at: i64) -> Option<&mut Vec<Tag>> {
         match parse_resource_arn(arn)? {
-            (ArnResourceKind::Collection, _) => self
-                .collection_by_arn_mut(arn)
-                .map(|record| &mut record.tags),
-            (ArnResourceKind::CollectionGroup, _) => self
-                .collection_group_by_arn_mut(arn)
-                .map(|record| &mut record.tags),
+            (ArnResourceKind::Collection, _) => self.collection_by_arn_mut(arn).map(|record| {
+                record.last_modified_date = written_at;
+                &mut record.tags
+            }),
+            (ArnResourceKind::CollectionGroup, _) => {
+                self.collection_group_by_arn_mut(arn).map(|record| {
+                    record.last_modified_date = written_at;
+                    &mut record.tags
+                })
+            }
         }
     }
 

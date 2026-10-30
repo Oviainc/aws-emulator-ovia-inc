@@ -3,7 +3,8 @@
 //! @op UntagResource
 //! IMPLEMENTED: removes the tag keys the request names from the resource whose
 //! stored ARN is `resourceArn` — a collection or a collection group, whichever kind the
-//! ARN addresses — so `ListTagsForResource` no longer reports them. A
+//! ARN addresses — so `ListTagsForResource` no longer reports them and the resource's
+//! `lastModifiedDate` reports the write instant. A
 //! `resourceArn` that names no resource this account holds — including a collection whose
 //! deletion has been accepted — is refused with `ResourceNotFoundException`, and a
 //! `tagKeys` that names one key twice with `ValidationException`.
@@ -187,7 +188,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        let Some(stored) = store.tags_by_arn_mut(&input.resource_arn) else {
+        // Removing tags REWRITES the resource, so the write instant is what its
+        // `lastModifiedDate` reports from here on: the stamping accessor applies it.
+        let written_at = crate::state::now_epoch_millis();
+        let Some(stored) = store.tags_by_arn_for_write(&input.resource_arn, written_at) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::resource_not_found_message(

@@ -4,7 +4,8 @@
 //! IMPLEMENTED: adds the tags the request carries to the resource whose stored ARN is
 //! `resourceArn` — a collection or a collection group, whichever kind the ARN addresses —
 //! replacing the value of a key the resource already carries, so
-//! `ListTagsForResource` reports them. A `resourceArn` that names no resource this
+//! `ListTagsForResource` reports them and the resource's `lastModifiedDate` reports the
+//! write instant. A `resourceArn` that names no resource this
 //! account holds — including a collection whose deletion has been accepted — is refused with
 //! `ResourceNotFoundException`, a write that would take the resource past the
 //! documented 50-tag quota with `ServiceQuotaExceededException`, and a `tags` that names
@@ -225,7 +226,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let Some(stored) = store.tags_by_arn_mut(&input.resource_arn) else {
+        // Storing tags REWRITES the resource, so the write instant is what its
+        // `lastModifiedDate` reports from here on: the stamping accessor applies it.
+        let written_at = crate::state::now_epoch_millis();
+        let Some(stored) = store.tags_by_arn_for_write(&input.resource_arn, written_at) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::resource_not_found_message(
