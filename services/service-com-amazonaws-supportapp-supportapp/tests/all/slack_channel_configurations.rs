@@ -286,13 +286,36 @@ impl Emulator {
         );
     }
 
+    /// Record the Amazon Web Services Support Center console's authorization of the Slack
+    /// workspace `team_id`, which is what makes that workspace exist for this API.
+    ///
+    /// A Slack workspace is authorized only through the interactive flow in that console,
+    /// which is not an API call, so there is no wire path to this state: the authorization
+    /// set this service's OWN handlers answer from is written through its state module,
+    /// exactly as [`Emulator::hand_organization_to`] writes the organization's own stored
+    /// record. Whether the arrangement took is then read back over the wire, by the
+    /// registration it lets through; without it a registration answers the modelled
+    /// `ResourceNotFoundException`, which is what [`crate::console_authorized_workspace`]
+    /// covers.
+    pub(crate) fn authorize_workspace_in_console(&self, team_id: &str) {
+        let state = service_com_amazonaws_supportapp_supportapp::state::service_state(&*self.engine)
+            .expect("the Support App store must be reachable on the shared engine");
+        state
+            .lock()
+            .console_authorized_slack_workspaces
+            .insert(team_id.to_string());
+    }
+
     /// Register `team_id` as a Slack workspace of this account — the precondition
     /// `CreateSlackChannelConfiguration` enforces.
     ///
-    /// Registering is itself an Organizations-scoped call, so the account is put in an
-    /// organization first; the membership precondition is covered in
+    /// The workspace is authorized in the console first, because a registration acts on an
+    /// already authorized workspace, and registering is itself an Organizations-scoped
+    /// call, so the account is put in an organization too; the two preconditions are
+    /// covered in [`crate::console_authorized_workspace`] and
     /// [`crate::organization_membership`].
     pub(crate) async fn register_workspace(&self, team_id: &str) -> Reply {
+        self.authorize_workspace_in_console(team_id);
         self.ensure_organization().await;
         self.call(
             "register-slack-workspace-for-organization",

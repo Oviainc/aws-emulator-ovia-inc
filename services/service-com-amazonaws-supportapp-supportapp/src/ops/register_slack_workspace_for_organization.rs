@@ -8,9 +8,23 @@
 //! `CreateSlackChannelConfiguration` enforces: until a workspace is registered, a
 //! channel configuration in it is a `ConflictException`.
 //!
-//! This is an Organizations-scoped call — "To call this API, your account must be part
-//! of an organization in Organizations" — so the account's membership is settled before
-//! the registry is touched, by reading the Organizations control plane's own store
+//! The call acts on a workspace that ALREADY exists for this API, so the workspace the
+//! request identifies is looked up before any precondition on the calling account, the
+//! same order the operations that act on a stored Slack channel configuration follow: a
+//! Slack workspace reaches this API only through the interactive flow in the Amazon Web
+//! Services Support Center console — "Sign in to the Amazon Web Services Support Center
+//! and authorize the Slack workspaces where you want your organization to have access
+//! to", after which this API "authorize[s] each Slack workspace for the organization" —
+//! and no operation of this API performs that flow, so the authorizations it left are
+//! state no call writes ([`crate::state::CONSOLE_AUTHORIZED_SLACK_WORKSPACES`]). A
+//! `teamId` absent from them names no workspace this call can act on and is the modelled
+//! `ResourceNotFoundException`
+//! ([`crate::state::ComAmazonawsSupportappSupportappState::unauthorized_workspace_not_found`]);
+//! nothing is registered.
+//!
+//! This is also an Organizations-scoped call — "To call this API, your account must be part
+//! of an organization in Organizations" — so the account's membership is settled next,
+//! before the registry is written, by reading the Organizations control plane's own store
 //! through the shared engine ([`crate::state::caller_account_type`]): an account that
 //! belongs to no organization is the first condition this operation's
 //! `ConflictException` enumerates, so the call is refused with it and nothing is
@@ -215,8 +229,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // The workspace the request IDENTIFIES is looked up first, before any
+        // precondition on the CALLING ACCOUNT, exactly as the operations that act on a
+        // stored Slack channel configuration do: a Slack workspace exists for this API
+        // only once the Support Center console's interactive flow has authorized it, and
+        // this call authorizes an ALREADY authorized workspace for the organization, so a
+        // `teamId` no console authorization recorded names nothing this call can act on
+        // and is the modelled `ResourceNotFoundException`. The guard is dropped before
+        // another service's store is read.
+        let not_found = {
+            let store = state.lock();
+            store.unauthorized_workspace_not_found(&input.team_id)
+        };
+        if let Some(message) = not_found {
+            return Err(
+                RegisterSlackWorkspaceForOrganizationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // An Organizations-scoped call, so the account's membership in an organization
-        // is settled first — before this service's own registry is reached, and with no
+        // is settled next — before this service's own registry is written, and with no
         // guard of it held. An account in no organization is the condition this
         // operation's `ConflictException` names, and the refusal registers nothing; a
         // store that cannot be read at all is this service's own server error, not a

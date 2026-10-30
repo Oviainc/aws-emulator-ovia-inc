@@ -79,7 +79,14 @@ fn other_management_accounts() -> Vec<String> {
 /// Register `team_id` with whatever role the organization currently gives this account —
 /// the raw call, with no organization arranged first (the harness's own
 /// `register_workspace` creates one, which would make the caller its management account).
+///
+/// The workspace IS authorized in the console, the precondition this operation settles
+/// ahead of anything about the calling account: without it every row below would be
+/// answered with the `ResourceNotFoundException` that
+/// [`crate::console_authorized_workspace`] covers, and this suite's rule would never be
+/// reached.
 async fn register(emulator: &Emulator, team_id: &str) -> Reply {
+    emulator.authorize_workspace_in_console(team_id);
     emulator
         .call(
             "register-slack-workspace-for-organization",

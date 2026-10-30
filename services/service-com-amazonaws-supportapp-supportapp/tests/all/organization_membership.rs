@@ -50,7 +50,14 @@ const DOCUMENTED_RULE: &str = "must be part of an organization in Organizations"
 /// answer is about the account's membership and nothing else. (The harness's own
 /// `register_workspace` puts the account in an organization first, which is what every
 /// other suite needs.)
+///
+/// The workspace IS authorized in the console, because that is the other precondition of
+/// this operation and it is settled ahead of the membership one: without it every row
+/// below would be answered with the `ResourceNotFoundException` that
+/// [`crate::console_authorized_workspace`] covers, and this suite's rule would never be
+/// reached.
 async fn register(emulator: &Emulator, team_id: &str) -> Reply {
+    emulator.authorize_workspace_in_console(team_id);
     emulator
         .call(
             "register-slack-workspace-for-organization",

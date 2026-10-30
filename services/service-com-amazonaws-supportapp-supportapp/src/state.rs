@@ -5,12 +5,13 @@
 //! Besides the state struct itself this module holds the few rules the Support App
 //! handlers share — the stored-record-to-modelled-shape conversion, the listing
 //! pagination rule, the documented `notifyOnCaseSeverity` consistency rule, the account
-//! a caller-supplied `channelRoleArn` must name, the organization membership an
+//! a caller-supplied `channelRoleArn` must name, the Slack workspaces the Support Center
+//! console has authorized, the organization membership an
 //! Organizations-scoped call needs, and the wording of the failures
 //! several operations can answer with — so the operation files
 //! agree on one implementation of each instead of carrying copies that can drift apart.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{SlackChannelConfiguration, SlackWorkspaceConfiguration};
 
@@ -32,6 +33,31 @@ pub const MAX_SLACK_CHANNEL_CONFIGURATIONS: usize = 20;
 /// `ValidationException`), so a registration past this quota is refused with that
 /// operation's modelled `ValidationException`.
 pub const MAX_SLACK_WORKSPACE_CONFIGURATIONS: usize = 5;
+
+/// The Slack workspaces the Amazon Web Services Support Center console has authorized,
+/// which a fresh account starts from.
+///
+/// A Slack workspace reaches this API only through the interactive flow in that console —
+/// "Sign in to the Amazon Web Services Support Center and authorize the Slack workspaces
+/// where you want your organization to have access to", after which
+/// `RegisterSlackWorkspaceForOrganization` "authorize[s] each Slack workspace for the
+/// organization"
+/// (`smithy_query(query="doc",shape="RegisterSlackWorkspaceForOrganization")`) — and NO
+/// operation of this API performs that flow, so which workspaces it authorized is state no
+/// call of this service writes. This is the set it leaves behind here: the workspace the
+/// API's own documentation presents as one of the account's, "This ID uniquely identifies a
+/// Slack workspace, such as `T012ABCDEFG`"
+/// (`smithy_query(query="doc",shape="RegisterSlackWorkspaceForOrganizationRequest",member="teamId")`).
+///
+/// Any other team id names a workspace no authorization recorded, which is what
+/// [`ComAmazonawsSupportappSupportappState::unauthorized_workspace_not_found`] reports.
+/// The set holds exactly the ids the documentation gives and no more: a further entry
+/// would be a workspace id no AWS documentation names, and a workspace this emulator
+/// never saw authorized is precisely what the miss is about. A caller or a suite that
+/// needs another workspace records its authorization in
+/// [`ComAmazonawsSupportappSupportappState::console_authorized_slack_workspaces`], which
+/// is where the console's own flow would have left it.
+pub const CONSOLE_AUTHORIZED_SLACK_WORKSPACES: [&str; 1] = ["T012ABCDEFG"];
 
 /// The longest Slack workspace name this API can report.
 ///
@@ -234,7 +260,12 @@ impl SlackWorkspaceConfig {
 }
 
 /// Per-service state for com-amazonaws-supportapp-supportapp. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+///
+/// `Default` is written out below rather than derived, because a fresh account does not
+/// start empty: it starts from the console authorizations in
+/// [`CONSOLE_AUTHORIZED_SLACK_WORKSPACES`]. A field added here needs its starting value
+/// there too.
+#[derive(Debug)]
 pub struct ComAmazonawsSupportappSupportappState {
     /// Every stored Slack channel configuration, keyed by `(teamId, channelId)` —
     /// the pair that identifies a channel configuration in this API. A `BTreeMap`,
@@ -253,6 +284,32 @@ pub struct ComAmazonawsSupportappSupportappState {
     /// [`ComAmazonawsSupportappSupportappState::unregistered_workspace_conflict`]) and
     /// deleting a workspace takes that workspace's channel configurations with it.
     pub slack_workspace_configurations: BTreeMap<String, SlackWorkspaceConfig>,
+    /// Every Slack workspace the Amazon Web Services Support Center console has
+    /// authorized, keyed by `teamId` and seeded from
+    /// [`CONSOLE_AUTHORIZED_SLACK_WORKSPACES`]. It is what makes a workspace EXIST for
+    /// this API — the two are different facts, so authorizing a workspace in the console
+    /// and registering it for the account are tracked apart: a registration is only
+    /// possible for a workspace this set holds (see
+    /// [`Self::unauthorized_workspace_not_found`]), and
+    /// `DeleteSlackWorkspaceConfiguration` removes the account's REGISTRATION, which
+    /// revokes no console authorization, so the same workspace can be registered again.
+    /// No operation of this API writes it: the console's interactive authorization flow
+    /// is not an API call.
+    pub console_authorized_slack_workspaces: BTreeSet<String>,
+}
+
+impl Default for ComAmazonawsSupportappSupportappState {
+    fn default() -> Self {
+        Self {
+            slack_channel_configurations: BTreeMap::new(),
+            account_alias: None,
+            slack_workspace_configurations: BTreeMap::new(),
+            console_authorized_slack_workspaces: CONSOLE_AUTHORIZED_SLACK_WORKSPACES
+                .iter()
+                .map(|team_id| (*team_id).to_string())
+                .collect(),
+        }
+    }
 }
 
 impl ComAmazonawsSupportappSupportappState {
@@ -276,6 +333,26 @@ impl ComAmazonawsSupportappSupportappState {
     pub fn unregistered_workspace_conflict(&self, team_id: &str) -> Option<String> {
         (!self.slack_workspace_configurations.contains_key(team_id))
             .then(|| workspace_not_registered_message(team_id))
+    }
+
+    /// Why a call that AUTHORIZES the Slack workspace `team_id` names must be refused
+    /// with the modelled `ResourceNotFoundException`, or `None` when this account's
+    /// console authorizations hold that workspace.
+    ///
+    /// `RegisterSlackWorkspaceForOrganization` acts on a workspace that ALREADY exists
+    /// for this API: the workspace is authorized through the interactive flow in the
+    /// Amazon Web Services Support Center console, and the API then "authorize[s] each
+    /// Slack workspace for the organization"
+    /// (`smithy_query(query="doc",shape="RegisterSlackWorkspaceForOrganization")`). So a
+    /// `teamId` absent from [`Self::console_authorized_slack_workspaces`] names no
+    /// workspace this API can act on, which is the resource miss
+    /// `ResourceNotFoundException` reports — "The specified resource is missing or
+    /// doesn't exist, such as an account alias, Slack channel configuration, or Slack
+    /// workspace configuration" — and is settled, like every other lookup of the
+    /// resource a request IDENTIFIES, before any precondition on the CALLING ACCOUNT.
+    pub fn unauthorized_workspace_not_found(&self, team_id: &str) -> Option<String> {
+        (!self.console_authorized_slack_workspaces.contains(team_id))
+            .then(|| slack_workspace_not_authorized_message(team_id))
     }
 }
 
@@ -534,6 +611,27 @@ pub fn slack_channel_configuration_not_found(team_id: &str, channel_id: &str) ->
 /// up.
 pub fn slack_workspace_configuration_not_found(team_id: &str) -> String {
     format!("Slack workspace configuration for team {team_id} not found")
+}
+
+/// The `ResourceNotFoundException` message for a `teamId` the Support Center console has
+/// authorized no Slack workspace for ("The specified resource is missing or doesn't
+/// exist, such as an account alias, Slack channel configuration, or Slack workspace
+/// configuration" — `ResourceNotFoundException`).
+///
+/// Built from the request's `teamId` and the account the emulator presents, so a caller
+/// reads which workspace was not found for which account, and it closes with the step
+/// that makes such a workspace exist, as the operation documents it: "Sign in to the
+/// Amazon Web Services Support Center and authorize the Slack workspaces where you want
+/// your organization to have access to"
+/// (`smithy_query(query="doc",shape="RegisterSlackWorkspaceForOrganization")`) — the
+/// action a human has to take, which is what tells this miss apart from the conflicts the
+/// same operation answers.
+pub fn slack_workspace_not_authorized_message(team_id: &str) -> String {
+    format!(
+        "Slack workspace {team_id} not found for account {account}. Sign in to the Amazon Web \
+         Services Support Center and authorize the Slack workspace before you register it.",
+        account = ::engine::emulator_account_id()
+    )
 }
 
 /// The `ConflictException` message for a `(teamId, channelId)` pair that is already

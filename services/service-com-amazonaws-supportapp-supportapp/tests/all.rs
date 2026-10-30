@@ -17,6 +17,8 @@ mod channel_configuration_lookup_order;
 mod channel_configuration_workspace_precondition;
 #[path = "all/channel_role_account.rs"]
 mod channel_role_account;
+#[path = "all/console_authorized_workspace.rs"]
+mod console_authorized_workspace;
 #[path = "all/delete_slack_workspace_configuration.rs"]
 mod delete_slack_workspace_configuration;
 #[path = "all/error_message_templates.rs"]
