@@ -31,6 +31,8 @@ mod acme_domain_validation_lifecycle;
 mod acme_domain_validation_listing;
 #[path = "all/acme_domain_validation_update.rs"]
 mod acme_domain_validation_update;
+#[path = "all/acme_endpoint_delete_cascade.rs"]
+mod acme_endpoint_delete_cascade;
 #[path = "all/acme_endpoint_lifecycle.rs"]
 mod acme_endpoint_lifecycle;
 #[path = "all/acme_endpoint_list.rs"]

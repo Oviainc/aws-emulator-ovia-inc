@@ -217,7 +217,7 @@ pub(crate) fn activate_endpoints_now(engine: &Arc<engine::InMemoryEngine>) {
 
 /// Hold every stored ACME endpoint in `CREATING` for the rest of the test by moving the
 /// activation it is owed an hour out.
-fn hold_endpoints_creating(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn hold_endpoints_creating(engine: &Arc<engine::InMemoryEngine>) {
     let store = engine.state::<state::ComAmazonawsAcmCertificatemanagerState>();
     let mut store = store.lock();
     let held = SystemTime::now() + Duration::from_secs(3600);
