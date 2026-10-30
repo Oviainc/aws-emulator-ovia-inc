@@ -55,6 +55,8 @@ mod resource_not_found_code;
 mod resource_tag_removal;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/security_configuration_listing.rs"]
+mod security_configuration_listing;
 #[path = "all/security_configurations.rs"]
 mod security_configurations;
 #[path = "all/state_roundtrip.rs"]
