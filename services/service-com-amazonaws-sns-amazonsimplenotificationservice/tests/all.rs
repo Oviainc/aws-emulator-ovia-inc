@@ -47,8 +47,14 @@ mod fifo_topic_deduplication_attribute;
 #[path = "all/filter_policy_delivery.rs"]
 mod filter_policy_delivery;
 
+#[path = "all/filter_policy_match_budget.rs"]
+mod filter_policy_match_budget;
+
 #[path = "all/filter_policy_parse_diagnostic.rs"]
 mod filter_policy_parse_diagnostic;
+
+#[path = "all/filter_policy_wildcard_operator.rs"]
+mod filter_policy_wildcard_operator;
 
 #[path = "all/invalid_next_token_sentence.rs"]
 mod invalid_next_token_sentence;
@@ -160,3 +166,6 @@ mod topic_attributes;
 
 #[path = "all/topics_subscriptions_publish.rs"]
 mod topics_subscriptions_publish;
+
+#[path = "all/unsubscribe_stops_delivery.rs"]
+mod unsubscribe_stops_delivery;

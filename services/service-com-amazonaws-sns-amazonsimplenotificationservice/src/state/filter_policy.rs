@@ -14,7 +14,7 @@
 //! listed for it holds — the matching Amazon SNS documents for its filter policies. The
 //! grammar is Amazon's own and no crate implements it, so it is read here: a condition
 //! is a value to equal, or one of the documented operator objects (`prefix`, `suffix`,
-//! `equals-ignore-case`, `anything-but`, `numeric`, `cidr`, `exists`, `$or`).
+//! `equals-ignore-case`, `wildcard`, `anything-but`, `numeric`, `cidr`, `exists`, `$or`).
 //!
 //! Nothing here reads the subscription's own records: the decision is a function of the
 //! stored policy, the stored scope and the published message, so the same message is
@@ -55,13 +55,27 @@ const MAX_VALUES_PER_PROPERTY: usize = 256;
 /// across every message it publishes and every subscription of the topic.
 ///
 /// The cost of matching is a PRODUCT — the conditions a stored policy lists, the values a
-/// published message holds for that property, the subscriptions of the topic and the
-/// entries of a batch — and each factor is caller-chosen, so bounding them one by one does
-/// not bound the work. This is the one budget that does, the matching counterpart of the
-/// delivery budget `crate::ops::publish` spends on the fan-out. It is set far above what
-/// any realistic policy against a realistic message costs (a handful of conditions against
-/// a handful of values, per subscriber).
+/// published message holds for that property, the OPTIONS or relations one condition's
+/// operator argument lists, the subscriptions of the topic and the entries of a batch — and
+/// each factor is caller-chosen, so bounding them one by one does not bound the work. This
+/// is what bounds how MANY comparisons that product comes to; what each of them READS is
+/// bounded by [`MAX_FILTER_MATCH_BYTES`] beside it, exactly as `crate::ops::publish` bounds
+/// its fan-out by a delivery count and a byte count together. It is set far above what any
+/// realistic policy against a realistic message costs (a handful of conditions against a
+/// handful of values, per subscriber).
 pub const MAX_FILTER_MATCH_COMPARISONS: usize = 20_000;
+
+/// How many BYTES of policy and message ONE request may compare while matching, across
+/// every message it publishes and every subscription of the topic.
+///
+/// A counted comparison is not a constant amount of work: a string operator reads its
+/// argument and the value it judges, both of them caller-chosen and bounded only by the
+/// topic's message-size ceiling and the subscription's attribute ceiling. A count alone
+/// would therefore admit a comparison count's worth of MESSAGE-SIZED reads, so the bytes
+/// those comparisons read are capped as well. It is set far above what a realistic fan-out
+/// reads — a message at the largest size SNS accepts, judged by every subscriber of a topic
+/// — so no legitimate publish is withheld for want of it.
+pub const MAX_FILTER_MATCH_BYTES: usize = 8 * 1024 * 1024;
 
 /// What one request has left to spend on filter matching.
 ///
@@ -72,11 +86,13 @@ pub const MAX_FILTER_MATCH_COMPARISONS: usize = 20_000;
 #[derive(Debug, Default)]
 pub struct MatchBudget {
     comparisons: usize,
+    bytes: usize,
     exhausted: bool,
 }
 
 impl MatchBudget {
-    /// A fresh budget: [`MAX_FILTER_MATCH_COMPARISONS`] comparisons.
+    /// A fresh budget: [`MAX_FILTER_MATCH_COMPARISONS`] comparisons reading at most
+    /// [`MAX_FILTER_MATCH_BYTES`] bytes.
     pub fn new() -> Self {
         Self::default()
     }
@@ -86,18 +102,55 @@ impl MatchBudget {
     fn charge(&mut self, comparisons: usize) -> bool {
         let spent = self.comparisons.saturating_add(comparisons);
         if spent > MAX_FILTER_MATCH_COMPARISONS {
-            if !self.exhausted {
-                self.exhausted = true;
-                ::tracing::warn!(
-                    comparisons = MAX_FILTER_MATCH_COMPARISONS,
-                    "this request reached the emulator's filter-matching budget; the \
-                     remaining filtered subscriptions of the topic are not delivered to"
-                );
-            }
+            return self.exhaust();
+        }
+        self.spend(|budget| budget.comparisons = spent)
+    }
+
+    /// Charge the `bytes` one comparison reads of the policy and of the message.
+    fn charge_bytes(&mut self, bytes: usize) -> bool {
+        let spent = self.bytes.saturating_add(bytes);
+        if spent > MAX_FILTER_MATCH_BYTES {
+            return self.exhaust();
+        }
+        self.spend(|budget| budget.bytes = spent)
+    }
+
+    /// Record what a charge spent, unless an earlier one already ran out.
+    ///
+    /// Spent is spent: once a charge has failed, every later one fails too, however small.
+    /// Otherwise a request that ran out on a long comparison would go on answering the
+    /// short ones, and a filter applied to part of a message would decide delivery.
+    fn spend(&mut self, record: impl FnOnce(&mut Self)) -> bool {
+        if self.exhausted {
             return false;
         }
-        self.comparisons = spent;
+        record(self);
         true
+    }
+
+    /// Note that the request has run out, once, and report the failed charge.
+    fn exhaust(&mut self) -> bool {
+        if !self.exhausted {
+            self.exhausted = true;
+            ::tracing::warn!(
+                comparisons = MAX_FILTER_MATCH_COMPARISONS,
+                bytes = MAX_FILTER_MATCH_BYTES,
+                "this request reached the emulator's filter-matching budget; the \
+                 remaining filtered subscriptions of the topic are not delivered to"
+            );
+        }
+        false
+    }
+
+    /// Whether this request has run out of matching budget.
+    ///
+    /// A NEGATED condition needs this: `anything-but` holds when its argument does NOT
+    /// match, and a match that stopped for want of budget is not evidence that it does not
+    /// match — so the exhaustion has to withhold the message rather than invert into an
+    /// admission.
+    fn stopped(&self) -> bool {
+        self.exhausted
     }
 }
 
@@ -109,6 +162,14 @@ const SUFFIX_OPERATOR: &str = "suffix";
 
 /// The operator that matches a string value without regard to case.
 const EQUALS_IGNORE_CASE_OPERATOR: &str = "equals-ignore-case";
+
+/// The operator that matches a string value against a PATTERN: "wildcard matching" (Amazon
+/// SNS Developer Guide, "Amazon SNS subscription filter policy"), whose argument is the
+/// pattern the value has to match, with `*` standing for any run of characters. The
+/// comparison itself is [`::service_common::event_pattern::matches_wildcard`], the tree's one
+/// reading of that pattern form, because the same wildcard grammar decides an EventBridge
+/// event pattern.
+const WILDCARD_OPERATOR: &str = "wildcard";
 
 /// The operator that matches every value but the ones it names.
 const ANYTHING_BUT_OPERATOR: &str = "anything-but";
@@ -316,23 +377,32 @@ fn matches_condition(
     held: Option<&[Value]>,
     budget: &mut MatchBudget,
 ) -> bool {
-    // What this condition costs the request: one comparison per value it is judged
-    // against, which is the product the budget exists to cap.
+    // What VISITING this condition costs the request: one comparison per value it is
+    // judged against. What each of those comparisons then READS — the options an
+    // operator's argument lists, its relations, its bytes — is charged where it is read,
+    // because that is the other half of the product the budget exists to cap.
     let cost = held.map_or(1, |values| values.len().max(1));
     if !budget.charge(cost) {
         return false;
     }
     if let Value::Object(operator) = condition {
-        return matches_operator(operator, held);
+        return matches_operator(operator, held, budget);
     }
     // A bare value is an exact match of the property's value.
     held.is_some_and(|values| values.iter().any(|value| equals(value, condition)))
 }
 
 /// Whether an operator condition holds.
+///
+/// `budget` is charged for what each operator READS beyond the one comparison per value
+/// [`matches_condition`] already charged: the options or relations its argument lists, and
+/// the bytes a string operator compares. Every factor of the matching cost is caller-chosen,
+/// so each is charged where it is spent and the whole product stays under
+/// [`MAX_FILTER_MATCH_COMPARISONS`] comparisons reading [`MAX_FILTER_MATCH_BYTES`] bytes.
 fn matches_operator(
     operator: &serde_json::Map<String, Value>,
     held: Option<&[Value]>,
+    budget: &mut MatchBudget,
 ) -> bool {
     let Some((name, argument)) = operator.iter().next() else {
         return false;
@@ -355,26 +425,42 @@ fn matches_operator(
         return false;
     };
     match name.as_str() {
-        PREFIX_OPERATOR => values
-            .iter()
-            .any(|value| matches_affix(value, argument, |held, affix| held.starts_with(affix))),
-        SUFFIX_OPERATOR => values
-            .iter()
-            .any(|value| matches_affix(value, argument, |held, affix| held.ends_with(affix))),
-        EQUALS_IGNORE_CASE_OPERATOR => values.iter().any(|value| {
-            matches!((value.as_str(), argument.as_str()), (Some(held), Some(wanted))
-                if held.eq_ignore_ascii_case(wanted))
+        PREFIX_OPERATOR => values.iter().any(|value| {
+            matches_affix(value, argument, budget, |held, affix| held.starts_with(affix))
         }),
-        ANYTHING_BUT_OPERATOR => values.iter().any(|value| !matches_any(argument, value)),
+        SUFFIX_OPERATOR => values.iter().any(|value| {
+            matches_affix(value, argument, budget, |held, affix| held.ends_with(affix))
+        }),
+        EQUALS_IGNORE_CASE_OPERATOR => values.iter().any(|value| {
+            let (Some(held), Some(wanted)) = (value.as_str(), argument.as_str()) else {
+                return false;
+            };
+            // Only the argument's own length is ever compared.
+            budget.charge_bytes(wanted.len()) && held.eq_ignore_ascii_case(wanted)
+        }),
+        WILDCARD_OPERATOR => values.iter().any(|value| {
+            let (Some(held), Some(pattern)) = (value.as_str(), argument.as_str()) else {
+                return false;
+            };
+            // The match walks the pattern and the value once each, so both lengths are
+            // what it reads.
+            budget.charge_bytes(pattern.len().saturating_add(held.len()))
+                && ::service_common::event_pattern::matches_wildcard(pattern, held)
+        }),
+        // A NEGATED condition: the message is withheld when the argument matches, and
+        // also when the budget ran out before the argument could be judged.
+        ANYTHING_BUT_OPERATOR => values
+            .iter()
+            .any(|value| !matches_any(argument, value, budget) && !budget.stopped()),
         NUMERIC_OPERATOR => match argument {
             Value::Array(relations) => values
                 .iter()
-                .any(|value| matches_numeric(relations, value)),
+                .any(|value| matches_numeric(relations, value, budget)),
             _ => false,
         },
-        CIDR_OPERATOR => values
-            .iter()
-            .any(|value| super::message_filter::matches_cidr(value, argument)),
+        CIDR_OPERATOR => values.iter().any(|value| {
+            budget.charge(1) && super::message_filter::matches_cidr(value, argument)
+        }),
         // An operator this service does not read matches nothing: a message is withheld
         // rather than delivered to a subscriber whose condition was not applied.
         _ => false,
@@ -382,33 +468,44 @@ fn matches_operator(
 }
 
 /// Whether `value` is one of the values `wanted` names: one value, or any of a list of
-/// them — the argument form `anything-but` takes, which may itself be an affix operator.
-fn matches_any(wanted: &Value, value: &Value) -> bool {
+/// them — the argument form `anything-but` takes, which may itself be an operator object.
+///
+/// Each option the argument lists is a comparison of its own, so each is charged.
+fn matches_any(wanted: &Value, value: &Value, budget: &mut MatchBudget) -> bool {
     match wanted {
-        Value::Array(options) => options.iter().any(|option| equals(value, option)),
+        Value::Array(options) => options
+            .iter()
+            .any(|option| budget.charge(1) && equals(value, option)),
         Value::Object(operator) => {
-            matches_operator(operator, Some(std::slice::from_ref(value)))
+            matches_operator(operator, Some(std::slice::from_ref(value)), budget)
         }
-        option => equals(value, option),
+        option => budget.charge(1) && equals(value, option),
     }
 }
 
 /// Whether the string `value` begins or ends with what `argument` names, by `test`.
 ///
 /// The argument is a string, or `{"equals-ignore-case": "…"}` — the case-insensitive
-/// form of the same affix match.
-fn matches_affix(value: &Value, argument: &Value, test: impl Fn(&str, &str) -> bool) -> bool {
+/// form of the same affix match. The bytes the comparison reads are charged to `budget`.
+fn matches_affix(
+    value: &Value,
+    argument: &Value,
+    budget: &mut MatchBudget,
+    test: impl Fn(&str, &str) -> bool,
+) -> bool {
     let Some(held) = value.as_str() else {
         return false;
     };
     match argument {
-        Value::String(affix) => test(held, affix),
+        // Only the affix's own length is read, whichever end it is at.
+        Value::String(affix) => budget.charge_bytes(affix.len()) && test(held, affix),
         Value::Object(operator) if operator.len() == 1 => {
             match operator.get(EQUALS_IGNORE_CASE_OPERATOR).and_then(Value::as_str) {
-                Some(affix) => test(
-                    &held.to_ascii_lowercase(),
-                    &affix.to_ascii_lowercase(),
-                ),
+                // The case-folded form reads both sides whole.
+                Some(affix) => {
+                    budget.charge_bytes(affix.len().saturating_add(held.len()))
+                        && test(&held.to_ascii_lowercase(), &affix.to_ascii_lowercase())
+                }
                 None => false,
             }
         }
@@ -420,14 +517,17 @@ fn matches_affix(value: &Value, argument: &Value, test: impl Fn(&str, &str) -> b
 ///
 /// The condition is a flat list of operator/operand pairs — `["=", 2]`, `[">", 0, "<=",
 /// 5]` — and ALL of its relations have to hold, which is what makes the two-pair form a
-/// range.
-fn matches_numeric(relations: &[Value], value: &Value) -> bool {
+/// range. Each relation judged is a comparison of its own, so each is charged.
+fn matches_numeric(relations: &[Value], value: &Value, budget: &mut MatchBudget) -> bool {
     let Some(held) = value.as_f64() else {
         return false;
     };
     let mut pairs = relations.chunks(2);
     let mut judged = false;
     for pair in &mut pairs {
+        if !budget.charge(1) {
+            return false;
+        }
         let [relation, operand] = pair else {
             // A trailing operator with no operand names no relation.
             return false;

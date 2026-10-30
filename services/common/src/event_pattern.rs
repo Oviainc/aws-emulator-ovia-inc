@@ -564,8 +564,15 @@ fn affix_matches(
     }
 }
 
+/// Whether `observed` matches the wildcard pattern `pattern`.
+///
 /// `*` is the only wildcard character EventBridge supports, and it stands for
-/// any run of characters, including none.
+/// any run of characters, including none; every other character is matched
+/// literally and case-sensitively, and the pattern describes the WHOLE value.
+/// `pub` because that is one grammar wherever a service accepts a wildcard
+/// pattern — an EventBridge event pattern, an Amazon SNS subscription filter
+/// policy — so two services handed the same pattern and the same value cannot
+/// disagree about whether it matches.
 ///
 /// The pattern is therefore a sequence of literal segments separated by `*`, and
 /// a single left-to-right cursor decides the match: the first segment has to be
@@ -573,13 +580,10 @@ fn affix_matches(
 /// previous one. That is LINEAR in the two lengths — a backtracking walk would
 /// be quadratic, which a caller choosing both the pattern and the value could
 /// turn into seconds of CPU per candidate.
-fn wildcard_matches(wildcard: &str, observed: &str, budget: &mut MatchBudget) -> bool {
-    if !budget.spend(wildcard.len() + observed.len()) {
-        return false;
-    }
+pub fn matches_wildcard(pattern: &str, observed: &str) -> bool {
     // No `*` at all: the whole pattern is one literal.
-    let Some((first, tail)) = wildcard.split_once('*') else {
-        return observed == wildcard;
+    let Some((first, tail)) = pattern.split_once('*') else {
+        return observed == pattern;
     };
     // Everything after the LAST `*` has to land at the end of the value;
     // everything between the two has to occur, in order, in what is left.
@@ -607,6 +611,15 @@ fn wildcard_matches(wildcard: &str, observed: &str, budget: &mut MatchBudget) ->
         }
     }
     true
+}
+
+/// The same match, charged to one event's matching budget: both lengths are read,
+/// so both are what it costs.
+fn wildcard_matches(wildcard: &str, observed: &str, budget: &mut MatchBudget) -> bool {
+    if !budget.spend(wildcard.len() + observed.len()) {
+        return false;
+    }
+    matches_wildcard(wildcard, observed)
 }
 
 fn numeric_matches(argument: &Value, observed: &Value, budget: &mut MatchBudget) -> bool {
