@@ -17,6 +17,10 @@ mod access_policy;
 mod access_policy_listing;
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/account_settings_audit.rs"]
+mod account_settings_audit;
+#[path = "all/audit_capture.rs"]
+mod audit_capture;
 #[path = "all/client_error_status.rs"]
 mod client_error_status;
 #[path = "all/client_token_scope.rs"]

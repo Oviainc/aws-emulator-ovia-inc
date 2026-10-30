@@ -64,19 +64,26 @@ pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemor
     (router, engine)
 }
 
-/// A SigV4 `Authorization` header scoped to this service in `region`.
-fn authorization(region: &str) -> String {
+/// The access key id [`call_in`] presents, which is what `emulator_server::extract_akid`
+/// reports in an audit record. A suite that reads records back signs with one of its own
+/// instead ([`call_signed_as`]), so its records are told apart from a parallel sibling's.
+pub(crate) const ACCESS_KEY_ID: &str = "AKIDTEST";
+
+/// A SigV4 `Authorization` header scoped to this service in `region`, presenting `akid` as
+/// the access key id.
+fn authorization(region: &str, akid: &str) -> String {
     format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{region}/{SIGNING_NAME}/aws4_request, \
+        "AWS4-HMAC-SHA256 Credential={akid}/20260101/{region}/{SIGNING_NAME}/aws4_request, \
          SignedHeaders=host, Signature=deadbeef"
     )
 }
 
-/// Call `operation` with `body`, signed for `region`; answer its HTTP status, the error
-/// code when it failed, and the parsed JSON body.
-pub(crate) async fn call_in(
+/// Call `operation` with `body`, signed for `region` presenting `akid`; answer its HTTP
+/// status, the error code when it failed, and the parsed JSON body.
+pub(crate) async fn call_signed_as(
     router: &MultiServiceRouter,
     region: &str,
+    akid: &str,
     operation: &str,
     body: Value,
 ) -> (u16, String, Value) {
@@ -86,7 +93,7 @@ pub(crate) async fn call_in(
         .header("host", format!("{SIGNING_NAME}.{region}.amazonaws.com"))
         .header("content-type", "application/x-amz-json-1.0")
         .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
-        .header("authorization", authorization(region))
+        .header("authorization", authorization(region, akid))
         .body(bytes::Bytes::from(
             serde_json::to_vec(&body).expect("the request body serializes"),
         ))
@@ -107,6 +114,16 @@ pub(crate) async fn call_in(
             .unwrap_or(&header_code),
     );
     (status, code, parsed)
+}
+
+/// [`call_signed_as`] presenting the harness's own [`ACCESS_KEY_ID`].
+pub(crate) async fn call_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: Value,
+) -> (u16, String, Value) {
+    call_signed_as(router, region, ACCESS_KEY_ID, operation, body).await
 }
 
 /// [`call_in`] in `us-east-1`.

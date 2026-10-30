@@ -24,6 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use crate::audit_capture::{audit_capture, CapturedRecords};
 use crate::collection_lifecycle::{at, call, emulator, is_policy_version, text, CLIENT_ERROR};
 
 /// The values `AccessPolicyType` accepts on the wire
@@ -608,83 +609,10 @@ const AUDITED: &str = "audited-";
 /// `emulator_server::extract_akid` reports in an audit record.
 const AUDIT_ACCESS_KEY_ID: &str = "AKIDTEST";
 
-/// Records captured from `tracing`, oldest first.
-#[derive(Clone, Default)]
-struct CapturedRecords(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-impl CapturedRecords {
-    /// Every record captured since the last drain, clearing the buffer.
-    fn drain(&self) -> Vec<String> {
-        std::mem::take(&mut *self.0.lock().expect("the audit capture lock"))
-    }
-}
-
-/// Renders an event's fields as ` name=value` onto one line.
-struct RecordLine(String);
-
-impl tracing::field::Visit for RecordLine {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        use std::fmt::Write as _;
-        let _ = write!(self.0, " {}={value:?}", field.name());
-    }
-
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        use std::fmt::Write as _;
-        let _ = write!(self.0, " {}={value}", field.name());
-    }
-}
-
-impl tracing::Subscriber for CapturedRecords {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        *metadata.level() <= tracing::Level::INFO
-    }
-
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        // The service emits events, never spans; an id is still required by the trait.
-        tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-        let mut line = RecordLine(format!("{} ", event.metadata().target()));
-        event.record(&mut line);
-        self.0.lock().expect("the audit capture lock").push(line.0);
-    }
-
-    fn enter(&self, _span: &tracing::span::Id) {}
-
-    fn exit(&self, _span: &tracing::span::Id) {}
-}
-
-/// The capture for audit records, installed ONCE as this test binary's global `tracing`
-/// subscriber.
-///
-/// Global rather than scoped on purpose: `tracing` caches per callsite whether any
-/// subscriber is interested, the cache is process-wide, and sibling tests run in parallel
-/// on other threads — so a thread-local subscriber is raced away as soon as another thread
-/// re-evaluates a handler's callsite with no subscriber of its own. The records of a
-/// sibling are told apart by the resource each test addresses.
-static AUDIT_CAPTURE: std::sync::OnceLock<CapturedRecords> = std::sync::OnceLock::new();
-
-fn audit_capture() -> &'static CapturedRecords {
-    AUDIT_CAPTURE.get_or_init(|| {
-        let captured = CapturedRecords::default();
-        tracing::subscriber::set_global_default(captured.clone())
-            .expect("this test binary installs no other global tracing subscriber");
-        captured
-    })
-}
-
-/// The captured records on the `emulator::audit` target that THIS test's calls wrote.
-fn audit_records(captured: &[String]) -> Vec<String> {
-    captured
-        .iter()
-        .filter(|record| record.starts_with("emulator::audit ") && record.contains(AUDITED))
-        .cloned()
-        .collect()
+/// The captured records on the `emulator::audit` target that THIS test's calls wrote,
+/// taken from the shared capture and leaving a sibling suite's records in it.
+fn audit_records(captured: &CapturedRecords) -> Vec<String> {
+    captured.drain_matching(|record| record.contains(AUDITED))
 }
 
 /// RULE: every access-policy call — state-changing or reporting, accepted or refused —
@@ -698,7 +626,7 @@ async fn every_access_policy_call_emits_one_structured_audit_record() {
     // Harness self-test, so a failure below can never be mistaken for a missing audit
     // record: the capture must receive an event emitted right here.
     tracing::info!(target: "emulator::audit", resource = "access-policy/data/audited-probe", "probe");
-    let probe = audit_records(&captured.drain());
+    let probe = audit_records(captured);
     assert_eq!(
         probe.len(),
         1,
@@ -863,7 +791,7 @@ async fn audited(
         "case {case}: expected {expected_status}, got {status} {code} with {answer}"
     );
 
-    let records = audit_records(&captured.drain());
+    let records = audit_records(captured);
     assert_eq!(
         records.len(),
         1,

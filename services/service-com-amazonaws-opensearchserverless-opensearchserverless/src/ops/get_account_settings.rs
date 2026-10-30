@@ -5,7 +5,8 @@
 //! [`crate::state::ComAmazonawsOpensearchserverlessOpensearchserverlessState::account_settings`],
 //! which `UpdateAccountSettings` writes and an account that was never configured carries
 //! the documented defaults of. A pure read: it writes nothing, so two calls with no write
-//! between them report the same limits.
+//! between them report the same limits, and every exit leaves one structured
+//! `emulator::audit` record naming the settings resource it read.
 //!
 //! ## Shape of an operation
 //!
@@ -131,10 +132,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        use crate::state::AuditOutcome;
+
         // `GetAccountSettingsRequest` models no members, and the read is account-wide, so
-        // neither the input nor the request's metadata selects anything.
-        let _ = (&input, ctx);
+        // there is nothing in the request to read; `ctx` is what the audit record below
+        // identifies the caller from. The account's own settings are a resource this crate
+        // audits, and the writer of that same resource records every one of its exits, so
+        // the read of it records every one of its own: whoever asked what the account's
+        // limits are is as observable as whoever set them.
+        let _ = input;
+        let resource = crate::state::AUDIT_ACCOUNT_SETTINGS_RESOURCE;
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::StoreUnreachable,
+                Some(resource),
+            );
             return Err(GetAccountSettingsErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(crate::state::STORE_UNREACHABLE.to_string()),
@@ -146,6 +160,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A REPORTING operation: the guard is taken for reading only, so a read can never
         // change what a later caller sees.
         let settings = state.lock().account_settings;
+        // The outcome every audited reader in this crate records, the statistics read
+        // beside this one included: a stored record was reported to a reader.
+        crate::state::audit(Self::NAME, ctx, AuditOutcome::PolicyRead, Some(resource));
         Ok(GetAccountSettingsOutput {
             account_settings_detail: Some(settings.detail()),
         })
