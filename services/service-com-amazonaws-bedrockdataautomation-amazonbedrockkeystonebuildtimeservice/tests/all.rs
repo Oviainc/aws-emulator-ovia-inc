@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/blueprint_lifecycle.rs"]
 mod blueprint_lifecycle;
+#[path = "all/blueprint_optimization.rs"]
+mod blueprint_optimization;
 #[path = "all/data_automation_project_lifecycle.rs"]
 mod data_automation_project_lifecycle;
 #[path = "all/data_automation_project_update.rs"]

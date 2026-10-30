@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InvokeBlueprintOptimizationAsync
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InvokeBlueprintOptimizationAsync`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InvokeBlueprintOptimizationAsync::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Accepts one blueprint-optimization submission: it resolves the blueprint the
+//! submission references, mints an `invocationArn` for the job, PERSISTS the submission
+//! under it (see [`crate::state::BlueprintOptimizationJobRecord`]) and answers with that
+//! ARN, which `GetBlueprintOptimizationStatus` reads the job back through. A create, so
+//! writing is what the operation does.
+//!
+//! The record IS the job: nothing here optimizes a schema, and an accepted job reaching
+//! [`crate::state::OPTIMIZATION_SUCCESS`] says the job RECORD reached its terminal
+//! state, never that an optimized blueprint exists under the submitted
+//! `outputConfiguration.s3Object` — that object lives in a service this crate does not
+//! emulate, and nothing here writes it or synthesises an optimized schema.
+//!
+//! The model marks this operation `@idempotent` but gives it no `@idempotencyToken`
+//! member and returns the job's own identity, so no value in the request identifies an
+//! earlier submission: two submissions describing the same optimization are two jobs,
+//! each with its own ARN. Deduplicating them would mean keying on a digest of the whole
+//! payload, which AWS documents nowhere.
+//!
+//! ## Authorization
+//!
+//! Caller-identity authorization is deliberately NOT emulated by this service. The
+//! emulator verifies every request signature centrally and holds no
+//! principal-to-resource policy, so the modelled `AccessDeniedException` is unreachable
+//! from this handler.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +177,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InvokeBlueprintOptimizationAsync` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InvokeBlueprintOptimizationAsyncErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("InvokeBlueprintOptimizationAsync"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            InvokeBlueprintOptimizationAsyncError::Modeled(
+                InvokeBlueprintOptimizationAsyncErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the Bedrock Data Automation store is unavailable".to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // The job optimizes the blueprint its submission references, so a reference this
+        // store cannot resolve describes no job: the blueprint's stored schema IS what
+        // such a job reads. Refused BEFORE anything is minted, so a refused submission
+        // leaves no record behind.
+        if store.names_unknown_blueprint(
+            &input.blueprint.blueprint_arn,
+            input.blueprint.stage.as_deref(),
+        ) {
+            return Err(
+                InvokeBlueprintOptimizationAsyncErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::BLUEPRINT_ARN_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store is bounded: past the quota a submission is refused rather than
+        // allowed to grow the state without end.
+        if store.optimization_jobs.len() >= crate::state::OPTIMIZATION_JOB_QUOTA {
+            return Err(
+                InvokeBlueprintOptimizationAsyncErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "the quota of {} blueprint optimization jobs per account has \
+                             been reached",
+                            crate::state::OPTIMIZATION_JOB_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let (submitted_at, submitted_at_timestamp) = crate::state::now_pair();
+        let sequence = store.take_arn_sequence();
+        let invocation_arn = crate::state::mint_blueprint_optimization_invocation_arn(
+            &crate::state::request_region(ctx),
+            submitted_at_timestamp,
+            sequence,
+        );
+        // Both transitions this job owes are fixed at the instant it is accepted, from
+        // ONE clock read, so the two due instants cannot come from two different ones.
+        let in_progress_at = submitted_at + crate::state::OPTIMIZATION_STAGE_SPAN;
+        let (kms_key_id, kms_encryption_context) = match input.encryption_configuration {
+            Some(config) => (Some(config.kms_key_id), config.kms_encryption_context),
+            None => (None, None),
+        };
+        let record = crate::state::BlueprintOptimizationJobRecord {
+            invocation_arn: invocation_arn.clone(),
+            blueprint_arn: input.blueprint.blueprint_arn,
+            blueprint_stage: input.blueprint.stage,
+            samples: input.samples,
+            output_configuration: input.output_configuration,
+            data_automation_profile_arn: input.data_automation_profile_arn,
+            kms_key_id,
+            kms_encryption_context,
+            tags: input.tags.unwrap_or_default(),
+            in_progress_at,
+            succeeds_at: in_progress_at + crate::state::OPTIMIZATION_STAGE_SPAN,
+        };
+        store.optimization_jobs.insert(invocation_arn.clone(), record);
+
+        // Answer with the identity of the job that is now PERSISTED, read back out of
+        // the store rather than from the value just built: a later
+        // `GetBlueprintOptimizationStatus` must resolve exactly this ARN.
+        let stored_arn = store
+            .optimization_jobs
+            .get(&invocation_arn)
+            .map(|job| job.invocation_arn.clone())
+            .ok_or_else(|| {
+                InvokeBlueprintOptimizationAsyncError::Modeled(
+                    InvokeBlueprintOptimizationAsyncErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: Some(
+                                "the blueprint optimization job could not be read back after \
+                                 it was stored"
+                                    .to_string(),
+                            ),
+                        },
+                    ),
+                )
+            })?;
+        Ok(InvokeBlueprintOptimizationAsyncOutput {
+            invocation_arn: stored_arn,
+        })
     }
 }

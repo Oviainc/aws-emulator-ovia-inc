@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBlueprintOptimizationStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBlueprintOptimizationStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBlueprintOptimizationStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one persisted blueprint-optimization job. `@readonly`, and a pure read: the
+//! status it answers is derived from the two due instants the submission stored
+//! ([`crate::state::BlueprintOptimizationJobRecord::status_at`]), so nothing is written
+//! and two readers at one instant agree.
+//!
+//! A reported [`crate::state::OPTIMIZATION_SUCCESS`] says the job RECORD reached its
+//! terminal state; it does not claim that an optimized blueprint exists under the
+//! submitted `outputConfiguration.s3Object`, which lives in a service this crate does
+//! not emulate. Nothing here writes that object or synthesises an optimized schema.
+//!
+//! ## An `invocationArn` that names no job
+//!
+//! Such a call is refused with the modelled `ValidationException` (HTTP 400) carrying
+//! [`crate::state::UNKNOWN_INVOCATION_MESSAGE`]: that is the refusal this service gives
+//! for an invocation ARN it cannot resolve, rather than the missing-resource refusal
+//! (HTTP 404) its blueprint and project reads answer with for an ARN of a resource they
+//! own. The sibling runtime service refuses an unresolvable REFERENCE the same way.
+//!
+//! ## Authorization
+//!
+//! Caller-identity authorization is deliberately NOT emulated by this service. The
+//! emulator verifies every request signature centrally and holds no
+//! principal-to-resource policy, so the modelled `AccessDeniedException` is unreachable
+//! from this handler: a job is addressed only by the ARN the caller supplies, and
+//! resolved inside this service's own store.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +170,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBlueprintOptimizationStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBlueprintOptimizationStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBlueprintOptimizationStatus"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetBlueprintOptimizationStatusError::Modeled(
+                GetBlueprintOptimizationStatusErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the Bedrock Data Automation store is unavailable".to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        // A read: it only projects what is already stored.
+        let store = state.lock();
+
+        // The modelled `@pattern` and `@length` on `invocationArn` are refused before
+        // this handler runs, so an ARN that reaches here is well formed; one naming no
+        // stored job is simply unresolvable (see this module's header for why that is
+        // the modelled `ValidationException` and not the 404).
+        let job = store
+            .optimization_jobs
+            .get(&input.invocation_arn)
+            .ok_or_else(|| {
+                GetBlueprintOptimizationStatusErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::UNKNOWN_INVOCATION_MESSAGE.to_string()),
+                        field_list: None,
+                    },
+                )
+            })?;
+
+        Ok(GetBlueprintOptimizationStatusOutput {
+            status: Some(job.status_at(::std::time::SystemTime::now()).to_string()),
+            // A job this emulator accepted never fails, so neither member is set: a
+            // status carrying no error reports no error.
+            error_type: None,
+            error_message: None,
+            output_configuration: Some(job.output_configuration.clone()),
+        })
     }
 }

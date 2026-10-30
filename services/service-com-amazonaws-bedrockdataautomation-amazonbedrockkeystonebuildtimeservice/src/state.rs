@@ -6,7 +6,9 @@
 //! (`CreateBlueprint`, `GetBlueprint`, `ListBlueprints`, `UpdateBlueprint`,
 //! `DeleteBlueprint`, `CreateBlueprintVersion`) share and the DataAutomationProject
 //! record `CreateDataAutomationProject`, `GetDataAutomationProject` and
-//! `UpdateDataAutomationProject` share, plus
+//! `UpdateDataAutomationProject` share, and the blueprint-optimization job record
+//! `InvokeBlueprintOptimizationAsync` mints and `GetBlueprintOptimizationStatus`
+//! reports, plus
 //! the few helpers more than one of those handlers needs: minting a resource ARN,
 //! resolving the request's region, and the opaque `nextToken` codec used by the
 //! paginated list. Operation BEHAVIOUR stays in `src/ops/<operation>.rs`; only the
@@ -16,7 +18,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Blueprint, BlueprintSummary, CustomOutputConfiguration, DataAutomationLibraryConfiguration,
+    Blueprint, BlueprintOptimizationOutputConfiguration, BlueprintOptimizationSample,
+    BlueprintSummary, CustomOutputConfiguration, DataAutomationLibraryConfiguration,
     DataAutomationProject, OverrideConfiguration, StandardOutputConfiguration, Tag,
 };
 
@@ -72,6 +75,128 @@ pub const BLUEPRINT_QUOTA: usize = 1_000;
 /// on a whole-blueprint delete) releases its token with it, so that map holds at
 /// most one entry per live snapshot.
 pub const BLUEPRINT_VERSION_QUOTA: usize = 100;
+
+/// The resource portion prefix of a blueprint-optimization invocation ARN, as the
+/// modelled `BlueprintOptimizationInvocationArn` pattern spells it
+/// (`smithy_query(operation="GetBlueprintOptimizationStatus")`:
+/// `…:blueprint-optimization-invocation/[a-zA-Z0-9-_]+`).
+pub const OPTIMIZATION_INVOCATION_RESOURCE_PREFIX: &str = "blueprint-optimization-invocation/";
+
+/// The status a blueprint-optimization job carries from the moment
+/// `InvokeBlueprintOptimizationAsync` accepts it.
+///
+/// Source: `smithy_query(shape="BlueprintOptimizationJobStatus")` ->
+/// `["Created", "InProgress", "Success", "ServiceError", "ClientError"]`. The two error
+/// statuses are reached by no path here: nothing in this emulator fails a job it has
+/// accepted, and a submission this service refuses is refused on the wire rather than
+/// recorded as a failed job.
+pub const OPTIMIZATION_CREATED: &str = "Created";
+
+/// The status a blueprint-optimization job carries once the clock has made its first
+/// transition due. See [`OPTIMIZATION_CREATED`] for the source of the value.
+pub const OPTIMIZATION_IN_PROGRESS: &str = "InProgress";
+
+/// The terminal status of a blueprint-optimization job this store accepted. See
+/// [`OPTIMIZATION_CREATED`] for the source of the value.
+///
+/// It says that the job RECORD reached its terminal state; it does not claim that an
+/// optimized blueprint exists under the submitted `outputConfiguration.s3Object`, which
+/// lives in a service this crate does not emulate.
+pub const OPTIMIZATION_SUCCESS: &str = "Success";
+
+/// How long after `InvokeBlueprintOptimizationAsync` the clock owes a job its
+/// `Created` -> `InProgress` transition, and how long after that instant it owes
+/// `InProgress` -> `Success`.
+///
+/// AWS documents no duration for either leg — `GetBlueprintOptimizationStatus` models
+/// `status` as one of `Created`/`InProgress`/`Success` precisely because an accepted job
+/// is not finished when the submission returns — so this span is CHOSEN, not modelled.
+/// It is deliberately non-zero, so a caller polling straight after the submission still
+/// observes `Created` and the status it reports is never skipped. Nothing sleeps for it:
+/// the two due instants are stored on the record and compared against the clock.
+pub const OPTIMIZATION_STAGE_SPAN: Duration = Duration::from_secs(3);
+
+/// How many blueprint-optimization jobs the store holds before
+/// `InvokeBlueprintOptimizationAsync` refuses with the modelled
+/// `ServiceQuotaExceededException` (HTTP 402).
+///
+/// Same reasoning as [`BLUEPRINT_QUOTA`]: Bedrock Data Automation publishes adjustable
+/// quotas per account per Region and this emulator models neither Service Quotas nor an
+/// account's adjustments, so this is the emulator's OWN bound on the store — what stops
+/// a caller submitting jobs from growing the state without end.
+pub const OPTIMIZATION_JOB_QUOTA: usize = 1_000;
+
+/// What this service answers when an `invocationArn` names no blueprint-optimization
+/// job this store holds.
+///
+/// The "operation" this refusal speaks of is the ASYNCHRONOUS JOB the ARN names, not the
+/// API call: the answer is this service's own modelled `ValidationException`, which it
+/// raises only after it has understood the request. The text is fixed and carries
+/// NOTHING from the request — the caller's ARN is not echoed back, exactly as this
+/// service's other refusals for a resource it cannot resolve do not echo theirs
+/// ([`BLUEPRINT_ARN_NOT_FOUND_MESSAGE`]).
+pub const UNKNOWN_INVOCATION_MESSAGE: &str =
+    "The requested operation is not recognized by the service.";
+
+/// What this service answers when a submission references a blueprint this store does
+/// not hold: the wording this service's blueprint reads use for a `blueprintArn` that
+/// resolves to nothing, for the resource a blueprint-optimization submission names by
+/// reference. Fixed text, with nothing taken from the request.
+pub const BLUEPRINT_ARN_NOT_FOUND_MESSAGE: &str = "Blueprint Arn not found.";
+
+/// The ARN account field AWS's OWN resources carry, as the modelled `BlueprintArn`
+/// pattern admits beside a 12-digit account
+/// (`…:(aws|[0-9]{12}):blueprint/(bedrock-data-automation-public-…|…)`).
+const SERVICE_OWNED_ACCOUNT: &str = "aws";
+
+/// Whether `arn` names a resource an ACCOUNT holds rather than one of AWS's own.
+///
+/// Read through the shared `service_common::arn` parse, so this service and its siblings
+/// agree on what an ARN's account field is. Absence of an AWS-owned resource cannot be
+/// concluded from this store: it holds no catalog of the public, service-owned
+/// blueprints the `BlueprintArn` pattern admits.
+fn names_account_owned_resource(arn: &str) -> bool {
+    ::service_common::arn::parse(arn).is_some_and(|parsed| parsed.account != SERVICE_OWNED_ACCOUNT)
+}
+
+/// A stored blueprint-optimization job: the submission
+/// `InvokeBlueprintOptimizationAsync` accepted, plus the two instants the clock owes
+/// this job's status transitions.
+#[derive(Debug, Clone)]
+pub struct BlueprintOptimizationJobRecord {
+    pub invocation_arn: String,
+    pub blueprint_arn: String,
+    /// The `blueprint.stage` the submission selected, as submitted; `None` when it
+    /// named none.
+    pub blueprint_stage: Option<String>,
+    pub samples: Vec<BlueprintOptimizationSample>,
+    pub output_configuration: BlueprintOptimizationOutputConfiguration,
+    pub data_automation_profile_arn: String,
+    pub kms_key_id: Option<String>,
+    pub kms_encryption_context: Option<HashMap<String, String>>,
+    pub tags: Vec<Tag>,
+    /// When this job stops being `Created`.
+    pub in_progress_at: SystemTime,
+    /// When this job reaches [`OPTIMIZATION_SUCCESS`].
+    pub succeeds_at: SystemTime,
+}
+
+impl BlueprintOptimizationJobRecord {
+    /// This job's modeled `status` as of `now`, derived from the two stored due
+    /// instants.
+    ///
+    /// A pure function of the record, so reporting the status writes nothing and two
+    /// readers at the same instant agree.
+    pub fn status_at(&self, now: SystemTime) -> &'static str {
+        if now >= self.succeeds_at {
+            OPTIMIZATION_SUCCESS
+        } else if now >= self.in_progress_at {
+            OPTIMIZATION_IN_PROGRESS
+        } else {
+            OPTIMIZATION_CREATED
+        }
+    }
+}
 
 /// The `projectStage` a DataAutomationProject takes when the create request names
 /// none.
@@ -260,8 +385,11 @@ impl BlueprintRecord {
             blueprint_stage: Some(self.blueprint_stage.clone()),
             kms_key_id: self.kms_key_id.clone(),
             kms_encryption_context: self.kms_encryption_context.clone(),
-            // Blueprint optimization is a separate, still-unimplemented slice; a
-            // blueprint nothing optimized carries neither member.
+            // A blueprint-optimization job delivers its optimized blueprint to the
+            // output location its submission named, and neither the model nor the
+            // service's docs say such a job re-writes the blueprint it read, so a job
+            // leaves this record alone and both members stay absent. No request can set
+            // them either: no input shape of this service carries them.
             optimization_samples: None,
             optimization_time: None,
         }
@@ -316,6 +444,11 @@ pub struct ComAmazonawsBedrockdataautomationAmazonbedrockkeystonebuildtimeservic
     /// `CreateDataAutomationProject` `clientToken` -> the ARN that call created, so
     /// an `@idempotencyToken` replay returns the original project.
     pub project_create_idempotency: HashMap<String, String>,
+    /// Every blueprint-optimization job `InvokeBlueprintOptimizationAsync` has
+    /// accepted, keyed by the `invocationArn` it minted for it, and read back by
+    /// `GetBlueprintOptimizationStatus`. Bounded at [`OPTIMIZATION_JOB_QUOTA`] by the
+    /// submission, which refuses rather than inserting past it.
+    pub optimization_jobs: HashMap<String, BlueprintOptimizationJobRecord>,
     /// The sequence number the next minted resource ARN carries, for every
     /// resource this store mints one for (a blueprint, a DataAutomationProject). It
     /// counts the creates this store has served and is never rolled back, so every
@@ -359,6 +492,25 @@ impl ComAmazonawsBedrockdataautomationAmazonbedrockkeystonebuildtimeserviceState
         self.version_idempotency.retain(|_, (stored_arn, stored_version)| {
             stored_arn != arn || *stored_version != version
         });
+    }
+
+    /// Whether this store can tell that the submission's blueprint reference names NO
+    /// blueprint of this account: either nothing is stored under `blueprint_arn`, or
+    /// what is stored is not at the `stage` the submission selected — a reference a
+    /// blueprint-optimization job cannot be run against, because the blueprint's schema
+    /// IS what such a job optimizes.
+    ///
+    /// `false` for an AWS-owned (public) blueprint ARN: this store holds no catalog of
+    /// those, so absence here is no evidence about them
+    /// ([`names_account_owned_resource`]).
+    pub fn names_unknown_blueprint(&self, blueprint_arn: &str, stage: Option<&str>) -> bool {
+        if !names_account_owned_resource(blueprint_arn) {
+            return false;
+        }
+        match self.blueprints.get(blueprint_arn) {
+            None => true,
+            Some(record) => stage.is_some_and(|stage| stage != record.blueprint_stage),
+        }
     }
 
     /// Forget a DataAutomationProject entirely: the record, its name reservation
@@ -426,6 +578,33 @@ pub fn mint_project_arn(
 ) -> String {
     let id = format!("{:08x}-{:016x}", created_at.subsec_nanos(), sequence);
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("data-automation-project/{id}"))
+}
+
+/// Mint a fresh blueprint-optimization invocation ARN for `region`.
+///
+/// `smithy_query(operation="GetBlueprintOptimizationStatus")` constrains
+/// `invocationArn` to
+/// `^arn:aws(|-cn|-iso|-iso-[a-z]|-us-gov):bedrock:[a-zA-Z0-9-]*:[0-9]{12}:blueprint-optimization-invocation/[a-zA-Z0-9-_]+$`
+/// with `@length(1..128)`, and `InvokeBlueprintOptimizationAsync` returns the value in
+/// a member carrying the same constraints — so an ARN this service mints has to satisfy
+/// them, or it would name a job no caller could ever address. The resource id is the
+/// one [`mint_blueprint_arn`] builds and rests its uniqueness on (the creating instant's
+/// nanoseconds-within-the-second, then the store's never-rolled-back sequence number in
+/// full 64-bit width), and `region` is reduced to a region label through the shared
+/// `service_common::arn::region_label` grammar — non-empty, at most 20 characters, only
+/// `[a-z0-9-]`, which is the form the pattern's region field states — so the whole value
+/// stays inside the pattern and well under 128 characters whatever a caller signs for.
+pub fn mint_blueprint_optimization_invocation_arn(
+    region: &str,
+    created_at: ::aws_smithy_types::DateTime,
+    sequence: u64,
+) -> String {
+    let id = format!("{:08x}-{:016x}", created_at.subsec_nanos(), sequence);
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        ::service_common::arn::region_label(region).unwrap_or(DEFAULT_REGION),
+        &format!("{OPTIMIZATION_INVOCATION_RESOURCE_PREFIX}{id}"),
+    )
 }
 
 /// The current wall-clock instant as a modeled `date-time` timestamp.
