@@ -241,10 +241,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let filter_dimensions = crate::state::dimension_set(input.dimensions.as_deref());
 
         let mut store = state.lock();
+        let now_secs = crate::state::now_secs();
+        // The model an alarm's DUE evaluation needs: the alarm names the band as its threshold,
+        // so the evaluation the clock already made due owes a model for the metric that band is
+        // drawn from, whether or not anybody called. Materialising it here reports what the
+        // store already owed rather than changing what it holds.
+        store.restore_alarm_referenced_models(now_secs);
         // The training each stored model's write started: a transition the clock owed at this
         // instant whether or not anybody called, so materialising it here reports what the
         // store already owed rather than changing it.
-        store.settle_anomaly_detector_training(crate::state::now_secs());
+        store.settle_anomaly_detector_training(now_secs);
 
         // Ordered by identifier so paging is stable and a token can simply name the model the
         // next page starts at.

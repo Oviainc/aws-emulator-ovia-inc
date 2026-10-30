@@ -613,8 +613,65 @@ impl SeriesSource for StoreSeriesSource<'_> {
         let metric = series.metric.as_ref()?;
         let detector_id = super::AnomalyDetectorForm::of_series_metric(metric).detector_id();
         let stored = self.store.anomaly_detectors.get(&detector_id)?;
-        super::anomaly_model_of(stored, &series.points, self.now)
+        // What the model was TRAINED on is the metric's own history and not the span this read
+        // happens to cover ([`anomaly_training_history`]), so the band a graph shows over one
+        // window and the band an alarm compares one period against are the same numbers.
+        let history = anomaly_training_history(self.store, metric, self.now);
+        super::anomaly_model_of(stored, &history, &series.points, self.now)
     }
+
+    fn anomaly_training_datapoints(&self, series: &MathSeries) -> usize {
+        // What the fold above will VISIT: the datapoints the metric's own series holds, which
+        // is the same count [`Resolution::retrieve`] and the alarm evaluator charge a fold of
+        // one series by. A series no detector was created for is never folded, so it costs
+        // nothing.
+        let Some(metric) = series.metric.as_ref() else {
+            return 0;
+        };
+        let detector_id = super::AnomalyDetectorForm::of_series_metric(metric).detector_id();
+        if !self.store.anomaly_detectors.contains_key(&detector_id) {
+            return 0;
+        }
+        self.store
+            .metrics
+            .get(&training_series_key(metric))
+            .map_or(0, Vec::len)
+    }
+}
+
+/// The series identity a model's training history is folded out of: the metric the detector was
+/// created for.
+fn training_series_key(metric: &SeriesMetric) -> MetricKey {
+    MetricKey {
+        namespace: metric.namespace.clone(),
+        metric_name: metric.metric_name.clone(),
+        dimensions: metric.dimensions.clone(),
+    }
+}
+
+/// The history an anomaly detection model is trained on: the series its detector watches,
+/// folded by the statistic the detector was created for, over the training span that ends at
+/// `now` ([`super::ANOMALY_TRAINING_SPAN_SECS`]).
+///
+/// Folded by the SAME fold every reader of a series uses ([`folded_series`]), so a model is
+/// trained on exactly the values a caller reading that metric would see, and what the walk
+/// costs is the datapoints the series holds rather than the span — the count its caller charges
+/// to its budget before this runs ([`SeriesSource::anomaly_training_datapoints`]).
+fn anomaly_training_history(store: &State, metric: &SeriesMetric, now: f64) -> Vec<(f64, f64)> {
+    let key = training_series_key(metric);
+    let period = super::ANOMALY_TRAINING_PERIOD_SECS;
+    folded_series(
+        store,
+        &key,
+        &metric.stat,
+        None,
+        period,
+        now - super::ANOMALY_TRAINING_SPAN_SECS,
+        // The period the clock is IN is part of the history too: a datapoint just published is
+        // one the metric's history holds, so the fold reaches the end of that period.
+        now + f64::from(period),
+        now,
+    )
 }
 
 /// The label a searched series is reported under: the metric's name and the values of its

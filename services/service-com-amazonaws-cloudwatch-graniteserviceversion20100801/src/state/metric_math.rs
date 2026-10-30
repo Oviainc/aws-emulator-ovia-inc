@@ -117,6 +117,14 @@ pub trait SeriesSource {
     /// retrieved for ([`MathSeries::metric`]), because that is what a detector is created
     /// for.
     fn anomaly_model(&self, series: &MathSeries) -> Option<AnomalyModel>;
+
+    /// How many stored data points answering [`Self::anomaly_model`] for `series` will VISIT:
+    /// the history the model is trained on, which is the metric's own and not the span this
+    /// expression reads.
+    ///
+    /// Reported separately so the caller charges that work to its budget BEFORE the fold runs
+    /// ([`Evaluation::charge`]), the way every other loop over a series' points is charged.
+    fn anomaly_training_datapoints(&self, series: &MathSeries) -> usize;
 }
 
 /// What an anomaly detector's trained model says a series is expected to be.
@@ -1623,6 +1631,15 @@ impl<'a> Evaluation<'a> {
                 "ANOMALY_DETECTION_BAND's band width is greater than zero",
             ));
         }
+        // The history the model is trained on is read out of the store, and reading it is a
+        // walk over that metric's stored datapoints — so it is charged to this evaluation's
+        // budget BEFORE it runs, the way every other loop over a series' points is, and an
+        // expression that asks for more of them than one request evaluates is refused rather
+        // than answered.
+        let training = self.scope.source.anomaly_training_datapoints(series);
+        if !self.charge(training) {
+            return Err(MathError::new(BUDGET_SPENT));
+        }
         let model = self.scope.source.anomaly_model(series);
         let (expected, deviation) = model.map_or_else(
             || (Vec::new(), Vec::new()),
@@ -1773,10 +1790,14 @@ const DEFAULT_SEARCH_STAT: &str = "Average";
 const DEFAULT_BAND_WIDTH: f64 = 2.0;
 
 /// What the lower bound of an anomaly detection band is labelled with.
-const LOWER_BAND_SUFFIX: &str = " Low";
+///
+/// The label is what tells the two bounds of a band apart wherever one is read — the alarm
+/// whose threshold IS a band reads the bound it compares against by it — so the suffix is
+/// stated once here rather than at each reader.
+pub(super) const LOWER_BAND_SUFFIX: &str = " Low";
 
 /// What the upper bound of an anomaly detection band is labelled with.
-const UPPER_BAND_SUFFIX: &str = " High";
+pub(super) const UPPER_BAND_SUFFIX: &str = " High";
 
 /// How many periods a constructed series spans at most, so an expression over a wide range at
 /// a one-second granularity cannot allocate without bound.

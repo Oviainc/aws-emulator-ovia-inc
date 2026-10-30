@@ -896,3 +896,218 @@ async fn every_declared_output_carries_its_resolved_value() {
         );
     }
 }
+
+/// The metric names the exclude filter of the estate below narrows its namespace to, in the
+/// order the template lists them: an order no sort reproduces, so a filter reported in it is
+/// one the deployment carried through rather than one rebuilt.
+const EXCLUDED_METRIC_NAMES: &[&str] = &[
+    "NetworkPacketsOut",
+    "CPUUtilization",
+    "StatusCheckFailed",
+    "DiskReadBytes",
+    "NetworkIn",
+];
+
+/// The namespaces the include stream of that estate is limited to, in template order.
+const INCLUDED_NAMESPACES: &[&str] = &["AWS/EC2", "AWS/Lambda"];
+
+/// The stack a client deploys an observability ESTATE with: one Firehose/S3 destination and
+/// TWO metric streams over it, one limited to what it excludes and one to what it includes.
+fn estate_template() -> String {
+    json!({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Description": "two CloudWatch metric streams over one Firehose destination",
+        "Resources": {
+            "DeliveryRole": {
+                "Type": "AWS::IAM::Role",
+                "Properties": {
+                    "RoleName": "msestate-role",
+                    "AssumeRolePolicyDocument": TRUST_POLICY,
+                },
+            },
+            "MetricsBucket": {
+                "Type": "AWS::S3::Bucket",
+                "Properties": {"BucketName": "msestate-metrics"},
+            },
+            "MetricsFirehose": {
+                "Type": "AWS::KinesisFirehose::DeliveryStream",
+                "Properties": {
+                    "DeliveryStreamName": "msestate-firehose",
+                    "DeliveryStreamType": "DirectPut",
+                    "ExtendedS3DestinationConfiguration": {
+                        "BucketARN": {"Fn::GetAtt": ["MetricsBucket", "Arn"]},
+                        "RoleARN": {"Fn::GetAtt": ["DeliveryRole", "Arn"]},
+                        "CompressionFormat": "GZIP",
+                    },
+                },
+            },
+            "ExcludeStream": {
+                "Type": "AWS::CloudWatch::MetricStream",
+                "Properties": {
+                    "Name": "msestate-exclude",
+                    "FirehoseArn": {"Fn::GetAtt": ["MetricsFirehose", "Arn"]},
+                    "RoleArn": {"Fn::GetAtt": ["DeliveryRole", "Arn"]},
+                    "OutputFormat": "json",
+                    "ExcludeFilters": [
+                        {"Namespace": "AWS/EC2", "MetricNames": EXCLUDED_METRIC_NAMES},
+                    ],
+                },
+            },
+            "IncludeStream": {
+                "Type": "AWS::CloudWatch::MetricStream",
+                "Properties": {
+                    "Name": "msestate-include",
+                    "FirehoseArn": {"Fn::GetAtt": ["MetricsFirehose", "Arn"]},
+                    "RoleArn": {"Fn::GetAtt": ["DeliveryRole", "Arn"]},
+                    "OutputFormat": "json",
+                    "IncludeFilters": INCLUDED_NAMESPACES
+                        .iter()
+                        .map(|namespace| json!({"Namespace": namespace}))
+                        .collect::<Vec<Value>>(),
+                },
+            },
+        },
+        "Outputs": {
+            "ExcludeStreamName": {"Value": {"Ref": "ExcludeStream"}},
+            "IncludeStreamName": {"Value": {"Ref": "IncludeStream"}},
+            "FirehoseArn": {"Value": {"Fn::GetAtt": ["MetricsFirehose", "Arn"]}},
+        },
+    })
+    .to_string()
+}
+
+/// A stack declaring SEVERAL metric streams over one destination is readable, stoppable and
+/// destroyed as a whole: each stream is created in CloudWatch with the filter — and only the
+/// filter — its own declaration carries, `StopMetricStreams` moves both to `stopped`, and the
+/// stack's deletion leaves CloudWatch answering its not-found for each of them and
+/// CloudFormation answering its own for the stack.
+///
+/// The one row of the first test's table generalises to several resources of the same type in
+/// one stack: nothing about the rule is per-stack-resource, and the mutually exclusive filters
+/// are what tells the two declarations apart — a member one stream declares is absent from the
+/// other rather than reported empty.
+#[tokio::test]
+async fn an_estate_of_two_metric_streams_is_readable_stoppable_and_destroyed_with_its_stack() {
+    let case = "two metric streams over one Firehose destination";
+    let stack_name = "msestate-stack";
+    let router = build_router();
+    let body = create_and_settle(&router, case, stack_name, &estate_template()).await;
+    assert_eq!(
+        opt_element(&body, "StackStatus").as_deref(),
+        Some("CREATE_COMPLETE"),
+        "case {case:?}: expected the estate's stack to complete, got {body}"
+    );
+    let outputs = outputs_of(&body);
+    let exclude = outputs
+        .get("ExcludeStreamName")
+        .unwrap_or_else(|| panic!("case {case:?}: no ExcludeStreamName output in {body}"))
+        .clone();
+    let include = outputs
+        .get("IncludeStreamName")
+        .unwrap_or_else(|| panic!("case {case:?}: no IncludeStreamName output in {body}"))
+        .clone();
+    let destination = outputs
+        .get("FirehoseArn")
+        .unwrap_or_else(|| panic!("case {case:?}: no FirehoseArn output in {body}"))
+        .clone();
+
+    // The stream declared with an EXCLUDE filter carries exactly that filter, with its metric
+    // names in the order the template listed them, and no include filter at all.
+    let reported = get_metric_stream(&router, case, &exclude).await;
+    assert_eq!(
+        reported.get("ExcludeFilters"),
+        Some(&json!([
+            {"Namespace": "AWS/EC2", "MetricNames": EXCLUDED_METRIC_NAMES},
+        ])),
+        "case {case:?}: expected the excluded names in template order, got {reported}"
+    );
+    assert!(
+        reported.get("IncludeFilters").is_none(),
+        "case {case:?}: a stream that declares one filter kind carries no other, got {reported}"
+    );
+
+    // The stream declared with an INCLUDE filter carries its namespaces in template order and
+    // NO exclude filter member — absent, not an empty list.
+    let reported_include = get_metric_stream(&router, case, &include).await;
+    assert_eq!(
+        reported_include.get("IncludeFilters"),
+        Some(&json!([
+            {"Namespace": "AWS/EC2"},
+            {"Namespace": "AWS/Lambda"},
+        ])),
+        "case {case:?}: expected the included namespaces in template order, got \
+         {reported_include}"
+    );
+    assert!(
+        reported_include.get("ExcludeFilters").is_none(),
+        "case {case:?}: an include-only stream carries no ExcludeFilters member, got \
+         {reported_include}"
+    );
+
+    // Both streams deliver to the destination the stack created, and both are running: "the
+    // stream is created in the running state" (`PutMetricStream`).
+    for (name, stream) in [(&exclude, &reported), (&include, &reported_include)] {
+        assert_eq!(
+            stream.get("FirehoseArn").and_then(Value::as_str),
+            Some(destination.as_str()),
+            "case {case:?}: expected {name} to deliver to the stack's Firehose stream, got \
+             {stream}"
+        );
+        assert_eq!(
+            stream.get("State").and_then(Value::as_str),
+            Some("running"),
+            "case {case:?}: expected {name} to be running, got {stream}"
+        );
+    }
+
+    // Stopping the estate quiesces both streams at once.
+    let (status, stopped) = cloudwatch(
+        &router,
+        "StopMetricStreams",
+        &json!({"Names": [&exclude, &include]}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from StopMetricStreams, got {status} with {stopped}"
+    );
+    for name in [&exclude, &include] {
+        let stream = get_metric_stream(&router, case, name).await;
+        assert_eq!(
+            stream.get("State").and_then(Value::as_str),
+            Some("stopped"),
+            "case {case:?}: expected {name} to be stopped, got {stream}"
+        );
+    }
+
+    // Destroying the stack destroys every stream it created, and the stack itself is gone:
+    // CloudWatch answers its not-found for each name, and CloudFormation answers the
+    // validation error naming the stack the request asked about.
+    let (status, deleted) =
+        cloudformation(&router, "DeleteStack", &[("StackName", stack_name)]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from DeleteStack, got {status} with {deleted}"
+    );
+    tokio::time::sleep(PAST_BOTH_SPANS).await;
+    for name in [&exclude, &include] {
+        let (status, gone) = cloudwatch(&router, "GetMetricStream", &json!({"Name": name})).await;
+        assert_eq!(
+            (status, cloudwatch_error_code(&gone).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: expected {name} to be gone with the stack, got {status} with {gone}"
+        );
+    }
+    let (status, missing) =
+        cloudformation(&router, "DescribeStackResources", &[("StackName", stack_name)]).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400 for a stack that no longer exists, got {status} with \
+         {missing}"
+    );
+    assert_eq!(
+        opt_element(&missing, "Message").as_deref(),
+        Some(format!("Stack with id {stack_name} does not exist").as_str()),
+        "case {case:?}: expected the validation error to name the stack, got {missing}"
+    );
+}

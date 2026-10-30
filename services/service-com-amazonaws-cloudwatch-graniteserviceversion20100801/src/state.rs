@@ -1353,6 +1353,21 @@ pub const ANOMALY_DETECTOR_TYPE_METRIC_MATH: &str = "METRIC_MATH";
 /// call at or after it ([`ComAmazonawsCloudwatchGraniteserviceversion20100801State::settle_anomaly_detector_training`]).
 pub const TRAINING_DELAY_SECS: f64 = 0.5;
 
+/// How far back the history an anomaly detection model is trained on reaches.
+///
+/// A model is trained on the metric's own past — "You can use the model to display a band of
+/// expected normal values when the metric is graphed." (`PutAnomalyDetector`) — and neither the
+/// model nor the operation publishes how much of that past it reads, so the span is the
+/// emulator's own bounded choice: the whole of the tier a one-minute read still reaches
+/// ([`retained_at_period`]), so the history a model trains on is every datapoint the store can
+/// still report at that granularity and the walk it costs stays bounded by the series itself.
+pub const ANOMALY_TRAINING_SPAN_SECS: f64 = FIFTEEN_DAYS_SECS;
+
+/// The granularity the history a model is trained on is folded at: one minute, the finest
+/// granularity a datapoint stays readable at over the whole training span
+/// ([`retained_at_period`]).
+pub const ANOMALY_TRAINING_PERIOD_SECS: i32 = 60;
+
 /// The largest number of anomaly detection models this in-memory store holds.
 ///
 /// A capacity bound, not an AWS quota: the detector records live in this process's memory, so
@@ -1615,6 +1630,12 @@ pub fn anomaly_detector_form_missing(form: &AnomalyDetectorForm) -> Option<Strin
 /// therefore the mean of the values it was trained on and how far they spread from it, and the
 /// band reaches the requested number of those spreads either side of the mean.
 ///
+/// `history` is what the model was TRAINED on and `points` are the instants the band is
+/// reported at: the two are separate because a model is trained on the metric's past — "the
+/// model ... is based on the metric's historical data" — and not on the span a caller happens
+/// to read, so the band a graph shows over one window and the band an alarm compares one period
+/// against are the same numbers.
+///
 /// It says nothing in two cases: while the model is still being trained (the trained state is
 /// owed at `now_secs`, so a caller reading before then sees the training its write started),
 /// and when the training was left with no value at all — a model trained on nothing has no
@@ -1627,6 +1648,7 @@ pub fn anomaly_detector_form_missing(form: &AnomalyDetectorForm) -> Option<Strin
 /// the band is reported at.
 pub fn anomaly_model_of(
     stored: &StoredAnomalyDetector,
+    history: &[(f64, f64)],
     points: &[(f64, f64)],
     now_secs: f64,
 ) -> Option<metric_math::AnomalyModel> {
@@ -1645,7 +1667,7 @@ pub fn anomaly_model_of(
             )
         })
         .collect();
-    let trained: Vec<f64> = points
+    let trained: Vec<f64> = history
         .iter()
         .filter(|(at, _)| {
             !excluded

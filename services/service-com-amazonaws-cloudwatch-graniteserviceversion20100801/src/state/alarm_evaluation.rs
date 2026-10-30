@@ -73,10 +73,8 @@
 //!
 //! What is NOT evaluated here keeps the state it has, rather than being answered with a
 //! state nothing computed: an alarm with `EvaluationCriteria` (a PromQL query), one whose
-//! threshold is an anomaly-detection band (`ThresholdMetricId`, or one of the
-//! `…LowerOrGreaterThanUpper…` comparisons), one whose configuration names no stored metric at
-//! all, and one over a `Metrics` query array this engine cannot resolve to a single time
-//! series.
+//! configuration names no stored metric at all, and one over a `Metrics` query array this
+//! engine cannot resolve to a single time series.
 //!
 //! An alarm configured with a `Metrics` query array IS evaluated: "Use the `Metrics` parameter
 //! to create an alarm based on a metric math expression" (`PutMetricAlarmInput$Metrics`), and
@@ -84,6 +82,16 @@
 //! computed over the same stored datapoints `GetMetricData` answers the same array from
 //! ([`super::metric_query`]) — against the same threshold, the same m-of-n predicate and the
 //! same explanation as an alarm over one metric.
+//!
+//! An alarm whose threshold is a MODEL rather than a number is evaluated by the same predicate
+//! over a threshold that moves with the series: "In an alarm based on an anomaly detection
+//! model, this is the ID of the ANOMALY_DETECTION_BAND function used as the threshold for the
+//! alarm" (`MetricAlarm$ThresholdMetricId`), so the designated query of the array is resolved
+//! to the pair of bounds that function yields and each graded window is compared against the
+//! bound its own period carries ([`Predicate`]) — the upper bound, the lower bound, or both,
+//! as the alarm's comparison names. A window the model says nothing about yet is not graded at
+//! all, the same way an under-sampled percentile window is not: the alarm keeps the state it
+//! has rather than being moved by a threshold nothing computed.
 
 use ::serde_json::{Map, Value};
 
@@ -95,7 +103,9 @@ use super::{
     ALARM_STATE_ALARM, ALARM_STATE_INSUFFICIENT_DATA, ALARM_STATE_OK, ALARM_TYPE_METRIC,
     HISTORY_DATA_VERSION, MAX_STATE_REASON_DATA_LEN,
 };
-use crate::ops::types::{AlarmHistoryItem, MetricAlarm, MetricDataQuery, STATISTIC_VALUES};
+use crate::ops::types::{
+    AlarmHistoryItem, AnomalyDetector, MetricAlarm, MetricDataQuery, STATISTIC_VALUES,
+};
 
 /// How long after the write that configured an alarm its FIRST evaluation is owed, and how
 /// long after an evaluation the NEXT one is owed.
@@ -382,6 +392,173 @@ fn graded_period(queries: &[MetricDataQuery], graded: &MetricDataQuery) -> f64 {
     }
 }
 
+/// The metrics the BAND of one alarm is drawn from: the metrics the query its
+/// `ThresholdMetricId` designates reads, followed through the ids that query's expression
+/// refers to ("A math expression can use the `Id` of the other metrics or queries to refer to
+/// those metrics", `MetricDataQuery$Expression`). Empty for an alarm whose threshold is a
+/// number.
+///
+/// The walk visits each id of the array at most once — the ids an expression may refer to are
+/// the array's own, so a chain of references cannot be longer than the array and one that goes
+/// in a circle is left after its first visit.
+fn band_model_metrics(alarm: &MetricAlarm) -> Vec<super::metric_math::SeriesMetric> {
+    let mut metrics: Vec<super::metric_math::SeriesMetric> = Vec::new();
+    let (Some(threshold_id), Some(queries)) = (
+        alarm.threshold_metric_id.as_deref(),
+        alarm.metrics.as_deref(),
+    ) else {
+        return metrics;
+    };
+    let mut pending: Vec<String> = vec![threshold_id.to_string()];
+    let mut visited: Vec<String> = Vec::with_capacity(queries.len());
+    while let Some(id) = pending.pop() {
+        if visited.contains(&id) {
+            continue;
+        }
+        visited.push(id.clone());
+        let Some(query) = queries.iter().find(|query| query.id == id) else {
+            continue;
+        };
+        if let Some(stat) = query.metric_stat.as_ref() {
+            // A model is the DETECTOR's, and a detector is created for one metric folded by
+            // one statistic, which is the identity this query names
+            // ([`super::metric_query::query_series_key`]).
+            if let Some(key) = super::metric_query::query_series_key(stat) {
+                metrics.push(super::metric_math::SeriesMetric {
+                    namespace: key.namespace,
+                    metric_name: key.metric_name,
+                    dimensions: key.dimensions,
+                    stat: stat.stat.clone(),
+                });
+            }
+            continue;
+        }
+        if let Some(tree) = query
+            .expression
+            .as_deref()
+            .and_then(|expression| super::metric_math::parse(expression).ok())
+        {
+            pending.extend(super::metric_math::references(&tree));
+        }
+    }
+    metrics
+}
+
+/// Which query of a `Metrics` array the alarm WATCHES: the one returning data that is not the
+/// query its threshold comes from.
+///
+/// "When used in PutMetricAlarm, specify true for the one expression result to use as the
+/// alarm." … "If you omit this, the default of true is used." (`MetricDataQuery$ReturnData`) —
+/// the query that returns data is the one the alarm grades, whether it is an expression or a
+/// metric. The query named by `ThresholdMetricId` is what the watched result is compared
+/// AGAINST rather than the result itself, so it is never the watched one however its own
+/// `ReturnData` reads.
+fn watched_query<'array>(
+    queries: &'array [MetricDataQuery],
+    threshold_metric_id: Option<&str>,
+) -> Option<&'array MetricDataQuery> {
+    queries.iter().find(|query| {
+        query.return_data != Some(false)
+            && threshold_metric_id.is_none_or(|designated| designated != query.id)
+    })
+}
+
+/// The points of ONE resolved series: its `(time stamp, value)` pairs, oldest first.
+type SeriesPoints<'resolved> = &'resolved [(f64, f64)];
+
+/// The points of the ONE series the query `id` resolved to.
+///
+/// "Any expression used in a PutMetricAlarm operation must return a single time series."
+/// (`MetricDataQuery`) — a number is no series at all, and an array of several is not the one
+/// series an alarm watches.
+fn single_series<'resolved>(
+    resolution: &'resolved super::metric_query::Resolution,
+    id: &str,
+) -> Option<SeriesPoints<'resolved>> {
+    match resolution.value(id)? {
+        MathValue::Series(series) => Some(&series.points),
+        MathValue::Array(series) if series.len() == 1 => Some(&series.first()?.points),
+        _ => None,
+    }
+}
+
+/// The LOWER and UPPER bound series of the band the query `id` resolved to, in that order.
+///
+/// A band is the pair of series `ANOMALY_DETECTION_BAND` yields, each reported under the
+/// label the function suffixes ([`super::metric_math::LOWER_BAND_SUFFIX`] /
+/// [`super::metric_math::UPPER_BAND_SUFFIX`]), so the bound a value is compared against is
+/// read from the label the same reader of the band sees rather than from the position of a
+/// series in the array. `None` for a value that is not such a pair: a query the alarm
+/// designates as its threshold and that is no band yields no threshold at all.
+fn band_bounds<'resolved>(
+    resolution: &'resolved super::metric_query::Resolution,
+    id: &str,
+) -> Option<(SeriesPoints<'resolved>, SeriesPoints<'resolved>)> {
+    let MathValue::Array(series) = resolution.value(id)? else {
+        return None;
+    };
+    let bound = |suffix: &str| {
+        series
+            .iter()
+            .find(|series| series.label.ends_with(suffix))
+            .map(|series| series.points.as_slice())
+    };
+    Some((
+        bound(super::metric_math::LOWER_BAND_SUFFIX)?,
+        bound(super::metric_math::UPPER_BAND_SUFFIX)?,
+    ))
+}
+
+/// One resolved series folded into the windows an evaluation grades, newest first — index 0
+/// being the window the end of the evaluation's rolling range fell in
+/// ([`newest_graded_period`]).
+///
+/// Which window a point belongs to is decided by its own time stamp, the same anchoring an
+/// alarm over one metric folds its datapoints by, and a point past the end of this evaluation's
+/// range is left to a later evaluation; where a series carries several points inside one window
+/// — a series spaced finer than the period it is graded in — the window takes the NEWEST of
+/// them.
+fn graded_windows(
+    points: &[(f64, f64)],
+    period: f64,
+    range_periods: usize,
+    now_secs: f64,
+) -> Vec<Option<GradedDatapoint>> {
+    let newest_window = newest_graded_period(now_secs, period);
+    let mut windows: Vec<Option<(f64, GradedDatapoint)>> = vec![None; range_periods];
+    for (timestamp, value) in points {
+        // A point the arithmetic produced no finite number for is not a value the alarm can
+        // grade, and it is reported as dropped rather than graded as a zero.
+        if !value.is_finite() {
+            continue;
+        }
+        let periods_back = newest_window - (timestamp / period).floor();
+        if periods_back < 0.0 {
+            continue;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let index = periods_back as usize;
+        let Some(slot) = windows.get_mut(index) else {
+            continue;
+        };
+        if slot.is_none_or(|(held, _)| *timestamp >= held) {
+            *slot = Some((
+                *timestamp,
+                GradedDatapoint {
+                    value: *value,
+                    // Nothing measured a sample count for a value an expression computed: the
+                    // series is not one metric's observations.
+                    sample_count: None,
+                },
+            ));
+        }
+    }
+    windows
+        .into_iter()
+        .map(|slot| slot.map(|(_, datapoint)| datapoint))
+        .collect()
+}
+
 /// How many of the alarm's periods ONE evaluation grades — its `EvaluationPeriods`, within the
 /// capacity bound — or `None` for an alarm that names none.
 fn evaluated_periods(alarm: &MetricAlarm) -> Option<usize> {
@@ -523,10 +700,10 @@ struct GradedSeries<'alarm> {
 /// many of its periods the verdict covers, and what it does with a window that has no value.
 #[derive(Debug, Clone, Copy)]
 struct GradedAgainst<'alarm> {
-    /// "The value to compare with the specified statistic." (`MetricAlarm$Threshold`)
-    threshold: f64,
-    /// The comparison the alarm makes between a datapoint and that threshold.
-    comparison: Comparison,
+    /// The threshold and comparison the alarm judges each datapoint by — a number
+    /// ("The value to compare with the specified statistic.", `MetricAlarm$Threshold`) or the
+    /// band a model draws.
+    predicate: &'alarm Predicate,
     /// How many of those periods held a datapoint the alarm WITHHELD for holding too few
     /// observations for its percentile ([`low_sample_floor`]): those slots are filled by
     /// nothing, because the period was published into, so no arm of the missing-data treatment
@@ -550,6 +727,11 @@ struct Evaluated {
     value: Option<f64>,
     /// How many observations that window aggregated, for a real datapoint.
     sample_count: Option<f64>,
+    /// The threshold this datapoint was compared AGAINST, for an alarm whose threshold moves
+    /// with the series — the bound of the band its own period carries. `None` where the
+    /// threshold is the one number the alarm is configured with, which a record reports once
+    /// rather than per datapoint.
+    threshold: Option<f64>,
     /// How it stands against the threshold.
     datapoint: Datapoint,
 }
@@ -700,6 +882,9 @@ impl State {
         // Everything the evaluation reads is read before anything is written.
         let alarm = stored.alarm.clone();
         budget.charge_alarm();
+        // An alarm whose threshold is a MODEL keeps that model: the evaluation that is now due
+        // re-creates the detector its band is drawn from if the store no longer holds it.
+        self.restore_referenced_models(&alarm, now_secs);
         // This alarm is being evaluated now, so its NEXT evaluation is owed a span from here
         // rather than being due again at once: it is re-armed before the fold runs, so the
         // fold is charged to this request only and a following request pays for the alarms
@@ -768,6 +953,81 @@ impl State {
         self.make_parents_due(name, now_secs);
     }
 
+    /// Re-create every anomaly detection model a LIVE alarm's threshold is drawn from that this
+    /// store no longer holds, for the alarms whose evaluation the clock has already made due.
+    ///
+    /// The detector store's side of the same rule [`Self::restore_referenced_models`] states for
+    /// one alarm, for the reader that reports the models: an alarm's due evaluation needs the
+    /// model its band is drawn from, and that evaluation was owed at this instant whether or not
+    /// anybody called — so a model deleted under such an alarm is back a span later, while one
+    /// no alarm's threshold is drawn from stays deleted. Bounded by
+    /// [`MAX_ALARMS_EVALUATED_PER_REQUEST`], like every other pass one request pays for.
+    pub fn restore_alarm_referenced_models(&mut self, now_secs: f64) {
+        let needed: Vec<MetricAlarm> = self
+            .alarms
+            .values()
+            .filter(|stored| {
+                stored.alarm.threshold_metric_id.is_some()
+                    && stored.evaluation_due_secs <= now_secs
+            })
+            .take(MAX_ALARMS_EVALUATED_PER_REQUEST)
+            .map(|stored| stored.alarm.clone())
+            .collect();
+        for alarm in &needed {
+            self.restore_referenced_models(alarm, now_secs);
+        }
+    }
+
+    /// Re-create the anomaly detection model `alarm`'s threshold is drawn from, when the store
+    /// no longer holds it.
+    ///
+    /// An alarm whose threshold is a model KEEPS that model alive: the alarm names the band as
+    /// its threshold ("the ID of the ANOMALY_DETECTION_BAND function used as the threshold for
+    /// the alarm", `MetricAlarm$ThresholdMetricId`), so the evaluation that is due for it needs
+    /// a model for the metric its band is drawn from and creates one where there is none —
+    /// pending training, exactly as a newly created model is. A model no live alarm's threshold
+    /// is drawn from is not re-created: deleting it removes it for good.
+    ///
+    /// The re-created model carries no training configuration and no metric characteristics:
+    /// those were the deleted model's own, and the alarm names only the metric and statistic
+    /// its band is drawn from.
+    fn restore_referenced_models(&mut self, alarm: &MetricAlarm, now_secs: f64) {
+        for metric in band_model_metrics(alarm) {
+            let form = super::AnomalyDetectorForm::of_series_metric(&metric);
+            let detector_id = form.detector_id();
+            if self.anomaly_detectors.contains_key(&detector_id)
+                || self.anomaly_detectors.len() >= super::MAX_ANOMALY_DETECTORS
+            {
+                continue;
+            }
+            let single = form.single_metric().cloned();
+            self.anomaly_detectors.insert(
+                detector_id.clone(),
+                super::StoredAnomalyDetector {
+                    detector: AnomalyDetector {
+                        anomaly_detector_id: Some(detector_id),
+                        // The deprecated flat members report the same metric the single-metric
+                        // structure carries, as a model this service wrote itself does.
+                        namespace: single.as_ref().and_then(|single| single.namespace.clone()),
+                        metric_name: single
+                            .as_ref()
+                            .and_then(|single| single.metric_name.clone()),
+                        dimensions: single.as_ref().and_then(|single| single.dimensions.clone()),
+                        stat: single.as_ref().and_then(|single| single.stat.clone()),
+                        configuration: None,
+                        state_value: Some(
+                            super::ANOMALY_DETECTOR_PENDING_TRAINING.to_string(),
+                        ),
+                        metric_characteristics: None,
+                        single_metric_anomaly_detector: single,
+                        metric_math_anomaly_detector: None,
+                    },
+                    trained_due_secs: now_secs + super::TRAINING_DELAY_SECS,
+                },
+            );
+        }
+    }
+
     /// The state the alarm's own comparison puts it in at `now_secs`, or `None` for an alarm
     /// this engine does not evaluate (see the module docs) and for one whose computed state
     /// is the state it already has. The datapoints the fold visits are charged to `budget`.
@@ -777,21 +1037,41 @@ impl State {
         now_secs: f64,
         budget: &mut EvaluationBudget,
     ) -> Option<Evaluation> {
-        // An alarm over a PromQL query, and one whose threshold is an anomaly-detection band
-        // rather than a number, is not graded against a static threshold at all, so nothing
-        // is computed for it.
-        if alarm.evaluation_criteria.is_some() || alarm.threshold_metric_id.is_some() {
+        // An alarm over a PromQL query is not graded against a threshold of this store at all,
+        // so nothing is computed for it.
+        if alarm.evaluation_criteria.is_some() {
             return None;
         }
-        let threshold = alarm.threshold?;
-        let comparison = comparison_of(alarm.comparison_operator.as_deref()?)?;
+        let operator = alarm.comparison_operator.as_deref()?;
         let evaluation_periods = evaluated_periods(alarm)?;
         // The windows of the EVALUATION RANGE: window 0 is the newest period this evaluation
         // grades ([`newest_graded_period`]), window i the period before it, and the range
         // reaches further back than the look-back ([`EVALUATION_RANGE_FACTOR`]).
         let range_periods = evaluation_range_periods(evaluation_periods);
-        // The series this alarm GRADES, as the value each of those windows took.
-        let graded = self.graded_series(alarm, range_periods, now_secs, budget)?;
+        // The series this alarm GRADES, as the value each of those windows took, and what it
+        // compares each of them against: the one number the alarm is configured with, or the
+        // band the query its `ThresholdMetricId` designates draws.
+        let (graded, predicate) = match alarm.threshold_metric_id.as_deref() {
+            Some(threshold_id) => {
+                let bound = band_bound_of(operator)?;
+                let queries = alarm.metrics.as_deref()?;
+                let (graded, bands) =
+                    self.graded_against_band(queries, threshold_id, range_periods, now_secs, budget)?;
+                (graded, Predicate::Band { bound, bands })
+            }
+            None => {
+                let comparison = comparison_of(operator)?;
+                let threshold = alarm.threshold?;
+                let graded = self.graded_series(alarm, range_periods, now_secs, budget)?;
+                (
+                    graded,
+                    Predicate::Static {
+                        threshold,
+                        comparison,
+                    },
+                )
+            }
+        };
 
         let treat_missing = alarm.treat_missing_data.as_deref().unwrap_or(MISSING_MISSING);
         // How many observations a window has to hold before this alarm grades the percentile
@@ -807,7 +1087,8 @@ impl State {
         // evaluation", and where the range holds more than the alarm evaluates, it is the
         // most recent ones it evaluates.
         let mut evaluated: Vec<Evaluated> = Vec::with_capacity(evaluation_periods);
-        // How many windows held a datapoint this alarm WITHHELD for being under-sampled.
+        // How many windows held a datapoint this alarm did not grade: one holding too few
+        // observations for its percentile, and one the alarm's threshold says nothing about.
         let mut withheld = 0_usize;
         for (index, window) in graded.windows.iter().enumerate() {
             if evaluated.len() == evaluation_periods {
@@ -825,13 +1106,24 @@ impl State {
                 withheld += 1;
                 continue;
             }
+            // A window whose threshold the alarm's configuration does not yield — a period a
+            // still-training model says nothing about — is not graded either: there is no
+            // comparison to make for it, and the period WAS published into, so no arm of the
+            // missing-data treatment stands in for it.
+            let Some((breaches, threshold)) = predicate.judge(index, datapoint.value) else {
+                withheld += 1;
+                continue;
+            };
             evaluated.push(Evaluated {
                 window: Some(index),
                 value: Some(datapoint.value),
                 // How many observations the window stood for, which is what a decision record
                 // reports beside the value the statistic took over them.
                 sample_count: datapoint.sample_count,
-                datapoint: if (comparison.breaches)(datapoint.value, threshold) {
+                // The threshold this window's datapoint was compared against, which a record
+                // reports per datapoint where it moves with the series.
+                threshold: predicate.moving_threshold().then_some(threshold),
+                datapoint: if breaches {
                     Datapoint::Breaching
                 } else {
                     Datapoint::NotBreaching
@@ -850,8 +1142,7 @@ impl State {
             alarm,
             &graded,
             GradedAgainst {
-                threshold,
-                comparison,
+                predicate: &predicate,
                 // How many of the alarm's periods held a datapoint it withheld: those slots are
                 // not ones the missing-data treatment may stand in for either, because
                 // substituting a datapoint for a period the metric really was published into
@@ -973,13 +1264,95 @@ impl State {
         now_secs: f64,
         budget: &mut EvaluationBudget,
     ) -> Option<GradedSeries<'static>> {
-        // "When used in PutMetricAlarm, specify true for the one expression result to use as
-        // the alarm." … "If you omit this, the default of true is used."
-        // (`MetricDataQuery$ReturnData`) — the query that returns data is the one the alarm
-        // grades, whether it is an expression or a metric.
-        let graded = queries
+        let graded = watched_query(queries, None)?;
+        let (resolution, period) =
+            self.resolved_query_array(queries, graded, range_periods, now_secs, budget)?;
+        Some(GradedSeries {
+            // No single statistic describes a series a query array computed, so its decision
+            // record names none.
+            statistic: None,
+            period,
+            windows: graded_windows(
+                single_series(&resolution, &graded.id)?,
+                period,
+                range_periods,
+                now_secs,
+            ),
+        })
+    }
+
+    /// The series an anomaly alarm grades and the BAND it grades each of its windows against:
+    /// the value of the query the array returns, and the pair of bounds the query
+    /// `threshold_id` designates yields over the same windows.
+    ///
+    /// "In an alarm based on an anomaly detection model, this is the ID of the
+    /// ANOMALY_DETECTION_BAND function used as the threshold for the alarm"
+    /// (`MetricAlarm$ThresholdMetricId`) — so the two come out of ONE resolution of the array,
+    /// the same resolution `GetMetricData` answers that array from: the bound the alarm cites
+    /// for a period is the value the band's own series carries at it, and nothing recomputes
+    /// either of them a second way.
+    ///
+    /// `None` when the array resolves to no single watched series, or when the designated query
+    /// is not a band at all — a value that is not the Low/High pair that function yields is no
+    /// threshold, so the alarm keeps the state it has.
+    fn graded_against_band(
+        &self,
+        queries: &[MetricDataQuery],
+        threshold_id: &str,
+        range_periods: usize,
+        now_secs: f64,
+        budget: &mut EvaluationBudget,
+    ) -> Option<(GradedSeries<'static>, Vec<Option<Band>>)> {
+        let graded = watched_query(queries, Some(threshold_id))?;
+        let (resolution, period) =
+            self.resolved_query_array(queries, graded, range_periods, now_secs, budget)?;
+        let watched = graded_windows(
+            single_series(&resolution, &graded.id)?,
+            period,
+            range_periods,
+            now_secs,
+        );
+        let (lower, upper) = band_bounds(&resolution, threshold_id)?;
+        let lower = graded_windows(lower, period, range_periods, now_secs);
+        let upper = graded_windows(upper, period, range_periods, now_secs);
+        // A period is inside the band only where BOTH bounds have a value for it: a model
+        // reports its band as the two series together, so half of one is no band.
+        let bands = lower
             .iter()
-            .find(|query| query.return_data != Some(false))?;
+            .zip(&upper)
+            .map(|bounds| match bounds {
+                (Some(low), Some(high)) => Some(Band {
+                    lower: low.value,
+                    upper: high.value,
+                }),
+                _ => None,
+            })
+            .collect();
+        Some((
+            GradedSeries {
+                statistic: None,
+                period,
+                windows: watched,
+            },
+            bands,
+        ))
+    }
+
+    /// ONE resolution of an alarm's `Metrics` array over the windows its evaluation grades,
+    /// with the granularity those windows are laid at: the value of every query of the array,
+    /// computed exactly as a `GetMetricData` request over the same array is answered.
+    ///
+    /// `None` for an array this engine cannot resolve — a malformed or unevaluable expression,
+    /// a query naming no stored metric, or one asking for more work than one resolution may do
+    /// — so such an alarm keeps the state it has rather than being graded from a part of itself.
+    fn resolved_query_array(
+        &self,
+        queries: &[MetricDataQuery],
+        graded: &MetricDataQuery,
+        range_periods: usize,
+        now_secs: f64,
+        budget: &mut EvaluationBudget,
+    ) -> Option<(super::metric_query::Resolution, f64)> {
         let period = graded_period(queries, graded);
         // The range the array is resolved over is exactly the windows the evaluation grades:
         // anchored at multiples of the period, the newest being the one the end of this
@@ -1047,58 +1420,7 @@ impl State {
                 .ok()?;
             resolution.record(id, evaluated);
         }
-
-        // "Any expression used in a PutMetricAlarm operation must return a single time
-        // series." (`MetricDataQuery`) — a number is no series at all, and an array of
-        // several is not the one series an alarm watches.
-        let points = match resolution.value(&graded.id)? {
-            MathValue::Series(series) => &series.points,
-            MathValue::Array(series) if series.len() == 1 => &series.first()?.points,
-            _ => return None,
-        };
-        // Which window each point of that series belongs to is decided by its own time stamp,
-        // the same anchoring an alarm over one metric folds its datapoints by, and a point past
-        // the end of this evaluation's range is left to a later evaluation; where a
-        // series carries several points inside one window — an expression spaced finer than the
-        // period it is graded in — the window took the NEWEST of them.
-        let mut graded_windows: Vec<Option<(f64, GradedDatapoint)>> = vec![None; range_periods];
-        for (timestamp, value) in points {
-            // A point the arithmetic produced no finite number for is not a value the alarm
-            // can grade, and it is reported as dropped rather than graded as a zero.
-            if !value.is_finite() {
-                continue;
-            }
-            let periods_back = newest_window - (timestamp / period).floor();
-            if periods_back < 0.0 {
-                continue;
-            }
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let index = periods_back as usize;
-            let Some(slot) = graded_windows.get_mut(index) else {
-                continue;
-            };
-            if slot.is_none_or(|(held, _)| *timestamp >= held) {
-                *slot = Some((
-                    *timestamp,
-                    GradedDatapoint {
-                        value: *value,
-                        // Nothing measured a sample count for a value an expression computed:
-                        // the series is not one metric's observations.
-                        sample_count: None,
-                    },
-                ));
-            }
-        }
-        Some(GradedSeries {
-            // No single statistic describes a series a query array computed, so its decision
-            // record names none.
-            statistic: None,
-            period,
-            windows: graded_windows
-                .into_iter()
-                .map(|slot| slot.map(|(_, datapoint)| datapoint))
-                .collect(),
-        })
+        Some((resolution, period))
     }
 
     /// The state the alarm's "M out of N" predicate puts it in over the datapoints `evaluated`,
@@ -1113,8 +1435,7 @@ impl State {
         now_secs: f64,
     ) -> Option<Evaluation> {
         let GradedAgainst {
-            threshold,
-            comparison,
+            predicate,
             withheld,
             evaluation_periods,
             treat_missing,
@@ -1136,6 +1457,7 @@ impl State {
                 window: None,
                 value: None,
                 sample_count: None,
+                threshold: None,
                 datapoint: substituted,
             });
         }
@@ -1221,20 +1543,24 @@ impl State {
             periods: evaluated.len(),
             minimum: verdict.map_or(0, |verdict| verdict.minimum),
         };
+        // How the sentence reads the comparison the evaluation made, and the thresholds it
+        // cites: the one number a static alarm names, or the band bound each counted datapoint
+        // was compared against.
+        let (phrase, thresholds) = predicate.phrase(&evaluated);
         Some(Evaluation {
             state,
             reason: state_reason(
                 state,
                 counts,
                 missing_data_arm(treat_missing),
-                comparison.phrase,
-                threshold,
+                phrase,
+                &thresholds,
                 &cited_datapoints(&evaluated, now_secs, period),
             ),
             reason_data: state_reason_data(
                 graded.statistic.as_ref(),
                 period,
-                threshold,
+                predicate.fixed_threshold(),
                 now_secs,
                 &evaluated,
                 verdict,
@@ -1285,9 +1611,9 @@ struct Comparison {
     phrase: &'static str,
 }
 
-/// The comparison one `ComparisonOperator` makes between a datapoint and the threshold, or
-/// `None` for the anomaly-detection band operators, which compare against a model this
-/// engine does not compute rather than against a static threshold.
+/// The comparison one `ComparisonOperator` makes between a datapoint and a STATIC threshold, or
+/// `None` for the anomaly-detection band operators, which compare against the pair of bounds a
+/// model draws ([`band_bound_of`]) rather than against a number.
 fn comparison_of(comparison: &str) -> Option<Comparison> {
     // The static-threshold members of the modelled `ComparisonOperator` enum
     // (`smithy_query(query="shape",shape="ComparisonOperator")`), each with the reading
@@ -1312,6 +1638,144 @@ fn comparison_of(comparison: &str) -> Option<Comparison> {
         // "LessThanLowerOrGreaterThanUpperThreshold", "LessThanLowerThreshold" and
         // "GreaterThanUpperThreshold" compare against an anomaly detection band.
         _ => None,
+    }
+}
+
+/// The pair of bounds an anomaly-detection band holds ONE period's value between: the values
+/// the model's two series carry at it.
+#[derive(Debug, Clone, Copy)]
+struct Band {
+    /// What the band's "Low" series reports for the period.
+    lower: f64,
+    /// What its "High" series reports for the period.
+    upper: f64,
+}
+
+/// Which bound of that band one `ComparisonOperator` tests a datapoint against.
+#[derive(Debug, Clone, Copy)]
+enum BandBound {
+    /// `GreaterThanUpperThreshold`: a datapoint above the upper bound breaches.
+    Upper,
+    /// `LessThanLowerThreshold`: a datapoint below the lower bound breaches.
+    Lower,
+    /// `LessThanLowerOrGreaterThanUpperThreshold`: a datapoint outside the band breaches,
+    /// whichever side of it the value left.
+    Either,
+}
+
+/// The band bound one `ComparisonOperator` compares against, or `None` for the operators that
+/// compare against a static threshold ([`comparison_of`]).
+fn band_bound_of(comparison: &str) -> Option<BandBound> {
+    // The band members of the modelled `ComparisonOperator` enum
+    // (`smithy_query(query="shape",shape="ComparisonOperator")`), which are the operators an
+    // alarm whose threshold is a model is written with.
+    match comparison {
+        "GreaterThanUpperThreshold" => Some(BandBound::Upper),
+        "LessThanLowerThreshold" => Some(BandBound::Lower),
+        "LessThanLowerOrGreaterThanUpperThreshold" => Some(BandBound::Either),
+        _ => None,
+    }
+}
+
+impl BandBound {
+    /// Whether `value` breaches `band` under this operator, and the bound the explanation cites
+    /// for that datapoint: the bound the comparison TESTED — the one a value outside the band
+    /// crossed, and the upper bound for a two-sided comparison the value satisfied.
+    fn judge(self, band: Band, value: f64) -> (bool, f64) {
+        match self {
+            Self::Upper => (value > band.upper, band.upper),
+            Self::Lower => (value < band.lower, band.lower),
+            Self::Either if value > band.upper => (true, band.upper),
+            Self::Either if value < band.lower => (true, band.lower),
+            Self::Either => (false, band.upper),
+        }
+    }
+
+    /// How a `StateReason` reads this comparison, and what it calls the thresholds it cites:
+    /// the same sentence a static-threshold alarm's reason is written in, with the band's own
+    /// bounds in place of the one number ("… were greater than the upper thresholds [12.5]").
+    fn phrase(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Upper => ("greater than", "the upper thresholds"),
+            Self::Lower => ("less than", "the lower thresholds"),
+            Self::Either => ("outside", "the band"),
+        }
+    }
+}
+
+/// What ONE alarm compares each of its graded datapoints against.
+#[derive(Debug)]
+enum Predicate {
+    /// "The value to compare with the specified statistic." (`MetricAlarm$Threshold`) — one
+    /// number, for every window the evaluation grades.
+    Static {
+        /// The number itself.
+        threshold: f64,
+        /// The comparison the alarm makes between a datapoint and it.
+        comparison: Comparison,
+    },
+    /// The band the query `ThresholdMetricId` designates draws: a threshold that moves with the
+    /// series, so each window is compared against the bound its OWN period carries.
+    Band {
+        /// Which bound of the band the alarm's comparison tests against.
+        bound: BandBound,
+        /// The band of each window of the evaluation range, newest first, and `None` for a
+        /// window the model says nothing about.
+        bands: Vec<Option<Band>>,
+    },
+}
+
+impl Predicate {
+    /// Whether the datapoint `value` of the window `index` BREACHES, and the threshold it was
+    /// compared against; `None` for a window this predicate has no threshold for, which is a
+    /// window the evaluation does not grade at all.
+    fn judge(&self, index: usize, value: f64) -> Option<(bool, f64)> {
+        match self {
+            Self::Static {
+                threshold,
+                comparison,
+            } => Some(((comparison.breaches)(value, *threshold), *threshold)),
+            Self::Band { bound, bands } => Some(bound.judge((*bands.get(index)?)?, value)),
+        }
+    }
+
+    /// Whether the threshold MOVES from window to window, which is what makes a decision
+    /// record report one threshold per datapoint rather than one for the whole evaluation.
+    fn moving_threshold(&self) -> bool {
+        matches!(self, Self::Band { .. })
+    }
+
+    /// The one threshold every window was compared against, for an alarm compared against a
+    /// number; `None` for one compared against a band, whose datapoints each carry their own.
+    fn fixed_threshold(&self) -> Option<f64> {
+        match self {
+            Self::Static { threshold, .. } => Some(*threshold),
+            Self::Band { .. } => None,
+        }
+    }
+
+    /// How a `StateReason` reads the comparison this predicate makes, and the thresholds that
+    /// sentence cites: "greater than" and "the threshold (10.0)" for a number, and "greater
+    /// than" and "the upper thresholds [12.5, 12.4]" for a band — the bound cited for each
+    /// datapoint the reason counts, newest first.
+    fn phrase(&self, cited: &[Evaluated]) -> (&'static str, String) {
+        match self {
+            Self::Static {
+                threshold,
+                comparison,
+            } => (
+                comparison.phrase,
+                format!("the threshold ({})", decimal_text(*threshold)),
+            ),
+            Self::Band { bound, .. } => {
+                let (phrase, name) = bound.phrase();
+                let thresholds: Vec<String> = cited
+                    .iter()
+                    .filter_map(|slot| slot.threshold.map(decimal_text))
+                    .collect();
+                (phrase, format!("{name} [{}]", thresholds.join(", ")))
+            }
+        }
     }
 }
 
@@ -1469,9 +1933,12 @@ fn plural(count: usize) -> (&'static str, &'static str) {
 ///
 /// The sentence is the one CloudWatch publishes for an evaluated alarm:
 /// `Threshold Crossed: <n> out of the last <m> datapoints [<value> (<instant>), …] was|were
-/// [not] <comparison> the threshold (<threshold>) (minimum <k> datapoint(s) for <from> -> <to>
+/// [not] <comparison> <thresholds> (minimum <k> datapoint(s) for <from> -> <to>
 /// transition).` for a graded state, and `Insufficient Data: <m> datapoint(s) was|were unknown.`
-/// for a state decided with too few datapoints to grade. The state the alarm moved to decides
+/// for a state decided with too few datapoints to grade. `<thresholds>` is what the alarm was
+/// compared against as its own predicate words it — `the threshold (<threshold>)` for a number
+/// and `the upper thresholds [<bound>, …]` for a band ([`Predicate::phrase`]). The state the
+/// alarm moved to decides
 /// whether the comparison is stated as it holds or negated, the count is of the datapoints that
 /// read that way, and the closing clause names that direction and the minimum it needed
 /// ([`transition_minimum`]).
@@ -1496,7 +1963,7 @@ fn state_reason(
     counts: EvaluationCounts,
     arm: Option<&str>,
     comparison: &str,
-    threshold: f64,
+    thresholds: &str,
     cited: &str,
 ) -> String {
     let EvaluationCounts {
@@ -1507,7 +1974,6 @@ fn state_reason(
         periods,
         minimum,
     } = counts;
-    let threshold = decimal_text(threshold);
     if state == ALARM_STATE_INSUFFICIENT_DATA {
         // The window was short of the datapoints either direction of the predicate needs, so
         // the evaluation reports the ones it did not have: the windows of its look-back that
@@ -1545,7 +2011,7 @@ fn state_reason(
         // the datapoints it held for.
         return format!(
             "Threshold Crossed: {breaching} out of the last {present} datapoints{cited} \
-             {} {comparison} the threshold ({threshold}) ({}).{substituted_clause}",
+             {} {comparison} {thresholds} ({}).{substituted_clause}",
             plural(breaching).1,
             transition_minimum(minimum, state)
         );
@@ -1555,7 +2021,7 @@ fn state_reason(
     // reported, not the ones that breached.
     format!(
         "Threshold Crossed: {not_breaching} out of the last {present} datapoints{cited} {} not \
-         {comparison} the threshold ({threshold}) ({}).{substituted_clause}",
+         {comparison} {thresholds} ({}).{substituted_clause}",
         plural(not_breaching).1,
         transition_minimum(minimum, state)
     )
@@ -1690,7 +2156,7 @@ fn decimal_text(value: f64) -> String {
 fn state_reason_data(
     statistic: Option<&AlarmStatistic<'_>>,
     period: f64,
-    threshold: f64,
+    threshold: Option<f64>,
     now_secs: f64,
     evaluated: &[Evaluated],
     verdict: Option<Verdict>,
@@ -1722,7 +2188,13 @@ fn state_reason_data(
         document.insert("statistic".to_string(), Value::from(statistic.name()));
     }
     document.insert("period".to_string(), Value::from(period));
-    document.insert("threshold".to_string(), Value::from(threshold));
+    // The threshold the evaluation compared every window against, for an alarm compared
+    // against a number. An alarm whose threshold is a model has no one threshold to report
+    // here: the bound each window was compared against moves with the series, so it is
+    // reported on the datapoint it decided instead.
+    if let Some(threshold) = threshold {
+        document.insert("threshold".to_string(), Value::from(threshold));
+    }
     // The values the evaluation really had, oldest first — the order they were observed in.
     // `evaluated` is newest first and holds a slot for every period the alarm evaluates, so
     // the slots a missing-data treatment filled contribute no value here: this list reports
@@ -1755,14 +2227,25 @@ fn state_reason_data(
             if let Some(value) = slot.value {
                 entry.insert("value".to_string(), Value::from(value));
             }
-            entry.insert(
-                "datapoint".to_string(),
-                Value::from(match slot.datapoint {
-                    Datapoint::Breaching => "breaching",
-                    Datapoint::NotBreaching => "notBreaching",
-                    Datapoint::Missing => "missing",
-                }),
-            );
+            // The threshold THIS datapoint was compared against, for an alarm whose threshold
+            // moves with the series: a band bound belongs to the period it was drawn for, so a
+            // reader recovers the comparison the verdict rests on from the datapoint itself.
+            if let Some(threshold) = slot.threshold {
+                entry.insert("threshold".to_string(), Value::from(threshold));
+            }
+            // A slot no datapoint was MEASURED for reports the missing-data arm that stood in
+            // for it, since there is no measurement of it to report; a window that really held
+            // a datapoint reports what was measured over it and nothing else.
+            if slot.window.is_none() {
+                entry.insert(
+                    "datapoint".to_string(),
+                    Value::from(match slot.datapoint {
+                        Datapoint::Breaching => "breaching",
+                        Datapoint::NotBreaching => "notBreaching",
+                        Datapoint::Missing => "missing",
+                    }),
+                );
+            }
             datapoints.push(Value::Object(entry));
         }
     }
