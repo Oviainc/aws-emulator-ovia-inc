@@ -293,12 +293,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
             // A reimport replaces the CERTIFICATE, not the ACM resource it is stored
-            // as: the tags it carries, the resources using it, the options it was
-            // created with and the instant it first entered the store stay as they are,
-            // and everything the new certificate itself decides is replaced.
+            // as: the tags it carries, the options it was created with and the instant it
+            // first entered the store stay as they are, and everything the new
+            // certificate itself decides is replaced. The resources using it are no part
+            // of the record at all — they are keyed by this ARN in the shared
+            // association directory, so they survive a reimport untouched.
             let replaced = imported.record(target.to_string(), existing.tags.clone(), now);
             *existing = crate::state::Certificate {
-                in_use_by: existing.in_use_by.clone(),
                 options: existing.options.clone(),
                 created_at: existing.created_at,
                 exported: existing.exported,
@@ -461,7 +462,6 @@ impl ImportedCertificate {
             renewal: None,
             failure_reason: None,
             pending_validation: None,
-            in_use_by: Vec::new(),
             // The X.509 extensions the imported certificate itself carries.
             key_usages: self.key_usages,
             extended_key_usages: self.extended_key_usages,

@@ -179,6 +179,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        let Some(associations) = crate::state::certificate_association_directory(&*self.engine)
+        else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the acm certificate store is unavailable",
+            ));
+        };
+
         // An ARN that does not name an ACM certificate at all is classified before any
         // lookup, exactly as on every other operation that resolves `CertificateArn`.
         if crate::state::certificate_id_from_arn(&input.certificate_arn).is_none() {
@@ -269,18 +276,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`ResourceInUseException` doc) — revoking a certificate another service is
         // serving would break that service, so ACM refuses it.
         //
-        // `in_use_by` is only ever populated by the service that associates a
-        // certificate with a load balancer, distribution or API, and no operation in
-        // this emulator does that yet, so this refusal cannot fire today. It is the
-        // modelled answer for the real condition and is kept here, as on
-        // `DeleteCertificate`, for whichever gap issue adds that association.
-        if !certificate.in_use_by.is_empty() {
-            let in_use_by = certificate.in_use_by.join(", ");
+        // Which resources reference this certificate is the referencing service's fact,
+        // recorded in the SHARED association directory
+        // ([`crate::state::certificate_association_directory`]), so the refusal stands
+        // for every service that associates a certificate and lifts of its own accord
+        // once the last association is released — which is a release the clock owes,
+        // since a resource stops presenting a certificate only once the work that takes
+        // it away has run.
+        let mut associations = associations.lock();
+        associations.materialize_due(now);
+        if associations.is_in_use(&input.certificate_arn) {
             return Err(RevokeCertificateErrorModeled::ResourceInUseException(
                 ResourceInUseException {
-                    message: Some(format!(
-                        "Certificate {} is in use by {in_use_by}",
-                        input.certificate_arn
+                    message: Some(crate::state::certificate_in_use_message(
+                        &input.certificate_arn,
                     )),
                 },
             )

@@ -155,6 +155,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let Some(associations) = crate::state::certificate_association_directory(&*self.engine)
+        else {
+            return Err(DescribeCertificateErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some("the acm certificate store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
         if crate::state::certificate_id_from_arn(&input.certificate_arn).is_none() {
             return Err(DescribeCertificateErrorModeled::InvalidArnException(
                 InvalidArnException {
@@ -167,8 +177,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read of one record, except for the outcomes the clock already owes: a
         // certificate whose validation fell due before this call is reported as it
         // stands now, which is what makes a poll for a terminal status terminate.
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        store.materialize_due(::std::time::SystemTime::now());
+        store.materialize_due(now);
         let Some(certificate) = store.certificates.get(&input.certificate_arn) else {
             return Err(DescribeCertificateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -180,8 +191,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Which resources reference this certificate is the referencing service's fact,
+        // read from the SHARED association directory, so `InUseBy` reports the resources
+        // another service recorded against this ARN rather than a list this service kept
+        // a second copy of. A reference whose release has already fallen due is gone, as
+        // every other transition the clock owes is.
+        let mut associations = associations.lock();
+        associations.materialize_due(now);
+        let in_use_by = associations.resources_using(&input.certificate_arn);
         Ok(DescribeCertificateOutput {
-            certificate: Some(crate::state::certificate_detail(certificate)),
+            certificate: Some(crate::state::certificate_detail(certificate, in_use_by)),
         })
     }
 }

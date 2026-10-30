@@ -11,6 +11,12 @@
 //! beside those facts ([`Certificate::certificate_body`]), so `GetCertificate` hands
 //! back the certificate the resource was stored from.
 //!
+//! What a record does NOT carry is which resources reference the certificate: those
+//! resources belong to the services that own them, so the association is read from the
+//! SHARED directory those services write
+//! ([`certificate_association_directory`]) and is projected into `InUseBy` / `InUse` by
+//! the readers rather than copied into a certificate's record.
+//!
 //! Beside them, one [`AcmeEndpointRecord`] per managed ACME endpoint, keyed by its
 //! ARN, plus the idempotency index `CreateAcmeEndpoint` consults
 //! ([`AcmeEndpointIdempotency`]). `DescribeAcmeEndpoint` projects that record through
@@ -887,8 +893,6 @@ pub struct Certificate {
     /// `PENDING_VALIDATION`. `None` once the certificate has reached a terminal
     /// status — there is nothing left for the clock to do.
     pub pending_validation: Option<PendingValidation>,
-    /// ARNs of the resources using this certificate.
-    pub in_use_by: Vec<String>,
     /// The `KeyUsageName` values of the certificate's X.509 Key Usage extensions.
     /// Those extensions exist only once the certificate has been issued, so this is
     /// empty while it is pending — which is what the `Includes.keyUsage` filter
@@ -1919,6 +1923,40 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsAcmCertificatemanagerState>)
 }
 
+/// The SHARED certificate-association directory in the shared engine: call it with a
+/// handler's `&*self.engine`.
+///
+/// Which resources reference a certificate is a fact about the OTHER services' resources
+/// — a custom domain name, a listener, a distribution — each of which lives in the store
+/// of the service that owns it, so this service cannot see them. The owning service
+/// records its resource's references in ONE directory under one shared type
+/// ([`::service_common::acm_certificate_associations::CertificateAssociationDirectory`]),
+/// which is how `DescribeCertificate` can report `InUseBy`, `ListCertificates` and
+/// `SearchCertificates` can report `InUse`, and `DeleteCertificate` and
+/// `RevokeCertificate` can refuse a certificate another service is still serving. The
+/// engine keys state by TYPE, so a copy of its own inside
+/// [`ComAmazonawsAcmCertificatemanagerState`] would be invisible to the writers.
+///
+/// LOCK ORDER: a reader takes [`service_state`] first and this directory second, and
+/// nothing holds this one while taking another store, so the order cannot invert.
+///
+/// Answer `None` with a modelled server error, never with a fresh directory.
+pub fn certificate_association_directory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<
+    ::engine::ServiceState<
+        ::service_common::acm_certificate_associations::CertificateAssociationDirectory,
+    >,
+> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::acm_certificate_associations::CertificateAssociationDirectory,
+            >,
+        )
+}
+
 /// The region to mint ARNs in: the one the caller signed for, else [`DEFAULT_REGION`].
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
@@ -2361,6 +2399,19 @@ pub fn acme_endpoint_id_from_arn(arn: &str) -> Option<&str> {
 /// certificate-lookup path reports the same sentence.
 pub fn invalid_arn_message(certificate_arn: &str) -> String {
     format!("{certificate_arn} is not a valid ARN")
+}
+
+/// The `ResourceInUseException` message for a call that would take a certificate away
+/// from a resource still referencing it, built from the ARN the request asked for.
+///
+/// `ResourceInUseException` carries one modelled member (`message: String`) and the model
+/// documents no text for it, so the sentence comes from ACM's recorded behaviour: one
+/// complete sentence naming the requested certificate and terminated by a period. It
+/// names no referencing resource — which resources those are is what
+/// `DescribeCertificate`'s `InUseBy` reports — and every operation that refuses on an
+/// association renders it here, so the template cannot drift between them.
+pub fn certificate_in_use_message(certificate_arn: &str) -> String {
+    format!("Certificate {certificate_arn} is in use.")
 }
 
 /// The `ResourceNotFoundException` message for an ACM certificate ARN that no stored
@@ -3189,7 +3240,7 @@ fn domain_validation(record: &DomainValidationRecord) -> DomainValidation {
 /// certificate is still pending) and the full `Options`. Members that come into
 /// existence only with the certificate itself (`Serial`, `IssuedAt`, `NotBefore` /
 /// `NotAfter`) stay absent until the record carries them.
-pub fn certificate_detail(cert: &Certificate) -> CertificateDetail {
+pub fn certificate_detail(cert: &Certificate, in_use_by: Vec<String>) -> CertificateDetail {
     CertificateDetail {
         certificate_arn: Some(cert.arn.clone()),
         domain_name: Some(cert.domain_name.clone()),
@@ -3213,7 +3264,13 @@ pub fn certificate_detail(cert: &Certificate) -> CertificateDetail {
         subject: cert.subject.clone(),
         issuer: cert.issuer.clone(),
         signature_algorithm: cert.signature_algorithm.clone(),
-        in_use_by: Some(cert.in_use_by.clone()),
+        // "A list of ARNs for the Amazon Web Services resources that are using the
+        // certificate" (`CertificateDetail$InUseBy` doc): those resources live in the
+        // stores of the services that own them, so the list is the shared association
+        // directory's answer for this certificate
+        // ([`certificate_association_directory`]) and never a fact this service holds a
+        // second copy of.
+        in_use_by: Some(in_use_by),
         // The X.509 key-usage extensions the certificate carries. A pending
         // certificate has none yet, which is the EMPTY list, not a missing member.
         key_usages: Some(
@@ -3260,7 +3317,7 @@ pub fn certificate_detail(cert: &Certificate) -> CertificateDetail {
 /// `SubjectAlternativeNameSummaries` carries at most [`SUMMARY_SAN_LIMIT`] names and
 /// `HasAdditionalSubjectAlternativeNames` says whether the certificate has more, as
 /// that member's doc defines.
-pub fn certificate_summary(cert: &Certificate) -> CertificateSummary {
+pub fn certificate_summary(cert: &Certificate, in_use: bool) -> CertificateSummary {
     let total_sans = cert.subject_alternative_names.len();
     let shown = total_sans.min(SUMMARY_SAN_LIMIT);
     CertificateSummary {
@@ -3284,7 +3341,9 @@ pub fn certificate_summary(cert: &Certificate) -> CertificateSummary {
         extended_key_usages: (!cert.extended_key_usages.is_empty())
             .then(|| extended_key_usage_names(&cert.extended_key_usages)),
         export_option: Some(export_option(cert)),
-        in_use: Some(!cert.in_use_by.is_empty()),
+        // Whether any resource reported by `CertificateDetail$InUseBy` references this
+        // certificate, which the shared association directory is what knows.
+        in_use: Some(in_use),
         exported: Some(cert.exported),
         renewal_eligibility: Some(cert.renewal_eligibility().to_string()),
         not_before: cert.not_before.map(to_date_time),
@@ -3528,7 +3587,7 @@ pub fn acme_account_summary(account: &AcmeAccountRecord) -> AcmeAccountSummary {
 ///   nothing for it, which "exists only when the certificate status is REVOKED"
 ///   (`CertificateDetail$RevokedAt` doc) and "only when the certificate type is
 ///   IMPORTED" (`$ImportedAt` doc) demand.
-pub fn certificate_search_result(cert: &Certificate) -> CertificateSearchResult {
+pub fn certificate_search_result(cert: &Certificate, in_use: bool) -> CertificateSearchResult {
     CertificateSearchResult {
         certificate_arn: Some(cert.arn.clone()),
         x509_attributes: Some(X509Attributes {
@@ -3568,7 +3627,7 @@ pub fn certificate_search_result(cert: &Certificate) -> CertificateSearchResult 
             AcmCertificateMetadata {
                 created_at: (!cert.is_imported()).then(|| to_date_time(cert.created_at)),
                 exported: Some(cert.exported),
-                in_use: Some(!cert.in_use_by.is_empty()),
+                in_use: Some(in_use),
                 issued_at: cert.issued_at.map(to_date_time),
                 imported_at: cert.imported_at.map(to_date_time),
                 // The revocation instant, which exists only beside the `REVOKED`

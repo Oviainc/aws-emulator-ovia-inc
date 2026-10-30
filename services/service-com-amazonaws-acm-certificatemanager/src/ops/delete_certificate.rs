@@ -3,7 +3,8 @@
 //! @op DeleteCertificate
 //! IMPLEMENTED: removes the certificate record named by `CertificateArn` (and the
 //! idempotency entries that resolved to it), so it is gone from `ListCertificates`
-//! and `DescribeCertificate`.
+//! and `DescribeCertificate` — unless a resource of another service still references
+//! it, which is refused with `ResourceInUseException`.
 //!
 //! ## Shape of an operation
 //!
@@ -202,6 +203,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let Some(associations) = crate::state::certificate_association_directory(&*self.engine)
+        else {
+            return Err(DeleteCertificateErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some("the acm certificate store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
         if crate::state::certificate_id_from_arn(&input.certificate_arn).is_none() {
             return Err(DeleteCertificateErrorModeled::InvalidArnException(
                 InvalidArnException {
@@ -215,8 +226,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Materialise what the clock already owes before deciding whether this
         // certificate may be deleted, so the refusal is judged on the record's
         // current state rather than a stale one.
-        store.materialize_due(::std::time::SystemTime::now());
-        let Some(certificate) = store.certificates.get(&input.certificate_arn) else {
+        let now = ::std::time::SystemTime::now();
+        store.materialize_due(now);
+        if !store.certificates.contains_key(&input.certificate_arn) {
             return Err(DeleteCertificateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::certificate_not_found_message(
@@ -225,23 +237,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        };
+        }
 
         // "You cannot delete an ACM certificate that is being used by another Amazon
-        // Web Services service" — the condition `ResourceInUseException` reports.
+        // Web Services service … To delete a certificate that is in use, you must first
+        // remove the certificate association using the console or the CLI for the
+        // associated service" (this operation's doc) — the condition
+        // `ResourceInUseException` reports ("The certificate is in use by another Amazon
+        // Web Services service in the caller's account. Remove the association and try
+        // again").
         //
-        // `in_use_by` is only ever populated by the service that associates a
-        // certificate with a load balancer, distribution or API, and no operation in
-        // this emulator does that yet, so this refusal cannot fire today. It is the
-        // modelled answer for the real condition and stays here, rather than being
-        // dropped and re-derived, for whichever gap issue adds that association.
-        if !certificate.in_use_by.is_empty() {
-            let in_use_by = certificate.in_use_by.join(", ");
+        // Which resources reference this certificate is the referencing service's fact,
+        // recorded in the SHARED association directory
+        // ([`crate::state::certificate_association_directory`]), so the refusal stands
+        // for every service that associates a certificate and lifts of its own accord
+        // once the last association is released — which is a release the clock owes,
+        // since a resource stops presenting a certificate only once the work that takes
+        // it away has run.
+        let mut associations = associations.lock();
+        associations.materialize_due(now);
+        if associations.is_in_use(&input.certificate_arn) {
             return Err(DeleteCertificateErrorModeled::ResourceInUseException(
                 ResourceInUseException {
-                    message: Some(format!(
-                        "Certificate {} is in use by {in_use_by}",
-                        input.certificate_arn
+                    message: Some(crate::state::certificate_in_use_message(
+                        &input.certificate_arn,
                     )),
                 },
             )

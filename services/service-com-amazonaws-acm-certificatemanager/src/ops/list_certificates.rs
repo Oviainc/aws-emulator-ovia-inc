@@ -178,6 +178,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let Some(associations) = crate::state::certificate_association_directory(&*self.engine)
+        else {
+            return Err(ListCertificatesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some("the acm certificate store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
         // The sort members are documented as a pair: "If you specify SortBy, you must
         // also specify SortOrder" (`ListCertificatesRequest$SortBy`) and "If you
         // specify SortOrder, you must also specify SortBy"
@@ -206,7 +216,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The statuses this page filters and reports are the ones the clock has
         // already made due, so a `CertificateStatuses` filter and a `DescribeCertificate`
         // of the same certificate cannot disagree.
-        store.materialize_due(::std::time::SystemTime::now());
+        let now = ::std::time::SystemTime::now();
+        store.materialize_due(now);
+
+        // Which certificates something is using is the referencing services' fact, taken
+        // from the SHARED association directory once for this call — with the releases
+        // the clock has already made due applied, exactly as the store's own are.
+        let in_use = {
+            let mut associations = associations.lock();
+            associations.materialize_due(now);
+            associations.certificates_in_use()
+        };
 
         // The order this response is built in: `CREATED_AT` with the ARN as the
         // tie-break when the request asked for it, else the store's own ARN order.
@@ -266,8 +286,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let summaries: Vec<CertificateSummary> = page[..emitted]
             .iter()
-            .copied()
-            .map(crate::state::certificate_summary)
+            .map(|cert| {
+                // Whether anything is using a certificate is the referencing service's
+                // fact, read from the SHARED association directory, so one summary's
+                // `InUse` and that certificate's own `InUseBy` cannot disagree.
+                crate::state::certificate_summary(cert, in_use.contains(&cert.arn))
+            })
             .collect();
         // A token is issued only when this page stopped short of the matches, and it
         // names the last certificate the page emitted.

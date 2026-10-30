@@ -18,7 +18,7 @@
 
 pub mod paging;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types as wire;
@@ -326,6 +326,19 @@ pub const DOMAIN_NAME_STATUS_UPDATING: &str = "UPDATING";
 /// nothing sleeps for it: the due instant is stored and the status is derived from the
 /// clock on every read.
 pub const DOMAIN_NAME_MIGRATION: Duration = Duration::from_millis(500);
+
+/// How long the teardown of a deleted domain name takes before the clock owes the
+/// release of the certificates its endpoints were presenting.
+///
+/// `DeleteDomainName` ACCEPTS the removal rather than completing it — the recorded API
+/// answers `202 Accepted` — so the endpoints the domain name was served on are torn down
+/// after the call returns, and a certificate one of them presents is still in use until
+/// that teardown is done. A CHOSEN span, not one AWS documents: what matters is that it
+/// is never zero, so a client that deletes a domain name and immediately asks ACM to
+/// delete the certificate it was built on still gets the refusal the real service answers
+/// there, and that nothing sleeps for it — the instant is stored and the release is
+/// applied by whichever call next reads the directory.
+pub const DOMAIN_NAME_DELETION: Duration = Duration::from_secs(3);
 
 /// The refusal a request carries when its `DomainNameConfigurations` names no endpoint:
 /// the message of the `BadRequestException` both domain-name writers answer with (see
@@ -3854,6 +3867,28 @@ pub struct DomainName {
 }
 
 impl DomainName {
+    /// Every ACM certificate ARN this domain name's endpoints reference, in ARN order
+    /// and each only once.
+    ///
+    /// A custom domain name PRESENTS the certificates its configuration entries name —
+    /// the endpoint's own `CertificateArn` and, for a mutual-TLS endpoint, the
+    /// `OwnershipVerificationCertificateArn` it was verified with — so those are the
+    /// certificates this resource is using. Reported here so the whole set is read off
+    /// the stored record in one place, which is what the create, the update and the
+    /// delete record in the shared association directory.
+    pub fn referenced_certificate_arns(&self) -> BTreeSet<String> {
+        self.configurations
+            .iter()
+            .flat_map(|endpoint| {
+                [
+                    endpoint.certificate_arn.clone(),
+                    endpoint.ownership_verification_certificate_arn.clone(),
+                ]
+            })
+            .flatten()
+            .collect()
+    }
+
     /// Mint a fresh `RoutingRuleId` for this domain name: ten lowercase alphanumerics,
     /// never one this domain name already minted.
     pub fn mint_routing_rule_id(&mut self) -> String {
@@ -4710,4 +4745,38 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsApigatewayv2Apigatewayv2State>)
+}
+
+/// The SHARED certificate-association directory in the shared engine: call it with a
+/// handler's `&*self.engine`.
+///
+/// A custom domain name PRESENTS the ACM certificates its configuration entries name
+/// ([`DomainName::referenced_certificate_arns`]), and ACM — which holds those
+/// certificates but cannot see this store — has to report those references and refuse to
+/// delete or revoke a certificate while one remains. So a domain name's references are
+/// recorded in ONE directory under one shared type
+/// ([`::service_common::acm_certificate_associations::CertificateAssociationDirectory`]),
+/// written by whichever call creates, changes or deletes the resource that holds them.
+/// The engine keys state by TYPE, so a copy of its own inside
+/// [`ComAmazonawsApigatewayv2Apigatewayv2State`] would be invisible to the reader.
+///
+/// LOCK ORDER: a writer takes [`service_state`] first and this directory second, and
+/// nothing holds this one while taking another store, so the order cannot invert.
+///
+/// Answer `None` by leaving the directory unwritten: the record is an aid to another
+/// service, never part of this operation's own answer.
+pub fn certificate_association_directory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<
+    ::engine::ServiceState<
+        ::service_common::acm_certificate_associations::CertificateAssociationDirectory,
+    >,
+> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::acm_certificate_associations::CertificateAssociationDirectory,
+            >,
+        )
 }

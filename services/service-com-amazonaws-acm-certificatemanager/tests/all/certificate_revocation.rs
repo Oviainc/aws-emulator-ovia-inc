@@ -66,7 +66,7 @@ type RevokeCase<'a> = (Value, &'a str);
 /// a revocation: a private-CA request (nothing to prove, so it reaches `ISSUED`) that
 /// opts in to export, which "you cannot update ... after the the certificate is
 /// created" (`CertificateOptions$Export` doc).
-fn revocable_request(domain: &str, sans: &[String]) -> Value {
+pub(crate) fn revocable_request(domain: &str, sans: &[String]) -> Value {
     let mut body = json!({
         "DomainName": domain,
         "CertificateAuthorityArn": PRIVATE_CA_ARN,
@@ -124,7 +124,7 @@ pub(crate) fn mark_exported(engine: &Arc<engine::InMemoryEngine>, arn: &str) {
 /// Request the certificate `body` asks for and carry it to `ISSUED`, returning its
 /// ARN. Every step goes over the wire bar the stored due instant, which is moved into
 /// the past so the test does not race the settle delay.
-async fn issued_certificate(
+pub(crate) async fn issued_certificate(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     body: &Value,

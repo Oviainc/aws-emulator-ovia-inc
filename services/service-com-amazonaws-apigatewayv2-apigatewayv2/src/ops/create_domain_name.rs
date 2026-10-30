@@ -252,11 +252,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Taking the entry back gives the STORED record, so what the caller is told is
         // what a later GetDomainName will report.
+        let now = ::std::time::SystemTime::now();
         let stored = store
             .domain_names
             .entry(input.domain_name)
-            .or_insert(record)
-            .to_wire(::std::time::SystemTime::now());
+            .or_insert(record);
+        let referenced_certificates = stored.referenced_certificate_arns();
+        let resource_arn = stored.domain_name_arn.clone();
+        let stored = stored.to_wire(now);
+
+        // This resource now PRESENTS the certificates its endpoints name, which is a
+        // fact ACM has to know: it holds those certificates, cannot see this store, and
+        // may not let one be deleted or revoked while this domain name is serving it.
+        // Recorded in the shared directory keyed by this resource's own ARN, so the
+        // update and the delete replace and release exactly these references.
+        if let Some(associations) = crate::state::certificate_association_directory(&*self.engine) {
+            associations.lock().record_resource(
+                &resource_arn,
+                &referenced_certificates,
+                now,
+                crate::state::DOMAIN_NAME_MIGRATION,
+            );
+        }
+
         Ok(CreateDomainNameOutput {
             api_mapping_selection_expression: stored.api_mapping_selection_expression,
             domain_name: Some(stored.domain_name),

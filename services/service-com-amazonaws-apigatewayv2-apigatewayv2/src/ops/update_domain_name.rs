@@ -241,7 +241,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // GetDomainName will report. `DomainNameArn` and `ApiGatewayDomainName` are
         // carried over untouched: they name the resource and the host a caller's DNS
         // record points at, neither of which an update moves.
+        let referenced_certificates = record.referenced_certificate_arns();
+        let resource_arn = record.domain_name_arn.clone();
         let stored = record.to_wire(now);
+
+        // A patch that moved this domain name onto another certificate also moved which
+        // certificate it is using, and ACM protects and reports exactly the certificates
+        // something is using: recording the resource's whole set REPLACES what it
+        // referenced before. The certificate it was rotated off is still presented by
+        // the endpoints until the migration this patch started finishes, which is when
+        // its release falls due.
+        if let Some(associations) = crate::state::certificate_association_directory(&*self.engine) {
+            associations.lock().record_resource(
+                &resource_arn,
+                &referenced_certificates,
+                now,
+                crate::state::DOMAIN_NAME_MIGRATION,
+            );
+        }
+
         Ok(UpdateDomainNameOutput {
             api_mapping_selection_expression: stored.api_mapping_selection_expression,
             domain_name: Some(stored.domain_name),

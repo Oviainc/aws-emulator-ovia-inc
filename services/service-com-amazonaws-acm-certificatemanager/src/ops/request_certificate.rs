@@ -427,7 +427,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             pending_validation: Some(crate::state::PendingValidation::starting_at(
                 now, outcome,
             )),
-            in_use_by: Vec::new(),
             // A certificate carries X.509 key-usage extensions only once it has been
             // issued, and this one is pending validation.
             key_usages: Vec::new(),

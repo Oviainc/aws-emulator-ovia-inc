@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The domain name OWNS its api mappings — each is addressed under it
         // (`/v2/domainnames/{DomainName}/apimappings/{ApiMappingId}`) — so removing its
         // entry is the cascade: no mapping can outlive the domain it belonged to.
-        if store.domain_names.remove(&input.domain_name).is_none() {
+        let Some(removed) = store.domain_names.remove(&input.domain_name) else {
             return Err(DeleteDomainNameErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::state::INVALID_DOMAIN_NAME_IDENTIFIER.to_string()),
@@ -171,6 +171,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        };
+
+        // Nothing will present this resource's certificates once it is gone, so the
+        // references it held are given up: ACM protects a certificate only while
+        // something is using it, and "to delete a certificate that is in use, you must
+        // first remove the certificate association" is the association this delete
+        // removes. The removal is ACCEPTED here rather than finished — the endpoints
+        // still have to be torn down — so each reference stays in use until that
+        // teardown falls due, which is why a certificate delete sent straight after this
+        // call is still refused.
+        if let Some(associations) = crate::state::certificate_association_directory(&*self.engine) {
+            associations.lock().release_resource(
+                &removed.domain_name_arn,
+                ::std::time::SystemTime::now(),
+                crate::state::DOMAIN_NAME_DELETION,
+            );
         }
 
         Ok(DeleteDomainNameOutput)

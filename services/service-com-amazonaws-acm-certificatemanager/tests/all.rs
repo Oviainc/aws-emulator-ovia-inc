@@ -65,6 +65,8 @@ mod certificate_idempotency_expiry;
 mod certificate_import;
 #[path = "all/certificate_import_material.rs"]
 mod certificate_import_material;
+#[path = "all/certificate_in_use_by_another_service.rs"]
+mod certificate_in_use_by_another_service;
 #[path = "all/certificate_lifecycle.rs"]
 mod certificate_lifecycle;
 #[path = "all/certificate_list_filters.rs"]

@@ -201,6 +201,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(validation_exception("the acm certificate store is unavailable"));
         };
 
+        let Some(associations) = crate::state::certificate_association_directory(&*self.engine)
+        else {
+            return Err(validation_exception("the acm certificate store is unavailable"));
+        };
+
         // Refused before the store is touched: a filter statement that cannot select
         // anything is a bad request, not an empty result.
         if let Some(statement) = input.filter_statement.as_ref() {
@@ -224,7 +229,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The metadata this call filters, sorts and reports is the metadata the clock
         // has already made due, so a `Status` filter and a `DescribeCertificate` of
         // the same certificate cannot disagree.
-        store.materialize_due(::std::time::SystemTime::now());
+        let now = ::std::time::SystemTime::now();
+        store.materialize_due(now);
+
+        // Which certificates something is using is the referencing services' fact, taken
+        // from the SHARED association directory once for this call — with the releases
+        // the clock has already made due applied, as the store's own are: `InUse` is
+        // filtered, sorted and reported off this one snapshot, so the three cannot
+        // disagree inside a single response.
+        let in_use = {
+            let mut associations = associations.lock();
+            associations.materialize_due(now);
+            associations.certificates_in_use()
+        };
 
         // Every stored certificate the filter statement keeps. A request that names no
         // statement selects every one of them: unlike `ListCertificates`, this
@@ -233,16 +250,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .certificates
             .values()
             .filter(|cert| {
-                input
-                    .filter_statement
-                    .as_ref()
-                    .is_none_or(|statement| statement_matches(statement, cert))
+                input.filter_statement.as_ref().is_none_or(|statement| {
+                    statement_matches(statement, cert, in_use.contains(&cert.arn))
+                })
             })
             .collect();
         // Sorted on the requested field, with the ARN as the tie-break so equal
         // values — and every certificate when the field is one no record carries —
         // order the same way on every call.
-        matching.sort_by_cached_key(|cert| (order.sort_value(cert), cert.arn.clone()));
+        matching.sort_by_cached_key(|cert| {
+            (
+                order.sort_value(cert, in_use.contains(&cert.arn)),
+                cert.arn.clone(),
+            )
+        });
         if order.descending {
             matching.reverse();
         }
@@ -255,7 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
             Some(cursor) => matching
                 .iter()
-                .position(|cert| order.is_after(cursor, cert))
+                .position(|cert| order.is_after(cursor, cert, in_use.contains(&cert.arn)))
                 .unwrap_or(matching.len()),
         };
         let page = &matching[start.min(matching.len())..];
@@ -273,15 +294,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let results: Vec<CertificateSearchResult> = page[..emitted]
             .iter()
-            .copied()
-            .map(crate::state::certificate_search_result)
+            .map(|cert| crate::state::certificate_search_result(cert, in_use.contains(&cert.arn)))
             .collect();
         // A token is issued only when this page stopped short of the matches, and it
         // names the last certificate the page emitted.
         let next_token = if emitted < page.len() {
             page[..emitted]
                 .last()
-                .map(|cert| order.encode_next_token(cert))
+                .map(|cert| order.encode_next_token(cert, in_use.contains(&cert.arn)))
         } else {
             None
         };
@@ -553,7 +573,9 @@ fn stored_epoch_pair(at: ::std::time::SystemTime) -> (i64, u32) {
 }
 
 /// Whether `cert` satisfies `statement`: the logical operators combine the leaf
-/// filters below, each of which compares one value the RECORD carries.
+/// filters below, each of which compares one value the RECORD carries — or, for
+/// `InUse`, the one value the shared association directory carries for it, which
+/// `in_use` is this certificate's.
 ///
 /// Recurses over the statement tree, whose depth and node count
 /// [`validate_statement`] has already bounded ([`MAX_STATEMENT_DEPTH`]) — this walk
@@ -562,26 +584,33 @@ fn stored_epoch_pair(at: ::std::time::SystemTime) -> (i64, u32) {
 fn statement_matches(
     statement: &CertificateFilterStatement,
     cert: &crate::state::Certificate,
+    in_use: bool,
 ) -> bool {
     match statement {
         CertificateFilterStatement::And(statements) => statements
             .iter()
-            .all(|nested| statement_matches(nested, cert)),
+            .all(|nested| statement_matches(nested, cert, in_use)),
         CertificateFilterStatement::Or(statements) => statements
             .iter()
-            .any(|nested| statement_matches(nested, cert)),
-        CertificateFilterStatement::Not(nested) => !statement_matches(nested, cert),
-        CertificateFilterStatement::Filter(filter) => filter_matches(filter, cert),
+            .any(|nested| statement_matches(nested, cert, in_use)),
+        CertificateFilterStatement::Not(nested) => !statement_matches(nested, cert, in_use),
+        CertificateFilterStatement::Filter(filter) => filter_matches(filter, cert, in_use),
     }
 }
 
 /// Whether `cert` satisfies one leaf filter.
-fn filter_matches(filter: &CertificateFilter, cert: &crate::state::Certificate) -> bool {
+fn filter_matches(
+    filter: &CertificateFilter,
+    cert: &crate::state::Certificate,
+    in_use: bool,
+) -> bool {
     match filter {
         // An ARN identifies one certificate, so this selects the record stored under it.
         CertificateFilter::CertificateArn(arn) => cert.arn == *arn,
         CertificateFilter::X509AttributeFilter(filter) => x509_matches(filter, cert),
-        CertificateFilter::AcmCertificateMetadataFilter(filter) => metadata_matches(filter, cert),
+        CertificateFilter::AcmCertificateMetadataFilter(filter) => {
+            metadata_matches(filter, cert, in_use)
+        }
     }
 }
 
@@ -630,16 +659,14 @@ fn x509_matches(filter: &X509AttributeFilter, cert: &crate::state::Certificate) 
 fn metadata_matches(
     filter: &AcmCertificateMetadataFilter,
     cert: &crate::state::Certificate,
+    in_use: bool,
 ) -> bool {
     match filter {
         AcmCertificateMetadataFilter::Status(status) => cert.status == *status,
         AcmCertificateMetadataFilter::Type(cert_type) => cert.cert_type == *cert_type,
-        // A certificate is in use when something has associated it; `InUseBy` is the
-        // list of those resources.
-        AcmCertificateMetadataFilter::InUse(in_use) => {
-            let certificate_is_in_use = !cert.in_use_by.is_empty();
-            certificate_is_in_use == *in_use
-        }
+        // A certificate is in use when a resource of another service references it;
+        // `InUseBy` is the list of those resources.
+        AcmCertificateMetadataFilter::InUse(wanted) => in_use == *wanted,
         AcmCertificateMetadataFilter::Exported(exported) => cert.exported == *exported,
         AcmCertificateMetadataFilter::ExportOption(option) => {
             crate::state::export_option(cert) == *option
@@ -725,7 +752,7 @@ impl ResultOrder {
     /// A value the record does not carry renders as the empty string, which sorts
     /// before every other rendering — so certificates missing the sorted-on field come
     /// first ascending and last descending, and keep their ARN order among themselves.
-    fn sort_value(&self, cert: &crate::state::Certificate) -> String {
+    fn sort_value(&self, cert: &crate::state::Certificate, in_use: bool) -> String {
         // Every `SearchCertificatesSortBy` value the model declares
         // (`smithy_query(query="shape",
         // shape="com.amazonaws.acm#SearchCertificatesSortBy")`), each reading the same
@@ -742,7 +769,7 @@ impl ResultOrder {
             "MANAGED_BY" => cert.managed_by.clone().unwrap_or_default(),
             "VALIDATION_METHOD" => cert.validation_method.clone().unwrap_or_default(),
             "EXPORTED" => flag_key(cert.exported),
-            "IN_USE" => flag_key(!cert.in_use_by.is_empty()),
+            "IN_USE" => flag_key(in_use),
             "NOT_AFTER" => instant_key(cert.not_after),
             "NOT_BEFORE" => instant_key(cert.not_before),
             "ISSUED_AT" => instant_key(cert.issued_at),
@@ -766,9 +793,14 @@ impl ResultOrder {
 
     /// Whether `cert` sorts strictly after `cursor` in this order, i.e. whether it
     /// belongs on the page that resumes from it.
-    fn is_after(&self, cursor: &Cursor, cert: &crate::state::Certificate) -> bool {
+    fn is_after(
+        &self,
+        cursor: &Cursor,
+        cert: &crate::state::Certificate,
+        in_use: bool,
+    ) -> bool {
         let here = (cursor.sort_value.as_str(), cursor.arn.as_str());
-        let value = self.sort_value(cert);
+        let value = self.sort_value(cert, in_use);
         let there = (value.as_str(), cert.arn.as_str());
         if self.descending {
             there < here
@@ -792,12 +824,12 @@ impl ResultOrder {
     ///
     /// Hex-encoded so the token is opaque to the caller and satisfies the member's
     /// `^[\u0009\u000A\u000D\u0020-\u00FF]*$` pattern whatever the values contain.
-    fn encode_next_token(&self, cert: &crate::state::Certificate) -> String {
+    fn encode_next_token(&self, cert: &crate::state::Certificate, in_use: bool) -> String {
         hex::encode(format!(
             "{}{CURSOR_SEPARATOR}{}{CURSOR_SEPARATOR}{}{CURSOR_SEPARATOR}{}",
             self.sort_by,
             self.direction(),
-            self.sort_value(cert),
+            self.sort_value(cert, in_use),
             cert.arn
         ))
     }

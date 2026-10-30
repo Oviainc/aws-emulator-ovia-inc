@@ -54,9 +54,13 @@
 //!   which operation it names — for every service whose published target prefix carries
 //!   dots of its own, which the framework's first-dot readers cannot route;
 //!
-//! Beside them, six SHARED STORES live here, each held once in the shared engine so
+//! Beside them, seven SHARED STORES live here, each held once in the shared engine so
 //! the services on either side of a hand-off cannot hold two copies of one fact:
 //!
+//! * [`acm_certificate_associations`], the directory of which resources reference an ACM
+//!   certificate — written by the service that owns the referencing resource (a custom
+//!   domain name, a listener) and read by ACM, which cannot see those resources and yet
+//!   has to report them and refuse to delete or revoke a certificate while one remains;
 //! * [`iot_job_executions`], the IoT job-execution store the IoT control plane writes
 //!   (a job targets a thing) and the IoT Jobs data plane reads and updates (the device
 //!   polls, starts and reports);
@@ -208,6 +212,9 @@
 
 pub mod rds_cluster_parameters;
 
+/// The directory of which resources of the other services reference an ACM certificate,
+/// written by the service that owns the referencing resource and read by ACM.
+pub mod acm_certificate_associations;
 /// The SageMaker job directory the SageMaker control plane writes when it creates a job
 /// of a reinforcement-fine-tuning category, and the AgenticRFT job runtime data plane
 /// reads to resolve the job ARN its callers carry.
