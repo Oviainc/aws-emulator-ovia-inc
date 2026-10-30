@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateSubnets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateSubnets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateSubnets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the named subnets from the stored `FirewallRecord`'s
+//! `SubnetMappings`, dropping the firewall endpoint each one carried — the inverse
+//! of `AssociateSubnets` over the same mapping set — and re-mints the firewall's
+//! `UpdateToken` when the mapping set changed, so a following `DescribeFirewall`
+//! reports the remainder. A stale `UpdateToken` is refused with
+//! `InvalidTokenException`, and a firewall carrying `SubnetChangeProtection` with
+//! `InvalidOperationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +185,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateSubnets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateSubnetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateSubnets"))
+        // This call removes endpoints rather than creating any, so it names no
+        // Availability Zone and needs nothing from the request's metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DisassociateSubnetsErrorModeled::InternalServerError(InternalServerError {
+                    message: Some("the firewall store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        // "You must specify the ARN or the name, and you can specify both", so
+        // the firewall this call changes is identified exactly the way every
+        // other firewall operation identifies one.
+        let key = state
+            .resolve_firewall(input.firewall_name.as_deref(), input.firewall_arn.as_deref())
+            .map_err(disassociate_lookup_error)?;
+        let Some(record) = state.firewalls.get_mut(&key) else {
+            return Err(DisassociateSubnetsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The `PROVISIONING` -> `READY` move the clock owed at `ready_at()` is
+        // materialised here too, so the endpoints this call does not remove
+        // carry the status a reader would see rather than a stale one.
+        record.settle(::std::time::SystemTime::now());
+
+        // `UpdateToken` is the resource's optimistic lock: when the caller sends
+        // one it must be the token the firewall currently carries, so a caller
+        // that read the firewall before someone else changed it is refused rather
+        // than overwriting that change.
+        if input
+            .update_token
+            .as_ref()
+            .is_some_and(|token| token != &record.update_token)
+        {
+            return Err(DisassociateSubnetsErrorModeled::InvalidTokenException(
+                InvalidTokenException {
+                    message: Some(crate::state::INVALID_TOKEN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let detached = record
+            .disassociate_subnets(&input.subnet_ids)
+            .map_err(|breach| disassociate_breach_error(breach, Self::NAME))?;
+        // The token "marks the state of the firewall resource at the time of the
+        // request", so it is re-minted exactly when this call moved that state: a
+        // request naming only subnets the firewall does not carry disassociated
+        // nothing, and leaves the resource — its token included — as it was.
+        if !detached.is_empty() {
+            record.update_token = crate::state::new_uuid();
+        }
+
+        Ok(DisassociateSubnetsOutput {
+            firewall_arn: Some(record.firewall_arn.clone()),
+            firewall_name: Some(record.firewall_name.clone()),
+            subnet_mappings: Some(record.subnet_mappings.clone()),
+            update_token: Some(record.update_token.clone()),
+        })
     }
+}
+
+crate::state::impl_resolve_error!(
+    disassociate_lookup_error -> DisassociateSubnetsError, DisassociateSubnetsErrorModeled,
+    plural = "firewalls",
+    name_member = "FirewallName", arn_member = "FirewallArn"
+);
+
+/// Map a refused subnet disassociation onto this operation's modelled errors,
+/// the way the association path maps the same refusals: a firewall protected
+/// against subnet changes cannot take the change at all
+/// (`InvalidOperationException` — "the operation failed because it's not
+/// valid"), while a request that names no subnet, or names one twice, is a bad
+/// request (`InvalidRequestException`).
+///
+/// `operation` is the name of the call being served, which the protection
+/// refusal names (see [`crate::state::change_protected_message`]).
+fn disassociate_breach_error(
+    breach: crate::state::SubnetAssociationBreach,
+    operation: &str,
+) -> DisassociateSubnetsError {
+    use crate::state::SubnetAssociationBreach as Breach;
+    match breach {
+        Breach::Protected => DisassociateSubnetsErrorModeled::InvalidOperationException(
+            InvalidOperationException {
+                message: Some(crate::state::change_protected_message(
+                    operation,
+                    crate::state::SUBNET_CHANGE_PROTECTION_MEMBER,
+                )),
+            },
+        ),
+        Breach::NoSubnets => {
+            DisassociateSubnetsErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(crate::state::NO_SUBNETS_MESSAGE.to_string()),
+            })
+        }
+        Breach::RepeatedSubnet(subnet_id) => {
+            DisassociateSubnetsErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(crate::state::parameter_message(
+                    "Subnet is specified more than once",
+                    &subnet_id,
+                )),
+            })
+        }
+        // Removing subnets only shrinks the mapping set, so no disassociation is
+        // refused for zone capacity; the arm is mapped to the same bad-request
+        // wording the association path uses.
+        Breach::ZoneCapacity => {
+            DisassociateSubnetsErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(crate::state::too_many_zones_message()),
+            })
+        }
+    }
+    .into()
 }

@@ -47,3 +47,5 @@ mod rule_group_response_members;
 mod state_roundtrip;
 #[path = "all/subnet_associations.rs"]
 mod subnet_associations;
+#[path = "all/subnet_disassociations.rs"]
+mod subnet_disassociations;

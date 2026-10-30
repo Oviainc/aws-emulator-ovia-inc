@@ -1608,6 +1608,56 @@ impl FirewallRecord {
         Ok(attached)
     }
 
+    /// Disassociate the subnets `requested` names from this firewall, and answer
+    /// the subnets that lost a firewall endpoint here.
+    ///
+    /// `DisassociateSubnets` is documented "Removes the specified subnet
+    /// associations from the firewall. This removes the firewall endpoints from
+    /// the subnets and removes any network filtering protections that the
+    /// endpoints were providing", so it is the inverse of
+    /// [`FirewallRecord::associate_subnets`] over the same SET of subnets: every
+    /// named subnet the firewall carries loses its mapping and the endpoint in
+    /// its Availability Zone — which frees that zone for a later association —
+    /// while a subnet the firewall does not carry is already not associated and
+    /// loses nothing.
+    ///
+    /// No endpoint is created here, so this starts no provisioning and leaves
+    /// the firewall's own status to [`FirewallRecord::settle`]: the endpoints
+    /// this call removes are gone from every projection of the record, so no
+    /// reader is shown an endpoint for a subnet the firewall no longer carries.
+    ///
+    /// Nothing is written on a refusal: every check runs before the first
+    /// mutation.
+    pub fn disassociate_subnets(
+        &mut self,
+        requested: &[String],
+    ) -> Result<Vec<String>, SubnetAssociationBreach> {
+        if requested.is_empty() {
+            return Err(SubnetAssociationBreach::NoSubnets);
+        }
+        if self.subnet_change_protection {
+            return Err(SubnetAssociationBreach::Protected);
+        }
+        let mut named = HashSet::new();
+        for subnet_id in requested {
+            if !named.insert(subnet_id.as_str()) {
+                return Err(SubnetAssociationBreach::RepeatedSubnet(subnet_id.clone()));
+            }
+        }
+
+        let detached: Vec<String> = self
+            .subnet_mappings
+            .iter()
+            .filter(|mapping| named.contains(mapping.subnet_id.as_str()))
+            .map(|mapping| mapping.subnet_id.clone())
+            .collect();
+        self.subnet_mappings
+            .retain(|mapping| !named.contains(mapping.subnet_id.as_str()));
+        self.sync_states
+            .retain(|_, endpoint| !named.contains(endpoint.subnet_id.as_str()));
+        Ok(detached)
+    }
+
     /// The `Firewall` shape for this record.
     pub fn to_firewall(&self) -> Firewall {
         Firewall {
