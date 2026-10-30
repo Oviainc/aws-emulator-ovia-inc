@@ -15,10 +15,11 @@
 //! the attribute a filter names is set at all, a wildcard value, the id selector alone and
 //! combined with a filter, and a page size at the published bounds.
 //!
-//! `CreateTransitGatewayConnect` is still a scaffold, so the Connect attachments are seeded
-//! straight into the store the way the Connect-peer and attachment-acceptance suites seed the
-//! attachments their operations act on; the transit gateways themselves are created over the
-//! wire, so the gateway ids the attachments name are ones that operation really stored.
+//! The Connect attachments are seeded straight into the store, the way the Connect-peer and
+//! attachment-acceptance suites seed the attachments their operations act on, so this suite
+//! can hold attachments in states and with members no single create would leave behind; the
+//! transit gateways themselves are created over the wire, so the gateway ids the attachments
+//! name are ones that operation really stored.
 
 use std::sync::Arc;
 

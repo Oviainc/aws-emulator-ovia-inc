@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTransitGatewayConnect
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTransitGatewayConnect`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTransitGatewayConnect::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does
+//!
+//! "Creates a Connect attachment from a specified transit gateway attachment": it resolves
+//! the TRANSPORT attachment the request names, takes the transit gateway from that
+//! attachment's own record, and stores the Connect attachment in the one attachment store in
+//! the non-terminal `pending` state with the clock owing it `available`.
+//! `DescribeTransitGatewayConnects` reads the very record this writes.
+//!
+//! Nothing about the answer is taken from a recording: the attachment id comes from the
+//! store's id mint, the `TransitGatewayId` from the transport attachment the request names,
+//! the tunnel protocol from the request's `Options`, and the state from the one writer that
+//! stores a Connect attachment, which is the only place its state and its owed move are set.
+//!
+//! A transport attachment is "a VPC attachment or Amazon Web Services Direct Connect
+//! attachment" (`TransportTransitGatewayAttachmentId`), and the GRE tunnel it carries only
+//! runs once that attachment is in service — so an attachment of another kind, or one in any
+//! other state, is refused and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +84,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,18 +154,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTransitGatewayConnect` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTransitGatewayConnectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTransitGatewayConnect"))
+        // `ctx` carries request metadata only; this operation reads none of it — the transport
+        // attachment and the options are named by the request, and the transit gateway comes
+        // from the store, which is reached through the engine held on `self`.
+        let _ = ctx;
+        use std::time::SystemTime;
+
+        // The request's own form first, before anything is resolved: an id that is not a
+        // transit gateway attachment id at all is refused as an invalid parameter value, so
+        // "not an id of this kind" never reads as "no such attachment" and is never answered
+        // by the DryRun arm below either.
+        if !state::prefixed_id_is_well_formed(
+            state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
+            &input.transport_transit_gateway_attachment_id,
+        ) {
+            return Err(state::invalid_parameter_value(
+                state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MESSAGE,
+            ));
+        }
+
+        // "The tunnel protocol" (`CreateTransitGatewayConnectRequestOptions$Protocol`), whose
+        // enum publishes exactly one member — "a Connect attachment is a GRE-based tunnel
+        // attachment". The modelled `required` and the enum are both applied at the request
+        // boundary, so a request that names no `Options` or a protocol outside that enum is
+        // refused before this handler runs; this is the backstop that keeps a protocol the
+        // store would then report from ever being one the model does not publish.
+        if input.options.protocol != state::PROTOCOL_VALUE_GRE {
+            return Err(state::invalid_parameter_value(format!(
+                "Options.Protocol must name the tunnel protocol of the Connect attachment, \
+                 '{gre}'",
+                gre = state::PROTOCOL_VALUE_GRE,
+            )));
+        }
+
+        // "The tags to apply to the Connect attachment" (`TagSpecifications`) — "you must
+        // specify the resource type to tag, otherwise the request will fail"
+        // (`TagSpecification`), and the only type this action tags is the attachment it
+        // creates. The tag payload's own bounds are applied by the one shared reader every
+        // create holds its tags to.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_TRANSIT_GATEWAY_ATTACHMENT,
+            Self::NAME,
+        )?;
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock first: whether the transport attachment admits this call is asked of the
+        // state it is ACTUALLY in rather than of the one its last writer left it in.
+        store.materialize_due_transitions();
+
+        // "The ID of the transit gateway attachment. You can specify a VPC attachment or
+        // Amazon Web Services Direct Connect attachment"
+        // (`TransportTransitGatewayAttachmentId`). Every kind of attachment shares one id
+        // space, so an id naming an attachment of a kind that cannot carry a Connect
+        // attachment is refused for its kind rather than reported as unknown.
+        let transport = store
+            .transit_gateway_attachments
+            .get(&input.transport_transit_gateway_attachment_id)
+            .ok_or_else(|| {
+                state::invalid_transit_gateway_attachment_id_not_found(
+                    &input.transport_transit_gateway_attachment_id,
+                )
+            })?;
+        if !matches!(transport.view, state::TransitGatewayAttachmentView::Vpc(_)) {
+            return Err(state::invalid_parameter_value(format!(
+                "The transit gateway attachment '{attachment_id}' is a '{kind}' attachment; a \
+                 Connect attachment can only be created from a '{vpc}' attachment or an Amazon \
+                 Web Services Direct Connect attachment",
+                attachment_id = input.transport_transit_gateway_attachment_id,
+                kind = transport.view.resource_type(),
+                vpc = state::TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_VPC,
+            )));
+        }
+        let transport_state = transport.view.state().unwrap_or_default().to_string();
+        let transit_gateway_id = transport.view.transit_gateway_id().map(str::to_string);
+
+        // A Connect attachment is a GRE tunnel over the transport attachment, and that
+        // attachment carries traffic only once it is in service, so a transport attachment in
+        // any other state is refused with `IncorrectState` and nothing is written.
+        if transport_state != state::TRANSIT_GATEWAY_ATTACHMENT_STATE_AVAILABLE {
+            return Err(state::incorrect_state(format!(
+                "The transit gateway attachment '{attachment_id}' is in state \
+                 '{transport_state}'; a Connect attachment can only be created from an \
+                 attachment in state '{available}'",
+                attachment_id = input.transport_transit_gateway_attachment_id,
+                available = state::TRANSIT_GATEWAY_ATTACHMENT_STATE_AVAILABLE,
+            )));
+        }
+
+        // "Information about the Connect attachment" as it is about to be stored. The id and
+        // the state are left for the store to mint, so no path can report an attachment in a
+        // state the store does not hold.
+        let view = TransitGatewayConnect {
+            transit_gateway_attachment_id: None,
+            transport_transit_gateway_attachment_id: Some(
+                input.transport_transit_gateway_attachment_id.clone(),
+            ),
+            transit_gateway_id,
+            state: None,
+            creation_time: Some(state::system_time_to_date_time(SystemTime::now())),
+            options: Some(TransitGatewayConnectOptions {
+                protocol: Some(input.options.protocol.clone()),
+            }),
+            tags: (!tags.is_empty()).then_some(tags),
+        };
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if !store.has_transit_gateway_attachment_capacity() {
+            return Err(state::resource_count_exceeded(
+                "This emulator holds as many transit gateway attachments as it will store",
+            ));
+        }
+        // The very number the insert then charges, asked of the budget before anything is
+        // written: the record's own overhead plus the caller-chosen bytes it holds.
+        let payload_bytes = state::STORED_RECORD_OVERHEAD_BYTES
+            + state::transit_gateway_connect_payload_bytes(&view);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let Some(attachment_id) = store.insert_transit_gateway_connect(view) else {
+            return Err(state::resource_count_exceeded(
+                "This emulator holds as many transit gateway attachments as it will store",
+            ));
+        };
+
+        // The answer is the record as it was STORED, so this operation and
+        // `DescribeTransitGatewayConnects` cannot drift apart.
+        let Some(state::TransitGatewayAttachmentView::Connect(stored)) = store
+            .transit_gateway_attachments
+            .get(&attachment_id)
+            .map(|record| &record.view)
+        else {
+            return Err(state::internal_error(
+                "the transit gateway Connect attachment just created could not be read back",
+            ));
+        };
+        Ok(CreateTransitGatewayConnectOutput {
+            transit_gateway_connect: Some(stored.clone()),
+        })
     }
 }

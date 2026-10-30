@@ -69,10 +69,11 @@ fn past_the_transition() -> Duration {
 /// The emulator, a transit gateway with one CIDR block of each family, and a Connect
 /// attachment on it in `attachment_state`.
 ///
-/// `CreateTransitGatewayConnect` is still a scaffold, so the Connect attachment is seeded
-/// straight into the store the way the attachment-acceptance suite seeds the attachments its
-/// operations act on; the transit gateway itself is created over the wire, so the ASN and the
-/// CIDR blocks the peer is derived from are the ones that operation really stored.
+/// The Connect attachment is seeded straight into the store, the way the attachment-acceptance
+/// suite seeds the attachments its operations act on, so this suite can put one in any state it
+/// needs rather than only the state a create leaves it in; the transit gateway itself is
+/// created over the wire, so the ASN and the CIDR blocks the peer is derived from are the ones
+/// that operation really stored.
 struct Fixture {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,

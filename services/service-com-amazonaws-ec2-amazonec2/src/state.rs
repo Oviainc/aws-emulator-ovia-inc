@@ -30264,6 +30264,18 @@ pub const TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_CLIENT_VPN: &str = "client-vp
 /// The `TransitGatewayAttachmentResourceType` of a Connect attachment: `connect`.
 pub const TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_CONNECT: &str = "connect";
 
+/// The sentence EC2 refuses something that is not a transit gateway attachment id AT ALL
+/// with, whichever code the operation at hand carries it under.
+///
+/// ENTIRELY fixed: this refusal interpolates nothing a caller sent, unlike the family's
+/// not-found sentence ([`transit_gateway_attachment_deleted_or_absent`]), which names the id.
+/// One definition because the operations that take an attachment id answer the same sentence
+/// under different codes — [`require_well_formed_transit_gateway_attachment_id`] carries it
+/// as that resource's own `Invalid<Kind>.Malformed`, while an operation that takes one as a
+/// parameter OF a create can carry it as [`INVALID_PARAMETER_VALUE`].
+pub const INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MESSAGE: &str =
+    "Invalid Transit Gateway Attachment id.";
+
 /// How one kind of attachment spells the states an acceptance or a rejection walks through.
 ///
 /// The two state enums the model gives attachments name the same states with different
@@ -30496,6 +30508,11 @@ impl TransitGatewayAttachmentView {
     /// [`STORED_RECORD_OVERHEAD_BYTES`] is charged beside it by
     /// [`ComAmazonawsEc2Amazonec2State::insert_transit_gateway_attachment`], so no stored
     /// attachment is free against the byte budget whatever it carries.
+    ///
+    /// A handler that has to ask the store's byte budget whether the attachment it is about to
+    /// write FITS measures it through the per-kind function this delegates to
+    /// ([`transit_gateway_connect_payload_bytes`]) rather than through a view of its own, so
+    /// the gate and this charge cannot drift.
     fn payload_bytes(&self) -> usize {
         match self {
             Self::Vpc(attachment) => tag_list_bytes(attachment.tags.as_deref().unwrap_or_default()),
@@ -30516,11 +30533,20 @@ impl TransitGatewayAttachmentView {
                         .unwrap_or_default()
                         .len(),
                 ),
-            Self::Connect(attachment) => {
-                tag_list_bytes(attachment.tags.as_deref().unwrap_or_default())
-            }
+            Self::Connect(attachment) => transit_gateway_connect_payload_bytes(attachment),
         }
     }
+}
+
+/// The caller-chosen bytes one stored Connect attachment holds: its tags, which are the only
+/// member of `TransitGatewayConnect` a caller chooses the size of — the two attachment ids and
+/// the gateway id are minted or resolved, and the tunnel protocol is one enum member.
+///
+/// Beside the view's own [`TransitGatewayAttachmentView::payload_bytes`], which delegates the
+/// Connect arm to it, so the create that asks the byte budget whether its attachment FITS
+/// weighs it with the very function the insert then charges by, without a view to wrap it in.
+pub fn transit_gateway_connect_payload_bytes(attachment: &TransitGatewayConnect) -> usize {
+    tag_list_bytes(attachment.tags.as_deref().unwrap_or_default())
 }
 
 /// One stored transit gateway attachment: the modelled view its describe reports, plus the
@@ -31657,7 +31683,7 @@ pub fn require_well_formed_transit_gateway_attachment_id<E>(
     Err(Scaffolded::service_error(
         INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
         400,
-        "Invalid Transit Gateway Attachment id.".to_string(),
+        INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MESSAGE.to_string(),
     ))
 }
 
@@ -31766,6 +31792,31 @@ impl ComAmazonawsEc2Amazonec2State {
                 pending: None,
             },
         );
+        Some(attachment_id)
+    }
+
+    /// Store a transit gateway Connect attachment in the non-terminal state a create leaves
+    /// it in, with the move to `available` the clock owes it, and answer the
+    /// `TransitGatewayAttachmentId` it was given — or `None` when the store is at
+    /// [`MAX_STORED_RECORDS_PER_STORE`] and nothing was stored.
+    ///
+    /// The id, the state and the owed move are minted HERE rather than taken from `view`, the
+    /// way [`Self::insert_transit_gateway_connect_peer`] mints a peer's, so no path can report
+    /// a Connect attachment in a state the store does not hold; the id and the byte charge are
+    /// the shared [`Self::insert_transit_gateway_attachment`]'s, so a Connect attachment is
+    /// stored and charged exactly like every other kind.
+    pub fn insert_transit_gateway_connect(
+        &mut self,
+        mut view: TransitGatewayConnect,
+    ) -> Option<String> {
+        view.state = Some(TRANSIT_GATEWAY_ATTACHMENT_STATE_PENDING.to_string());
+        let attachment_id =
+            self.insert_transit_gateway_attachment(TransitGatewayAttachmentView::Connect(view))?;
+        if let Some(record) = self.transit_gateway_attachments.get_mut(&attachment_id) {
+            record.pending = Some(PendingStateMove::starting_now(
+                TRANSIT_GATEWAY_ATTACHMENT_STATE_AVAILABLE,
+            ));
+        }
         Some(attachment_id)
     }
 
