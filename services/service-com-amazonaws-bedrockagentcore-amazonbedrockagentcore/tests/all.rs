@@ -15,6 +15,8 @@
 mod code_interpreter_sessions;
 #[path = "all/memory_events.rs"]
 mod memory_events;
+#[path = "all/on_demand_evaluation.rs"]
+mod on_demand_evaluation;
 #[path = "all/service_claim.rs"]
 mod service_claim;
 #[path = "all/state_roundtrip.rs"]

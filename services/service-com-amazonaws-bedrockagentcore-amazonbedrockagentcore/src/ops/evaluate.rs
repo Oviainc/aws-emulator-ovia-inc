@@ -1,15 +1,47 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Evaluate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Evaluate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reads the agent trace a request carries and answers one result per unit the request
+//! asks to have evaluated, with the evaluator its URI names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Evaluate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the SYNCHRONOUS, on-demand evaluation surface: the spans to evaluate, the
+//! unit to evaluate them at and the ground truth to evaluate them against all arrive in
+//! the request, and no modelled operation of this service reports an on-demand
+//! evaluation afterwards — so this operation computes its answer from the request it was
+//! handed and persists nothing ([`crate::state`] holds the records that ARE read back:
+//! memory events and tool sessions).
+//!
+//! ## Which units are evaluated
+//!
+//! `evaluationTarget` chooses the level: one result per `spanIds` entry (a single tool
+//! call) or per `traceIds` entry (one request-response interaction). With nothing
+//! targeted the units are the contexts the `evaluationReferenceInputs` address, and
+//! with neither a target nor a reference input the unit is the whole session the
+//! submitted spans belong to. Every id a caller supplies has to be its own: a span id
+//! repeated inside `evaluationInput.sessionSpans`, an id repeated inside
+//! `evaluationTarget`, or two `evaluationReferenceInputs` entries addressing one
+//! context all name a single unit twice, which is refused as a 400
+//! `ValidationException` instead of evaluated.
+//!
+//! ## What a result carries
+//!
+//! A rating is what an EVALUATOR produces — `evaluationResults` holds "numerical or
+//! categorical ratings based on the evaluator's rating scale, and token usage
+//! statistics for the evaluation process" — and no judge model runs in this emulator,
+//! so no result carries one: `value`, `label`, `explanation` and `tokenUsage` are all
+//! left out rather than filled with a number or a sentence nothing produced. What each
+//! result does carry is the evaluator it was asked for, the `spanContext` it is about,
+//! and an `errorCode` saying why it is unscored — the context's log events were not
+//! among the submitted spans, or they were and no judge model ran. The ground truth a
+//! request supplies is read for the contexts it addresses and for the uniqueness rule
+//! above, and nothing is compared against it.
+//!
+//! The span members read here are the OpenTelemetry ones, in both the spelling the
+//! OTLP/JSON encoding uses and the snake_case several exporters write
+//! ([`SPAN_ID_MEMBERS`], [`TRACE_ID_MEMBERS`], [`START_TIME_MEMBERS`]), and the
+//! attributes are those of the OpenTelemetry and OpenInference conventions the
+//! instrumentations named in this operation's `evaluationInput` documentation emit
+//! ([`SESSION_ID_ATTRIBUTE`], [`TOOL_NAME_ATTRIBUTES`], [`RESPONSE_ATTRIBUTES`]).
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +223,709 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Evaluate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EvaluateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Evaluate"))
+        // On-demand evaluation is synchronous and stateless: every input it reads
+        // arrives in the request, and nothing in this service's API reports an
+        // on-demand evaluation back, so there is no record to keep and none to read.
+        // Repeating a call therefore answers exactly the same results.
+        let _ = (ctx, &self.engine);
+
+        let spans = read_spans(&input.evaluation_input)?;
+        let references = read_references(input.evaluation_reference_inputs.as_deref())?;
+        let units = target_units(input.evaluation_target.as_ref(), &spans, &references)?;
+        // The body is read before the evaluator the URI names is resolved, so a request
+        // that is not evaluable at all is refused as the bad request it is rather than
+        // reported as a missing resource.
+        let evaluator = resolve_evaluator(&input.evaluator_id)?;
+
+        Ok(EvaluateOutput {
+            evaluation_results: units
+                .iter()
+                .map(|unit| reported(unit, &evaluator))
+                .collect(),
+        })
+    }
+}
+
+/// The members an OpenTelemetry span states its own id under, in each spelling this
+/// operation accepts: the OTLP/JSON encoding's `spanId` and the `span_id` several
+/// exporters write instead.
+const SPAN_ID_MEMBERS: [&str; 2] = ["spanId", "span_id"];
+
+/// The members a span states the trace it belongs to under, in the same two spellings.
+const TRACE_ID_MEMBERS: [&str; 2] = ["traceId", "trace_id"];
+
+/// The members a span states its start instant under, in the same two spellings. It is
+/// what puts the submitted spans in trace order, which is the order the trace is read
+/// in.
+const START_TIME_MEMBERS: [&str; 2] = ["startTimeUnixNano", "start_time_unix_nano"];
+
+/// The member a span states its attributes under.
+const ATTRIBUTES_MEMBER: &str = "attributes";
+
+/// The attribute carrying the id of the session an interaction belongs to: `session.id`
+/// from the OpenTelemetry semantic conventions, which the OpenInference instrumentation
+/// this operation's `evaluationInput` documentation names spells the same way.
+const SESSION_ID_ATTRIBUTE: &str = "session.id";
+
+/// The attributes carrying the name of the tool a span invoked: `gen_ai.tool.name` from
+/// the OpenTelemetry GenAI conventions, and `tool.name` from the OpenInference ones. A
+/// span carrying one records a tool call.
+const TOOL_NAME_ATTRIBUTES: [&str; 2] = ["gen_ai.tool.name", "tool.name"];
+
+/// The attributes carrying the text a span answered with: `gen_ai.completion` and
+/// `gen_ai.output.messages` from the OpenTelemetry GenAI conventions, and `output.value`
+/// from the OpenInference ones. A span carrying one records an answer.
+const RESPONSE_ATTRIBUTES: [&str; 3] = [
+    "gen_ai.completion",
+    "gen_ai.output.messages",
+    "output.value",
+];
+
+/// How deeply a structured attribute value is read for the text it holds. A caller
+/// chooses how deeply its spans nest, so the read stops here rather than recursing as
+/// far as the request asks; this is the EMULATOR's own bound, set far above the two
+/// levels an OTLP typed value and a chat-message list take.
+const MAX_ATTRIBUTE_DEPTH: usize = 8;
+
+/// How many text leaves one attribute value contributes, for the same reason.
+const MAX_ATTRIBUTE_LEAVES: usize = 256;
+
+/// The longest `evaluatorName` a result may carry (`EvaluatorName` `@length(1..48)`),
+/// which is shorter than `EvaluatorId`'s own maximum of 111.
+const MAX_EVALUATOR_NAME: usize = 48;
+
+/// The `ValidationExceptionReason` for a request whose values break a rule of the
+/// service (source: smithy_query query="shape" shape="ValidationExceptionReason").
+const FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
+
+/// The `ValidationExceptionReason` for a request this operation cannot read at all,
+/// from the same enum.
+const CANNOT_PARSE: &str = "CannotParse";
+
+/// The id prefix of an evaluator AWS itself provides, from `EvaluatorId`'s first
+/// pattern alternative.
+const BUILTIN_PREFIX: &str = "Builtin.";
+
+/// The id prefix of a partner-provided evaluator, from the second alternative.
+const THIRD_PARTY_PREFIX: &str = "ThirdParty.";
+
+/// The `errorCode` the service reports for a context whose log events it does not have,
+/// which here is a context the submitted spans record nothing for. The spelling is the
+/// one the behavioural recording this operation was implemented against requires of
+/// such a result; `EvaluationErrorCode` is a bare string shape, so the model states no
+/// code of its own.
+const LOG_EVENT_MISSING_CODE: &str = "LogEventMissingException";
+
+/// The `errorCode` a result carries when the context's log events ARE there and no
+/// judge model ran over them. It is the EMULATOR's own code — a rating comes from an
+/// evaluator, no evaluator runs here, and reporting that is the honest answer where a
+/// number would be one nothing produced.
+const NO_JUDGE_MODEL_CODE: &str = "NoJudgeModelAvailable";
+
+/// The `evaluationInput.sessionSpans` member path a refusal names.
+const SESSION_SPANS: &str = "evaluationInput.sessionSpans";
+
+/// The `evaluationTarget.spanIds` member path a refusal names.
+const TARGET_SPAN_IDS: &str = "evaluationTarget.spanIds";
+
+/// The `evaluationTarget.traceIds` member path a refusal names.
+const TARGET_TRACE_IDS: &str = "evaluationTarget.traceIds";
+
+/// The `evaluationReferenceInputs` member path a refusal names.
+const REFERENCE_INPUTS: &str = "evaluationReferenceInputs";
+
+/// Refuse the request, naming the member it was refused over both in the message and in
+/// the `fieldList` a client reads programmatically.
+fn refused(member: &str, message: String, reason: &str) -> EvaluateError {
+    EvaluateErrorModeled::ValidationException(ValidationException {
+        message: message.clone(),
+        reason: reason.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message,
+        }]),
+    })
+    .into()
+}
+
+/// One submitted span, as this operation reads it.
+#[derive(Debug, Clone)]
+struct TraceSpan {
+    /// The span's own id, which every span has to carry.
+    span_id: String,
+    /// The trace it belongs to, when it states one.
+    trace_id: Option<String>,
+    /// The session it belongs to, from [`SESSION_ID_ATTRIBUTE`].
+    session_id: Option<String>,
+    /// Whether the span records an interaction of the agent — a tool call
+    /// ([`TOOL_NAME_ATTRIBUTES`]) or an answer ([`RESPONSE_ATTRIBUTES`]) — which is
+    /// what makes it a log event of the context it belongs to rather than a span with
+    /// nothing in it to evaluate.
+    records_interaction: bool,
+    /// Its start instant in nanoseconds, or 0 when it states none.
+    start: u128,
+    /// Where it arrived in `sessionSpans`, which orders spans sharing a start instant.
+    at: usize,
+}
+
+/// The context one `evaluationReferenceInputs` entry addresses. The ground truth that
+/// entry supplies is not read: a rating comes from an evaluator, and none runs here, so
+/// nothing is compared against it (see the module header).
+#[derive(Debug, Clone)]
+struct ReferenceInput<'a> {
+    session_id: &'a str,
+    trace_id: Option<&'a str>,
+    span_id: Option<&'a str>,
+}
+
+impl ReferenceInput<'_> {
+    /// Whether this entry's context addresses the unit identified by `trace_id` and
+    /// `span_id`, whichever session that unit belongs to: a span-level entry addresses
+    /// just that span, a trace-level one every unit of that trace, and a session-level
+    /// one — the documented "session-level reference inputs apply to the entire
+    /// conversation" — every unit of its session.
+    fn addresses(&self, trace_id: Option<&str>, span_id: Option<&str>) -> bool {
+        if let Some(wanted) = self.span_id {
+            return span_id.is_some_and(|got| got.eq_ignore_ascii_case(wanted));
+        }
+        if let Some(wanted) = self.trace_id {
+            return trace_id.is_some_and(|got| got.eq_ignore_ascii_case(wanted));
+        }
+        true
+    }
+}
+
+/// One unit of evaluation: the context a result reports, and the spans that belong to
+/// it.
+#[derive(Debug)]
+struct Unit<'a> {
+    session_id: String,
+    trace_id: Option<String>,
+    span_id: Option<String>,
+    spans: Vec<&'a TraceSpan>,
+}
+
+impl Unit<'_> {
+    /// What the unit's level is called in the message a result carries. The three levels
+    /// are the ones an evaluator is defined at (source: smithy_query query="shape"
+    /// shape="EvaluatorLevel" on the AgentCore control plane's model, values
+    /// SESSION | TRACE | TOOL_CALL).
+    fn level(&self) -> &'static str {
+        match (&self.trace_id, &self.span_id) {
+            (_, Some(_)) => "tool call",
+            (Some(_), None) => "trace",
+            (None, None) => "session",
+        }
+    }
+}
+
+/// The evaluator a request named, as a result reports it.
+#[derive(Debug)]
+struct ResolvedEvaluator {
+    id: String,
+    name: String,
+    arn: String,
+}
+
+/// The text `document` states, for a scalar: a string as itself, a number or boolean as
+/// its spelling, and a composite or null as nothing.
+fn text(document: &::aws_smithy_types::Document) -> Option<String> {
+    use ::aws_smithy_types::{Document, Number};
+    match document {
+        Document::String(value) => Some(value.clone()),
+        Document::Number(Number::PosInt(value)) => Some(value.to_string()),
+        Document::Number(Number::NegInt(value)) => Some(value.to_string()),
+        Document::Number(Number::Float(value)) => Some(value.to_string()),
+        Document::Bool(value) => Some(value.to_string()),
+        Document::Object(_) | Document::Array(_) | Document::Null => None,
+    }
+}
+
+/// Every scalar leaf `document` holds, joined by a space: the text of a plain attribute
+/// value, of an OTLP typed one (`{"stringValue": …}`) and of a structured one (a list of
+/// chat messages) alike.
+fn leaf_text(document: &::aws_smithy_types::Document) -> Option<String> {
+    let mut leaves: Vec<String> = Vec::new();
+    collect_leaves(document, 0, &mut leaves);
+    (!leaves.is_empty()).then(|| leaves.join(" "))
+}
+
+/// The bounded walk behind [`leaf_text`].
+fn collect_leaves(document: &::aws_smithy_types::Document, depth: usize, leaves: &mut Vec<String>) {
+    use ::aws_smithy_types::Document;
+    if depth > MAX_ATTRIBUTE_DEPTH || leaves.len() >= MAX_ATTRIBUTE_LEAVES {
+        return;
+    }
+    match document {
+        // Read in member-name order: a document's members are held in a `HashMap`,
+        // whose iteration order would otherwise make one span read two ways.
+        Document::Object(members) => {
+            for (_, value) in members.iter().collect::<std::collections::BTreeMap<_, _>>() {
+                collect_leaves(value, depth.saturating_add(1), leaves);
+            }
+        }
+        Document::Array(items) => {
+            for item in items {
+                collect_leaves(item, depth.saturating_add(1), leaves);
+            }
+        }
+        scalar => {
+            if let Some(value) = text(scalar) {
+                leaves.push(value);
+            }
+        }
+    }
+}
+
+/// The first of `names` the span states, as text.
+fn text_member(
+    members: &std::collections::HashMap<String, ::aws_smithy_types::Document>,
+    names: &[&str],
+) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| members.get(*name).and_then(text))
+}
+
+/// The attributes a span carries, as one map from name to the text it states — read
+/// from the OTLP encoding's list of `{key, value}` entries and from the plain JSON
+/// object other exporters write, so one reading covers both.
+fn attributes(
+    members: &std::collections::HashMap<String, ::aws_smithy_types::Document>,
+) -> std::collections::BTreeMap<String, String> {
+    use ::aws_smithy_types::Document;
+    let mut read = std::collections::BTreeMap::new();
+    match members.get(ATTRIBUTES_MEMBER) {
+        Some(Document::Array(entries)) => {
+            for entry in entries {
+                let Document::Object(entry) = entry else {
+                    continue;
+                };
+                let Some(key) = entry.get("key").and_then(text) else {
+                    continue;
+                };
+                if let Some(value) = entry.get("value").and_then(leaf_text) {
+                    read.insert(key, value);
+                }
+            }
+        }
+        Some(Document::Object(map)) => {
+            for (key, value) in map {
+                if let Some(value) = leaf_text(value) {
+                    read.insert(key.clone(), value);
+                }
+            }
+        }
+        _ => {}
+    }
+    read
+}
+
+/// Whether the attributes state any of `names`.
+fn states_any(
+    attributes: &std::collections::BTreeMap<String, String>,
+    names: &[&str],
+) -> bool {
+    names.iter().any(|name| attributes.contains_key(*name))
+}
+
+/// The submitted spans in trace order, refusing a request whose spans cannot be read or
+/// do not each carry their own id.
+fn read_spans(input: &EvaluationInput) -> Result<Vec<TraceSpan>, EvaluateError> {
+    use ::aws_smithy_types::Document;
+    let EvaluationInput::sessionSpans(documents) = input;
+    let mut spans: Vec<TraceSpan> = Vec::with_capacity(documents.len());
+    // Keyed by the lowercased id: a trace or span id is hexadecimal (`TraceId` is 32
+    // characters, `SpanId` 16), so two spellings of one id are one id.
+    let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (at, document) in documents.iter().enumerate() {
+        let Document::Object(members) = document else {
+            return Err(refused(
+                SESSION_SPANS,
+                format!("{SESSION_SPANS}[{at}] is not a span object."),
+                CANNOT_PARSE,
+            ));
+        };
+        // Every refusal below WITHHOLDS the values it is about: `sessionSpans` is a
+        // `@sensitive` member, so a refusal states which entry was wrong and why, never
+        // what that entry held.
+        let span_id = text_member(members, &SPAN_ID_MEMBERS).ok_or_else(|| {
+            refused(
+                SESSION_SPANS,
+                format!("{SESSION_SPANS}[{at}] carries no span id."),
+                FIELD_VALIDATION_FAILED,
+            )
+        })?;
+        if let Some(first) = seen.insert(span_id.to_ascii_lowercase(), at) {
+            return Err(refused(
+                SESSION_SPANS,
+                format!(
+                    "{SESSION_SPANS}[{at}] carries the same span id as {SESSION_SPANS}[{first}]; \
+                     every span of one evaluation input must carry its own span id."
+                ),
+                FIELD_VALIDATION_FAILED,
+            ));
+        }
+        let attributes = attributes(members);
+        // A span that states a start instant has to state a readable one: the order the
+        // spans are read in is taken off it, so a value this operation cannot read would
+        // silently reorder the trace.
+        let start = match text_member(members, &START_TIME_MEMBERS) {
+            None => 0,
+            Some(stated) => stated.parse::<u128>().map_err(|_| {
+                refused(
+                    SESSION_SPANS,
+                    format!(
+                        "{SESSION_SPANS}[{at}] states a start instant that is not a whole \
+                         number of nanoseconds."
+                    ),
+                    CANNOT_PARSE,
+                )
+            })?,
+        };
+        spans.push(TraceSpan {
+            span_id,
+            trace_id: text_member(members, &TRACE_ID_MEMBERS),
+            session_id: attributes.get(SESSION_ID_ATTRIBUTE).cloned(),
+            records_interaction: states_any(&attributes, &TOOL_NAME_ATTRIBUTES)
+                || states_any(&attributes, &RESPONSE_ATTRIBUTES),
+            start,
+            at,
+        });
+    }
+    spans.sort_by_key(|span| (span.start, span.at));
+    Ok(spans)
+}
+
+/// The contexts the request's ground truth addresses, refusing two entries that address
+/// one context.
+fn read_references(
+    entries: Option<&[EvaluationReferenceInput]>,
+) -> Result<Vec<ReferenceInput<'_>>, EvaluateError> {
+    let mut references: Vec<ReferenceInput<'_>> = Vec::new();
+    let mut seen: std::collections::BTreeMap<(String, String, String), usize> =
+        std::collections::BTreeMap::new();
+    for (at, entry) in entries.unwrap_or_default().iter().enumerate() {
+        let Context::spanContext(context) = &entry.context;
+        let key = (
+            context.session_id.clone(),
+            context
+                .trace_id
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+            context
+                .span_id
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+        );
+        if seen.insert(key, at).is_some() {
+            // The wording AWS answers a repeated context with, which names the context
+            // itself: the members it carries in single quotes and the ones it does not
+            // as `None`. `SpanContext` models no parent span id, so that member of the
+            // context is never one a request can state.
+            return Err(refused(
+                REFERENCE_INPUTS,
+                format!(
+                    "Duplicate context found: session_id={} parent_span_id={} trace_id={} \
+                     span_id={}",
+                    context_member(Some(context.session_id.as_str())),
+                    context_member(None),
+                    context_member(context.trace_id.as_deref()),
+                    context_member(context.span_id.as_deref()),
+                ),
+                FIELD_VALIDATION_FAILED,
+            ));
+        }
+        references.push(ReferenceInput {
+            session_id: context.session_id.as_str(),
+            trace_id: context.trace_id.as_deref(),
+            span_id: context.span_id.as_deref(),
+        });
+    }
+    Ok(references)
+}
+
+/// How a message spells one member of a context: a value it carries in single quotes,
+/// and one it does not as `None`.
+fn context_member(value: Option<&str>) -> String {
+    value.map_or_else(|| "None".to_string(), |value| format!("'{value}'"))
+}
+
+/// Refuse a list of targeted ids that names one id twice. `EvaluationTarget` carries no
+/// `@sensitive` trait, so a refusal over it states the id it is about.
+fn unique_ids(member: &str, kind: &str, ids: &[String]) -> Result<(), EvaluateError> {
+    let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (at, id) in ids.iter().enumerate() {
+        if let Some(first) = seen.insert(id.to_ascii_lowercase(), at) {
+            return Err(refused(
+                member,
+                format!(
+                    "{member} names the {kind} {id} at index {first} and again at index {at}; \
+                     every id a request targets must be its own."
+                ),
+                FIELD_VALIDATION_FAILED,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `span` is one of the trace or span a context addresses — the half of
+/// belonging that does not depend on the session.
+fn matches_ids(span: &TraceSpan, trace_id: Option<&str>, span_id: Option<&str>) -> bool {
+    if let Some(wanted) = trace_id {
+        if !span
+            .trace_id
+            .as_deref()
+            .is_some_and(|carried| carried.eq_ignore_ascii_case(wanted))
+        {
+            return false;
+        }
+    }
+    if let Some(wanted) = span_id {
+        if !span.span_id.eq_ignore_ascii_case(wanted) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The session a unit belongs to: the one the spans it addresses state, else the one
+/// the reference input addressing it states, else the single session every reference
+/// input shares, else the session the submitted spans are of.
+///
+/// A unit with none of those has no session at all, and `context.sessionId` is
+/// `@required` on every result, so such a request is refused rather than answered with
+/// an invented session.
+fn session_of(
+    addressed: &[&TraceSpan],
+    spans: &[TraceSpan],
+    references: &[ReferenceInput<'_>],
+    ids: (Option<&str>, Option<&str>),
+) -> Option<String> {
+    if let Some(stated) = addressed.iter().find_map(|span| span.session_id.clone()) {
+        return Some(stated);
+    }
+    if let Some(covering) = references
+        .iter()
+        .find(|reference| reference.addresses(ids.0, ids.1))
+    {
+        return Some(covering.session_id.to_string());
+    }
+    let sessions: std::collections::BTreeSet<&str> = references
+        .iter()
+        .map(|reference| reference.session_id)
+        .collect();
+    if sessions.len() == 1 {
+        return sessions.into_iter().next().map(str::to_string);
+    }
+    spans.iter().find_map(|span| span.session_id.clone())
+}
+
+/// The units the request asks for, in the order it names them: the ids
+/// `evaluationTarget` names, else — with nothing targeted — the contexts the reference
+/// inputs address, and with neither the one session the submitted spans are.
+///
+/// A unit the submitted spans carry nothing for is kept rather than refused: it is
+/// reported as a result whose log events are missing (see [`reported`]).
+fn target_units<'a>(
+    target: Option<&EvaluationTarget>,
+    spans: &'a [TraceSpan],
+    references: &[ReferenceInput<'_>],
+) -> Result<Vec<Unit<'a>>, EvaluateError> {
+    // One entry per context to evaluate: the session it NAMES (only a reference input's
+    // context names one), the trace and the span.
+    type Addressed = (Option<String>, Option<String>, Option<String>);
+    let contexts: Vec<Addressed> = match target {
+        Some(EvaluationTarget::traceIds(ids)) => {
+            unique_ids(TARGET_TRACE_IDS, "trace id", ids)?;
+            ids.iter()
+                .map(|id| (None, Some(id.clone()), None))
+                .collect()
+        }
+        Some(EvaluationTarget::spanIds(ids)) => {
+            unique_ids(TARGET_SPAN_IDS, "span id", ids)?;
+            ids.iter()
+                .map(|id| (None, None, Some(id.clone())))
+                .collect()
+        }
+        None if !references.is_empty() => references
+            .iter()
+            .map(|reference| {
+                (
+                    Some(reference.session_id.to_string()),
+                    reference.trace_id.map(str::to_string),
+                    reference.span_id.map(str::to_string),
+                )
+            })
+            .collect(),
+        None => vec![(None, None, None)],
+    };
+
+    let mut units = Vec::with_capacity(contexts.len());
+    for (named_session, trace_id, span_id) in contexts {
+        // The scan below is one pass over the submitted spans per unit, and both
+        // factors are bounded by the model: `evaluationTarget` holds at most 10 ids and
+        // `evaluationReferenceInputs` at most 1000 entries, over at most 20000 spans
+        // (`Spans` is `@length(1..20000)`, source: smithy_query query="shape"
+        // shape="Spans"), so no request can ask for work that grows without limit.
+        let addressed: Vec<&TraceSpan> = spans
+            .iter()
+            .filter(|span| matches_ids(span, trace_id.as_deref(), span_id.as_deref()))
+            .collect();
+        let named = named_session.is_some();
+        let session_id = match named_session {
+            Some(session) => session,
+            None => session_of(
+                &addressed,
+                spans,
+                references,
+                (trace_id.as_deref(), span_id.as_deref()),
+            )
+            .ok_or_else(|| {
+                refused(
+                    SESSION_SPANS,
+                    format!(
+                        "the evaluated context has no session: no span states a \
+                         {SESSION_ID_ATTRIBUTE} attribute and no reference input supplies a \
+                         session id."
+                    ),
+                    FIELD_VALIDATION_FAILED,
+                )
+            })?,
+        };
+        let held: Vec<&TraceSpan> = addressed
+            .into_iter()
+            .filter(|span| {
+                if named {
+                    // A context that NAMES a session is matched against what the spans
+                    // state: a span that states another session, or none at all, is not
+                    // a log event of the named one.
+                    span.session_id.as_deref() == Some(session_id.as_str())
+                } else {
+                    // Where the session was read off the spans themselves, a span that
+                    // states none of its own is part of the session its siblings state.
+                    span.session_id
+                        .as_deref()
+                        .is_none_or(|carried| carried == session_id)
+                }
+            })
+            .collect();
+        // A span targeted on its OWN reports the trace it belongs to; a session-level
+        // unit reports no trace, because it is not about one.
+        let trace_id = if span_id.is_some() {
+            trace_id.or_else(|| held.first().and_then(|span| span.trace_id.clone()))
+        } else {
+            trace_id
+        };
+        units.push(Unit {
+            session_id,
+            trace_id,
+            span_id,
+            spans: held,
+        });
+    }
+    Ok(units)
+}
+
+/// The evaluator the request named.
+///
+/// A built-in or partner evaluator is one the service itself provides, so its id names
+/// it and its ARN is the account-free form `EvaluatorArn`'s second pattern alternative
+/// states (`^arn:aws[a-zA-Z-]*:bedrock-agentcore:::evaluator/(Builtin|ThirdParty)\.…$`,
+/// source: smithy_query query="shape" shape="EvaluatorArn"). Any other id is a CUSTOM
+/// evaluator, which exists only once the control plane has created it — no operation of
+/// this emulator does, so no such evaluator can be found.
+fn resolve_evaluator(evaluator_id: &str) -> Result<ResolvedEvaluator, EvaluateError> {
+    if !(evaluator_id.starts_with(BUILTIN_PREFIX) || evaluator_id.starts_with(THIRD_PARTY_PREFIX)) {
+        return Err(EvaluateErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: Some(format!("evaluator {evaluator_id} not found")),
+            },
+        )
+        .into());
+    }
+    Ok(ResolvedEvaluator {
+        id: evaluator_id.to_string(),
+        // `EvaluatorName` admits the `Builtin.`/`ThirdParty.` spellings an id uses, so a
+        // provided evaluator's name IS its id — except that the name's own maximum is
+        // shorter than the id's, and clipping an id would leave a spelling the name's
+        // pattern does not admit, so a longer id is named by its last segment, which is
+        // the evaluator's own name within its family.
+        name: match evaluator_id.chars().count() <= MAX_EVALUATOR_NAME {
+            true => evaluator_id.to_string(),
+            false => evaluator_id
+                .rsplit('.')
+                .next()
+                .unwrap_or(evaluator_id)
+                .chars()
+                .take(MAX_EVALUATOR_NAME)
+                .collect(),
+        },
+        arn: format!("arn:aws:bedrock-agentcore:::evaluator/{evaluator_id}"),
+    })
+}
+
+/// One unit's result: the evaluator it was asked for, the context it is about, and why
+/// it carries no rating.
+///
+/// A rating is an evaluator's output, and no judge model runs in this emulator, so
+/// `value`, `label`, `explanation` and `tokenUsage` are left out of every result rather
+/// than filled with a number or a sentence nothing produced. `errorCode` says which of
+/// the two reasons applies: the context's log events were not among the submitted spans,
+/// or they were and nothing judged them.
+fn reported(unit: &Unit<'_>, evaluator: &ResolvedEvaluator) -> EvaluationResultContent {
+    // A span belonging to the context records a log event of it only when it records
+    // what the agent did — a tool call or an answer.
+    let missing_log_events = !unit.spans.iter().any(|span| span.records_interaction);
+    let (error_code, error_message) = if missing_log_events {
+        (
+            LOG_EVENT_MISSING_CODE,
+            format!(
+                "No log events found for context: session_id={} parent_span_id={} trace_id={} \
+                 span_id={}",
+                context_member(Some(unit.session_id.as_str())),
+                context_member(None),
+                context_member(unit.trace_id.as_deref()),
+                context_member(unit.span_id.as_deref()),
+            ),
+        )
+    } else {
+        (
+            NO_JUDGE_MODEL_CODE,
+            format!(
+                "No judge model runs in this emulator, so evaluator {} rated nothing for this \
+                 {} context.",
+                evaluator.id,
+                unit.level()
+            ),
+        )
+    };
+
+    EvaluationResultContent {
+        evaluator_arn: evaluator.arn.clone(),
+        evaluator_id: evaluator.id.clone(),
+        evaluator_name: evaluator.name.clone(),
+        // An explanation is the judge's reasoning about its rating, so there is none.
+        explanation: None,
+        context: Context::spanContext(SpanContext {
+            session_id: unit.session_id.clone(),
+            trace_id: unit.trace_id.clone(),
+            span_id: unit.span_id.clone(),
+        }),
+        // A numerical or categorical rating on the evaluator's own rating scale, which
+        // only an evaluator produces.
+        value: None,
+        label: None,
+        // `tokenUsage` is what the EVALUATION spent, and nothing was spent; the token
+        // counts a trace carries are the AGENT's.
+        token_usage: None,
+        error_message: Some(error_message),
+        error_code: Some(error_code.to_string()),
+        // Nothing was compared against the supplied reference input, so no field of one
+        // was singled out as ignored.
+        ignored_reference_input_fields: None,
     }
 }
