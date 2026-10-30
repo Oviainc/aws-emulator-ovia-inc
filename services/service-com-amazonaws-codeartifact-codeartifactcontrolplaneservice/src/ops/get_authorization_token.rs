@@ -269,8 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // credential is this service's own, so this service is what validates it. The
         // principal travels with it, because what that principal may do in a repository is
         // what that repository's own policy states.
-        let principal =
-            crate::service::token_authorization::caller_principal(&*self.engine, ctx);
+        let principal = crate::service::authorization::caller_principal(&*self.engine, ctx);
         state.lock().record_authorization_token(
             &token,
             &input.domain,

@@ -161,6 +161,12 @@ pub async fn call_in_region(
         .body(payload)
         .expect("build request");
 
+    send(router, request).await
+}
+
+/// Dispatch one built request and reduce the response to an [`Answer`] — the one reduction
+/// every call in this crate's suites goes through.
+async fn send(router: &MultiServiceRouter, request: http::Request<bytes::Bytes>) -> Answer {
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     let error_type = response
@@ -201,3 +207,152 @@ pub async fn create_domain(
     )
     .await
 }
+
+// ---------------------------------------------------------------------------
+// The caller a request speaks for
+//
+// An authorization decision is read out of the STS and IAM stores of the SAME shared
+// engine the service under test runs on — the stores those services' own handlers write —
+// so a suite about it seeds a role, a policy and a session there and then signs with that
+// session's access key id. That seeding is the same work for every such suite, so it lives
+// here once.
+// ---------------------------------------------------------------------------
+
+/// The name of the one inline policy [`given_role_policy`] writes.
+const INLINE_POLICY_NAME: &str = "inline";
+
+/// The ARN the account holds a role by, as `iam:CreateRole` records it.
+pub fn role_arn(role: &str) -> String {
+    format!("arn:aws:iam::{ACCOUNT}:role/{role}")
+}
+
+/// The ARN `sts:AssumeRole` reports for the session `session` of `role`.
+pub fn session_arn(role: &str, session: &str) -> String {
+    format!("arn:aws:sts::{ACCOUNT}:assumed-role/{role}/{session}")
+}
+
+/// Hold `role` in the IAM store, as `iam:CreateRole` does: its policies are read under the
+/// ARN the account holds it by, which is what this returns.
+pub fn given_role(engine: &Arc<engine::InMemoryEngine>, role: &str) -> String {
+    use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
+
+    let arn = role_arn(role);
+    let store = iam::service_state(&**engine).expect("the IAM store");
+    store.lock().roles.insert(
+        iam::name_key(role),
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::Role {
+            path: "/".to_string(),
+            role_name: role.to_string(),
+            role_id: service_com_amazonaws_sts_awssecuritytokenservicev20110615::state::role_id(
+                role,
+            ),
+            arn: arn.clone(),
+            create_date: aws_smithy_types::DateTime::from_secs(0),
+            assume_role_policy_document: None,
+            description: None,
+            max_session_duration: None,
+            permissions_boundary: None,
+            tags: None,
+            role_last_used: None,
+            source_role_template: None,
+        },
+    );
+    arn
+}
+
+/// Attach `document` to `role` as its one inline policy, replacing whatever it carried —
+/// what `iam:PutRolePolicy` does. `None` takes every policy off it, as
+/// `iam:DeleteRolePolicy` does.
+pub fn given_role_policy(engine: &Arc<engine::InMemoryEngine>, role: &str, document: Option<&Value>) {
+    use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
+
+    let store = iam::service_state(&**engine).expect("the IAM store");
+    let mut held = store.lock();
+    match document {
+        Some(document) => {
+            held.role_inline_policies.insert(
+                iam::name_key(role),
+                std::collections::BTreeMap::from([(
+                    iam::name_key(INLINE_POLICY_NAME),
+                    iam::InlinePolicy {
+                        policy_name: INLINE_POLICY_NAME.to_string(),
+                        policy_document: document.to_string(),
+                    },
+                )]),
+            );
+        }
+        None => {
+            held.role_inline_policies.remove(&iam::name_key(role));
+        }
+    }
+}
+
+/// Record the assumed-role session the access key id `access_key_id` speaks for, as
+/// `sts:AssumeRole` records one, lasting `duration_seconds`. Returns the session's own
+/// expiry — the `Expiration` the caller was given for those credentials.
+pub fn given_session(
+    engine: &Arc<engine::InMemoryEngine>,
+    access_key_id: &str,
+    role: &str,
+    session: &str,
+    duration_seconds: i32,
+) -> std::time::SystemTime {
+    use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts;
+
+    let now = std::time::SystemTime::now();
+    let expires_at =
+        now + std::time::Duration::from_secs(u64::try_from(duration_seconds).unwrap_or(0));
+    let store = sts::service_state(&**engine).expect("the STS store");
+    let mut sessions = store.lock();
+    sessions.sessions.remove(access_key_id);
+    sessions
+        .insert(sts::Session {
+            access_key_id: access_key_id.to_string(),
+            created_at: now,
+            expires_at,
+            duration_seconds,
+            identity: sts::Identity {
+                user_id: sts::role_id(role),
+                account: ACCOUNT.to_string(),
+                arn: session_arn(role, session),
+            },
+            kind: sts::SessionKind::AssumedRole,
+            source_identity: None,
+            tags: Vec::new(),
+            transitive_tag_keys: Vec::new(),
+            packed_policy_size: None,
+            external_id: None,
+            role_arn: Some(role_arn(role)),
+            revoked: false,
+        })
+        .expect("the session is recorded");
+    expires_at
+}
+
+/// [`call`], signed with `access_key_id` instead of the harness's placeholder credential —
+/// which is what names the session the request speaks for.
+pub async fn call_as(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> Answer {
+    let payload = match &body {
+        Some(value) => bytes::Bytes::from(serde_json::to_vec(value).expect("serialize body")),
+        None => bytes::Bytes::new(),
+    };
+    let request = http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("host", format!("codeartifact.{REGION}.amazonaws.com"))
+        .header(
+            "authorization",
+            auth_for(REGION).replace("AKIDEXAMPLE", access_key_id),
+        )
+        .header("content-type", "application/json")
+        .body(payload)
+        .expect("build request");
+    send(router, request).await
+}
+

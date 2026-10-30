@@ -277,9 +277,10 @@ const PUBLISH_ACTION: &str = "codeartifact:PublishPackageVersion";
 /// Only an explicit `Deny` refuses here. That is IAM's evaluation order within one account:
 /// a deny in the resource policy wins over anything an identity policy allows, while a
 /// resource policy that merely states nothing withholds no access — the caller's identity
-/// policies may still permit it, and those are not this plane's to read (the identity-policy
-/// gate for this service's operations is a change of its own). A repository carrying no
-/// policy refuses nothing.
+/// policies may still permit it, and this plane holds no session to read them for: it
+/// authenticates a BEARER credential, whose principal is the one recorded at the mint, not a
+/// signing session ([`crate::service::authorization`] is the decision for a control-plane
+/// call, which does have one). A repository carrying no policy refuses nothing.
 fn policy_refusal(
     store: &CaState,
     resolved: &Resolved,

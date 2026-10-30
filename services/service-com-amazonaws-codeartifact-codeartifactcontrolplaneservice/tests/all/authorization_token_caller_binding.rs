@@ -24,16 +24,13 @@
 //!    the caller's own identity for the cross-service action, which names no resource type —
 //!    and the reason, whether nothing allowed the action or a readable document denied it.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
-use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{auth_for, create_domain, Answer, ACCOUNT, REGION};
+use crate::harness::{call_as, create_domain, given_role, given_role_policy, given_session, Answer, ACCOUNT, REGION};
 
 /// The role every session below is assumed from.
 const ROLE: &str = "ca-publisher";
@@ -42,8 +39,8 @@ const ROLE: &str = "ca-publisher";
 /// for a session.
 const SESSION_KEY_ID: &str = "ASIAEXAMPLESESSION01";
 
-/// The name of the inline policy the role carries.
-const POLICY_NAME: &str = "inline";
+/// The name of the session every request below speaks for.
+const SESSION_NAME: &str = "publish-session";
 
 /// How far an asserted `expiration` may sit from the instant it is compared with: the
 /// wall-clock cost of the call itself, which is a handler invocation rather than a sleep.
@@ -78,87 +75,32 @@ impl Emulator {
     /// records one, lasting `duration_seconds`. Returns the session's own expiry — the
     /// `Expiration` the caller was given for those credentials.
     fn given_session(&self, duration_seconds: i32) -> SystemTime {
-        let now = SystemTime::now();
-        let expires_at = now + Duration::from_secs(u64::try_from(duration_seconds).unwrap_or(0));
-        let store = sts::service_state(&*self.engine).expect("the STS store");
-        let mut sessions = store.lock();
-        sessions.sessions.remove(SESSION_KEY_ID);
-        sessions
-            .insert(sts::Session {
-                access_key_id: SESSION_KEY_ID.to_string(),
-                created_at: now,
-                expires_at,
-                duration_seconds,
-                identity: sts::Identity {
-                    user_id: sts::role_id(ROLE),
-                    account: ACCOUNT.to_string(),
-                    arn: format!("arn:aws:sts::{ACCOUNT}:assumed-role/{ROLE}/publish-session"),
-                },
-                kind: sts::SessionKind::AssumedRole,
-                source_identity: None,
-                tags: Vec::new(),
-                transitive_tag_keys: Vec::new(),
-                packed_policy_size: None,
-                external_id: None,
-                role_arn: Some(role_arn()),
-                revoked: false,
-            })
-            .expect("the session is recorded");
-        expires_at
+        given_session(
+            &self.engine,
+            SESSION_KEY_ID,
+            ROLE,
+            SESSION_NAME,
+            duration_seconds,
+        )
     }
 
     /// Hold the role itself, as `iam:CreateRole` does: its policies are read under the ARN
     /// the account holds it by.
     fn given_role(&self) {
-        let store = iam::service_state(&*self.engine).expect("the IAM store");
-        store.lock().roles.insert(
-            iam::name_key(ROLE),
-            service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::Role {
-                path: "/".to_string(),
-                role_name: ROLE.to_string(),
-                role_id: sts::role_id(ROLE),
-                arn: role_arn(),
-                create_date: aws_smithy_types::DateTime::from_secs(0),
-                assume_role_policy_document: None,
-                description: None,
-                max_session_duration: None,
-                permissions_boundary: None,
-                tags: None,
-                role_last_used: None,
-                source_role_template: None,
-            },
-        );
+        given_role(&self.engine, ROLE);
     }
 
     /// Attach `document` to the role as its inline policy, replacing whatever it carried —
     /// what `iam:PutRolePolicy` does. `None` takes every policy off it, as
     /// `iam:DeleteRolePolicy` does.
     fn given_role_policy(&self, document: Option<&Value>) {
-        let store = iam::service_state(&*self.engine).expect("the IAM store");
-        let mut held = store.lock();
-        match document {
-            Some(document) => {
-                held.role_inline_policies.insert(
-                    iam::name_key(ROLE),
-                    BTreeMap::from([(
-                        iam::name_key(POLICY_NAME),
-                        iam::InlinePolicy {
-                            policy_name: POLICY_NAME.to_string(),
-                            policy_document: document.to_string(),
-                        },
-                    )]),
-                );
-            }
-            None => {
-                held.role_inline_policies.remove(&iam::name_key(ROLE));
-            }
-        }
+        given_role_policy(&self.engine, ROLE, document);
     }
 }
 
 /// The ARN the account holds the role by.
 fn role_arn() -> String {
-    format!("arn:aws:iam::{ACCOUNT}:role/{ROLE}")
+    crate::harness::role_arn(ROLE)
 }
 
 /// A policy allowing `actions` on every resource.
@@ -181,33 +123,7 @@ async fn get_token_as(
     if let Some(duration) = duration_seconds {
         uri.push_str(&format!("&duration={duration}"));
     }
-    let authorization = auth_for(REGION).replace("AKIDEXAMPLE", access_key_id);
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("host", format!("codeartifact.{REGION}.amazonaws.com"))
-        .header("authorization", authorization)
-        .header("content-type", "application/json")
-        .body(bytes::Bytes::new())
-        .expect("build request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let raw = response.into_body();
-    let body = if raw.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&raw).unwrap_or(Value::Null)
-    };
-    Answer {
-        status,
-        error_type,
-        body,
-    }
+    call_as(router, access_key_id, "POST", &uri, None).await
 }
 
 /// The `expiration` of an answer as epoch seconds (restJson1 serialises a `Timestamp` as an
@@ -444,7 +360,7 @@ async fn the_refusal_states_iams_whole_sentence_including_the_resource_it_was_ju
     emulator.given_role();
     emulator.given_session(3_600);
 
-    let session_arn = format!("arn:aws:sts::{ACCOUNT}:assumed-role/{ROLE}/publish-session");
+    let session_arn = crate::harness::session_arn(ROLE, SESSION_NAME);
     let domain_arn = format!("arn:aws:codeartifact:{REGION}:{ACCOUNT}:domain/{domain}");
     let own_action = "codeartifact:GetAuthorizationToken";
     let bearer_action = "sts:GetServiceBearerToken";

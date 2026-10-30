@@ -218,6 +218,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The authorization decision this call takes before anything is read or written: see
+        // [`crate::service::authorization`] for the rule and the callers it does not bound.
+        // A copy addresses TWO repositories — it reads the source and writes the
+        // destination — so the action is authorized on each of them.
+        for repository in [&input.source_repository, &input.destination_repository] {
+            crate::service::authorization::authorize_repository_action(
+                &*self.engine,
+                ctx,
+                Self::NAME,
+                &input.domain,
+                input.domain_owner.as_deref(),
+                repository,
+            )
+            .map_err(CopyPackageVersionsErrorModeled::AccessDeniedException)?;
+        }
+
         // The store's own work holds this service's lock and contains no await, so the
         // guard cannot outlive it: a lock over state shared between requests must not be
         // held across the announcement below.

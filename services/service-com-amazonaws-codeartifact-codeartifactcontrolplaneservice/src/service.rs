@@ -54,8 +54,13 @@
 //!   asset records the control plane writes.
 //! - [`npm_manifest`] — the one reading of an npm metadata document, which is where every
 //!   member this service reports off one comes from.
+//! - [`authorization`] — whether IAM lets the caller perform a CodeArtifact action on a
+//!   repository, the decision every control-plane operation addressing one takes before it
+//!   answers.
 //! - [`token_authorization`] — whether IAM lets the caller mint a repository bearer
 //!   credential, which `GetAuthorizationToken` takes before anything is minted.
+
+pub mod authorization;
 
 pub mod npm_manifest;
 

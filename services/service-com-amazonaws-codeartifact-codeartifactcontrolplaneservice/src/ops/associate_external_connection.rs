@@ -169,8 +169,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The authorization decision this call takes before anything is read or written: see
+        // [`crate::service::authorization`] for the rule and the callers it does not bound.
+        crate::service::authorization::authorize_repository_action(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.domain,
+            input.domain_owner.as_deref(),
+            &input.repository,
+        )
+        .map_err(AssociateExternalConnectionErrorModeled::AccessDeniedException)?;
         // `externalConnection` is modelled as a free string, so the boundary validator has
         // only checked its length and pattern: whether it NAMES a registry CodeArtifact
         // can connect to is this handler's check, and its package format comes from the

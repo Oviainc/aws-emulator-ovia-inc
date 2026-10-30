@@ -170,6 +170,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The authorization decision this call takes before anything is read or written: see
+        // [`crate::service::authorization`] for the rule and the callers it does not bound.
+        crate::service::authorization::authorize_repository_action(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.domain,
+            input.domain_owner.as_deref(),
+            &input.repository,
+        )
+        .map_err(DeletePackageErrorModeled::AccessDeniedException)?;
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
         let _ = (&input, ctx, &self.engine);

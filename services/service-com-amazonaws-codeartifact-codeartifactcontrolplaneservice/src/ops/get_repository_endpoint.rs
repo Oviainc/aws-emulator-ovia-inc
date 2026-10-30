@@ -10,6 +10,12 @@
 //! repository this service does not hold is answered with `ResourceNotFoundException`
 //! rather than with a URL. Reporting only: this operation writes nothing.
 //!
+//! It is an AUTHORIZED read: the decision whether the caller may perform
+//! `codeartifact:GetRepositoryEndpoint` on the addressed repository is taken ahead of
+//! everything else ([`crate::service::authorization`]), so a principal allowed by neither its
+//! own identity policies nor the repository's permissions policy is refused with
+//! `AccessDeniedException` (403) instead of being handed the endpoint.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -159,6 +165,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // An authorized control-plane read: the caller may discover this repository's
+        // endpoint only where its own identity policies or the repository's own permissions
+        // policy allows this action on it ([`crate::service::authorization`]). Decided from
+        // the names the REQUEST carries, before the store is read, so a refused caller
+        // learns nothing about whether the repository exists.
+        crate::service::authorization::authorize_repository_action(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.domain,
+            input.domain_owner.as_deref(),
+            &input.repository,
+        )
+        .map_err(GetRepositoryEndpointErrorModeled::AccessDeniedException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetRepositoryEndpointErrorModeled::InternalServerException(
                 InternalServerException {
