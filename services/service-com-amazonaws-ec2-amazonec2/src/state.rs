@@ -690,7 +690,15 @@
 //! that due instant is a fact the modelled [`IpamPool`] carries no member for, so it lives
 //! beside the pool under the same id in
 //! [`ComAmazonawsEc2Amazonec2State::ipam_pool_create_complete_at`], the way a `pending`
-//! VPC's does. A scope `CreateIpamScope` creates is the same story one level up: it is
+//! VPC's does. The other end of the same pool's life is kept the same way: a pool
+//! `DeleteIpamPool` left `delete-in-progress`
+//! ([`ComAmazonawsEc2Amazonec2State::begin_ipam_pool_deletion`]) is owed `delete-complete`
+//! through [`ComAmazonawsEc2Amazonec2State::ipam_pool_delete_complete_at`], and the pools
+//! within it ([`ComAmazonawsEc2Amazonec2State::ipam_pools_within`]) and the CIDRs
+//! provisioned to it ([`ComAmazonawsEc2Amazonec2State::ipam_pool_provisioned_cidrs`]) are
+//! what that delete is held against; the scope that held it stops counting it
+//! (`IpamScope$PoolCount`). A scope `CreateIpamScope` creates is the same story one level
+//! up: it is
 //! answered in the non-terminal `create-in-progress` `IpamScopeState` and its due instant
 //! lives in [`ComAmazonawsEc2Amazonec2State::ipam_scope_create_complete_at`] — the two
 //! DEFAULT scopes an IPAM comes up with are not listed there, because the one entry
@@ -3794,6 +3802,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// `pending` VPC's `available` move, on the same monotonic clock and the same
     /// [`TRANSITION_DELAY`]. [`Self::materialize_due_transitions`] applies it.
     pub ipam_pool_create_complete_at: BTreeMap<String, Instant>,
+    /// When a `delete-in-progress` IPAM pool's move to `delete-complete` falls due, by
+    /// `IpamPoolId` — the counterpart of [`Self::ipam_pool_create_complete_at`] for the other
+    /// end of a pool's life, on the same monotonic clock and the same [`TRANSITION_DELAY`],
+    /// and applied by the same [`Self::materialize_due_transitions`].
+    pub ipam_pool_delete_complete_at: BTreeMap<String, Instant>,
     /// A `CreateIpamPool` `ClientToken` and the `IpamPoolId` that call minted, so a replay
     /// of the same request answers with that pool instead of creating a second one: "a
     /// unique, case-sensitive identifier that you provide to ensure the idempotency of the
@@ -4241,6 +4254,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             ipam_scope_create_complete_at: BTreeMap::new(),
             ipam_scope_client_tokens: HashMap::new(),
             ipam_pool_create_complete_at: BTreeMap::new(),
+            ipam_pool_delete_complete_at: BTreeMap::new(),
             ipam_pool_client_tokens: HashMap::new(),
             ipam_internet_registry_associations: BTreeMap::new(),
             ipam_routing_policy_registration_deltas: BTreeMap::new(),
@@ -7317,6 +7331,21 @@ impl ComAmazonawsEc2Amazonec2State {
                 }
             }
             // The transition is applied once; nothing is owed on this pool any more.
+            false
+        });
+        // A pool `DeleteIpamPool` answered as `delete-in-progress` reaches `delete-complete`
+        // once its due instant has passed, whether or not anybody called — the other end of
+        // the same pool's life, owed and applied exactly as its creation was above.
+        let ipam_pools = &mut self.ipam_pools;
+        self.ipam_pool_delete_complete_at.retain(|pool_id, due_at| {
+            if now < *due_at {
+                return true;
+            }
+            if let Some(pool) = ipam_pools.get_mut(pool_id) {
+                if pool.state.as_deref() == Some(IPAM_POOL_STATE_DELETE_IN_PROGRESS) {
+                    pool.state = Some(IPAM_POOL_STATE_DELETE_COMPLETE.to_string());
+                }
+            }
             false
         });
         // An IPAM scope `CreateIpamScope` answered as `create-in-progress` reaches
@@ -30864,6 +30893,25 @@ pub const IPAM_POOL_STATE_CREATE_IN_PROGRESS: &str = "create-in-progress";
 /// [`TRANSITION_DELAY`] after the call that created it.
 pub const IPAM_POOL_STATE_CREATE_COMPLETE: &str = "create-complete";
 
+/// A pool whose deletion has been asked for and has not settled yet: the `IpamPoolState`
+/// enum's `delete-in-progress` member, the TRANSIENT state a delete answers with.
+pub const IPAM_POOL_STATE_DELETE_IN_PROGRESS: &str = "delete-in-progress";
+
+/// A pool whose deletion has settled: that same enum's `delete-complete` member, which the
+/// clock owes every pool a delete has started on, one [`TRANSITION_DELAY`] later.
+pub const IPAM_POOL_STATE_DELETE_COMPLETE: &str = "delete-complete";
+
+/// Whether a pool in `state` has already had its deletion asked for: it is either still
+/// [`IPAM_POOL_STATE_DELETE_IN_PROGRESS`] or already [`IPAM_POOL_STATE_DELETE_COMPLETE`],
+/// and in neither is there a pool left to delete.
+///
+/// The ONE definition of "is this pool on its way out", so the delete path, the pools-within
+/// walk and the scope's pool count all read a pool's way out the same way.
+pub fn ipam_pool_is_deleting(pool: &IpamPool) -> bool {
+    let state = pool.state.as_deref().unwrap_or_default();
+    state == IPAM_POOL_STATE_DELETE_IN_PROGRESS || state == IPAM_POOL_STATE_DELETE_COMPLETE
+}
+
 /// The `IpamPoolPublicIpSource` a public-scope pool gets when the request names none:
 /// "Default is byoip" (`CreateIpamPoolRequest$PublicIpSource`).
 pub const IPAM_POOL_PUBLIC_IP_SOURCE_BYOIP: &str = "byoip";
@@ -31399,17 +31447,18 @@ impl ComAmazonawsEc2Amazonec2State {
 
     /// Store an IPAM pool and answer the `IpamPoolId` it was given — or `None` when the
     /// store is at its ceiling and nothing was stored.
+    ///
+    /// "The Amazon Resource Name (ARN) of the IPAM pool" (`IpamPool$IpamPoolArn`) is built by
+    /// the one writer of every IPAM-family ARN ([`ipam_resource_arn`]), so a pool's ARN is
+    /// spelled the way the scope's and the IPAM's own are — with an EMPTY Region segment, the
+    /// pool's Region being reported in `IpamPool$IpamRegion` instead.
     pub fn insert_ipam_pool(&mut self, mut view: IpamPool) -> Option<String> {
         if !self.has_ipam_pool_capacity() {
             return None;
         }
         let pool_id = self.next_id(IPAM_POOL_ID_PREFIX);
         view.ipam_pool_id = Some(pool_id.clone());
-        view.ipam_pool_arn = Some(::engine::emulator_arn(
-            "ec2",
-            view.ipam_region.as_deref().unwrap_or(DEFAULT_REGION),
-            &format!("{RESOURCE_TYPE_IPAM_POOL}/{pool_id}"),
-        ));
+        view.ipam_pool_arn = Some(ipam_resource_arn(RESOURCE_TYPE_IPAM_POOL, &pool_id));
         self.add_stored_bytes(
             STORED_RECORD_OVERHEAD_BYTES
                 + tag_list_bytes(view.tags.as_deref().unwrap_or_default())
@@ -31566,6 +31615,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// then leave the scope claiming a pool count the store does not hold. A pool names its
     /// scope by `IpamScopeArn` (the modelled [`IpamPool`] carries no scope id at all), which
     /// is what the pools of this scope are counted by.
+    ///
+    /// A pool whose deletion has been asked for ([`ipam_pool_is_deleting`]) is not one of
+    /// them: the record stays in the store so its state can still be reported, but the scope
+    /// no longer HOLDS it, so a delete recounts the scope exactly as a create does.
     fn recount_ipam_scope_pools(&mut self, scope_id: &str) {
         let Some(scope_arn) = self
             .ipam_scopes
@@ -31577,11 +31630,132 @@ impl ComAmazonawsEc2Amazonec2State {
         let pools = self
             .ipam_pools
             .values()
-            .filter(|pool| pool.ipam_scope_arn.as_deref() == Some(scope_arn.as_str()))
+            .filter(|pool| {
+                pool.ipam_scope_arn.as_deref() == Some(scope_arn.as_str())
+                    && !ipam_pool_is_deleting(pool)
+            })
             .count();
         if let Some(scope) = self.ipam_scopes.get_mut(scope_id) {
             scope.pool_count = i32::try_from(pools).ok();
         }
+    }
+
+    /// The `IpamScopeId` of the scope the pool `pool_id` lives in, found by the `IpamScopeArn`
+    /// the pool names it by — the modelled [`IpamPool`] carries no scope id at all.
+    fn ipam_scope_id_of_pool(&self, pool_id: &str) -> Option<String> {
+        let scope_arn = self.ipam_pools.get(pool_id)?.ipam_scope_arn.clone()?;
+        self.ipam_scopes
+            .iter()
+            .find(|(_, scope)| scope.ipam_scope_arn.as_deref() == Some(scope_arn.as_str()))
+            .map(|(scope_id, _)| scope_id.clone())
+    }
+
+    /// The pools created WITHIN the pool `pool_id` names, deepest first, excluding any whose
+    /// own deletion has already been asked for.
+    ///
+    /// "The ID of the source IPAM pool. You can use this option to create an IPAM pool within
+    /// an existing source pool" (`IpamPool$SourceIpamPoolId`) is what makes one pool a pool
+    /// inside another, so the tree is walked by that member — transitively, because a pool
+    /// inside a pool inside this one is still "within that pool"
+    /// (`DeleteIpamPoolRequest$Cascade`). Deepest first, so a caller acting on the answer
+    /// deletes a child before its parent.
+    ///
+    /// Each pool is visited once, so the walk is bounded by the number of pools the store
+    /// holds ([`MAX_STORED_RECORDS_PER_STORE`]) however the `SourceIpamPoolId` members point
+    /// at one another.
+    pub fn ipam_pools_within(&self, pool_id: &str) -> Vec<String> {
+        let mut frontier = vec![pool_id.to_string()];
+        let mut seen: BTreeSet<String> = BTreeSet::from([pool_id.to_string()]);
+        let mut within: Vec<String> = Vec::new();
+        while let Some(parent) = frontier.pop() {
+            for child in self
+                .ipam_pools
+                .iter()
+                .filter(|(_, pool)| {
+                    pool.source_ipam_pool_id.as_deref() == Some(parent.as_str())
+                        && !ipam_pool_is_deleting(pool)
+                })
+                .map(|(child_id, _)| child_id.clone())
+            {
+                if !seen.insert(child.clone()) {
+                    continue;
+                }
+                frontier.push(child.clone());
+                within.push(child);
+            }
+        }
+        // The walk above appends a parent before its own children, so reversing it answers
+        // the deepest pools first.
+        within.reverse();
+        within
+    }
+
+    /// The CIDRs provisioned to the pool `pool_id` names, as the store spells each range.
+    ///
+    /// A BYOIP address range IPAM manages names the pool managing it
+    /// (`ByoipCidr$IpamPoolId`), which `MoveByoipCidrToIpam` is what writes, so those ranges
+    /// are the CIDRs provisioned to a pool that "you cannot delete an IPAM pool if there are
+    /// … provisioned to it" (`DeleteIpamPool`) speaks of. They are the only ones the store
+    /// holds today; whoever implements `ProvisionIpamPoolCidr` should answer its records from
+    /// here too, so the one reader of "what is provisioned to this pool" keeps covering all
+    /// of them.
+    pub fn ipam_pool_provisioned_cidrs(&self, pool_id: &str) -> Vec<String> {
+        self.byoip_cidrs
+            .iter()
+            .filter(|(_, record)| record.byoip_cidr.ipam_pool_id.as_deref() == Some(pool_id))
+            .map(|(cidr, _)| cidr.clone())
+            .collect()
+    }
+
+    /// Deprovision every CIDR provisioned to the pool `pool_id` names, and answer how many
+    /// ranges that was.
+    ///
+    /// The inverse of the move that provisioned them: a range stops being managed by this
+    /// pool (`ByoipCidr$IpamPoolId`) and is in no public IPv4 pool either
+    /// (`ByoipCidr$PoolId`), so it is once again a range the account holds outside IPAM. Its
+    /// own state is untouched — a range that was being advertised goes on being advertised —
+    /// exactly as `MoveByoipCidrToIpam` leaves it across the move in.
+    pub fn deprovision_ipam_pool_cidrs(&mut self, pool_id: &str) -> usize {
+        let provisioned = self.ipam_pool_provisioned_cidrs(pool_id);
+        for cidr in &provisioned {
+            if let Some(record) = self.byoip_cidrs.get_mut(cidr) {
+                record.byoip_cidr.ipam_pool_id = None;
+                record.byoip_cidr.pool_id = None;
+            }
+        }
+        provisioned.len()
+    }
+
+    /// Start deleting the IPAM pool `pool_id` names, and answer it as the store then holds it
+    /// — `None` when the account holds no such pool.
+    ///
+    /// "Delete an IPAM pool" is work AWS reports as under way: the `IpamPoolState` catalog
+    /// carries both `delete-in-progress` and `delete-complete`, so the pool is left in the
+    /// TRANSIENT state with the clock owing it the terminal one
+    /// ([`Self::ipam_pool_delete_complete_at`], applied by
+    /// [`Self::materialize_due_transitions`]) — the same arrangement, on the same clock, as
+    /// the `create-in-progress` the pool started in. The span is never zero, so a caller
+    /// acting straight after this call still sees `delete-in-progress`.
+    ///
+    /// The record STAYS in the store, because a pool in either delete state still has a state
+    /// to report ([`IPAM_POOL_STATE_DELETE_COMPLETE`]) — so its caller-chosen bytes stay
+    /// charged to the store's budget, which still holds them, the same arrangement as
+    /// [`Self::begin_ipam_policy_deletion`]. The scope it was in no longer HOLDS it, so its
+    /// "number of pools in the scope" is recounted exactly as a create recounts it.
+    pub fn begin_ipam_pool_deletion(&mut self, pool_id: &str) -> Option<IpamPool> {
+        let scope_id = self.ipam_scope_id_of_pool(pool_id);
+        let pool = self.ipam_pools.get_mut(pool_id)?;
+        pool.state = Some(IPAM_POOL_STATE_DELETE_IN_PROGRESS.to_string());
+        let view = pool.clone();
+        // A pool on its way out is not going to land in the state its creation was moving it
+        // to, so the delete supersedes whatever move was owed it.
+        self.ipam_pool_create_complete_at.remove(pool_id);
+        self.ipam_pool_delete_complete_at
+            .insert(pool_id.to_string(), Instant::now() + TRANSITION_DELAY);
+        if let Some(scope_id) = scope_id {
+            self.recount_ipam_scope_pools(&scope_id);
+        }
+        Some(view)
     }
 }
 

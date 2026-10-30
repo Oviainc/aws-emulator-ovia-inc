@@ -34,7 +34,8 @@ use ec2::state::{
     IPAM_POOL_STATE_CREATE_IN_PROGRESS, IPAM_SCOPE_TYPE_PRIVATE, IPAM_SCOPE_TYPE_PUBLIC,
     INVALID_IPAM_POOL_ID_MALFORMED, INVALID_IPAM_POOL_ID_NOT_FOUND,
     INVALID_IPAM_SCOPE_ID_MALFORMED, INVALID_IPAM_SCOPE_ID_NOT_FOUND, INVALID_PARAMETER_VALUE,
-    TOP_LEVEL_IPAM_POOL_DEPTH, TRANSITION_DELAY, canonical_byoip_cidr,
+    RESOURCE_TYPE_IPAM_POOL, TOP_LEVEL_IPAM_POOL_DEPTH, TRANSITION_DELAY, canonical_byoip_cidr,
+    ipam_resource_arn,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -312,11 +313,23 @@ async fn a_created_pool_reports_the_request_and_its_scope() {
         );
         // The members the SERVICE owns: the ARN carries the minted id, the pool names the
         // scope it was created in and that scope's IPAM and Region, and the owner is this
-        // emulator's account.
+        // emulator's account. An IPAM-family ARN carries an EMPTY Region segment — the
+        // pool's Region is reported in `IpamPool$IpamRegion` — so the expected ARN is spelled
+        // out here, independently of the writer that builds it, with the account segment
+        // taken from the emulator rather than written as a literal.
+        let expected_pool_arn = format!(
+            "arn:aws:ec2::{account}:{RESOURCE_TYPE_IPAM_POOL}/{pool_id}",
+            account = engine::emulator_account_id(),
+        );
         assert_eq!(
             element(&body, "ipamPoolArn").as_deref(),
-            Some(engine::emulator_arn("ec2", REGION, &format!("ipam-pool/{pool_id}")).as_str()),
+            Some(expected_pool_arn.as_str()),
             "case {case:?}: expected the pool's ARN to name {pool_id}, got {body}"
+        );
+        assert_eq!(
+            element(&body, "ipamPoolArn").as_deref(),
+            Some(ipam_resource_arn(RESOURCE_TYPE_IPAM_POOL, &pool_id).as_str()),
+            "case {case:?}: expected the ARN the one writer of an IPAM ARN builds, got {body}"
         );
         assert_eq!(
             element(&body, "ipamScopeArn").as_deref(),

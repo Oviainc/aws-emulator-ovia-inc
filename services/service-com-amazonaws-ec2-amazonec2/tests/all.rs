@@ -588,6 +588,10 @@ mod ipam_internet_registry_association_reports;
 mod ipam_policies;
 #[path = "all/ipam_pools.rs"]
 mod ipam_pools;
+// Deleting an IPAM pool, what it refuses while the pool still holds resources, and what
+// `Cascade` takes with it.
+#[path = "all/ipam_pool_deletion.rs"]
+mod ipam_pool_deletion;
 // Creating one further IPAM scope in an IPAM, and reading the account's scopes back.
 #[path = "all/ipam_scopes.rs"]
 mod ipam_scopes;
