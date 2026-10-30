@@ -69,3 +69,5 @@ mod region_opt_target_rule;
 mod state_roundtrip;
 #[path = "all/unknown_account_refusal.rs"]
 mod unknown_account_refusal;
+#[path = "all/validation_field_list_names_the_member.rs"]
+mod validation_field_list_names_the_member;

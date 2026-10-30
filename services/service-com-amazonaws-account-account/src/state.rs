@@ -1704,6 +1704,10 @@ pub fn invalid_alternate_contact_type(value: &str) -> ValidationException {
     }
 }
 
+/// The Smithy member the Region operations take their Region code in, which a
+/// refusal about that code names in its `fieldList`.
+pub const REGION_NAME_MEMBER: &str = "RegionName";
+
 /// The `ValidationException` payload for a `RegionName` that is not a Region
 /// code of this partition.
 ///
@@ -1713,10 +1717,12 @@ pub fn invalid_alternate_contact_type(value: &str) -> ValidationException {
 /// names the member, so the caller can see which input was rejected.
 pub fn unknown_region(region_name: &str) -> ValidationException {
     ValidationException {
-        message: format!("RegionName {region_name:?} is not an Amazon Web Services Region code"),
+        message: format!(
+            "{REGION_NAME_MEMBER} {region_name:?} is not an Amazon Web Services Region code"
+        ),
         reason: Some(FIELD_VALIDATION_FAILED.to_string()),
         field_list: Some(vec![ValidationExceptionField {
-            name: "RegionName".to_string(),
+            name: REGION_NAME_MEMBER.to_string(),
             message: format!("{region_name:?} is not an Amazon Web Services Region code"),
         }]),
     }
@@ -1726,14 +1732,23 @@ pub fn unknown_region(region_name: &str) -> ValidationException {
 /// out of: it is enabled by default, so it is not a Region-opt target.
 ///
 /// `reason` is `invalidRegionOptTarget` — the `ValidationExceptionReason` value
-/// that exists for exactly this refusal.
+/// that exists for exactly this refusal — and `fieldList` names the member the
+/// refusal is ABOUT, which is "the field where the invalid entry was detected":
+/// this request is turned away on its `RegionName` alone, before anything else
+/// about it is looked at, exactly as the sibling refusal of the same member is
+/// ([`unknown_region`]). Which `reason` a refusal carries says why the member is
+/// wrong, not whether a member is at fault, so the two refusals of one member
+/// report that member alike.
 pub fn region_not_opt_target(region_name: &str) -> ValidationException {
+    let stated =
+        format!("Region {region_name} is enabled by default and cannot be enabled or disabled");
     ValidationException {
-        message: format!(
-            "Region {region_name} is enabled by default and cannot be enabled or disabled"
-        ),
+        message: stated.clone(),
         reason: Some(INVALID_REGION_OPT_TARGET.to_string()),
-        field_list: None,
+        field_list: Some(vec![ValidationExceptionField {
+            name: REGION_NAME_MEMBER.to_string(),
+            message: stated,
+        }]),
     }
 }
 
