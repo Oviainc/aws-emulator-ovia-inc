@@ -6,9 +6,9 @@
 //! a key the rule does not carry is appended, and a key it already carries
 //! keeps its position and takes the new value, so the stored list holds at most
 //! one entry per key. A `ruleRevision` other than the rule's current one is
-//! refused with `InvalidParameterValueException` (400), as is a request naming
-//! the same key twice, a key in the reserved tag namespace
-//! (`state::tag_keys_violation`) and an addition that
+//! refused with `InvalidParameterValueException` (400), as is a tag list
+//! `state::tag_list_violation` refuses — one naming the same key twice, or a key
+//! in the reserved tag namespace — and an addition that
 //! would leave the rule holding more than `state::MAX_TAGS_PER_RESOURCE` tags;
 //! an ARN no rule has is `ResourceNotFoundException` (404). Tagging is not a
 //! rule revision, so the same request may be repeated — the operation is
@@ -178,22 +178,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A tag list states one value per key, so a request naming the same key
-        // twice states two values for one tag. Refused ahead of the token ledger
-        // and of the store, so it consumes nothing and changes nothing. The same
-        // check the create path makes of the `tags` it stores.
-        if let Some(report) = crate::state::duplicate_tag_key_violation(&input.tags) {
+        // The whole judgement of the `tags` list this request carries, made in
+        // ONE place for every path that takes tags
+        // ([`crate::state::tag_list_violation`]): a list naming the same key
+        // twice states two values for one tag, and a key may be outside the
+        // form the model declares or inside the reserved namespace, which no
+        // modelled constraint can express. The rules are ordered there, so the
+        // create path refuses the same list with the same report. Refused ahead
+        // of the token ledger and of the store, so it consumes nothing and
+        // changes nothing.
+        if let Some(report) = crate::state::tag_list_violation(&input.tags) {
             return Err(invalid_parameter(report));
-        }
-
-        // `Tag$key` targets `TagKey`, so the boundary validator judged each
-        // key's FORM — but not the namespace it falls in, which no modelled
-        // constraint can express. Judged in the same place and for the same
-        // reason: a refused request adds no tag and consumes no client token.
-        if let Some(message) =
-            crate::state::tag_keys_violation(input.tags.iter().map(|tag| tag.key.as_str()))
-        {
-            return Err(invalid_parameter(message));
         }
 
         let mut probe = input.clone();
@@ -294,7 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// so a tag list holds at most one entry per key, in whatever order the
 /// additions arrive. `added` itself names each key at most once: a request that
 /// named one twice was refused above
-/// ([`crate::state::duplicate_tag_key_violation`]).
+/// ([`crate::state::tag_list_violation`]).
 fn merge_tags(stored: &[Tag], added: &[Tag]) -> Vec<Tag> {
     let mut merged = stored.to_vec();
     for tag in added {

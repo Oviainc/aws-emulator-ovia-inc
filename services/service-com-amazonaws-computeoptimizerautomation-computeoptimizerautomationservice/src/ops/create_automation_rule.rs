@@ -431,10 +431,11 @@ fn access_denied() -> CreateAutomationRuleError {
 ///   ([`crate::state::criteria_violation`]), which is what the preview
 ///   operations refuse the same value set with: a rule whose criteria can never
 ///   be previewed or evaluated is not a rule this service could run.
-/// * `tags` — one request may not name the same tag key twice
-///   ([`crate::state::duplicate_tag_key_violation`]), and no key may be one a
-///   caller may not supply ([`crate::state::tag_keys_violation`]), which is
-///   what the tagging operations refuse the same key with.
+/// * `tags` — the whole judgement of a caller-supplied tag list
+///   ([`crate::state::tag_list_violation`]): one request may not name the same
+///   tag key twice, and no key may be one a caller may not supply. The rules
+///   are ordered THERE, not here, so the tagging operations refuse the same
+///   list with the same report.
 ///
 /// Every clause runs BEFORE the store is touched, so a refused create leaves
 /// the store exactly as it was.
@@ -468,11 +469,6 @@ fn invalid_parameter(input: &CreateAutomationRuleInput) -> Option<String> {
     if let Some(report) = crate::state::schedule_violation(&input.schedule) {
         return Some(report);
     }
-    if let Some(report) =
-        crate::state::tag_keys_violation(input.tags.iter().flatten().map(|tag| tag.key.as_str()))
-    {
-        return Some(report);
-    }
     if let Some(report) = input
         .criteria
         .as_ref()
@@ -483,5 +479,5 @@ fn invalid_parameter(input: &CreateAutomationRuleInput) -> Option<String> {
     input
         .tags
         .as_deref()
-        .and_then(crate::state::duplicate_tag_key_violation)
+        .and_then(crate::state::tag_list_violation)
 }

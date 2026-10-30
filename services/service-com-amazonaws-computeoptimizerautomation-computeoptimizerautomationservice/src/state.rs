@@ -2828,6 +2828,24 @@ pub fn duplicate_tag_key_violation(tags: &[Tag]) -> Option<String> {
     None
 }
 
+/// Why this caller-supplied `tags` list cannot be applied as sent, if it cannot
+/// — the WHOLE judgement of a `tags` list, for every operation that takes one.
+///
+/// A list is judged by both rules this service owns over a `tags` member, in ONE
+/// order: first the list as a whole ([`duplicate_tag_key_violation`] — a list
+/// naming one key twice is not a tag map at all), then each key in the order the
+/// request states them ([`tag_keys_violation`] — a key outside the modelled form,
+/// or inside the provider's reserved namespace). Ordering the rules HERE instead
+/// of in each handler is what makes a list that breaks more than one of them
+/// refused with one and the same report whichever operation received it: two
+/// handlers applying the same two rules in opposite orders word the same refusal
+/// differently, which is exactly what single-homing the wording in this module is
+/// for.
+pub fn tag_list_violation(tags: &[Tag]) -> Option<String> {
+    duplicate_tag_key_violation(tags)
+        .or_else(|| tag_keys_violation(tags.iter().map(|tag| tag.key.as_str())))
+}
+
 /// Why this `recommendedActionTypes` list cannot drive a rule, if it cannot.
 ///
 /// The list names the action types the rule may execute, so an empty one selects
