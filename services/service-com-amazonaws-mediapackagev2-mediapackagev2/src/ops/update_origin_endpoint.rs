@@ -33,7 +33,15 @@
 //! * a `StreamNameOutputMode` named for an endpoint whose parent channel's `InputType` may
 //!   not carry the member at all
 //!   (`ONLY_HLS_INPUT_TYPE_ALLOW_STREAM_NAME_OUTPUT_MODE`), off the same rule the create
-//!   reads ([`crate::state::stream_name_output_mode_input_type_violation`]).
+//!   reads ([`crate::state::stream_name_output_mode_input_type_violation`]);
+//! * a manifest set that would stop publishing a manifest one of the endpoint's own
+//!   harvest jobs is still harvesting — a 409 `ConflictException` / `RESOURCE_IN_USE`
+//!   ([`crate::state::harvested_manifest_in_use`]), because the stored job's
+//!   `HarvestedManifests` reference the endpoint's manifests by name and the write would
+//!   leave that reference pointing at nothing; the reference is resolved through the same
+//!   predicate `CreateHarvestJob` refuses to establish a dangling one with
+//!   ([`crate::state::names_unpublished_manifest`]), and a job in a status it can no
+//!   longer leave holds no such reference.
 //!
 //! A group, channel or endpoint that does not resolve is a `ResourceNotFoundException`.
 //!
@@ -510,33 +518,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             channel: &channel_name,
             endpoint: &input.origin_endpoint_name,
         };
-        // What the endpoint was before this request wrote anything, so the commit below
-        // can tell a real change from an update that stores what was already there.
-        let before = endpoint.configuration_fingerprint();
-        endpoint.hls_manifests = input
+        // The manifest set this update would leave the endpoint publishing, materialised
+        // before anything is written so the rule below can read it: an update carries the
+        // WHOLE set, so a family the request omits ends up empty.
+        let hls_manifests: Vec<_> = input
             .hls_manifests
             .unwrap_or_default()
             .into_iter()
             .map(|manifest| crate::state::stored_hls_manifest(manifest, at))
             .collect();
-        endpoint.low_latency_hls_manifests = input
+        let low_latency_hls_manifests: Vec<_> = input
             .low_latency_hls_manifests
             .unwrap_or_default()
             .into_iter()
             .map(|manifest| crate::state::stored_low_latency_hls_manifest(manifest, at))
             .collect();
-        endpoint.dash_manifests = input
+        let dash_manifests: Vec<_> = input
             .dash_manifests
             .unwrap_or_default()
             .into_iter()
             .map(|manifest| crate::state::stored_dash_manifest(manifest, at))
             .collect();
-        endpoint.mss_manifests = input
+        let mss_manifests: Vec<_> = input
             .mss_manifests
             .unwrap_or_default()
             .into_iter()
             .map(|manifest| crate::state::stored_mss_manifest(manifest, at))
             .collect();
+
+        let now = crate::state::now();
+        // The status each of the endpoint's harvest jobs HAS at this instant is what the
+        // rule below is about, so the transitions the clock already owed them are
+        // materialised first — each was due at the same instant whether or not this
+        // update arrived, exactly as the reporting operations materialise them.
+        for job in endpoint.harvest_jobs.values_mut() {
+            job.materialise_due_transitions(now);
+        }
+        // A harvest job of this endpoint that has not finished harvests the manifests it
+        // named, and those names resolve against the manifests the endpoint publishes —
+        // the reference `CreateHarvestJob` refuses to establish against a manifest that is
+        // not published. An update that stopped publishing one of them would leave that
+        // reference pointing at nothing, which is the inconsistent state the model's
+        // `ConflictException` describes, so the replacement set is judged against the
+        // stored jobs through the same predicate the create reads and the endpoint is left
+        // exactly as it was.
+        if crate::state::harvest_job_harvests_unpublished_manifest(
+            endpoint,
+            crate::state::PublishedManifests {
+                hls: &hls_manifests,
+                low_latency_hls: &low_latency_hls_manifests,
+                dash: &dash_manifests,
+            },
+        ) {
+            return Err(UpdateOriginEndpointErrorModeled::ConflictException(
+                crate::state::harvested_manifest_in_use(),
+            )
+            .into());
+        }
+        // What the endpoint was before this request wrote anything, so the commit below
+        // can tell a real change from an update that stores what was already there.
+        let before = endpoint.configuration_fingerprint();
+        endpoint.hls_manifests = hls_manifests;
+        endpoint.low_latency_hls_manifests = low_latency_hls_manifests;
+        endpoint.dash_manifests = dash_manifests;
+        endpoint.mss_manifests = mss_manifests;
         // An update carries the whole packaging configuration, so a member the request
         // omits is cleared rather than kept — except the ones the model says are preserved
         // when absent (`UriSeparator`: "If you don't specify a value in the update
@@ -575,7 +620,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already there changed nothing, so it commits nothing: neither the tag nor
         // `ModifiedAt` moves, and the tag the caller holds stays usable as the
         // precondition of the update it is entitled to make.
-        endpoint.commit_if_changed(&before, crate::state::now());
+        endpoint.commit_if_changed(&before, now);
 
         Ok(endpoint_output(endpoint))
     }

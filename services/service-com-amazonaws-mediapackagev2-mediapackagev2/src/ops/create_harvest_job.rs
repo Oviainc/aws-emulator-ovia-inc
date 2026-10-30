@@ -358,8 +358,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A harvest job exports manifests the endpoint actually publishes, so each
-        // requested manifest name is resolved against the endpoint's own manifests.
-        if names_unpublished_manifest(&input.harvested_manifests, endpoint) {
+        // requested manifest name is resolved against the endpoint's own manifests —
+        // through the ONE predicate that resolves this reference, which the update that
+        // would break it reads too.
+        if crate::state::names_unpublished_manifest(
+            &input.harvested_manifests,
+            endpoint.published_manifests(),
+        ) {
             return Err(CreateHarvestJobErrorModeled::ValidationException(
                 crate::state::validation_failed(
                     "harvestedManifests",
@@ -543,60 +548,3 @@ fn job_output(job: &crate::state::HarvestJobRecord) -> CreateHarvestJobOutput {
     }
 }
 
-/// Whether `requested` names any manifest `endpoint` does not publish.
-///
-/// A harvested manifest is addressed by the `ManifestName` the endpoint was created with,
-/// per family: HLS and low-latency HLS and DASH each have their own list on the endpoint,
-/// so each requested family is resolved against the matching one.
-///
-/// A PREDICATE rather than the offending name: what the caller is told is the rule it
-/// broke, so the name it sent is never needed outside this check.
-fn names_unpublished_manifest(
-    requested: &HarvestedManifests,
-    endpoint: &crate::state::OriginEndpoint,
-) -> bool {
-    /// The per-family rule, stated once: a requested name resolves only if the endpoint
-    /// publishes a manifest with that name in the SAME family. Both sides stay
-    /// iterators, so a family is walked only until a name fails to resolve.
-    fn any_unpublished<'a, Requested, Published>(
-        mut requested: Requested,
-        published: Published,
-    ) -> bool
-    where
-        Requested: Iterator<Item = &'a str>,
-        Published: Iterator<Item = &'a str> + Clone,
-    {
-        requested.any(|name| !published.clone().any(|known| known == name))
-    }
-    any_unpublished(
-        requested
-            .hls_manifests
-            .iter()
-            .flatten()
-            .map(|manifest| manifest.manifest_name.as_str()),
-        endpoint
-            .hls_manifests
-            .iter()
-            .map(|published| published.manifest_name.as_str()),
-    ) || any_unpublished(
-        requested
-            .low_latency_hls_manifests
-            .iter()
-            .flatten()
-            .map(|manifest| manifest.manifest_name.as_str()),
-        endpoint
-            .low_latency_hls_manifests
-            .iter()
-            .map(|published| published.manifest_name.as_str()),
-    ) || any_unpublished(
-        requested
-            .dash_manifests
-            .iter()
-            .flatten()
-            .map(|manifest| manifest.manifest_name.as_str()),
-        endpoint
-            .dash_manifests
-            .iter()
-            .map(|published| published.manifest_name.as_str()),
-    )
-}

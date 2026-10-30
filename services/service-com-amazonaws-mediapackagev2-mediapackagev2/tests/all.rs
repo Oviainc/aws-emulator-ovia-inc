@@ -130,3 +130,5 @@ mod channel_reset_removes_ingested_content;
 mod origin_endpoint_reset_content_scope;
 #[path = "all/harvest_job_modification_instant.rs"]
 mod harvest_job_modification_instant;
+#[path = "all/harvest_job_manifest_reference.rs"]
+mod harvest_job_manifest_reference;

@@ -1297,6 +1297,112 @@ impl OriginEndpoint {
         self.modified_at = at;
         self.etag = origin_endpoint_etag(self);
     }
+
+    /// The manifest names this endpoint publishes, in the families a harvest job can name
+    /// — the set a job's `HarvestedManifests` is resolved against.
+    pub fn published_manifests(&self) -> PublishedManifests<'_> {
+        PublishedManifests {
+            hls: &self.hls_manifests,
+            low_latency_hls: &self.low_latency_hls_manifests,
+            dash: &self.dash_manifests,
+        }
+    }
+}
+
+/// A set of published manifests, per harvestable family: what a harvest job's
+/// `HarvestedManifests` has to resolve against.
+///
+/// Borrowed rather than owned, so ONE predicate judges both the set an endpoint publishes
+/// now ([`OriginEndpoint::published_manifests`]) and the set a write is about to leave it
+/// publishing. The model's `HarvestedManifests` carries the HLS, low-latency HLS and DASH
+/// families only, so an endpoint's MSS manifests are not part of the set.
+#[derive(Debug, Clone, Copy)]
+pub struct PublishedManifests<'a> {
+    pub hls: &'a [GetHlsManifestConfiguration],
+    pub low_latency_hls: &'a [GetLowLatencyHlsManifestConfiguration],
+    pub dash: &'a [GetDashManifestConfiguration],
+}
+
+/// Whether `requested` names any manifest `published` does not carry.
+///
+/// A harvested manifest is addressed by the `ManifestName` the endpoint publishes it
+/// under, per family: HLS and low-latency HLS and DASH each have their own list, so each
+/// requested family is resolved against the matching one.
+///
+/// A PREDICATE rather than the offending name: what a caller is told is the rule that was
+/// broken, so the name it sent is never needed outside this check. The ONE place the
+/// reference between a harvest job and its endpoint's manifests is resolved — read by the
+/// create that establishes it ([`validation_failed`] with
+/// [`VALIDATION_HARVESTED_MANIFEST_NOT_FOUND_ON_ENDPOINT`]) and by the update that would
+/// break it ([`harvest_job_harvests_unpublished_manifest`]).
+pub fn names_unpublished_manifest(
+    requested: &HarvestedManifests,
+    published: PublishedManifests<'_>,
+) -> bool {
+    /// The per-family rule, stated once: a requested name resolves only if the same family
+    /// publishes a manifest with that name. Both sides stay iterators, so a family is
+    /// walked only until a name fails to resolve.
+    fn any_unpublished<'a, Requested, Published>(
+        mut requested: Requested,
+        published: Published,
+    ) -> bool
+    where
+        Requested: Iterator<Item = &'a str>,
+        Published: Iterator<Item = &'a str> + Clone,
+    {
+        requested.any(|name| !published.clone().any(|known| known == name))
+    }
+    any_unpublished(
+        requested
+            .hls_manifests
+            .iter()
+            .flatten()
+            .map(|manifest| manifest.manifest_name.as_str()),
+        published
+            .hls
+            .iter()
+            .map(|published| published.manifest_name.as_str()),
+    ) || any_unpublished(
+        requested
+            .low_latency_hls_manifests
+            .iter()
+            .flatten()
+            .map(|manifest| manifest.manifest_name.as_str()),
+        published
+            .low_latency_hls
+            .iter()
+            .map(|published| published.manifest_name.as_str()),
+    ) || any_unpublished(
+        requested
+            .dash_manifests
+            .iter()
+            .flatten()
+            .map(|manifest| manifest.manifest_name.as_str()),
+        published
+            .dash
+            .iter()
+            .map(|published| published.manifest_name.as_str()),
+    )
+}
+
+/// Whether a harvest job of `endpoint` that has NOT finished harvests a manifest the
+/// `replacement` manifest set would not publish — the stored cross-reference a write that
+/// replaces the endpoint's manifests would leave pointing at nothing.
+///
+/// Only a job that can still harvest holds such a reference: a job in a status it can no
+/// longer leave ([`HarvestJobRecord::is_terminal`]) is a record of work that is over, and
+/// the manifests it names are the ones it was harvesting rather than ones it still needs.
+/// Statuses the clock already owed are expected to have been materialised
+/// ([`HarvestJobRecord::materialise_due_transitions`]) before this is asked.
+pub fn harvest_job_harvests_unpublished_manifest(
+    endpoint: &OriginEndpoint,
+    replacement: PublishedManifests<'_>,
+) -> bool {
+    endpoint
+        .harvest_jobs
+        .values()
+        .filter(|job| !job.is_terminal())
+        .any(|job| names_unpublished_manifest(&job.harvested_manifests, replacement))
 }
 
 /// The shortest time a harvest job spends in each status it has yet to leave.
@@ -2724,6 +2830,27 @@ pub fn multiview_source_in_use() -> ConflictException {
              multiview channel in the same channel group. If you want to delete this \
              channel, you must first update the multiview channels that list it as an \
              available source"
+                .to_string(),
+        ),
+        conflict_exception_type: Some("RESOURCE_IN_USE".to_string()),
+    }
+}
+
+/// The 409 an update answers while a harvest job that has not finished still harvests a
+/// manifest the update would stop the origin endpoint publishing.
+///
+/// `RESOURCE_IN_USE`, the same discriminator [`children_attached`] and
+/// [`multiview_source_in_use`] use: a sub-resource that references the manifests is a use
+/// of them, and the write would leave that reference pointing at nothing. The sentence
+/// names what has to change first and, like every refusal here, neither the caller's names
+/// nor how many references there are.
+pub fn harvested_manifest_in_use() -> ConflictException {
+    ConflictException {
+        message: Some(
+            "The origin endpoint you tried to update publishes manifests that a harvest \
+             job which hasn't finished is harvesting. If you want to update this origin \
+             endpoint, you must first cancel the harvest jobs that harvest the manifests \
+             you're removing"
                 .to_string(),
         ),
         conflict_exception_type: Some("RESOURCE_IN_USE".to_string()),
