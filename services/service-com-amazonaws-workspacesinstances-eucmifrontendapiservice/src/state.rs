@@ -2356,10 +2356,18 @@ pub fn encode_next_token(resume_point: &str) -> String {
 /// a resume point the caller's list cannot name) is refused with
 /// [`invalid_next_token`] rather than guessed at. Both paginated operations that mint
 /// a token use this, so the scheme lives in one place.
+///
+/// Accepted ONLY when the token is byte for byte what [`encode_next_token`] mints for
+/// the resume point it carries: the decoder's acceptance set is the encoder's output
+/// set and nothing wider. `hex::decode` also reads spellings `hex::encode` never emits
+/// (uppercase and mixed-case digits), and those spell a token this service never issued,
+/// so re-minting the decoded resume point and comparing is what keeps the two exact
+/// inverses — whatever the encoding is.
 pub fn decode_next_token(token: &str) -> Option<String> {
-    hex::decode(token)
+    let resume_point = hex::decode(token)
         .ok()
-        .and_then(|raw| String::from_utf8(raw).ok())
+        .and_then(|raw| String::from_utf8(raw).ok())?;
+    (encode_next_token(&resume_point) == token).then_some(resume_point)
 }
 
 /// The modelled `ValidationException` (HTTP 400) for a `NextToken` this service did

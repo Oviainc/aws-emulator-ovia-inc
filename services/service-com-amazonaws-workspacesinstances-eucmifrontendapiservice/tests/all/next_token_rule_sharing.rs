@@ -130,7 +130,11 @@ fn token_rows() -> Vec<(String, String)> {
 
 /// The request bodies one token is presented in, so the refusal cannot turn on a page
 /// size or a filter: `operation` takes only the members its input models.
-fn requests(operation: &str, token: &str) -> Vec<Value> {
+///
+/// `pub(crate)`: the sibling suite that drives the spelling half of the same
+/// bad-`NextToken` rule presents its tokens in these very bodies, so the two cannot
+/// drift on what a token is presented in.
+pub(crate) fn requests(operation: &str, token: &str) -> Vec<Value> {
     let mut bodies = vec![
         json!({ "NextToken": token }),
         json!({ "NextToken": token, "MaxResults": 1 }),
