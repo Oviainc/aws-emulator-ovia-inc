@@ -82,11 +82,6 @@ use std::collections::BTreeSet;
 use super::types::*;
 use crate::state::CrossClusterSearchConnection;
 
-/// The largest page this operation answers with, and the page size a request that
-/// asks for none gets: `MaxResults` is `@range(max: 100)`, and the member's own
-/// documentation says "if not specified, defaults to 100".
-const MAX_PAGE: usize = 100;
-
 /// `Filter$Name` for the connection's own id.
 ///
 /// This and the four below are exactly the filter names the `Filters` member
@@ -220,29 +215,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // have shifted. A token that names no connection of THIS filtered set — one
         // this service never minted, or one carried over to a request with different
         // filters — names no such place, which is the modelled refusal.
-        let start = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => matching
+        let token = input.next_token.as_deref();
+        let Some(start) = crate::state::page_start(
+            matching
                 .iter()
-                .position(|connection| connection.connection_id == token)
-                .ok_or_else(|| {
-                    DescribeOutboundCrossClusterSearchConnectionsErrorModeled::InvalidPaginationTokenException(
-                        crate::state::invalid_pagination_token(token),
-                    )
-                })?,
+                .map(|connection| connection.connection_id.as_str()),
+            token,
+        ) else {
+            return Err(
+                DescribeOutboundCrossClusterSearchConnectionsErrorModeled::InvalidPaginationTokenException(
+                    crate::state::invalid_pagination_token(token.unwrap_or_default()),
+                )
+                .into(),
+            );
         };
 
-        // "Set this value to limit the number of results returned. If not specified,
-        // defaults to 100": the model defaults the member to 0, so a request that
-        // asks for no particular page size gets the whole page rather than none. The
-        // member declares no minimum, so a negative value also reaches here; it names
-        // no page size either, and the documented unspecified case is the only one
-        // the member defines, so it is answered the same way rather than refused.
-        let page_size = match usize::try_from(input.max_results) {
-            Ok(0) | Err(_) => MAX_PAGE,
-            Ok(size) => size.min(MAX_PAGE),
-        };
-        let end = start.saturating_add(page_size).min(matching.len());
+        let end = crate::state::page_end(start, input.max_results, matching.len());
 
         Ok(DescribeOutboundCrossClusterSearchConnectionsOutput {
             cross_cluster_search_connections: Some(

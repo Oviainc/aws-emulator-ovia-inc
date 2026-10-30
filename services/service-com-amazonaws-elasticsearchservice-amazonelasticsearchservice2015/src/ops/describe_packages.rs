@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePackages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePackages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePackages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the packages this store holds for the Region the call was signed for:
+//! every answer is the stored record's own `PackageDetails`, filtered and paged.
+//! A read, so nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +75,36 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::Package;
+
+use std::collections::BTreeSet;
+
+/// `DescribePackagesFilter$Name`'s `PackageID`.
+///
+/// This and the two below are exactly the members `DescribePackagesFilterName`
+/// declares, so a filter can name no other property.
+const FILTER_PACKAGE_ID: &str = "PackageID";
+
+/// `DescribePackagesFilter$Name`'s `PackageName`.
+const FILTER_PACKAGE_NAME: &str = "PackageName";
+
+/// `DescribePackagesFilter$Name`'s `PackageStatus`.
+const FILTER_PACKAGE_STATUS: &str = "PackageStatus";
+
+/// The most filters one request may carry.
+///
+/// An EMULATOR-IMPOSED cap, not a modelled constraint: `DescribePackagesFilterList`
+/// carries no `@length` trait, so nothing refuses an arbitrarily long filter list
+/// before this handler runs, and the scan below is linear in the filter count.
+/// It is well above the three filter names this operation has properties for, so
+/// no request a caller can mean is refused by it.
+const MAX_FILTERS: usize = 10;
+
+/// The most values one filter may carry — an emulator-imposed cap for the same
+/// reason: each filter's values become one set, so this bounds the set a package
+/// is looked up in. It is far above the number of packages the store can hold,
+/// so a filter enumerating every package a caller could have is inside it.
+const MAX_VALUES_PER_FILTER: usize = 1_000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -154,18 +178,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePackages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePackagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePackages"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        // A package is held by the control plane of the Region its create was
+        // signed for, so that is the set this call reports.
+        let region = crate::state::request_region(&ctx.parts().headers);
+        // The filters are bounded and compiled BEFORE the store is locked, so
+        // the work done while holding it is bounded by the caps above and by the
+        // store's own size rather than by how much a request asked for.
+        let filters = compile_filters(input.filters.unwrap_or_default())?;
+
+        let store = state.lock();
+        // Order-stable, because the store is keyed by package id: the same
+        // request reports the same order twice, which is what lets a token name
+        // a place in the set.
+        let matching: Vec<&Package> = store
+            .packages_in(&region)
+            .filter(|package| matches_every_filter(package, &filters, now))
+            .collect();
+
+        // A token names the package the next page starts at, so paging resumes
+        // from a place in the set rather than from an offset a later create
+        // would have shifted. A token that names no package of THIS filtered set
+        // names no place, which this operation models no pagination error for,
+        // so it is refused as invalid input.
+        let token = input.next_token.as_deref();
+        let Some(start) = crate::state::page_start(
+            matching.iter().map(|package| package.package_id.as_str()),
+            token,
+        ) else {
+            return Err(DescribePackagesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::invalid_pagination_token_message(
+                        token.unwrap_or_default(),
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let end = crate::state::page_end(start, input.max_results, matching.len());
+
+        Ok(DescribePackagesOutput {
+            package_details_list: Some(
+                matching[start..end]
+                    .iter()
+                    .map(|package| package.to_details(now))
+                    .collect(),
+            ),
+            // `NextToken` is "only necessary if a previous API call includes a
+            // non-null NextToken value": the token is the next package in the
+            // set, and there is none once this page ended it.
+            next_token: matching.get(end).map(|package| package.package_id.clone()),
+        })
+    }
+}
+
+/// One request filter as the scan uses it: the property it names, and the values
+/// that satisfy it as a SET, so testing a package against it costs one lookup
+/// rather than a walk of everything the request listed.
+struct CompiledFilter {
+    name: String,
+    values: BTreeSet<String>,
+}
+
+/// The request's filters, bounded and turned into [`CompiledFilter`]s once per
+/// request.
+///
+/// A filter list or a value list past the caps is refused with the modelled 400
+/// `ValidationException`, naming the cap as the emulator's own, rather than
+/// scanned: the caps are what keep the scan's comparison count bounded.
+fn compile_filters(
+    filters: Vec<DescribePackagesFilter>,
+) -> Result<Vec<CompiledFilter>, DescribePackagesError> {
+    if filters.len() > MAX_FILTERS {
+        return Err(DescribePackagesErrorModeled::ValidationException(ValidationException {
+            message: Some(format!(
+                "Filters carries {count} filters, which is more than the {MAX_FILTERS} this \
+                 emulator matches in one request",
+                count = filters.len()
+            )),
+        })
+        .into());
+    }
+    filters
+        .into_iter()
+        .map(|filter| {
+            let values = filter.value.unwrap_or_default();
+            if values.len() > MAX_VALUES_PER_FILTER {
+                return Err(DescribePackagesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "Filters.Value carries {count} values for filter {name}, which is \
+                             more than the {MAX_VALUES_PER_FILTER} this emulator matches per \
+                             filter",
+                            count = values.len(),
+                            name = filter.name.clone().unwrap_or_default()
+                        )),
+                    },
+                )
+                .into());
+            }
+            Ok(CompiledFilter {
+                name: filter.name.unwrap_or_default(),
+                values: values.into_iter().collect(),
+            })
+        })
+        .collect()
+}
+
+/// Whether `package` is reported under `filters`.
+///
+/// A package must match EVERY filter given, and each filter carries "a non-empty
+/// list of values for the specified field", so the values within one filter are
+/// alternatives and the filters themselves are cumulative. A filter naming a
+/// property a package has no value for matches nothing.
+fn matches_every_filter(
+    package: &Package,
+    filters: &[CompiledFilter],
+    now: ::std::time::SystemTime,
+) -> bool {
+    filters.iter().all(|filter| {
+        filtered_property(package, &filter.name, now)
+            .is_some_and(|actual| filter.values.contains(&actual))
+    })
+}
+
+/// The value of the package property `name` filters on, or `None` when this
+/// operation filters on no such property.
+fn filtered_property(
+    package: &Package,
+    name: &str,
+    now: ::std::time::SystemTime,
+) -> Option<String> {
+    match name {
+        FILTER_PACKAGE_ID => Some(package.package_id.clone()),
+        FILTER_PACKAGE_NAME => Some(package.package_name.clone()),
+        FILTER_PACKAGE_STATUS => Some(package.status(now).to_string()),
+        _ => None,
     }
 }

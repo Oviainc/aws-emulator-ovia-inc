@@ -15,8 +15,9 @@
 //!    and is stamped with the domain's new config version; an option it omits
 //!    keeps both its value and its version.
 //! 4. `DryRun` persists nothing.
-//! 5. A name that exists cannot be created again; a name that does not exist is
-//!    not found by any of the per-domain operations.
+//! 5. A create naming a name that exists answers from the stored record and
+//!    changes nothing; a name that does not exist is not found by any of the
+//!    per-domain operations.
 //! 6. A deleted domain leaves every read.
 //! 7. A created domain is `Processing` for a non-zero span and then settles,
 //!    without any read changing what the next read sees.
@@ -637,10 +638,10 @@ async fn a_dry_run_update_persists_nothing() {
     }
 }
 
-/// RULE 5a: a name that already exists cannot be created again, and the losing
-/// request changes nothing.
+/// RULE 5a: a create naming a domain that already exists is the SAME create
+/// again — it answers 200 from the stored record and changes nothing.
 #[tokio::test]
-async fn creating_an_existing_domain_name_conflicts_and_changes_nothing() {
+async fn creating_an_existing_domain_name_echoes_the_stored_domain_and_changes_nothing() {
     let router = router();
     let name = "taken-domain";
     let first = create(&router, &merge_baseline(name)).await;
@@ -660,18 +661,36 @@ async fn creating_an_existing_domain_name_conflicts_and_changes_nothing() {
                 "ElasticsearchClusterConfig": {"InstanceType": "r5.large.elasticsearch", "InstanceCount": 9}
             }),
         ),
+        (
+            "only the required name",
+            json!({"DomainName": name}),
+        ),
     ] {
         let again = create(&router, &body).await;
         assert_eq!(
-            again.status, 409,
-            "case {label:?}: a duplicate create must be refused with 409, got {} {}",
+            again.status, 200,
+            "case {label:?}: a repeated create must answer 200, got {} {}",
             again.status, again.body
         );
-        assert!(
-            again.error_type.contains("ResourceAlreadyExistsException"),
-            "case {label:?}: the error must be ResourceAlreadyExistsException, got {:?} / {}",
-            again.error_type,
-            again.body
+        assert_eq!(
+            again.body.pointer("/DomainStatus/ElasticsearchClusterConfig"),
+            first
+                .body
+                .pointer("/DomainStatus/ElasticsearchClusterConfig"),
+            "case {label:?}: a repeated create must report the FIRST call's cluster config, got {:?}",
+            again.body.pointer("/DomainStatus/ElasticsearchClusterConfig")
+        );
+        assert_eq!(
+            again.body.pointer("/DomainStatus/ElasticsearchVersion"),
+            Some(&json!("7.10")),
+            "case {label:?}: a repeated create must report the stored version, got {:?}",
+            again.body.pointer("/DomainStatus/ElasticsearchVersion")
+        );
+        assert_eq!(
+            again.body.pointer("/DomainStatus/DomainId"),
+            first.body.pointer("/DomainStatus/DomainId"),
+            "case {label:?}: a repeated create must report the stored domain's id, got {:?}",
+            again.body.pointer("/DomainStatus/DomainId")
         );
     }
 
@@ -681,14 +700,21 @@ async fn creating_an_existing_domain_name_conflicts_and_changes_nothing() {
         first
             .body
             .pointer("/DomainStatus/ElasticsearchClusterConfig"),
-        "a refused duplicate must leave the stored domain untouched, got {:?}",
+        "a repeated create must leave the stored domain untouched, got {:?}",
         read.body.pointer("/DomainStatus/ElasticsearchClusterConfig")
     );
     assert_eq!(
         read.body.pointer("/DomainStatus/ElasticsearchVersion"),
         Some(&json!("7.10")),
-        "a refused duplicate must leave the stored version untouched, got {:?}",
+        "a repeated create must leave the stored version untouched, got {:?}",
         read.body.pointer("/DomainStatus/ElasticsearchVersion")
+    );
+    let names = list(&router, None).await;
+    assert_eq!(
+        names.at("repeat create", "/DomainNames"),
+        &json!([{"DomainName": name, "EngineType": "Elasticsearch"}]),
+        "a repeated create must not add a second domain, got {:?}",
+        names.body.pointer("/DomainNames")
     );
 }
 

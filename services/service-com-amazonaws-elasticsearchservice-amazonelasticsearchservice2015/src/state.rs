@@ -771,23 +771,23 @@ pub const MAX_CONNECTIONS_PER_DOMAIN: usize = 20;
 /// of the two documented quotas, so it never clips a caller that stays inside both.
 pub const MAX_CONNECTIONS_TOTAL: usize = MAX_CONNECTIONS_PER_DOMAIN * MAX_DOMAINS_TOTAL;
 
-/// The odd multiplier that scrambles a connection counter into its id.
+/// The odd multiplier that scrambles a resource counter into its id.
 ///
 /// Multiplication by an odd constant modulo 2^64 is a BIJECTION on `u64`, so two
 /// counter values can never render the same id.
-const CONNECTION_ID_MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
+const ID_MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
 
 /// The id an outbound cross-cluster search connection is addressed by.
 ///
 /// `CrossClusterSearchConnectionId` declares no constraint, so what matters is that
 /// the id is opaque and that two connections never share one: it is the store's
 /// monotonic connection counter scrambled through the bijection described on
-/// [`CONNECTION_ID_MULTIPLIER`], behind the prefix naming the resource it
+/// [`ID_MULTIPLIER`], behind the prefix naming the resource it
 /// identifies.
 pub fn cross_cluster_connection_id(seq: u64) -> String {
     format!(
         "ccs-{token:016x}",
-        token = seq.wrapping_mul(CONNECTION_ID_MULTIPLIER)
+        token = seq.wrapping_mul(ID_MULTIPLIER)
     )
 }
 
@@ -878,6 +878,143 @@ impl CrossClusterSearchConnection {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Packages
+// ---------------------------------------------------------------------------
+
+/// `PackageStatus`'s `COPYING`: the package's content is still being copied out
+/// of the customer's S3 location. The status a package holds from the instant
+/// `CreatePackage` returns until [`active_deadline`] has passed.
+pub const PACKAGE_STATUS_COPYING: &str = "COPYING";
+
+/// `PackageStatus`'s `AVAILABLE`: the copy finished and the package can be
+/// associated with a domain.
+pub const PACKAGE_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// The version `CreatePackage` stamps on a package's first content.
+///
+/// `PackageVersion` is an unconstrained string and `UpdatePackage` reports the
+/// version its new content got, so the versions a package goes through are the
+/// counting numbers from here.
+pub const FIRST_PACKAGE_VERSION: &str = "1";
+
+/// A hard ceiling on every stored package, across every region.
+///
+/// Packages are the second caller-driven growth site in this store, and
+/// `CreatePackage`'s only bound on it: the region comes from the request's own
+/// credential scope, so a per-region allowance alone would not bound the total.
+/// It sits far above the number of packages any domain workflow associates, so
+/// no caller that stays inside the service's own quotas is clipped by it.
+pub const MAX_PACKAGES_TOTAL: usize = 1_000;
+
+/// The key one package is stored under: the region it was created in and the id
+/// the service minted for it.
+pub fn package_key(region: &str, package_id: &str) -> (String, String) {
+    (region.to_string(), package_id.to_string())
+}
+
+/// The id a package is addressed by.
+///
+/// `PackageID` declares no constraint, so what matters is that the id is opaque
+/// and that two packages never share one: it is the store's monotonic package
+/// counter scrambled through the bijection described on [`ID_MULTIPLIER`],
+/// behind the prefix naming the resource it identifies.
+pub fn package_id(seq: u64) -> String {
+    format!("pkg-{token:016x}", token = seq.wrapping_mul(ID_MULTIPLIER))
+}
+
+/// One package, as stored.
+///
+/// The record is the single source of truth for every answer about the package:
+/// the create's response and every later read are both [`Self::to_details`] of
+/// it, so the two cannot disagree. The package's status is COMPUTED from the
+/// instant its copy falls due rather than stored as a mutable status, so no read
+/// has to write.
+#[derive(Debug, Clone)]
+pub struct Package {
+    /// `PackageID`, unique per package, so it is half the key the store holds
+    /// the record under.
+    pub package_id: String,
+    /// `PackageName`, the name the caller gave the package. Unique among the
+    /// packages of one region, which is the scope a create checks it in.
+    pub package_name: String,
+    /// `PackageType` — one of `PACKAGE_TYPE_VALUES`.
+    pub package_type: String,
+    /// `PackageDescription`, where the create supplied one.
+    pub package_description: Option<String>,
+    /// The S3 location the content was imported from, as the request gave it.
+    pub source: PackageSource,
+    /// When the package was created.
+    pub created_at: SystemTime,
+    /// When the package last changed.
+    pub last_updated_at: SystemTime,
+    /// When the clock finishes copying the current content, i.e. when the
+    /// package becomes [`PACKAGE_STATUS_AVAILABLE`].
+    pub available_at: SystemTime,
+    /// `AvailablePackageVersion` — the version the current content got.
+    pub available_version: String,
+}
+
+impl Package {
+    /// A newly created package, whose content is still being copied.
+    pub fn create(
+        package_id: String,
+        package_name: String,
+        package_type: String,
+        package_description: Option<String>,
+        source: PackageSource,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            package_id,
+            package_name,
+            package_type,
+            package_description,
+            source,
+            created_at: now,
+            last_updated_at: now,
+            available_at: active_deadline(now),
+            available_version: FIRST_PACKAGE_VERSION.to_string(),
+        }
+    }
+
+    /// Whether the clock has not yet finished copying the package's content.
+    pub fn copying(&self, now: SystemTime) -> bool {
+        now < self.available_at
+    }
+
+    /// The package's modelled state — one of `PACKAGE_STATUS_VALUES`.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if self.copying(now) {
+            PACKAGE_STATUS_COPYING
+        } else {
+            PACKAGE_STATUS_AVAILABLE
+        }
+    }
+
+    /// This record as the `PackageDetails` every package operation reports.
+    ///
+    /// `AvailablePackageVersion` names the version a domain can associate, so a
+    /// package whose copy has not landed yet has none to report; `ErrorDetails`
+    /// is "additional information if the package is in an error state. Null
+    /// otherwise" (its own documentation), and a stored package is in no error
+    /// state.
+    pub fn to_details(&self, now: SystemTime) -> PackageDetails {
+        PackageDetails {
+            package_id: Some(self.package_id.clone()),
+            package_name: Some(self.package_name.clone()),
+            package_type: Some(self.package_type.clone()),
+            package_description: self.package_description.clone(),
+            package_status: Some(self.status(now).to_string()),
+            created_at: Some(datetime_of(self.created_at)),
+            last_updated_at: Some(datetime_of(self.last_updated_at)),
+            available_package_version: (!self.copying(now))
+                .then(|| self.available_version.clone()),
+            error_details: None,
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-elasticsearchservice-amazonelasticsearchservice2015. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsElasticsearchserviceAmazonelasticsearchservice2015State {
@@ -895,6 +1032,13 @@ pub struct ComAmazonawsElasticsearchserviceAmazonelasticsearchservice2015State {
     pub connections: BTreeMap<String, CrossClusterSearchConnection>,
     /// Monotonic counter feeding [`Self::mint_connection_id`].
     pub connection_seq: u64,
+    /// Every package, keyed by `(region, package id)` — a package is held by the
+    /// control plane of the Region its create was signed for. Ordered, so a
+    /// describe reports the same order twice, which is what lets a pagination
+    /// token name a place in the set.
+    pub packages: BTreeMap<(String, String), Package>,
+    /// Monotonic counter feeding [`Self::mint_package_id`].
+    pub package_seq: u64,
 }
 
 impl ComAmazonawsElasticsearchserviceAmazonelasticsearchservice2015State {
@@ -961,6 +1105,29 @@ impl ComAmazonawsElasticsearchserviceAmazonelasticsearchservice2015State {
             .filter(|connection| connection.source_domain.domain_name == source_domain_name)
             .count()
     }
+
+    /// Hand out the id of the next package created, so two packages never share
+    /// one. See [`package_id`].
+    pub fn mint_package_id(&mut self) -> String {
+        self.package_seq = self.package_seq.wrapping_add(1);
+        package_id(self.package_seq)
+    }
+
+    /// The packages of one Region, in package-id order.
+    pub fn packages_in<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a Package> {
+        self.packages
+            .iter()
+            .filter(move |((each, _), _)| each == region)
+            .map(|(_, package)| package)
+    }
+
+    /// The package of `region` carrying `package_name`, if the store holds one:
+    /// a package name is unique among the packages of one Region, so this is
+    /// what a create checks before minting another.
+    pub fn package_named<'a>(&'a self, region: &'a str, package_name: &str) -> Option<&'a Package> {
+        self.packages_in(region)
+            .find(|package| package.package_name == package_name)
+    }
 }
 
 /// What a handler answers when [`service_state`] cannot reach this service's store.
@@ -977,12 +1144,58 @@ pub fn state_unavailable<E>() -> crate::scaffolded::Scaffolded<E> {
     })
 }
 
+/// The message a `NextToken` that names no place in the set being paginated is
+/// refused with, wherever an operation refuses one: an operation that models
+/// `InvalidPaginationTokenException` carries it in that shape, and one that
+/// models only `ValidationException` carries the same text in that one.
+pub fn invalid_pagination_token_message(token: &str) -> String {
+    format!("Invalid pagination token: {token}")
+}
+
 /// `InvalidPaginationTokenException` for a `NextToken` that names no place in the
 /// set being paginated.
 pub fn invalid_pagination_token(token: &str) -> InvalidPaginationTokenException {
     InvalidPaginationTokenException {
-        message: Some(format!("Invalid pagination token: {token}")),
+        message: Some(invalid_pagination_token_message(token)),
     }
+}
+
+/// The largest page a paginated operation of this service answers with, and the
+/// page size a request that asks for none gets: this model's `MaxResults` is
+/// `@range(max: 100)` and its documentation gives 100 as the unspecified case.
+pub const MAX_PAGE: usize = 100;
+
+/// Where the page a `NextToken` names starts: the position, in the set being
+/// paginated, of the item the token names — 0 when the request carries no token,
+/// and `None` when the token names no item of THAT set (one this service never
+/// minted, or one carried over to a request with different filters), which is
+/// what each operation refuses in the shape its own model declares.
+///
+/// A token names a PLACE in the set rather than an offset, so paging resumes
+/// where the last page ended even though a later create may have grown the set.
+pub fn page_start<'a>(
+    ids: impl IntoIterator<Item = &'a str>,
+    token: Option<&str>,
+) -> Option<usize> {
+    match token {
+        None => Some(0),
+        Some(token) => ids.into_iter().position(|id| id == token),
+    }
+}
+
+/// Where a page of `max_results` items starting at `start` ends, in a set of
+/// `len` items.
+///
+/// The model defaults `MaxResults` to 0, so a request that asks for no
+/// particular page size gets the whole page rather than none; the member
+/// declares no minimum, so a negative value also reaches here, and it names no
+/// page size either, so it is answered the same way rather than refused.
+pub fn page_end(start: usize, max_results: i32, len: usize) -> usize {
+    let size = match usize::try_from(max_results) {
+        Ok(0) | Err(_) => MAX_PAGE,
+        Ok(size) => size.min(MAX_PAGE),
+    };
+    start.saturating_add(size).min(len)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

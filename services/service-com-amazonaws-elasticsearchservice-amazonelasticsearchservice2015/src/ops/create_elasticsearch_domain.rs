@@ -238,17 +238,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // Domain names are unique per account and region (DomainName's own doc),
-        // which is the scope the store is keyed on.
+        // which is the scope the store is keyed on. A create naming a domain
+        // that already exists is the SAME create again — the normal reaction to
+        // a timeout or a throttle, and what the SDK retry layer issues on its
+        // own — so it is answered from the stored record and the request's
+        // differing options are ignored: the first call's configuration is what
+        // the domain has, and what every later read keeps reporting.
         let key = domain_key(&region, &input.domain_name);
-        if store.domains.contains_key(&key) {
-            return Err(
-                CreateElasticsearchDomainErrorModeled::ResourceAlreadyExistsException(
-                    ResourceAlreadyExistsException {
-                        message: Some(format!("Domain already exists: {}", input.domain_name)),
-                    },
-                )
-                .into(),
-            );
+        if let Some(existing) = store.domains.get(&key) {
+            return Ok(CreateElasticsearchDomainOutput {
+                domain_status: Some(existing.domain_status(now)),
+            });
         }
 
         // The account's per-region domain quota, and the store's hard ceiling
