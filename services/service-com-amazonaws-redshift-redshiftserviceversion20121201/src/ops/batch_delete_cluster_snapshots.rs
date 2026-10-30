@@ -265,64 +265,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> BatchDeleteCluste
 
             // Read what the decision needs, then let the borrow go: the entry
             // removes the very record it was read from.
-            let (identifier, cluster_identifier, status, snapshot_type, shared_with) = {
+            let (identifier, cluster_identifier, refusal) = {
                 let snapshot = &store.snapshots[index].snapshot;
-                (
-                    snapshot
-                        .snapshot_identifier
-                        .clone()
-                        .unwrap_or_else(|| requested.snapshot_identifier.clone()),
-                    snapshot.cluster_identifier.clone(),
-                    snapshot.status.clone().unwrap_or_default(),
-                    snapshot.snapshot_type.clone().unwrap_or_default(),
-                    snapshot
-                        .accounts_with_restore_access
-                        .iter()
-                        .flatten()
-                        .count(),
-                )
+                let identifier = snapshot
+                    .snapshot_identifier
+                    .clone()
+                    .unwrap_or_else(|| requested.snapshot_identifier.clone());
+                let refusal = st::snapshot_delete_refusal(snapshot, &identifier);
+                (identifier, snapshot.cluster_identifier.clone(), refusal)
             };
 
-            // The three rules the one-snapshot path deletes by, reported here as
-            // that entry's failure. "Deletes the specified MANUAL snapshot":
-            // Amazon Redshift deletes a snapshot it took on its own schedule
-            // itself, when that snapshot's retention period ends.
-            if snapshot_type != st::SNAPSHOT_TYPE_MANUAL {
+            // The rules the one-snapshot path deletes by, reported here as that
+            // entry's failure: ONE rule, in the one place
+            // ([`crate::state::snapshot_delete_refusal`]), so what a batch
+            // refuses and what the one-snapshot delete refuses cannot drift.
+            if let Some(reason) = refusal {
                 errors.push(SnapshotErrorMessage {
-                    snapshot_identifier: Some(identifier.clone()),
+                    snapshot_identifier: Some(identifier),
                     snapshot_cluster_identifier: cluster_identifier,
                     failure_code: Some(FAILURE_CODE_INVALID_STATE.to_string()),
-                    failure_reason: Some(format!(
-                        "Cluster snapshot {identifier} is of type {snapshot_type}, and only a {} snapshot can be deleted.",
-                        st::SNAPSHOT_TYPE_MANUAL
-                    )),
-                });
-                continue;
-            }
-            // "The snapshot must be in the available state".
-            if status != st::STATUS_AVAILABLE {
-                errors.push(SnapshotErrorMessage {
-                    snapshot_identifier: Some(identifier.clone()),
-                    snapshot_cluster_identifier: cluster_identifier,
-                    failure_code: Some(FAILURE_CODE_INVALID_STATE.to_string()),
-                    failure_reason: Some(format!(
-                        "Cluster snapshot {identifier} is in the {status} state, not {}.",
-                        st::STATUS_AVAILABLE
-                    )),
-                });
-                continue;
-            }
-            // "with no other users authorized to access the snapshot […] If other
-            // accounts are authorized to access the snapshot, you must revoke all
-            // of the authorizations before you can delete the snapshot."
-            if shared_with > 0 {
-                errors.push(SnapshotErrorMessage {
-                    snapshot_identifier: Some(identifier.clone()),
-                    snapshot_cluster_identifier: cluster_identifier,
-                    failure_code: Some(FAILURE_CODE_INVALID_STATE.to_string()),
-                    failure_reason: Some(format!(
-                        "Cluster snapshot {identifier} is authorized for restore by {shared_with} other account(s); revoke every authorization before deleting it."
-                    )),
+                    failure_reason: Some(reason),
                 });
                 continue;
             }

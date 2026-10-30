@@ -209,9 +209,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 RevokeSnapshotAccessErrorModeled::ClusterSnapshotNotFoundFault(
                     ClusterSnapshotNotFoundFault {
-                        message: Some(format!(
-                            "Cluster snapshot {} not found.",
-                            snapshot_identifier.or(snapshot_arn).unwrap_or_default()
+                        message: Some(st::cluster_snapshot_not_found_message(
+                            st::ClusterSnapshotNotFoundWording::NotFoundThenIdentifier,
+                            snapshot_identifier.or(snapshot_arn).unwrap_or_default(),
                         )),
                     },
                 )

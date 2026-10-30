@@ -1680,6 +1680,48 @@ pub enum ClusterNotFoundWording {
     TheClusterWasNotFound,
 }
 
+/// Which sentence a `ClusterSnapshotNotFoundFault` is worded with.
+///
+/// The same split as [`ClusterNotFoundWording`], for the snapshot the request
+/// named: the fault's status (404) and awsQuery code (`ClusterSnapshotNotFound`)
+/// are what the model fixes, while the fixed text around the identifier is an
+/// attribute of the OPERATION, and recorded refusals show both sentences below
+/// in use. Naming each wording here keeps the choice at the handler that makes
+/// it, so no operation can quietly inherit another one's sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterSnapshotNotFoundWording {
+    /// `ClusterSnapshot not found: <SnapshotIdentifier>` — what the operations
+    /// that ACT on the snapshot they name answer (`DeleteClusterSnapshot`,
+    /// `ModifyClusterSnapshot`, `CopyClusterSnapshot`,
+    /// `AuthorizeSnapshotAccess`, `RevokeSnapshotAccess`,
+    /// `RestoreFromClusterSnapshot`), the same shape of sentence the operations
+    /// that act on a named cluster answer for a cluster
+    /// ([`ClusterNotFoundWording::NotFoundThenIdentifier`]) and the
+    /// parameter-group operations answer for a group.
+    NotFoundThenIdentifier,
+    /// `Snapshot <SnapshotIdentifier> not found.` — what the snapshot READ,
+    /// `DescribeClusterSnapshots`, answers: the fixed text is an attribute of
+    /// the OPERATION, so a read and a write word the same fault differently for
+    /// the same name.
+    SnapshotThenNotFound,
+}
+
+/// The `ClusterSnapshotNotFoundFault` message `wording` words, naming the
+/// `SnapshotIdentifier` the request asked about.
+pub fn cluster_snapshot_not_found_message(
+    wording: ClusterSnapshotNotFoundWording,
+    snapshot_identifier: &str,
+) -> String {
+    match wording {
+        ClusterSnapshotNotFoundWording::NotFoundThenIdentifier => {
+            format!("ClusterSnapshot not found: {snapshot_identifier}")
+        }
+        ClusterSnapshotNotFoundWording::SnapshotThenNotFound => {
+            format!("Snapshot {snapshot_identifier} not found.")
+        }
+    }
+}
+
 /// The `ClusterNotFoundFault` message `wording` words, naming the
 /// `ClusterIdentifier` the request asked about.
 pub fn cluster_not_found_message(
@@ -7105,6 +7147,54 @@ pub fn subnet_record(subnet_identifier: &str, region: &str) -> Subnet {
         subnet_availability_zone: Some(availability_zone(&zones[index])),
         subnet_status: Some(SUBNET_STATUS_ACTIVE.to_string()),
     }
+}
+
+/// Why the snapshot `snapshot`, named by `identifier`, cannot be deleted as it
+/// stands — or `None` when every rule a delete enforces admits it.
+///
+/// ONE rule for both delete paths, the one-snapshot `DeleteClusterSnapshot` and
+/// the per-entry `BatchDeleteClusterSnapshots`, so the two cannot drift on what
+/// is deletable or on what they say about a record that is not. The three rules,
+/// each from the one-snapshot operation's own documentation:
+///
+/// * "Deletes the specified MANUAL snapshot" — Amazon Redshift deletes a
+///   snapshot it took on its own schedule itself, when that snapshot's retention
+///   period ends, so a caller cannot delete one;
+/// * "The snapshot must be in the available state" — which is also what
+///   `InvalidClusterSnapshotStateFault` reports;
+/// * "with no other users authorized to access the snapshot […] If other
+///   accounts are authorized to access the snapshot, you must revoke all of the
+///   authorizations before you can delete the snapshot."
+///
+/// The identifier is passed rather than read off the record, so a caller that
+/// has already resolved which spelling to report (the stored one, or the one its
+/// entry named) keeps it.
+pub fn snapshot_delete_refusal(snapshot: &Snapshot, identifier: &str) -> Option<String> {
+    let snapshot_type = snapshot.snapshot_type.as_deref().unwrap_or_default();
+    if snapshot_type != SNAPSHOT_TYPE_MANUAL {
+        return Some(format!(
+            "Cluster snapshot {identifier} is of type {snapshot_type}, and only a \
+             {SNAPSHOT_TYPE_MANUAL} snapshot can be deleted."
+        ));
+    }
+    let status = snapshot.status.as_deref().unwrap_or_default();
+    if status != STATUS_AVAILABLE {
+        return Some(format!(
+            "Cluster snapshot {identifier} is in the {status} state, not {STATUS_AVAILABLE}."
+        ));
+    }
+    let shared_with = snapshot
+        .accounts_with_restore_access
+        .iter()
+        .flatten()
+        .count();
+    if shared_with > 0 {
+        return Some(format!(
+            "Cluster snapshot {identifier} is authorized for restore by {shared_with} other \
+             account(s); revoke every authorization before deleting it."
+        ));
+    }
+    None
 }
 
 /// Build the snapshot record a manual snapshot of `cluster` reports.

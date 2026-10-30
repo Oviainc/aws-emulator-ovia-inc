@@ -53,6 +53,8 @@ mod custom_domain_and_partners;
 mod custom_domain_association_refusal_wording;
 #[path = "all/default_cluster_parameters.rs"]
 mod default_cluster_parameters;
+#[path = "all/delete_cluster_snapshot.rs"]
+mod delete_cluster_snapshot;
 #[path = "all/endpoint_access.rs"]
 mod endpoint_access;
 #[path = "all/error_envelope.rs"]

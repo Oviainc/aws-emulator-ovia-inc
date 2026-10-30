@@ -175,7 +175,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ModifyClusterSnapshotErrorModeled::ClusterSnapshotNotFoundFault(
                     ClusterSnapshotNotFoundFault {
-                        message: Some(format!("Cluster snapshot {identifier} not found.")),
+                        message: Some(st::cluster_snapshot_not_found_message(
+                            st::ClusterSnapshotNotFoundWording::NotFoundThenIdentifier,
+                            identifier,
+                        )),
                     },
                 )
                 .into(),

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteClusterSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteClusterSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteClusterSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes ONE manual snapshot from the store and reports the record it removed,
+//! in the `deleted` status — the same three rules the sibling batch delete
+//! decides each of its entries by: the snapshot has to be one a caller took, in
+//! the state a delete admits, and shared with no other account.
 //!
 //! ## Shape of an operation
 //!
@@ -91,11 +87,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DeleteClusterSnapshotError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DeleteClusterSnapshot")]
+// `DependentServiceUnavailableFault` is widened in, exactly as the sibling
+// snapshot operations widen it: the model does not list it here, but the service
+// declares the shape, and it is the only modelled way to say "the control-plane
+// store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DeleteClusterSnapshot",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DeleteClusterSnapshotErrorModeled {
     ClusterSnapshotNotFoundFault(ClusterSnapshotNotFoundFault),
     InvalidClusterSnapshotStateFault(InvalidClusterSnapshotStateFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -149,18 +153,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteClusterSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteClusterSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteClusterSnapshot"))
+        // The delete holds the store's lock; the event it raises is published
+        // once that lock is released, because a publish is an in-process call
+        // into another service and must not run under it.
+        let output = self.delete(&input)?;
+
+        // The snapshot no longer exists, which is the event this removal raises:
+        // every subscription scoped to it is told, on its own topic.
+        let deleted = output
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.snapshot_identifier.clone())
+            .unwrap_or_else(|| input.snapshot_identifier.clone());
+        crate::state::notifications::raise(
+            ctx,
+            &*self.engine,
+            crate::state::EVENT_ID_SNAPSHOT_DELETED,
+            &deleted,
+            &[(
+                crate::state::notifications::SNAPSHOT_NAME,
+                deleted.as_str(),
+            )],
+        )
+        .await;
+
+        Ok(output)
+    }
+}
+
+/// This operation's refusal for a pair of locators that names no snapshot this
+/// account holds.
+///
+/// One function, so the identifier-only and the identifier-with-cluster path
+/// cannot drift: `SnapshotClusterIdentifier` NARROWS the locator rather than
+/// naming a second resource, so a pair that matches no one record is the same
+/// "no such snapshot" as an identifier that matches none.
+fn not_found(snapshot_identifier: &str) -> DeleteClusterSnapshotError {
+    DeleteClusterSnapshotErrorModeled::ClusterSnapshotNotFoundFault(ClusterSnapshotNotFoundFault {
+        message: Some(crate::state::cluster_snapshot_not_found_message(
+            // The sentence this OPERATION words the fault with; see the catalog
+            // for which operation answers which.
+            crate::state::ClusterSnapshotNotFoundWording::NotFoundThenIdentifier,
+            snapshot_identifier,
+        )),
+    })
+    .into()
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteClusterSnapshot<Eng> {
+    /// The delete itself: the record it removed, as it reports it back.
+    ///
+    /// Everything that touches the store lives here, so the lock is held for the
+    /// write ALONE and nothing is awaited while it is.
+    fn delete(
+        &self,
+        input: &DeleteClusterSnapshotInput,
+    ) -> Result<DeleteClusterSnapshotOutput, DeleteClusterSnapshotError> {
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DeleteClusterSnapshotErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let started = ::std::time::Instant::now();
+
+        // A request carrying an empty identifier names no snapshot to delete,
+        // which is a malformed request rather than a missing snapshot — the same
+        // reading `ModifyClusterSnapshot` gives its own required identifier.
+        let identifier = input.snapshot_identifier.as_str();
+        if identifier.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "SnapshotIdentifier must be supplied.",
+            ));
+        }
+
+        let mut store = state.lock();
+        store.settle(started);
+
+        let Some(index) = store.snapshot_located_position(Some(identifier), None) else {
+            return Err(not_found(identifier));
+        };
+
+        let snapshot = &store.snapshots[index].snapshot;
+        let stored_identifier = snapshot
+            .snapshot_identifier
+            .clone()
+            .unwrap_or_else(|| identifier.to_string());
+        // `SnapshotClusterIdentifier` is "the unique identifier of the cluster the
+        // snapshot was created from", so the pair is the locator and a request
+        // naming a cluster this snapshot was not taken of names no snapshot — the
+        // same rule `RevokeSnapshotAccess` and the batch delete apply.
+        if let Some(wanted) = input
+            .snapshot_cluster_identifier
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            if snapshot.cluster_identifier.as_deref() != Some(wanted) {
+                return Err(not_found(identifier));
+            }
+        }
+
+        // The rules a delete enforces, which the sibling batch delete decides
+        // each of its entries by: ONE rule, in the one place, reported here as
+        // this request's own modelled refusal.
+        if let Some(reason) = st::snapshot_delete_refusal(snapshot, &stored_identifier) {
+            return Err(
+                DeleteClusterSnapshotErrorModeled::InvalidClusterSnapshotStateFault(
+                    InvalidClusterSnapshotStateFault {
+                        message: Some(reason),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut removed = store.snapshots.remove(index);
+        // "DeleteClusterSnapshot returns status as \"deleted\"": the record this
+        // call removed is reported back in the state it left it in, and the store
+        // no longer holds it.
+        removed.snapshot.status = Some(st::STATUS_DELETED.to_string());
+        Ok(DeleteClusterSnapshotOutput {
+            snapshot: Some(removed.snapshot),
+        })
     }
 }

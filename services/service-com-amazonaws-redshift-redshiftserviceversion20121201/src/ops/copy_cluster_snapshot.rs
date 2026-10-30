@@ -305,7 +305,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyClusterSnapsh
             return Err(
                 CopyClusterSnapshotErrorModeled::ClusterSnapshotNotFoundFault(
                     ClusterSnapshotNotFoundFault {
-                        message: Some(format!("Cluster snapshot {source_identifier} not found.")),
+                        message: Some(st::cluster_snapshot_not_found_message(
+                            st::ClusterSnapshotNotFoundWording::NotFoundThenIdentifier,
+                            source_identifier,
+                        )),
                     },
                 )
                 .into(),
