@@ -33,7 +33,7 @@ use crate::app_branch_lifecycle::{string_member, Emulator, Reply, ACCOUNT_ID, RE
 /// (`smithy_query(query="operation",operation="TagResource")` reports
 /// `POST /tags/{resourceArn}`), so the ARN travels as ONE path segment with its `:`
 /// and `/` percent-encoded, exactly as an AWS SDK client sends it.
-async fn tag_resource(emulator: &Emulator, resource_arn: &str, tags: &Value) -> Reply {
+pub(crate) async fn tag_resource(emulator: &Emulator, resource_arn: &str, tags: &Value) -> Reply {
     emulator
         .call(
             "POST",
@@ -44,7 +44,7 @@ async fn tag_resource(emulator: &Emulator, resource_arn: &str, tags: &Value) -> 
 }
 
 /// `ListTagsForResource`: `GET /tags/{resourceArn}`.
-async fn list_tags(emulator: &Emulator, resource_arn: &str) -> Reply {
+pub(crate) async fn list_tags(emulator: &Emulator, resource_arn: &str) -> Reply {
     emulator
         .call("GET", &format!("/tags/{}", encode_label(resource_arn)), None)
         .await
@@ -52,14 +52,14 @@ async fn list_tags(emulator: &Emulator, resource_arn: &str) -> Reply {
 
 /// `value` as one path segment: everything outside the alphanumerics is
 /// percent-encoded, so an ARN's `:` and `/` cannot be read as segment boundaries.
-fn encode_label(value: &str) -> String {
+pub(crate) fn encode_label(value: &str) -> String {
     utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
 }
 
 /// A resource kind tagging addresses: the kinds the model gives a `TagMap` member
 /// (`App$tags`, `Branch$tags`) and whose create accepts `tags`.
 #[derive(Debug, Clone, Copy)]
-enum Kind {
+pub(crate) enum Kind {
     /// An app, addressed by `…:apps/<appId>`.
     App,
     /// A branch under this name, addressed by `…:apps/<appId>/branches/<branchName>`.
@@ -70,18 +70,18 @@ enum Kind {
 /// slash — `BranchName` is modelled `length 1..255, pattern ^(?s).+$`
 /// (`smithy_query(query="shape",shape="BranchName")`), so `release/1.0` is a name, and
 /// its ARN's last segment therefore carries a slash of its own.
-const KINDS: [Kind; 3] = [Kind::App, Kind::Branch("main"), Kind::Branch("release/1.0")];
+pub(crate) const KINDS: [Kind; 3] = [Kind::App, Kind::Branch("main"), Kind::Branch("release/1.0")];
 
 /// A seeded resource: the ARN tagging addresses it by, and the ids its own reader takes.
-struct Seeded {
-    kind: Kind,
-    app_id: String,
-    arn: String,
+pub(crate) struct Seeded {
+    pub(crate) kind: Kind,
+    pub(crate) app_id: String,
+    pub(crate) arn: String,
 }
 
 /// Create one resource of `kind`, carrying `tags` from birth when the case sets them,
 /// and answer what the suite needs to address it.
-async fn seed(emulator: &Emulator, kind: Kind, tags: Option<&Value>) -> Seeded {
+pub(crate) async fn seed(emulator: &Emulator, kind: Kind, tags: Option<&Value>) -> Seeded {
     match kind {
         Kind::App => {
             let mut request = json!({ "name": "tagging-host" });
@@ -118,7 +118,7 @@ async fn seed(emulator: &Emulator, kind: Kind, tags: Option<&Value>) -> Seeded {
 /// The `tags` member of the resource's OWN record, read back through `GetApp` /
 /// `GetBranch`: the tag map has one home, so the record's reader reports what a tag
 /// write left.
-async fn record_tags(emulator: &Emulator, seeded: &Seeded) -> Value {
+pub(crate) async fn record_tags(emulator: &Emulator, seeded: &Seeded) -> Value {
     let reply = match seeded.kind {
         Kind::App => emulator.get_app(&seeded.app_id).await,
         Kind::Branch(branch_name) => {

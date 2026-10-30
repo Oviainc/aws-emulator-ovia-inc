@@ -43,6 +43,8 @@ mod domain_associations;
 mod hosted_branch_site;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/resource_untagging.rs"]
+mod resource_untagging;
 #[path = "all/s3_sourced_deployments.rs"]
 mod s3_sourced_deployments;
 #[path = "all/start_job_repository_precondition.rs"]
