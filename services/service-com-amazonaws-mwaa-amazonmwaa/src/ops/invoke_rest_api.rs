@@ -823,13 +823,7 @@ fn requested_variable(body: Option<&Document>) -> Result<AirflowVariable, Airflo
     bounded(&key, "key", crate::state::MAX_AIRFLOW_KEY_LENGTH)?;
     addressable(&key, "key")?;
     bounded(&value, "value", crate::state::MAX_AIRFLOW_VALUE_LENGTH)?;
-    if let Some(description) = description.as_deref() {
-        bounded(
-            description,
-            "description",
-            crate::state::MAX_AIRFLOW_VALUE_LENGTH,
-        )?;
-    }
+    bounded_description(description.as_deref())?;
     Ok(AirflowVariable {
         key,
         value,
@@ -856,13 +850,7 @@ fn requested_pool(body: Option<&Document>) -> Result<AirflowPool, AirflowAnswer>
     let description = optional_text(body, "description")?;
     bounded(&name, "name", crate::state::MAX_AIRFLOW_KEY_LENGTH)?;
     addressable(&name, "name")?;
-    if let Some(description) = description.as_deref() {
-        bounded(
-            description,
-            "description",
-            crate::state::MAX_AIRFLOW_VALUE_LENGTH,
-        )?;
-    }
+    bounded_description(description.as_deref())?;
     let include_deferred = match member(body, "include_deferred") {
         Some(Document::Bool(include)) => *include,
         Some(Document::Null) | None => false,
@@ -965,6 +953,25 @@ fn bounded(value: &str, name: &str, longest: usize) -> Result<(), AirflowAnswer>
         )));
     }
     Ok(())
+}
+
+/// Refuse a `description` this store will not hold at that length, for a body that states
+/// one; a body that states none states no length to bound, so it is taken.
+///
+/// Both entities a write can carry — a variable and a slot pool — may carry an optional
+/// `description`, and this is the one place either of them asks what one may be: the
+/// branch, the member name the refusal sentence names and the ceiling it is held to are
+/// decided HERE and nowhere else, so a variable write and a pool write cannot drift apart
+/// about the length of a description.
+fn bounded_description(description: Option<&str>) -> Result<(), AirflowAnswer> {
+    match description {
+        Some(description) => bounded(
+            description,
+            "description",
+            crate::state::MAX_AIRFLOW_VALUE_LENGTH,
+        ),
+        None => Ok(()),
+    }
 }
 
 /// A query parameter as a whole number, or why it is not one. An absent parameter is

@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/airflow_description_bound_single_rule.rs"]
+mod airflow_description_bound_single_rule;
 #[path = "all/airflow_rest_api.rs"]
 mod airflow_rest_api;
 #[path = "all/airflow_rest_api_entity_keys.rs"]
