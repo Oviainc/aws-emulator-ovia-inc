@@ -35,7 +35,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_cloudformation_cloudformation::state::wait_conditions::{
-    MAX_HELD_OPEN, MAX_TIMEOUT,
+    DEFAULT_TIMEOUT, MAX_TIMEOUT,
 };
 use service_com_amazonaws_cloudformation_cloudformation::state::{resource_status, status};
 use smithy_server_runtime::MultiServiceRouter;
@@ -837,10 +837,11 @@ struct HoldCase {
 
 /// The class the bound covers: every `Timeout` a declaration can state.
 ///
-/// The published bound is the type's own: "the maximum time that can be specified for this
+/// A wait the template asked for is held for exactly as long as it asked. The published
+/// bound is the type's own: "the maximum time that can be specified for this
 /// property is 12 hours (43200 seconds)" (`AWS::CloudFormation::WaitCondition`'s `Timeout`),
-/// so the rows include it, one second past it, and the degenerate zero — plus the instants
-/// either side of what this emulator holds an operation open for.
+/// so the rows include it, one second past it, and the degenerate zero — plus a declaration
+/// that states no wait at all, which is held to the documented default.
 fn hold_cases() -> Vec<HoldCase> {
     vec![
         HoldCase {
@@ -856,59 +857,52 @@ fn hold_cases() -> Vec<HoldCase> {
             held: Duration::from_secs(1),
         },
         HoldCase {
-            case: "a wait just inside what this emulator holds open",
+            case: "a wait of fourteen seconds",
             stack: "hold-just-inside",
             declared: Some("14"),
-            held: MAX_HELD_OPEN - Duration::from_secs(1),
-        },
-        HoldCase {
-            case: "a wait of exactly what this emulator holds open",
-            stack: "hold-exactly",
-            declared: Some("15"),
-            held: MAX_HELD_OPEN,
-        },
-        HoldCase {
-            case: "a wait one second past what this emulator holds open",
-            stack: "hold-just-past",
-            declared: Some("16"),
-            held: MAX_HELD_OPEN,
+            held: Duration::from_secs(14),
         },
         HoldCase {
             case: "a wait of a minute and a half",
             stack: "hold-ninety",
             declared: Some("90"),
-            held: MAX_HELD_OPEN,
+            held: Duration::from_secs(90),
+        },
+        HoldCase {
+            case: "a wait just under the documented default",
+            stack: "hold-just-under-default",
+            declared: Some("299"),
+            held: Duration::from_secs(299),
         },
         HoldCase {
             case: "a wait of the documented maximum",
             stack: "hold-maximum",
             declared: Some("43200"),
-            held: MAX_HELD_OPEN,
+            held: MAX_TIMEOUT,
         },
         HoldCase {
             case: "a wait past the documented maximum",
             stack: "hold-past-maximum",
             declared: Some("43201"),
-            held: MAX_HELD_OPEN,
+            held: MAX_TIMEOUT,
         },
         HoldCase {
             case: "a declaration that states no wait at all",
             stack: "hold-unstated",
             declared: None,
-            held: MAX_HELD_OPEN,
+            held: DEFAULT_TIMEOUT,
         },
     ]
 }
 
 #[tokio::test]
-async fn a_wait_is_held_for_what_it_asked_bounded_by_what_this_emulator_holds_open() {
-    // The emulator's own bound is shorter than the type's documented maximum, which is what
-    // makes a stack held at an unsignalled wait condition settle inside a client's poll
-    // loop.
+async fn a_wait_is_held_for_what_it_asked_bounded_by_the_documented_maximum() {
+    // The default a declaration that states nothing falls back to is inside the type's own
+    // published ceiling, so no row can be held longer than the attribute permits.
     assert!(
-        MAX_HELD_OPEN < MAX_TIMEOUT,
-        "the hold bound must be shorter than the documented Timeout maximum, got \
-         {MAX_HELD_OPEN:?} against {MAX_TIMEOUT:?}"
+        DEFAULT_TIMEOUT < MAX_TIMEOUT,
+        "the default wait must be inside the documented Timeout maximum, got \
+         {DEFAULT_TIMEOUT:?} against {MAX_TIMEOUT:?}"
     );
 
     let (router, engine) = router_with_engine();

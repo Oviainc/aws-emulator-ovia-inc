@@ -188,6 +188,11 @@ async fn a_signal_nothing_waits_on_is_accepted_and_changes_nothing() {
         signal_status: &'static str,
         /// Signal while the create is still in flight, or after it settled.
         while_creating: bool,
+        /// The `UniqueId` of the SUCCESS signal that releases the create's own wait before
+        /// the row's signal is sent, for a declaration that HOLDS the create open: such a
+        /// create cannot settle until it has its signals, so a row that needs it settled
+        /// delivers them first. `None` for a declaration nothing waits on during a create.
+        release: Option<&'static str>,
         /// Address the stack by its id rather than by its name.
         by_stack_id: bool,
     }
@@ -200,6 +205,7 @@ async fn a_signal_nothing_waits_on_is_accepted_and_changes_nothing() {
             logical_id: GATE,
             signal_status: "SUCCESS",
             while_creating: false,
+            release: None,
             by_stack_id: false,
         },
         Row {
@@ -209,6 +215,7 @@ async fn a_signal_nothing_waits_on_is_accepted_and_changes_nothing() {
             logical_id: GATE,
             signal_status: "FAILURE",
             while_creating: true,
+            release: None,
             by_stack_id: false,
         },
         Row {
@@ -218,6 +225,7 @@ async fn a_signal_nothing_waits_on_is_accepted_and_changes_nothing() {
             logical_id: "NoSuchResource",
             signal_status: "SUCCESS",
             while_creating: true,
+            release: None,
             by_stack_id: false,
         },
         Row {
@@ -227,6 +235,7 @@ async fn a_signal_nothing_waits_on_is_accepted_and_changes_nothing() {
             logical_id: GATE,
             signal_status: "FAILURE",
             while_creating: false,
+            release: Some("i-00release00"),
             by_stack_id: false,
         },
         Row {
@@ -236,6 +245,7 @@ async fn a_signal_nothing_waits_on_is_accepted_and_changes_nothing() {
             logical_id: GATE,
             signal_status: "FAILURE",
             while_creating: true,
+            release: None,
             by_stack_id: true,
         },
     ];
@@ -255,6 +265,25 @@ async fn a_signal_nothing_waits_on_is_accepted_and_changes_nothing() {
         } else {
             row.stack.to_string()
         };
+        // A declaration that HOLDS the create open is released first: the row's own signal
+        // is the one nothing is waiting for, and the create has to have reached the status
+        // the row signals it in.
+        let mut expected: Vec<(String, String, String)> = Vec::new();
+        if let Some(release) = row.release {
+            let (status_code, released) =
+                signal(&router, &addressed, row.logical_id, release, "SUCCESS").await;
+            assert_eq!(
+                status_code, 200,
+                "case {:?}: the releasing signal must be accepted, got {status_code} \
+                 {released}",
+                row.case
+            );
+            expected.push((
+                row.logical_id.to_string(),
+                release.to_string(),
+                "SUCCESS".to_string(),
+            ));
+        }
         if !row.while_creating {
             wait_for_the_transition().await;
         }
@@ -292,14 +321,14 @@ async fn a_signal_nothing_waits_on_is_accepted_and_changes_nothing() {
             })
             .collect();
         drop(held);
+        expected.push((
+            row.logical_id.to_string(),
+            unique_id.to_string(),
+            row.signal_status.to_string(),
+        ));
         assert_eq!(
-            recorded,
-            vec![(
-                row.logical_id.to_string(),
-                unique_id.to_string(),
-                row.signal_status.to_string()
-            )],
-            "case {:?}: expected the one signal to be recorded, got {recorded:?}",
+            recorded, expected,
+            "case {:?}: expected the signals the row sent to be recorded, got {recorded:?}",
             row.case
         );
 
@@ -324,9 +353,7 @@ async fn a_signal_nothing_waits_on_is_accepted_and_changes_nothing() {
             .map(|(_, _, reason, _)| reason)
             .collect();
         assert!(
-            !reasons
-                .iter()
-                .any(|reason| reason.contains("signal with UniqueId")),
+            !reasons.iter().any(|reason| reason.contains(unique_id)),
             "case {:?}: no event may report a signal nothing was waiting for, got \
              {reasons:?}",
             row.case

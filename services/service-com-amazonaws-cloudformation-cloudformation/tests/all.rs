@@ -187,6 +187,8 @@ mod resource_scan_related_resources;
 mod resource_scan_resources;
 #[path = "all/resource_scans.rs"]
 mod resource_scans;
+#[path = "all/resource_signal_waits.rs"]
+mod resource_signal_waits;
 #[path = "all/resource_signals.rs"]
 mod resource_signals;
 #[path = "all/rolled_back_resource_records.rs"]

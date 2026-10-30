@@ -309,9 +309,9 @@ pub mod handler_progress;
 /// starts and `DescribeGeneratedTemplate` reads the progress of.
 pub mod generated_template;
 
-/// The wait conditions of one stack operation: the barrier an
-/// `AWS::CloudFormation::WaitCondition` puts in a create or an update, and the signals
-/// `SignalResource` releases it with.
+/// The resource-signal waits of one stack operation: the barrier an
+/// `AWS::CloudFormation::WaitCondition` or a `CreationPolicy`'s `ResourceSignal` puts in a
+/// create or an update, and the signals `SignalResource` releases it with.
 pub mod wait_conditions;
 
 /// The create-time stabilisation of one stack operation: the resources whose owning
@@ -1298,7 +1298,7 @@ pub struct PendingDeployment {
     /// reference index `ListImports` reports, so it takes effect when the deployment
     /// completes, exactly as the resources and outputs beside it do.
     pub imports: BTreeMap<String, String>,
-    /// The wait conditions the template being deployed declares
+    /// The resource-signal waits the template being deployed declares
     /// ([`wait_conditions::declared`]), each with the resources whose creation waits on
     /// it. Computed where the template is READ, outside the store lock;
     /// [`StoredStack::begin_transition`] is what opens a barrier for each one the
@@ -2853,7 +2853,12 @@ impl StoredStack {
     /// Only a CREATE or an UPDATE waits: those are the operations CloudFormation "doesn't
     /// proceed with … until resources receive the required number of signals"
     /// (`SignalResource`), while a delete or a rollback removes what is there and waits
-    /// for nothing. A wait condition the stack has ALREADY deployed and that this
+    /// for nothing. A wait a `CreationPolicy` declares is a wait of the CREATE alone — that
+    /// attribute "is invoked during resource creation" — so an update that re-deploys the
+    /// same resource is not held at it
+    /// ([`wait_conditions::DeclaredWaitCondition::only_on_create`]), while a wait condition
+    /// waits whichever operation deploys it. A wait condition the stack has ALREADY deployed
+    /// and that this
     /// deployment declares unchanged is not waited at a second time — it is the same
     /// satisfied wait condition ("you can't update a wait condition that has already been
     /// satisfied unless you also change the handle").
@@ -2874,6 +2879,9 @@ impl StoredStack {
         deployment
             .wait_conditions
             .iter()
+            .filter(|declared| {
+                !declared.only_on_create() || in_progress == status::CREATE_IN_PROGRESS
+            })
             .filter(|declared| !self.already_satisfied(&declared.logical_id))
             .cloned()
             .map(|declared| wait_conditions::WaitConditionBarrier::open(declared, now))
