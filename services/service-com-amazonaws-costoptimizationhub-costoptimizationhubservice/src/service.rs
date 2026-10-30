@@ -334,16 +334,18 @@ pub(crate) fn stated_validation_exception(
 }
 
 /// How this service words the refusal of a request for Cost Optimization Hub
-/// data about accounts other than the caller's: it names the data that was asked
-/// for and the reason the caller cannot have it — it is not the organization's
-/// management account. `subject` is the data the request asked for
-/// (`"enrollment statuses"`, `"recommendations"`). The message of the modelled
-/// `AccessDeniedException` the organization-scoped readers answer with.
-pub(crate) fn organization_view_denied(subject: &str) -> String {
-    format!(
-        "Cannot get {subject} for member accounts of the organization. This is because your \
-         account is not the management account of the organization."
-    )
+/// data about accounts other than the caller's: one fixed sentence naming the
+/// member accounts of the organization and the reason the caller cannot have
+/// their data — it is not the organization's management account.
+///
+/// The sentence is the same for every read that refuses, whichever data was
+/// asked for, so it takes no parameter: the refusal class is one class, and the
+/// message of the modelled `AccessDeniedException` every organization-scoped
+/// reader answers with is built here once.
+pub(crate) fn organization_view_denied() -> String {
+    "Cannot get enrollment statuses for member accounts of the organization. This is because \
+     your account is not the management account of the organization."
+        .to_string()
 }
 
 /// This service's refusal of a numeric member outside the range the calling

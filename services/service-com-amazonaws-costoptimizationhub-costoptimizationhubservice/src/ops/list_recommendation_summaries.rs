@@ -25,9 +25,11 @@
 //! over, or the caller's effective `savingsEstimationMode` is the undiscounted
 //! one.
 //!
-//! `filter.accountIds` asks for other accounts' recommendations, which only the
-//! organization's management account may do, so a populated `accountIds` from
-//! any other caller is refused with the modelled `AccessDeniedException`. The
+//! `filter.accountIds` naming an account other than the caller's asks for other
+//! accounts' recommendations, which only the organization's management account
+//! may do, so such a scope from any other caller is refused with the modelled
+//! `AccessDeniedException`; an `accountIds` naming only the caller's own account
+//! is a read of that account's own record and is served. The
 //! three `filter` members this API documents as unsupported are refused with the
 //! modelled `ValidationException`, whose `message` names the filter that was
 //! rejected and that this operation does not support it.
@@ -265,7 +267,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The same shared rule `ListRecommendations` reads its rows through
         // (`crate::state::...::recommendation_view`): the organization gate on
         // `filter.accountIds` — only the organization's management account may
-        // ask for other accounts' data — the caller's effective savings
+        // ask for the data of accounts other than the caller's — the caller's
+        // effective savings
         // estimation mode, and the rows this account may read (the same
         // visibility `ListRecommendations` and `GetRecommendation` serve, so a
         // summary never reports a catalog nobody opted into) narrowed by the
@@ -498,10 +501,12 @@ fn unknown_metric(metric: &str) -> ListRecommendationSummariesError {
 /// Refuse a caller that is not the organization's management account the
 /// summaries of the organization's member accounts: the modelled
 /// `AccessDeniedException` (403), because what is missing is the caller's
-/// permission and not anything about the values it sent.
+/// permission and not anything about the values it sent. The sentence is the
+/// service's one wording of this refusal class
+/// (`crate::service::organization_view_denied`), not an operation-specific one.
 fn not_an_organization_view() -> ListRecommendationSummariesError {
     ListRecommendationSummariesErrorModeled::AccessDeniedException(AccessDeniedException {
-        message: crate::service::organization_view_denied("recommendation summaries"),
+        message: crate::service::organization_view_denied(),
     })
     .into()
 }

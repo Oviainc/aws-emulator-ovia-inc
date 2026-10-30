@@ -3,7 +3,7 @@
 //! The organization gate, driven end-to-end over the wire (`awsJson1_0`)
 //! through the same multi-service router the emulator boots.
 //!
-//! The rule under test: a Cost Optimization Hub READ whose scope is the
+//! The rule under test: a Cost Optimization Hub READ whose scope reaches the
 //! organization's MEMBER accounts belongs to the organization's management
 //! account alone — the enrollment or the recommendations of accounts other than
 //! the caller's. This emulator records no organization and so no management
@@ -11,7 +11,7 @@
 //! is refused with the operation's own modelled error — HTTP 403
 //! `AccessDeniedException` for a view the caller does not have
 //! (`smithy_query(query="operation", operation="ListRecommendations,ListEnrollmentStatuses")`)
-//! — and the same request without the organization-scoped member is served.
+//! — and a read confined to the caller's own account is served.
 //!
 //! The PREFERENCE writes are not here: a write the organization's management
 //! account alone may make is refused with the modelled `ValidationException`
@@ -54,10 +54,10 @@ async fn refused(
     );
 }
 
-/// A populated `filter.accountIds` asks `ListRecommendations` for other
-/// accounts' recommendations, so it is refused with 403
-/// `AccessDeniedException` — for any value, including the caller's own account
-/// id — while the identical request without that member is served.
+/// A `filter.accountIds` that reaches PAST the caller's own account asks
+/// `ListRecommendations` for other accounts' recommendations, so it is refused
+/// with 403 `AccessDeniedException`, while a scope naming only the caller — and
+/// the identical request without that member — is served.
 #[tokio::test]
 async fn an_account_ids_filter_is_refused_to_a_non_management_account() {
     // An enrolled account whose analysis has come due, because the positive
@@ -65,37 +65,59 @@ async fn an_account_ids_filter_is_refused_to_a_non_management_account() {
     let router = enrolled_router().await;
     let account = engine::emulator_account_id();
 
-    // (case, the filter sent). The rows differ in which ids the member names,
-    // how many, and what else the filter narrows by.
-    let cases: Vec<(String, Value)> = vec![
+    // (case, the filter sent, whether its scope reaches past the caller). The
+    // rows differ in which ids the member names, how many, and what else the
+    // filter narrows by.
+    let cases: Vec<(String, Value, bool)> = vec![
         (
             "the caller's own account".to_string(),
             json!({"accountIds": [account]}),
+            false,
+        ),
+        (
+            "the caller's own account, beside another filter member".to_string(),
+            json!({"accountIds": [account], "regions": ["us-east-1"]}),
+            false,
         ),
         (
             "an account that owns nothing in the catalog".to_string(),
             json!({"accountIds": ["111122223333"]}),
+            true,
         ),
         (
-            "two accounts".to_string(),
+            "two other accounts".to_string(),
             json!({"accountIds": ["111122223333", "444455556666"]}),
+            true,
         ),
         (
-            "beside another filter member".to_string(),
-            json!({"accountIds": [account], "regions": ["us-east-1"]}),
+            "another account beside the caller's own".to_string(),
+            json!({"accountIds": [account, "111122223333"]}),
+            true,
         ),
     ];
 
-    for (case, filter) in &cases {
-        refused(
-            &router,
-            case,
-            "ListRecommendations",
-            &json!({"includeAllRecommendations": true, "filter": filter, "maxResults": 10}),
-            403,
-            "AccessDeniedException",
-        )
-        .await;
+    for (case, filter, reaches_past) in &cases {
+        let request =
+            json!({"includeAllRecommendations": true, "filter": filter, "maxResults": 10});
+        if *reaches_past {
+            refused(
+                &router,
+                case,
+                "ListRecommendations",
+                &request,
+                403,
+                "AccessDeniedException",
+            )
+            .await;
+        } else {
+            let served = ok(&router, "ListRecommendations", &request).await;
+            assert!(
+                served["items"]
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty()),
+                "case {case:?}: expected the account's own rows, got {served}"
+            );
+        }
 
         // The same request with the organization-scoped member dropped is
         // served: it is that member, not the rest of the filter, that the

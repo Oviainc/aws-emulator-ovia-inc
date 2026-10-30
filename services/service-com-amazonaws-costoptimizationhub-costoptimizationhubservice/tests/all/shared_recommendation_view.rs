@@ -3,11 +3,11 @@
 //! The ONE recommendation view both recommendation readers serve from.
 //!
 //! `ListRecommendations` and `ListRecommendationSummaries` select their rows
-//! through the same rule: a populated `filter.accountIds` asks for the
-//! recommendations of accounts other than the caller's, which only the
+//! through the same rule: a `filter.accountIds` that reaches past the caller's
+//! own account asks for the recommendations of other accounts, which only the
 //! organization's management account may do; otherwise the rows are the ones the
-//! account may read — an enrolled account whose analysis has come due — narrowed
-//! by every member the filter sets, under the caller's effective
+//! addressed account may read — an enrolled account whose analysis has come due
+//! — narrowed by every member the filter sets, under the caller's effective
 //! `savingsEstimationMode`.
 //!
 //! These tests drive that one path through BOTH operations over the wire and
@@ -21,6 +21,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cost_optimization_hub::{
     call, enrolled_router, enrolled_router_with_discounts_visible, error_code, ok, router,
+    ORGANIZATION_VIEW_DENIAL,
 };
 
 /// Two money figures are the same figure: both readers round to cents, so
@@ -210,36 +211,61 @@ async fn both_recommendation_readers_select_the_same_rows() {
     }
 }
 
-/// The organization gate is one rule: a populated `filter.accountIds` is refused
-/// to a caller that is not the organization's management account — with the 403
-/// `AccessDeniedException` each operation declares — and served, by both
-/// readers, to the management account.
+/// The organization gate is one rule: an `accountIds` scope that reaches PAST
+/// the caller's own account is refused to a caller that is not the
+/// organization's management account — with the 403 `AccessDeniedException`
+/// each operation declares — while a scope naming only the caller is a read of
+/// its own record and is served, by both readers alike; the management account
+/// is served either.
 #[tokio::test]
 async fn the_account_ids_gate_answers_the_same_for_both_readers() {
     let member = enrolled_router().await;
     let account = engine::emulator_account_id();
 
-    // (case, the `accountIds` the filter names). The rows differ in which ids
-    // the member names, how many, and what else the filter narrows by.
-    let cases: Vec<(&str, Value)> = vec![
-        ("the caller's own account", json!({"accountIds": [account]})),
+    // (case, the `accountIds` the filter names, whether the scope reaches past
+    // the caller). The rows differ in which ids the member names, how many,
+    // and what else the filter narrows by.
+    let cases: Vec<(&str, Value, bool)> = vec![
+        (
+            "the caller's own account",
+            json!({"accountIds": [account]}),
+            false,
+        ),
+        (
+            "the caller's own account twice",
+            json!({"accountIds": [account, account]}),
+            false,
+        ),
+        (
+            "the caller's own account beside another filter member",
+            json!({"accountIds": [account], "regions": ["us-east-1"]}),
+            false,
+        ),
         (
             "an account that owns nothing in the catalog",
             json!({"accountIds": ["111122223333"]}),
+            true,
         ),
         (
-            "two accounts",
+            "two other accounts",
             json!({"accountIds": ["111122223333", "444455556666"]}),
+            true,
         ),
         (
-            "beside another filter member",
-            json!({"accountIds": [account], "regions": ["us-east-1"]}),
+            "the caller beside another account",
+            json!({"accountIds": [account, "111122223333"]}),
+            true,
+        ),
+        (
+            "another account beside another filter member",
+            json!({"accountIds": ["111122223333"], "regions": ["us-east-1"]}),
+            true,
         ),
     ];
 
-    for (case, filter) in &cases {
-        // Both readers refuse it, and word the refusal as the view the caller
-        // does not have rather than as a bad value.
+    for (case, filter, reaches_past) in &cases {
+        // Both readers answer the same way, and word a refusal as the view the
+        // caller does not have rather than as a bad value.
         for (operation, body) in [
             (
                 "ListRecommendations",
@@ -251,34 +277,53 @@ async fn the_account_ids_gate_answers_the_same_for_both_readers() {
             ),
         ] {
             let (status, payload) = call(&member, operation, &body).await;
+            let expected = if *reaches_past { 403 } else { 200 };
             assert_eq!(
-                status, 403,
-                "case {case:?} {operation}: expected HTTP 403, got {status} with {payload}"
+                status, expected,
+                "case {case:?} {operation}: expected HTTP {expected}, got {status} with {payload}"
             );
+            if !*reaches_past {
+                continue;
+            }
             assert_eq!(
                 error_code(&payload),
                 "AccessDeniedException",
                 "case {case:?} {operation}: expected an AccessDeniedException, got {payload}"
             );
-            assert!(
-                payload["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("management account")),
-                "case {case:?} {operation}: expected a message naming the rule, got {payload}"
+            assert_eq!(
+                payload["message"].as_str(),
+                Some(ORGANIZATION_VIEW_DENIAL),
+                "case {case:?} {operation}: expected the refusal {ORGANIZATION_VIEW_DENIAL:?}, \
+                 got {payload}"
             );
         }
     }
 
+    // What the admitted self-named scope selects: the caller's own rows, the
+    // same ones the read that names no account at all is served.
+    let own = json!({"accountIds": [account]});
+    let named = listed(&member, Some(&own), true).await;
+    let unnamed = listed(&member, None, true).await;
+    assert_eq!(
+        named, unnamed,
+        "case the caller's own account: expected the rows the unfiltered read serves, got \
+         {named:?}"
+    );
+    assert!(
+        !named.is_empty(),
+        "case the caller's own account: expected the enrolled account's rows, got {named:?}"
+    );
+
     // The other arm of the same gate: the organization's management account is
-    // served the filter, by both readers, and they agree on what it selects.
+    // served a scope that does reach past it, by both readers, and they agree
+    // on what it selects.
     let management = enrolled_router_with_discounts_visible().await;
-    let filter = json!({"accountIds": [account]});
-    let items = listed(&management, Some(&filter), true).await;
+    let items = listed(&management, Some(&own), true).await;
     assert!(
         !items.is_empty(),
         "case management account: expected the account's recommendations, got {items:?}"
     );
-    let summary = summarised(&management, Some(&filter), "AccountId").await;
+    let summary = summarised(&management, Some(&own), "AccountId").await;
     assert_eq!(
         groups(&summary),
         distinct(&items, "accountId"),

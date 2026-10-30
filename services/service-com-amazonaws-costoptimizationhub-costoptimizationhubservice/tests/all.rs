@@ -39,6 +39,8 @@ mod preference_state_consistency;
 mod preference_writes;
 #[path = "all/recommendation_detail_lookup.rs"]
 mod recommendation_detail_lookup;
+#[path = "all/recommendation_read_scope_gate.rs"]
+mod recommendation_read_scope_gate;
 #[path = "all/recommendation_summaries.rs"]
 mod recommendation_summaries;
 #[path = "all/rejection_fidelity.rs"]

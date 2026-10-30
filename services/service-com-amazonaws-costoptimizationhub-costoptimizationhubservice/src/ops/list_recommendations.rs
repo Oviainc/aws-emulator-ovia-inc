@@ -14,9 +14,11 @@
 //! are computed from each row's stored prices under the caller's effective
 //! `savingsEstimationMode` preference.
 //!
-//! `filter.accountIds` asks for other accounts' recommendations, which only the
-//! organization's management account may do, so a populated `accountIds` from
-//! any other caller is refused with the modelled `AccessDeniedException`.
+//! `filter.accountIds` naming an account other than the caller's asks for other
+//! accounts' recommendations, which only the organization's management account
+//! may do, so such a scope from any other caller is refused with the modelled
+//! `AccessDeniedException`; an `accountIds` naming only the caller's own account
+//! is a read of that account's own record and is served.
 //!
 //! An `orderBy` the request sets is honoured as a whole: its `dimension` says
 //! which values the rows are put in order of, so one that names no
@@ -380,10 +382,12 @@ fn stated_refusal(statement: String, field_message: String) -> ListRecommendatio
 /// Refuse a caller that is not the organization's management account the
 /// recommendations of the organization's member accounts: the modelled
 /// `AccessDeniedException` (403), because what is missing is the caller's
-/// permission and not anything about the values it sent.
+/// permission and not anything about the values it sent. The sentence is the
+/// service's one wording of this refusal class
+/// (`crate::service::organization_view_denied`), not an operation-specific one.
 fn not_an_organization_view() -> ListRecommendationsError {
     ListRecommendationsErrorModeled::AccessDeniedException(AccessDeniedException {
-        message: crate::service::organization_view_denied("recommendations"),
+        message: crate::service::organization_view_denied(),
     })
     .into()
 }

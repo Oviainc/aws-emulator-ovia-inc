@@ -1163,16 +1163,22 @@ impl ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
     /// The recommendation rows one request selects, and the savings estimation
     /// mode their money members are computed under.
     ///
-    /// The one place the rule both LIST readers apply is written: asking for
-    /// the recommendations of accounts other than the caller's — a populated
-    /// `filter.accountIds` — is an organization view, which only the
+    /// The one place the rule both LIST readers apply is written: a read whose
+    /// scope reaches PAST the caller's own account — a `filter.accountIds`
+    /// naming any other account — is an organization view, which only the
     /// organization's management account has, so any other caller is refused
     /// ([`OrganizationViewRequired`], which each reader answers through its own
-    /// modelled error); otherwise the rows are the ones the accounts the
-    /// request ADDRESSES may be read for ([`Self::addressed_accounts`],
-    /// `view_over`) narrowed by every member the filter sets, under the
-    /// account's effective `savingsEstimationMode` — the view the reader of ONE
-    /// recommendation is served too ([`Self::readable_recommendation_view`]).
+    /// modelled error), while a scope confined to the caller's own account is
+    /// that account's own record and is served whoever asks. That question is
+    /// the enrollment reader's too, so it is asked once, of the one
+    /// [`ReadScope`] the request resolves to
+    /// ([`Self::addressed_accounts_for_read`]).
+    ///
+    /// Otherwise the rows are the ones the accounts the request ADDRESSES may
+    /// be read for (`view_over`) narrowed by every member the filter sets,
+    /// under the account's effective `savingsEstimationMode` — the view the
+    /// reader of ONE recommendation is served too
+    /// ([`Self::readable_recommendation_view`]).
     pub fn recommendation_view(
         &self,
         account_id: &str,
@@ -1181,16 +1187,12 @@ impl ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
         let named = filter
             .and_then(|filter| filter.account_ids.as_deref())
             .unwrap_or_default();
-        // Refused for ANY populated `accountIds`, because what the caller lacks
-        // is the view, not one account in it.
-        if !named.is_empty() && !self.is_management_account(account_id) {
-            return Err(OrganizationViewRequired);
-        }
-
-        // The rows come from the accounts the request addresses — the ones it
-        // named, else the caller's own — so a read admitted as reaching another
-        // account answers that account's rows rather than an empty list.
-        let addressed = self.addressed_accounts(account_id, named, false);
+        // Gate and scoping from the one scope: the read is refused only where
+        // it reaches an account other than the caller's, and the rows then come
+        // from the accounts it addresses — the ones it named, else the caller's
+        // own — so a read admitted as reaching another account answers that
+        // account's rows rather than an empty list.
+        let addressed = self.addressed_accounts_for_read(account_id, named, false)?;
         Ok(self.view_over(account_id, &addressed, filter))
     }
 

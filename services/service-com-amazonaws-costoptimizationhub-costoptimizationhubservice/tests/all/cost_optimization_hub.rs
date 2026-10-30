@@ -160,6 +160,15 @@ pub(crate) fn error_code(payload: &Value) -> String {
 /// `Other`, for a refusal no field accounts for).
 pub(crate) const FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
 
+/// The one sentence this service refuses a read whose scope reaches past the
+/// caller's own account with — the `message` of the 403 `AccessDeniedException`
+/// every organization-scoped reader answers. Entirely fixed text, the same for
+/// whichever data was asked for, so it is named once here and asserted
+/// verbatim by every suite that drives the refusal.
+pub(crate) const ORGANIZATION_VIEW_DENIAL: &str =
+    "Cannot get enrollment statuses for member accounts of the organization. This is because \
+     your account is not the management account of the organization.";
+
 /// The fixed, request-independent summary a refusal whose detail is carried in
 /// `fields` states in `message`.
 pub(crate) const FIELD_VALIDATION_SUMMARY: &str =

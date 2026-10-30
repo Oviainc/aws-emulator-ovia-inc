@@ -245,10 +245,12 @@ const PAGE_KIND: &str = "enrollment-statuses";
 /// Refuse a caller that is not the organization's management account the
 /// enrollment of the organization's member accounts: the modelled
 /// `AccessDeniedException` (403), because what is missing is the caller's
-/// permission and not anything about the values it sent.
+/// permission and not anything about the values it sent. The sentence is the
+/// service's one wording of this refusal class
+/// (`crate::service::organization_view_denied`).
 fn not_an_organization_view() -> ListEnrollmentStatusesError {
     ListEnrollmentStatusesErrorModeled::AccessDeniedException(AccessDeniedException {
-        message: crate::service::organization_view_denied("enrollment statuses"),
+        message: crate::service::organization_view_denied(),
     })
     .into()
 }
