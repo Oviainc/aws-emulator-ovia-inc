@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/absent_group_refusal_messages.rs"]
 mod absent_group_refusal_messages;
+#[path = "all/account_level_reads_publish_service_data.rs"]
+mod account_level_reads_publish_service_data;
 #[path = "all/auto_scaling_group_lifecycle.rs"]
 mod auto_scaling_group_lifecycle;
 #[path = "all/cancel_instance_refresh.rs"]

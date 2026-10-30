@@ -195,6 +195,26 @@ pub const MAX_GROUPS: usize = 500;
 /// approach the limit.
 pub const MAX_LAUNCH_CONFIGURATIONS: usize = 200;
 
+/// How fast the account's API call-rate bucket refills, in calls per second, as
+/// `DescribeAccountLimits` reports it under `ThrottlingLimits/AccountMaxCallRate`.
+///
+/// The subtree is RECORDED behaviour rather than modelled: the live awsQuery
+/// response carries it while `DescribeAccountLimitsAnswer` declares only the four
+/// counts (`smithy_query(query="shape", shape="DescribeAccountLimitsAnswer")`), so
+/// the shapes it is written through are hand-authored beside that answer in
+/// `ops/types/describe_account_limits_types.rs`.
+///
+/// The figure is what the account REPORTS, like [`MAX_GROUPS`]: a rate rather than a
+/// counter, so nothing about it moves as calls arrive, and nothing in this emulator
+/// paces a caller against it. A client that reads its own call budget before pacing
+/// its calls needs a rate and a burst size here instead of a null.
+pub const ACCOUNT_MAX_CALL_RATE_REFILL_RATE: f64 = 5.0;
+
+/// How many calls the account's API call-rate bucket holds — its burst size — as
+/// `DescribeAccountLimits` reports it under `ThrottlingLimits/AccountMaxCallRate`,
+/// on the same footing as [`ACCOUNT_MAX_CALL_RATE_REFILL_RATE`].
+pub const ACCOUNT_MAX_CALL_RATE_BUCKET_SIZE: i32 = 30;
+
 /// The most scaling activities this service retains; appending past it drops the
 /// oldest.
 ///
@@ -1317,9 +1337,22 @@ pub const LIFECYCLE_HOOK_TYPES: &[&str] = &[
 ];
 
 /// The catalog `DescribeAutoScalingNotificationTypes` reports: the event types a
-/// group can notify about, from the model's own documentation for
-/// `NotificationConfiguration$NotificationType` ("One of the following event
-/// notification types: …"), in the order that documentation publishes them.
+/// group can notify about.
+///
+/// The model's own documentation for `NotificationConfiguration$NotificationType`
+/// ("One of the following event notification types: …") enumerates the four
+/// instance-lifecycle events and the test notification, so that prose is a LOWER
+/// BOUND on what the service publishes rather than the catalog itself: the service
+/// also notifies about the replacement of an instance's root volume, under
+/// `autoscaling:EC2_ROOT_VOLUME_REPLACEMENT` and its `_ERROR` counterpart, which a
+/// group may name in a notification configuration without the prose listing it. The
+/// list target is an untyped string list
+/// (`smithy_query(query="shape", shape="AutoScalingNotificationTypes")`), so the
+/// membership is the service's own.
+///
+/// In ASCII order, which is the order the service publishes them in: the
+/// instance-lifecycle events, then the root-volume ones, then the test
+/// notification.
 ///
 /// The lifecycle transitions of [`LIFECYCLE_HOOK_TYPES`] are a SEPARATE catalog,
 /// published by `DescribeLifecycleHookTypes`, even though the model carries both
@@ -1332,6 +1365,8 @@ pub const AUTO_SCALING_NOTIFICATION_TYPES: &[&str] = &[
     "autoscaling:EC2_INSTANCE_LAUNCH_ERROR",
     "autoscaling:EC2_INSTANCE_TERMINATE",
     "autoscaling:EC2_INSTANCE_TERMINATE_ERROR",
+    "autoscaling:EC2_ROOT_VOLUME_REPLACEMENT",
+    "autoscaling:EC2_ROOT_VOLUME_REPLACEMENT_ERROR",
     "autoscaling:TEST_NOTIFICATION",
 ];
 

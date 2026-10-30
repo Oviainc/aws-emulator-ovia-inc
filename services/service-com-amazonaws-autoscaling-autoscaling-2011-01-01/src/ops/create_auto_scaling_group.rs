@@ -435,7 +435,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 "Valid requests must contain either LaunchTemplate, LaunchConfigurationName, \
-                 InstanceId or MixedInstancesPolicy",
+                 InstanceId or MixedInstancesPolicy parameter.",
             ));
         }
         if input.min_size < 0 {

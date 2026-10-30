@@ -59,9 +59,14 @@
 //! * `NumberOfLaunchConfigurations` (integer) — The current number of launch
 //!   configurations for your account.
 //!
-//! The model declares no `ThrottlingLimits` member on
-//! `DescribeAccountLimitsAnswer`, so this operation reports none: a member the
-//! model does not carry has no place on the wire.
+//! The answer also carries `ThrottlingLimits/AccountMaxCallRate` — the rate the
+//! account's API call-rate bucket refills at and the number of calls it holds —
+//! which the on-disk model does not declare on `DescribeAccountLimitsAnswer` and
+//! the service's own response does carry: RECORDED behaviour, reported from
+//! [`crate::state::ACCOUNT_MAX_CALL_RATE_REFILL_RATE`] and
+//! [`crate::state::ACCOUNT_MAX_CALL_RATE_BUCKET_SIZE`] through the hand-authored
+//! shapes in `types/describe_account_limits_types.rs`, which says why that
+//! structure's schema and serializer are written out rather than derived.
 //!
 //! ## Errors
 //!
@@ -151,8 +156,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
 
-        // `i32` is the modelled width of every member here, and both counts are
-        // bounded by the maxima beside them, so neither conversion can be lossy.
+        // `i32` is the modelled width of every count member here, and both counts
+        // are bounded by the maxima beside them, so neither conversion can be
+        // lossy.
         Ok(DescribeAccountLimitsOutput {
             max_number_of_auto_scaling_groups: Some(crate::state::MAX_GROUPS as i32),
             max_number_of_launch_configurations: Some(
@@ -160,6 +166,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             number_of_auto_scaling_groups: Some(state.groups.len() as i32),
             number_of_launch_configurations: Some(state.launch_configurations.len() as i32),
+            // The account's own call-rate budget: a published figure of the account
+            // rather than anything the store counts, so it is the same on every read
+            // and no read moves it.
+            throttling_limits: Some(ThrottlingLimits {
+                account_max_call_rate: Some(AccountMaxCallRate {
+                    refill_rate: crate::state::ACCOUNT_MAX_CALL_RATE_REFILL_RATE,
+                    bucket_size: crate::state::ACCOUNT_MAX_CALL_RATE_BUCKET_SIZE,
+                }),
+            }),
         })
     }
 }
