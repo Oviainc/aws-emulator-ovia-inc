@@ -103,7 +103,7 @@ pub(crate) async fn cloudformation(
 
 /// Call one Amazon S3 Vectors operation over its restJson1 wire, signed for `region`: a
 /// POST to the operation's own URI, which is how that model binds every one of them.
-async fn s3vectors(
+pub(crate) async fn s3vectors(
     router: &MultiServiceRouter,
     region: &str,
     operation: &str,
@@ -151,7 +151,7 @@ fn bucket_arn(region: &str, name: &str) -> String {
 }
 
 /// A vector index's ARN, which nests inside its bucket's.
-fn index_arn(region: &str, bucket: &str, index: &str) -> String {
+pub(crate) fn index_arn(region: &str, bucket: &str, index: &str) -> String {
     format!("{}/index/{index}", bucket_arn(region, bucket))
 }
 

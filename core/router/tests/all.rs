@@ -17,6 +17,10 @@
 // are where concurrently landing suites add their line, so a declaration placed there
 // collides with every one of them. The head of the list is the one region nothing
 // else appends to.
+#[path = "all/cloudformation_refuses_s3vectors_vector_buckets.rs"]
+mod cloudformation_refuses_s3vectors_vector_buckets;
+// Declared here, at the head, for the reason the entry below records: the appended tail and
+// the sorted `k…` span are both regions concurrently landing suites add their line to.
 #[path = "all/kinesisvideo_signing_name_routing.rs"]
 mod kinesisvideo_signing_name_routing;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
