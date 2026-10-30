@@ -8,9 +8,9 @@
 //! distinct combination of the values its `Contribution.Keys` extract, counting occurrences or
 //! summing the field its `ValueOf` names, ranked by the statistic `OrderBy` asks for and cut to
 //! `MaxContributorCount` — and the series it reports is one datapoint per `Period` of the
-//! window that holds an observation, anchored at multiples of the period and so strictly
-//! ascending in `Timestamp` with no instant repeated; a window shorter than one `Period` is
-//! refused.**
+//! window, anchored at multiples of the period and so strictly ascending in `Timestamp` with no
+//! instant repeated, a period holding no observation reporting each statistic asked for at
+//! zero; a window shorter than one `Period` is refused.**
 //!
 //! The rows differ along what the rule generalises over: the log format (`JSON` and `CLF`), how
 //! a key addresses its field (a member, a nested member, a `CLF` position and a `CLF` name),
@@ -214,7 +214,7 @@ async fn a_report_is_computed_from_the_log_events_the_rule_evaluated() {
                 (4, access_log(json!({"ip": "198.51.100.7", "requestBytes": 64}))),
             ],
             key_labels: vec!["$.ip"],
-            aggregation_statistic: "Count",
+            aggregation_statistic: "SampleCount",
             contributors: vec![
                 (vec!["203.0.113.42"], 3.0),
                 (vec!["198.51.100.7"], 1.0),
@@ -241,7 +241,7 @@ async fn a_report_is_computed_from_the_log_events_the_rule_evaluated() {
                 (3, access_log(json!({"ip": "203.0.113.42", "httpMethod": "GET"}))),
             ],
             key_labels: vec!["$.ip", "$.httpMethod"],
-            aggregation_statistic: "Count",
+            aggregation_statistic: "SampleCount",
             contributors: vec![
                 (vec!["203.0.113.42", "GET"], 2.0),
                 (vec!["203.0.113.42", "PUT"], 1.0),
@@ -294,7 +294,7 @@ async fn a_report_is_computed_from_the_log_events_the_rule_evaluated() {
                 (3, access_log(json!({"request": {"ip": "192.0.2.9"}}))),
             ],
             key_labels: vec!["$.request.ip"],
-            aggregation_statistic: "Count",
+            aggregation_statistic: "SampleCount",
             contributors: vec![(vec!["203.0.113.42"], 2.0), (vec!["192.0.2.9"], 1.0)],
             datapoint: vec![("UniqueContributors", 2.0), ("SampleCount", 3.0)],
         },
@@ -310,7 +310,7 @@ async fn a_report_is_computed_from_the_log_events_the_rule_evaluated() {
                 (3, access_log(json!({"status": 404}))),
             ],
             key_labels: vec!["$.status"],
-            aggregation_statistic: "Count",
+            aggregation_statistic: "SampleCount",
             contributors: vec![(vec!["404"], 2.0), (vec!["200"], 1.0)],
             datapoint: vec![("UniqueContributors", 2.0), ("SampleCount", 3.0)],
         },
@@ -355,7 +355,7 @@ async fn a_report_is_computed_from_the_log_events_the_rule_evaluated() {
                 (3, "GET /health 200".to_string()),
             ],
             key_labels: vec!["$2"],
-            aggregation_statistic: "Count",
+            aggregation_statistic: "SampleCount",
             contributors: vec![(vec!["/index.html"], 2.0), (vec!["/health"], 1.0)],
             datapoint: vec![("UniqueContributors", 2.0), ("SampleCount", 3.0)],
         },
@@ -373,7 +373,7 @@ async fn a_report_is_computed_from_the_log_events_the_rule_evaluated() {
                 (2, access_log(json!({"ip": "203.0.113.42"}))),
             ],
             key_labels: vec!["$.ip"],
-            aggregation_statistic: "Count",
+            aggregation_statistic: "SampleCount",
             contributors: vec![(vec!["203.0.113.42"], 2.0)],
             datapoint: vec![("UniqueContributors", 1.0), ("SampleCount", 2.0)],
         },
@@ -448,7 +448,7 @@ async fn a_report_is_computed_from_the_log_events_the_rule_evaluated() {
                 ),
             ],
             key_labels: vec!["$.ip"],
-            aggregation_statistic: "Count",
+            aggregation_statistic: "SampleCount",
             contributors: vec![(vec!["203.0.113.42"], 1.0)],
             datapoint: vec![("UniqueContributors", 1.0), ("SampleCount", 1.0)],
         },
@@ -631,10 +631,18 @@ async fn an_event_the_rule_does_not_admit_contributes_nothing() {
             Some(0.0),
             "case {case:?}: nothing contributed means nothing aggregated, got {report}"
         );
+        let datapoints = reported_datapoints(&report);
         assert_eq!(
-            reported_datapoints(&report),
-            no_datapoints(),
-            "case {case:?}: a period holding no observation is no datapoint, got {report}"
+            datapoints.len(),
+            1,
+            "case {case:?}: the window spans one period, which the series reports whether or not \
+             it holds an observation, got {report}"
+        );
+        assert_eq!(
+            statistic(&datapoints[0], "UniqueContributors"),
+            Some(0.0),
+            "case {case:?}: a period holding no observation reports the statistic asked for at \
+             zero, got {report}"
         );
     }
 }
@@ -785,9 +793,12 @@ async fn each_filter_operation_admits_exactly_the_events_it_names() {
 }
 
 #[tokio::test]
-async fn the_series_holds_one_ascending_datapoint_per_period_that_holds_an_observation() {
+async fn the_series_holds_one_ascending_datapoint_per_period_of_the_window() {
     // Rows differ along the period the datapoints are aggregated over and how many periods the
-    // observations span, including the one-second period the model's lower bound allows.
+    // observations span, including the one-second period the model's lower bound allows. The
+    // last column names the periods that hold an observation — every OTHER period of the window
+    // is reported too, at zero.
+    const WINDOW_SECS: i64 = 3_600;
     let cases: Vec<(&str, i64, Vec<i64>, Vec<i64>)> = vec![
         (
             "a one-minute period over three minutes",
@@ -808,7 +819,7 @@ async fn the_series_holds_one_ascending_datapoint_per_period_that_holds_an_obser
             vec![0, 1, 4],
         ),
         (
-            "periods with no observation report no datapoint",
+            "periods with no observation between the ones that hold them",
             60,
             vec![5, 125],
             vec![0, 120],
@@ -821,7 +832,7 @@ async fn the_series_holds_one_ascending_datapoint_per_period_that_holds_an_obser
         ),
     ];
 
-    for (index, (case, period, offsets, expected_buckets)) in cases.into_iter().enumerate() {
+    for (index, (case, period, offsets, observed_buckets)) in cases.into_iter().enumerate() {
         let (router, engine) = build_router_with_engine();
         let name = format!("series-rule-{index}");
         given_rule(&router, &name, &definition(json!({})), None).await;
@@ -834,18 +845,23 @@ async fn the_series_holds_one_ascending_datapoint_per_period_that_holds_an_obser
         let report = ok(
             &router,
             "GetInsightRuleReport",
-            &report_request(&name, period, 3_600, &["SampleCount"]),
+            &report_request(&name, period, WINDOW_SECS, &["SampleCount"]),
         )
         .await;
         let timestamps = datapoint_timestamps(&report);
+        // Every period of the window, and not only the ones holding an observation: "A time
+        // series of metric data points that matches the time period in the rule request."
+        // (`GetInsightRuleReportOutput$MetricDatapoints`)
         #[allow(clippy::cast_precision_loss)]
-        let expected: Vec<f64> = expected_buckets
-            .iter()
-            .map(|bucket| (ANCHOR_SECS + bucket) as f64)
+        let expected: Vec<f64> = (0..WINDOW_SECS / period)
+            .map(|step| (ANCHOR_SECS + step * period) as f64)
             .collect();
         assert_eq!(
             timestamps, expected,
-            "case {case:?}: expected the periods {expected:?}, got {timestamps:?} in {report}"
+            "case {case:?}: expected one datapoint per period of the window, {} of them, got {} \
+             in {report}",
+            expected.len(),
+            timestamps.len()
         );
         // The series is strictly ascending, so no instant is reported twice.
         assert!(
@@ -863,11 +879,45 @@ async fn the_series_holds_one_ascending_datapoint_per_period_that_holds_an_obser
             "case {case:?}: each datapoint is anchored at a multiple of the period, got \
              {timestamps:?}"
         );
-        // Every observation is counted exactly once across the series.
-        let counted: f64 = reported_datapoints(&report)
+        // A period reports the observations that fell in it, and a period holding none reports
+        // the statistic at zero.
+        #[allow(clippy::cast_precision_loss)]
+        let expected_counts: Vec<f64> = (0..WINDOW_SECS / period)
+            .map(|step| {
+                let bucket = step * period;
+                offsets
+                    .iter()
+                    .filter(|offset| *offset - offset.rem_euclid(period) == bucket)
+                    .count() as f64
+            })
+            .collect();
+        let counts: Vec<f64> = reported_datapoints(&report)
             .iter()
-            .filter_map(|point| statistic(point, "SampleCount"))
-            .sum();
+            .map(|point| statistic(point, "SampleCount").unwrap_or(f64::NAN))
+            .collect();
+        assert_eq!(
+            counts, expected_counts,
+            "case {case:?}: expected the per-period counts {expected_counts:?}, got {counts:?} \
+             in {report}"
+        );
+        // The row's own account of which periods hold an observation, read off the series.
+        #[allow(clippy::cast_precision_loss)]
+        let expected_observed: Vec<f64> = observed_buckets
+            .iter()
+            .map(|bucket| (ANCHOR_SECS + bucket) as f64)
+            .collect();
+        let observed: Vec<f64> = reported_datapoints(&report)
+            .iter()
+            .filter(|point| statistic(point, "SampleCount").unwrap_or_default() > 0.0)
+            .filter_map(|point| point.get("Timestamp").and_then(Value::as_f64))
+            .collect();
+        assert_eq!(
+            observed, expected_observed,
+            "case {case:?}: expected the periods {expected_observed:?} to hold the observations, \
+             got {observed:?} in {report}"
+        );
+        // Every observation is counted exactly once across the series.
+        let counted: f64 = counts.iter().sum();
         #[allow(clippy::cast_precision_loss)]
         let ingested = offsets.len() as f64;
         assert_eq!(

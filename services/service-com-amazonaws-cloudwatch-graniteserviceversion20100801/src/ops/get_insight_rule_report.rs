@@ -245,17 +245,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// (`crate::state::EMPTY_RULE_NAMES`), and echoes neither instant.
 const INVALID_TIME_RANGE: &str = "INVALID_TIME_RANGE";
 
-/// How many `Period`-wide datapoints ONE report may span.
-///
-/// EMULATOR CEILING on the RATIO the caller chooses: the series is one datapoint per period of
-/// the window, so the window divided by the `Period` is what the answer's size is proportional
-/// to, and bounding each of them on its own (the model bounds `Period` only as `range 1..`)
-/// does not bound that ratio. The number is the one CloudWatch publishes for the same kind of
-/// read — "A GetMetricData operation that does not include a query can retrieve as many as 500
-/// different metrics in a single request, with a total of as many as 100,800 data points."
-/// (`GetMetricData`) — so a report a client could really ask for is still served.
-const MAX_REPORTED_PERIODS: i64 = 100_800;
-
 /// Refuse the request with this operation's modelled `InvalidParameterValueException`
 /// (HTTP 400): "The value of an input parameter is bad or out-of-range."
 fn invalid_parameter_value(message: String) -> GetInsightRuleReportError {
@@ -272,7 +261,8 @@ fn invalid_parameter_value(message: String) -> GetInsightRuleReportError {
 ///
 /// The window is `[StartTime, EndTime)` and has to span at least one whole `Period`: a report
 /// is a series of `Period`-wide datapoints, so a shorter window holds none. It must also not
-/// span more periods than one report carries ([`MAX_REPORTED_PERIODS`]).
+/// span more periods than one report carries
+/// ([`insight_rules::MAX_REPORTED_PERIODS`]).
 fn report_request(
     input: &GetInsightRuleReportInput,
 ) -> Result<insight_rules::ReportRequest, GetInsightRuleReportError> {
@@ -287,11 +277,13 @@ fn report_request(
     if !window.is_finite() || window < period_width {
         return Err(invalid_parameter_value(INVALID_TIME_RANGE.to_string()));
     }
-    // How many datapoints the REQUEST asks for: the window the caller named over the period the
-    // caller named, which is the ratio the answer's size is proportional to.
-    let requested_periods = (window / period_width).ceil();
+    // How many datapoints the REQUEST asks for: the periods of the window the caller named at
+    // the period the caller named, which is the ratio the answer's size is proportional to and
+    // exactly the series the report would carry.
+    let requested_periods =
+        insight_rules::reported_period_count(start_secs, end_secs, period_secs);
     #[allow(clippy::cast_precision_loss)]
-    let cap = MAX_REPORTED_PERIODS as f64;
+    let cap = insight_rules::MAX_REPORTED_PERIODS as f64;
     if requested_periods > cap {
         return Err(invalid_parameter_value(crate::state::datapoint_cap_exceeded(
             requested_periods,

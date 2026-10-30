@@ -290,8 +290,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 // services." (`PutManagedInsightRules`)
                                 state: crate::state::INSIGHT_RULE_ENABLED.to_string(),
                                 // "For managed rules, this is `{"Name": "ServiceLogRule",
-                                // "Version": 1}`" (`InsightRule$Schema`).
-                                schema: crate::state::MANAGED_INSIGHT_RULE_SCHEMA.to_string(),
+                                // "Version": 1}`" (`InsightRule$Schema`), reported as the
+                                // compact schema that value names.
+                                schema: crate::state::insight_rule_schema(
+                                    crate::state::MANAGED_INSIGHT_RULE_SCHEMA_NAME,
+                                ),
                                 definition: definition.clone(),
                                 // "An optional built-in rule that Amazon Web Services
                                 // manages." (`InsightRule$ManagedRule`)
@@ -371,11 +374,10 @@ const INVALID_RESOURCE_ARN_EXCEPTION: &str = "InvalidParameterException";
 /// (`PutManagedInsightRules`) — so what it reports is the request this rule came from, under
 /// the schema the model names for a managed rule.
 fn managed_definition(origin: &crate::state::ManagedRuleOrigin) -> String {
-    // The schema is the one constant `crate::state` keeps for a managed rule, parsed so the
-    // definition and the rule's own `Schema` member cannot drift apart.
-    let schema: ::serde_json::Value =
-        ::serde_json::from_str(crate::state::MANAGED_INSIGHT_RULE_SCHEMA)
-            .unwrap_or(::serde_json::Value::Null);
+    // The schema document is built from the one schema `crate::state` keeps for a managed rule,
+    // so the definition and the rule's own `Schema` member cannot drift apart.
+    let schema =
+        crate::state::insight_rule_schema_document(crate::state::MANAGED_INSIGHT_RULE_SCHEMA_NAME);
     ::serde_json::json!({
         "Schema": schema,
         "TemplateName": origin.template_name,

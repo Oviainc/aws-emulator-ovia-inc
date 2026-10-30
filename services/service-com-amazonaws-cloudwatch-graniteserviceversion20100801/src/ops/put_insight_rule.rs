@@ -226,10 +226,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     name: input.rule_name.clone(),
                     state: rule_state,
                     // "For rules that you create, this is always `{"Name":
-                    // "CloudWatchLogRule", "Version": 1}`" (`InsightRule$Schema`), and such
-                    // a rule is not one Amazon Web Services manages
-                    // (`InsightRule$ManagedRule`).
-                    schema: crate::state::INSIGHT_RULE_SCHEMA.to_string(),
+                    // "CloudWatchLogRule", "Version": 1}`" (`InsightRule$Schema`), reported
+                    // as the compact schema that value names, and such a rule is not one
+                    // Amazon Web Services manages (`InsightRule$ManagedRule`).
+                    schema: crate::state::insight_rule_schema(
+                        crate::state::INSIGHT_RULE_SCHEMA_NAME,
+                    ),
                     definition: input.rule_definition.clone(),
                     managed_rule: Some(false),
                     // "The default is false" (`PutInsightRuleInput$ApplyOnTransformedLogs`).
@@ -331,13 +333,17 @@ fn validate_definition(definition: &str) -> Result<(), PutInsightRuleError> {
         .get("Schema")
         .and_then(::serde_json::Value::as_object)
         .filter(|schema| {
-            schema.get("Name").and_then(::serde_json::Value::as_str) == Some("CloudWatchLogRule")
-                && schema.get("Version").and_then(::serde_json::Value::as_u64) == Some(1)
+            schema.get("Name").and_then(::serde_json::Value::as_str)
+                == Some(crate::state::INSIGHT_RULE_SCHEMA_NAME)
+                && schema.get("Version").and_then(::serde_json::Value::as_u64)
+                    == Some(crate::state::INSIGHT_RULE_SCHEMA_VERSION)
         });
     if schema.is_none() {
-        return Err(invalid_parameter_value(definition_error(
-            "its Schema is not the CloudWatchLogRule schema, version 1",
-        )));
+        return Err(invalid_parameter_value(definition_error(&format!(
+            "its Schema is not the {} schema, version {}",
+            crate::state::INSIGHT_RULE_SCHEMA_NAME,
+            crate::state::INSIGHT_RULE_SCHEMA_VERSION
+        ))));
     }
 
     // The log groups the rule evaluates, named either by name or by ARN. A rule that selects

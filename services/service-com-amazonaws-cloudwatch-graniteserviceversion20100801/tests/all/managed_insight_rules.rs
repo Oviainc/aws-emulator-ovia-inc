@@ -30,9 +30,10 @@ use crate::harness::{
 };
 use serde_json::{json, Value};
 
-/// The `Schema` a managed rule carries: "For managed rules, this is `{"Name":
-/// "ServiceLogRule", "Version": 1}`" (`InsightRule$Schema`).
-const MANAGED_RULE_SCHEMA: &str = "{\"Name\": \"ServiceLogRule\", \"Version\": 1}";
+/// The `Schema` a managed rule carries: the schema "For managed rules, this is `{"Name":
+/// "ServiceLogRule", "Version": 1}`" (`InsightRule$Schema`) names, as the compact string the
+/// member carries it as.
+const MANAGED_RULE_SCHEMA: &str = "ServiceLogRule/1";
 
 /// How this service words a `ResourceARN` that is not an ARN.
 const INVALID_ARN_MESSAGE: &str = "INVALID_RESOURCE_ARN: Invalid ARN.";

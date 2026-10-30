@@ -36,7 +36,7 @@ const CLOUDWATCH_TARGET_PREFIX: &str = "GraniteServiceVersion20100801";
 const CLOUDWATCH_SIGNING_NAME: &str = "monitoring";
 
 /// The period the reports below aggregate their datapoints over, and the window they ask about:
-/// a window of several periods, so the series is one datapoint per period that holds an event.
+/// a window of several periods, so the series is one datapoint per period of it.
 const PERIOD_SECS: i64 = 60;
 
 /// The emulator with the two services this suite exercises, mounted on ONE engine exactly as
@@ -428,11 +428,32 @@ async fn an_ingested_log_event_contributes_to_the_rules_over_its_log_group() {
             timestamps.windows(2).all(|pair| pair[0] < pair[1]),
             "case {case:?}: the series must be strictly ascending by Timestamp, got {timestamps:?}"
         );
-        assert_eq!(
-            timestamps.is_empty(),
-            expected.is_empty(),
-            "case {case:?}: a rule with contributors reports a series and one without reports \
-             none, got {answered}"
+        // The series covers the window the request named, whether or not every period of it
+        // holds an observation: it opens on the period the window starts in, ends inside the
+        // window, and steps by exactly one period.
+        #[allow(clippy::cast_precision_loss)]
+        let period_width = PERIOD_SECS as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let window_start = start_secs as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let window_end = end_secs as f64;
+        let first = timestamps.first().copied().unwrap_or(f64::NAN);
+        let last = timestamps.last().copied().unwrap_or(f64::NAN);
+        assert!(
+            first <= window_start && window_start < first + period_width,
+            "case {case:?}: the series must open on the period {window_start} falls in, got \
+             {first} in {answered}"
+        );
+        assert!(
+            last < window_end && window_end <= last + period_width,
+            "case {case:?}: the series must end on the last period before {window_end}, got \
+             {last} in {answered}"
+        );
+        assert!(
+            timestamps
+                .windows(2)
+                .all(|pair| (pair[1] - pair[0] - period_width).abs() <= f64::EPSILON),
+            "case {case:?}: the series must step by one period, got {timestamps:?}"
         );
     }
 }

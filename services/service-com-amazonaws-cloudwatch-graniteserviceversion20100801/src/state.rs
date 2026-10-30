@@ -2284,10 +2284,36 @@ pub const MAX_HISTORY_ITEMS_PER_ALARM: usize = 1_000;
 /// oldest, the same direction retention ages history out in, so recent reads stay exact.
 pub const MAX_ALARM_HISTORIES: usize = 10_000;
 
-/// The `Schema` every Contributor Insights rule a caller creates carries: "For rules that
-/// you create, this is always `{"Name": "CloudWatchLogRule", "Version": 1}`. For managed
-/// rules, this is `{"Name": "ServiceLogRule", "Version": 1}`" (`InsightRule$Schema`).
-pub const INSIGHT_RULE_SCHEMA: &str = "{\"Name\": \"CloudWatchLogRule\", \"Version\": 1}";
+/// The schema NAME every Contributor Insights rule a caller creates is written against: "For
+/// rules that you create, this is always `{"Name": "CloudWatchLogRule", "Version": 1}`. For
+/// managed rules, this is `{"Name": "ServiceLogRule", "Version": 1}`" (`InsightRule$Schema`).
+pub const INSIGHT_RULE_SCHEMA_NAME: &str = "CloudWatchLogRule";
+
+/// The version both schema names are at — the one the member's documented value states. See
+/// [`INSIGHT_RULE_SCHEMA_NAME`].
+pub const INSIGHT_RULE_SCHEMA_VERSION: u64 = 1;
+
+/// A rule's schema as `InsightRule$Schema` carries it: the schema's name and version, joined
+/// by `/`.
+///
+/// `InsightRuleSchema` is a plain string, and the member's documented value
+/// (`{"Name": …, "Version": …}`) is the schema that string NAMES rather than the text of it —
+/// so what goes on the wire is the compact pair, which is what lets a client tell a rule it
+/// wrote from a rule the service manages by reading the name before the `/`.
+#[must_use]
+pub fn insight_rule_schema(schema_name: &str) -> String {
+    format!("{schema_name}/{INSIGHT_RULE_SCHEMA_VERSION}")
+}
+
+/// The same schema as the JSON object a rule DEFINITION states it with
+/// (`InsightRule$Definition`, "the definition of the rule, as a JSON object").
+///
+/// Built from the same name and version the wire form is ([`insight_rule_schema`]), so the
+/// schema a definition declares and the one the rule reports cannot drift apart.
+#[must_use]
+pub fn insight_rule_schema_document(schema_name: &str) -> ::serde_json::Value {
+    ::serde_json::json!({"Name": schema_name, "Version": INSIGHT_RULE_SCHEMA_VERSION})
+}
 
 /// A Contributor Insights rule that is evaluating log events: "The state of the rule. Valid
 /// values are ENABLED and DISABLED." (`PutInsightRuleInput$RuleState`)
@@ -2348,12 +2374,12 @@ pub const EMPTY_RULE_NAMES: &str = "EMPTY_RULE_NAMES: RuleNames cannot be an emp
 /// the other.
 pub const EMPTY_RULE_STATES: &str = "EMPTY_RULE_STATES: RuleStates cannot be an empty array.";
 
-/// The `Schema` a managed Contributor Insights rule carries: "For managed rules, this is
-/// `{"Name": "ServiceLogRule", "Version": 1}`" (`InsightRule$Schema`) — the schema of a rule
-/// `PutManagedInsightRules` enabled, which is why `PutInsightRule` refuses a definition
+/// The schema NAME a managed Contributor Insights rule is written against: "For managed rules,
+/// this is `{"Name": "ServiceLogRule", "Version": 1}`" (`InsightRule$Schema`) — the schema of a
+/// rule `PutManagedInsightRules` enabled, which is why `PutInsightRule` refuses a definition
 /// carrying it ("You cannot edit these rules with PutInsightRule",
 /// `PutManagedInsightRules`).
-pub const MANAGED_INSIGHT_RULE_SCHEMA: &str = "{\"Name\": \"ServiceLogRule\", \"Version\": 1}";
+pub const MANAGED_INSIGHT_RULE_SCHEMA_NAME: &str = "ServiceLogRule";
 
 /// The name the managed Contributor Insights rule enabled from `template_name` for
 /// `resource_arn` takes.

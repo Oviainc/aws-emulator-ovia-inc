@@ -89,6 +89,8 @@ mod insight_rule_batch_failures;
 mod insight_rule_report;
 #[path = "all/insight_rule_state.rs"]
 mod insight_rule_state;
+#[path = "all/insight_rule_wire_shapes.rs"]
+mod insight_rule_wire_shapes;
 #[path = "all/insight_rules.rs"]
 mod insight_rules;
 #[path = "all/list_metric_streams.rs"]

@@ -23,8 +23,10 @@
 //! Reporting is then pure ([`report`]): the observations inside the requested window are
 //! bucketed into `Period`-wide datapoints anchored at multiples of the period, which is what
 //! makes the series a report answers with strictly ascending in `Timestamp` with no instant
-//! repeated, and grouped by contributor for the ranking the request asks for. A report reads;
-//! it never changes what a later caller sees.
+//! repeated, and grouped by contributor for the ranking the request asks for. The series spans
+//! every period of the window, so a period that holds no observation is reported with each
+//! statistic asked for at zero rather than left out. A report reads; it never changes what a
+//! later caller sees.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -47,8 +49,8 @@ pub const LOG_FORMAT_CLF: &str = "CLF";
 pub const LOG_FORMATS: [&str; 2] = [LOG_FORMAT_JSON, LOG_FORMAT_CLF];
 
 /// What a rule aggregates contributor data on: the count of occurrences of each contributor.
-/// `GetInsightRuleReport` reports the same choice back as its `AggregationStatistic`
-/// ("Specifies whether this rule aggregates contributor data by COUNT or SUM").
+/// This is the keyword the rule's DEFINITION carries; the statistic a report names that
+/// aggregation by is [`aggregation_statistic`].
 pub const AGGREGATE_ON_COUNT: &str = "Count";
 
 /// The aggregation that sums the field a contribution's `ValueOf` names. See
@@ -57,6 +59,25 @@ pub const AGGREGATE_ON_SUM: &str = "Sum";
 
 /// The two aggregations a rule definition may name.
 pub const AGGREGATE_ON: [&str; 2] = [AGGREGATE_ON_COUNT, AGGREGATE_ON_SUM];
+
+/// The statistic a report names `aggregate_on` by: "Specifies whether this rule aggregates
+/// contributor data by COUNT or SUM" (`GetInsightRuleReportOutput$AggregationStatistic`).
+///
+/// A report names an aggregation by the per-datapoint STATISTIC that aggregation computes, not
+/// by the keyword the definition spells it with: counting occurrences computes "the number of
+/// occurrences that matched the rule during this data point"
+/// (`InsightRuleMetricDatapoint$SampleCount`), and summing the field a contribution names
+/// computes "the sum of the values from all contributors"
+/// (`InsightRuleMetricDatapoint$Sum`). A rule whose definition names no aggregation counts
+/// (the reading [`LogRuleDefinition::parse`] makes), so every rule has one of the two.
+#[must_use]
+pub fn aggregation_statistic(aggregate_on: &str) -> &'static str {
+    if aggregate_on == AGGREGATE_ON_SUM {
+        SUM_METRIC
+    } else {
+        SAMPLE_COUNT_METRIC
+    }
+}
 
 /// The statistic a report ranks its contributors by when the request names none: the first of
 /// the two the member allows ("Determines what statistic to use to rank the contributors.
@@ -600,8 +621,8 @@ pub struct InsightReport {
     /// The strings used as the keys for the rule, which are the fields it classifies
     /// contributors by.
     pub key_labels: Vec<String>,
-    /// Whether the rule aggregates contributor data by count or by sum, or `None` for a rule
-    /// whose definition names no aggregation this evaluation can read.
+    /// The statistic the rule's aggregation computes ([`aggregation_statistic`]): every rule
+    /// has one, since a rule whose definition names no aggregation counts.
     pub aggregation_statistic: Option<String>,
     /// "The sum of the values from all individual contributors that match the rule."
     /// (`GetInsightRuleReportOutput$AggregateValue`)
@@ -636,18 +657,15 @@ struct PeriodAggregate {
 ///
 /// PURE: it reads the rule's observations and writes nothing, so two reports of the same window
 /// are the same report and neither changes what a later caller sees. Its cost is the rule's
-/// observations, which is bounded ([`MAX_RULE_OBSERVATIONS`]) and not the window the caller
-/// named: a period holding no observation is no datapoint, so the series cannot be longer than
-/// the observations it folds.
+/// observations plus the periods the window spans, and both are bounded
+/// ([`MAX_RULE_OBSERVATIONS`], [`MAX_REPORTED_PERIODS`]).
 #[must_use]
 pub fn report(rule: &StoredInsightRule, request: &ReportRequest) -> InsightReport {
     // The definition as the write that stored the rule read it, so the definition TEXT has one
-    // reading and a report does not re-read it.
-    let Some(definition) = &rule.collection else {
-        // A rule whose definition is not a log rule this evaluation reads classifies no
-        // contributor, so there is nothing to report for it.
-        return InsightReport::default();
-    };
+    // reading and a report does not re-read it. A rule whose definition is not a log rule this
+    // evaluation reads classifies no contributor and has collected nothing, so it reports no
+    // key and no contributor — but still the series its window spans.
+    let definition = rule.collection.as_ref();
     let period = request.period_secs.max(1);
 
     let mut periods: BTreeMap<i64, PeriodAggregate> = BTreeMap::new();
@@ -681,9 +699,14 @@ pub fn report(rule: &StoredInsightRule, request: &ReportRequest) -> InsightRepor
         aggregate_value += observation.value;
     }
 
+    let aggregate_on = definition.map_or(AGGREGATE_ON_COUNT, |definition| {
+        definition.aggregate_on.as_str()
+    });
     InsightReport {
-        key_labels: definition.keys.clone(),
-        aggregation_statistic: Some(definition.aggregate_on.clone()),
+        key_labels: definition
+            .map(|definition| definition.keys.clone())
+            .unwrap_or_default(),
+        aggregation_statistic: Some(aggregation_statistic(aggregate_on).to_string()),
         aggregate_value,
         approximate_unique_count: i64::try_from(contributors.len()).unwrap_or(i64::MAX),
         contributors: ranked_contributors(&contributors, request),
@@ -733,9 +756,14 @@ fn ranked_contributors(
         .collect()
 }
 
-/// The series the report carries: one datapoint per period of the window that holds an
-/// observation, ascending by timestamp, each carrying exactly the statistics the request asked
-/// for.
+/// The series the report carries: one datapoint per `Period` of the window, ascending by
+/// timestamp, each carrying exactly the statistics the request asked for.
+///
+/// "A time series of metric data points that matches the time period in the rule request."
+/// (`GetInsightRuleReportOutput$MetricDatapoints`) — so the series is the WINDOW's periods and
+/// not only the ones that hold an observation: a period that holds none is still a period of
+/// the window, reported with each statistic asked for at zero, which is what gives a client
+/// charting the report an x-axis over the whole window.
 ///
 /// A request that asked for no statistic gets no series: "You can also optionally return one
 /// or more statistics about each data point in the time series." (`GetInsightRuleReport`), so a
@@ -748,27 +776,41 @@ fn metric_datapoints(
     if asked.is_empty() {
         return Vec::new();
     }
-    periods
-        .iter()
-        .map(|(bucket, aggregate)| {
+    // The period a datapoint of the window holds nothing in: every statistic of it is the
+    // aggregate of no observation.
+    let nothing_observed = PeriodAggregate::default();
+    window_periods(request)
+        .map(|bucket| {
+            let aggregate = periods.get(&bucket).unwrap_or(&nothing_observed);
             let statistic = |name: &str, value: f64| asked.contains(name).then_some(value);
             #[allow(clippy::cast_precision_loss)]
             let unique_contributors = aggregate.per_contributor.len() as f64;
+            // The largest total any ONE contributor reached in the period, and zero for a
+            // period no contributor appeared in — a contributor's value may be negative, so
+            // this is the largest of what is there rather than the largest of that and zero.
             let max_contributor_value = aggregate
                 .per_contributor
                 .values()
                 .copied()
-                .fold(f64::MIN, f64::max);
+                .reduce(f64::max)
+                .unwrap_or(0.0);
+            // The mean of no observation is zero rather than the undefined value a division
+            // by the empty count would be.
+            let average = if aggregate.sample_count == 0.0 {
+                0.0
+            } else {
+                aggregate.sum / aggregate.sample_count
+            };
             InsightRuleMetricDatapoint {
                 #[allow(clippy::cast_precision_loss)]
-                timestamp: super::to_timestamp(*bucket as f64),
+                timestamp: super::to_timestamp(bucket as f64),
                 unique_contributors: statistic(UNIQUE_CONTRIBUTORS_METRIC, unique_contributors),
                 max_contributor_value: statistic(
                     MAX_CONTRIBUTOR_VALUE_METRIC,
                     max_contributor_value,
                 ),
                 sample_count: statistic(SAMPLE_COUNT_METRIC, aggregate.sample_count),
-                average: statistic(AVERAGE_METRIC, aggregate.sum / aggregate.sample_count),
+                average: statistic(AVERAGE_METRIC, average),
                 sum: statistic(SUM_METRIC, aggregate.sum),
                 minimum: statistic(MINIMUM_METRIC, aggregate.minimum),
                 maximum: statistic(MAXIMUM_METRIC, aggregate.maximum),
@@ -776,6 +818,61 @@ fn metric_datapoints(
         })
         .collect()
 }
+
+/// Every period of the window the report was asked over, by its start in epoch seconds,
+/// ascending.
+///
+/// The periods are ANCHORED at multiples of the period, the same anchoring an observation is
+/// bucketed by ([`period_start`]), so the series holds exactly the buckets an observation of
+/// the window can fall in — which is what makes it strictly ascending with no instant repeated,
+/// and the instant a datapoint is reported at decided by the clock rather than by when the
+/// report was asked for. As many as [`reported_period_count`] counts, which is the number
+/// `GetInsightRuleReport` holds against [`MAX_REPORTED_PERIODS`] before it answers at all, so
+/// the `take` below only ever bounds a report nothing asked for.
+fn window_periods(request: &ReportRequest) -> impl Iterator<Item = i64> + '_ {
+    let period = request.period_secs.max(1);
+    let first = period_start(request.start_secs, period);
+    let end_secs = request.end_secs;
+    (0..)
+        .map(move |index: i64| first.saturating_add(index.saturating_mul(period)))
+        .take_while(move |bucket| {
+            #[allow(clippy::cast_precision_loss)]
+            let at = *bucket as f64;
+            at < end_secs
+        })
+        .take(MAX_REPORTED_PERIODS)
+}
+
+/// How many datapoints a report over `[start_secs, end_secs)` carries at a `period_secs`-wide
+/// period: the periods [`window_periods`] enumerates, counted.
+///
+/// Counted from the ANCHORED start, the same instant the series opens at, so what
+/// `GetInsightRuleReport` holds against [`MAX_REPORTED_PERIODS`] is exactly the series it would
+/// answer with — a window that is not period-aligned opens one period before its own start,
+/// and counting it from the un-anchored start would let a request one datapoint over the cap be
+/// served with its last datapoint cut off.
+#[must_use]
+pub fn reported_period_count(start_secs: f64, end_secs: f64, period_secs: i64) -> f64 {
+    let period = period_secs.max(1);
+    #[allow(clippy::cast_precision_loss)]
+    let anchored_start = period_start(start_secs, period) as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let width = period as f64;
+    ((end_secs - anchored_start) / width).ceil()
+}
+
+/// How many `Period`-wide datapoints ONE report carries, and so how many periods a report may
+/// be asked over.
+///
+/// EMULATOR CEILING on the RATIO the caller chooses: the series is one datapoint per period of
+/// the window, so the window divided by the `Period` is what the answer's size is proportional
+/// to, and bounding each of them on its own (the model bounds `Period` only as `range 1..`)
+/// does not bound that ratio. The number is the one CloudWatch publishes for the same kind of
+/// read — "A GetMetricData operation that does not include a query can retrieve as many as 500
+/// different metrics in a single request, with a total of as many as 100,800 data points."
+/// (`GetMetricData`) — so a report a client could really ask for is still served. A request
+/// asking for more is refused by `GetInsightRuleReport` rather than answered with a cut series.
+pub const MAX_REPORTED_PERIODS: usize = 100_800;
 
 /// The start of the `period`-second window `at_secs` falls in, in epoch seconds.
 ///

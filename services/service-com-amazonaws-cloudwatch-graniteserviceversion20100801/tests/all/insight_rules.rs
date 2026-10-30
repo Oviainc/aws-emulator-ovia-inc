@@ -14,9 +14,10 @@
 use crate::harness::{build_router, call, error_code, ok};
 use serde_json::{json, Value};
 
-/// The `Schema` every rule a caller creates carries: "For rules that you create, this is
-/// always `{"Name": "CloudWatchLogRule", "Version": 1}`" (`InsightRule$Schema`).
-const CREATED_RULE_SCHEMA: &str = "{\"Name\": \"CloudWatchLogRule\", \"Version\": 1}";
+/// The `Schema` every rule a caller creates carries: the schema "For rules that you create,
+/// this is always `{"Name": "CloudWatchLogRule", "Version": 1}`" (`InsightRule$Schema`)
+/// names, as the compact string the member carries it as.
+const CREATED_RULE_SCHEMA: &str = "CloudWatchLogRule/1";
 
 /// A `PutInsightRule` request with only the members the model makes required.
 fn put_request(name: &str, definition: &str) -> Value {
