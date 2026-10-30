@@ -17,7 +17,9 @@
 //!   model documents, the clock's `CreatedAt`, and `ExpiresAt` only for the type that
 //!   expires — and refuses a second create at the same identity;
 //! * a list that supplies `SyncedAt` is an incremental sync: it reports `Changed: false` and
-//!   omits the configuration details when the scope's set has not changed since then.
+//!   omits the configuration details when the scope's set has not changed since then — a gate
+//!   on starting a listing, so a request that also carries a `NextToken` is a continuation and
+//!   is served the page its cursor names whatever watermark it supplies.
 //!
 //! One rule cannot be reached over HTTP at all: a configuration's lapse. The documented
 //! floor on a BREAKPOINT lifetime is 5 minutes, so no request can create a configuration
@@ -808,6 +810,194 @@ async fn synced_at_makes_the_list_an_incremental_sync() {
         Some(2),
         "expected the full current set of the scope, got {answer:?}"
     );
+}
+
+/// What a continuation request carries in `SyncedAt` beside its cursor. The rows differ along
+/// the watermark alone, because the rule is that NONE of them suppresses the page the cursor
+/// names — including the one the member docs tell a syncing client to send back ("The server
+/// timestamp to supply on the next sync call").
+#[derive(Clone, Copy, Debug)]
+enum Watermark {
+    /// No watermark at all: a plain paginated walk.
+    Absent,
+    /// The instant the PREVIOUS page handed back, which is what a client following both member
+    /// docs sends.
+    PreviousPage,
+    /// The instant the FIRST page handed back, kept for the whole walk.
+    FirstPage,
+    /// An instant no stored change can be after, so the sync gate alone would report nothing.
+    AnHourAhead,
+    /// An instant every stored configuration is newer than.
+    AnHourBehind,
+}
+
+impl Watermark {
+    /// The value to send, given the instants the first and the previous page handed back.
+    fn value(self, first_page: f64, previous_page: f64) -> Option<f64> {
+        match self {
+            Watermark::Absent => None,
+            Watermark::PreviousPage => Some(previous_page),
+            Watermark::FirstPage => Some(first_page),
+            Watermark::AnHourAhead => Some(first_page + 3_600.0),
+            Watermark::AnHourBehind => Some(first_page - 3_600.0),
+        }
+    }
+}
+
+/// The `LocationHash` of every configuration a page reports, in the order it reports them.
+fn reported_hashes(answer: &Value) -> Vec<String> {
+    answer["LatestConfigurations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|item| item["LocationHash"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Walk `scope` a page at a time the way the two member docs tell a client to: the first call
+/// starts the listing, and every call after it carries the `NextToken` of the page before it
+/// together with `watermark`.
+async fn walk_following_the_cursor_and_the_watermark(
+    router: &MultiServiceRouter,
+    scope: &Scope,
+    max_results: i64,
+    watermark: Watermark,
+) -> Vec<String> {
+    let label = format!("{max_results} per page carrying {watermark:?}");
+
+    let mut body = scope.list_body();
+    body["MaxResults"] = json!(max_results);
+    let (status, first) = list(router, body).await;
+    assert_eq!(
+        status, 200,
+        "case {label:?}: expected the first page to answer 200, got {status} with {first:?}"
+    );
+    let first_synced = first["SyncedAt"].as_f64().unwrap_or_else(|| {
+        panic!("case {label:?}: expected the instant to sync from next, got {first:?}")
+    });
+    let mut previous_synced = first_synced;
+    let mut walked = reported_hashes(&first);
+    let mut token = first["NextToken"].as_str().map(ToString::to_string);
+
+    for page in 1..=32 {
+        let Some(cursor) = token else { return walked };
+        let mut body = scope.list_body();
+        body["MaxResults"] = json!(max_results);
+        body["NextToken"] = json!(cursor);
+        if let Some(synced_at) = watermark.value(first_synced, previous_synced) {
+            body["SyncedAt"] = json!(synced_at);
+        }
+        let (status, answer) = list(router, body).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?} page {page}: expected 200, got {status} with {answer:?}"
+        );
+        assert_eq!(
+            answer["Changed"].as_bool(),
+            Some(true),
+            "case {label:?} page {page}: expected a continuation to report the page its cursor \
+             names, got {answer:?}"
+        );
+        let reported = reported_hashes(&answer);
+        assert!(
+            !reported.is_empty() && reported.len() as i64 <= max_results,
+            "case {label:?} page {page}: expected between one and {max_results} configurations, \
+             got {answer:?}"
+        );
+        walked.extend(reported);
+        previous_synced = answer["SyncedAt"].as_f64().unwrap_or_else(|| {
+            panic!("case {label:?} page {page}: expected the next instant to sync from, got {answer:?}")
+        });
+        token = answer["NextToken"].as_str().map(ToString::to_string);
+    }
+    panic!("case {label:?}: the walk never ran out of pages");
+}
+
+#[tokio::test]
+async fn a_continuation_serves_its_page_whatever_watermark_it_carries() {
+    let router = router();
+    let cases = cases();
+    let hashes = create_all(&router, &cases).await;
+    let scope = cases[0].scope.clone();
+    let stored: BTreeSet<String> = cases
+        .iter()
+        .zip(hashes.iter())
+        .filter(|(case, _)| {
+            case.scope.instrumentation_type == scope.instrumentation_type
+                && case.scope.service == scope.service
+                && case.scope.environment == scope.environment
+        })
+        .map(|(_, hash)| hash.clone())
+        .collect();
+    assert!(
+        stored.len() > 2,
+        "expected a scope a cursor can divide more than once, got {stored:?}"
+    );
+
+    // Every page bound that divides the stored set, over every watermark a continuation can
+    // carry: the cursor decides the page, so each walk reports the same set exactly once.
+    for watermark in [
+        Watermark::Absent,
+        Watermark::PreviousPage,
+        Watermark::FirstPage,
+        Watermark::AnHourAhead,
+        Watermark::AnHourBehind,
+    ] {
+        for max_results in [1, 2, stored.len() as i64 - 1] {
+            let walked =
+                walk_following_the_cursor_and_the_watermark(&router, &scope, max_results, watermark)
+                    .await;
+            let distinct: BTreeSet<String> = walked.iter().cloned().collect();
+            assert_eq!(
+                walked.len(),
+                distinct.len(),
+                "case {max_results} per page carrying {watermark:?}: expected every \
+                 configuration once, got {walked:?}"
+            );
+            assert_eq!(
+                distinct, stored,
+                "case {max_results} per page carrying {watermark:?}: expected exactly the \
+                 stored configurations, got {walked:?}"
+            );
+        }
+    }
+
+    // The sync gate still governs a listing that has NOT started: with no cursor, a watermark
+    // the scope holds no change after suppresses the details, and one it does answers them.
+    let (status, probe) = list(&router, scope.list_body()).await;
+    assert_eq!(status, 200, "expected 200, got {status} with {probe:?}");
+    let synced_at = probe["SyncedAt"]
+        .as_f64()
+        .expect("the page carries the instant to sync from next");
+    for (watermark, expected_changed) in [
+        (Watermark::FirstPage, false),
+        (Watermark::AnHourAhead, false),
+        (Watermark::AnHourBehind, true),
+    ] {
+        let mut body = scope.list_body();
+        body["MaxResults"] = json!(1);
+        body["SyncedAt"] = json!(watermark
+            .value(synced_at, synced_at)
+            .expect("the rows above all carry a watermark"));
+        let (status, answer) = list(&router, body).await;
+        assert_eq!(
+            status, 200,
+            "case {watermark:?} with no cursor: expected 200, got {status} with {answer:?}"
+        );
+        assert_eq!(
+            answer["Changed"].as_bool(),
+            Some(expected_changed),
+            "case {watermark:?} with no cursor: expected Changed to be {expected_changed}, got \
+             {answer:?}"
+        );
+        assert_eq!(
+            answer["LatestConfigurations"].is_array(),
+            expected_changed,
+            "case {watermark:?} with no cursor: expected the configuration details only when \
+             something changed, got {answer:?}"
+        );
+    }
 }
 
 #[tokio::test]

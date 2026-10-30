@@ -168,6 +168,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// the response sets Changed to false and omits configuration details"). The response
     /// always carries the server instant to supply on the next sync and the interval to
     /// wait before it.
+    ///
+    /// That gate decides whether a listing is reported AT ALL, so it is consulted only on the
+    /// call that starts one — the call carrying no `NextToken`. A call that does carry one is
+    /// a continuation of a listing already in progress, and the page its cursor names is the
+    /// only way the caller can reach the configurations after the first page, so it is always
+    /// served.
     async fn handle(
         &self,
         input: Self::Input,
@@ -220,10 +226,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.expire_instrumentation_configurations(&now);
 
-        let changed = match input.synced_at.as_ref() {
-            None => true,
-            Some(since) => store.instrumentation_changed_since(&scope, since),
-        };
+        // A continuation (a request carrying a cursor) reports the page that cursor names
+        // whatever the sync watermark says: the watermark can only suppress a listing that
+        // has not started. Reporting the page is what `Changed` being true states, and
+        // swallowing it would strand every configuration after the first page.
+        let changed = cursor.is_some()
+            || match input.synced_at.as_ref() {
+                None => true,
+                Some(since) => store.instrumentation_changed_since(&scope, since),
+            };
 
         let (latest_configurations, next_token) = if changed {
             let (page, next_token) =
