@@ -21,6 +21,8 @@ mod aggregated_profile_combination;
 mod analysis_list_presence;
 #[path = "all/anomaly_feedback.rs"]
 mod anomaly_feedback;
+#[path = "all/create_idempotency_records.rs"]
+mod create_idempotency_records;
 #[path = "all/document_read_concurrency.rs"]
 mod document_read_concurrency;
 #[path = "all/findings_report_account_summary.rs"]

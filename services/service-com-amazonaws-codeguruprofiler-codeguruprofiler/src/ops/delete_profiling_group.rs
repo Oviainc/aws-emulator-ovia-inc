@@ -157,11 +157,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // Forget the create tokens that made this group: a token kept after the delete
-        // would make a later CreateProfilingGroup replay a group that no longer exists.
-        guard
-            .create_tokens
-            .retain(|_, name| name != &input.profiling_group_name);
+        // Removing the group takes the create token it carries with it: a token kept
+        // after the delete would make a later CreateProfilingGroup replay a group that no
+        // longer exists.
 
         Ok(DeleteProfilingGroupOutput {})
     }

@@ -2,8 +2,9 @@
 
 //! @op CreateProfilingGroup
 //! Creates a profiling group and stores it; every response member is built from the
-//! stored record. Idempotent on `clientToken`: a retry of the same create returns the
-//! group that token already created instead of conflicting.
+//! stored record. Idempotent on `clientToken`: the token is recorded ON the group the
+//! create stored, so a retry of that create replays that group instead of conflicting,
+//! and a later create reusing the token for another name leaves the record intact.
 //!
 //! ## Shape of an operation
 //!
@@ -195,22 +196,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
 
-        // Idempotency: the same `clientToken` that already created THIS name replays the
-        // stored group. A used token naming a different group is a different create and
-        // falls through to the name-conflict check below.
-        if guard
-            .create_tokens
-            .get(&input.client_token)
-            .is_some_and(|name| name == &input.profiling_group_name)
-        {
-            if let Some(group) = guard.groups.get(&input.profiling_group_name) {
+        // Both answers a create has for a name that is already taken are decided by the
+        // ONE stored group of that name, and by the `clientToken` it records:
+        //
+        //  * it records THIS token, so this call is the retry that token exists for
+        //    ("prevent the accidental creation of duplicate profiling groups if there are
+        //    failures and retries") and replays the group that create stored;
+        //  * it records another one, so this is a different create of a name that is
+        //    taken: the conflict.
+        //
+        // The record is read off the group itself, so it is exactly as old as the group
+        // and no later create can have rewritten it.
+        if let Some(group) = guard.groups.get(&input.profiling_group_name) {
+            if group.was_created_by(&input.client_token) {
                 return Ok(CreateProfilingGroupOutput {
                     profiling_group: group.created_description(crate::state::now()),
                 });
             }
-        }
-
-        if guard.groups.contains_key(&input.profiling_group_name) {
             return Err(CreateProfilingGroupErrorModeled::ConflictException(
                 ConflictException {
                     // The conflict is about the group RECORD: it names the group and the
@@ -247,6 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let created_at = crate::state::now();
         let group = crate::state::ProfilingGroup {
             name: input.profiling_group_name.clone(),
+            // The group carries the token of the create that stored it: that is the
+            // idempotency record a retry of THIS create replays, and it belongs to this
+            // group alone, so a create of another name reusing the token leaves it intact.
+            create_token: input.client_token.clone(),
             arn: crate::state::profiling_group_arn(
                 &crate::state::request_region(ctx),
                 &input.profiling_group_name,
@@ -286,9 +292,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard
             .groups
             .insert(input.profiling_group_name.clone(), group);
-        guard
-            .create_tokens
-            .insert(input.client_token.clone(), input.profiling_group_name.clone());
 
         Ok(CreateProfilingGroupOutput {
             profiling_group: description,

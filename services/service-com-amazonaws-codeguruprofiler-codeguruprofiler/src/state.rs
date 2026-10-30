@@ -970,6 +970,15 @@ impl FindingsReport {
 pub struct ProfilingGroup {
     pub name: String,
     pub arn: String,
+    /// The `clientToken` of the `CreateProfilingGroup` call that created this group: its
+    /// idempotency record, so a retry of THAT create replays this group instead of
+    /// conflicting with it ([`ProfilingGroup::was_created_by`]).
+    ///
+    /// It lives ON the group, which is what makes the record outlive every later create:
+    /// a create writes only the record of the group it added, so no call can rewrite or
+    /// drop another create's record, and deleting the group takes its record with it —
+    /// the token of a group that no longer exists replays nothing.
+    pub create_token: String,
     pub compute_platform: String,
     /// `agentOrchestrationConfig.profilingEnabled`.
     pub profiling_enabled: bool,
@@ -1029,6 +1038,13 @@ pub struct ProfilingGroup {
 }
 
 impl ProfilingGroup {
+    /// Whether this group is the one the create carrying `client_token` created — i.e.
+    /// whether a create presenting that token is a RETRY of the create that stored this
+    /// group, which `CreateProfilingGroup` replays rather than refusing.
+    pub fn was_created_by(&self, client_token: &str) -> bool {
+        self.create_token == client_token
+    }
+
     /// The `ProfilingGroupDescription` every READ of a stored profiling group answers with
     /// — `DescribeProfilingGroup`, `UpdateProfilingGroup` and the described form of
     /// `ListProfilingGroups` — built from what is stored, never from the request that is
@@ -1541,12 +1557,6 @@ impl ProfilingGroup {
 pub struct ComAmazonawsCodeguruprofilerCodeguruprofilerState {
     /// `profilingGroupName` -> the group.
     pub groups: HashMap<String, ProfilingGroup>,
-    /// `CreateProfilingGroup`'s `clientToken` -> the name it created, so a retry of
-    /// the same create is idempotent instead of a conflict. Bounded by `groups`: an
-    /// entry is written only by a create that also added a group, and
-    /// `DeleteProfilingGroup` removes every entry naming the group it deletes, so this
-    /// map never holds more entries than there are live groups.
-    pub create_tokens: HashMap<String, String>,
     /// How many policy revisions this store has minted. Bumped by
     /// [`Self::mint_revision_id`], the only minter, and mixed into every revision it
     /// derives, so two writes of the same grants never carry the same revision.
