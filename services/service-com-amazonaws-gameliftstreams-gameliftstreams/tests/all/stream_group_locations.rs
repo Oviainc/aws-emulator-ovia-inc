@@ -228,11 +228,204 @@ async fn adding_locations_persists_exactly_the_locations_the_call_configures() {
     }
 }
 
+/// One row of the replay table below: the case, the locations the group is
+/// created with, the `LocationConfigurations` one call then sends, whether to name
+/// the group by its ARN, the names the group holds afterwards and the status it
+/// reports afterwards.
+type ReplayCase<'a> = (
+    &'a str,
+    &'a [&'a str],
+    Vec<Value>,
+    bool,
+    &'a [&'a str],
+    &'a str,
+);
+
+/// Configuring a location the stream group ALREADY holds is served, not refused:
+/// that entry leaves the stored location and the group exactly as they stand (no
+/// second row, no capacity rewrite, no status move) and is still reported with its
+/// current state, while any location of the SAME call that the group does not hold
+/// yet is provisioned as usual.
+///
+/// The rows differ in how many held locations one call replays, whether the replay
+/// carries the capacity the location holds, a different one or none at all,
+/// whether the call also names a location the group lacks, and whether the group is
+/// named by id or by ARN.
+#[tokio::test]
+async fn re_adding_a_location_the_group_holds_is_an_idempotent_no_op() {
+    let router = emulator();
+    let (app_id, _) = ready_application(&router, "idempotent-app").await;
+
+    // `active_stream_group` creates each of its locations with
+    // `AlwaysOnCapacity: 1`, so that is the stored capacity a replay must leave
+    // alone.
+    let cases: [ReplayCase; 5] = [
+        (
+            "the held location replayed at the capacity it holds",
+            &["us-west-2"],
+            vec![json!({"LocationName": "us-west-2", "AlwaysOnCapacity": 1})],
+            false,
+            &["us-west-2"],
+            "ACTIVE",
+        ),
+        (
+            "the held location replayed at a different capacity",
+            &["us-west-2"],
+            vec![json!({"LocationName": "us-west-2", "AlwaysOnCapacity": 7,
+                        "MaximumCapacity": 9})],
+            false,
+            &["us-west-2"],
+            "ACTIVE",
+        ),
+        (
+            "the held location replayed with no capacity at all, named by ARN",
+            &["eu-central-1"],
+            vec![json!({"LocationName": "eu-central-1"})],
+            true,
+            &["eu-central-1"],
+            "ACTIVE",
+        ),
+        (
+            "the whole held set replayed",
+            &["us-west-2", "ap-south-1"],
+            vec![
+                json!({"LocationName": "ap-south-1", "AlwaysOnCapacity": 1}),
+                json!({"LocationName": "us-west-2", "AlwaysOnCapacity": 1}),
+            ],
+            false,
+            &["us-west-2", "ap-south-1"],
+            "ACTIVE",
+        ),
+        (
+            "a held location alongside one the group lacks",
+            &["us-west-2"],
+            vec![
+                json!({"LocationName": "us-west-2", "AlwaysOnCapacity": 1}),
+                json!({"LocationName": "sa-east-1", "AlwaysOnCapacity": 2}),
+            ],
+            false,
+            &["us-west-2", "sa-east-1"],
+            "UPDATING_LOCATIONS",
+        ),
+    ];
+
+    for (case, created_with, configurations, by_arn, whole_set, group_status) in cases {
+        let (group_id, group_arn) =
+            active_stream_group(&router, "idempotent-group", &app_id, created_with).await;
+        let identifier = if by_arn {
+            as_label(&group_arn)
+        } else {
+            group_id.clone()
+        };
+        let path = format!("/streamgroups/{group_id}");
+        let (_, before) = call(&router, "GET", &path, None).await;
+
+        let (status, added) = call(
+            &router,
+            "POST",
+            &format!("/streamgroups/{identifier}/locations"),
+            Some(json!({"LocationConfigurations": configurations.clone()})),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a replayed location is served, expected 200, got {status} {added}"
+        );
+        assert_eq!(
+            text(&added, "/Identifier", case),
+            group_arn,
+            "case {case:?}: expected the stream group's ARN, got {added}"
+        );
+        // Every location the call named is reported, held or new alike.
+        let reported: Vec<String> = configurations
+            .iter()
+            .map(|configuration| configuration["LocationName"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names(&added["Locations"]),
+            reported,
+            "case {case:?}: expected exactly the configured locations, got {added}"
+        );
+        for configuration in &configurations {
+            let name = configuration["LocationName"].as_str().unwrap();
+            let state = location(&added["Locations"], name);
+            let held = created_with.contains(&name);
+            assert_eq!(
+                state["Status"],
+                json!(if held { "ACTIVE" } else { "ACTIVATING" }),
+                "case {case:?}: location {name} is reported with its current status, got {state}"
+            );
+            if held {
+                // The stored configuration stands: adding is not how a held
+                // location's capacity changes.
+                assert_eq!(
+                    state["AlwaysOnCapacity"],
+                    json!(1),
+                    "case {case:?}: location {name} keeps the capacity it holds, got {state}"
+                );
+                assert_eq!(
+                    state["MaximumCapacity"],
+                    Value::Null,
+                    "case {case:?}: location {name} keeps the capacity it holds, got {state}"
+                );
+                assert_eq!(
+                    state["AllocatedCapacity"],
+                    json!(1),
+                    "case {case:?}: a provisioned location holds its always-on capacity, \
+                     got {state}"
+                );
+            } else {
+                for member in CAPACITY_MEMBERS {
+                    assert_eq!(
+                        state[member], configuration[member],
+                        "case {case:?}: expected {member} {}, got {state}",
+                        configuration[member]
+                    );
+                }
+            }
+        }
+
+        // Read the group back: one row per location it holds (no duplicate row for
+        // a replayed one), and a status that moved only if the call joined
+        // something.
+        let (status, got) = call(&router, "GET", &path, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected GetStreamGroup 200, got {status} {got}"
+        );
+        assert_eq!(
+            names(&got["LocationStates"]),
+            whole_set.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+            "case {case:?}: expected one row per location the group holds, got {got}"
+        );
+        assert_eq!(
+            got["Status"],
+            json!(group_status),
+            "case {case:?}: expected the group in {group_status}, got {got}"
+        );
+        for name in created_with {
+            assert_eq!(
+                location(&got["LocationStates"], name)["Status"],
+                json!("ACTIVE"),
+                "case {case:?}: the location {name} the group already held stays ACTIVE, got {got}"
+            );
+        }
+        if whole_set.len() == created_with.len() {
+            // A call that joined nothing changed nothing, so the group's own
+            // `LastUpdatedAt` cannot have moved either.
+            assert_eq!(
+                got["LastUpdatedAt"], before["LastUpdatedAt"],
+                "case {case:?}: a no-op add leaves LastUpdatedAt alone, got {got}"
+            );
+        }
+    }
+}
+
 /// The preconditions of `AddStreamGroupLocations`: the group must exist, it must
 /// be in `ACTIVE` status ("To add a location, the stream group must be in ACTIVE
-/// status"), a location the group already holds (or one the same request names
-/// twice) is not added again, and a capacity the model bounds at `@range(min: 0)`
-/// is refused. Each refusal leaves the group's location set as it was.
+/// status"), the same request must not name one location twice, and a capacity
+/// the model bounds at `@range(min: 0)` is refused. Each refusal leaves the
+/// group's location set as it was.
 #[tokio::test]
 async fn adding_locations_refuses_a_request_that_breaks_a_precondition() {
     let router = emulator();
@@ -265,30 +458,13 @@ async fn adding_locations_refuses_a_request_that_breaks_a_precondition() {
 
     // (case, the group the request names, the LocationConfigurations, expected
     // status, the modelled error shape that status must carry).
-    let cases: [(&str, &str, Value, u16, &str); 7] = [
+    let cases: [(&str, &str, Value, u16, &str); 5] = [
         (
             "a group that does not exist",
             "sg-doesnotexist",
             json!([{"LocationName": "us-east-1", "AlwaysOnCapacity": 1}]),
             404,
             "ResourceNotFoundException",
-        ),
-        (
-            "a location the group already holds",
-            active_id.as_str(),
-            json!([{"LocationName": "us-west-2", "AlwaysOnCapacity": 1}]),
-            400,
-            "ValidationException",
-        ),
-        (
-            "a held location alongside a new one",
-            active_id.as_str(),
-            json!([
-                {"LocationName": "us-east-2", "AlwaysOnCapacity": 1},
-                {"LocationName": "us-west-2", "AlwaysOnCapacity": 1},
-            ]),
-            400,
-            "ValidationException",
         ),
         (
             "the same new location configured twice",

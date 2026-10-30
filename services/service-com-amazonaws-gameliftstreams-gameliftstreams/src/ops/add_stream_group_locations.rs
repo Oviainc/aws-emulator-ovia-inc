@@ -2,9 +2,11 @@
 
 //! @op AddStreamGroupLocations
 //! Adds locations to a stored stream group and PERSISTS them: each location this
-//! call configures joins the group's set in `ACTIVATING`, the group reports
-//! `UPDATING_LOCATIONS` until the clock has provisioned them, and every associated
-//! application starts replicating its content to each new location.
+//! call configures that the group does not hold yet joins the group's set in
+//! `ACTIVATING`, the group reports `UPDATING_LOCATIONS` until the clock has
+//! provisioned them, and every associated application starts replicating its
+//! content to each new location. A location the group already holds is left as it
+//! stands and reported with its current status.
 //!
 //! ## Shape of an operation
 //!
@@ -230,29 +232,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A `LocationConfiguration` whose capacities this service cannot store is
-        // refused before any of it reaches state, and so is one naming a location
-        // the group already holds, or naming the same location twice: adding is not
-        // how an existing location's capacity changes ("To update the capacity for
-        // an existing stream group, call UpdateStreamGroup"), and one location
-        // cannot hold two capacity configurations at once.
+        // refused before any of it reaches state, and so is one naming the same
+        // location twice: one location cannot hold two capacity configurations at
+        // once. Naming a location the group ALREADY holds is NOT a refusal —
+        // configuring a location the group's set already satisfies leaves that
+        // location exactly as it stands, so a retry or a reconcile that replays the
+        // same set is served — and adding is still not how a held location's
+        // capacity changes ("To update the capacity for an existing stream group,
+        // call UpdateStreamGroup").
         let mut configured: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
         for configuration in &input.location_configurations {
             if let Some(message) = crate::state::unstorable_location_configuration(configuration) {
                 return Err(AddStreamGroupLocationsErrorModeled::ValidationException(
                     ValidationException {
                         message: crate::state::with_internal_id(message),
-                    },
-                )
-                .into());
-            }
-            if group.has_location(&configuration.location_name) {
-                return Err(AddStreamGroupLocationsErrorModeled::ValidationException(
-                    ValidationException {
-                        message: crate::state::with_internal_id(format!(
-                            "stream group {} already holds location {}; use UpdateStreamGroup to \
-                             change the capacity of a location it holds",
-                            group.id, configuration.location_name
-                        )),
                     },
                 )
                 .into());
@@ -270,11 +263,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // Every location this call names is reported back, whether this call is
+        // what joins it to the set or it was already there.
+        let reported: Vec<String> = input
+            .location_configurations
+            .iter()
+            .map(|configuration| configuration.location_name.clone())
+            .collect();
+        // Only the locations the group does not hold yet are provisioned by this
+        // call; the rest are already in the set, at the configuration the request
+        // that joined them asked for.
+        let joining: Vec<LocationConfiguration> = input
+            .location_configurations
+            .into_iter()
+            .filter(|configuration| !group.has_location(&configuration.location_name))
+            .collect();
+
         // The emulator's own bound on one group's location set, refused with the
-        // error the model already declares for a quota.
-        if group.locations.len() + input.location_configurations.len()
-            > crate::state::LOCATIONS_PER_STREAM_GROUP
-        {
+        // error the model already declares for a quota. A location the group holds
+        // takes up no further room, so it cannot push the set past the bound.
+        if group.locations.len() + joining.len() > crate::state::LOCATIONS_PER_STREAM_GROUP {
             return Err(
                 AddStreamGroupLocationsErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
@@ -284,7 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             group.id,
                             group.locations.len(),
                             crate::state::LOCATIONS_PER_STREAM_GROUP,
-                            input.location_configurations.len()
+                            joining.len()
                         )),
                     },
                 )
@@ -292,43 +300,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let added: Vec<String> = input
-            .location_configurations
+        let added: Vec<String> = joining
             .iter()
             .map(|configuration| configuration.location_name.clone())
             .collect();
-        for configuration in input.location_configurations {
-            group
-                .locations
-                .push(crate::state::LocationSlot::activating(configuration, now));
+        if !added.is_empty() {
+            for configuration in joining {
+                group
+                    .locations
+                    .push(crate::state::LocationSlot::activating(configuration, now));
+            }
+            // "ACTIVATING: Amazon GameLift Streams is preparing the location", so the
+            // group itself is "UPDATING_LOCATIONS: One or more locations in the stream
+            // group are in the process of updating" until the clock has provisioned
+            // the capacity those locations asked for. The group keeps serving while it
+            // is: a stream session still starts in any location already provisioned
+            // (`StreamGroup::can_host_sessions`). A call that joins nothing provisions
+            // nothing, so it moves neither the group's status nor its `LastUpdatedAt`.
+            group.status = crate::state::STREAM_GROUP_UPDATING_LOCATIONS.to_string();
+            group.status_due_at = Some(now + crate::state::TRANSITION);
+            group.last_updated_at = now;
         }
-        // "ACTIVATING: Amazon GameLift Streams is preparing the location", so the
-        // group itself is "UPDATING_LOCATIONS: One or more locations in the stream
-        // group are in the process of updating" until the clock has provisioned
-        // the capacity those locations asked for. The group keeps serving while it
-        // is: a stream session still starts in any location already provisioned
-        // (`StreamGroup::can_host_sessions`).
-        group.status = crate::state::STREAM_GROUP_UPDATING_LOCATIONS.to_string();
-        group.status_due_at = Some(now + crate::state::TRANSITION);
-        group.last_updated_at = now;
         let arn = group.arn.clone();
-        let locations = group.location_states_of(&added);
+        let locations = group.location_states_of(&reported);
         let associated_applications = group.associated_applications.clone();
 
         // "This operation also copies the content files of all associated
         // applications to an internal S3 bucket at each location", which is what
-        // the applications report as their `ReplicationStatuses`.
-        for application_arn in &associated_applications {
-            let Some(application) = state.application_mut(application_arn) else {
-                continue;
-            };
-            application.last_updated_at = now;
-            for location in &added {
-                application.replications.push(crate::state::Replication {
-                    stream_group_arn: arn.clone(),
-                    location: location.clone(),
-                    completes_at: now + crate::state::TRANSITION,
-                });
+        // the applications report as their `ReplicationStatuses`. A location the
+        // group already held already has its content, so a call that joins none
+        // copies nothing and leaves the associated applications as they stand.
+        if !added.is_empty() {
+            for application_arn in &associated_applications {
+                let Some(application) = state.application_mut(application_arn) else {
+                    continue;
+                };
+                application.last_updated_at = now;
+                for location in &added {
+                    application.replications.push(crate::state::Replication {
+                        stream_group_arn: arn.clone(),
+                        location: location.clone(),
+                        completes_at: now + crate::state::TRANSITION,
+                    });
+                }
             }
         }
 
