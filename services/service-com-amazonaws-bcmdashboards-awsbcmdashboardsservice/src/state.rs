@@ -1953,44 +1953,171 @@ pub fn date_time_range_refusal(path: &str, range: &DateTimeRange) -> Option<Stri
     None
 }
 
-/// The time range of one widget query, as `(the union member that carries the query, the
-/// range)`.
+/// The `MetricName` values a cost-and-usage query's `metrics` admits, in the order the
+/// model lists them: `CostAndUsageQuery$metrics` is documented "Valid values for
+/// CostAndUsageQuery metrics are AmortizedCost, BlendedCost, NetAmortizedCost,
+/// NetUnblendedCost, NormalizedUsageAmount, UnblendedCost, and UsageQuantity"
+/// (`smithy_query(query="shape",shape="CostAndUsageQuery")`).
+const COST_AND_USAGE_METRICS: &[&str] = &[
+    "AmortizedCost",
+    "BlendedCost",
+    "NetAmortizedCost",
+    "NetUnblendedCost",
+    "NormalizedUsageAmount",
+    "UnblendedCost",
+    "UsageQuantity",
+];
+
+/// The `MetricName` values a Savings Plans coverage query's `metrics` admits:
+/// `SavingsPlansCoverageQuery$metrics` is documented "Valid value for
+/// SavingsPlansCoverageQuery metrics is SpendCoveredBySavingsPlans"
+/// (`smithy_query(query="shape",shape="SavingsPlansCoverageQuery")`).
+const SAVINGS_PLANS_COVERAGE_METRICS: &[&str] = &["SpendCoveredBySavingsPlans"];
+
+/// The `MetricName` values a reservation coverage query's `metrics` admits, in the order
+/// the model lists them: `ReservationCoverageQuery$metrics` is documented "Valid values for
+/// ReservationCoverageQuery metrics are Hour, Unit, and Cost"
+/// (`smithy_query(query="shape",shape="ReservationCoverageQuery")`).
+const RESERVATION_COVERAGE_METRICS: &[&str] = &["Hour", "Unit", "Cost"];
+
+/// The `metrics` one widget query submitted, beside the values ITS OWN member documents as
+/// valid.
+struct SubmittedMetrics<'a> {
+    /// The shape carrying the `metrics` member, as its documented rule names it — the name
+    /// a refusal quotes the rule under.
+    query_shape: &'static str,
+    /// What the request asked for.
+    submitted: &'a [String],
+    /// The `MetricName` values that member admits.
+    valid: &'static [&'static str],
+}
+
+/// One widget query as a dashboard write sees it: which member of the `QueryParameters`
+/// union carries it, its time range, and the `metrics` it submitted when its member models
+/// that list at all.
+struct SubmittedQuery<'a> {
+    member: &'static str,
+    range: &'a DateTimeRange,
+    metrics: Option<SubmittedMetrics<'a>>,
+}
+
+/// The submitted query one `QueryParameters` union member carries.
 ///
-/// Every member of the `QueryParameters` union carries a `@required` `timeRange`
+/// Every member of the union carries a `@required` `timeRange`
 /// (`smithy_query(query="shape",shape="QueryParameters")`), so the rules a range has to
-/// satisfy reach all five of them rather than only the cost-and-usage query.
-fn query_time_range(parameters: &QueryParameters) -> (&'static str, &DateTimeRange) {
+/// satisfy reach all five of them rather than only the cost-and-usage query. THREE of them
+/// also model a `metrics` list, and each one documents its own set of valid `MetricName`
+/// values; the two utilization queries model no `metrics` member at all, so there is no
+/// metric of theirs to judge.
+fn submitted_query(parameters: &QueryParameters) -> SubmittedQuery<'_> {
     match parameters {
-        QueryParameters::costAndUsage(query) => ("costAndUsage", &query.time_range),
-        QueryParameters::savingsPlansCoverage(query) => {
-            ("savingsPlansCoverage", &query.time_range)
-        }
-        QueryParameters::savingsPlansUtilization(query) => {
-            ("savingsPlansUtilization", &query.time_range)
-        }
-        QueryParameters::reservationCoverage(query) => {
-            ("reservationCoverage", &query.time_range)
-        }
-        QueryParameters::reservationUtilization(query) => {
-            ("reservationUtilization", &query.time_range)
-        }
+        QueryParameters::costAndUsage(query) => SubmittedQuery {
+            member: "costAndUsage",
+            range: &query.time_range,
+            metrics: Some(SubmittedMetrics {
+                query_shape: "CostAndUsageQuery",
+                submitted: &query.metrics,
+                valid: COST_AND_USAGE_METRICS,
+            }),
+        },
+        QueryParameters::savingsPlansCoverage(query) => SubmittedQuery {
+            member: "savingsPlansCoverage",
+            range: &query.time_range,
+            metrics: Some(SubmittedMetrics {
+                query_shape: "SavingsPlansCoverageQuery",
+                submitted: query.metrics.as_deref().unwrap_or_default(),
+                valid: SAVINGS_PLANS_COVERAGE_METRICS,
+            }),
+        },
+        QueryParameters::savingsPlansUtilization(query) => SubmittedQuery {
+            member: "savingsPlansUtilization",
+            range: &query.time_range,
+            metrics: None,
+        },
+        QueryParameters::reservationCoverage(query) => SubmittedQuery {
+            member: "reservationCoverage",
+            range: &query.time_range,
+            metrics: Some(SubmittedMetrics {
+                query_shape: "ReservationCoverageQuery",
+                submitted: query.metrics.as_deref().unwrap_or_default(),
+                valid: RESERVATION_COVERAGE_METRICS,
+            }),
+        },
+        QueryParameters::reservationUtilization(query) => SubmittedQuery {
+            member: "reservationUtilization",
+            range: &query.time_range,
+            metrics: None,
+        },
     }
+}
+
+/// `values` as a documented list reads them: `A`, `A and B`, or `A, B, and C`.
+fn listed_in_prose(values: &[&str]) -> String {
+    match values {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [first, last] => format!("{first} and {last}"),
+        [leading @ .., last] => format!(
+            "{}{MESSAGE_LIST_SEPARATOR}and {last}",
+            leading.join(MESSAGE_LIST_SEPARATOR)
+        ),
+    }
+}
+
+/// How a dashboard write refuses the metric at the member path `path`, which the query
+/// carrying it does not admit.
+///
+/// Worded the way every other refusal of this service is: the member that broke the rule,
+/// the value it carried, and the rule itself quoted from the member whose documentation
+/// states it — so the clause a caller reads is the one their own copy of the model carries.
+/// Nothing quoted here is free text: a `MetricName` is an enumerated value the boundary
+/// validator already held to the eleven the enum declares, and the rest of the message is
+/// a member path, so no part of it can reach [`MAX_MESSAGE_LENGTH`] the way a message
+/// quoting a string member can.
+fn metric_outside_query_message(
+    path: &str,
+    metric: &str,
+    member: &str,
+    metrics: &SubmittedMetrics<'_>,
+) -> String {
+    let shape = metrics.query_shape;
+    let documented = if metrics.valid.len() == 1 {
+        format!(
+            "valid value for {shape} metrics is {}",
+            listed_in_prose(metrics.valid)
+        )
+    } else {
+        format!(
+            "valid values for {shape} metrics are {}",
+            listed_in_prose(metrics.valid)
+        )
+    };
+    format!("{path}: '{metric}' is not a valid metric for a {member} query; {documented}")
 }
 
 /// How this service refuses the `widgets` a dashboard write submits, or `None` when every
 /// widget in the list is one this service can store.
 ///
-/// Two rules, applied before anything is written — no ARN minted, no widget id consumed —
+/// Three rules, applied before anything is written — no ARN minted, no widget id consumed —
 /// so a stored dashboard never holds a widget configuration a reader would have to make
 /// sense of:
 ///
 /// * the time range of every query of every config is a time period
 ///   ([`date_time_range_refusal`]);
+/// * every metric a query asks for is one THAT query admits
+///   ([`metric_outside_query_message`]). `metrics` targets `MetricNames` everywhere it is
+///   modelled, whose member is the `MetricName` enum holding the UNION of the three
+///   documented sets (`smithy_query(query="shape",shape="MetricName,MetricNames")`), so the
+///   boundary validator can only check membership in that union — which set of it applies
+///   is decided by the union member carrying the query, and that is known only here;
 /// * the ids in ONE list are DISTINCT. `Widget$id` is documented as "the unique identifier
 ///   for the widget" (`smithy_query(query="shape",shape="Widget")`), and a client may
 ///   supply it, so two widgets of one dashboard carrying one id would make every id-keyed
 ///   resolution of a widget ambiguous — a scheduled report's `widgetIds`, and the
 ///   `WIDGET_ID_NOT_FOUND` an execution derives from it.
+///
+/// The first two are judged per config, in the order the request spells its configs, so the
+/// member a refusal names is the first one of the list that breaks a rule.
 ///
 /// One helper for both dashboard writes, so `CreateDashboard` and `UpdateDashboard` apply
 /// the same rules at the same member paths. A widget and a config name their 1-based
@@ -2005,17 +2132,40 @@ pub fn widget_list_refusal(widgets: &[Widget]) -> Option<String> {
     };
     for (index, widget) in widgets.iter().enumerate() {
         for (config_index, config) in widget.configs.iter().enumerate() {
-            let (query_member, range) = query_time_range(&config.query_parameters);
-            let path = ::aws_smithy_schema_server::constraints::path::join(&[
+            let query = submitted_query(&config.query_parameters);
+            let query_member = query.member;
+            let query_path = ::aws_smithy_schema_server::constraints::path::join(&[
                 widget_path(index),
                 "configs".to_string(),
                 position(config_index + 1),
                 "queryParameters".to_string(),
                 query_member.to_string(),
+            ]);
+            let path = ::aws_smithy_schema_server::constraints::path::join(&[
+                query_path.clone(),
                 "timeRange".to_string(),
             ]);
-            if let Some(message) = date_time_range_refusal(&path, range) {
+            if let Some(message) = date_time_range_refusal(&path, query.range) {
                 return Some(message);
+            }
+            let Some(metrics) = query.metrics else {
+                continue;
+            };
+            for (metric_index, metric) in metrics.submitted.iter().enumerate() {
+                if metrics.valid.contains(&metric.as_str()) {
+                    continue;
+                }
+                let path = ::aws_smithy_schema_server::constraints::path::join(&[
+                    query_path.clone(),
+                    "metrics".to_string(),
+                    position(metric_index + 1),
+                ]);
+                return Some(metric_outside_query_message(
+                    &path,
+                    metric,
+                    query_member,
+                    &metrics,
+                ));
             }
         }
     }

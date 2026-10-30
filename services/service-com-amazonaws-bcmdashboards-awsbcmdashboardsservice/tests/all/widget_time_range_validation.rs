@@ -277,7 +277,7 @@ fn refusal_cases() -> Vec<RefusalCase> {
         request: json!({
             "name": "Second Widget",
             "widgets": [
-                json!({"title": "Spend", "configs": [graph_config("Cost", "BAR", "DAILY")]}),
+                json!({"title": "Spend", "configs": [graph_config("BlendedCost", "BAR", "DAILY")]}),
                 widget_over(range(
                     point("ABSOLUTE", "2026-01-01"),
                     point("ABSOLUTE", "2025-12-31"),
@@ -322,12 +322,12 @@ fn refusal_cases() -> Vec<RefusalCase> {
                 {
                     "id": widget_id('f'),
                     "title": "First",
-                    "configs": [graph_config("Cost", "BAR", "DAILY")]
+                    "configs": [graph_config("BlendedCost", "BAR", "DAILY")]
                 },
                 {
                     "id": widget_id('f'),
                     "title": "Second",
-                    "configs": [graph_config("Cost", "BAR", "DAILY")]
+                    "configs": [graph_config("BlendedCost", "BAR", "DAILY")]
                 }
             ]
         }),
@@ -342,17 +342,17 @@ fn refusal_cases() -> Vec<RefusalCase> {
                 {
                     "id": widget_id('a'),
                     "title": "First",
-                    "configs": [graph_config("Cost", "BAR", "DAILY")]
+                    "configs": [graph_config("BlendedCost", "BAR", "DAILY")]
                 },
                 {
                     "id": widget_id('b'),
                     "title": "Second",
-                    "configs": [graph_config("Cost", "BAR", "DAILY")]
+                    "configs": [graph_config("BlendedCost", "BAR", "DAILY")]
                 },
                 {
                     "id": widget_id('a'),
                     "title": "Third",
-                    "configs": [graph_config("Cost", "BAR", "DAILY")]
+                    "configs": [graph_config("BlendedCost", "BAR", "DAILY")]
                 }
             ]
         }),
@@ -387,12 +387,12 @@ fn refusal_cases() -> Vec<RefusalCase> {
                 {
                     "id": widget_id('c'),
                     "title": "First",
-                    "configs": [graph_config("Cost", "BAR", "DAILY")]
+                    "configs": [graph_config("BlendedCost", "BAR", "DAILY")]
                 },
                 {
                     "id": widget_id('c'),
                     "title": "Second",
-                    "configs": [graph_config("Cost", "BAR", "DAILY")]
+                    "configs": [graph_config("BlendedCost", "BAR", "DAILY")]
                 }
             ]
         }),
@@ -701,11 +701,11 @@ async fn a_minted_widget_id_never_repeats_a_supplied_one() {
                     {
                         "id": supplied,
                         "title": "Supplied Id",
-                        "configs": [graph_config("Cost", "BAR", "DAILY")]
+                        "configs": [graph_config("BlendedCost", "BAR", "DAILY")]
                     },
                     {
                         "title": "Minted Id",
-                        "configs": [graph_config("Cost", "BAR", "DAILY")]
+                        "configs": [graph_config("BlendedCost", "BAR", "DAILY")]
                     }
                 ]
             }),
@@ -751,16 +751,16 @@ async fn distinct_widget_ids_are_stored_as_submitted() {
                 {
                     "id": first,
                     "title": "First",
-                    "configs": [graph_config("Cost", "BAR", "DAILY")]
+                    "configs": [graph_config("BlendedCost", "BAR", "DAILY")]
                 },
                 {
                     "id": second,
                     "title": "Second",
-                    "configs": [graph_config("Cost", "BAR", "DAILY")]
+                    "configs": [graph_config("BlendedCost", "BAR", "DAILY")]
                 },
                 {
                     "title": "No Id Of Its Own",
-                    "configs": [graph_config("Cost", "BAR", "DAILY")]
+                    "configs": [graph_config("BlendedCost", "BAR", "DAILY")]
                 }
             ]
         }),
@@ -807,7 +807,7 @@ async fn distinct_widget_ids_are_stored_as_submitted() {
             "widgets": [{
                 "id": first,
                 "title": "First",
-                "configs": [graph_config("Cost", "BAR", "DAILY")]
+                "configs": [graph_config("BlendedCost", "BAR", "DAILY")]
             }]
         }),
     )

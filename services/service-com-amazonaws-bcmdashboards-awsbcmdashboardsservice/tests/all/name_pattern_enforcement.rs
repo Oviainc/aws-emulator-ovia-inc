@@ -159,7 +159,7 @@ fn refusal_cases() -> Vec<RefusalCase> {
                 "name": "Widget Titles",
                 "widgets": [
                     valid_widget(),
-                    {"title": "Total  Cost", "configs": [graph_config("Cost", "BAR", "DAILY")]}
+                    {"title": "Total  Cost", "configs": [graph_config("BlendedCost", "BAR", "DAILY")]}
                 ]
             }),
             clauses: vec![pattern_clause(
@@ -173,7 +173,7 @@ fn refusal_cases() -> Vec<RefusalCase> {
             operation: "CreateDashboard",
             request: json!({
                 "name": "Leading Space Title",
-                "widgets": [{"title": " Spend", "configs": [graph_config("Cost", "BAR", "DAILY")]}]
+                "widgets": [{"title": " Spend", "configs": [graph_config("BlendedCost", "BAR", "DAILY")]}]
             }),
             clauses: vec![pattern_clause(
                 " Spend",
@@ -186,7 +186,7 @@ fn refusal_cases() -> Vec<RefusalCase> {
             operation: "CreateDashboard",
             request: json!({
                 "name": "Punctuated Title",
-                "widgets": [{"title": "Spend.", "configs": [graph_config("Cost", "BAR", "DAILY")]}]
+                "widgets": [{"title": "Spend.", "configs": [graph_config("BlendedCost", "BAR", "DAILY")]}]
             }),
             clauses: vec![pattern_clause(
                 "Spend.",
@@ -202,7 +202,7 @@ fn refusal_cases() -> Vec<RefusalCase> {
                 "widgets": [{
                     "title": "Spend",
                     "description": "Cost per <service>",
-                    "configs": [graph_config("Cost", "BAR", "DAILY")]
+                    "configs": [graph_config("BlendedCost", "BAR", "DAILY")]
                 }]
             }),
             clauses: vec![pattern_clause(
@@ -216,7 +216,7 @@ fn refusal_cases() -> Vec<RefusalCase> {
             operation: "CreateDashboard",
             request: json!({
                 "name": "Two  Faults",
-                "widgets": [{"title": "Total  Cost", "configs": [graph_config("Cost", "BAR", "DAILY")]}]
+                "widgets": [{"title": "Total  Cost", "configs": [graph_config("BlendedCost", "BAR", "DAILY")]}]
             }),
             clauses: vec![
                 pattern_clause("Two  Faults", "name", NAME_EXPRESSION),
@@ -239,7 +239,7 @@ fn refusal_cases() -> Vec<RefusalCase> {
             request: json!({
                 "arn": UNKNOWN_DASHBOARD_ARN,
                 "name": "Good Rename",
-                "widgets": [{"title": "Cost+Usage", "configs": [graph_config("Cost", "BAR", "DAILY")]}]
+                "widgets": [{"title": "Cost+Usage", "configs": [graph_config("BlendedCost", "BAR", "DAILY")]}]
             }),
             clauses: vec![pattern_clause(
                 "Cost+Usage",

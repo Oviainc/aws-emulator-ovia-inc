@@ -208,8 +208,11 @@ fn is_widget_id(id: &str) -> bool {
 }
 
 /// A widget config whose data comes from a cost-and-usage query and is displayed as a
-/// graph. `metric` is a `MetricName` value and `visual` a `VisualType` value (sources:
-/// the `MetricName` / `VisualType` / `Granularity` enums in the model).
+/// graph. `metric` is a `MetricName` value VALID FOR A COST-AND-USAGE QUERY — the model's
+/// note on `CostAndUsageQuery$metrics` admits AmortizedCost, BlendedCost, NetAmortizedCost,
+/// NetUnblendedCost, NormalizedUsageAmount, UnblendedCost and UsageQuantity, and a
+/// dashboard write refuses any other — and `visual` a `VisualType` value (sources: the
+/// `CostAndUsageQuery` / `VisualType` / `Granularity` shapes in the model).
 pub(crate) fn graph_config(metric: &str, visual: &str, granularity: &str) -> Value {
     json!({
         "queryParameters": {
@@ -226,7 +229,8 @@ pub(crate) fn graph_config(metric: &str, visual: &str, granularity: &str) -> Val
     })
 }
 
-/// A widget config displayed as a table, over an absolute time range.
+/// A widget config displayed as a table, over an absolute time range. `metric` is a
+/// `MetricName` valid for the cost-and-usage query this builds, as [`graph_config`] states.
 fn table_config(metric: &str) -> Value {
     json!({
         "queryParameters": {
@@ -301,7 +305,7 @@ fn create_cases() -> Vec<CreateCase> {
                 "height": 10,
                 "horizontalOffset": 3,
                 "configs": [
-                    graph_config("SpendCoveredBySavingsPlans", "STACK", "DAILY"),
+                    graph_config("NormalizedUsageAmount", "STACK", "DAILY"),
                     table_config("AmortizedCost")
                 ]
             })],
@@ -326,7 +330,7 @@ fn create_cases() -> Vec<CreateCase> {
                     "title": "Hourly",
                     "width": 2,
                     "height": 4,
-                    "configs": [graph_config("Cost", "BAR", "HOURLY")]
+                    "configs": [graph_config("BlendedCost", "BAR", "HOURLY")]
                 }),
                 json!({
                     "title": "Usage-Quantity",
@@ -606,7 +610,7 @@ async fn widget_sizes_are_held_to_their_modelled_range() {
                 "title": "Spend",
                 "width": width,
                 "height": height,
-                "configs": [table_config("Cost")]
+                "configs": [table_config("BlendedCost")]
             }]
         });
         let (status, body) = call(&router, "CreateDashboard", &request).await;
@@ -662,7 +666,7 @@ async fn list_dashboards_pages_over_the_stored_dashboards() {
             "CreateDashboard",
             &json!({
                 "name": name,
-                "widgets": [{"title": "Spend", "configs": [table_config("Cost")]}]
+                "widgets": [{"title": "Spend", "configs": [table_config("BlendedCost")]}]
             }),
         )
         .await;
@@ -818,7 +822,7 @@ async fn list_dashboards_refuses_a_bad_page_request() {
 #[tokio::test]
 async fn update_dashboard_mutates_the_stored_record() {
     let original_widgets = json!([
-        {"title": "Spend", "configs": [table_config("Cost")]},
+        {"title": "Spend", "configs": [table_config("BlendedCost")]},
         {"title": "Coverage", "configs": [graph_config("UnblendedCost", "BAR", "DAILY")]}
     ]);
 
@@ -847,9 +851,9 @@ async fn update_dashboard_mutates_the_stored_record() {
         (
             "widgets replaced by three",
             json!({"widgets": [
-                {"title": "One", "width": 2, "configs": [table_config("Cost")]},
-                {"title": "Two", "height": 10, "configs": [table_config("Hour")]},
-                {"title": "Three", "configs": [graph_config("Unit", "STACK", "HOURLY")]}
+                {"title": "One", "width": 2, "configs": [table_config("BlendedCost")]},
+                {"title": "Two", "height": 10, "configs": [table_config("NetAmortizedCost")]},
+                {"title": "Three", "configs": [graph_config("NormalizedUsageAmount", "STACK", "HOURLY")]}
             ]}),
             vec!["One", "Two", "Three"],
         ),
@@ -953,7 +957,7 @@ async fn delete_dashboard_removes_the_record() {
             "CreateDashboard",
             &json!({
                 "name": name,
-                "widgets": [{"title": "Spend", "configs": [table_config("Cost")]}],
+                "widgets": [{"title": "Spend", "configs": [table_config("BlendedCost")]}],
                 "resourceTags": [{"key": "team", "value": "finops"}]
             }),
         )

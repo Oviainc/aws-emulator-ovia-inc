@@ -199,11 +199,11 @@ fn targets() -> Vec<Target> {
                 json!({
                     "name": "Deep Value Bound Board",
                     "widgets": [
-                        {"title": "First", "configs": [graph_config("Cost", "BAR", "DAILY")]},
+                        {"title": "First", "configs": [graph_config("BlendedCost", "BAR", "DAILY")]},
                         {
                             "title": "Second",
                             "configs": [
-                                graph_config("Cost", "BAR", "DAILY"),
+                                graph_config("BlendedCost", "BAR", "DAILY"),
                                 reservation_coverage_config(time_range)
                             ]
                         }

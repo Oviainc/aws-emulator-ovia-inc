@@ -202,10 +202,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The rules a WIDGET's own configuration has to satisfy, which the boundary
         // validator cannot state either: a time range whose bounds are points in time of
-        // the form their `type` names and that runs forwards, and widget ids that are
-        // distinct within the list (`crate::state::widget_list_refusal`). A request
-        // breaking one is refused with this operation's modelled `ValidationException`
-        // (400) and creates NOTHING: no ARN is minted and no widget id consumed.
+        // the form their `type` names and that runs forwards, metrics each query's own
+        // member documents as valid for it, and widget ids that are distinct within the
+        // list (`crate::state::widget_list_refusal`). A request breaking one is refused
+        // with this operation's modelled `ValidationException` (400) and creates NOTHING:
+        // no ARN is minted and no widget id consumed.
         if let Some(message) = crate::state::widget_list_refusal(&input.widgets) {
             crate::state::record_state_change(ctx, Self::NAME, "-", "ValidationException");
             return Err(CreateDashboardErrorModeled::ValidationException(

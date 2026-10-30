@@ -272,9 +272,9 @@ async fn a_dashboard_created_through_the_api_reports_the_empty_document() {
             json!({
                 "name": "Three Widgets",
                 "widgets": [
-                    {"title": "One", "configs": [graph_config("Cost", "STACK", "MONTHLY")]},
+                    {"title": "One", "configs": [graph_config("BlendedCost", "STACK", "MONTHLY")]},
                     {"title": "Two", "width": 2, "configs": [graph_config("UsageQuantity", "LINE", "DAILY")]},
-                    {"title": "Three", "height": 10, "configs": [graph_config("Hour", "STACK", "HOURLY")]}
+                    {"title": "Three", "height": 10, "configs": [graph_config("NormalizedUsageAmount", "STACK", "HOURLY")]}
                 ],
                 "resourceTags": [{"key": "team", "value": "finops"}]
             }),

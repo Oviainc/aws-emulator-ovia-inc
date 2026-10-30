@@ -198,7 +198,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The rules a WIDGET's own configuration has to satisfy, applied here for the same
         // reason and at the same point as on the create path: a submitted time range has
-        // to be a time period and the ids in one widget list have to be distinct
+        // to be a time period, every metric a query asks for has to be one that query
+        // documents, and the ids in one widget list have to be distinct
         // (`crate::state::widget_list_refusal`). A request breaking one changes nothing —
         // not even the members it got right, and not the widget-id counter.
         if let Some(message) =
