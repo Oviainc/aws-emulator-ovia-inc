@@ -59,16 +59,18 @@
 //! (`None`), which keeps the framework's default sentence rather than inventing one:
 //! [`ViolationKind`] is `#[non_exhaustive]`, so a class can be added upstream.
 //!
-//! MIGRATION NOTE (`services/common/src/validation.rs`): the three rules that are NOT a
-//! per-service dialect — the requirement half read off the framework's own wording, the
-//! subject half, and a `@pattern` printed without its anchors — are staged in that
-//! module and inlined here as they are in ~24 other service crates, because moving them
-//! is a change of its own rather than a side effect of this service's issue. This copy
-//! is one of the ones that migration has to collect; what is genuinely this service's
-//! own and stays here is the tag-API taxonomy and the collection-value rendering.
+//! The halves of rules 3 and 4 that are NOT a per-service dialect are READ from
+//! `services/common/src/validation.rs`, the one home for them in this tree, rather than
+//! restated here: a `@pattern` printed without the anchors the model wraps it in
+//! ([`unanchored`]) and the recognition of a collection-element path
+//! ([`list_of_element`]). What stays this service's own is the tag-API taxonomy of rule
+//! 1, the collection-VALUE rendering of rule 4 (see [`Clause::render`]), and the
+//! requirement wording of every other class, which is read back off the framework's own
+//! clause rather than copied from it ([`framework_requirement`]).
 
 use std::collections::{HashMap, HashSet};
 
+use service_common::validation::{list_of_element, unanchored};
 use smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
 
 use crate::scaffolded::{UnmodeledRefusal, BAD_REQUEST_CODE};
@@ -92,11 +94,6 @@ const RESOURCE_ARN_MEMBER: &str = "resourceArn";
 /// leaves and a list names the tags a removal takes away, but each is a selection out of
 /// the one tag set a resource may carry, and it is that set's size the limit bounds.
 const TAG_SELECTION_MEMBERS: &[&str] = &["tags", "tagKeys"];
-
-/// The suffix the framework's validation path carries for the step from a collection
-/// into one of its elements: `path::element` spells an element as its 1-based position
-/// followed by this segment (`subscriptionProviderSources.1.member`).
-const COLLECTION_STEP: &str = ".member";
 
 /// The separator the framework's own clause puts before the requirement, which is how
 /// [`requirement`] reads a framework wording back off a clause.
@@ -138,40 +135,6 @@ fn framework_requirement(kind: &ViolationKind) -> Option<String> {
         .map(|(_, requirement)| requirement.to_string())
 }
 
-/// A `@pattern` expression without the anchors the model spells it with.
-///
-/// A `$` preceded by an odd number of backslashes is an ESCAPED dollar sign — a literal
-/// character of the expression, not the end anchor — so it stays.
-fn unanchored(pattern: &str) -> &str {
-    let body = pattern.strip_prefix('^').unwrap_or(pattern);
-    match body.strip_suffix('$') {
-        Some(trimmed) => {
-            let escapes = trimmed.len() - trimmed.trim_end_matches('\\').len();
-            if escapes % 2 == 0 {
-                trimmed
-            } else {
-                body
-            }
-        }
-        None => body,
-    }
-}
-
-/// The path of the collection a violation's path points INTO, when the violation is on
-/// one of that collection's elements.
-///
-/// An element path ends with the collection step preceded by the element's 1-based
-/// position (`subscriptionProviderSources.1.member` -> `subscriptionProviderSources`).
-/// The position is what identifies the step, so a member that happens to be NAMED
-/// `member` (`filters.1.member.member`) is not mistaken for one.
-fn enclosing_collection(path: &str) -> Option<&str> {
-    let (head, position) = path.strip_suffix(COLLECTION_STEP)?.rsplit_once('.')?;
-    if position.is_empty() || !position.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    Some(head)
-}
-
 /// `path` with every collection step walked out of, and how deep that nesting is stated.
 ///
 /// The path is collapsed all the way to the member, but the DEPTH is clamped to
@@ -181,7 +144,9 @@ fn enclosing_collection(path: &str) -> Option<&str> {
 fn collapsed(path: &str) -> (&str, usize) {
     let mut path = path;
     let mut depth = 0;
-    while let Some(collection) = enclosing_collection(path) {
+    // The element step is spelled `<collection>.<1-based position>.member`, which
+    // `list_of_element` is the one place in this tree that recognises.
+    while let Some(collection) = list_of_element(path) {
         path = collection;
         depth += 1;
     }
@@ -481,11 +446,13 @@ pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
 mod tests {
     use super::*;
 
-    /// The anchors are stripped, and only the anchors: a `$` that is part of the
-    /// expression stays. The two forms this service's own model reaches are covered
-    /// end-to-end by `tests/all/error_taxonomy.rs`; these rows pin the branches no input
-    /// shape of THIS model can produce, so the rule stays stated for a model that grows
-    /// one.
+    /// The anchor PAIR is stripped, and only that pair: a `$` that is part of the
+    /// expression stays, and so does an expression anchored at one end only. The two
+    /// forms this service's own model reaches are covered end-to-end by
+    /// `tests/all/error_taxonomy.rs`; these rows pin the branches no input shape of THIS
+    /// model can produce, so the rule this service states stays stated for a model that
+    /// grows one. The rule itself is `service_common::validation::unanchored`'s, the one
+    /// implementation of it in this tree, which these rows read it from.
     #[test]
     fn only_the_anchors_are_stripped_from_a_pattern() {
         for (pattern, expected) in [
@@ -494,8 +461,13 @@ mod tests {
             (r"^\$[0-9]+$", r"\$[0-9]+"),
             // An escaped backslash before the `$` leaves the `$` an anchor.
             (r"^[a-z]\\$", r"[a-z]\\"),
-            (r"^\$", r"\$"),
-            (r"^", ""),
+            // The pair is dropped POSITIONALLY and only as a PAIR: an expression whose
+            // trailing `$` is ESCAPED carries no end anchor, so nothing is dropped and
+            // the expression is quoted as the model spells it — and the same for one
+            // anchored at one end only.
+            (r"^\$", r"^\$"),
+            (r"^", "^"),
+            (r"[0-9]+$", r"[0-9]+$"),
         ] {
             let actual = unanchored(pattern);
             assert_eq!(
@@ -505,6 +477,9 @@ mod tests {
         }
     }
 
+    /// Which paths the shared element-path recognition
+    /// (`service_common::validation::list_of_element`) reports a collection for, as this
+    /// service's clause rule 4 reads it.
     #[test]
     fn only_an_indexed_step_is_a_collection_element() {
         for (path, expected) in [
@@ -521,7 +496,7 @@ mod tests {
             ("maxResults", None),
             ("filters.1.member.name", None),
         ] {
-            let actual = enclosing_collection(path);
+            let actual = list_of_element(path);
             assert_eq!(
                 actual, expected,
                 "case {path:?}: expected {expected:?}, got {actual:?}"

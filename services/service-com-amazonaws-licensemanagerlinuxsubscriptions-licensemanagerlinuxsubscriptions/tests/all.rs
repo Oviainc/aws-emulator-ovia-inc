@@ -39,6 +39,8 @@ mod service_settings_status;
 mod shared_discovery_report;
 #[path = "all/shared_harness.rs"]
 mod shared_harness;
+#[path = "all/shared_refusal_rendering.rs"]
+mod shared_refusal_rendering;
 #[path = "all/shared_tag_merge.rs"]
 mod shared_tag_merge;
 #[path = "all/shared_tag_projection.rs"]
