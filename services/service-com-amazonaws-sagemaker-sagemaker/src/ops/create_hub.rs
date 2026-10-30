@@ -147,7 +147,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         let region = crate::state::request_region(ctx);
-        let arn = crate::state::resource_arn(&region, "hub", &input.hub_name);
+        let arn = crate::state::resource_arn(&region, crate::state::HUB_KIND, &input.hub_name);
 
         let mut store = state.lock();
         // A name already in use is refused, never overwritten: otherwise the caller reads

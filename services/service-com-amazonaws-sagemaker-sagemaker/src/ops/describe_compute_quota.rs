@@ -167,14 +167,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
+        // The refusals below name the quota by the ARN its id resolves to, which is the
+        // identifier a successful call reports, so the Region the request signed for is
+        // what they are built against.
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
         let Some(quota) = store.compute_quotas.get_mut(&input.compute_quota_id) else {
             // Never a 200 with empty fields: a caller cannot tell that from a quota
             // that exists and carries nothing.
             return Err(DescribeComputeQuotaErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!(
-                    "Could not find compute quota \"{}\".",
-                    input.compute_quota_id
+                message: Some(crate::state::compute_quota_not_found(
+                    &region,
+                    &input.compute_quota_id,
                 )),
             })
             .into());
@@ -183,16 +187,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A version the definition never reached is not found, the same way an unknown
         // id is not: this slice mints version 1 and only `UpdateComputeQuota` moves it.
         // Checked before anything is written, so a refused request writes nothing.
-        if let Some(requested) = input
+        if input
             .compute_quota_version
-            .filter(|wanted| *wanted != quota.version)
+            .is_some_and(|wanted| wanted != quota.version)
         {
-            let (id, version) = (quota.id.clone(), quota.version);
+            let id = quota.id.clone();
             return Err(DescribeComputeQuotaErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!(
-                    "Could not find version {requested} of compute quota \"{id}\"; its \
-                     current version is {version}."
-                )),
+                // The same sentence an unknown id answers: the requested version is not
+                // one this account holds either, and the refusal names the quota rather
+                // than disclosing which of the two the request missed.
+                message: Some(crate::state::compute_quota_not_found(&region, &id)),
             })
             .into());
         }

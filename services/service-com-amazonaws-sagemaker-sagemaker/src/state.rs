@@ -1810,6 +1810,19 @@ pub const NO_INFERENCE_BENCHMARK_REASON: &str =
     "This emulator runs no model inference container and generates no benchmark traffic, so \
      no load test was performed and no inference recommendation was measured.";
 
+/// How every operation that cannot resolve the Inference Recommender job a request names
+/// states it: the entity as the service words it, the `JobName` the request carried, and
+/// `was not found.`
+///
+/// A recommendation job is addressed by NAME only
+/// (`RecommendationJobName`/`InferenceRecommendationsJobName`), so the identifier is the
+/// one the caller sent — unquoted — and a consumer correlates the refusal with its own
+/// input. Stated once here so the reader and the recommendation surfaces over a job cannot
+/// word the same fact differently.
+pub fn inference_recommendations_job_not_found(job_name: &str) -> String {
+    format!("Inference recommendations job {job_name} was not found.")
+}
+
 /// An Inference Recommender job created by `CreateInferenceRecommendationsJob`, as
 /// `DescribeInferenceRecommendationsJob` replays it.
 ///
@@ -2779,6 +2792,10 @@ pub fn model_package_key(name: &str, version: Option<i32>) -> String {
     }
 }
 
+/// The ARN segment that marks an identifier as a model package ARN rather than a name:
+/// the `:model-package/` before the key [`model_package_lookup_key`] cuts out.
+const MODEL_PACKAGE_ARN_SEGMENT: &str = ":model-package/";
+
 /// The store key a caller-supplied model package identifier names.
 ///
 /// `DescribeModelPackage` takes a `VersionedArnOrName`, whose modelled pattern admits
@@ -2788,7 +2805,7 @@ pub fn model_package_key(name: &str, version: Option<i32>) -> String {
 /// form above; anything else is already a key.
 pub fn model_package_lookup_key(identifier: &str) -> &str {
     identifier
-        .split_once(":model-package/")
+        .split_once(MODEL_PACKAGE_ARN_SEGMENT)
         .map_or(identifier, |(_, resource)| resource)
 }
 
@@ -3625,10 +3642,28 @@ pub const ENDPOINT_CONFIG_KIND_LABEL: &str = "endpoint configuration";
 /// The kind label [`could_not_find`] names an endpoint by.
 pub const ENDPOINT_KIND_LABEL: &str = "endpoint";
 
-/// The kind label [`could_not_find`] names a model package by — a versioned package is
-/// addressed by `<group>/<version>`, so the identifier the refusal quotes is whichever
-/// `VersionedArnOrName` form the request carried.
-pub const MODEL_PACKAGE_KIND_LABEL: &str = "model package";
+/// The entity label [`entity_does_not_exist`] names a model package by — one word, the
+/// way the service spells it for this resource.
+pub const MODEL_PACKAGE_ENTITY: &str = "ModelPackage";
+
+/// The ARN resource kind a model package carries, i.e. the `<kind>` in [`resource_arn`],
+/// as the modelled `ModelPackageArn` pattern spells it
+/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]{9,16}:[0-9]{12}:model-package/`).
+pub const MODEL_PACKAGE_KIND: &str = "model-package";
+
+/// How every operation that cannot resolve the model package a request names states it:
+/// the [`entity_does_not_exist`] sentence over the package's ARN.
+///
+/// The identifier is the ARN [`arn_from_name_or_arn`] decides rather than the name echoed,
+/// so a bare name, a `<group>/<version>` pair and an ARN all report the one identifier a
+/// successful call would have answered with. Stated once here so the readers and the
+/// deletes of this resource cannot word the same fact differently.
+pub fn model_package_not_found(region: &str, identifier: &str) -> String {
+    entity_does_not_exist(
+        MODEL_PACKAGE_ENTITY,
+        &arn_from_name_or_arn(region, MODEL_PACKAGE_KIND, identifier),
+    )
+}
 
 /// The `<Entity> '<identifier>' not found` clause SageMaker's AI benchmarking family
 /// states an unresolvable reference with, written once so the two sentences built on it
@@ -3747,9 +3782,11 @@ pub const CLUSTER_NOT_FOUND: &str = "Specified cluster not found";
 /// the recorded sentence — which ends with no period.
 ///
 /// `ClusterName` is a `ClusterNameOrArn`, so the identifier is whichever form arrived,
-/// echoed rather than resolved: a caller reading the refusal matches it against what it
-/// sent. Stated once here so the reader and the delete of a cluster cannot word the same
-/// fact differently.
+/// echoed rather than resolved: a cluster's ARN carries the minted cluster id rather than
+/// its name, so resolving the name of a cluster that does not exist would report an
+/// identifier nobody supplied, and a caller reading the refusal matches it against what it
+/// sent. Stated once here so the cluster readers, the delete and the node-inventory and
+/// node-batch operations cannot word the same fact differently.
 pub fn cluster_not_found(identifier: &str) -> String {
     format!("Cluster with name {identifier} not found")
 }
@@ -3760,6 +3797,92 @@ pub fn cluster_not_found(identifier: &str) -> String {
 /// unknown-identifier cases of one request — the cluster, and the node inside it — are
 /// what a caller tells apart by the refusal text, since both carry the same code.
 pub const CLUSTER_NODE_NOT_FOUND: &str = "Specified cluster node not found";
+
+/// The one `<Entity> with arn <arn> could not be found` sentence — how the HyperPod
+/// task-governance resources (the cluster policy and the compute quota) state one this
+/// account does not hold.
+///
+/// Private, and reached through [`cluster_scheduler_config_not_found`] /
+/// [`compute_quota_not_found`], so a call site names the resource it refuses rather than
+/// spelling the sentence again. Both resources are addressed by the id SageMaker minted,
+/// and both refusals name the ARN that id resolves to — unquoted, with no trailing period.
+fn arn_could_not_be_found(entity: &str, arn: &str) -> String {
+    format!("{entity} with arn {arn} could not be found")
+}
+
+/// The ARN resource kind a cluster policy carries, i.e. the `<kind>` in [`resource_arn`],
+/// as the modelled `ClusterSchedulerConfigArn` pattern spells it
+/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]{9,16}:[0-9]{12}:cluster-scheduler-config/`).
+pub const CLUSTER_SCHEDULER_CONFIG_KIND: &str = "cluster-scheduler-config";
+
+/// The entity label [`arn_could_not_be_found`] names a cluster policy by, as the service
+/// words it — not the modelled shape name, and not this crate's `cluster policy` prose.
+const CLUSTER_SCHEDULER_CONFIG_ENTITY: &str = "Cluster scheduler config";
+
+/// How every operation that cannot resolve the cluster policy a request names states it:
+/// the [`arn_could_not_be_found`] sentence over the policy's ARN, resolved from the
+/// requested `ClusterSchedulerConfigId` against the Region the request signed for.
+pub fn cluster_scheduler_config_not_found(region: &str, config_id: &str) -> String {
+    arn_could_not_be_found(
+        CLUSTER_SCHEDULER_CONFIG_ENTITY,
+        &resource_arn(region, CLUSTER_SCHEDULER_CONFIG_KIND, config_id),
+    )
+}
+
+/// The ARN resource kind a compute quota carries, i.e. the `<kind>` in [`resource_arn`],
+/// as the modelled `ComputeQuotaArn` pattern spells it
+/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:compute-quota/`).
+pub const COMPUTE_QUOTA_KIND: &str = "compute-quota";
+
+/// The entity label [`arn_could_not_be_found`] names a compute quota by, as the service
+/// words it.
+const COMPUTE_QUOTA_ENTITY: &str = "Compute Quota";
+
+/// How every operation that cannot resolve the compute quota a request names states it:
+/// the [`arn_could_not_be_found`] sentence over the quota's ARN, resolved from the
+/// requested `ComputeQuotaId` against the Region the request signed for.
+pub fn compute_quota_not_found(region: &str, quota_id: &str) -> String {
+    arn_could_not_be_found(
+        COMPUTE_QUOTA_ENTITY,
+        &resource_arn(region, COMPUTE_QUOTA_KIND, quota_id),
+    )
+}
+
+/// The ARN resource kind a JumpStart hub carries, i.e. the `<kind>` in [`resource_arn`],
+/// as the modelled `HubNameOrArn` pattern spells it
+/// (`^(arn:[a-z0-9-\.]{1,63}:sagemaker:\w+(?:-\w+)+:(\d{12}|aws):hub\/)?`).
+pub const HUB_KIND: &str = "hub";
+
+/// How every operation that cannot resolve the hub a request names states it: the entity,
+/// the hub's NAME, and `does not exist.`
+///
+/// A hub is addressed by `HubNameOrArn` and its ARN carries the hub's name, so both forms
+/// resolve to the one name this sentence reports — never an ARN, which is not what the
+/// service names here. Stated once so the readers, the delete and the content operations
+/// that resolve a hub cannot word the same fact differently.
+pub fn hub_not_found(hub_name: &str) -> String {
+    format!("Hub with name {hub_name} does not exist.")
+}
+
+/// The ARN resource kind a model card carries, i.e. the `<kind>` in [`resource_arn`], as
+/// the modelled `ModelCardArn` pattern spells it
+/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:model-card/`).
+pub const MODEL_CARD_KIND: &str = "model-card";
+
+/// How every operation that cannot resolve the model card a request names states it: the
+/// entity as the service spells it — one word — the card's ARN, and `does not exist` with
+/// NO trailing period.
+///
+/// A card is addressed by name or by ARN and the refusal reports the ARN
+/// [`arn_from_name_or_arn`] decides, so the identifier a consumer cuts out of the message is
+/// the one a successful call would have answered with. Stated once here so the readers, the
+/// update, the delete and the export jobs over a card word the same fact the same way.
+pub fn model_card_not_found(region: &str, identifier: &str) -> String {
+    format!(
+        "Modelcard {} does not exist",
+        arn_from_name_or_arn(region, MODEL_CARD_KIND, identifier)
+    )
+}
 
 /// Why SageMaker refuses this pipeline definition, or `None` when it accepts it.
 ///
@@ -5126,10 +5249,10 @@ impl ComAmazonawsSagemakerSagemakerState {
 
     /// The key [`ComAmazonawsSagemakerSagemakerState::actions`] holds an action under,
     /// for an identifier the caller gave as either a name or an ARN (the lineage
-    /// readers' `ExperimentEntityNameOrArn`). See [`lineage_entity_key`], which the
+    /// readers' `ExperimentEntityNameOrArn`). See [`arn_from_name_or_arn`], which the
     /// context slice resolves its own key with too.
     pub fn action_key(region: &str, identifier: &str) -> String {
-        lineage_entity_key(region, ACTION_KIND, identifier)
+        arn_from_name_or_arn(region, ACTION_KIND, identifier)
     }
 }
 
@@ -5538,14 +5661,13 @@ pub fn mint_partner_app_id() -> String {
     format!("app-{}", mint_short_id().to_ascii_uppercase())
 }
 
-/// How the partner-app operations state an app this account holds none of, for the ARN
-/// the request sent — the only identifier a caller can name one by.
+/// How the partner-app operations state an app this account holds none of.
 ///
-/// Stated once here so the reader (`DescribePartnerApp`) and the URL mint
-/// (`CreatePartnerAppPresignedUrl`) cannot word the same fact differently.
-pub fn partner_app_does_not_exist(arn: &str) -> String {
-    format!("Partner app {arn} does not exist.")
-}
+/// A FIXED sentence carrying NOTHING from the request: a partner AI app is addressed by
+/// its ARN, and the service names no identifier here, so the refusal does not echo back
+/// the ARN a caller probed with. Stated once here so the reader (`DescribePartnerApp`) and
+/// the URL mint (`CreatePartnerAppPresignedUrl`) cannot word the same fact differently.
+pub const PARTNER_APP_NOT_FOUND: &str = "App entity does not exist.";
 
 /// How `CreatePartnerApp` refuses a `Type` this account holds no partner-application
 /// subscription for: the type asked for, and what the caller has to do about it.
@@ -6272,9 +6394,10 @@ pub struct TrialComponent {
     pub last_modified_time: SystemTime,
 }
 
-/// The store key one lineage entity of `kind` is held under, for an identifier the caller
-/// gave as either a bare name or a full ARN (the lineage members'
-/// `ExperimentEntityNameOrArn` / `ContextNameOrArn`).
+/// The store key one lineage entity of `kind` is held under, and the ARN any resource of
+/// `kind` addressed by a bare name OR a full ARN resolves to (the lineage members'
+/// `ExperimentEntityNameOrArn` / `ContextNameOrArn`, a `ModelCardNameOrArn`, a
+/// `VersionedArnOrName`).
 ///
 /// Every lineage store in this module is keyed by the entity's ARN, which carries both the
 /// Region the name is unique within and the name itself — SageMaker documents these names
@@ -6284,10 +6407,14 @@ pub struct TrialComponent {
 /// or the Region addresses a different entity (and so, here, none). A name can never be
 /// mistaken for an ARN: no lineage name pattern admits a `:`.
 ///
-/// Shared by the action slice ([`ComAmazonawsSagemakerSagemakerState::action_key`]) and the
-/// context slice ([`context_key`]) so both resolve an identifier the same way.
-pub fn lineage_entity_key(region: &str, kind: &str, identifier: &str) -> String {
-    if identifier.starts_with("arn:") {
+/// Shared by the action slice ([`ComAmazonawsSagemakerSagemakerState::action_key`]), the
+/// context slice ([`context_key`]) and the refusals that NAME the resolved ARN
+/// ([`model_card_not_found`], [`model_package_not_found`]), so the name-or-ARN split is
+/// decided in ONE place: a name has to be resolved, because the caller sent no ARN to
+/// report, while an ARN is echoed, because rewriting it would report an identifier the
+/// caller never sent.
+pub fn arn_from_name_or_arn(region: &str, kind: &str, identifier: &str) -> String {
+    if identifier.starts_with(ARN_PREFIX) {
         identifier.to_string()
     } else {
         resource_arn(region, kind, identifier)
@@ -6295,7 +6422,7 @@ pub fn lineage_entity_key(region: &str, kind: &str, identifier: &str) -> String 
 }
 
 /// The store key for the context a request addresses: that context's ARN, resolved by
-/// [`lineage_entity_key`] against the Region the request signed for.
+/// [`arn_from_name_or_arn`] against the Region the request signed for.
 ///
 /// `CreateContext`'s `ContextName` is documented unique to an account in a Region, so the
 /// name alone does not identify a context — the ARN, which carries the Region and the
@@ -6306,7 +6433,7 @@ pub fn context_key(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     name_or_arn: &str,
 ) -> String {
-    lineage_entity_key(&request_region(ctx), CONTEXT_KIND, name_or_arn)
+    arn_from_name_or_arn(&request_region(ctx), CONTEXT_KIND, name_or_arn)
 }
 
 impl ComAmazonawsSagemakerSagemakerState {

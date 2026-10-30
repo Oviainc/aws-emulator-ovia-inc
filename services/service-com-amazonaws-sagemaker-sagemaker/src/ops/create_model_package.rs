@@ -360,7 +360,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "Cannot create already existing model package \"{key}\"."
             )));
         }
-        let arn = crate::state::resource_arn(&region, "model-package", &key);
+        let arn = crate::state::resource_arn(&region, crate::state::MODEL_PACKAGE_KIND, &key);
 
         // Registration is asynchronous: the package is `Pending` until the instant the
         // clock owes it `Completed`, which a reporting call materialises.

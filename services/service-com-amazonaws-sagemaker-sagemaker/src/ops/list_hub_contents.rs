@@ -183,7 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // Reporting only: this listing reads the stored contents of the hub the request
+        // names and writes nothing, so it needs no request metadata.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
@@ -223,11 +225,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         if !store.hubs.contains_key(&hub_name) {
-            // The one modelled error: there is no such hub to list the contents of.
-            let arn =
-                crate::state::resource_arn(&crate::state::request_region(ctx), "hub", &hub_name);
+            // The one modelled error: there is no such hub to list the contents of, worded
+            // the way every operation that resolves a hub words it.
             return Err(ListHubContentsErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Could not find hub \"{arn}\".")),
+                message: Some(crate::state::hub_not_found(&hub_name)),
             })
             .into());
         }

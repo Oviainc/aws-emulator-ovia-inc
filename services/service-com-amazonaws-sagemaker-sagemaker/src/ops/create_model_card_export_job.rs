@@ -169,16 +169,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same miss as a card nobody created, and the refusal does not disclose which of
         // the two it was.
         //
-        // This wording is the export surface's own: `DescribeModelCard` answers `Could not
-        // find model card '<name>'.` for the same resource, and the recorded unit this
-        // operation was filed from (`sagemaker.create-model-card-export-job-card-not-found`)
-        // pins the form below for the export path — so the two are deliberately not
-        // unified.
+        // The sentence is the one every operation over a model card answers for this fact,
+        // stated once in `crate::state`.
         let not_found = || {
             CreateModelCardExportJobErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!(
-                    "Modelcard {} does not exist",
-                    crate::state::resource_arn(&region, "model-card", card_name)
+                message: Some(crate::state::model_card_not_found(
+                    &region,
+                    &input.model_card_name,
                 )),
             })
         };
@@ -248,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let arn = crate::state::resource_arn(
             &region,
-            "model-card",
+            crate::state::MODEL_CARD_KIND,
             &format!(
                 "{card_name}/export-job/{}",
                 input.model_card_export_job_name

@@ -62,7 +62,10 @@ fn instance_group(name: &str) -> Value {
 /// `CreateCluster` writes and `ListClusters` reports, so the fixture is created through
 /// the API — as a client's would be — and the ARN every policy call below names is the
 /// service's own rather than one a test invented.
-async fn seed_cluster(emulator: &Emulator, region: &str, name: &str) -> String {
+///
+/// `pub(crate)` because the not-found-wording suite needs the same fixture — a cluster a
+/// policy and a quota can hang off — rather than a second copy of this create.
+pub(crate) async fn seed_cluster(emulator: &Emulator, region: &str, name: &str) -> String {
     let (status, created) = emulator
         .call_in(
             region,
@@ -115,8 +118,9 @@ fn is_modelled_id(id: &str) -> bool {
             .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
 }
 
-/// Create `name` in `cluster` and answer its minted id.
-async fn create(emulator: &Emulator, name: &str, cluster: &str) -> String {
+/// Create `name` in `cluster` and answer its minted id. `pub(crate)` for the same reason
+/// as [`seed_cluster`].
+pub(crate) async fn create(emulator: &Emulator, name: &str, cluster: &str) -> String {
     let created = emulator
         .ok(
             "CreateClusterSchedulerConfig",

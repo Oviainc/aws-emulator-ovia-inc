@@ -208,7 +208,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = policies.mint_id();
-        let arn = crate::state::resource_arn(&region, "cluster-scheduler-config", &id);
+        let arn = crate::state::resource_arn(
+            &region,
+            crate::state::CLUSTER_SCHEDULER_CONFIG_KIND,
+            &id,
+        );
         policies.configs.insert(
             id.clone(),
             policy::Config {

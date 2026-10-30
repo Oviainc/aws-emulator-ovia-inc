@@ -210,8 +210,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(job) = store.inference_recommendations_jobs.get(job_name) else {
             return Err(GetScalingConfigurationRecommendationErrorModeled::ResourceNotFound(
                 ResourceNotFound {
-                    message: Some(format!(
-                        "Inference recommendations job {job_name} does not exist."
+                    message: Some(crate::state::inference_recommendations_job_not_found(
+                        job_name,
                     )),
                 },
             )

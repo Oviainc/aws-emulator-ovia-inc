@@ -233,22 +233,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         // `ModelCardName` is a `ModelCardNameOrArn`: both forms name one stored card.
         let name = crate::state::name_from_arn_or_name(&input.model_card_name);
+        // The refusals below name the card by its ARN: the one the request carried, or the
+        // one this name resolves to in the Region the request signed for.
+        let not_found = || {
+            DescribeModelCardErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(crate::state::model_card_not_found(
+                    &crate::state::request_region(ctx),
+                    &input.model_card_name,
+                )),
+            })
+        };
 
         let store = state.lock();
         let Some(card) = store.model_cards.get(name) else {
             // Never a 200 with empty fields: a caller cannot tell that from a card that
             // exists and carries nothing.
-            return Err(DescribeModelCardErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Could not find model card '{name}'.")),
-            })
-            .into());
+            return Err(not_found().into());
         };
 
         // "If a version is not provided, then the latest version of the model card is
@@ -258,15 +265,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => card.latest_version(),
         };
         let Some(held) = held else {
-            return Err(DescribeModelCardErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(match input.model_card_version {
-                    Some(requested) => format!(
-                        "Could not find version {requested} of model card '{name}'."
-                    ),
-                    None => format!("Could not find model card '{name}'."),
-                }),
-            })
-            .into());
+            // A version the card never had is the same miss as a card nobody created, and
+            // the refusal names the card rather than disclosing which of the two it was —
+            // the wording the export surface over a card version already answers.
+            return Err(not_found().into());
         };
 
         let content = match input.included_data.as_deref() {

@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one name exactly one deletes it and the other reads the refusal below.
         let Some(card) = store.model_cards.remove(&input.model_card_name) else {
             // Nothing was deleted, so never a 200: a caller cannot tell that from a
-            // delete that landed. The message quotes the identifier the CALLER passed.
+            // delete that landed.
             //
             // This is also what a second delete of one card reads: the delete is
             // complete when this call answers, so no deletion is ever in flight for a
@@ -172,11 +172,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "Deletes an Amazon SageMaker Model Card", so no conflict is invented over
             // a job, and a job keeps replaying the card name and version it stored.)
             return Err(DeleteModelCardErrorModeled::ResourceNotFound(ResourceNotFound {
-                // The wording the model-card readers use for the same fact: the kind,
-                // then the identifier AS THE CALLER SENT IT, in single quotes.
-                message: Some(format!(
-                    "Could not find model card '{}'.",
-                    input.model_card_name
+                // The wording every operation over a model card uses for the same fact:
+                // the kind as the service spells it, then the card's resolved ARN.
+                message: Some(crate::state::model_card_not_found(
+                    &crate::state::request_region(ctx),
+                    &input.model_card_name,
                 )),
             })
             .into());

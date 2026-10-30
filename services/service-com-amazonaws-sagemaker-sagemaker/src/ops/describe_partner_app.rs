@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the modelled not-found.
             return Err(DescribePartnerAppErrorModeled::ResourceNotFound(
                 ResourceNotFound {
-                    message: Some(crate::state::partner_app_does_not_exist(&input.arn)),
+                    message: Some(crate::state::PARTNER_APP_NOT_FOUND.to_string()),
                 },
             )
             .into());

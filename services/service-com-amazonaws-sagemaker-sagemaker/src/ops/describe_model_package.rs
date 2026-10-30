@@ -287,11 +287,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let Some(package) = store.model_packages.get_mut(key) else {
-            // The message quotes the identifier the caller passed, not an ARN this
-            // emulator synthesized.
+            // The entity and the ARN the identifier resolves to, which is the identifier a
+            // successful call reports.
             return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::could_not_find(
-                    crate::state::MODEL_PACKAGE_KIND_LABEL,
+                crate::state::model_package_not_found(
+                    &crate::state::request_region(ctx),
                     &input.model_package_name,
                 ),
             ));

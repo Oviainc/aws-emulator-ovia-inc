@@ -165,12 +165,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Deleting an identifier no package is stored under is refused, never answered
         // with an empty 200: a caller cannot tell that from a delete that removed
         // something, so a cleanup loop could not tell whether the identifier was ever
-        // taken. The wording is `DescribeModelPackage`'s, so one identifier form reports
-        // the condition across this resource's operations.
+        // taken. The wording is this resource's own, stated once in `crate::state`, so
+        // every operation over a model package reports the condition the same way.
         let Some(package) = store.model_packages.remove(key) else {
             return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::could_not_find(
-                    crate::state::MODEL_PACKAGE_KIND_LABEL,
+                crate::state::model_package_not_found(
+                    &crate::state::request_region(ctx),
                     &input.model_package_name,
                 ),
             ));

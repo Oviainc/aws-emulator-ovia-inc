@@ -164,7 +164,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx);
-        let arn = crate::state::resource_arn(&region, "model-card", &input.model_card_name);
+        let arn = crate::state::resource_arn(
+            &region,
+            crate::state::MODEL_CARD_KIND,
+            &input.model_card_name,
+        );
         let now = ::std::time::SystemTime::now();
         // Who the card records as its creator: the identity this request signed with.
         let creator = crate::state::caller_user_context(ctx);

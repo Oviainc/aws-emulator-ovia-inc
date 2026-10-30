@@ -139,6 +139,8 @@ mod model_package_group_policy_names;
 mod model_package_registry;
 #[path = "all/model_package_updates.rs"]
 mod model_package_updates;
+#[path = "all/not_found_refusal_wording.rs"]
+mod not_found_refusal_wording;
 #[path = "all/notebook_instance_lifecycle.rs"]
 mod notebook_instance_lifecycle;
 #[path = "all/notebook_instance_stop.rs"]

@@ -164,6 +164,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         let now = ::std::time::SystemTime::now();
+        // The refusals below name the policy by the ARN its id resolves to, which is the
+        // identifier a successful call reports, so the Region the request signed for is
+        // what they are built against.
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
         let Some(config) = store
             .cluster_policies
@@ -175,9 +179,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // operation models for an id it does not hold.
             return Err(DescribeClusterSchedulerConfigErrorModeled::ResourceNotFound(
                 ResourceNotFound {
-                    message: Some(format!(
-                        "Could not find cluster policy \"{}\".",
-                        input.cluster_scheduler_config_id
+                    message: Some(crate::state::cluster_scheduler_config_not_found(
+                        &region,
+                        &input.cluster_scheduler_config_id,
                     )),
                 },
             )
@@ -189,12 +193,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // every transition this handler does materialise is also recorded below.
         if let Some(wanted) = input.cluster_scheduler_config_version {
             if wanted != config.version {
-                let (id, version) = (config.id.clone(), config.version);
+                let id = config.id.clone();
                 return Err(DescribeClusterSchedulerConfigErrorModeled::ResourceNotFound(
                     ResourceNotFound {
-                        message: Some(format!(
-                            "Could not find version {wanted} of cluster policy \"{id}\"; its \
-                             current version is {version}."
+                        // The same sentence an unknown id answers: the requested policy
+                        // version is not one this account holds either, and the refusal
+                        // names the policy rather than disclosing which of the two the
+                        // request missed.
+                        message: Some(crate::state::cluster_scheduler_config_not_found(
+                            &region, &id,
                         )),
                     },
                 )

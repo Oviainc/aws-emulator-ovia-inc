@@ -201,11 +201,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let Some(package) = store.model_packages.get_mut(&key) else {
-            // The message quotes the ARN the caller passed, not one this emulator
-            // synthesized.
+            // The sentence every operation over a model package answers for this fact: the
+            // entity, then the package's ARN resolved from the identifier the request
+            // carried.
             return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::could_not_find(
-                    crate::state::MODEL_PACKAGE_KIND_LABEL,
+                crate::state::model_package_not_found(
+                    &crate::state::request_region(ctx),
                     &input.model_package_arn,
                 ),
             ));

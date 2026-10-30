@@ -276,7 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cluster for is the modelled `ResourceNotFound` and no node is replaced.
         let Some(cluster) = store.cluster_by_name_or_arn_mut(&cluster_name) else {
             return Err(BatchReplaceClusterNodesErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Cluster {cluster_name} does not exist.")),
+                message: Some(crate::state::cluster_not_found(&cluster_name)),
             })
             .into());
         };

@@ -222,7 +222,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing to update, so never a 200: a caller cannot tell that from an update
             // that landed.
             return Err(UpdateModelCardErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Could not find model card '{name}'.")),
+                message: Some(crate::state::model_card_not_found(
+                    &crate::state::request_region(ctx),
+                    &input.model_card_name,
+                )),
             })
             .into());
         };
@@ -275,7 +278,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // Unreachable, as above: a stored card always holds a version.
                     return Err(UpdateModelCardErrorModeled::ResourceNotFound(
                         ResourceNotFound {
-                            message: Some(format!("Could not find model card '{name}'.")),
+                            message: Some(crate::state::model_card_not_found(
+                                &crate::state::request_region(ctx),
+                                &input.model_card_name,
+                            )),
                         },
                     )
                     .into());

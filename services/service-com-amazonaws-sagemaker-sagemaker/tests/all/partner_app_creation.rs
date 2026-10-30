@@ -606,8 +606,11 @@ async fn an_arn_this_account_holds_no_app_for_is_not_found() {
         );
         assert_eq!(
             message(&refused),
-            sm::partner_app_does_not_exist(&arn),
-            "case {arn}: the refusal must name the ARN the request sent, got {refused}"
+            // The sentence spelled out, not read from the constant under test: the wire
+            // form is the requirement.
+            "App entity does not exist.",
+            "case {arn}: the refusal must be the service's fixed sentence, naming no \
+             identifier, got {refused}"
         );
     }
 

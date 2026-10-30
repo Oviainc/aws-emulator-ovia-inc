@@ -211,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The id is the server's, minted by the compute-allocation slice's own mint so no
         // two quotas share one.
         let id = store.mint_compute_quota_id();
-        let arn = crate::state::resource_arn(&region, "compute-quota", &id);
+        let arn = crate::state::resource_arn(&region, crate::state::COMPUTE_QUOTA_KIND, &id);
         let now = ::std::time::SystemTime::now();
         store.compute_quotas.insert(
             id.clone(),

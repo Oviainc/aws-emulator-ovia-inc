@@ -178,8 +178,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(package) = found else {
                 errors.insert(
                     requested.clone(),
-                    item_error(crate::state::could_not_find(
-                        crate::state::MODEL_PACKAGE_KIND_LABEL,
+                    // The sentence every operation over a model package answers for this
+                    // fact, so one item error reads the way the single-package reader
+                    // does. This input is an ARN and nothing else, so the ARN the refusal
+                    // names is the one the request carried.
+                    item_error(crate::state::model_package_not_found(
+                        &crate::state::request_region(ctx),
                         requested,
                     )),
                 );

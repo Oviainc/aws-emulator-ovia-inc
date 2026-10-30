@@ -177,9 +177,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(job) = store.inference_recommendations_jobs.get_mut(&input.job_name) else {
             return Err(DescribeInferenceRecommendationsJobErrorModeled::ResourceNotFound(
                 ResourceNotFound {
-                    message: Some(format!(
-                        "Could not find inference recommendations job \"{}\".",
-                        input.job_name
+                    message: Some(crate::state::inference_recommendations_job_not_found(
+                        &input.job_name,
                     )),
                 },
             )

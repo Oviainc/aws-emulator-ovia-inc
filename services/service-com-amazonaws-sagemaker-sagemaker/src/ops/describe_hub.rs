@@ -156,7 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(hub) = store.hubs.get_mut(&name) else {
             return Err(DescribeHubErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Resource not found: hub \"{name}\".")),
+                message: Some(crate::state::hub_not_found(&name)),
             })
             .into());
         };

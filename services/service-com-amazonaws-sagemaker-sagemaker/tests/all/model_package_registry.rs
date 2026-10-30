@@ -1183,8 +1183,8 @@ async fn metadata_only_preserves_nothing_from_content_that_is_not_a_json_object(
 }
 
 /// RULE: `DescribeModelPackage` answers only for an identifier some stored package
-/// carries; anything else is refused 400 `ValidationException` quoting the identifier the
-/// request passed.
+/// carries; anything else is refused 400 `ValidationException` naming the package ARN the
+/// identifier resolves to.
 #[tokio::test]
 async fn describing_an_unknown_model_package_is_refused() {
     let emulator = Emulator::new();
@@ -1196,18 +1196,25 @@ async fn describing_an_unknown_model_package_is_refused() {
         .create("an unversioned package", &json!({"ModelPackageName": "unversioned"}))
         .await;
 
+    // Rows: (case, the identifier the request carries, the package key the refusal must
+    // report the ARN of).
     let rows = [
-        ("a name never registered", "absent".to_string()),
-        ("a group with no such version", "known/2".to_string()),
-        ("a versioned package by its group alone", "known".to_string()),
-        ("an unversioned package asked for by version", "unversioned/1".to_string()),
+        ("a name never registered", "absent".to_string(), "absent"),
+        ("a group with no such version", "known/2".to_string(), "known/2"),
+        ("a versioned package by its group alone", "known".to_string(), "known"),
+        (
+            "an unversioned package asked for by version",
+            "unversioned/1".to_string(),
+            "unversioned/1",
+        ),
         (
             "an ARN for a package that does not exist",
             expected_arn(state::DEFAULT_REGION, "absent"),
+            "absent",
         ),
     ];
 
-    for (case, identifier) in rows {
+    for (case, identifier, key) in rows {
         let (status, refused) = emulator
             .call("DescribeModelPackage", &json!({"ModelPackageName": identifier}))
             .await;
@@ -1222,8 +1229,11 @@ async fn describing_an_unknown_model_package_is_refused() {
         );
         assert_eq!(
             message(&refused),
-            format!("Could not find model package \"{identifier}\"."),
-            "case {case:?}: expected the message to quote the identifier passed, got {:?}",
+            format!(
+                "ModelPackage {} does not exist.",
+                expected_arn(state::DEFAULT_REGION, key)
+            ),
+            "case {case:?}: expected the message to name the resolved package ARN, got {:?}",
             message(&refused)
         );
     }
