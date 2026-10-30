@@ -694,11 +694,7 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
         // call that writes nothing consumes no id: the ids this state hands out are a
         // sequence, and one burned on a path that writes nothing would shift every
         // later id.
-        let Some(detector) = self
-            .detectors
-            .values()
-            .find(|detector| detector.region == region)
-        else {
+        let Some(detector) = self.inbox_in(region) else {
             return false;
         };
         if !detector.inbox_has_room_for(administrator_account_id) {
@@ -711,6 +707,38 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
             .is_some_and(|detector| {
                 detector.deliver_invitation(administrator_account_id, &invitation_id, now)
             })
+    }
+
+    /// The inbox `region`'s endpoint serves, if that Region holds a detector at all.
+    ///
+    /// One inbox per Region, for the reason [`Self::received_invitations_in`] gives:
+    /// the operations that deliver an invitation and the operations that answer one
+    /// name no detector, and a Region holds at most one detector ("you can have only
+    /// one detector per account per Region", which `CreateDetector` refuses a second
+    /// create under), so the Region's one detector IS the inbox a request through its
+    /// endpoint addresses.
+    fn inbox_in(&self, region: &str) -> Option<&Detector> {
+        self.detectors
+            .values()
+            .find(|detector| detector.region == region)
+    }
+
+    /// Is the invitation `administrator_account_id` sent through `region`'s endpoint
+    /// still pending?
+    ///
+    /// The ONE question both halves of a send are decided by. Sending an invitation
+    /// writes the administrator's own member records AND delivers the invitation to
+    /// the inbox the Region's endpoint serves ([`Self::deliver_invitation_in`]), and
+    /// an invitation stays pending only until the account it was delivered to answers
+    /// it — so taking it out of that inbox, which is what an acceptance
+    /// ([`Detector::accept_invitation`]), a decline and a delete
+    /// ([`Self::take_received_invitations_in`]) each do, is what makes it no longer
+    /// pending for the member records of that same send as much as for the inbox.
+    /// Both halves therefore ask HERE, so neither can report an invitation pending
+    /// that the other no longer holds.
+    pub fn invitation_pending_in(&self, region: &str, administrator_account_id: &str) -> bool {
+        self.inbox_in(region)
+            .is_some_and(|detector| detector.has_invitation_pending_from(administrator_account_id))
     }
 
     /// Take out of the inbox `region`'s endpoint serves the invitation each account
@@ -3136,10 +3164,24 @@ impl Detector {
     /// One definition, so the check and the write cannot disagree on what the
     /// inbox will accept.
     pub fn inbox_has_room_for(&self, administrator_account_id: &str) -> bool {
-        !self
-            .received_invitations
-            .contains_key(administrator_account_id)
+        !self.has_invitation_pending_from(administrator_account_id)
             && self.received_invitations.len() < MAX_INVITATIONS_PER_DETECTOR
+    }
+
+    /// Is an invitation from `administrator_account_id` pending for this detector's
+    /// account, whatever its id?
+    ///
+    /// ONE invitation is pending per inviting account at a time (see
+    /// [`ComAmazonawsGuarddutyGuarddutyapiserviceState::deliver_invitation_in`]), so
+    /// this single lookup is what "still pending" means for that account: it is the
+    /// condition a delivery takes its room from ([`Self::inbox_has_room_for`]) and
+    /// the condition a send leaves its member records untouched under, read over an
+    /// IMMUTABLE borrow so either caller can answer it before it writes. One
+    /// definition, so the two halves of a send cannot disagree about what is
+    /// pending.
+    pub fn has_invitation_pending_from(&self, administrator_account_id: &str) -> bool {
+        self.received_invitations
+            .contains_key(administrator_account_id)
     }
 
     /// Is an invitation pending for this detector's account under exactly the pair

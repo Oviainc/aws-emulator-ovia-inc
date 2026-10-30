@@ -22,7 +22,11 @@
 //! sizes, `AcceptInvitation` / `AcceptAdministratorInvitation` resolve and
 //! `DeclineInvitations` / `DeleteInvitations` take an invitation out of. One
 //! invitation is pending per inviting account, so a re-send re-sends that same
-//! invitation.
+//! invitation — and whether one is still pending is asked of that inbox
+//! ([`crate::state::ComAmazonawsGuarddutyGuarddutyapiserviceState::invitation_pending_in`])
+//! for BOTH halves, so a send after the invitation it sent has been accepted,
+//! declined or deleted writes a fresh one on both and the member records never name
+//! the instant of an invitation that is gone.
 //!
 //! An invitation's `AccountId` is the account that SENT it, and every account this
 //! emulator presents carries the one canonical account id
@@ -227,6 +231,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // call, so every member it invites carries the same `InvitedAt` and the same
         // `UpdatedAt`.
         let now = state.pending_millis();
+        // Is the invitation this administrator sent through this Region's endpoint
+        // still pending? Both halves of a send are decided by this one answer, read
+        // from the inbox an acceptance, a decline and a delete each take an
+        // invitation out of: while it is pending a re-send re-sends that same
+        // invitation and moves neither half, and once it has been answered or
+        // deleted nothing of that send is pending any more, so a later send is a
+        // fresh invitation on BOTH halves. Read before anything is written, because
+        // the delivery below is what changes it.
+        let invitation_pending = state.invitation_pending_in(&region, &administrator);
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             // Unreachable: the detector was resolved above and the lock has not been
             // released since. Answered rather than panicked, because a handler owes
@@ -255,13 +268,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // inviting an account whose invitation is still pending re-sends
                     // that same invitation rather than issuing a second one: nothing
                     // about the member moves, `InvitedAt` and `UpdatedAt` included.
-                    if member.relationship_status != crate::state::RELATIONSHIP_INVITED {
-                        member.relationship_status =
-                            crate::state::RELATIONSHIP_INVITED.to_string();
-                        member.invited_at_millis = Some(now);
-                        member.updated_at_millis = now;
-                        wrote = true;
+                    // "Still pending" is the inbox's answer, not the stored status's:
+                    // a member left `Invited` by a send whose invitation has since
+                    // been accepted, declined or deleted has none pending, so the
+                    // instant this send is made at is what its record carries — a
+                    // member's `InvitedAt` names the instant an invitation this store
+                    // holds was sent at, never one that was answered.
+                    if invitation_pending
+                        && member.relationship_status == crate::state::RELATIONSHIP_INVITED
+                    {
+                        continue;
                     }
+                    member.relationship_status = crate::state::RELATIONSHIP_INVITED.to_string();
+                    member.invited_at_millis = Some(now);
+                    member.updated_at_millis = now;
+                    wrote = true;
                 }
                 // An account this administrator holds no member record for cannot be
                 // invited — GuardDuty has to be enabled in the account and the
