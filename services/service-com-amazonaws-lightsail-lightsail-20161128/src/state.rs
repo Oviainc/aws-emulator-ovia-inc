@@ -11023,6 +11023,56 @@ pub fn alternative_domain_names(primary: &str, requested: Vec<String>) -> Vec<St
     covered
 }
 
+/// The alternative domains a certificate covers, given the primary domain it is
+/// for and the list the request member `member` carried, or the refusal message
+/// that member earned.
+///
+/// The ONE owner of the rule ANY requested alternative-name list has to
+/// satisfy, whichever certificate the request describes: every entry has to be
+/// a domain name (which is also what refuses the wildcards the documentation
+/// says are not supported, because `*` is not a character a DNS label carries),
+/// and the list the de-duping LEAVES has to be within `max_covered` — the
+/// maximum both certificate kinds document "in addition to the primary domain",
+/// applied to what [`alternative_domain_names`] leaves rather than to a list
+/// whose repeats Lightsail itself would have dropped.
+///
+/// Whether an entry is a repeat is only known once it has been examined, so how
+/// many entries the list may carry is bounded HERE, before a single one is
+/// looked at: every validation and every de-dupe comparison below is then
+/// bounded by [`MAX_DOMAIN_NAME_LIST_ENTRIES`] rather than by what the caller
+/// sent.
+fn requested_alternative_domain_names(
+    member: &str,
+    primary: &str,
+    requested: Vec<String>,
+    max_covered: usize,
+) -> Result<Vec<String>, String> {
+    if requested.len() > MAX_DOMAIN_NAME_LIST_ENTRIES {
+        return Err(format!(
+            "{member} carries {} entries, more than the \
+             {MAX_DOMAIN_NAME_LIST_ENTRIES} this service reads for one certificate",
+            requested.len()
+        ));
+    }
+    for name in &requested {
+        validate_domain_name(name).map_err(|detail| {
+            format!(
+                "{member} entry '{name}' is not an alternative domain of this certificate: \
+                 {detail}"
+            )
+        })?;
+    }
+    let covered = alternative_domain_names(primary, requested);
+    if covered.len() > max_covered {
+        return Err(format!(
+            "{member} names {} alternative domains, more than the {max_covered} a \
+             certificate may have in addition to its primary domain",
+            covered.len()
+        ));
+    }
+    Ok(covered)
+}
+
 /// The alternative domains a load balancer's SSL/TLS certificate covers for the
 /// `certificateDomainName`/`certificateAlternativeNames` pair a request asked
 /// for, or the refusal message those members earned.
@@ -11041,11 +11091,11 @@ pub fn alternative_domain_names(primary: &str, requested: Vec<String>) -> Vec<St
 /// leaves rather than to a list whose repeats Lightsail itself would have
 /// dropped.
 ///
-/// Whether an entry is a repeat is only known once it has been examined, so how
-/// many entries the list may carry is bounded HERE, before a single one is
-/// looked at: every validation and every de-dupe comparison below is then
-/// bounded by [`MAX_DOMAIN_NAME_LIST_ENTRIES`] rather than by what the caller
-/// sent.
+/// The entry bound, the per-entry validation and the de-duping are
+/// [`requested_alternative_domain_names`]'s, the one owner of that rule for
+/// every certificate this store holds; what is this path's own is the member
+/// names the refusals have to carry and the maximum this certificate kind
+/// documents.
 pub fn load_balancer_certificate_alternative_names(
     domain_name: &str,
     requested: Vec<String>,
@@ -11056,31 +11106,12 @@ pub fn load_balancer_certificate_alternative_names(
              certificate: {detail}"
         )
     })?;
-    if requested.len() > MAX_DOMAIN_NAME_LIST_ENTRIES {
-        return Err(format!(
-            "certificateAlternativeNames carries {} entries, more than the \
-             {MAX_DOMAIN_NAME_LIST_ENTRIES} this service reads for one certificate",
-            requested.len()
-        ));
-    }
-    for name in &requested {
-        validate_domain_name(name).map_err(|detail| {
-            format!(
-                "certificateAlternativeNames entry '{name}' is not an alternative domain of \
-                 this certificate: {detail}"
-            )
-        })?;
-    }
-    let covered = alternative_domain_names(domain_name, requested);
-    if covered.len() > MAX_LOAD_BALANCER_TLS_CERTIFICATE_ALTERNATIVE_NAMES {
-        return Err(format!(
-            "certificateAlternativeNames names {} alternative domains, more than the \
-             {MAX_LOAD_BALANCER_TLS_CERTIFICATE_ALTERNATIVE_NAMES} a certificate may have in \
-             addition to its primary domain",
-            covered.len()
-        ));
-    }
-    Ok(covered)
+    requested_alternative_domain_names(
+        "certificateAlternativeNames",
+        domain_name,
+        requested,
+        MAX_LOAD_BALANCER_TLS_CERTIFICATE_ALTERNATIVE_NAMES,
+    )
 }
 
 /// The resource portion an ARN of a load balancer's SSL/TLS certificate carries
@@ -12082,6 +12113,31 @@ pub const CERTIFICATE_VALIDITY_MILLIS: i64 = 395 * 24 * 60 * 60 * 1_000;
 /// domain name)".
 pub const MAX_SUBJECT_ALTERNATIVE_NAMES: usize = 9;
 
+/// The alternate domains an account's SSL/TLS certificate covers for the
+/// `domainName`/`subjectAlternativeNames` pair a request asked for, or the
+/// refusal message that list earned.
+///
+/// The rule is [`requested_alternative_domain_names`]' — the one owner of it
+/// for every certificate this store holds — with this certificate kind's own
+/// member name and its own documented maximum: a name the list repeats, and a
+/// name that already IS the certificate's primary domain, add no domain to the
+/// certificate, so the documented maximum is applied to what the de-duping
+/// leaves and what is STORED is that reduced list.
+///
+/// The primary domain is validated by the caller, which has its own
+/// `domainName` refusal to answer with.
+pub fn certificate_subject_alternative_names(
+    domain_name: &str,
+    requested: Vec<String>,
+) -> Result<Vec<String>, String> {
+    requested_alternative_domain_names(
+        "subjectAlternativeNames",
+        domain_name,
+        requested,
+        MAX_SUBJECT_ALTERNATIVE_NAMES,
+    )
+}
+
 /// The most SSL/TLS certificates this emulator will hold.
 ///
 /// Emulator resource guard, NOT an AWS quota: a create that would exceed it is
@@ -12216,8 +12272,12 @@ pub struct StoredCertificate {
     pub tags: Vec<Tag>,
     /// The domain the certificate is for, kept as the request asked.
     pub domain_name: String,
-    /// The alternate domains and subdomains the certificate also covers, kept in
-    /// the order the request named them.
+    /// The alternate domains and subdomains the certificate also covers, as
+    /// [`alternative_domain_names`] reduced them — every writer of this field
+    /// goes through that one owner (see
+    /// [`certificate_subject_alternative_names`]), so a repeat and the primary
+    /// domain are never among them — in the order the request first named
+    /// them.
     pub subject_alternative_names: Vec<String>,
     pub serial_number: String,
     /// The current `CertificateStatus`.
@@ -12237,8 +12297,13 @@ impl StoredCertificate {
         self.status == CERTIFICATE_STATUS_ISSUED
     }
 
-    /// Every domain this certificate covers — the domain it is for, then each
-    /// alternate domain the request named that is not already in the list.
+    /// Every domain this certificate covers: the domain it is for, then each
+    /// alternate domain it also covers.
+    ///
+    /// The alternate domains went through [`alternative_domain_names`] before
+    /// they were stored, so none of them repeats and none of them is the
+    /// primary domain — this list is the set of domains the certificate secures
+    /// traffic for, with its primary domain first.
     ///
     /// This is what a distribution the certificate is attached to reports as its
     /// `alternativeDomainNames`: "After the certificate is attached, your
@@ -12246,11 +12311,7 @@ impl StoredCertificate {
     /// associated with the certificate."
     pub fn domain_names(&self) -> Vec<String> {
         let mut names = vec![self.domain_name.clone()];
-        for alternative in &self.subject_alternative_names {
-            if !names.iter().any(|name| name == alternative) {
-                names.push(alternative.clone());
-            }
-        }
+        names.extend(self.subject_alternative_names.iter().cloned());
         names
     }
 

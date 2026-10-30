@@ -61,6 +61,8 @@ mod bucket_object_data_plane;
 mod bucket_resource_access;
 #[path = "all/bundle_catalog.rs"]
 mod bundle_catalog;
+#[path = "all/certificate_alternate_domain_dedupe.rs"]
+mod certificate_alternate_domain_dedupe;
 #[path = "all/certificate_delete.rs"]
 mod certificate_delete;
 #[path = "all/certificate_in_use_resources.rs"]

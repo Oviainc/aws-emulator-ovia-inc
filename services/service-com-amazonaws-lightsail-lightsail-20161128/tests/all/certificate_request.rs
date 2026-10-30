@@ -9,8 +9,9 @@
 //! bypassed.
 //!
 //! The rule under test: `CreateCertificate` stores ONE certificate record per
-//! request — the name, the domain, the alternate domains and the tags the
-//! request named, kept verbatim — assigns every other member from that request
+//! request — the name, the domain and the tags the request named, kept
+//! verbatim, and the alternate domains it named as Lightsail de-dupes them
+//! (see `certificate_alternate_domain_dedupe.rs`) — assigns every other member from that request
 //! plus the store's own allocators (the ARN and the support code from the minted
 //! id, the serial number from that same id, the creation instant from the
 //! clock), reports it `PENDING_VALIDATION` until the issuance the clock owes it
@@ -250,12 +251,14 @@ struct Requested {
     case: &'static str,
     certificate_name: &'static str,
     domain_name: &'static str,
-    /// The alternate domains the request names, kept and reported verbatim.
+    /// The alternate domains the request names, as sent.
     subject_alternative_names: &'static [&'static str],
     tags: &'static [(&'static str, Option<&'static str>)],
     /// Every domain the certificate covers, in order: the domain it is for, then
     /// each alternate domain the request named that is not already covered. This
-    /// is what the certificate's domain-validation records are about.
+    /// is what the certificate's domain-validation records are about, and
+    /// everything past the first entry is what `subjectAlternativeNames`
+    /// reports.
     covered_domains: &'static [&'static str],
 }
 
@@ -314,8 +317,8 @@ const REQUESTED: &[Requested] = &[
     },
     Requested {
         // An alternate domain that repeats the primary one adds no domain to the
-        // certificate, so it is covered once — while the request's own list is
-        // still reported as the caller sent it.
+        // certificate, so it is covered once — and the stored list the read
+        // reports is the de-duped one.
         case: "an alternate domain that repeats the certificate's domain",
         certificate_name: "repeat-cert",
         domain_name: "apex.example.com",
@@ -390,11 +393,14 @@ async fn requesting_a_certificate_stores_the_record_every_later_read_reports() {
             Some(row.certificate_name),
             "case {case}: expected the detail to carry the same name, got {detail:?}"
         );
+        // The alternate domains the certificate covers are every domain it
+        // covers but its primary one: a repeat and the primary domain itself add
+        // no domain to the certificate.
         assert_string_list(
             case,
             "subjectAlternativeNames",
             &detail["subjectAlternativeNames"],
-            row.subject_alternative_names,
+            &row.covered_domains[1..],
         );
 
         // What the service assigns, each computed from the request plus the

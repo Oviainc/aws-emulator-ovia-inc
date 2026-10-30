@@ -186,7 +186,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // domains have to be domain names (which is also what refuses the
         // "wildcard domain entries (*.example.com)" the documentation says are
         // "not supported", because `*` is not a character a DNS label carries),
-        // the alternate domains have to be within the documented nine, the tags
+        // the alternate domains the de-duping LEAVES have to be within the
+        // documented nine, the tags
         // within their bound, and the name has to still be free. Every one of
         // those is checked BEFORE the first write, so a refused request creates
         // nothing.
@@ -200,23 +201,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let domain_name = input.domain_name;
         crate::state::validate_domain_name(&domain_name).map_err(invalid)?;
-        let subject_alternative_names = input.subject_alternative_names.unwrap_or_default();
-        if subject_alternative_names.len() > crate::state::MAX_SUBJECT_ALTERNATIVE_NAMES {
-            return Err(invalid(format!(
-                "subjectAlternativeNames carries {} entries, more than the {} alternate \
-                 domains a certificate may have",
-                subject_alternative_names.len(),
-                crate::state::MAX_SUBJECT_ALTERNATIVE_NAMES
-            )));
-        }
-        for alternative in &subject_alternative_names {
-            crate::state::validate_domain_name(alternative).map_err(|detail| {
-                invalid(format!(
-                    "subjectAlternativeNames entry '{alternative}' is not an alternate \
-                     domain of this certificate: {detail}"
-                ))
-            })?;
-        }
+        // "Lightsail will de-dupe the names for you": a name the list repeats,
+        // and a name that already IS this certificate's domain, add no domain to
+        // the certificate — so the documented maximum is applied to what the
+        // de-duping LEAVES and the reduced list is what is stored, through the
+        // crate's one owner of that rule, shared with the certificates a load
+        // balancer holds.
+        let subject_alternative_names = crate::state::certificate_subject_alternative_names(
+            &domain_name,
+            input.subject_alternative_names.unwrap_or_default(),
+        )
+        .map_err(invalid)?;
         let tags = input.tags.unwrap_or_default();
         if tags.len() > crate::state::MAX_TAGS {
             return Err(invalid(format!(
