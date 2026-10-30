@@ -316,38 +316,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
         let mut reports: Vec<ServiceLevelObjectiveBudgetReport> = Vec::new();
         let mut errors: Vec<ServiceLevelObjectiveBudgetReportError> = Vec::new();
-        // The resources already answered for, each by its ARN: the STORED record's ARN for
-        // an id that resolves, and the ARN the id denotes for one that does not. Keying on
-        // the resolved resource rather than on the raw id is what makes the answer
-        // independent of the order `SloIds` states the ids in — an id that resolves to
-        // nothing can never take the place of one that resolves.
-        let mut answered: ::std::collections::BTreeSet<String> =
-            ::std::collections::BTreeSet::new();
+        // The resources already answered for, each by the SLO NAME its id denotes
+        // ([`crate::state::slo_name_of`], the one id resolution of this crate): that name is
+        // the whole identity of an SLO here, so every id form the modelled
+        // `ServiceLevelObjectiveId` admits for one SLO — a bare name, or an ARN whatever its
+        // partition, region or account field renders — keys the same entry, whether or not a
+        // record of that name is stored.
+        let mut answered: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
 
         let store = state.lock();
         for id in &input.slo_ids {
             // Either id form the modelled `ServiceLevelObjectiveId` admits resolves to one
             // record, so a request naming the same SLO by name AND by ARN names it once and
             // is answered with one report for it.
+            if !answered.insert(crate::state::slo_name_of(id)) {
+                continue;
+            }
             match store.resolve(id) {
-                Some(slo) => {
-                    if answered.insert(slo.arn.clone()) {
-                        reports.push(budget_report(slo, &input.timestamp, &now));
-                    }
-                }
+                Some(slo) => reports.push(budget_report(slo, &input.timestamp, &now)),
                 None => {
                     // The SLO is identified exactly as the not-found exception identifies
                     // it: by the name the id denotes and the ARN it would carry in this
                     // region, since there is no stored record to read an ARN off.
-                    let arn = crate::state::slo_arn_of(&region, id);
-                    if answered.insert(arn.clone()) {
-                        errors.push(ServiceLevelObjectiveBudgetReportError {
-                            name: crate::state::slo_name_of(id).to_string(),
-                            arn,
-                            error_code: NOT_FOUND_ERROR_CODE.to_string(),
-                            error_message: crate::state::slo_not_found(&region, id).message,
-                        });
-                    }
+                    errors.push(ServiceLevelObjectiveBudgetReportError {
+                        name: crate::state::slo_name_of(id).to_string(),
+                        arn: crate::state::slo_arn_of(&region, id),
+                        error_code: NOT_FOUND_ERROR_CODE.to_string(),
+                        error_message: crate::state::slo_not_found(&region, id).message,
+                    });
                 }
             }
         }

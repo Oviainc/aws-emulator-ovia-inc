@@ -105,6 +105,8 @@ mod sli_metric_type;
 mod slo_evaluation_kind;
 #[path = "all/slo_goal_retention.rs"]
 mod slo_goal_retention;
+#[path = "all/slo_id_spelling_identity.rs"]
+mod slo_id_spelling_identity;
 #[path = "all/slo_indicator_required.rs"]
 mod slo_indicator_required;
 #[path = "all/slo_lifecycle.rs"]

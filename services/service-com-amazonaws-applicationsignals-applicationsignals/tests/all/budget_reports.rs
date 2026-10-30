@@ -27,7 +27,7 @@ use crate::slo_lifecycle::{call, create, name_path_segment, router, sli_config, 
 
 /// The `ErrorCode` an id that names no stored SLO earns: the name of the exception a
 /// single-SLO read of the same id is refused with.
-const NOT_FOUND_ERROR_CODE: &str = "ResourceNotFoundException";
+pub(crate) const NOT_FOUND_ERROR_CODE: &str = "ResourceNotFoundException";
 
 /// The modelled `ServiceLevelObjectiveBudgetStatus` values this emulator can report
 /// (`smithy_query(shape="ServiceLevelObjectiveBudgetStatus")` -> `["OK", "WARNING",
@@ -65,7 +65,7 @@ fn slo_arn(name: &str) -> String {
 }
 
 /// Epoch seconds now, the instant a freshly created SLO is created at.
-fn now_seconds() -> i64 {
+pub(crate) fn now_seconds() -> i64 {
     i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -77,7 +77,7 @@ fn now_seconds() -> i64 {
 
 /// One `BatchGetServiceLevelObjectiveBudgetReport` call. `Timestamp` is an epoch-seconds
 /// `Timestamp` on `restJson1`.
-async fn budget_report(
+pub(crate) async fn budget_report(
     router: &MultiServiceRouter,
     slo_ids: &[String],
     timestamp: i64,
