@@ -197,11 +197,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // identity it names — and an ARN naming no identity of this account in
         // this Region names nothing to set a topic on.
         let identity = crate::state::resolve_identity(&input.identity, &region)
-            .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?
-            .to_string();
+            .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
+        // The identity as the REQUEST named it, which is what the refusal below
+        // reports: the key above is what the list is looked up by.
+        let named = crate::state::named_identity(&input.identity).to_string();
         let Some(record) = state.identities.get_mut(&identity) else {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                format!("Identity {identity} is not verified"),
+                format!("Identity {named} is not verified"),
             ));
         };
         record

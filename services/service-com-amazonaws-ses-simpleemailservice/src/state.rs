@@ -1156,9 +1156,13 @@ pub struct CustomVerificationEmailTemplate {
 /// Per-service state for com-amazonaws-ses-simpleemailservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSesSimpleemailserviceState {
-    /// The identity list, keyed by the identity string. A `BTreeMap` so every
-    /// listing is in one stable (lexicographic) order, which is what makes
-    /// `ListIdentities`' pagination resumable. Bounded at [`MAX_IDENTITIES`].
+    /// The identity list, keyed by [`identity_key`] — the key the ACCOUNT's
+    /// identity registry compares identities by, so one identity of the account is
+    /// one entry here however a request spelled the DNS name in it. The spelling it
+    /// was recorded with is [`Identity::name`], which is the value every listing and
+    /// report answers with. A `BTreeMap` so every listing is in one stable
+    /// (lexicographic) order, which is what makes `ListIdentities`' pagination
+    /// resumable. Bounded at [`MAX_IDENTITIES`].
     pub identities: BTreeMap<String, Identity>,
     /// The send log, oldest first. Appended through
     /// [`Self::log_sent_message`], which is where its bounds are applied.
@@ -1242,14 +1246,15 @@ impl ComAmazonawsSesSimpleemailserviceState {
         name: &str,
         identity_type: IdentityType,
     ) -> Option<&Identity> {
-        let is_new = !self.identities.contains_key(name);
+        let key = identity_key(name);
+        let is_new = !self.identities.contains_key(&key);
         if is_new && self.identities.len() >= MAX_IDENTITIES {
             return None;
         }
         let requested_at = SystemTime::now();
         Some(
             self.identities
-                .entry(name.to_string())
+                .entry(key)
                 .or_insert_with(|| Identity {
                     name: name.to_string(),
                     identity_type,
@@ -1310,9 +1315,10 @@ impl ComAmazonawsSesSimpleemailserviceState {
         held: Option<EasyDkimSettings>,
     ) -> Option<Vec<String>> {
         self.verify_identity(domain, IdentityType::Domain)?;
+        let key = identity_key(domain);
         if let Some(stored) = self
             .identities
-            .get(domain)
+            .get(&key)
             .and_then(|identity| identity.dkim.as_ref())
         {
             return Some(stored.tokens.clone());
@@ -1329,7 +1335,7 @@ impl ComAmazonawsSesSimpleemailserviceState {
             ),
         };
         let tokens = setup.tokens.clone();
-        let identity = self.identities.get_mut(domain)?;
+        let identity = self.identities.get_mut(&key)?;
         identity.dkim = Some(setup);
         Some(tokens)
     }
@@ -1348,17 +1354,23 @@ impl ComAmazonawsSesSimpleemailserviceState {
         let key = identity_key(identity);
         if let Some(own) = self
             .identities
-            .get(key)
+            .get(&key)
             .and_then(|stored| stored.dkim.as_ref())
         {
             return Some(own);
         }
         let (_, domain) = key.split_once('@')?;
-        domain_suffixes(domain).find_map(|suffix| {
-            self.identities
+        // Finished inside the body: the local `key` has to outlive the walk.
+        for suffix in domain_suffixes(domain) {
+            if let Some(covering) = self
+                .identities
                 .get(suffix)
                 .and_then(|stored| stored.dkim.as_ref())
-        })
+            {
+                return Some(covering);
+            }
+        }
+        None
     }
 
     /// Record `template` under its own name, replacing any template already
@@ -1442,8 +1454,20 @@ impl ComAmazonawsSesSimpleemailserviceState {
     /// is not one of them: the caller settles the store first
     /// ([`Self::settle_identities`]), so what this reads is the verification the
     /// clock has carried through.
+    ///
+    /// The address is keyed ONCE ([`identity_key`]) and every name walked from that
+    /// key, so a domain the identity was recorded with in another case covers the
+    /// sender all the same — which is how DNS compares a domain name.
     pub fn is_verified_sender(&self, address: &str) -> bool {
-        sender_identity_names(address).any(|name| self.is_verified(name))
+        let key = identity_key(address);
+        // Finished inside the body: the walk borrows the local `key`, which has to
+        // outlive the iterator over it.
+        for name in sender_identity_keys(&key) {
+            if self.holds_verified_key(name) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether this account HOLDS an identity for `address` — the addr-spec
@@ -1455,10 +1479,17 @@ impl ComAmazonawsSesSimpleemailserviceState {
     /// while whether the address is ELIGIBLE TO SEND is
     /// [`Self::is_verified_sender`] — which is what every operation that gates on
     /// a sender reads. Both readings walk the same names
-    /// ([`sender_identity_names`]), so an identity for a domain covers the
-    /// mailboxes in it and in its subdomains here too.
+    /// ([`sender_identity_keys`]), so an identity for a domain covers the
+    /// mailboxes in it and in its subdomains here too, and both compare a domain
+    /// the way DNS does.
     pub fn holds_sending_identity(&self, address: &str) -> bool {
-        sender_identity_names(address).any(|name| self.identities.contains_key(name))
+        let key = identity_key(address);
+        for name in sender_identity_keys(&key) {
+            if self.identities.contains_key(name) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether `domain` is itself a verified domain identity, or sits under one.
@@ -1467,7 +1498,26 @@ impl ComAmazonawsSesSimpleemailserviceState {
     /// [`Self::is_verified_sender`] applies to a sender's domain; it is what lets
     /// a custom tracking subdomain of a verified domain be used.
     pub fn covers_verified_domain(&self, domain: &str) -> bool {
-        domain_suffixes(domain).any(|suffix| self.is_verified(suffix))
+        let key = identity_key(domain);
+        // Finished inside the body: the local `key` has to outlive the walk.
+        for suffix in domain_suffixes(&key) {
+            if self.holds_verified_key(suffix) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether the identity list holds `key` — already an identity KEY — with a
+    /// successful verification.
+    ///
+    /// The one lookup behind [`Self::is_verified`] and the sender readings above,
+    /// so a caller that has keyed its value once is not made to key it again per
+    /// candidate name.
+    fn holds_verified_key(&self, key: &str) -> bool {
+        self.identities
+            .get(key)
+            .is_some_and(|identity| identity.verification_status == VerificationStatus::Success)
     }
 
     /// The sending-authorization policies attached to `identity`, or `None` when
@@ -1484,7 +1534,7 @@ impl ComAmazonawsSesSimpleemailserviceState {
     /// their own documentation states.
     pub fn identity_policies(&self, identity: &str) -> Option<&BTreeMap<String, String>> {
         self.identities
-            .get(identity_key(identity))
+            .get(&identity_key(identity))
             .map(|stored| &stored.policies)
     }
 
@@ -1495,18 +1545,19 @@ impl ComAmazonawsSesSimpleemailserviceState {
         identity: &str,
     ) -> Option<&mut BTreeMap<String, String>> {
         self.identities
-            .get_mut(identity_key(identity))
+            .get_mut(&identity_key(identity))
             .map(|stored| &mut stored.policies)
     }
 
     /// Whether `name` is in the identity list with a successful verification.
     ///
     /// The STORED status, which the caller has already settled against the clock
-    /// ([`Self::settle_identities`]).
+    /// ([`Self::settle_identities`]). The name is keyed the way the list is
+    /// ([`identity_key`]), so a domain cased unlike the one the identity was
+    /// recorded with names the same identity — which is how DNS compares a domain
+    /// name.
     pub fn is_verified(&self, name: &str) -> bool {
-        self.identities
-            .get(name)
-            .is_some_and(|identity| identity.verification_status == VerificationStatus::Success)
+        self.holds_verified_key(&identity_key(name))
     }
 
     /// The custom redirect domain a tracking-options request may be stored with,
@@ -1995,13 +2046,26 @@ fn identity_named_by_arn(value: &str) -> Option<&str> {
 /// way the value is keyed by its addr-spec, the way the writers key it
 /// ([`addr_spec`]).
 ///
-/// The SPELLING is kept: this table is keyed by the value an identity was recorded
-/// with, and that is the value `ListIdentities` reports. The account's identity
-/// registry compares the domain part the way DNS does
-/// (`service_common::ses_identities::identity_key`), so two records here that differ
-/// only in the case of their domain are one identity of the ACCOUNT — the registry
-/// holds it once, under the spelling it was first recorded with.
-pub fn identity_key(value: &str) -> &str {
+/// The DOMAIN part is compared the way DNS compares a name, so `Example.COM` and
+/// `example.com` name ONE identity of this account: the keying is the account identity
+/// registry's own (`service_common::ses_identities::identity_key`), so a record of this
+/// surface and the account's record of the same identity cannot be reached under two
+/// different keys. The spelling a request used is kept on the record itself
+/// ([`Identity::name`]), which is the value `ListIdentities` and every per-identity
+/// report answer with.
+pub fn identity_key(value: &str) -> String {
+    ::service_common::ses_identities::identity_key(named_identity(value))
+}
+
+/// The identity a request's value NAMES, in the SPELLING the request used: the
+/// value itself for a plain identity, and the identity an identity ARN addresses
+/// for an ARN ([`identity_named_by_arn`]).
+///
+/// What a message about the request reports, as against [`identity_key`], which is
+/// what the identity list is keyed by: a refusal names the identity the caller
+/// asked about, so its variable part comes from the request rather than from the
+/// normalisation the lookup applies.
+pub fn named_identity(value: &str) -> &str {
     let trimmed = value.trim();
     identity_named_by_arn(trimmed).unwrap_or_else(|| addr_spec(trimmed))
 }
@@ -2024,9 +2088,14 @@ fn domain_suffixes(domain: &str) -> impl Iterator<Item = &str> {
         .map(move |start| &domain[start..])
 }
 
-/// Every name an identity of this account could carry that would cover
-/// `address` as a sender: the addr-spec itself, then each domain suffix of its
-/// domain, longest first ([`domain_suffixes`]).
+/// Every identity KEY of this account that would cover a sender, given that
+/// sender's own key: the key itself, then each domain suffix of its domain,
+/// longest first ([`domain_suffixes`]).
+///
+/// `key` is already an identity key ([`identity_key`]), so every name walked from
+/// it is one too — which is what lets a caller key its value ONCE and compare a
+/// domain the way DNS compares one at every step of the walk, rather than keying
+/// each candidate name again.
 ///
 /// The ONE walk both readings of a sender use —
 /// [`ComAmazonawsSesSimpleemailserviceState::is_verified_sender`], which asks
@@ -2034,10 +2103,9 @@ fn domain_suffixes(domain: &str) -> impl Iterator<Item = &str> {
 /// [`ComAmazonawsSesSimpleemailserviceState::holds_sending_identity`], which
 /// asks only whether the list holds it — so the two cannot drift apart over
 /// which names cover an address.
-fn sender_identity_names(address: &str) -> impl Iterator<Item = &str> {
-    let addr = addr_spec(address);
-    let domain = addr.split_once('@').map(|(_, domain)| domain);
-    std::iter::once(addr).chain(domain.into_iter().flat_map(domain_suffixes))
+fn sender_identity_keys(key: &str) -> impl Iterator<Item = &str> {
+    let domain = key.split_once('@').map(|(_, domain)| domain);
+    std::iter::once(key).chain(domain.into_iter().flat_map(domain_suffixes))
 }
 
 /// Whether `value` is an email address in the form SES requires.
@@ -2666,7 +2734,7 @@ pub fn check_event_destination(
 /// [`identity_key`] keys it.
 ///
 /// `Err` carries the reason, for a caller that refuses the request with it.
-pub fn resolve_identity<'value>(value: &'value str, region: &str) -> Result<&'value str, String> {
+pub fn resolve_identity(value: &str, region: &str) -> Result<String, String> {
     let trimmed = value.trim();
     // A value that is not an ARN at all is the identity's own name.
     if ::service_common::arn::parse(trimmed).is_none() {
@@ -2675,7 +2743,7 @@ pub fn resolve_identity<'value>(value: &'value str, region: &str) -> Result<&'va
     match identity_named_by_arn(trimmed)
         .filter(|_| names_a_resource_here(trimmed, SES_ARN_VENDOR, region))
     {
-        Some(name) => Ok(name),
+        Some(name) => Ok(::service_common::ses_identities::identity_key(name)),
         None => Err(format!(
             "Invalid Identity {trimmed:?}: an identity ARN must name an identity of account {} \
              in {region}",
@@ -2973,7 +3041,7 @@ pub fn record_identity<Eng: Send + Sync + 'static>(
     let mut registry = registry.lock();
     let recorded = state.verify_identity(name, identity_type)?.clone();
     let published = registry.publish(registry_record(&recorded))?.clone();
-    let held = state.identities.get_mut(identity_key(&recorded.name))?;
+    let held = state.identities.get_mut(&identity_key(&recorded.name))?;
     held.registered = true;
     held.verification_token = published.verification_token;
     Some(held.clone())
@@ -3013,9 +3081,10 @@ pub fn record_easy_dkim<Eng: Send + Sync + 'static>(
             status: service_status(shared.status),
         });
     let tokens = state.request_easy_dkim(domain, held)?;
-    let recorded = state.identities.get(identity_key(domain))?.clone();
+    let key = identity_key(domain);
+    let recorded = state.identities.get(&key)?.clone();
     let published = registry.publish(registry_record(&recorded))?.clone();
-    let held = state.identities.get_mut(identity_key(domain))?;
+    let held = state.identities.get_mut(&key)?;
     held.registered = true;
     held.verification_token = published.verification_token;
     Some(tokens)
@@ -3035,7 +3104,7 @@ pub fn forget_identity<Eng: Send + Sync + 'static>(engine: &Eng, name: &str) {
     };
     let mut state = state.lock();
     let mut registry = registry.lock();
-    state.identities.remove(identity_key(name));
+    state.identities.remove(&identity_key(name));
     registry.forget(name);
 }
 
@@ -3059,7 +3128,7 @@ pub fn publish_identity<Eng: Send + Sync + 'static>(engine: &Eng, name: &str) {
     // The lock order of this service: its own store, then the registry.
     let state = state.lock();
     let mut registry = registry.lock();
-    let Some(held) = state.identities.get(identity_key(name)) else {
+    let Some(held) = state.identities.get(&identity_key(name)) else {
         return;
     };
     registry.publish(registry_record(held));
@@ -3103,10 +3172,11 @@ fn reconcile_identities(
 }
 
 impl ::service_common::ses_identities::AccountIdentityRecord for Identity {
-    /// This service's table is keyed by the identity's addr-spec, the way its own
-    /// operations look one up ([`identity_key`]).
+    /// This service's table is keyed by [`identity_key`] — the account identity
+    /// registry's key, which is the addr-spec with the domain part compared the way
+    /// DNS compares a name — the way its own operations look one up.
     fn table_key(name: &str) -> String {
-        identity_key(name).to_string()
+        identity_key(name)
     }
 
     fn identity_name(&self) -> &str {

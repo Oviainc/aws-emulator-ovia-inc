@@ -185,11 +185,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // key it (the ARN form the member documents resolved to the identity it
         // names, in this account and this Region).
         let identity = crate::state::resolve_identity(&input.identity, &region)
-            .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?
-            .to_string();
+            .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
+        // The identity as the REQUEST named it, which is what the refusal below
+        // reports: the key above is what the list is looked up by.
+        let named = crate::state::named_identity(&input.identity).to_string();
         let Some(record) = state.identities.get_mut(&identity) else {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                format!("Identity {identity} is not verified"),
+                format!("Identity {named} is not verified"),
             ));
         };
 

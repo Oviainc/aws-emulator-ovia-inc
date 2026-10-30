@@ -150,11 +150,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // writers key it (the ARN form the member documents resolved to the
         // identity it names, in this account and this Region).
         let identity = crate::state::resolve_identity(&input.identity, &region)
-            .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?
-            .to_string();
+            .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
+        // The identity as the REQUEST named it, which is what a refusal below
+        // reports: the key above is what the list is looked up by.
+        let named = crate::state::named_identity(&input.identity).to_string();
         let Some(record) = state.identities.get_mut(&identity) else {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                format!("Identity {identity} is not verified"),
+                format!("Identity {named} is not verified"),
             ));
         };
 
@@ -167,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
                 format!(
                     "ForwardingEnabled can only be set to false when Amazon SNS topics are set \
-                     for both Bounce and Complaint notification types; {identity} has no topic \
+                     for both Bounce and Complaint notification types; {named} has no topic \
                      for both of them"
                 ),
             ));

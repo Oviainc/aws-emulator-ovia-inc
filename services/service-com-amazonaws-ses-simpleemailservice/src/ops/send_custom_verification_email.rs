@@ -330,7 +330,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .publish(crate::state::registry_record(&recorded))
                 .cloned();
             if let Some(published) = published {
-                if let Some(held) = state.identities.get_mut(&address) {
+                if let Some(held) = state
+                    .identities
+                    .get_mut(&crate::state::identity_key(&address))
+                {
                     held.registered = true;
                     held.verification_token = published.verification_token;
                 }

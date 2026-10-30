@@ -173,7 +173,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Ok(key) = crate::state::resolve_identity(requested, &region) else {
                 continue;
             };
-            let key = key.to_string();
             let Some(identity) = state.identities.get_mut(&key) else {
                 continue;
             };

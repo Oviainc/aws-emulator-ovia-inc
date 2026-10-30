@@ -171,10 +171,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // invented status.
         let mut dkim_attributes = std::collections::HashMap::new();
         for requested in &input.identities {
-            // Normalised the same way the writers normalise: an identity is
-            // keyed by its addr-spec, so it reads back under the value it was
-            // verified with (`addr_spec` leaves a domain unchanged).
-            let Some(identity) = state.identities.get(crate::state::addr_spec(requested)) else {
+            // Keyed the way the identity list keys an identity
+            // (`crate::state::identity_key`), so a value is read back under the
+            // identity it names however the request spelled its domain: a domain is
+            // a DNS name, which is compared without regard to case.
+            let Some(identity) = state
+                .identities
+                .get(&crate::state::identity_key(requested))
+            else {
                 continue;
             };
             let name = identity.name.clone();

@@ -150,14 +150,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // writers key it, which is how every `SetIdentity*` operation of this
         // service reads its `Identity`.
         let identity = crate::state::resolve_identity(&input.identity, &region)
-            .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?
-            .to_string();
+            .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
+        // The identity as the REQUEST named it, which is what a refusal below
+        // reports: the key above is what the list is looked up by.
+        let named = crate::state::named_identity(&input.identity).to_string();
         // Whether an Easy DKIM setup covers the identity, read before the record
         // is taken mutably below.
         let covered_by_easy_dkim = state.easy_dkim_for(&identity).is_some();
         let Some(record) = state.identities.get_mut(&identity) else {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                format!("Identity {identity} is not verified"),
+                format!("Identity {named} is not verified"),
             ));
         };
 
@@ -171,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
                 format!(
                     "DkimEnabled can only be set to true for an identity that has been set up to \
-                     use Easy DKIM; {identity} has no Easy DKIM tokens"
+                     use Easy DKIM; {named} has no Easy DKIM tokens"
                 ),
             ));
         }

@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Ok(key) = crate::state::resolve_identity(requested, &region) else {
                 continue;
             };
-            let Some(identity) = state.identities.get(key) else {
+            let Some(identity) = state.identities.get(&key) else {
                 continue;
             };
             let notifications = &identity.notifications;

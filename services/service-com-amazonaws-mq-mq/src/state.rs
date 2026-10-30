@@ -1033,3 +1033,54 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsMqMqState>)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The page a client-supplied offset selects is always INSIDE the collection it
+    /// pages, whatever integer the offset carries: a `nextToken` carries an offset a
+    /// caller chose, so a page past the end is the empty last page — and the accessor
+    /// every listing of this service pages through ([`page_slice`]) answers no items
+    /// for it rather than indexing past the end.
+    #[test]
+    fn a_page_offset_past_the_end_selects_the_empty_last_page() {
+        // (case, how many items are stored, the offset the token carried, the items
+        // the page selects out of `0..total`)
+        let rows: [(&str, usize, usize, &[usize]); 8] = [
+            ("an empty store at the start", 0, 0, &[]),
+            ("an empty store one past the end", 0, 1, &[]),
+            ("an empty store at the largest offset", 0, usize::MAX, &[]),
+            ("a populated store at the start", 3, 0, &[0, 1, 2]),
+            ("a populated store inside the collection", 3, 1, &[1, 2]),
+            ("a populated store exactly at the end", 3, 3, &[]),
+            ("a populated store one past the end", 3, 4, &[]),
+            ("a populated store at the largest offset", 3, usize::MAX, &[]),
+        ];
+
+        for (case, total, offset, expected) in rows {
+            let page = page_of(total, Some(MAX_MAX_RESULTS), offset);
+            assert!(
+                page.start <= page.end && page.end <= total,
+                "case {case:?}: expected a range inside 0..={total}, got \
+                 {}..{}",
+                page.start,
+                page.end
+            );
+            let items: Vec<usize> = (0..total).collect();
+            let selected = page_slice(&items, &page);
+            assert_eq!(
+                selected, expected,
+                "case {case:?}: expected the items {expected:?}, got {selected:?}"
+            );
+            // A page that carries everything left, and one past the end, are both
+            // the LAST page: a paginating client that followed this token stops.
+            if page.end == total {
+                assert!(
+                    page.next_token.is_none(),
+                    "case {case:?}: expected no nextToken on the last page, got {page:?}"
+                );
+            }
+        }
+    }
+}
