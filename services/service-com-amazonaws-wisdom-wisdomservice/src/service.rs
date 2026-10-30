@@ -51,12 +51,14 @@
 //! - [`Service::can_handle`] also claims a request to an upload path naming an upload
 //!   THIS store holds, so following the URL routes back here even when nothing else in
 //!   the request names a service (an upload URL is followed WITHOUT a signature, as a
-//!   presigned URL is, and a loopback endpoint host names no service at all).//! - [`Service::override_routing_error`] serves it: that seam is reached BEFORE
+//!   presigned URL is, and a loopback endpoint host names no service at all).
+//! - [`Service::override_routing_error`] serves it: that seam is reached BEFORE
 //!   authentication precisely for requests that name no modelled operation, which is
 //!   what makes an unsigned `PUT` to a minted URL work.
 //!
-//! The plane writes ONLY the upload the URL names — the bytes, bounded by
-//! `crate::state::MAX_CONTENT_UPLOAD_BYTES` — and refuses a `PUT` that is late (the
+//! The plane writes ONLY the upload the URL names — the bytes, bounded both per body
+//! (`crate::state::MAX_CONTENT_UPLOAD_BYTES`) and across every written body this store
+//! holds (`crate::state::MAX_PENDING_UPLOAD_BYTES`) — and refuses a `PUT` that is late (the
 //! URL's `urlExpiry` has passed) or that does not carry the headers the start call
 //! published. Nothing else about the service is reachable through it.
 
@@ -290,11 +292,25 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         if body.len() > crate::state::MAX_CONTENT_UPLOAD_BYTES {
             return upload_error(413, "EntityTooLarge", UPLOAD_TOO_LARGE_MESSAGE);
         }
+        // The written bodies this store holds are bounded in AGGREGATE as well as one by
+        // one (`crate::state::MAX_PENDING_UPLOAD_BYTES`), so a caller that opens many
+        // uploads cannot hold the product of the two ceilings in this process's heap. A
+        // write there is no room for stores nothing: the slot keeps the body it had, and
+        // each outcome keeps its own answer.
+        match store.write_content_upload_body(&target.upload_id, body.to_vec()) {
+            crate::state::UploadWrite::Written => {}
+            crate::state::UploadWrite::NoRoom => {
+                return upload_error(413, "EntityTooLarge", UPLOAD_STORE_FULL_MESSAGE);
+            }
+            crate::state::UploadWrite::NoSuchUpload => {
+                // Unreachable: the lookups above found it while this lock is held.
+                return upload_error(404, "NoSuchUpload", UPLOAD_NOT_FOUND_MESSAGE);
+            }
+        }
         let Some(upload) = store.content_upload_mut(&target.upload_id) else {
             // Unreachable: the lookups above found it while this lock is held.
             return upload_error(404, "NoSuchUpload", UPLOAD_NOT_FOUND_MESSAGE);
         };
-        upload.body = Some(body.to_vec());
         upload.received_at = Some(now);
 
         let mut resp = RtResponse::new(
@@ -538,6 +554,14 @@ const UPLOAD_HEADERS_MESSAGE: &str =
 /// The body of an upload-plane refusal of a body larger than this emulator stores
 /// (`crate::state::MAX_CONTENT_UPLOAD_BYTES`).
 const UPLOAD_TOO_LARGE_MESSAGE: &str = "The upload is larger than this endpoint accepts";
+
+/// The body of an upload-plane refusal of a write the store has no room for: the written
+/// bodies it holds are bounded in aggregate as well as one by one
+/// (`crate::state::MAX_PENDING_UPLOAD_BYTES`). It names no figure of the store and
+/// carries nothing from the request, and it says what the caller can do about it.
+const UPLOAD_STORE_FULL_MESSAGE: &str =
+    "This endpoint is holding as many written upload bytes as it accepts; retry once an \
+     upload has been consumed or has expired";
 
 /// One upload-plane error response: the status, the code in `x-amzn-errortype`, and a
 /// JSON body carrying the reason.

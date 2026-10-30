@@ -51,6 +51,12 @@ use super::resource_tags::{
 const TAG_KEY_MAX: usize = 128;
 const TAG_VALUE_MAX: usize = 256;
 
+/// The status a tagging mutation of this endpoint answers a success with: its response
+/// structure declares no members, so there is no content to send. Written out here
+/// rather than imported from the implementation, so the assertion pins the status line a
+/// client sees.
+const NO_CONTENT: u16 = 204;
+
 /// `TagResource` on one resource ARN with one tag map.
 async fn tag_resource(
     emulator: &Emulator,
@@ -218,9 +224,9 @@ async fn tag_resource_merges_the_request_into_the_tags_stored_on_the_resource() 
 
             let tagged = tag_resource(&emulator, &arn, &case.merge).await;
             assert_eq!(
-                tagged.status, 200,
-                "case {:?} ({family:?}): expected TagResource to answer HTTP 200 for \
-                 {arn}, got {} with {}",
+                tagged.status, NO_CONTENT,
+                "case {:?} ({family:?}): expected TagResource to answer HTTP \
+                 {NO_CONTENT} for {arn}, got {} with {}",
                 case.label, tagged.status, tagged.body
             );
             assert!(
@@ -242,9 +248,9 @@ async fn tag_resource_merges_the_request_into_the_tags_stored_on_the_resource() 
             // `@idempotent`: merging the same pairs again leaves the same set.
             let repeated = tag_resource(&emulator, &arn, &case.merge).await;
             assert_eq!(
-                repeated.status, 200,
-                "case {:?} ({family:?}): expected a repeated merge to answer HTTP 200, \
-                 got {} with {}",
+                repeated.status, NO_CONTENT,
+                "case {:?} ({family:?}): expected a repeated merge to answer HTTP \
+                 {NO_CONTENT}, got {} with {}",
                 case.label, repeated.status, repeated.body
             );
             let after_repeat = stored_tags(&emulator, case.label, &arn).await;
@@ -348,8 +354,8 @@ async fn a_merge_past_the_tag_ceiling_is_refused_and_stores_nothing() {
         let case = format!("re-valuing a stored key ({family:?})");
         let revalued = tag_resource(&emulator, &arn, &pairs(&[("key-0", "revalued")])).await;
         assert_eq!(
-            revalued.status, 200,
-            "case {case:?}: expected HTTP 200, got {} with {}",
+            revalued.status, NO_CONTENT,
+            "case {case:?}: expected HTTP {NO_CONTENT}, got {} with {}",
             revalued.status, revalued.body
         );
         let mut expected = held.clone();
@@ -364,8 +370,8 @@ async fn a_merge_past_the_tag_ceiling_is_refused_and_stores_nothing() {
         let case = format!("the key that reaches the ceiling ({family:?})");
         let accepted = tag_resource(&emulator, &arn, &pairs(&[("last-slot", "taken")])).await;
         assert_eq!(
-            accepted.status, 200,
-            "case {case:?}: expected HTTP 200, got {} with {}",
+            accepted.status, NO_CONTENT,
+            "case {case:?}: expected HTTP {NO_CONTENT}, got {} with {}",
             accepted.status, accepted.body
         );
         expected.insert("last-slot".to_string(), "taken".to_string());
@@ -390,8 +396,8 @@ async fn a_merge_past_the_tag_ceiling_is_refused_and_stores_nothing() {
         let case = format!("re-valuing at the ceiling ({family:?})");
         let revalued = tag_resource(&emulator, &arn, &pairs(&[("last-slot", "again")])).await;
         assert_eq!(
-            revalued.status, 200,
-            "case {case:?}: expected HTTP 200, got {} with {}",
+            revalued.status, NO_CONTENT,
+            "case {case:?}: expected HTTP {NO_CONTENT}, got {} with {}",
             revalued.status, revalued.body
         );
         expected.insert("last-slot".to_string(), "again".to_string());
@@ -429,8 +435,8 @@ async fn a_merge_past_the_tag_ceiling_is_refused_and_stores_nothing() {
         let stored = stored_tags(&emulator, label_text, &arn).await;
         if accepted {
             assert_eq!(
-                reply.status, 200,
-                "case {label_text:?}: expected HTTP 200, got {} with {}",
+                reply.status, NO_CONTENT,
+                "case {label_text:?}: expected HTTP {NO_CONTENT}, got {} with {}",
                 reply.status, reply.body
             );
             assert_eq!(

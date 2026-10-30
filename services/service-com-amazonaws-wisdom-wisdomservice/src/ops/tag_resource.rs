@@ -153,7 +153,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    /// `TagResourceResponse` declares no members, so a successful tag application has
+    /// nothing to send and is answered with the no-content status, as every other
+    /// member-less response of this endpoint is. The model states no `@http` code for this
+    /// operation (`smithy_query(query="operation",operation="TagResource")` reports
+    /// `code: 200, codeDefaulted: true`), so the protocol default — which assumes a
+    /// document follows — is what has to be corrected here; the operations whose model
+    /// DOES state a code keep the stated one.
+    const SUCCESS_STATUS: u16 = crate::state::EMPTY_RESPONSE_SUCCESS_STATUS;
 
     async fn handle(
         &self,

@@ -457,8 +457,9 @@ async fn the_tagging_surface_words_an_arn_it_cannot_resolve_one_way() {
     );
     let tagged = tag_resource(&emulator, &assistant_arn).await;
     assert_eq!(
-        tagged.status, 200,
-        "case \"tagging the resource this account holds\": expected HTTP 200, got {} with {}",
+        tagged.status, 204,
+        "case \"tagging the resource this account holds\": expected the no-content HTTP 204, \
+         got {} with {}",
         tagged.status, tagged.body
     );
     let listed = emulator.list_tags(&assistant_arn).await;

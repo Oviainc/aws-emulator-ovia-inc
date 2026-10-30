@@ -47,3 +47,5 @@ mod session_recommendations;
 mod state_roundtrip;
 #[path = "all/tag_resource.rs"]
 mod tag_resource;
+#[path = "all/tagging_no_content_status.rs"]
+mod tagging_no_content_status;

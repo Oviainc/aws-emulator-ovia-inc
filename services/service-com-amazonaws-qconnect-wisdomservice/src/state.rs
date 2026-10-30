@@ -130,6 +130,19 @@ pub fn message_too_many_tags() -> String {
     format!("The resultant tag set must not have more than {MAX_TAGS_PER_RESOURCE} user tags.")
 }
 
+/// The success status an operation of this endpoint whose output structure declares NO
+/// members answers with: 204 No Content, with no document in the body.
+///
+/// Every member-less response of this endpoint is answered this way. Most of them say so
+/// in the model — the deletes and the removes carry an explicit `@http` code
+/// (`smithy_query(query="operation",operation="DeleteAssistant")`: `code: 204`), and an
+/// operation whose model states a code keeps the stated one (the AI-guardrail deletes
+/// state 202, which this constant is not used for). The two tagging mutations carry no
+/// `@http` code at all, so they would otherwise fall back to the protocol default 200,
+/// which tells a client a document follows where none does; they use this constant
+/// instead (`crate::ops::tag_resource`, `crate::ops::untag_resource`).
+pub const EMPTY_RESPONSE_SUCCESS_STATUS: u16 = 204;
+
 /// The fixed text of the modelled `ConflictException` a create whose `name` a live
 /// resource already holds is refused with. See [`MESSAGE_ASSISTANT_NOT_FOUND`].
 pub const MESSAGE_NAME_IN_USE: &str = "Name is already in use";

@@ -120,7 +120,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    /// `UntagResourceResponse` declares no members, so a successful tag removal has
+    /// nothing to send and is answered with the no-content status, exactly as
+    /// [`super::tag_resource`] is: the model states no `@http` code for either tagging
+    /// mutation (`smithy_query(query="operation",operation="UntagResource")` reports
+    /// `code: 200, codeDefaulted: true`), and the protocol default announces a document
+    /// that is not there.
+    const SUCCESS_STATUS: u16 = crate::state::EMPTY_RESPONSE_SUCCESS_STATUS;
 
     async fn handle(
         &self,

@@ -322,8 +322,8 @@ impl Emulator {
             )
             .await;
         assert_eq!(
-            reply.status, 200,
-            "case \"tag {resource_arn}\": expected HTTP 200, got {} with {}",
+            reply.status, 204,
+            "case \"tag {resource_arn}\": expected the no-content HTTP 204, got {} with {}",
             reply.status, reply.body
         );
     }
@@ -1163,8 +1163,8 @@ async fn untag_resource_removes_the_named_keys_and_refuses_an_unknown_arn() {
             )
             .await;
         assert_eq!(
-            removed.status, 200,
-            "case \"untag {case}\": expected HTTP 200, got {} with {}",
+            removed.status, 204,
+            "case \"untag {case}\": expected the no-content HTTP 204, got {} with {}",
             removed.status, removed.body
         );
         let tags = emulator.tags_of(resource_arn).await;
@@ -1184,8 +1184,8 @@ async fn untag_resource_removes_the_named_keys_and_refuses_an_unknown_arn() {
             )
             .await;
         assert_eq!(
-            cleared.status, 200,
-            "case \"untag {case} entirely\": expected HTTP 200, got {} with {}",
+            cleared.status, 204,
+            "case \"untag {case} entirely\": expected the no-content HTTP 204, got {} with {}",
             cleared.status, cleared.body
         );
         let tags = emulator.tags_of(resource_arn).await;

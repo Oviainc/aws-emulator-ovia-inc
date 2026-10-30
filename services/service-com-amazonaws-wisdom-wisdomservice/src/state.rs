@@ -244,6 +244,21 @@ pub fn message_too_many_tags() -> String {
     format!("The resultant tag set must not have more than {MAX_TAGS_PER_RESOURCE} user tags.")
 }
 
+/// The success status an operation of this endpoint whose output structure declares NO
+/// members answers with: 204 No Content, with no document in the body.
+///
+/// Every member-less response of this endpoint is answered this way. Most of them say so
+/// in the model — the deletes and the removes carry an explicit `@http` code
+/// (`smithy_query(query="operation",operation="DeleteAssistant")`: `code: 204`), and an
+/// operation whose model states a code keeps the stated one. The two tagging mutations
+/// carry no `@http` code at all, so they would otherwise fall back to the protocol
+/// default 200, which tells a client a document follows where none does; they use this
+/// constant instead (`crate::ops::tag_resource`, `crate::ops::untag_resource`). The
+/// Amazon Q in Connect view of this same endpoint answers its tagging mutations from its
+/// own copy of this constant, so a client cannot get a different status depending on
+/// which model it addressed.
+pub const EMPTY_RESPONSE_SUCCESS_STATUS: u16 = 204;
+
 /// The only `KnowledgeBaseType` a content upload may be started against.
 ///
 /// `StartContentUpload`'s own documentation states the rule — "You can only upload
@@ -320,6 +335,17 @@ pub const MAX_CONTENT_UPLOADS: usize = 1_000;
 /// NOT an AWS-published quota, and a larger body is refused by the upload plane rather
 /// than stored.
 pub const MAX_CONTENT_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
+
+/// The most written upload bytes this store holds across EVERY in-flight upload, so the
+/// uploads x bytes-per-upload PRODUCT is finite and not just each factor: a written body
+/// lives in this process's heap until its upload expires or is consumed, and each one may
+/// carry up to [`MAX_CONTENT_UPLOAD_BYTES`], so without this a caller that opens
+/// [`MAX_CONTENT_UPLOADS`] of them could hold the product. It is a resource guard this
+/// emulator owns, NOT an AWS-published quota, and a write there is no room for is refused
+/// by the upload plane rather than stored. The same bound as
+/// [`MAX_STORED_CONTENT_BYTES`] keeps on finalized assets, and the Amazon Q in Connect
+/// view of this same endpoint bounds its own upload store the same way.
+pub const MAX_PENDING_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 /// The header an upload's `PUT` carries the `contentType` the upload was started for
 /// under: an upload URL is minted for ONE media type, exactly as an S3 presigned `PUT`
@@ -1014,6 +1040,20 @@ pub struct ContentUploadTarget {
     pub upload_id: String,
 }
 
+/// What a write of one upload's body did, so the upload plane answers each outcome in its
+/// own words rather than reading one refusal for another. See
+/// [`ComAmazonawsWisdomWisdomserviceState::write_content_upload_body`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadWrite {
+    /// The bytes are stored on the upload the id names.
+    Written,
+    /// The written bodies this store holds leave no room for these bytes under
+    /// [`MAX_PENDING_UPLOAD_BYTES`]; nothing was stored.
+    NoRoom,
+    /// No upload of this store holds that id, so there was nothing to write to.
+    NoSuchUpload,
+}
+
 /// The path the upload plane serves one upload under.
 ///
 /// It sits under the knowledge base the upload belongs to — the same `/knowledgeBases`
@@ -1350,8 +1390,9 @@ pub struct ComAmazonawsWisdomWisdomserviceState {
     /// first once [`MAX_REMEMBERED_CLIENT_TOKENS`] are held.
     pub idempotency_order: VecDeque<IdempotencyKey>,
     /// Every content upload `StartContentUpload` opened, keyed by its `uploadId`, at
-    /// most [`MAX_CONTENT_UPLOADS`] of them and each holding at most
-    /// [`MAX_CONTENT_UPLOAD_BYTES`] bytes. An entry is reclaimed once its URL expires
+    /// most [`MAX_CONTENT_UPLOADS`] of them, each holding at most
+    /// [`MAX_CONTENT_UPLOAD_BYTES`] bytes and all of them together at most
+    /// [`MAX_PENDING_UPLOAD_BYTES`]. An entry is reclaimed once its URL expires
     /// or its knowledge base is deleted.
     pub content_uploads: HashMap<String, ContentUpload>,
     /// Every content `CreateContent` finalized, keyed by its `contentId`, at most
@@ -1865,6 +1906,42 @@ impl ComAmazonawsWisdomWisdomserviceState {
         self.content_uploads
             .insert(upload.upload_id.clone(), upload);
         true
+    }
+
+    /// Write one upload's body, as the upload plane's `PUT` does, reporting which of the
+    /// three outcomes happened so each refusal keeps its own answer
+    /// ([`UploadWrite`]). The slot is resolved FIRST, so an id this store does not hold
+    /// is told apart from a write there is no room for.
+    ///
+    /// A write is refused when the written bytes this store already holds leave no room
+    /// for it under [`MAX_PENDING_UPLOAD_BYTES`], so the aggregate bound holds however
+    /// many uploads a caller opens; a refused write stores nothing and the slot keeps the
+    /// body it had.
+    ///
+    /// The bytes an upload already holds do not count against the sum, so re-writing one
+    /// upload is accepted at the ceiling: a second `PUT` to the same URL replaces the
+    /// first body rather than adding to it.
+    pub fn write_content_upload_body(&mut self, upload_id: &str, body: Vec<u8>) -> UploadWrite {
+        if !self.content_uploads.contains_key(upload_id) {
+            return UploadWrite::NoSuchUpload;
+        }
+        let held: usize = self
+            .content_uploads
+            .iter()
+            .filter(|(id, _)| id.as_str() != upload_id)
+            .filter_map(|(_, upload)| upload.body.as_ref().map(Vec::len))
+            .sum();
+        if held.saturating_add(body.len()) > MAX_PENDING_UPLOAD_BYTES {
+            return UploadWrite::NoRoom;
+        }
+        match self.content_uploads.get_mut(upload_id) {
+            // Unreachable: the slot was resolved above under the same borrow.
+            None => UploadWrite::NoSuchUpload,
+            Some(upload) => {
+                upload.body = Some(body);
+                UploadWrite::Written
+            }
+        }
     }
 
     /// An `uploadId` no stored upload holds, or `None` when [`MINT_ATTEMPTS`] candidates
