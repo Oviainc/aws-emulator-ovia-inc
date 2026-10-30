@@ -17,6 +17,8 @@ mod api_cache;
 mod api_cache_create_rules;
 #[path = "all/api_cache_refusal_messages.rs"]
 mod api_cache_refusal_messages;
+#[path = "all/api_key_deletes_listing_agreement.rs"]
+mod api_key_deletes_listing_agreement;
 #[path = "all/api_key_deletion_window.rs"]
 mod api_key_deletion_window;
 #[path = "all/api_key_update.rs"]

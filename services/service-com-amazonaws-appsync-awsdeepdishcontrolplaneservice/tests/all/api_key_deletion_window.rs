@@ -22,6 +22,9 @@
 //! documented default.
 //!
 //! The harness (`call`, `create_api`, `router`, `Answer`) is the error-contract suite's.
+//! This suite's own constants, helpers and rule-1 assertion are `pub(crate)`, so the
+//! sibling suite that varies rule 2's dimension (`api_key_deletes_listing_agreement`)
+//! asserts the same arithmetic from the same single place rather than a second copy.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -32,10 +35,10 @@ use crate::event_api::{create_event_api, event_config};
 /// One hour in seconds — the granularity `ApiKey$expires` and `ApiKey$deletes` are
 /// documented with: both are "seconds since the epoch, rounded down to the nearest
 /// hour". Source: `smithy_query(query="doc", shape="ApiKey", member="deletes")`.
-const HOUR: i64 = 3_600;
+pub(crate) const HOUR: i64 = 3_600;
 
 /// One day in seconds — the unit the API-key validity window is stated in.
-const DAY: i64 = 86_400;
+pub(crate) const DAY: i64 = 86_400;
 
 /// How long an expired API key is kept before the service reclaims it — the span
 /// between a key's `expires` and its `deletes`. Source: the `ApiKey` shape's doc for
@@ -43,20 +46,21 @@ const DAY: i64 = 86_400;
 /// after the expiration time" (`smithy_query(query="doc", shape="ApiKey")`), which
 /// `ListApiKeys` restates as "API keys are deleted automatically 60 days after they
 /// expire".
-const RETENTION: i64 = 60 * DAY;
+pub(crate) const RETENTION: i64 = 60 * DAY;
 
 /// `CreateApiKey`'s documented default validity: "The default value for this parameter
 /// is 7 days from creation time."
-const DEFAULT_VALIDITY: i64 = 7 * DAY;
+pub(crate) const DEFAULT_VALIDITY: i64 = 7 * DAY;
 
 /// How far inside a published validity bound a row sits, so the seconds elapsing
-/// between this test's clock read and the handler's cannot push the row across the
-/// bound. The bounds come from `ApiKeyValidityOutOfBoundsException` — "between 1 and
-/// 365 days from creation (for CreateApiKey) or from update (for UpdateApiKey)".
-const BOUND_SLACK: i64 = 5;
+/// between this test's clock read and the handler's — across every write a row makes —
+/// cannot push the row across the bound. The bounds come from
+/// `ApiKeyValidityOutOfBoundsException` — "between 1 and 365 days from creation (for
+/// CreateApiKey) or from update (for UpdateApiKey)".
+pub(crate) const BOUND_SLACK: i64 = 60;
 
 /// Now, as whole seconds since the Unix epoch — the form `ApiKey$expires` takes.
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("the clock is after the epoch")
@@ -64,12 +68,12 @@ fn unix_now() -> i64 {
 }
 
 /// `seconds` rounded DOWN to the nearest hour, the form both time members take.
-fn floor_to_hour(seconds: i64) -> i64 {
+pub(crate) fn floor_to_hour(seconds: i64) -> i64 {
     seconds - seconds.rem_euclid(HOUR)
 }
 
 /// The deletion time the service owes a key whose expiration is `expires`: rule 1.
-fn expected_deletes(expires: i64) -> i64 {
+pub(crate) fn expected_deletes(expires: i64) -> i64 {
     floor_to_hour(expires + RETENTION)
 }
 
@@ -99,7 +103,7 @@ async fn event_api_id(router: &MultiServiceRouter, name: &str) -> String {
 }
 
 /// `CreateApiKey` under `api_id`.
-async fn create_key(router: &MultiServiceRouter, api_id: &str, body: Value) -> Answer {
+pub(crate) async fn create_key(router: &MultiServiceRouter, api_id: &str, body: Value) -> Answer {
     call(
         router,
         "POST",
@@ -110,7 +114,7 @@ async fn create_key(router: &MultiServiceRouter, api_id: &str, body: Value) -> A
 }
 
 /// `UpdateApiKey` on one stored key.
-async fn update_key(
+pub(crate) async fn update_key(
     router: &MultiServiceRouter,
     api_id: &str,
     key_id: &str,
@@ -127,7 +131,7 @@ async fn update_key(
 
 /// The key `key_id` as `ListApiKeys` reports it, or `Value::Null` when the API holds no
 /// such key.
-async fn listed_key(router: &MultiServiceRouter, api_id: &str, key_id: &str) -> Value {
+pub(crate) async fn listed_key(router: &MultiServiceRouter, api_id: &str, key_id: &str) -> Value {
     let answer = call(router, "GET", &format!("/v1/apis/{api_id}/apikeys"), None).await;
     assert_eq!(
         answer.status, 200,
@@ -144,7 +148,7 @@ async fn listed_key(router: &MultiServiceRouter, api_id: &str, key_id: &str) -> 
 }
 
 /// Assert rule 1 on one reported key, and return its expiration.
-fn assert_retention_span(case: &str, source: &str, key: &Value) -> i64 {
+pub(crate) fn assert_retention_span(case: &str, source: &str, key: &Value) -> i64 {
     let expires = key["expires"]
         .as_i64()
         .unwrap_or_else(|| panic!("case {case:?} from {source}: expected an expires, got {key:?}"));
