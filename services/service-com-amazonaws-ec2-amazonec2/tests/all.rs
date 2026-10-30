@@ -17,6 +17,12 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `CopySnapshot` mints from a stored snapshot, which members it reads off the source and
+// which off the request, and what it refuses. Declared beside `prefix_lists` for the reason
+// the note above gives: the sorted neighbourhood and the tail of this file are where every new
+// ec2 suite inserts its lines.
+#[path = "all/copy_snapshot.rs"]
+mod copy_snapshot;
 // What `CreateTransitGatewayConnect` computes a Connect attachment from — the transport
 // attachment it names, that attachment's own transit gateway, the requested tunnel protocol
 // and tags — the `pending` -> `available` move the clock owes it, and what it refuses.

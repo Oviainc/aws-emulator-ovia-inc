@@ -24,8 +24,8 @@
 //!
 //! [`ComAmazonawsEc2Amazonec2State::insert_snapshot`] is the one way a snapshot is stored,
 //! and it mints the id itself: a snapshot id is the service's to choose, never a caller's.
-//! `CreateSnapshots` is the writer wired to it so far; `CreateSnapshot` and `CopySnapshot`
-//! belong beside it as their own stub issues are closed, and a reader resolves an id out of
+//! `CreateSnapshots` and `CopySnapshot` are the writers wired to it so far; `CreateSnapshot`
+//! belongs beside them as its own stub issue is closed, and a reader resolves an id out of
 //! this store rather than keeping a second copy of it.
 
 use std::time::{Instant, SystemTime};
@@ -67,6 +67,22 @@ pub const SNAPSHOT_PROGRESS_COMPLETED: &str = "100%";
 /// and that it is ready for use" (`Snapshot$StorageTier`): the tier a snapshot is created
 /// in, `archive` being where `ModifySnapshotTier` moves one.
 pub const SNAPSHOT_STORAGE_TIER_STANDARD: &str = "standard";
+
+/// "`standard` - The snapshot copy was created with a standard snapshot copy operation"
+/// (`Snapshot$TransferType`): the transfer type of a copy the request asked no completion
+/// duration for, which is "completed on a best-effort basis". A member of the modelled
+/// `TransferType` catalog, the generated whole of which is
+/// [`crate::ops::types::TRANSFER_TYPE_VALUES`].
+///
+/// "Only for snapshot copies": a snapshot a create made carries no transfer type at all,
+/// which is why neither of these two words is a default of [`SnapshotRecord`].
+pub const SNAPSHOT_TRANSFER_TYPE_STANDARD: &str = "standard";
+
+/// "`time-based` - The snapshot copy was created with a time-based snapshot copy operation"
+/// (`Snapshot$TransferType`): the transfer type of a copy the request asked a completion
+/// duration for, which "complete[s] within the completion duration specified in the
+/// request".
+pub const SNAPSHOT_TRANSFER_TYPE_TIME_BASED: &str = "time-based";
 
 /// The one resource type a snapshot-creating action's `TagSpecifications` may name: "Tags
 /// to apply to every snapshot specified by the instance"
