@@ -267,7 +267,8 @@ use crate::ops::types::{
     CreateSecurityConfigurationInput, CreateSessionInput, CreateTriggerInput, CreateWorkflowInput,
     CustomEntityType,
     DataCatalogEncryptionSettings, DataLakeAccessPropertiesOutput, DataLakePrincipal,
-    DataQualityRuleRecommendationRunAdditionalRunOptions, DataQualityTargetTable,
+    DataQualityRuleRecommendationRunAdditionalRunOptions, DataQualityRulesetFilterCriteria,
+    DataQualityRulesetListDetails, DataQualityTargetTable,
     DataSource, Database, DatabaseIdentifier, DatabaseInput,
     Edge, EncryptionAtRest, EncryptionConfiguration, ErrorDetail, EventBatchingCondition,
     ExecutionAttempt, ExecutionProperty, FederatedCatalog, FederatedDatabase,
@@ -7187,12 +7188,28 @@ fn ordered_instant(at: SystemTime) -> String {
     format!("{nanos:020}")
 }
 
-/// `at` as seconds since the epoch, the one scale a transform's instants are compared
-/// against a client-supplied timestamp on.
+/// `at` as seconds since the epoch, the one scale a stored instant is compared against a
+/// client-supplied timestamp on.
 fn secs_since_epoch(at: SystemTime) -> f64 {
     at.duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+/// Whether `at` sits inside the window a filter's `…Before`/`…After` pair describes.
+///
+/// One reading, shared by every filtered listing in this service: a bound the criteria
+/// leave out narrows nothing, and a bound they name admits only an instant STRICTLY inside
+/// it — "the time and date before which the … were created" is a window the instant is
+/// before, not one it may sit on the edge of.
+fn instant_window_admits(
+    at: SystemTime,
+    before: Option<&::aws_smithy_types::DateTime>,
+    after: Option<&::aws_smithy_types::DateTime>,
+) -> bool {
+    let instant = secs_since_epoch(at);
+    before.is_none_or(|bound| instant < bound.as_secs_f64())
+        && after.is_none_or(|bound| instant > bound.as_secs_f64())
 }
 
 /// A stored machine learning transform: the definition `CreateMLTransform` registered,
@@ -7454,25 +7471,15 @@ impl MlTransformEntry {
         {
             return false;
         }
-        let created = secs_since_epoch(self.created_on);
-        let modified = secs_since_epoch(self.last_modified_on);
-        let outside_window = [
-            (filter.created_before.as_ref(), created, true),
-            (filter.created_after.as_ref(), created, false),
-            (filter.last_modified_before.as_ref(), modified, true),
-            (filter.last_modified_after.as_ref(), modified, false),
-        ]
-        .into_iter()
-        .any(|(bound, instant, before)| {
-            bound.is_some_and(|bound| {
-                if before {
-                    instant >= bound.as_secs_f64()
-                } else {
-                    instant <= bound.as_secs_f64()
-                }
-            })
-        });
-        if outside_window {
+        if !instant_window_admits(
+            self.created_on,
+            filter.created_before.as_ref(),
+            filter.created_after.as_ref(),
+        ) || !instant_window_admits(
+            self.last_modified_on,
+            filter.last_modified_before.as_ref(),
+            filter.last_modified_after.as_ref(),
+        ) {
             return false;
         }
         filter.schema.as_deref().is_none_or(|wanted| {
@@ -13906,6 +13913,191 @@ pub fn recommended_ruleset(columns: &[String]) -> Option<String> {
     Some(format!("{DQDL_RULES_PREFIX}{rules}{DQDL_RULES_SUFFIX}"))
 }
 
+/// The keyword that opens the rule list of a DQDL ruleset.
+const DQDL_RULES_KEYWORD: &str = "Rules";
+
+/// What every character of a DQDL string literal reads as while the rule list is walked:
+/// a word character, so the literal is still a rule's text but punctuates nothing.
+const DQDL_LITERAL_PLACEHOLDER: char = 'x';
+
+/// The most characters of one ruleset [`dqdl_rule_count`] reads. A ruleset longer than
+/// this cannot have been stored through the modelled operations, whose `Ruleset` member is
+/// `DataQualityRulesetString` (`length 1..65536`, a bound on the string's characters), so
+/// the bound is that member's own.
+///
+/// It reuses the constant the recommended-ruleset builder states that same limit in, which
+/// is spelled in bytes because that builder measures the text it BUILDS in bytes. The
+/// number is the member's own in either unit, and bounding the character count bounds the
+/// walk, so the reuse is deliberate rather than a unit confusion.
+const MAX_DQDL_CHARS_READ: usize = MAX_DATA_QUALITY_RULESET_BYTES;
+
+/// The deepest bracket nesting [`dqdl_rule_count`] walks. Nesting is what a rule's own
+/// operands are written with, so a handful of levels is all a rule uses; past this the walk
+/// stops rather than following text a caller chose to any depth.
+const MAX_DQDL_NESTING: usize = 32;
+
+/// How many rules the DQDL text `ruleset` declares — "the number of rules in the ruleset"
+/// (`DataQualityRulesetListDetails$RuleCount`).
+///
+/// A DQDL ruleset declares its rules as one comma-separated list introduced by
+/// `Rules = [ … ]`, so the count is the number of entries in THAT list: the commas that
+/// separate a rule from the next one sit at the list's own nesting level, while a comma
+/// inside a rule's own brackets, parentheses or quoted string belongs to that rule. Text
+/// declaring no rule list at all holds no rules and counts 0; a trailing separator adds
+/// no rule.
+///
+/// A comment runs from `#` to the end of its line and declares nothing, so neither the
+/// rules it describes nor a separator inside it is counted.
+///
+/// DQDL is proprietary to this service and no published crate parses it, so the list is
+/// walked here rather than through a dependency. Counting its entries needs none of the
+/// language beyond its nesting and its string literals, so no rule GRAMMAR is assumed:
+/// whatever a rule's own text is, it is one entry. The walk reads at most
+/// [`MAX_DQDL_CHARS_READ`] characters in ONE pass, holds no copy of the text, nests no
+/// deeper than [`MAX_DQDL_NESTING`] and never recurses, so text a caller chose bounds
+/// neither the memory nor the stack this takes. Text no rule list can be read out of
+/// declares no rules and counts 0: no list at all, a list left unterminated by a truncated
+/// text, an unterminated string or comment, or one nested past the limit.
+pub fn dqdl_rule_count(ruleset: &str) -> i32 {
+    let keyword: Vec<char> = DQDL_RULES_KEYWORD.chars().collect();
+    let mut phase = DqdlPhase::SeekKeyword(0);
+    // Whether the character before this one could be part of a word, which is what decides
+    // whether the keyword stands on its own or is the tail of a longer one.
+    let mut preceded_by_word = false;
+    let mut in_string = false;
+    let mut in_comment = false;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    let mut count = 0usize;
+    let mut has_content = false;
+    let mut closed = false;
+
+    for raw in ruleset.chars().take(MAX_DQDL_CHARS_READ) {
+        // A quoted string is where a rule names a column and a comment declares nothing, so
+        // neither carries structure: a literal's characters read as one word character each,
+        // which still counts as a rule's text while punctuating nothing, and a comment's
+        // read as blanks up to the line break that ends it. A backslash escapes the
+        // character after it, so an escaped quote does not end the string it sits in.
+        let ch = if in_comment {
+            in_comment = raw != '\n';
+            if in_comment {
+                ' '
+            } else {
+                raw
+            }
+        } else if in_string {
+            if escaped {
+                escaped = false;
+            } else if raw == '\\' {
+                escaped = true;
+            } else if raw == '"' {
+                in_string = false;
+            }
+            DQDL_LITERAL_PLACEHOLDER
+        } else if raw == '#' {
+            in_comment = true;
+            ' '
+        } else if raw == '"' {
+            in_string = true;
+            DQDL_LITERAL_PLACEHOLDER
+        } else {
+            raw
+        };
+
+        match phase {
+            // The keyword opens a list only where it stands on its own, so a match that a
+            // word character precedes is the tail of a longer word and no opener at all.
+            DqdlPhase::SeekKeyword(matched) => {
+                phase = if keyword.get(matched) == Some(&ch)
+                    && (matched > 0 || !preceded_by_word)
+                {
+                    if matched + 1 == keyword.len() {
+                        DqdlPhase::SeekEquals
+                    } else {
+                        DqdlPhase::SeekKeyword(matched + 1)
+                    }
+                } else {
+                    // A failed match restarts the search WITHOUT re-testing the character
+                    // that failed it, which loses no opener: that character is either not
+                    // the keyword's first, or it is and the match it broke means a word
+                    // character precedes it — and the keyword that a word character
+                    // precedes is part of a longer word, which opens no list.
+                    DqdlPhase::SeekKeyword(0)
+                };
+            }
+            DqdlPhase::SeekEquals => {
+                phase = match ch {
+                    '=' => DqdlPhase::SeekOpen,
+                    _ if ch.is_whitespace() => DqdlPhase::SeekEquals,
+                    _ => DqdlPhase::SeekKeyword(0),
+                };
+            }
+            DqdlPhase::SeekOpen => {
+                phase = match ch {
+                    '[' => DqdlPhase::Counting,
+                    _ if ch.is_whitespace() => DqdlPhase::SeekOpen,
+                    _ => DqdlPhase::SeekKeyword(0),
+                };
+            }
+            DqdlPhase::Counting => match ch {
+                // The list's own closing bracket: the entry before it is the last rule, and
+                // whatever follows the list declares no rule of this list's.
+                ']' if depth == 0 => {
+                    if has_content {
+                        count += 1;
+                    }
+                    closed = true;
+                    break;
+                }
+                '[' | '(' | '{' => {
+                    has_content = true;
+                    depth += 1;
+                    if depth > MAX_DQDL_NESTING {
+                        break;
+                    }
+                }
+                ']' | ')' | '}' => {
+                    has_content = true;
+                    depth = depth.saturating_sub(1);
+                }
+                ',' if depth == 0 => {
+                    if has_content {
+                        count += 1;
+                    }
+                    has_content = false;
+                }
+                _ => has_content |= !ch.is_whitespace(),
+            },
+        }
+        preceded_by_word = is_dqdl_word_char(ch);
+    }
+
+    if !closed {
+        return 0;
+    }
+    i32::try_from(count).unwrap_or(i32::MAX)
+}
+
+/// Where [`dqdl_rule_count`]'s single pass over a ruleset has got to: the three steps that
+/// find the rule list, then the walk over its entries.
+#[derive(Debug, Clone, Copy)]
+enum DqdlPhase {
+    /// Matching the rule-list keyword, with this many of its characters matched so far.
+    SeekKeyword(usize),
+    /// The keyword is spelled; awaiting the `=` that assigns the list.
+    SeekEquals,
+    /// The `=` is seen; awaiting the `[` that opens the list.
+    SeekOpen,
+    /// Inside the list, counting its entries.
+    Counting,
+}
+
+/// Whether `ch` can be part of a DQDL word, and so whether the rule-list keyword touching
+/// it is a word of its own.
+fn is_dqdl_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
 /// One stored data quality ruleset: the DQDL rules `CreateDataQualityRuleset` registers
 /// under a name, plus the members only the server sets.
 ///
@@ -14015,6 +14207,79 @@ impl DataQualityRulesetEntry {
             self.ruleset = ruleset.clone();
         }
         self.last_modified_on = now;
+    }
+
+    /// This stored ruleset as one entry of a listing — "describes a data quality ruleset
+    /// returned by `GetDataQualityRuleset`" (`DataQualityRulesetListDetails`).
+    ///
+    /// Every member but `RuleCount` is the one the single-ruleset read serves, so the two
+    /// can never disagree about a ruleset; `RuleCount`, which that read does not carry, is
+    /// counted from the DQDL text this record holds ([`dqdl_rule_count`]). The DQDL text
+    /// itself is not a member of this shape, so a listing reports how many rules a ruleset
+    /// holds without serving them.
+    pub fn to_list_details(&self) -> DataQualityRulesetListDetails {
+        DataQualityRulesetListDetails {
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            created_on: Some(to_date_time(self.created_on)),
+            last_modified_on: Some(to_date_time(self.last_modified_on)),
+            target_table: self.target_table.clone(),
+            recommendation_run_id: self.recommendation_run_id.clone(),
+            rule_count: Some(dqdl_rule_count(&self.ruleset)),
+        }
+    }
+
+    /// Whether this ruleset satisfies every criterion `filter` names.
+    ///
+    /// A `DataQualityRulesetFilterCriteria` is "the criteria used to filter data quality
+    /// rulesets": a conjunction in which each member it carries narrows the listing and a
+    /// member it leaves out narrows nothing. `Name` and the description are matched whole —
+    /// the model documents no matching mode for either, so they are compared the way this
+    /// service's other filtered listing compares the name it is given — the target table is
+    /// matched on the table it addresses, and the two instant pairs bound the window the
+    /// criteria describe ([`instant_window_admits`], the one reading this service's filtered
+    /// listings share).
+    pub fn matches(&self, filter: &DataQualityRulesetFilterCriteria) -> bool {
+        if filter
+            .name
+            .as_deref()
+            .is_some_and(|name| name != self.name.as_str())
+        {
+            return false;
+        }
+        if filter.description.as_deref().is_some_and(|description| {
+            self.description.as_deref() != Some(description)
+        }) {
+            return false;
+        }
+        // "The name and database name of the target table": a ruleset qualifies when the
+        // table it targets is the one named, so a ruleset targeting no table at all is
+        // never admitted by criteria that name one. The catalog is compared only where the
+        // criteria name one, since the member documents the table and its database as what
+        // it addresses.
+        if let Some(wanted) = filter.target_table.as_ref() {
+            let Some(targeted) = self.target_table.as_ref() else {
+                return false;
+            };
+            if targeted.table_name != wanted.table_name
+                || targeted.database_name != wanted.database_name
+                || wanted
+                    .catalog_id
+                    .as_ref()
+                    .is_some_and(|catalog| Some(catalog) != targeted.catalog_id.as_ref())
+            {
+                return false;
+            }
+        }
+        instant_window_admits(
+            self.created_on,
+            filter.created_before.as_ref(),
+            filter.created_after.as_ref(),
+        ) && instant_window_admits(
+            self.last_modified_on,
+            filter.last_modified_before.as_ref(),
+            filter.last_modified_after.as_ref(),
+        )
     }
 }
 
