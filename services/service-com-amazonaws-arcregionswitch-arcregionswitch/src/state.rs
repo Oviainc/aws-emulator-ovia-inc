@@ -18,6 +18,7 @@
 //! |---|---|---|
 //! | [`ComAmazonawsArcregionswitchArcregionswitchState::plans`] | [`MAX_PLANS`] | `DeletePlan`, or the request is refused |
 //! | [`ComAmazonawsArcregionswitchArcregionswitchState::executions`] | [`MAX_EXECUTIONS_PER_PLAN`] per plan | the oldest terminal execution is evicted; deleting the plan drops them all |
+//! | [`StoredExecution::events`] | [`MAX_EVENTS_PER_EXECUTION`] per execution | the oldest event is evicted (FIFO) |
 //! | [`ComAmazonawsArcregionswitchArcregionswitchState::client_tokens`] | [`MAX_CLIENT_TOKENS`] | the oldest record is evicted (FIFO) |
 //! | [`StoredPlan::tags`] | [`MAX_TAGS_PER_PLAN`] | `UntagResource`, or the request is refused |
 //!
@@ -61,6 +62,31 @@ pub const IN_PROGRESS: &str = "inProgress";
 /// It is NOT terminal: the execution still holds the plan, the step itself reports
 /// [`STEP_PENDING_APPROVAL`], and `ApprovePlanExecutionStep` is what moves it on.
 pub const PENDING_MANUAL_APPROVAL: &str = "pendingManualApproval";
+
+/// The `ExecutionState` of an execution a caller stopped with `UpdatePlanExecution`'s
+/// `pause` action.
+///
+/// It is NOT terminal: the execution still holds the plan, and the clock owes it nothing
+/// while it stands here — a `resume` is the call that puts it back where it stood.
+pub const PAUSED_BY_OPERATOR: &str = "pausedByOperator";
+
+/// The `ExecutionState` of an execution stopped at a step that failed. Nothing in this
+/// emulator produces it (a step it cannot perform fails the whole execution), but it is
+/// the other state a `resume` lifts, so it is named where that rule is written.
+pub const PAUSED_BY_FAILED_STEP: &str = "pausedByFailedStep";
+
+/// The `ExecutionState` values a `resume` lifts, from the model's `ExecutionState` enum.
+pub const PAUSED_EXECUTION_STATES: &[&str] = &[PAUSED_BY_OPERATOR, PAUSED_BY_FAILED_STEP];
+
+/// The `ExecutionMode` an execution runs in step by step, waiting on each one's own
+/// health, from the model's `ExecutionMode` enum
+/// (`smithy_query(query="shape", shape="ExecutionMode", model_path="services/service-com-amazonaws-arcregionswitch-arcregionswitch/smithy-model/com-amazonaws-arcregionswitch-arcregionswitch.json")`).
+/// It is also `StartPlanExecutionRequest$mode`'s modelled `@default`.
+pub const MODE_GRACEFUL: &str = "graceful";
+
+/// The other `ExecutionMode`: the switch is made without waiting on the resources it
+/// moves away from.
+pub const MODE_UNGRACEFUL: &str = "ungraceful";
 
 /// The `ExecutionState` of an execution every step of which reached
 /// [`STEP_COMPLETED`] — including a workflow that configures no execution block at all,
@@ -141,6 +167,21 @@ pub const EVENT_EXECUTION_SUCCEEDED: &str = "executionSucceeded";
 /// The `ExecutionEventType` recorded when a declined approval stops an execution.
 pub const EVENT_EXECUTION_CANCELED: &str = "executionCanceled";
 
+/// The `ExecutionEventType` recorded when a caller pauses an execution.
+pub const EVENT_EXECUTION_PAUSED: &str = "executionPaused";
+
+/// The `ExecutionEventType` recorded when a paused execution is resumed: the clock is
+/// driving it again. The model's `ExecutionEventType` enum declares no resumed member, so
+/// this is the nearest it has.
+pub const EVENT_EXECUTION_STARTED: &str = "executionStarted";
+
+/// The `ExecutionEventType` recorded when an execution is switched to [`MODE_GRACEFUL`].
+pub const EVENT_BEHAVIOR_CHANGED_TO_GRACEFUL: &str = "executionBehaviorChangedToGraceful";
+
+/// The `ExecutionEventType` recorded when an execution is switched to
+/// [`MODE_UNGRACEFUL`].
+pub const EVENT_BEHAVIOR_CHANGED_TO_UNGRACEFUL: &str = "executionBehaviorChangedToUngraceful";
+
 /// The approval window this emulator falls back to, in minutes.
 ///
 /// It is the model's own default for the member that carries it
@@ -191,6 +232,11 @@ pub const MAX_PLANS: usize = 500;
 /// is refused. (One plan can hold only one non-terminal execution at a time, so this
 /// ceiling is what bounds the history that accumulates behind it.)
 pub const MAX_EXECUTIONS_PER_PLAN: usize = 50;
+
+/// The most events this emulator keeps on one execution's timeline. Reaching it drops the
+/// oldest event, so a caller that keeps updating one execution cannot grow the store
+/// without limit; it is far above the event count a workflow's own steps produce.
+pub const MAX_EVENTS_PER_EXECUTION: usize = 1_000;
 
 /// The most tags one plan carries.
 ///
@@ -797,21 +843,35 @@ pub struct StoredExecution {
     pub step_states: Vec<StepState>,
     /// What the clock needs to know about each of those steps, in the same order.
     pub planned_steps: Vec<PlannedStep>,
-    /// The execution's events, oldest first, as `ListPlanExecutionEvents` reports them.
-    /// Bounded by the step count of the workflow the execution runs — each step records at
-    /// most one event of its own — plus its lifecycle events, so it cannot grow per
-    /// request.
+    /// The execution's events, oldest first, as `ListPlanExecutionEvents` reports them,
+    /// at most [`MAX_EVENTS_PER_EXECUTION`] of them: a caller that keeps asking for
+    /// updates (pausing and resuming, say) appends events after the workflow's own, so
+    /// the timeline has a ceiling and drops its oldest event at it.
     pub events: Vec<ExecutionEvent>,
     /// When the clock owes this execution its next transition; `None` once it owes none —
     /// because the execution has reached a state it never leaves, or because it is waiting
     /// for a call (an approval) rather than for the clock.
     pub outcome_due_at: Option<SystemTime>,
+    /// The `ExecutionState` a `pause` interrupted, so a `resume` puts the execution back
+    /// where it stood instead of guessing a state for it; `None` whenever the execution is
+    /// not paused.
+    pub resumes_to: Option<String>,
+    /// What the clock still owed the execution when a `pause` stopped it — the rest of a
+    /// manual-approval window, say. A `resume` serves that remainder from the instant it
+    /// is called, so a pause costs the execution no progress and takes none away either;
+    /// `None` when the clock owed it nothing, or the execution is not paused.
+    pub owed_on_resume: Option<Duration>,
 }
 
 impl StoredExecution {
     /// Whether the execution has reached a state it never leaves, so the plan is free.
     pub fn is_terminal(&self) -> bool {
         TERMINAL_EXECUTION_STATES.contains(&self.execution_state.as_str())
+    }
+
+    /// Whether the execution stands in a state a `resume` lifts.
+    pub fn is_paused(&self) -> bool {
+        PAUSED_EXECUTION_STATES.contains(&self.execution_state.as_str())
     }
 
     /// The position of the step the execution is waiting for an approval decision on.
@@ -902,6 +962,60 @@ pub enum ApprovalOutcome {
     NoSuchStep,
     /// The step is not waiting for a decision; it reports `status`.
     NotAwaitingApproval { status: String },
+}
+
+/// What `UpdatePlanExecution` asks of an execution, parsed from the modelled
+/// `UpdatePlanExecutionAction` the request carries
+/// (`smithy_query(query="shape", shape="UpdatePlanExecutionAction", model_path="services/service-com-amazonaws-arcregionswitch-arcregionswitch/smithy-model/com-amazonaws-arcregionswitch-arcregionswitch.json")`:
+/// `pause | resume | switchToGraceful | switchToUngraceful`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionUpdate {
+    /// Stop the clock on the execution, recording what it still owed.
+    Pause,
+    /// Put a paused execution back where it stood and let the clock drive it again.
+    Resume,
+    /// Run the rest of the workflow in this [`ExecutionMode`][MODE_GRACEFUL].
+    SwitchMode(&'static str),
+}
+
+impl ExecutionUpdate {
+    /// The update one modelled `UpdatePlanExecutionAction` value asks for; `None` for a
+    /// value the enum does not declare, which the boundary validator has already refused.
+    pub fn of(action: &str) -> Option<Self> {
+        match action {
+            "pause" => Some(Self::Pause),
+            "resume" => Some(Self::Resume),
+            "switchToGraceful" => Some(Self::SwitchMode(MODE_GRACEFUL)),
+            "switchToUngraceful" => Some(Self::SwitchMode(MODE_UNGRACEFUL)),
+            _ => None,
+        }
+    }
+
+    /// What this update would do to the execution, for the message of a refusal that
+    /// names the state it was refused from.
+    pub fn effect(&self) -> String {
+        match self {
+            Self::Pause => "paused".to_string(),
+            Self::Resume => "resumed".to_string(),
+            Self::SwitchMode(mode) => format!("switched to {mode} mode"),
+        }
+    }
+}
+
+/// What [`ComAmazonawsArcregionswitchArcregionswitchState::apply_execution_update`] found
+/// when it tried to apply one, so `UpdatePlanExecution` can answer the right modelled
+/// failure for each case.
+#[derive(Debug)]
+pub enum ExecutionUpdateOutcome {
+    /// The update was admitted, and whatever it had to change is changed.
+    Applied,
+    /// This emulator holds no plan under that ARN.
+    NoSuchPlan,
+    /// That plan holds no execution with that id.
+    NoSuchExecution,
+    /// The execution reports `state`, which it never leaves: there is no in-progress
+    /// execution left to update.
+    StateDisallows { state: String },
 }
 
 /// Per-service state for com-amazonaws-arcregionswitch-arcregionswitch. A handler reaches it through [`service_state`].
@@ -1139,6 +1253,118 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
         ApprovalOutcome::Applied
     }
 
+    /// Apply one `UpdatePlanExecution` action to one execution of one plan.
+    ///
+    /// The operation updates an IN-PROGRESS execution, so the one precondition is that
+    /// the execution has not ended: one that has reached a state it never leaves is
+    /// [`ExecutionUpdateOutcome::StateDisallows`] — the modelled `IllegalStateException`
+    /// — for every action, because there is no longer an execution to update. While it is
+    /// still running the action is admitted, and what it changes is decided by the state
+    /// the execution stands in:
+    ///
+    /// * [`ExecutionUpdate::Pause`] stops it at [`PAUSED_BY_OPERATOR`], remembering the
+    ///   state it stood in and what the clock still owed it. One already paused has no
+    ///   progress left to stop, so nothing changes.
+    /// * [`ExecutionUpdate::Resume`] puts a paused one ([`PAUSED_EXECUTION_STATES`]) back
+    ///   into the state the pause interrupted, with the clock owing it the remainder it
+    ///   had left, measured from this call. One that is not paused is not waiting on a
+    ///   resume, so nothing changes.
+    /// * [`ExecutionUpdate::SwitchMode`] re-points it, and every step the clock has NOT
+    ///   reached, at the given [`ExecutionMode`][MODE_GRACEFUL]; a step already reached
+    ///   keeps the mode it ran in. One already running that mode has nothing to switch.
+    ///
+    /// An action that changes nothing appends no event: nothing happened to record. A
+    /// `comment` the request carries is what the execution reports from then on either
+    /// way, and is recorded on the event an action that DID change something appends.
+    pub fn apply_execution_update(
+        &mut self,
+        key: &(String, String),
+        update: ExecutionUpdate,
+        comment: Option<String>,
+        now: SystemTime,
+    ) -> ExecutionUpdateOutcome {
+        if !self.plans.contains_key(&key.0) {
+            return ExecutionUpdateOutcome::NoSuchPlan;
+        }
+        let Some(execution) = self.executions.get(key) else {
+            return ExecutionUpdateOutcome::NoSuchExecution;
+        };
+        if execution.is_terminal() {
+            return ExecutionUpdateOutcome::StateDisallows {
+                state: execution.execution_state.clone(),
+            };
+        }
+        let state = execution.execution_state.clone();
+        let at = DateTime::from(now);
+
+        let event = match update {
+            ExecutionUpdate::Pause if !execution.is_paused() => {
+                // Read what the clock owed before the deadline is dropped, so the
+                // remainder a resume serves is the one that was outstanding.
+                let owed = execution
+                    .outcome_due_at
+                    .map(|due| due.duration_since(now).unwrap_or_default());
+                self.schedule(key, None);
+                if let Some(execution) = self.executions.get_mut(key) {
+                    execution.resumes_to = Some(state);
+                    execution.owed_on_resume = owed;
+                    execution.execution_state = PAUSED_BY_OPERATOR.to_string();
+                }
+                Some(EVENT_EXECUTION_PAUSED)
+            }
+            ExecutionUpdate::Resume if execution.is_paused() => {
+                // A state the pause did not record (a step the service paused, which
+                // nothing here produces) resumes as an execution between steps, with the
+                // clock owing it the next one.
+                let resumed = execution
+                    .resumes_to
+                    .clone()
+                    .unwrap_or_else(|| IN_PROGRESS.to_string());
+                let owed = execution.owed_on_resume.unwrap_or(EXECUTION_START_SPAN);
+                if let Some(execution) = self.executions.get_mut(key) {
+                    execution.execution_state = resumed;
+                    execution.resumes_to = None;
+                    execution.owed_on_resume = None;
+                }
+                self.schedule(key, Some(now + owed));
+                Some(EVENT_EXECUTION_STARTED)
+            }
+            ExecutionUpdate::SwitchMode(mode) if execution.mode != mode => {
+                if let Some(execution) = self.executions.get_mut(key) {
+                    execution.mode = mode.to_string();
+                    for step in &mut execution.step_states {
+                        if step.status.as_deref() == Some(STEP_NOT_STARTED) {
+                            step.step_mode = Some(mode.to_string());
+                        }
+                    }
+                }
+                Some(if mode == MODE_UNGRACEFUL {
+                    EVENT_BEHAVIOR_CHANGED_TO_UNGRACEFUL
+                } else {
+                    EVENT_BEHAVIOR_CHANGED_TO_GRACEFUL
+                })
+            }
+            // The action asks for what the execution has already reached: it is admitted,
+            // and there is nothing for it to change.
+            ExecutionUpdate::Pause | ExecutionUpdate::Resume | ExecutionUpdate::SwitchMode(_) => {
+                None
+            }
+        };
+
+        if event.is_some() || comment.is_some() {
+            if let Some(execution) = self.executions.get_mut(key) {
+                execution.updated_at = at;
+                if comment.is_some() {
+                    execution.comment = comment.clone();
+                }
+            }
+        }
+        if let Some(event) = event {
+            self.push_detailed_event(key, event, None, comment, None, at);
+        }
+        ExecutionUpdateOutcome::Applied
+    }
+
     /// Move the step at `index` to `status`, timestamping it, and report its name.
     ///
     /// `startTime` is filled in only when the step carries none: a step the clock stopped
@@ -1206,6 +1432,10 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
     }
 
     /// Append one event, which may name the step it is about and carry a description.
+    ///
+    /// The timeline is bounded by [`MAX_EVENTS_PER_EXECUTION`]: at the ceiling the oldest
+    /// event is dropped, and the oldest one kept is unchained, so what a caller can read
+    /// is always a complete chain.
     pub fn push_detailed_event(
         &mut self,
         key: &(String, String),
@@ -1233,6 +1463,16 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
                 previous_event_id,
             };
             execution.events.push(event);
+            let overflow = execution
+                .events
+                .len()
+                .saturating_sub(MAX_EVENTS_PER_EXECUTION);
+            if overflow > 0 {
+                execution.events.drain(..overflow);
+                if let Some(oldest) = execution.events.first_mut() {
+                    oldest.previous_event_id = None;
+                }
+            }
         }
     }
 

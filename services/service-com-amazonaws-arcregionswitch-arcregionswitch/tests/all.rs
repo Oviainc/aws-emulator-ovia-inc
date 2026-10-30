@@ -23,6 +23,8 @@ mod in_region_unresolvable_plan;
 mod plan_evaluation_status;
 #[path = "all/plan_execution_listing.rs"]
 mod plan_execution_listing;
+#[path = "all/plan_execution_update.rs"]
+mod plan_execution_update;
 #[path = "all/plan_lifecycle.rs"]
 mod plan_lifecycle;
 #[path = "all/plan_update.rs"]

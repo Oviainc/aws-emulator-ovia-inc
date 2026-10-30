@@ -411,6 +411,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             planned_steps,
             events: Vec::new(),
             outcome_due_at: Some(now + crate::state::EXECUTION_START_SPAN),
+            // Nothing has paused it, so there is no state to put it back into and no
+            // remainder to serve: both are what `UpdatePlanExecution`'s `pause` records.
+            resumes_to: None,
+            owed_on_resume: None,
         };
 
         let key = (input.plan_arn.clone(), execution_id.clone());
