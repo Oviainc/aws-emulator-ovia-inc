@@ -174,11 +174,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_due_transitions(now);
 
         // "Before you can delete a gateway, you must deregister its instances and delete
-        // its bridges." Both halves are read off this store: an instance names the gateway
-        // it is registered with on its own record
-        // (`crate::state::StoredGatewayInstance::gateway_arn`), and a bridge names the
+        // its bridges." Both halves are read off this store, through one reading of "its
+        // <children>": an instance names the gateway it is registered with on its own
+        // record (`crate::state::StoredGatewayInstance::gateway_arn`), a bridge names the
         // gateway it is placed on by its placement ARN (`ListedBridge$PlacementArn`: "the
-        // ARN of the gateway associated with the bridge").
+        // ARN of the gateway associated with the bridge"), and a record the service keeps
+        // only so it stays readable in its terminal retired state is no longer one of the
+        // gateway's — see `registered_gateway_instance_count` and `placed_bridge_count`.
         let Some(gateway) = store.gateways.get(&input.gateway_arn) else {
             return Err(DeleteGatewayErrorModeled::NotFoundException(
                 NotFoundException {
@@ -206,11 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            let placed = store
-                .bridges
-                .values()
-                .filter(|bridge| bridge.placement_arn == gateway_arn)
-                .count();
+            let placed = store.placed_bridge_count(&gateway_arn);
             if placed > 0 {
                 return Err(DeleteGatewayErrorModeled::BadRequestException(
                     BadRequestException {

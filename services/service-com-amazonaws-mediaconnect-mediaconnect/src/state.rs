@@ -3393,6 +3393,23 @@ impl StoredBridge {
         }
     }
 
+    /// Whether this bridge is still PLACED on the gateway its placement ARN names, i.e. has
+    /// not reached the terminal [`BRIDGE_STATE_DELETED`].
+    ///
+    /// This is what "the gateway's bridges" means to the operation that counts them —
+    /// DeleteGateway's documented precondition ("before you can delete a gateway, you must
+    /// deregister its instances and delete its bridges"), through
+    /// [`ComAmazonawsMediaconnectMediaconnectState::placed_bridge_count`]. A record the
+    /// service keeps only so it stays readable in its terminal retired state is no longer
+    /// one of its parent's children, exactly as for an instance
+    /// ([`StoredGatewayInstance::is_registered`]) and for a gateway
+    /// ([`ComAmazonawsMediaconnectMediaconnectState::live_gateway_count`]); a bridge whose
+    /// deletion is still in flight ([`BRIDGE_STATE_DELETING`]) has not reached that state,
+    /// so it is still one of them.
+    pub fn is_placed(&self) -> bool {
+        self.bridge_state != BRIDGE_STATE_DELETED
+    }
+
     /// The modelled `Bridge` for this record.
     pub fn to_bridge(&self) -> Bridge {
         Bridge {
@@ -6934,6 +6951,24 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         self.gateway_instances
             .values()
             .filter(|instance| instance.gateway_arn == gateway_arn && instance.is_registered())
+            .count()
+    }
+
+    /// The bridges still PLACED on the gateway `gateway_arn` names — the ones DeleteGateway's
+    /// documented precondition requires to be deleted first ("before you can delete a
+    /// gateway, you must deregister its instances and delete its bridges").
+    ///
+    /// A bridge names the gateway it is placed on by its placement ARN
+    /// (`ListedBridge$PlacementArn`: "the ARN of the gateway associated with the bridge"),
+    /// and a bridge that has reached its terminal `DELETED` state stays readable but is no
+    /// longer one of the gateway's bridges ([`StoredBridge::is_placed`]) — the SAME reading
+    /// of "its <children>" the instance half of that one sentence uses
+    /// ([`Self::registered_gateway_instance_count`]), so the two halves cannot word the
+    /// precondition differently.
+    pub fn placed_bridge_count(&self, gateway_arn: &str) -> usize {
+        self.bridges
+            .values()
+            .filter(|bridge| bridge.placement_arn == gateway_arn && bridge.is_placed())
             .count()
     }
 

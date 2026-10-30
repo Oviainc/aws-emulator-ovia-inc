@@ -223,3 +223,5 @@ mod bridge_deletion_flow_source_integrity;
 mod flow_ndi_discovery_servers;
 #[path = "all/required_query_parameters.rs"]
 mod required_query_parameters;
+#[path = "all/gateway_deletion_counts_placed_bridges.rs"]
+mod gateway_deletion_counts_placed_bridges;
