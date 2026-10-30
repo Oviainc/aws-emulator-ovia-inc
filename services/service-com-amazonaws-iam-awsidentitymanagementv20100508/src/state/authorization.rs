@@ -255,6 +255,9 @@ pub const CREATE_DELEGATION_REQUEST: &str = "iam:CreateDelegationRequest";
 /// `iam:UpdateDelegationRequest`.
 pub const UPDATE_DELEGATION_REQUEST: &str = "iam:UpdateDelegationRequest";
 
+/// `iam:AcceptDelegationRequest`.
+pub const ACCEPT_DELEGATION_REQUEST: &str = "iam:AcceptDelegationRequest";
+
 /// `iam:GenerateOrganizationsAccessReport`.
 pub const GENERATE_ORGANIZATIONS_ACCESS_REPORT: &str = "iam:GenerateOrganizationsAccessReport";
 

@@ -3695,17 +3695,18 @@ pub const ARN_UNPARSEABLE: &str = "Invalid ARN: Could not be parsed!";
 /// [`ARN_UNPARSEABLE`] is.
 pub const ARN_WRONG_RESOURCE_TYPE: &str = "Invalid resource type in ARN";
 
-/// The message a read of a delegation request the account does not hold is refused
-/// with: the entity type that was looked for, then the identifier the request named —
-/// "the error message describes the resource" (`NoSuchEntityException`).
+/// The message a call that cannot resolve a delegation request the account does not hold
+/// is refused with: the entity type that was looked for, then the identifier the request
+/// named — "the error message describes the resource" (`NoSuchEntityException`).
 ///
 /// The delegation-request API family's own wording, which is not the "The &lt;entity&gt;
 /// with name &lt;name&gt; cannot be found." form IAM words its user, role and group
 /// reads with (see `crate::ops::get_human_readable_summary`). Stated ONCE here so the
-/// reads of a delegation request cannot word their refusal two ways; the identifier is
-/// taken from the request. The operations that CHANGE a delegation request word the
-/// entity the other way the family words it
-/// ([`delegation_request_write_not_found_message`]).
+/// operations spelling the entity this way cannot word their refusal two ways; the
+/// identifier is taken from the request. The family words that entity TWO ways and which
+/// one a refusal carries goes by the operation: the reads and the acceptance name it by
+/// the shape, while the update, the rejection, the association and the token send spell it
+/// the other way ([`delegation_request_write_not_found_message`]).
 pub fn delegation_request_not_found_message(delegation_request_id: &str) -> String {
     format!("DelegationRequest not found: {delegation_request_id}")
 }
@@ -3715,12 +3716,12 @@ pub fn delegation_request_not_found_message(delegation_request_id: &str) -> Stri
 /// error message describes the resource" (`NoSuchEntityException`).
 ///
 /// The delegation-request family words that entity two ways, and which one a refusal
-/// carries goes by the operation: the reads name it by the shape
-/// ([`delegation_request_not_found_message`]), while the operations that change a
-/// request — the update, the rejection, the association, the token send — spell it as the
-/// two words recorded for them. Stated ONCE here for the same reason the read's wording
-/// is: those operations cannot word their refusal two ways. The identifier is whatever
-/// the caller sent, and nothing of it is part of the text.
+/// carries goes by the operation: the reads and the acceptance name it by the shape
+/// ([`delegation_request_not_found_message`]), while the update, the rejection, the
+/// association and the token send spell it as the two words recorded for them. Stated ONCE
+/// here for the same reason the other wording is: those operations cannot word their
+/// refusal two ways. The identifier is whatever the caller sent, and nothing of it is part
+/// of the text.
 pub fn delegation_request_write_not_found_message(delegation_request_id: &str) -> String {
     format!("Delegation request not found: {delegation_request_id}")
 }

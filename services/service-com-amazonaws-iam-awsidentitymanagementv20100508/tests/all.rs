@@ -43,6 +43,8 @@ mod change_password;
 mod composed_condition_context;
 #[path = "all/custom_policy_context_keys.rs"]
 mod custom_policy_context_keys;
+#[path = "all/delegation_request_acceptance.rs"]
+mod delegation_request_acceptance;
 #[path = "all/delegation_request_filing.rs"]
 mod delegation_request_filing;
 #[path = "all/delegation_request_listing.rs"]
