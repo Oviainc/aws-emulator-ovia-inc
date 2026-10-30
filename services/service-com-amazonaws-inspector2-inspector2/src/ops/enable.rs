@@ -240,17 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
 
-            accounts.push(Account {
-                account_id,
-                status: enablement.account_status().to_string(),
-                resource_status: ResourceStatus {
-                    ec2: enablement.status_of("EC2").to_string(),
-                    ecr: enablement.status_of("ECR").to_string(),
-                    lambda: Some(enablement.status_of("LAMBDA").to_string()),
-                    lambda_code: Some(enablement.status_of("LAMBDA_CODE").to_string()),
-                    code_repository: Some(enablement.status_of("CODE_REPOSITORY").to_string()),
-                },
-            });
+            accounts.push(crate::state::account_view(&account_id, enablement));
         }
 
         Ok(EnableOutput {

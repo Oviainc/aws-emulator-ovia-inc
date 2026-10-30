@@ -212,6 +212,31 @@ impl AccountEnablement {
         }
     }
 
+    /// Turn every scan type `resource_types` names off for this account.
+    ///
+    /// A scan type the call does not name keeps whatever it had, and the account-level
+    /// `Status` follows the scan types: it stays [`STATUS_ENABLED`] while any scan type is
+    /// still on, and becomes [`STATUS_DISABLED`] once none is, because turning off every
+    /// scan type in an account turns Amazon Inspector itself off for it.
+    pub fn disable(&mut self, resource_types: &[String]) {
+        for resource_type in resource_types {
+            self.resource_status
+                .insert(resource_type.clone(), STATUS_DISABLED.to_string());
+        }
+        let any_on = RESOURCE_SCAN_TYPES
+            .iter()
+            .any(|resource_type| self.status_of(resource_type) == STATUS_ENABLED);
+        if !any_on {
+            self.status = Some(STATUS_DISABLED.to_string());
+            // Amazon Inspector is no longer enabled for the account, so neither the
+            // instant it was enabled at nor the tokens that acknowledged that enablement
+            // describes anything any more: a later `Enable` carrying one of those tokens
+            // asks for a fresh enablement rather than replaying the disabled one.
+            self.enabled_at = None;
+            self.client_tokens.clear();
+        }
+    }
+
     /// Whether this account was already enabled under `token`.
     pub fn has_token(&self, token: &str) -> bool {
         self.client_tokens.iter().any(|seen| seen == token)
@@ -273,6 +298,30 @@ pub struct Ec2DeepInspectionReport {
     pub package_paths: Option<Vec<String>>,
     /// The organization's custom paths, absent when it has none.
     pub org_package_paths: Option<Vec<String>>,
+}
+
+/// One account's enablement as the wire `Account` both `Enable` and `Disable` report: the
+/// account-level `Status` and the per-`ResourceScanType` status map, every modelled scan
+/// type reported, so an account with no record reports every scan off rather than leaving
+/// a type out.
+///
+/// Source: `smithy_query(query="shape", shape="Account,ResourceStatus")` — `ec2` and `ecr`
+/// are required members, the other three optional.
+pub fn account_view(
+    account_id: &str,
+    enablement: &AccountEnablement,
+) -> crate::ops::types::Account {
+    crate::ops::types::Account {
+        account_id: account_id.to_string(),
+        status: enablement.account_status().to_string(),
+        resource_status: crate::ops::types::ResourceStatus {
+            ec2: enablement.status_of("EC2").to_string(),
+            ecr: enablement.status_of("ECR").to_string(),
+            lambda: Some(enablement.status_of("LAMBDA").to_string()),
+            lambda_code: Some(enablement.status_of("LAMBDA_CODE").to_string()),
+            code_repository: Some(enablement.status_of("CODE_REPOSITORY").to_string()),
+        },
+    }
 }
 
 /// Render a stored `PathList` for the wire: the paths when any are configured, and the
