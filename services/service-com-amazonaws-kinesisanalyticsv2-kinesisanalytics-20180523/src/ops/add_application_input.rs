@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddApplicationInput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddApplicationInput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddApplicationInput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: adds a streaming source to a SQL-based application's stored configuration
+//! and answers with the input descriptions it now carries. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +158,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddApplicationInput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddApplicationInputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddApplicationInput"))
+        let _ = ctx;
+        // Every modelled constraint on the input — `ApplicationName`'s length and
+        // `^[a-zA-Z0-9_.-]+$` pattern, `CurrentApplicationVersionId`'s 1..999999999 range
+        // and the required members of `Input` — is refused at the boundary with HTTP 400
+        // before this handler runs, so reaching here means the request satisfies them.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AddApplicationInputErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "this service is not mounted on a stateful engine, so no \
+                         application input can be stored"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.application_name.clone();
+        let now = crate::state::now_timestamp();
+
+        let mut store = state.lock();
+        store.settle_named(&name);
+
+        let Some(application) = store.applications.get(&name) else {
+            return Err(AddApplicationInputErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::missing_application_message(&name)),
+                },
+            )
+            .into());
+        };
+        let runtime_environment = application.runtime_environment.clone();
+        let arn = application.arn.clone();
+        let stored_version = application.version_id;
+        let stored_inputs = application
+            .configuration
+            .as_ref()
+            .and_then(|cfg| cfg.sql_application_configuration_description.as_ref())
+            .and_then(|sql| sql.input_descriptions.as_ref())
+            .map_or(0, Vec::len);
+
+        // A streaming source is part of a SQL application's configuration: this operation
+        // "adds a streaming source to your SQL-based Kinesis Data Analytics application"
+        // (its own doc), and an application of any other runtime family processes records
+        // with the code it runs rather than with SQL, so there is no SQL configuration on
+        // it for an input to join. The refusal is about the runtime the STORED application
+        // declares, not about anything in the request, and it is checked before the
+        // version token because it holds for every version that application will ever be
+        // on.
+        if !crate::state::is_sql_runtime(&runtime_environment) {
+            return Err(AddApplicationInputErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(
+                        "You cannot add sql configuration to a Flink application."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The optimistic-concurrency token: a configuration update is accepted only
+        // against the version the application is on NOW, so a caller replaying a consumed
+        // version id is refused rather than silently overwriting whatever landed since.
+        if input.current_application_version_id != stored_version {
+            return Err(
+                AddApplicationInputErrorModeled::ConcurrentModificationException(
+                    ConcurrentModificationException {
+                        message: Some(crate::state::STALE_VERSION_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A SQL application reads from ONE streaming source, so the application that
+        // already has one is not a valid argument to add another to — and this is also
+        // what bounds the input list a caller can grow by calling this operation: the
+        // stored application accepts at most `MAX_STREAMING_SOURCES` of them.
+        if stored_inputs >= MAX_STREAMING_SOURCES {
+            return Err(AddApplicationInputErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(format!(
+                        "Application {name} already has a streaming source. A SQL-based \
+                         application supports only one streaming source."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Accepted: the input is described with the id and the in-app stream names the
+        // service assigns it, stored on the application's SQL configuration, and the
+        // application is moved on to a new version — which is what "any configuration
+        // update … results in a new version of the application" means.
+        let Some((application_version_id, input_descriptions)) =
+            store.add_input(&name, &input.input, now)
+        else {
+            return Err(AddApplicationInputErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::missing_application_message(&name)),
+                },
+            )
+            .into());
+        };
+
+        // Answered out of the store, so what the caller receives is exactly what a later
+        // DescribeApplication will report.
+        Ok(AddApplicationInputOutput {
+            application_arn: Some(arn),
+            application_version_id: Some(application_version_id),
+            input_descriptions: Some(input_descriptions),
+        })
     }
 }
+
+/// How many streaming sources one SQL-based application reads from: "You can add a
+/// streaming source either with the `CreateApplication` or the `AddApplicationInput`
+/// operation" and an application has one of them, which is why the model gives this
+/// operation a single `Input` member rather than a list.
+const MAX_STREAMING_SOURCES: usize = 1;

@@ -27,7 +27,7 @@ use crate::ops::types::{
     CatalogConfigurationDescription, CheckpointConfigurationDescription, CodeContentDescription,
     CustomArtifactConfigurationDescription, DeployAsApplicationConfigurationDescription,
     EnvironmentPropertyDescriptions, FlinkApplicationConfigurationDescription,
-    GlueDataCatalogConfigurationDescription, InputDescription,
+    GlueDataCatalogConfigurationDescription, Input, InputDescription,
     InputProcessingConfigurationDescription, InputLambdaProcessorDescription,
     KinesisFirehoseInputDescription, KinesisFirehoseOutputDescription,
     KinesisStreamsInputDescription, KinesisStreamsOutputDescription, LambdaOutputDescription,
@@ -157,6 +157,9 @@ pub struct Application {
     /// The status change the clock owes, while one is outstanding.
     pub pending: Option<PendingTransition>,
     pub version_id: i64,
+    /// The version this application was on before the latest configuration update, while
+    /// one has landed: `ApplicationVersionUpdatedFrom`.
+    pub version_updated_from: Option<i64>,
     pub create_timestamp: DateTime,
     /// When the current application version was created; equal to `create_timestamp`
     /// until an operation that mints a new version lands.
@@ -244,8 +247,11 @@ impl Application {
             // UpdateApplicationMaintenanceConfiguration is still scaffolded, so no
             // maintenance window has ever been set on a stored application.
             application_maintenance_configuration_description: None,
-            // Only an update or a rollback fills these; neither is in this slice.
-            application_version_updated_from: None,
+            // The version an accepted configuration update moved this application on
+            // from, as [`ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State::advance_version`]
+            // recorded it.
+            application_version_updated_from: self.version_updated_from,
+            // Only a rollback fills this, and RollbackApplication is not in this slice.
             application_version_rolled_back_from: None,
             application_version_create_timestamp: Some(self.version_create_timestamp),
             conditional_token: self.conditional_token.clone(),
@@ -418,10 +424,125 @@ impl ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State {
         }
     }
 
-    /// The `ApplicationConfigurationDescription` for a configuration supplied to
-    /// `CreateApplication`: every member the creator set, plus the ids and derived
-    /// values the service assigns.
+    /// Record a new version of `application` and return it.
+    ///
+    /// Every accepted configuration update results in a new version of the application
+    /// (the `AddApplicationInput` doc says so for adding a streaming source, and
+    /// `ApplicationDetail$ApplicationVersionId` states it for the API as a whole), so the
+    /// version the caller's next optimistic-concurrency token must carry advances by one,
+    /// the version it moved on from is remembered as `ApplicationVersionUpdatedFrom`, and
+    /// the `ConditionalToken` — which names the CURRENT version — is minted afresh.
+    ///
+    /// Answers `None` when no application is stored under `application`, so a caller
+    /// cannot read a version that was never recorded.
+    pub fn advance_version(&mut self, application: &str, now: DateTime) -> Option<i64> {
+        let conditional_token = self.mint_id("ConditionalToken");
+        let app = self.applications.get_mut(application)?;
+        app.version_updated_from = Some(app.version_id);
+        app.version_id += 1;
+        app.version_create_timestamp = now;
+        app.last_update_timestamp = Some(now);
+        app.conditional_token = Some(conditional_token);
+        Some(app.version_id)
+    }
+
+    /// Store `input` as `application`'s streaming source and move the application on to a
+    /// new version; answers that version and the input descriptions it now carries.
+    ///
+    /// The whole accepted mutation of `AddApplicationInput`, in one place beside the other
+    /// writers of this store: the description (with the id and in-app stream names the
+    /// service assigns), the version advance, and the answer read back out of what was
+    /// stored. `None` when no application is stored under `application`.
+    pub fn add_input(
+        &mut self,
+        application: &str,
+        input: &Input,
+        now: DateTime,
+    ) -> Option<(i64, Vec<InputDescription>)> {
+        let description = self.describe_input(input);
+        let version_id = self.advance_version(application, now)?;
+        let app = self.applications.get_mut(application)?;
+        let descriptions = app
+            .configuration
+            .get_or_insert_with(ApplicationConfigurationDescription::default)
+            .sql_application_configuration_description
+            .get_or_insert_with(SqlApplicationConfigurationDescription::default)
+            .input_descriptions
+            .get_or_insert_with(Vec::new);
+        descriptions.push(description);
+        Some((version_id, descriptions.clone()))
+    }
+
+    /// The `ApplicationConfigurationDescription` an application RUNS under: every member
+    /// the creator set, plus the ids and derived values the service assigns, completed
+    /// with the service defaults for everything the request left out
+    /// ([`complete_with_service_defaults`]).
+    ///
+    /// `cfg` is `None` when the request carried no `ApplicationConfiguration` at all,
+    /// which is not an application with no configuration: the service still runs it under
+    /// its defaults, so the description is materialised either way.
     pub fn describe_configuration(
+        &mut self,
+        cfg: Option<&ApplicationConfiguration>,
+        runtime_environment: &str,
+    ) -> ApplicationConfigurationDescription {
+        let mut description = match cfg {
+            Some(cfg) => self.describe_supplied_configuration(cfg),
+            None => ApplicationConfigurationDescription::default(),
+        };
+        complete_with_service_defaults(&mut description, runtime_environment);
+        description
+    }
+
+    /// The description of one streaming source, with the id and the in-app stream names
+    /// the service assigns it.
+    ///
+    /// Shared by `CreateApplication`'s `SqlApplicationConfiguration` and by
+    /// `AddApplicationInput`, so an input added after the fact is described exactly like
+    /// one supplied at create time.
+    pub fn describe_input(&mut self, input: &Input) -> InputDescription {
+        InputDescription {
+            input_id: Some(self.mint_id("Input")),
+            name_prefix: Some(input.name_prefix.clone()),
+            in_app_stream_names: in_app_stream_names(
+                &input.name_prefix,
+                input
+                    .input_parallelism
+                    .as_ref()
+                    .and_then(|p| p.count)
+                    .unwrap_or(1),
+            ),
+            input_processing_configuration_description: input
+                .input_processing_configuration
+                .as_ref()
+                .map(|ipc| InputProcessingConfigurationDescription {
+                    input_lambda_processor_description: Some(InputLambdaProcessorDescription {
+                        resource_arn: ipc.input_lambda_processor.resource_arn.clone(),
+                        role_arn: None,
+                    }),
+                }),
+            kinesis_streams_input_description: input.kinesis_streams_input.as_ref().map(|k| {
+                KinesisStreamsInputDescription {
+                    resource_arn: k.resource_arn.clone(),
+                    role_arn: None,
+                }
+            }),
+            kinesis_firehose_input_description: input.kinesis_firehose_input.as_ref().map(|k| {
+                KinesisFirehoseInputDescription {
+                    resource_arn: k.resource_arn.clone(),
+                    role_arn: None,
+                }
+            }),
+            input_schema: Some(input.input_schema.clone()),
+            input_parallelism: input.input_parallelism.clone(),
+            // Set by the RunConfiguration a StartApplication call carries.
+            input_starting_position_configuration: None,
+        }
+    }
+
+    /// The description of the members a request actually supplied, before the service
+    /// defaults complete it.
+    fn describe_supplied_configuration(
         &mut self,
         cfg: &ApplicationConfiguration,
     ) -> ApplicationConfigurationDescription {
@@ -430,50 +551,7 @@ impl ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State {
                 input_descriptions: sql.inputs.as_ref().map(|inputs| {
                     inputs
                         .iter()
-                        .map(|input| InputDescription {
-                            input_id: Some(self.mint_id("Input")),
-                            name_prefix: Some(input.name_prefix.clone()),
-                            in_app_stream_names: in_app_stream_names(
-                                &input.name_prefix,
-                                input
-                                    .input_parallelism
-                                    .as_ref()
-                                    .and_then(|p| p.count)
-                                    .unwrap_or(1),
-                            ),
-                            input_processing_configuration_description: input
-                                .input_processing_configuration
-                                .as_ref()
-                                .map(|ipc| InputProcessingConfigurationDescription {
-                                    input_lambda_processor_description: Some(
-                                        InputLambdaProcessorDescription {
-                                            resource_arn: ipc
-                                                .input_lambda_processor
-                                                .resource_arn
-                                                .clone(),
-                                            role_arn: None,
-                                        },
-                                    ),
-                                }),
-                            kinesis_streams_input_description: input
-                                .kinesis_streams_input
-                                .as_ref()
-                                .map(|k| KinesisStreamsInputDescription {
-                                    resource_arn: k.resource_arn.clone(),
-                                    role_arn: None,
-                                }),
-                            kinesis_firehose_input_description: input
-                                .kinesis_firehose_input
-                                .as_ref()
-                                .map(|k| KinesisFirehoseInputDescription {
-                                    resource_arn: k.resource_arn.clone(),
-                                    role_arn: None,
-                                }),
-                            input_schema: Some(input.input_schema.clone()),
-                            input_parallelism: input.input_parallelism.clone(),
-                            // Set by the RunConfiguration a StartApplication call carries.
-                            input_starting_position_configuration: None,
-                        })
+                        .map(|input| self.describe_input(input))
                         .collect()
                 }),
                 output_descriptions: sql.outputs.as_ref().map(|outputs| {
@@ -707,6 +785,228 @@ impl ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State {
             .collect()
     }
 }
+
+/// The two `ConfigurationType` values, spelled as the model's enum spells them
+/// (`smithy_query(query="shape",shape="ConfigurationType")`).
+const CONFIGURATION_DEFAULT: &str = "DEFAULT";
+const CONFIGURATION_CUSTOM: &str = "CUSTOM";
+
+/// The checkpointing values a `DEFAULT` checkpoint configuration runs with, from the
+/// `CheckpointConfiguration$ConfigurationType` doc: "If this value is set to `DEFAULT`,
+/// the application will use the following values, even if they are set to other values
+/// using APIs or application code: CheckpointingEnabled true, CheckpointInterval 60000,
+/// MinPauseBetweenCheckpoints 5000".
+const DEFAULT_CHECKPOINTING_ENABLED: bool = true;
+/// See [`DEFAULT_CHECKPOINTING_ENABLED`]; milliseconds, as the member is documented.
+const DEFAULT_CHECKPOINT_INTERVAL: i64 = 60_000;
+/// See [`DEFAULT_CHECKPOINTING_ENABLED`]; milliseconds, as the member is documented.
+const DEFAULT_MIN_PAUSE_BETWEEN_CHECKPOINTS: i64 = 5_000;
+
+/// The CloudWatch logging a `DEFAULT` monitoring configuration runs with: the service's
+/// own published defaults for the two members `CUSTOM` is required to set
+/// (`MonitoringConfiguration$ConfigurationType`), each a value of its modelled enum
+/// (`smithy_query(query="shape",shape="MetricsLevel")` / `shape="LogLevel"`).
+const DEFAULT_METRICS_LEVEL: &str = "APPLICATION";
+/// See [`DEFAULT_METRICS_LEVEL`].
+const DEFAULT_LOG_LEVEL: &str = "INFO";
+
+/// The parallelism a `DEFAULT` parallelism configuration runs with: the service's own
+/// published defaults for the three members `CUSTOM` is required to set
+/// (`ParallelismConfiguration$ConfigurationType`) — one parallel task, one task per KPU,
+/// and the service free to scale the application out in response to load.
+const DEFAULT_PARALLELISM: i32 = 1;
+/// See [`DEFAULT_PARALLELISM`].
+const DEFAULT_PARALLELISM_PER_KPU: i32 = 1;
+/// See [`DEFAULT_PARALLELISM`].
+const DEFAULT_AUTO_SCALING_ENABLED: bool = true;
+
+/// Snapshots are taken for an application whose creator said nothing about them: the
+/// service's default for `ApplicationSnapshotConfiguration$SnapshotsEnabled`.
+const DEFAULT_SNAPSHOTS_ENABLED: bool = true;
+
+/// The service does not roll an application back on its own unless its creator asked for
+/// it: the default for `ApplicationSystemRollbackConfiguration$RollbackEnabled`.
+const DEFAULT_ROLLBACK_ENABLED: bool = false;
+
+/// An application whose creator named no KMS key is encrypted at rest under the key AWS
+/// owns, which is the `KeyType` value the model declares for it
+/// (`smithy_query(query="shape",shape="KeyType")`). No key id is reported with it,
+/// because the caller has no key of their own to name.
+const DEFAULT_KEY_TYPE: &str = "AWS_OWNED_KEY";
+
+/// Complete `description` with the configuration the service runs an application under
+/// when the request said nothing about it.
+///
+/// The rule: an application is always RUNNING under a full configuration, so every
+/// sub-configuration that applies to its runtime is described — with `ConfigurationType`
+/// `DEFAULT` and the documented default values where the request supplied none — and a
+/// sub-configuration the request marked `DEFAULT` is described with those same defaults
+/// whatever else it carried, which is what `ConfigurationType` `DEFAULT` MEANS. Only a
+/// `CUSTOM` sub-configuration reports the caller's values, and the members it left unset
+/// still report the defaults the service applies to them.
+fn complete_with_service_defaults(
+    description: &mut ApplicationConfigurationDescription,
+    runtime_environment: &str,
+) {
+    // Every runtime family this API still creates applications for runs on Apache Flink
+    // (`FLINK-` directly, `ZEPPELIN-FLINK-` as a Studio notebook), so all of them run
+    // under a Flink configuration. A SQL application does not: its processing is
+    // configured by its SQL configuration, so it is described with whatever Flink
+    // configuration it was given and nothing is invented for it.
+    if !is_sql_runtime(runtime_environment)
+        || description
+            .flink_application_configuration_description
+            .is_some()
+    {
+        let flink = description
+            .flink_application_configuration_description
+            .get_or_insert_with(FlinkApplicationConfigurationDescription::default);
+        complete_checkpoint_configuration(
+            flink
+                .checkpoint_configuration_description
+                .get_or_insert_with(CheckpointConfigurationDescription::default),
+        );
+        complete_monitoring_configuration(
+            flink
+                .monitoring_configuration_description
+                .get_or_insert_with(MonitoringConfigurationDescription::default),
+        );
+        complete_parallelism_configuration(
+            flink
+                .parallelism_configuration_description
+                .get_or_insert_with(ParallelismConfigurationDescription::default),
+        );
+    }
+
+    if description
+        .application_snapshot_configuration_description
+        .is_none()
+    {
+        description.application_snapshot_configuration_description =
+            Some(ApplicationSnapshotConfigurationDescription {
+                snapshots_enabled: DEFAULT_SNAPSHOTS_ENABLED,
+            });
+    }
+    if description
+        .application_system_rollback_configuration_description
+        .is_none()
+    {
+        description.application_system_rollback_configuration_description =
+            Some(ApplicationSystemRollbackConfigurationDescription {
+                rollback_enabled: DEFAULT_ROLLBACK_ENABLED,
+            });
+    }
+    if description
+        .application_encryption_configuration_description
+        .is_none()
+    {
+        description.application_encryption_configuration_description =
+            Some(ApplicationEncryptionConfigurationDescription {
+                key_id: None,
+                key_type: DEFAULT_KEY_TYPE.to_string(),
+            });
+    }
+}
+
+/// Whether a sub-configuration described with `configuration_type` is the caller's own:
+/// `CUSTOM` is, and anything else — `DEFAULT`, or no type at all because the request
+/// supplied no such sub-configuration — runs on the service's defaults.
+fn is_custom(configuration_type: Option<&String>) -> bool {
+    configuration_type.map(String::as_str) == Some(CONFIGURATION_CUSTOM)
+}
+
+/// See [`complete_with_service_defaults`].
+fn complete_checkpoint_configuration(description: &mut CheckpointConfigurationDescription) {
+    if !is_custom(description.configuration_type.as_ref()) {
+        *description = CheckpointConfigurationDescription {
+            configuration_type: Some(CONFIGURATION_DEFAULT.to_string()),
+            checkpointing_enabled: Some(DEFAULT_CHECKPOINTING_ENABLED),
+            checkpoint_interval: Some(DEFAULT_CHECKPOINT_INTERVAL),
+            min_pause_between_checkpoints: Some(DEFAULT_MIN_PAUSE_BETWEEN_CHECKPOINTS),
+        };
+        return;
+    }
+    description.checkpointing_enabled = description
+        .checkpointing_enabled
+        .or(Some(DEFAULT_CHECKPOINTING_ENABLED));
+    description.checkpoint_interval = description
+        .checkpoint_interval
+        .or(Some(DEFAULT_CHECKPOINT_INTERVAL));
+    description.min_pause_between_checkpoints = description
+        .min_pause_between_checkpoints
+        .or(Some(DEFAULT_MIN_PAUSE_BETWEEN_CHECKPOINTS));
+}
+
+/// See [`complete_with_service_defaults`].
+fn complete_monitoring_configuration(description: &mut MonitoringConfigurationDescription) {
+    if !is_custom(description.configuration_type.as_ref()) {
+        *description = MonitoringConfigurationDescription {
+            configuration_type: Some(CONFIGURATION_DEFAULT.to_string()),
+            metrics_level: Some(DEFAULT_METRICS_LEVEL.to_string()),
+            log_level: Some(DEFAULT_LOG_LEVEL.to_string()),
+        };
+        return;
+    }
+    description.metrics_level = description
+        .metrics_level
+        .take()
+        .or_else(|| Some(DEFAULT_METRICS_LEVEL.to_string()));
+    description.log_level = description
+        .log_level
+        .take()
+        .or_else(|| Some(DEFAULT_LOG_LEVEL.to_string()));
+}
+
+/// See [`complete_with_service_defaults`]. `CurrentParallelism` is the parallelism in
+/// force right now, which is the configured one until autoscaling moves it, and
+/// autoscaling is not modelled.
+fn complete_parallelism_configuration(description: &mut ParallelismConfigurationDescription) {
+    if !is_custom(description.configuration_type.as_ref()) {
+        *description = ParallelismConfigurationDescription {
+            configuration_type: Some(CONFIGURATION_DEFAULT.to_string()),
+            parallelism: Some(DEFAULT_PARALLELISM),
+            parallelism_per_kpu: Some(DEFAULT_PARALLELISM_PER_KPU),
+            current_parallelism: Some(DEFAULT_PARALLELISM),
+            auto_scaling_enabled: Some(DEFAULT_AUTO_SCALING_ENABLED),
+        };
+        return;
+    }
+    description.parallelism = description.parallelism.or(Some(DEFAULT_PARALLELISM));
+    description.parallelism_per_kpu = description
+        .parallelism_per_kpu
+        .or(Some(DEFAULT_PARALLELISM_PER_KPU));
+    description.current_parallelism = description.current_parallelism.or(description.parallelism);
+    description.auto_scaling_enabled = description
+        .auto_scaling_enabled
+        .or(Some(DEFAULT_AUTO_SCALING_ENABLED));
+}
+
+/// The `RuntimeEnvironment` family that names a SQL application, as the enum spells its
+/// members (`smithy_query(query="shape",shape="RuntimeEnvironment")`: the SQL family is
+/// `SQL-<major>_<minor>`, today `SQL-1_0`, beside the `FLINK-` and `ZEPPELIN-FLINK-`
+/// families).
+const SQL_RUNTIME_FAMILY: &str = "SQL-";
+
+/// Whether `runtime` names a SQL application's runtime — any version of that family, not
+/// one spelled-out value, so a later enum member of the same family is read the same way.
+///
+/// The value reaching here is either one the enum admits (the boundary validator refuses
+/// anything else on the way in) or one read back off a stored application, and the enum's
+/// members are the exact strings a client sends, so the comparison is on those bytes.
+pub fn is_sql_runtime(runtime: &str) -> bool {
+    runtime.starts_with(SQL_RUNTIME_FAMILY)
+}
+
+/// How this service words a request whose `CurrentApplicationVersionId` is not the
+/// version the application is on now.
+///
+/// One wording for every operation that carries that optimistic-concurrency token, so
+/// two operations cannot report the same stale token differently. The sentence is entirely
+/// fixed text for this error class: naming the version the caller sent, or the one the
+/// application is on, would hand a client a way to guess its way past the check.
+pub const STALE_VERSION_MESSAGE: &str =
+    "The provided application version ID does not match the most recent version for the \
+     application.";
 
 /// The current wall-clock instant as a modelled timestamp, truncated to whole seconds.
 ///

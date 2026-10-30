@@ -21,5 +21,7 @@ mod harness;
 mod modeled_client_errors;
 #[path = "all/ops_name_bindings.rs"]
 mod ops_name_bindings;
+#[path = "all/sql_input_and_configuration_defaults.rs"]
+mod sql_input_and_configuration_defaults;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

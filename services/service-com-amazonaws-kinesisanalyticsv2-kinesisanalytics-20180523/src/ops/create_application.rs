@@ -198,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // can still be read and run, while a create naming it is refused with the
         // modelled `UnsupportedOperationException` (HTTP 400). Checked before anything is
         // looked up or stored, because it is a property of the request alone.
-        if is_sql_runtime(&input.runtime_environment) {
+        if crate::state::is_sql_runtime(&input.runtime_environment) {
             return Err(
                 CreateApplicationErrorModeled::UnsupportedOperationException(
                     UnsupportedOperationException {
@@ -262,10 +262,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let configuration = input
-            .application_configuration
-            .as_ref()
-            .map(|cfg| store.describe_configuration(cfg));
+        // An application always RUNS under a full configuration, so the description is
+        // materialised whether or not this request carried one: `describe_configuration`
+        // completes whatever the creator supplied with the service's defaults.
+        let configuration = Some(store.describe_configuration(
+            input.application_configuration.as_ref(),
+            &input.runtime_environment,
+        ));
         let cloud_watch_logging_options = input
             .cloud_watch_logging_options
             .as_deref()
@@ -285,6 +288,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::STATUS_READY.to_string(),
             pending: None,
             version_id: 1,
+            // No update has landed on an application this call just created.
+            version_updated_from: None,
             create_timestamp: now,
             version_create_timestamp: now,
             last_update_timestamp: None,
@@ -315,19 +320,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The ceiling on user-defined application tags, from the `CreateApplication$Tags` and
 /// `TooManyTagsException` docs: "the maximum number of user-defined application tags is 50".
 const MAX_USER_TAGS: usize = 50;
-
-/// The `RuntimeEnvironment` family that names a SQL application, as the enum spells its
-/// members (`smithy_query(query="shape",shape="RuntimeEnvironment")`: the SQL family is
-/// `SQL-<major>_<minor>`, today `SQL-1_0`, beside the `FLINK-` and `ZEPPELIN-FLINK-`
-/// families).
-const SQL_RUNTIME_FAMILY: &str = "SQL-";
-
-/// Whether `runtime` names a SQL application's runtime — any version of that family, not
-/// one spelled-out value, so a later enum member of the same family is read the same way.
-///
-/// The value reaching here is already one the enum admits (the boundary validator refuses
-/// anything else), and the enum's members are the exact strings a client sends, so the
-/// comparison is on those bytes.
-fn is_sql_runtime(runtime: &str) -> bool {
-    runtime.starts_with(SQL_RUNTIME_FAMILY)
-}
