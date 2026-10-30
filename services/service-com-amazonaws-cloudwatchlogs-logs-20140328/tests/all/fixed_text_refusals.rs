@@ -7,8 +7,7 @@
 //!   document addressed by the identifier of the log group it is attached to and by nothing
 //!   else — is refused with the service's own missing-resource text, naming neither the log
 //!   group, nor a policy name, nor a word for the kind of resource (`DeleteIndexPolicy`,
-//!   `GetDataProtectionPolicy` / `DeleteDataProtectionPolicy`, `GetTransformer` /
-//!   `DeleteTransformer`);
+//!   `GetDataProtectionPolicy` / `DeleteDataProtectionPolicy`, `DeleteTransformer`);
 //! * an `expectedRevisionId` that IS a revision the service issued and a later write
 //!   superseded is refused as a conflict against the resource the caller is to re-read and
 //!   retry, naming neither the revision presented, nor the stored one, nor the policy's name
@@ -111,7 +110,10 @@ fn rows() -> Vec<Row> {
             document: json!({
                 "transformerConfig": [{"parseJSON": {"source": "@message", "destination": "parsed"}}],
             }),
-            readers: &["GetTransformer"],
+            // `GetTransformer` is NOT a refusing reader of this resource: a group that has
+            // had no transformer created reports an empty `transformerConfig`, which
+            // `tests/all/transformers.rs` is about.
+            readers: &[],
             delete: "DeleteTransformer",
         },
     ]

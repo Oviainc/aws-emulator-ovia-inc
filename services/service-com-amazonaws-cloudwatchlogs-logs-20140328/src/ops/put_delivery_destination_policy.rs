@@ -6,8 +6,12 @@
 //! destination holds exactly that policy afterwards and a later assignment replaces it.
 //! The policy is stored on the destination it is assigned to
 //! (`crate::state::DeliveryDestinationRecord::policy`) — nothing but that destination names
-//! one — and the policy this call reports is read back out of the store, so
-//! `GetDeliveryDestinationPolicy` reports the same contents.
+//! one — and the policy this call reports is the document the request assigned.
+//!
+//! What is STORED is the policy DOCUMENT rather than the bytes the caller's renderer
+//! produced: the service reads the document and writes it back out, so the whitespace between
+//! its JSON tokens is not part of what a later read reports
+//! ([`service_common::json_document::minified`]).
 //!
 //! ## Shape of an operation
 //!
@@ -162,20 +166,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request was signed for holds under that name.
         let region = crate::state::request_region(ctx.parts());
 
-        // "Creates and assigns an IAM policy": an IAM policy is a JSON document, so a
-        // `deliveryDestinationPolicy` that is not a JSON object is not one. Its statements
-        // are not interpreted here — they govern a cross-account delivery nothing in this
-        // store performs — so the document is kept and reported verbatim.
-        if !::serde_json::from_str::<::serde_json::Value>(&input.delivery_destination_policy)
-            .is_ok_and(|document| document.is_object())
-        {
+        // "Creates and assigns an IAM policy": an IAM policy is a JSON document, and this one
+        // is the policy that "allows delivery to that destination", whose contents "must
+        // include two statements. One statement enables general logs delivery, and the other
+        // allows delivery to the chosen destination" — so a document that is not such a
+        // policy is refused rather than assigned
+        // ([`crate::state::is_delivery_destination_policy`]). What those statements SAY is not
+        // interpreted here: they govern a cross-account delivery nothing in this store
+        // performs, so the document's CONTENT is kept as it arrived.
+        if !crate::state::is_delivery_destination_policy(&input.delivery_destination_policy) {
             return Err(
                 PutDeliveryDestinationPolicyErrorModeled::ValidationException(
                     ValidationException {
                         message: Some(
-                            "deliveryDestinationPolicy must be an IAM policy document \
-                             (a JSON object)"
-                                .to_string(),
+                            crate::state::INVALID_DELIVERY_DESTINATION_POLICY_MESSAGE.to_string(),
                         ),
                     },
                 )
@@ -214,15 +218,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A destination holds at most one delivery destination policy, so assigning one
         // REPLACES whatever it held: the contents assigned last are the contents every later
-        // reader sees.
-        destination.policy = Some(input.delivery_destination_policy);
+        // reader sees. The document is stored as the service reads it — its members and their
+        // values in the order and spelling they arrived in, and none of the whitespace BETWEEN
+        // its JSON tokens, which belongs to the caller's rendering rather than to the policy.
+        let assigned = input.delivery_destination_policy;
+        destination.policy = Some(::service_common::json_document::minified(&assigned));
 
         Ok(PutDeliveryDestinationPolicyOutput {
-            // "The contents of the policy that you just created" — read back off the stored
-            // destination, so what this call reports is what `GetDeliveryDestinationPolicy`
-            // reports afterwards.
+            // "The contents of the policy that you just created" — the document this call
+            // assigned, as the request wrote it, which is what the recorded answer to an
+            // assignment carries: the recording of this operation reports back the spacing
+            // the request's own document was written with, while the read that follows it
+            // reports the stored form. So the STORED form is the same document with its
+            // insignificant whitespace gone — what every later read of it reports — and the
+            // spelling a caller used is this one answer's, not the policy's.
             policy: Some(Policy {
-                delivery_destination_policy: destination.policy.clone(),
+                delivery_destination_policy: Some(assigned),
             }),
         })
     }

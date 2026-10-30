@@ -9,7 +9,10 @@
 //! interpolates the value submitted there, nor a `null` for a member the request did not
 //! carry at all (the recorded `PutStorageTierPolicy` refusal for an absent `storageTier`
 //! states `Value at 'storageTier' … Member must not be null`). An enum's value set is
-//! listed in ascending order of its values. The CODE such a refusal carries is the one the
+//! listed in ascending order of its values, and a `@pattern` is stated as AWS publishes the
+//! expression for that shape — the model's expression, except for a shape whose published
+//! form drops its `^`…`$` anchors ([`DELIVERY_SOURCE_NAME_PATTERN`]). The CODE such a
+//! refusal carries is the one the
 //! served operation declares, which `tests/all/refusal_error_codes.rs` is about: the
 //! delivery and S3-table-source operations below declare `ValidationException`, while
 //! `CreateLogGroup` and `DescribeLogGroups` declare `InvalidParameterException`.
@@ -59,6 +62,14 @@ const INVALID_PARAMETER: &str = "InvalidParameterException";
 /// `DeleteDelivery.id` and `UpdateDeliveryConfiguration.id`.
 const DELIVERY_ID_PATTERN: &str =
     "Member must satisfy regular expression pattern: ^[0-9A-Za-z]+$";
+
+/// The clause `DeliverySourceName`'s `@pattern` states. The model's `DeliverySourceName`
+/// shape carries `@length` 1..60 and `@pattern ^[\w-]*$`, and the expression AWS publishes
+/// for that shape is the same one UNANCHORED, which is the form its recorded refusal states.
+/// Reached by `name` of the four delivery-source operations and by
+/// `CreateDelivery.deliverySourceName`.
+const DELIVERY_SOURCE_NAME_PATTERN: &str =
+    "Member must satisfy regular expression pattern: [\\w-]*";
 
 /// The envelope one refused clause is wrapped in.
 fn one(clause: &str) -> String {
@@ -158,10 +169,7 @@ fn cases() -> Vec<Case> {
                 "logType": "WAFLOGS",
             }),
             code: VALIDATION,
-            message: at(
-                "name",
-                "Member must satisfy regular expression pattern: ^[\\w-]*$",
-            ),
+            message: at("name", DELIVERY_SOURCE_NAME_PATTERN),
         },
         Case {
             name: "PutDeliverySource name one character past the maximum length",

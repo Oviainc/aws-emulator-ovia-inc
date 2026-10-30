@@ -265,9 +265,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateLookupTableErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
-                        // The wording `CreateLogGroup` already refuses a name the account
-                        // holds with, naming the resource kind that already exists.
-                        message: Some("The specified lookup table already exists".to_string()),
+                        // The sentence states WHICH table collided and in WHICH account it is
+                        // already held, the two variable parts the mirror refusal of a table
+                        // the account does NOT hold states as well
+                        // ([`crate::state::lookup_table_not_found_message`]).
+                        message: Some(crate::state::lookup_table_already_exists_message(
+                            &input.lookup_table_name,
+                            ::engine::emulator_account_id(),
+                        )),
                     },
                 )
                 .into(),

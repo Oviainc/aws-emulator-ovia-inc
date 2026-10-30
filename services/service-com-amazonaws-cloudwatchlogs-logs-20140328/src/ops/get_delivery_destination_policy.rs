@@ -2,8 +2,10 @@
 
 //! @op GetDeliveryDestinationPolicy
 //!
-//! REPORTS the delivery destination policy assigned to the destination the request names, so
-//! a destination no policy has been assigned to reports none at all. Nothing is written.
+//! REPORTS the delivery destination policy assigned to the destination the request names. The
+//! output member `policy` is the modelled `Policy` STRUCTURE, whose single member carries the
+//! policy contents, so a destination no policy has been assigned to reports that structure
+//! EMPTY rather than no structure at all. Nothing is written.
 //!
 //! The policy lives on the destination it is assigned to
 //! (`crate::state::DeliveryDestinationRecord::policy`), which is where
@@ -175,10 +177,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetDeliveryDestinationPolicyOutput {
             // "The IAM policy for this delivery destination" — the contents the last
-            // assignment stored, and no `policy` at all for a destination that exists but has
-            // had none assigned.
-            policy: destination.policy.clone().map(|delivery_destination_policy| Policy {
-                delivery_destination_policy: Some(delivery_destination_policy),
+            // assignment stored, in the `Policy` structure the output models. The structure
+            // is what this operation has to say about the destination's policy, so it is
+            // reported for every destination that exists: EMPTY for one that has had no
+            // policy assigned, rather than absent.
+            policy: Some(Policy {
+                delivery_destination_policy: destination.policy.clone(),
             }),
         })
     }

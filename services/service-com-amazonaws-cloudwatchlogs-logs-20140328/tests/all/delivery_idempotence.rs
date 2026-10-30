@@ -46,7 +46,7 @@ async fn delivery_source(logs: &Logs, name: &str, group: &str) {
     let (_, group_arn) = logs.group_arns(group).await;
     logs.ok(
         "PutDeliverySource",
-        &json!({"name": name, "resourceArn": group_arn, "logType": "APPLICATION_LOGS"}),
+        &json!({"name": name, "resourceArn": group_arn, "logType": "INSIGHTS_QUERY_LOGS"}),
     )
     .await;
 }

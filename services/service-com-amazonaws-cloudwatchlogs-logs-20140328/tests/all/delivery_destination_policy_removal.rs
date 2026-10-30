@@ -6,11 +6,13 @@
 //! The rule under test: the policy a delivery destination holds belongs to THAT destination,
 //! so deleting it leaves the destination it names holding no policy at all — which is what
 //! every later read reports — while every other destination keeps the policy it holds and the
-//! named destination keeps every other parameter it was created with; a destination holding no
-//! policy is already in that state, so the deletion is accepted and changes nothing however
-//! often it is repeated, and a later assignment takes effect on the same destination; and a
+//! named destination keeps every other parameter it was created with; the resource the delete
+//! REMOVES is that policy, so a destination holding none has nothing for the delete to remove
+//! and the delete is refused as a missing resource however often it is repeated, while a later
+//! assignment on the same destination takes effect and can be deleted again; and a
 //! `deliveryDestinationName` the account holds no delivery destination under names no resource
-//! to delete a policy from, so it is refused as a missing resource and nothing is persisted.
+//! to delete a policy from, so it is refused as a missing resource too and nothing is
+//! persisted.
 //!
 //! Every case drives the service the way a client does — `POST /` with
 //! `X-Amz-Target: Logs_20140328.<Operation>` through the router that mounts it — so what is
@@ -45,6 +47,11 @@ const CREATE_LOG_GROUP: &str = "CreateLogGroup";
 /// under, and the sentence CloudWatch Logs words it with.
 const NOT_FOUND: &str = "ResourceNotFoundException";
 const NOT_FOUND_MESSAGE: &str = "Requested Delivery Destination does not exist in this account.";
+
+/// The sentence CloudWatch Logs words the OTHER missing resource of this operation with: the
+/// destination is there, and the policy the delete addresses is not.
+const NO_POLICY_MESSAGE: &str =
+    "Delivery Destination Policy does not exist for this Delivery Destination.";
 
 /// Destination resources of three of the vendors a delivery destination can represent.
 const BUCKET_ARN: &str = "arn:aws:s3:::vended-logs-bucket";
@@ -133,47 +140,87 @@ fn rows() -> Vec<Row> {
             policy: None,
         },
         Row {
-            label: "a Firehose destination holding the smallest JSON object",
+            label: "a Firehose destination holding a one-statement policy",
             name: "vended-logs-stream".to_string(),
             resource_arn: Some(FIREHOSE_ARN),
-            policy: Some("{}".to_string()),
+            policy: Some(one_statement_policy("stream")),
         },
         Row {
             label: "a trace destination holding one statement",
             name: "vended-traces".to_string(),
             resource_arn: None,
             policy: Some(
-                json!({"Version": "2012-10-17", "Statement": [{"Effect": "Allow"}]}).to_string(),
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": "xray:PutTraceSegments",
+                    }],
+                })
+                .to_string(),
             ),
         },
         Row {
             label: "a name at the minimum length, holding a non-ASCII policy",
             name: "d".to_string(),
             resource_arn: Some(BUCKET_ARN),
-            policy: Some(
-                json!({"Sid": "lieferung-\u{00fc}ber-gr\u{00f6}\u{00df}e-\u{65e5}\u{672c}"})
-                    .to_string(),
-            ),
+            policy: Some(one_statement_policy(
+                "lieferung-\u{00fc}ber-gr\u{00f6}\u{00df}e-\u{65e5}\u{672c}",
+            )),
         },
         Row {
-            label: "a name at the maximum length, holding a pretty-printed policy",
+            label: "a name at the maximum length, holding a statement written as an object",
             name: "n".repeat(NAME_MAX_LENGTH),
             resource_arn: Some(FIREHOSE_ARN),
-            policy: Some("{\n  \"Version\" : \"2012-10-17\",\n  \"Statement\" : [ ]\n}".to_string()),
+            policy: Some(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": {
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": "logs:PutLogEvents",
+                    },
+                })
+                .to_string(),
+            ),
         },
     ]
 }
 
+/// One resource-policy statement carrying `sid`: an effect, the service principal that
+/// delivers vended logs and the action it may take — the elements the IAM policy language
+/// requires of a resource-based statement.
+fn one_statement_policy(sid: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": sid,
+            "Effect": "Allow",
+            "Principal": {"Service": "delivery.logs.amazonaws.com"},
+            "Action": "logs:PutLogEvents",
+        }],
+    })
+    .to_string()
+}
+
 /// The `policy.deliveryDestinationPolicy` the service reports for `name`, or `None` when the
-/// response carries no `policy` member at all.
+/// reported `policy` structure carries none — which is what a destination no policy has been
+/// assigned to reports. The structure itself is always there, asserted here for every read.
 async fn read_policy(logs: &Logs, name: &str) -> Option<String> {
     let body = json!({"deliveryDestinationName": name});
     let response = logs.ok(GET_POLICY, &body).await;
-    let policy = response.get("policy")?;
+    let policy = response.get("policy").unwrap_or_else(|| {
+        panic!("{GET_POLICY} {body}: the response carries the policy structure, got {response}")
+    });
+    assert!(
+        policy.is_object(),
+        "{GET_POLICY} {body}: policy is the modelled structure, got {response}"
+    );
     Some(
         policy
-            .get("deliveryDestinationPolicy")
-            .and_then(Value::as_str)
+            .get("deliveryDestinationPolicy")?
+            .as_str()
             .unwrap_or_else(|| {
                 panic!(
                     "{GET_POLICY} {body}: a reported policy carries deliveryDestinationPolicy, \
@@ -198,6 +245,21 @@ async fn delete_policy(logs: &Logs, case: &str, name: &str) {
     assert!(
         response.is_null() || response.as_object().is_some_and(serde_json::Map::is_empty),
         "case {case:?}: {DELETE_POLICY} reports no members, got {response}"
+    );
+}
+
+/// Delete one destination's policy over the wire where the destination holds NONE, asserting
+/// the refusal that names the missing policy rather than the destination.
+async fn delete_policy_refused(logs: &Logs, case: &str, name: &str) {
+    let body = json!({"deliveryDestinationName": name});
+    let (code, message) = logs.refusal(DELETE_POLICY, &body).await;
+    assert_eq!(
+        code, NOT_FOUND,
+        "case {case:?}: a destination holding no policy is refused with {NOT_FOUND}, got {code}"
+    );
+    assert_eq!(
+        message, NO_POLICY_MESSAGE,
+        "case {case:?}: expected the refusal {NO_POLICY_MESSAGE:?}, got {message:?}"
     );
 }
 
@@ -239,9 +301,14 @@ async fn a_delete_takes_the_policy_off_only_the_destination_it_names() {
     }
 
     // Delete the destinations' policies one at a time: after each delete the destination it
-    // named holds none, and every destination not yet deleted from still holds its own.
+    // named holds none, and every destination not yet deleted from still holds its own. A row
+    // that holds no policy has nothing to delete, so its delete is refused instead.
     for (index, row) in rows.iter().enumerate() {
-        delete_policy(&logs, row.label, &row.name).await;
+        if row.policy.is_some() {
+            delete_policy(&logs, row.label, &row.name).await;
+        } else {
+            delete_policy_refused(&logs, row.label, &row.name).await;
+        }
 
         for (other_index, other) in rows.iter().enumerate() {
             let case = (row.label, other.label);
@@ -282,22 +349,26 @@ async fn a_delete_takes_the_policy_off_only_the_destination_it_names() {
     }
 }
 
-/// A destination holding no policy is already in the state the delete asks for, so the delete
-/// is accepted and changes nothing however often it is repeated — on a destination whose policy
-/// was just deleted, and on one none was ever assigned to — and a later assignment on the same
-/// destination takes effect and can be deleted again.
+/// A destination holding no policy has nothing for the delete to remove, so the delete is
+/// refused however often it is repeated — on a destination whose policy was just deleted, and on
+/// one none was ever assigned to — and a later assignment on the same destination takes effect
+/// and can be deleted again.
 #[tokio::test]
-async fn a_delete_is_idempotent_and_a_later_assignment_takes_effect() {
+async fn a_repeated_delete_is_refused_and_a_later_assignment_takes_effect() {
     let logs = Logs::new();
     let rows = rows();
     store(&logs, &rows).await;
 
     for row in &rows {
-        // Four deletes in a row: the first takes off whatever the row holds, the rest find
-        // nothing to take off, and all four are accepted.
+        // The first delete takes off whatever the row holds; every delete after it finds no
+        // policy to take off and is refused.
         for round in 1..=4 {
             let case = (row.label, round);
-            delete_policy(&logs, row.label, &row.name).await;
+            if round == 1 && row.policy.is_some() {
+                delete_policy(&logs, row.label, &row.name).await;
+            } else {
+                delete_policy_refused(&logs, &format!("{case:?}"), &row.name).await;
+            }
             let reported = read_policy(&logs, &row.name).await;
             assert_eq!(
                 reported, None,
@@ -351,7 +422,7 @@ async fn a_name_the_account_holds_no_destination_under_is_refused() {
     let namesake = "shared_name";
     logs.ok(
         PUT_SOURCE,
-        &json!({"name": namesake, "resourceArn": BUCKET_ARN, "logType": "ACCESS_LOGS"}),
+        &json!({"name": namesake, "resourceArn": BUCKET_ARN, "logType": "S3_SERVER_ACCESS_LOGS"}),
     )
     .await;
     logs.ok(CREATE_LOG_GROUP, &json!({"logGroupName": namesake}))

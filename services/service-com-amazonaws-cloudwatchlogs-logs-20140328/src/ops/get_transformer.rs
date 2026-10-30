@@ -2,7 +2,8 @@
 
 //! @op GetTransformer
 //! Implemented: reports the log-group level transformer stored on the log group
-//! `logGroupIdentifier` names, as `PutTransformer` configured it. This is the ONLY file
+//! `logGroupIdentifier` names, as `PutTransformer` configured it — and an EMPTY
+//! `transformerConfig` for a group that has had none created. This is the ONLY file
 //! to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -180,17 +181,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         };
 
-        // "This operation returns data only for transformers created at the log group
-        // level": until one has been created for this group there is no transformer to
-        // report, which is a missing resource rather than an empty response. The request
-        // identifies that transformer by nothing of its own — only by the group it belongs
-        // to — so the refusal states nothing about it beyond that the resource is not
-        // there. An account-level transformer is read through `DescribeAccountPolicies` and
-        // is not reported here even when one would apply to this group.
+        // "This operation returns data only for transformers created at the log group level":
+        // a group that has had none created reports an EMPTY transformer configuration — the
+        // question this read answers is which processors the group transforms its ingested
+        // events with, and for such a group the answer is none. There is no transformer, so
+        // there is no creation or modification time to report either. An account-level
+        // transformer is read through `DescribeAccountPolicies` and is not reported here even
+        // when one would apply to this group.
         let Some(transformer) = group.transformer.as_ref() else {
-            return Err(not_found(
-                crate::state::UNIDENTIFIED_RESOURCE_NOT_FOUND_MESSAGE,
-            ));
+            return Ok(GetTransformerOutput {
+                log_group_identifier: None,
+                creation_time: None,
+                last_modified_time: None,
+                transformer_config: Some(Vec::new()),
+            });
         };
 
         Ok(GetTransformerOutput {

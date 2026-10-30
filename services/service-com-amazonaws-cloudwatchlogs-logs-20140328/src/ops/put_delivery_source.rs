@@ -17,6 +17,11 @@
 //! supported for that kind of log in the Region the request reached
 //! ([`crate::state::unsupported_log_type_region_message`]).
 //!
+//! The log type must also be one the sending resource's service sends: the `logType` member's
+//! own catalogue lists the valid values per service, so a put naming any other type for that
+//! resource is refused with `ValidationException`, stating the options that service does
+//! support ([`crate::state::unsupported_log_type_message`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -223,6 +228,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.resource_arn,
             &region,
         ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // "Defines the type of log that the source is sending": WHICH log types a source may
+        // send is a property of the service whose resource is sending them — the `logType`
+        // member's own catalogue lists them per service — so a put naming a type that
+        // resource's service does not send is refused as the invalid parameter it is, telling
+        // the caller which options that service does support
+        // ([`crate::state::unsupported_log_type_message`]). A resource of a service this
+        // emulator publishes no list for is no basis to refuse one, so its log type is kept as
+        // given.
+        if let Some(message) =
+            crate::state::unsupported_log_type_message(&input.resource_arn, &input.log_type)
+        {
             return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 

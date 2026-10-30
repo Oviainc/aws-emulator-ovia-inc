@@ -100,10 +100,11 @@
 //! handler-side refusal in `crate::state` lists for a policy-document attribute
 //! ([`enum_value_set`]).
 //!
-//! A `@pattern` is reported as the MODEL spells it, anchors included; the reasoning for
-//! that one is on [`requirement`], which is also where the handler-side refusal in
-//! `crate::state` reads its wording from ([`one_violation_message`]), so both refusal
-//! paths read alike.
+//! A `@pattern` is stated as AWS publishes the expression for that shape — the model's
+//! expression, except for the shapes whose published form drops its `^`…`$` anchors
+//! ([`PUBLISHED_PATTERNS`]); the reasoning for that one is on [`requirement`], which is
+//! also where the handler-side refusal in `crate::state` reads its wording from
+//! ([`one_violation_message`]), so both refusal paths read alike.
 //!
 //! The subject rule is the half `services/common/src/validation.rs` names as "still to
 //! come", and ~26 service crates word it inline today. Migrating them onto one shared
@@ -258,13 +259,15 @@ const SUBJECT: &str = "Value at";
 ///
 /// THE PATTERN RENDERING RULE, stated once for the whole service (the handler-side
 /// refusal in `crate::state` words its clause through [`one_violation_message`], so both
-/// refusal paths read alike): a `@pattern` is reported as the MODEL spells it, anchors
-/// included. The model is this emulator's only source for that expression, and the
-/// recorded refusals of this service disagree with each other about the anchors — the
-/// three recorded `DeliveryId` refusals print the model's `^[0-9A-Za-z]+$` anchored,
-/// while the recorded `DeliverySourceName` one prints the model's `^[\w-]*$` as
-/// `[\w-]*` — so no rule over the model can produce both and the expression is rendered
-/// rather than rewritten.
+/// refusal paths read alike): a `@pattern` is stated as AWS PUBLISHES the expression for
+/// that shape — the model's trait string, except for the shapes whose published expression
+/// drops the trait's surrounding `^`…`$` anchors ([`PUBLISHED_PATTERNS`]). The anchoring is
+/// a property of the SHAPE rather than of a member or an operation, and the recorded
+/// refusals of this service differ on it — the three recorded `DeliveryId` refusals print
+/// the model's `^[0-9A-Za-z]+$` anchored, while the recorded `DeliverySourceName` one prints
+/// the model's `^[\w-]*$` as `[\w-]*` — so the shapes whose published form differs from the
+/// model's are named in that table and every other shape's expression is rendered as the
+/// model spells it.
 ///
 /// THE ENUM ORDERING RULE: an enum's admissible set is listed in the order AWS publishes
 /// for that enum where there is one ([`PUBLISHED_ENUM_ORDERS`]), and otherwise in ascending
@@ -294,7 +297,10 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
             format!("Member must have value less than or equal to {max}")
         }
         ViolationKind::Pattern(pattern) => {
-            format!("Member must satisfy regular expression pattern: {pattern}")
+            format!(
+                "Member must satisfy regular expression pattern: {}",
+                published_pattern(pattern)
+            )
         }
         // A "value set" is just that: the requirement is WHICH values the model allows,
         // listed in the one order this service states that enum's values in (the enum
@@ -306,6 +312,35 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
         ViolationKind::UniqueItems => "Member must have unique values".to_string(),
         _ => return None,
     })
+}
+
+/// The shapes whose PUBLISHED `@pattern` expression is not the trait string the model
+/// carries: one entry per shape, as `(the model's expression, the expression AWS states)`.
+///
+/// AWS states the expression its own request validator holds, which for these shapes is the
+/// model's expression WITHOUT the surrounding `^`…`$` anchors — the recorded
+/// `DeliverySourceName` refusal states `[\w-]*` for the model's `^[\w-]*$`. The entry is
+/// keyed on the model's expression rather than on a member or an operation, so it holds for
+/// every member of every operation that targets the shape (`DeliverySourceName` is reached by
+/// `name` of the four delivery-source operations and by `deliverySourceName` of
+/// `CreateDelivery`), and a shape not named here is stated as the model spells it — which is
+/// what the recorded `DeliveryId` refusals show for `^[0-9A-Za-z]+$`.
+///
+/// Each entry's published form is the declared one unanchored, which
+/// `a_published_pattern_is_the_declared_expression_unanchored` pins.
+const PUBLISHED_PATTERNS: &[(&str, &str)] = &[
+    // `DeliverySourceName` (`@length` 1..60, `@pattern ^[\w-]*$`).
+    (r"^[\w-]*$", r"[\w-]*"),
+];
+
+/// The expression this service states for the `@pattern` the model spells `pattern`: the
+/// published form where AWS publishes another one ([`PUBLISHED_PATTERNS`]), and otherwise the
+/// model's own expression.
+fn published_pattern(pattern: &str) -> &str {
+    PUBLISHED_PATTERNS
+        .iter()
+        .find(|(declared, _published)| *declared == pattern)
+        .map_or(pattern, |(_declared, published)| *published)
 }
 
 /// The order this service STATES an enum's admissible set in, for an enum AWS publishes an
@@ -471,10 +506,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // THE MESSAGE states a member-constraint failure against the INPUT POSITION that
         // failed and the constraint it failed — never the value that was submitted there,
         // so a delivery id, a source name or a page size a caller sent is not reflected
-        // back into a 400 body. A `@pattern` keeps the anchors the model spells it with
-        // and an enum's value set is listed in ascending order — both rules stated once
-        // on `requirement` above, and shared with the handler-side refusal through
-        // `one_violation_message`.
+        // back into a 400 body. A `@pattern` is stated as AWS publishes the expression for
+        // that shape and an enum's value set is listed in ascending order — both rules
+        // stated once on `requirement` above, and shared with the handler-side refusal
+        // through `one_violation_message`.
         //
         // An authentication refusal keeps the framework's wording: it is not an
         // input-constraint failure, and it is raised before any operation is served.
@@ -519,12 +554,45 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 #[cfg(test)]
 mod tests {
     use super::{
-        constraint_clause, constraint_envelope, enum_value_set, published_enum_order, refusal_code,
-        served_refusal_code, INVALID_PARAMETER_EXCEPTION, NO_REFUSAL_ERROR_OPERATIONS,
-        PUBLISHED_ENUM_ORDERS, SERVED_REFUSAL_CODE, VALIDATION_EXCEPTION,
-        VALIDATION_EXCEPTION_OPERATIONS,
+        constraint_clause, constraint_envelope, enum_value_set, published_enum_order,
+        published_pattern, refusal_code, served_refusal_code, INVALID_PARAMETER_EXCEPTION,
+        NO_REFUSAL_ERROR_OPERATIONS, PUBLISHED_ENUM_ORDERS, PUBLISHED_PATTERNS,
+        SERVED_REFUSAL_CODE, VALIDATION_EXCEPTION, VALIDATION_EXCEPTION_OPERATIONS,
     };
     use smithy_server_runtime::{Violation, ViolationKind};
+
+    /// Every published pattern is the DECLARED expression with its anchors dropped — a table
+    /// entry cannot rewrite the expression itself — and the lookup is keyed on the declared
+    /// string, so a shape the table does not name keeps the model's spelling.
+    #[test]
+    fn a_published_pattern_is_the_declared_expression_unanchored() {
+        for (declared, published) in PUBLISHED_PATTERNS {
+            let unanchored = declared
+                .strip_prefix('^')
+                .and_then(|pattern| pattern.strip_suffix('$'));
+            assert_eq!(
+                unanchored,
+                Some(*published),
+                "case {declared:?}: the published form is the declared expression unanchored, \
+                 got {published:?}"
+            );
+            let stated = published_pattern(declared);
+            assert_eq!(
+                stated, *published,
+                "case {declared:?}: expected {published:?}, got {stated:?}"
+            );
+        }
+
+        // A shape the table does not name: the model's expression stands, anchors included.
+        // Source: the model's `DeliveryId` shape (`@pattern ^[0-9A-Za-z]+$`), whose recorded
+        // refusals state it anchored.
+        let declared = "^[0-9A-Za-z]+$";
+        let stated = published_pattern(declared);
+        assert_eq!(
+            stated, declared,
+            "case {declared:?}: an unnamed shape keeps the model's expression, got {stated:?}"
+        );
+    }
 
     /// Both tables are searched with `binary_search`, so both must be sorted; and an
     /// operation cannot be in both, or its refusal code would depend on which table was

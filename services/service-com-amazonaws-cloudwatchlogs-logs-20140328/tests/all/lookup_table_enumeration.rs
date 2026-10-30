@@ -7,7 +7,9 @@
 //! each rendered from the record the create stored (so a listing and `GetLookupTable` cannot
 //! disagree about one), in ascending table-name order whatever order the tables were created
 //! in; `lookupTableNamePrefix` narrows the enumeration to the tables whose names start with
-//! it and nothing else; a page holds at most `maxResults` tables — 50 when the request leaves
+//! it and nothing else — and a prefix the account holds no table under names no resource, so
+//! it is refused rather than answered with an empty page; a page holds at most `maxResults`
+//! tables — 50 when the request leaves
 //! that member at its modelled default, which is the default the member documents — and
 //! carries a `nextToken` exactly while tables remain beyond it, resuming the SAME enumeration
 //! after the last table reported. A token this operation did not mint, or one minted for a
@@ -42,6 +44,10 @@ const GET: &str = "GetLookupTable";
 /// The code CloudWatch Logs answers for a parameter it will not accept, which is what
 /// `DescribeLookupTables` declares for one ("A parameter is specified incorrectly").
 const INVALID_PARAMETER: &str = "InvalidParameterException";
+
+/// The code answered when the resource the request names is not there, which a prefix no
+/// table's name starts with is.
+const NOT_FOUND: &str = "ResourceNotFoundException";
 
 /// A KMS key ARN, for the seeded tables that are encrypted with a customer key.
 const KMS_KEY: &str = "arn:aws:kms:eu-west-2:000000000000:key/aaaabbbb-cccc-dddd-eeee-ffff00001111";
@@ -346,7 +352,8 @@ async fn every_held_table_is_reported_in_ascending_name_order() {
     }
 }
 
-/// `lookupTableNamePrefix` selects the tables whose names START with it, and nothing else.
+/// `lookupTableNamePrefix` selects the tables whose names START with it, and nothing else; a
+/// prefix no name starts with names no table at all and is refused.
 #[tokio::test]
 async fn a_name_prefix_selects_exactly_the_tables_it_starts() {
     let logs = Logs::new();
@@ -376,7 +383,6 @@ async fn a_name_prefix_selects_exactly_the_tables_it_starts() {
             "U",
             vec!["Users_upper"],
         ),
-        ("a prefix no name starts with", "zzz", vec![]),
     ];
 
     for (case, prefix, expected) in cases {
@@ -392,6 +398,29 @@ async fn a_name_prefix_selects_exactly_the_tables_it_starts() {
             page.get("nextToken").is_none(),
             "case {case:?}: one page holds every selected table, so no nextToken follows, got \
              {page}"
+        );
+    }
+
+    // Prefixes no held name starts with: each names a set of tables the account does not
+    // hold, so the request is refused rather than answered with an empty page.
+    for (case, prefix) in [
+        ("a prefix no name starts with", "zzz"),
+        ("a held name with one character too many", "users_eux"),
+        ("a held name in the other case", "USERS"),
+    ] {
+        let (code, message) = logs.refusal(DESCRIBE, &request(Some(prefix), None, None)).await;
+        assert_eq!(
+            code, NOT_FOUND,
+            "case {case:?}: prefix {prefix:?} selects no table, expected {NOT_FOUND}, got \
+             {code} {message:?}"
+        );
+        let expected = format!(
+            "No lookup tables found for accountId '{}' with prefix: '{prefix}'",
+            engine::emulator_account_id()
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
         );
     }
 }

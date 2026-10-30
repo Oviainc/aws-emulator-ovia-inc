@@ -9,8 +9,9 @@
 //! `PutDeliveryDestinationPolicy` put it; nothing else about that destination is touched.
 //!
 //! The resource the request specifies is the delivery DESTINATION, so a name the account holds
-//! no destination under is the modelled not-found refusal. A destination holding no policy is
-//! already in the state this call asks for, so the deletion is idempotent.
+//! no destination under is the modelled not-found refusal. The resource this call REMOVES is the
+//! policy, so a destination that holds none has nothing for it to remove and is refused with the
+//! same error class: the deletion is not idempotent.
 //!
 //! ## Shape of an operation
 //!
@@ -194,12 +195,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // A destination holds at most one delivery destination policy, so deleting it leaves
-        // the destination holding none — the state a destination none was ever assigned to is
-        // already in, which is why repeating the delete is accepted and changes nothing. Every
-        // other parameter of the destination stays where it is: the policy is assigned by its
-        // own operation and deleted by this one.
-        destination.policy = None;
+        // A destination holds at most one delivery destination policy, and the resource THIS
+        // delete addresses is that policy rather than the destination: a destination that has
+        // had none assigned holds nothing to delete, so the delete is refused rather than
+        // answered as a no-op. Every other parameter of the destination stays where it is: the
+        // policy is assigned by its own operation and deleted by this one.
+        if destination.policy.take().is_none() {
+            return Err(
+                DeleteDeliveryDestinationPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::DELIVERY_DESTINATION_POLICY_NOT_FOUND_MESSAGE
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
 
         Ok(DeleteDeliveryDestinationPolicyOutput)
     }

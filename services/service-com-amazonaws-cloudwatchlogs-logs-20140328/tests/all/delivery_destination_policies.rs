@@ -4,12 +4,15 @@
 //! the IAM policy an account assigns to one of its delivery destinations.
 //!
 //! The rule under test: a delivery destination holds at most one delivery destination
-//! policy, so assigning one stores the document the request carries VERBATIM on the
-//! destination it names and REPLACES whatever that destination held, and both the assigning
-//! call and every later read report those stored contents; a destination that has had none
-//! assigned reports no policy at all; a `deliveryDestinationName` the account does not hold
-//! is refused as a missing resource by both operations; and a policy that is not an IAM
-//! policy document — a JSON object — is refused as an invalid parameter.
+//! policy, so assigning one stores the DOCUMENT the request carries on the destination it
+//! names and REPLACES whatever that destination held; the assigning call reports the document
+//! as the request wrote it, and every later read reports the STORED form — the document's own
+//! members, values and order, with the insignificant whitespace between its JSON tokens gone,
+//! because the service reads the document rather than keeping the bytes the caller's renderer
+//! produced; a destination that has had none assigned reports no policy at all; a
+//! `deliveryDestinationName` the account does not hold is refused as a missing resource by
+//! both operations; and a policy that is not an IAM policy document — a JSON object — is
+//! refused as an invalid parameter.
 //!
 //! Every case drives the service the way a client does — `POST /` with
 //! `X-Amz-Target: Logs_20140328.<Operation>` through the router that mounts it — so what is
@@ -17,11 +20,11 @@
 //! from the shared store cannot pass.
 //!
 //! The table spans what the rule generalises over rather than one request: policy documents
-//! of several forms and sizes (the smallest JSON object, one statement, the two statements
-//! the operation's documentation describes, nested conditions, non-ASCII contents,
-//! pretty-printed whitespace, and a document on the published maximum length and one past
-//! it), destinations of several `DeliveryDestinationType`s, and destination names at both
-//! published length bounds.
+//! of several forms and sizes (one statement and the two statements the operation's
+//! documentation describes, a statement written as the object itself, nested conditions,
+//! non-ASCII contents, pretty-printed and spaced whitespace, and a document on the published
+//! maximum length and one past it), destinations of several `DeliveryDestinationType`s, and
+//! destination names at both published length bounds.
 
 use serde_json::{json, Value};
 
@@ -113,15 +116,30 @@ fn destinations() -> Vec<Destination> {
 struct PolicyCase {
     /// What this row varies, for the assertion messages.
     label: &'static str,
-    /// The `deliveryDestinationPolicy` string, sent and reported verbatim.
+    /// The `deliveryDestinationPolicy` string the request carries.
     document: String,
+    /// The text every LATER reader reports for it: the document with the whitespace between
+    /// its JSON tokens dropped, and nothing else about it changed.
+    reported: String,
 }
 
 impl PolicyCase {
+    /// A document already carrying no insignificant whitespace, so it is reported as sent.
     fn of(label: &'static str, document: &str) -> Self {
         Self {
             label,
             document: document.to_string(),
+            reported: document.to_string(),
+        }
+    }
+
+    /// A document whose spelling carries whitespace between its tokens, paired with the text
+    /// the service reports for it.
+    fn spaced(label: &'static str, document: &str, reported: &str) -> Self {
+        Self {
+            label,
+            document: document.to_string(),
+            reported: reported.to_string(),
         }
     }
 }
@@ -152,18 +170,28 @@ fn two_statement_policy(destination_arn: &str) -> String {
     .to_string()
 }
 
-/// A JSON object of exactly `length` characters: the smallest object padded through one
-/// `Sid` value, so a case can sit on a published length bound.
+/// A resource-policy document of exactly `length` characters: one statement padded through
+/// its `Sid` value, so a case can sit on a published length bound.
 fn policy_of_length(length: usize) -> String {
-    let skeleton = r#"{"Sid":""}"#;
+    let skeleton = one_statement_policy("");
     let padding = length - skeleton.len();
-    format!(r#"{{"Sid":"{}"}}"#, "p".repeat(padding))
+    one_statement_policy(&"p".repeat(padding))
+}
+
+/// One resource-policy statement carrying `sid`: an effect, the service principal that
+/// delivers vended logs and the action it may take — the elements the IAM policy language
+/// requires of a resource-based statement.
+fn one_statement_policy(sid: &str) -> String {
+    format!(
+        "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Sid\":\"{sid}\",\
+         \"Effect\":\"Allow\",\"Principal\":{{\"Service\":\"delivery.logs.amazonaws.com\"}},\
+         \"Action\":\"logs:PutLogEvents\"}}]}}"
+    )
 }
 
 /// Policy documents spanning form, size, nesting, character set and whitespace.
 fn policies() -> Vec<PolicyCase> {
     vec![
-        PolicyCase::of("the smallest JSON object", "{}"),
         PolicyCase::of(
             "a one-statement policy",
             &json!({
@@ -200,11 +228,31 @@ fn policies() -> Vec<PolicyCase> {
         ),
         PolicyCase::of(
             "a policy carrying non-ASCII contents",
-            &json!({"Sid": "lieferung-\u{00fc}ber-gr\u{00f6}\u{00dfe}-\u{65e5}\u{672c}"}).to_string(),
+            &one_statement_policy("lieferung-\u{00fc}ber-gr\u{00f6}\u{00df}e-\u{65e5}\u{672c}"),
         ),
         PolicyCase::of(
+            "a statement written as the object itself rather than as a list",
+            &json!({
+                "Version": "2012-10-17",
+                "Statement": {
+                    "Effect": "Deny",
+                    "NotPrincipal": {"AWS": "arn:aws:iam::210987654321:root"},
+                    "NotAction": "logs:PutLogEvents",
+                },
+            })
+            .to_string(),
+        ),
+        PolicyCase::spaced(
             "a pretty-printed policy, whitespace and all",
-            "{\n  \"Version\" : \"2012-10-17\",\n  \"Statement\" : [ ]\n}",
+            "{\n  \"Version\" : \"2012-10-17\",\n  \"Statement\" : [ {\n    \"Effect\" : \"Allow\",\n \
+             \"Principal\" : \"*\",\n    \"Action\" : \"logs:PutLogEvents\"\n  } ]\n}",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"logs:PutLogEvents"}]}"#,
+        ),
+        PolicyCase::spaced(
+            "a policy spaced after each separator, with whitespace inside a string",
+            "{\"Version\": \"2012-10-17\", \"Statement\": [{\"Sid\": \"two words\", \
+             \"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"logs:PutLogEvents\"}]}",
+            r#"{"Version":"2012-10-17","Statement":[{"Sid":"two words","Effect":"Allow","Principal":"*","Action":"logs:PutLogEvents"}]}"#,
         ),
         PolicyCase::of(
             "a policy on the published maximum length",
@@ -213,14 +261,21 @@ fn policies() -> Vec<PolicyCase> {
     ]
 }
 
-/// The `policy.deliveryDestinationPolicy` a response carries, or `None` when the response
-/// carries no `policy` at all.
+/// The `policy.deliveryDestinationPolicy` a response carries, or `None` when the reported
+/// `policy` structure carries none — which is what a destination no policy has been assigned
+/// to reports. The structure itself is always there, which is asserted here for every read.
 fn reported_policy(operation: &str, body: &Value, response: &Value) -> Option<String> {
-    let policy = response.get("policy")?;
+    let policy = response.get("policy").unwrap_or_else(|| {
+        panic!("{operation} {body}: the response carries the policy structure, got {response}")
+    });
+    assert!(
+        policy.is_object(),
+        "{operation} {body}: policy is the modelled structure, got {response}"
+    );
     Some(
         policy
-            .get("deliveryDestinationPolicy")
-            .and_then(Value::as_str)
+            .get("deliveryDestinationPolicy")?
+            .as_str()
             .unwrap_or_else(|| {
                 panic!(
                     "{operation} {body}: a reported policy carries deliveryDestinationPolicy, \
@@ -245,8 +300,9 @@ async fn put_policy(logs: &Logs, name: &str, document: &str) -> Option<String> {
     reported_policy(PUT_POLICY, &body, &response)
 }
 
-/// Every policy document, assigned to every destination, is reported VERBATIM by the call
-/// that assigns it and read back by `GetDeliveryDestinationPolicy` — the round trip through
+/// Every policy document, assigned to every destination, is reported by the call that assigns
+/// it as the request wrote it, and read back by `GetDeliveryDestinationPolicy` as the DOCUMENT
+/// it is — its whitespace between tokens gone and nothing else moved: the round trip through
 /// stored state.
 #[tokio::test]
 async fn an_assigned_policy_is_reported_and_read_back() {
@@ -271,7 +327,7 @@ async fn an_assigned_policy_is_reported_and_read_back() {
             let read_back = get_policy(&logs, &destination.name).await;
             assert_eq!(
                 read_back.as_deref(),
-                Some(policy.document.as_str()),
+                Some(policy.reported.as_str()),
                 "case {case:?}: {GET_POLICY} reports the assigned policy, got {read_back:?}"
             );
 
@@ -294,27 +350,27 @@ async fn the_policy_assigned_last_is_the_one_reported() {
     let destination = Destination::of("an S3 bucket destination", "overwritten", BUCKET_ARN);
     logs.ok(PUT_DESTINATION, &destination.put_body()).await;
 
-    let mut documents: Vec<String> = policies().into_iter().map(|case| case.document).collect();
+    let mut documents: Vec<PolicyCase> = policies();
     // The same set assigned in the reverse order too, so what is reported follows the LAST
     // assignment rather than the first, the longest or the shortest.
-    let mut reversed = documents.clone();
+    let mut reversed = policies();
     reversed.reverse();
     documents.extend(reversed);
 
-    for document in &documents {
-        let assigned = put_policy(&logs, &destination.name, document).await;
+    for policy in &documents {
+        let assigned = put_policy(&logs, &destination.name, &policy.document).await;
         assert_eq!(
             assigned.as_deref(),
-            Some(document.as_str()),
+            Some(policy.document.as_str()),
             "case {:?}: the assigning call reports the new policy, got {assigned:?}",
-            document.len()
+            policy.label
         );
         let read_back = get_policy(&logs, &destination.name).await;
         assert_eq!(
             read_back.as_deref(),
-            Some(document.as_str()),
+            Some(policy.reported.as_str()),
             "case {:?}: the last policy assigned is the one reported, got {read_back:?}",
-            document.len()
+            policy.label
         );
     }
 }
@@ -341,7 +397,7 @@ async fn a_destination_with_no_policy_assigned_reports_none() {
 
     // One destination is given a policy; every other one still reports none.
     let assigned_to = &destinations[0];
-    put_policy(&logs, &assigned_to.name, "{}").await;
+    put_policy(&logs, &assigned_to.name, &two_statement_policy(BUCKET_ARN)).await;
     for destination in destinations.iter().skip(1) {
         let reported = get_policy(&logs, &destination.name).await;
         assert_eq!(
@@ -375,7 +431,10 @@ async fn a_name_the_account_does_not_hold_is_refused() {
         let code = logs
             .err(
                 PUT_POLICY,
-                &json!({"deliveryDestinationName": name, "deliveryDestinationPolicy": "{}"}),
+                &json!({
+                    "deliveryDestinationName": name,
+                    "deliveryDestinationPolicy": two_statement_policy(BUCKET_ARN),
+                }),
             )
             .await;
         assert_eq!(
@@ -405,9 +464,11 @@ async fn a_name_the_account_does_not_hold_is_refused() {
     );
 }
 
-/// "Creates and assigns an IAM policy": an IAM policy is a JSON object, so a
-/// `deliveryDestinationPolicy` that is not one is refused as an invalid parameter — and the
-/// refusal leaves the policy the destination already held in place.
+/// "Creates and assigns an IAM policy that grants permissions to CloudWatch Logs to deliver
+/// logs cross-account": the document is an IAM policy in its RESOURCE-based form — a JSON
+/// object whose statements each state an effect, the actions they cover and the principal they
+/// grant them to — so a `deliveryDestinationPolicy` that is not one is refused as an invalid
+/// parameter, and the refusal leaves the policy the destination already held in place.
 #[tokio::test]
 async fn a_policy_that_is_not_an_iam_policy_document_is_refused() {
     let logs = Logs::new();
@@ -416,6 +477,9 @@ async fn a_policy_that_is_not_an_iam_policy_document_is_refused() {
     let kept = two_statement_policy(BUCKET_ARN);
     put_policy(&logs, &destination.name, &kept).await;
 
+    // The rows span the grammar's clauses: text that is not JSON at all, JSON that is not an
+    // object, an object declaring no statement, a statement that is not an object, and a
+    // statement missing each of the elements a resource-based statement states.
     let rejected = [
         ("plain text", "not a policy at all".to_string()),
         ("a one-character document", "p".to_string()),
@@ -425,6 +489,32 @@ async fn a_policy_that_is_not_an_iam_policy_document_is_refused() {
         ("a JSON null", "null".to_string()),
         ("a truncated object", r#"{"Statement":"#.to_string()),
         ("an object with a trailing comma", r#"{"Sid":"a",}"#.to_string()),
+        ("the smallest JSON object, which declares no statement", "{}".to_string()),
+        (
+            "an empty statement list",
+            r#"{"Version":"2012-10-17","Statement":[]}"#.to_string(),
+        ),
+        (
+            "a Statement that is a string",
+            r#"{"Statement":"let me deliver"}"#.to_string(),
+        ),
+        (
+            "a statement with no Effect",
+            r#"{"Statement":[{"Principal":"*","Action":"logs:PutLogEvents"}]}"#.to_string(),
+        ),
+        (
+            "a statement with no Action",
+            r#"{"Statement":[{"Effect":"Allow","Principal":"*"}]}"#.to_string(),
+        ),
+        (
+            "a statement with no Principal, which a resource policy states",
+            r#"{"Statement":[{"Effect":"Allow","Action":"logs:PutLogEvents"}]}"#.to_string(),
+        ),
+        (
+            "a policy version no policy language has",
+            r#"{"Version":"2024-01-01","Statement":[{"Effect":"Allow","Principal":"*","Action":"logs:PutLogEvents"}]}"#
+                .to_string(),
+        ),
         // One character past the published maximum length of `DeliveryDestinationPolicy`
         // (`@length` 1..51200), whose in-bound sibling is a passing row above.
         (

@@ -71,19 +71,16 @@ const CLOUDFRONT_HOME_REGION: &str = "us-east-1";
 /// Log types the `logType` member's own catalogue names — "For Amazon Web Services Amplify,
 /// the valid values are ACCESS_LOGS and WAF_LOGS. For Application Load Balancer, the valid
 /// values are ALB_ACCESS_LOGS, ALB_CONNECTION_LOGS, and ALB_HEALTH_CHECK_LOGS. For Amazon
-/// Bedrock AgentCore [...] APPLICATION_LOGS and TRACES" — none of which the model turns into
-/// an enum, so the service stores and reports whichever of them a request names. Source: the
-/// `logType` member of `PutDeliverySourceRequest`
+/// Bedrock AgentCore [...] APPLICATION_LOGS and TRACES" — are the values a put may name FOR A
+/// RESOURCE OF THAT SERVICE, so each case below pairs a resource with a log type its own
+/// service sends. Source: the `logType` member of `PutDeliverySourceRequest`
 /// (`smithy_query(query="doc",shape="PutDeliverySourceRequest",member="logType")`).
-const LOG_TYPES: [&str; 7] = [
-    "ACCESS_LOGS",
-    "WAF_LOGS",
-    "ALB_ACCESS_LOGS",
-    "ALB_CONNECTION_LOGS",
-    "ALB_HEALTH_CHECK_LOGS",
-    "APPLICATION_LOGS",
-    "TRACES",
-];
+///
+/// A resource of a service the `logType` catalogue names NO log types for, so no log type can
+/// be judged against it: Elemental MediaPackage is in that catalogue as a log sender, but this
+/// emulator publishes no list for its namespace, which is what makes the rows using it about
+/// the `LogType` LENGTH bounds rather than about which values one service sends.
+const UNCATALOGUED_ARN: &str = "arn:aws:mediapackage:eu-west-2:123456789012:channels/vended";
 
 /// One put, and what the service must then report for the delivery source it created.
 #[derive(Debug)]
@@ -236,7 +233,7 @@ fn cases() -> Vec<Case> {
             "a regional resource, no configuration and no tags",
             "workmail-logs",
             WORKMAIL_ARN,
-            "ACCESS_LOGS",
+            "ACCESS_CONTROL_LOGS",
             "workmail",
         ),
         // A resource of a global service, which is reached only through its partition's global
@@ -254,7 +251,7 @@ fn cases() -> Vec<Case> {
             "a resource ARN with neither Region nor account, several tags",
             "s3-access-logs",
             BUCKET_ARN,
-            "WAF_LOGS",
+            "S3_SERVER_ACCESS_LOGS",
             "s3",
         )
         .with_tags(&[("env", "prod"), ("owner", "obs"), ("tier", "gold")]),
@@ -279,7 +276,7 @@ fn cases() -> Vec<Case> {
             "a wildcard hub resource ARN",
             "security-findings",
             SECURITY_HUB_ARN,
-            "APPLICATION_LOGS",
+            "SECURITY_FINDING_LOGS",
             "securityhub",
         ),
         // Both published bounds of `DeliverySourceName` (`@length` 1..60), and the
@@ -288,7 +285,7 @@ fn cases() -> Vec<Case> {
             "the shortest name the model admits, configuration at both key and value bounds",
             "a",
             QUERY_LOG_GROUP_ARN,
-            "ALB_CONNECTION_LOGS",
+            "INSIGHTS_QUERY_LOGS",
             "logs",
         )
         .with_configuration(&[(longest_key.as_str(), longest_value.as_str())]),
@@ -296,7 +293,7 @@ fn cases() -> Vec<Case> {
             "the longest name the model admits",
             &"z".repeat(60),
             BUCKET_ARN,
-            "ALB_HEALTH_CHECK_LOGS",
+            "S3_SERVER_ACCESS_LOGS",
             "s3",
         ),
     ]
@@ -350,24 +347,63 @@ async fn a_put_delivery_source_is_reported_and_read_back() {
     }
 }
 
-/// Every log type the `logType` member's catalogue names is stored and reported as given, and
-/// so is one at either published length bound; one past the maximum is refused by the modelled
-/// constraint. Source: the model's `LogType` shape (`@length` 1..255, `@pattern ^[\w]*$`).
+/// Every log type the `logType` member's catalogue names FOR THE RESOURCE SENDING IT is stored
+/// and reported as given, and so is one at either published length bound for a resource whose
+/// service that catalogue names none for; one past the maximum is refused by the modelled
+/// constraint. Source: the model's `LogType` shape (`@length` 1..255, `@pattern ^[\w]*$`) and
+/// the `logType` member's own catalogue
+/// (`smithy_query(query="doc",shape="PutDeliverySourceRequest",member="logType")`).
 #[tokio::test]
 async fn every_published_log_type_is_stored_and_the_length_bounds_hold() {
     let logs = Logs::new();
 
-    let shortest = "L".to_string();
-    let longest = "L".repeat(255);
-    let mut accepted: Vec<String> = LOG_TYPES.iter().map(ToString::to_string).collect();
-    accepted.push(shortest);
-    accepted.push(longest);
+    // (the sending resource, a log type its own service sends) — the regional and Region-less
+    // senders of the catalogue, every log type each of them names.
+    let mut accepted: Vec<(&str, String)> = Vec::new();
+    for (resource_arn, log_types) in [
+        (
+            WORKMAIL_ARN,
+            [
+                "ACCESS_CONTROL_LOGS",
+                "AUTHENTICATION_LOGS",
+                "WORKMAIL_AVAILABILITY_PROVIDER_LOGS",
+                "WORKMAIL_MAILBOX_ACCESS_LOGS",
+                "WORKMAIL_PERSONAL_ACCESS_TOKEN_LOGS",
+            ]
+            .as_slice(),
+        ),
+        (BUCKET_ARN, ["S3_SERVER_ACCESS_LOGS"].as_slice()),
+        (
+            LOAD_BALANCER_ARN,
+            [
+                "ALB_ACCESS_LOGS",
+                "ALB_CONNECTION_LOGS",
+                "ALB_HEALTH_CHECK_LOGS",
+                "NLB_ACCESS_LOGS",
+            ]
+            .as_slice(),
+        ),
+        (
+            AGENTCORE_ARN,
+            ["APPLICATION_LOGS", "USAGE_LOGS", "TRACES"].as_slice(),
+        ),
+        (SECURITY_HUB_ARN, ["SECURITY_FINDING_LOGS"].as_slice()),
+        (QUERY_LOG_GROUP_ARN, ["INSIGHTS_QUERY_LOGS"].as_slice()),
+        // A resource whose service the catalogue names no log types for: its log type is
+        // kept as given, which is what puts the published LENGTH bounds under test here.
+        (UNCATALOGUED_ARN, ["L", "ACCESS_LOGS"].as_slice()),
+    ] {
+        for log_type in log_types {
+            accepted.push((resource_arn, (*log_type).to_string()));
+        }
+    }
+    accepted.push((UNCATALOGUED_ARN, "L".repeat(255)));
 
-    for (index, log_type) in accepted.iter().enumerate() {
+    for (index, (resource_arn, log_type)) in accepted.iter().enumerate() {
         let name = format!("log-type-{index}");
         let body = json!({
             "name": name,
-            "resourceArn": WORKMAIL_ARN,
+            "resourceArn": resource_arn,
             "logType": log_type,
         });
         let response = logs.ok(PUT, &body).await;
@@ -391,12 +427,33 @@ async fn every_published_log_type_is_stored_and_the_length_bounds_hold() {
     let code = logs
         .err(
             PUT,
-            &json!({"name": "log-type-too-long", "resourceArn": WORKMAIL_ARN, "logType": too_long}),
+            &json!({
+                "name": "log-type-too-long",
+                "resourceArn": UNCATALOGUED_ARN,
+                "logType": too_long,
+            }),
         )
         .await;
     assert_eq!(
         code, VALIDATION,
         "case a logType one past the published maximum: expected {VALIDATION}, got {code}"
+    );
+
+    // A log type the sending resource's service does NOT send is refused, whatever its
+    // length: which values are legal is the sending service's, not the member's.
+    let code = logs
+        .err(
+            PUT,
+            &json!({
+                "name": "log-type-not-sent",
+                "resourceArn": BUCKET_ARN,
+                "logType": "ACCESS_CONTROL_LOGS",
+            }),
+        )
+        .await;
+    assert_eq!(
+        code, VALIDATION,
+        "case a logType the resource's service does not send: expected {VALIDATION}, got {code}"
     );
 }
 
@@ -410,14 +467,14 @@ async fn a_put_under_a_held_name_overwrites_the_source_parameters() {
     let logs = Logs::new();
     let name = "overwritten-source";
 
-    let created = Case::of("created", name, WORKMAIL_ARN, "ACCESS_LOGS", "workmail")
+    let created = Case::of("created", name, WORKMAIL_ARN, "ACCESS_CONTROL_LOGS", "workmail")
         .with_configuration(&[("samplingRate", "50"), ("includeHeaders", "true")])
         .with_tags(&[("env", "prod")]);
     logs.ok(PUT, &created.body()).await;
 
     // A second put of the same resource with another logType and NO configuration: the
     // configuration the first put named is gone, and the tag set it assigned stays.
-    let overwritten = Case::of("overwritten", name, WORKMAIL_ARN, "WAF_LOGS", "workmail")
+    let overwritten = Case::of("overwritten", name, WORKMAIL_ARN, "AUTHENTICATION_LOGS", "workmail")
         .with_tags(&[("env", "prod")]);
     let body = overwritten.body();
     let response = logs.ok(PUT, &body).await;
@@ -434,7 +491,7 @@ async fn a_put_under_a_held_name_overwrites_the_source_parameters() {
     );
 
     // A third put naming tags assigns exactly those, and a configuration again.
-    let retagged = Case::of("retagged", name, WORKMAIL_ARN, "WAF_LOGS", "workmail")
+    let retagged = Case::of("retagged", name, WORKMAIL_ARN, "AUTHENTICATION_LOGS", "workmail")
         .with_configuration(&[("samplingRate", "10")])
         .with_tags(&[("env", "staging"), ("owner", "obs")]);
     logs.ok(PUT, &retagged.body()).await;
@@ -469,7 +526,7 @@ async fn a_put_under_a_held_name_naming_another_resource_is_a_conflict() {
     let logs = Logs::new();
     let name = "conflicted-source";
 
-    let held = Case::of("held", name, WORKMAIL_ARN, "ACCESS_LOGS", "workmail")
+    let held = Case::of("held", name, WORKMAIL_ARN, "ACCESS_CONTROL_LOGS", "workmail")
         .with_tags(&[("env", "prod")]);
     logs.ok(PUT, &held.body()).await;
     let expected = held.expected();
@@ -477,9 +534,9 @@ async fn a_put_under_a_held_name_naming_another_resource_is_a_conflict() {
     // (case, the other resource the put names, the logType it names)
     let conflicting: [(&str, &str, &str); 4] = [
         ("another vendor's resource", LOAD_BALANCER_ARN, "ALB_ACCESS_LOGS"),
-        ("another resource of the same vendor", "arn:aws:workmail:eu-west-2:123456789012:organization/m-0000EXAMPLEabcd1234abcd1234abcd1234", "ACCESS_LOGS"),
-        ("another resource and another logType", BUCKET_ARN, "WAF_LOGS"),
-        ("a wildcard ARN of the same vendor", "arn:aws:workmail:eu-west-2:123456789012:organization/*", "ACCESS_LOGS"),
+        ("another resource of the same vendor", "arn:aws:workmail:eu-west-2:123456789012:organization/m-0000EXAMPLEabcd1234abcd1234abcd1234", "ACCESS_CONTROL_LOGS"),
+        ("another resource and another logType", BUCKET_ARN, "S3_SERVER_ACCESS_LOGS"),
+        ("a wildcard ARN of the same vendor", "arn:aws:workmail:eu-west-2:123456789012:organization/*", "ACCESS_CONTROL_LOGS"),
     ];
 
     for (case, resource_arn, log_type) in conflicting {
@@ -739,7 +796,7 @@ async fn a_resource_that_pins_no_region_is_accepted_from_every_region() {
         (
             "a regional resource of the request's own Region",
             WORKMAIL_ARN,
-            "ACCESS_LOGS",
+            "ACCESS_CONTROL_LOGS",
         ),
         (
             "a regional resource of another Region",
@@ -806,7 +863,7 @@ async fn the_published_name_bounds_are_accepted_and_one_past_each_is_refused() {
     let logs = Logs::new();
 
     for name in ["n", &"n".repeat(60)] {
-        let body = json!({"name": name, "resourceArn": BUCKET_ARN, "logType": "WAF_LOGS"});
+        let body = json!({"name": name, "resourceArn": BUCKET_ARN, "logType": "S3_SERVER_ACCESS_LOGS"});
         let response = logs.ok(PUT, &body).await;
         let put_reported = reported(PUT, &body, &response);
         assert_eq!(
@@ -828,7 +885,7 @@ async fn the_published_name_bounds_are_accepted_and_one_past_each_is_refused() {
         let put_code = logs
             .err(
                 PUT,
-                &json!({"name": name, "resourceArn": BUCKET_ARN, "logType": "WAF_LOGS"}),
+                &json!({"name": name, "resourceArn": BUCKET_ARN, "logType": "S3_SERVER_ACCESS_LOGS"}),
             )
             .await;
         assert_eq!(
@@ -855,7 +912,7 @@ async fn reading_a_source_the_account_does_not_hold_is_refused() {
         "case an empty account: expected {NOT_FOUND}, got {code}"
     );
 
-    let held = Case::of("held", "held-source", BUCKET_ARN, "WAF_LOGS", "s3");
+    let held = Case::of("held", "held-source", BUCKET_ARN, "S3_SERVER_ACCESS_LOGS", "s3");
     logs.ok(PUT, &held.body()).await;
 
     // A name is a name: nothing but the one the account holds is reported, and a source is not
@@ -1104,7 +1161,7 @@ async fn a_delivery_source_and_a_delivery_destination_each_carry_one_tag_set() {
         &json!({
             "name": source_name,
             "resourceArn": WORKMAIL_ARN,
-            "logType": "ACCESS_LOGS",
+            "logType": "ACCESS_CONTROL_LOGS",
             "tags": {"env": "prod"},
         }),
     )

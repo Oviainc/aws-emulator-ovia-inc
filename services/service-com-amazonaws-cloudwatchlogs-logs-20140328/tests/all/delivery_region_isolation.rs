@@ -83,6 +83,10 @@ struct Pair {
     log_type: &'static str,
     /// The resource the row's delivery destination represents.
     destination_resource_arn: &'static str,
+    /// A `logType` the service of `destination_resource_arn` sends — which values are legal
+    /// is a property of the SENDING service, so the row needs one for that resource too when
+    /// it uses it as a second sender.
+    destination_log_type: &'static str,
 }
 
 /// The Region pairs every case below runs over.
@@ -94,6 +98,7 @@ const PAIRS: [Pair; 3] = [
         resource_arn: "arn:aws:s3:::vended-logs-source-one",
         log_type: "S3_SERVER_ACCESS_LOGS",
         destination_resource_arn: "arn:aws:s3:::vended-logs-bucket-one",
+        destination_log_type: "S3_SERVER_ACCESS_LOGS",
     },
     Pair {
         label: "a European and an Asia-Pacific Region",
@@ -101,9 +106,12 @@ const PAIRS: [Pair; 3] = [
         away: "ap-southeast-2",
         resource_arn:
             "arn:aws:workmail:eu-west-2:123456789012:organization/m-1234EXAMPLEabcd1234abcd1234abcd",
-        log_type: "ACCESS_LOGS",
+        log_type: "ACCESS_CONTROL_LOGS",
         destination_resource_arn:
             "arn:aws:firehose:eu-west-2:123456789012:deliverystream/vended-logs",
+        // Firehose is not one of the log senders the `logType` catalogue names, so this
+        // emulator publishes no list for it and the value is kept as given.
+        destination_log_type: "APPLICATION_LOGS",
     },
     Pair {
         label: "two Regions neither of which is the caller's usual one",
@@ -113,6 +121,7 @@ const PAIRS: [Pair; 3] = [
             "arn:aws:elasticloadbalancing:ap-northeast-1:123456789012:loadbalancer/app/web/50dc6c495c0c9188",
         log_type: "ALB_ACCESS_LOGS",
         destination_resource_arn: "arn:aws:s3:::vended-logs-bucket-two",
+        destination_log_type: "S3_SERVER_ACCESS_LOGS",
     },
 ];
 
@@ -317,7 +326,7 @@ async fn a_delivery_source_is_held_only_by_the_region_that_created_it() {
             away,
             &name,
             pair.destination_resource_arn,
-            pair.log_type,
+            pair.destination_log_type,
         )
         .await;
         let away_arn = member(&case, &elsewhere, "arn");
@@ -348,7 +357,20 @@ async fn a_delivery_source_is_held_only_by_the_region_that_created_it() {
 #[tokio::test]
 async fn a_delivery_destination_is_held_only_by_the_region_that_created_it() {
     let logs = Logs::new();
-    let policy = json!({"Version": "2012-10-17", "Statement": []}).to_string();
+    // The policy assigned below is a resource-based IAM policy document, which is what
+    // `PutDeliveryDestinationPolicy` assigns ("Creates and assigns an IAM policy that grants
+    // permissions to CloudWatch Logs to deliver logs cross-account"): one statement naming an
+    // effect, the service principal that delivers the logs and the actions it may take.
+    let policy = json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": "delivery.logs.amazonaws.com"},
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": "*",
+        }],
+    })
+    .to_string();
 
     for (case, home, away, pair) in directions() {
         let name = format!("destination-{home}-{away}");
@@ -409,10 +431,13 @@ async fn a_delivery_destination_is_held_only_by_the_region_that_created_it() {
             "case {case:?}: two Regions' destinations of one name are two resources, got \
              {away_arn} for both"
         );
-        // And it carries no policy: the one assigned in the creating Region is not its.
+        // And it carries no policy: the one assigned in the creating Region is not its, so the
+        // `policy` structure it reports is empty.
         let answer = logs.ok_in_region(away, GET_DESTINATION_POLICY, &by_policy_name).await;
         assert!(
-            answer.get("policy").is_none_or(Value::is_null),
+            answer
+                .get("policy")
+                .is_some_and(|policy| policy.get("deliveryDestinationPolicy").is_none()),
             "case {case:?}: the second destination carries no policy of its own, got {answer}"
         );
     }

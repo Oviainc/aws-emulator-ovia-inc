@@ -10,9 +10,9 @@
 //! The rule under test: `GetTransformer` reports the log-group level transformer stored
 //! on the log group its `logGroupIdentifier` resolves to — the processor pipeline exactly
 //! as the last `PutTransformer` configured it, in that order, with the times that put and
-//! the one that created it stamped — and refuses, as a missing resource, a group that
-//! carries no transformer (including one whose transformer was deleted) and an identifier
-//! that names no group.
+//! the one that created it stamped — reports an EMPTY pipeline for a group of this account
+//! that carries no transformer (including one whose transformer was deleted), and refuses,
+//! as a missing resource, an identifier that names no log group.
 //!
 //! The tables below span the classes the rule generalises over (the processor KINDS the
 //! model's `Processor` structure names, the pipeline LENGTH at both published bounds and
@@ -267,6 +267,26 @@ fn reported_config(response: &Value) -> Vec<Value> {
         .clone()
 }
 
+/// Assert that the log group `identifier` names carries NO log-group level transformer: the
+/// read succeeds and reports an empty `transformerConfig`, and no transformer time with it.
+async fn assert_no_transformer(logs: &Logs, case: &str, identifier: &str) {
+    let found = logs
+        .ok("GetTransformer", &json!({"logGroupIdentifier": identifier}))
+        .await;
+    assert_eq!(
+        reported_config(&found),
+        Vec::<Value>::new(),
+        "case {case}: a group carrying no transformer reports an empty transformerConfig, \
+         got {found}"
+    );
+    for member in ["creationTime", "lastModifiedTime"] {
+        assert!(
+            found.get(member).is_none(),
+            "case {case}: there is no transformer, so no {member} is reported, got {found}"
+        );
+    }
+}
+
 /// A timestamp member of a `GetTransformer` response.
 fn reported_time(response: &Value, member: &str) -> i64 {
     response
@@ -400,12 +420,12 @@ async fn put_over_an_existing_transformer_replaces_it_and_keeps_its_creation_tim
     );
 }
 
-/// `GetTransformer` refuses, as a missing resource, every read that names no stored
-/// log-group level transformer: a group that never had one, a group whose transformer
-/// went with it when the group was deleted, a group named by an identifier nothing was
-/// created under, and another group than the one put on.
+/// `GetTransformer` reports an EMPTY configuration for every read that names no stored
+/// log-group level transformer on a group the account holds — a group that never had one, and
+/// a group whose transformer went with it when the group was deleted — and refuses, as a
+/// missing resource, a read that names no log group at all.
 #[tokio::test]
-async fn get_transformer_refuses_a_read_that_names_no_stored_transformer() {
+async fn get_transformer_reports_an_empty_configuration_where_no_transformer_is_stored() {
     let logs = Logs::new();
     let configured = "/transformers/configured";
     let bare = "/transformers/bare";
@@ -419,18 +439,24 @@ async fn get_transformer_refuses_a_read_that_names_no_stored_transformer() {
     )
     .await;
 
-    // A group with no transformer of its own, named both ways, and a name and an ARN
-    // that name no group at all.
-    let absent = [
+    // A group the account holds that has no transformer of its own, named both ways: the
+    // configuration it reports is empty.
+    for (case, identifier) in [
         ("a group that never had a transformer, by name", bare.to_string()),
         ("a group that never had a transformer, by ARN", bare_arn),
+    ] {
+        assert_no_transformer(&logs, case, &identifier).await;
+    }
+
+    // A name and an ARN that name no log group at all: the missing resource is the GROUP,
+    // which is refused.
+    for (case, identifier) in [
         ("a name no group was created under", "/transformers/missing".to_string()),
         (
             "an ARN no group was created under",
             group_arn.replace("configured", "never-created"),
         ),
-    ];
-    for (case, identifier) in absent {
+    ] {
         let code = logs
             .err("GetTransformer", &json!({"logGroupIdentifier": identifier}))
             .await;
@@ -469,13 +495,7 @@ async fn get_transformer_refuses_a_read_that_names_no_stored_transformer() {
     logs.ok("DeleteLogGroup", &json!({"logGroupName": configured}))
         .await;
     create_group(&logs, configured, None).await;
-    let code = logs
-        .err("GetTransformer", &json!({"logGroupIdentifier": configured}))
-        .await;
-    assert_eq!(
-        code, RESOURCE_NOT_FOUND,
-        "case a recreated log group: expected {RESOURCE_NOT_FOUND}, got {code}"
-    );
+    assert_no_transformer(&logs, "a recreated log group", configured).await;
 }
 
 /// `PutTransformer` refuses a group that is not there, and leaves no transformer behind
@@ -502,13 +522,7 @@ async fn put_transformer_refuses_a_log_group_that_is_not_there() {
     }
 
     create_group(&logs, group, None).await;
-    let code = logs
-        .err("GetTransformer", &json!({"logGroupIdentifier": group}))
-        .await;
-    assert_eq!(
-        code, RESOURCE_NOT_FOUND,
-        "case a refused put: nothing is stored, so expected {RESOURCE_NOT_FOUND}, got {code}"
-    );
+    assert_no_transformer(&logs, "a refused put stores nothing", group).await;
 }
 
 /// Only a log group in the Standard log class can carry a transformer: every other class
@@ -541,13 +555,7 @@ async fn put_transformer_refuses_a_log_group_outside_the_standard_class() {
             code, INVALID_OPERATION,
             "case class {class}: expected {INVALID_OPERATION}, got {code}"
         );
-        let code = logs
-            .err("GetTransformer", &json!({"logGroupIdentifier": group}))
-            .await;
-        assert_eq!(
-            code, RESOURCE_NOT_FOUND,
-            "case class {class}: a refused put stores nothing, so expected {RESOURCE_NOT_FOUND}, got {code}"
-        );
+        assert_no_transformer(&logs, &format!("class {class}, a refused put"), &group).await;
     }
 
     // A group created with no `logGroupClass` at all is in the Standard class, so it
@@ -709,13 +717,7 @@ async fn delete_transformer_removes_the_one_the_group_carries() {
         )
         .await;
 
-        let code = logs
-            .err("GetTransformer", &json!({"logGroupIdentifier": group}))
-            .await;
-        assert_eq!(
-            code, RESOURCE_NOT_FOUND,
-            "case {identifier}: a deleted transformer is gone, so expected {RESOURCE_NOT_FOUND}, got {code}"
-        );
+        assert_no_transformer(&logs, &format!("{identifier}, after the delete"), group).await;
 
         // A delete of a transformer that is no longer there names a missing resource.
         let code = logs
@@ -805,13 +807,7 @@ async fn a_transformer_is_scoped_to_the_log_group_it_was_put_on() {
 
     for (group, config) in &groups {
         if config.is_empty() {
-            let code = logs
-                .err("GetTransformer", &json!({"logGroupIdentifier": group}))
-                .await;
-            assert_eq!(
-                code, RESOURCE_NOT_FOUND,
-                "case {group}: no put was made for it, so expected {RESOURCE_NOT_FOUND}, got {code}"
-            );
+            assert_no_transformer(&logs, group, group).await;
             continue;
         }
         let found = logs

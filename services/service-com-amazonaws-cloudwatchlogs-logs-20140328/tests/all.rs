@@ -53,6 +53,8 @@ mod delivery_idempotence;
 mod delivery_region_isolation;
 #[path = "all/delivery_resource_in_use_refusals.rs"]
 mod delivery_resource_in_use_refusals;
+#[path = "all/delivery_source_log_types.rs"]
+mod delivery_source_log_types;
 #[path = "all/delivery_source_region_support.rs"]
 mod delivery_source_region_support;
 #[path = "all/delivery_sources.rs"]
@@ -131,6 +133,8 @@ mod lookup_table_enumeration;
 mod lookup_table_queries;
 #[path = "all/lookup_table_removal.rs"]
 mod lookup_table_removal;
+#[path = "all/lookup_table_tagging.rs"]
+mod lookup_table_tagging;
 #[path = "all/lookup_table_updates.rs"]
 mod lookup_table_updates;
 #[path = "all/lookup_tables.rs"]

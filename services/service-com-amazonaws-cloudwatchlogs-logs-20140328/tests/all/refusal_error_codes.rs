@@ -461,7 +461,8 @@ async fn a_clause_names_the_member_and_the_requirement_without_a_value() {
              DATA_SOURCE_NAME_TYPE_AND_FORMAT]",
         ),
         (
-            // A `@pattern` keeps the anchors the model writes it with.
+            // A `@pattern` the service publishes no other form for is stated as the model
+            // writes it, anchors included.
             "a value outside a pattern",
             "CreateLookupTable",
             json!({"lookupTableName": "bad-name-with-hyphen"}),

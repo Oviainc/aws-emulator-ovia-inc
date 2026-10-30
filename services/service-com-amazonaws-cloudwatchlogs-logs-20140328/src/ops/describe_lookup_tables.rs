@@ -7,6 +7,10 @@
 //! `lookupTableNamePrefix`, in the order this operation documents ("Results are sorted by
 //! table name in ascending order") and paged with the opaque `nextToken` it mints.
 //!
+//! A request that NAMES a prefix names the tables under it, so a prefix the account holds no
+//! table under is the modelled not-found refusal rather than an empty page; an unfiltered
+//! request reports whatever the account holds, including nothing.
+//!
 //! Each table is reported through [`crate::state::LookupTableRecord::reported`], the one
 //! rendering of a stored table, so this listing and `GetLookupTable` cannot disagree about
 //! one.
@@ -256,6 +260,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .is_none_or(|prefix| table.name.starts_with(prefix))
             })
             .collect();
+
+        // A request that names a prefix asks for the tables under it, so a prefix the account
+        // holds no table under names no resource at all and is refused rather than answered
+        // with an empty page — the message stating the account that was searched and the prefix
+        // it was searched under. A request that names NO prefix asks for whatever the account
+        // holds, which is an enumeration of its own size, empty included.
+        if let Some(prefix) = input.lookup_table_name_prefix.as_deref() {
+            if matching.is_empty() {
+                return Err(
+                    DescribeLookupTablesErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::lookup_tables_not_found_message(
+                                ::engine::emulator_account_id(),
+                                prefix,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
 
         let first = match &cursor {
             Some(cursor) => matching.partition_point(|table| table.name <= cursor.after),

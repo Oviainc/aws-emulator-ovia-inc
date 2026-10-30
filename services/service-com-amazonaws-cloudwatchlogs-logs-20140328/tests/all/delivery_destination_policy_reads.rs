@@ -25,8 +25,8 @@
 //! destination) and near-miss spellings of a held name.
 //!
 //! `tests/all/delivery_destination_policies.rs` is the assignment side of the same state:
-//! that a policy is stored and reported verbatim, replaced by the next assignment, and
-//! refused when it is not an IAM policy document.
+//! that a policy is stored and reported as the document the assignment read, replaced by the
+//! next assignment, and refused when it is not an IAM policy document.
 
 use serde_json::{json, Value};
 
@@ -135,10 +135,10 @@ fn rows() -> Vec<Row> {
             policy: None,
         },
         Row {
-            label: "a Firehose destination holding the smallest JSON object",
+            label: "a Firehose destination holding a one-statement policy",
             name: "vended-logs-stream".to_string(),
             resource_arn: Some(FIREHOSE_ARN),
-            policy: Some("{}".to_string()),
+            policy: Some(one_statement_policy("stream")),
         },
         Row {
             label: "a trace destination holding no policy",
@@ -150,28 +150,60 @@ fn rows() -> Vec<Row> {
             label: "a name at the minimum length, holding a non-ASCII policy",
             name: "d".to_string(),
             resource_arn: Some(BUCKET_ARN),
-            policy: Some(
-                json!({"Sid": "lieferung-\u{00fc}ber-gr\u{00f6}\u{00df}e-\u{65e5}\u{672c}"})
-                    .to_string(),
-            ),
+            policy: Some(one_statement_policy(
+                "lieferung-\u{00fc}ber-gr\u{00f6}\u{00df}e-\u{65e5}\u{672c}",
+            )),
         },
         Row {
-            label: "a name at the maximum length, holding a pretty-printed policy",
+            label: "a name at the maximum length, holding a statement written as an object",
             name: "n".repeat(NAME_MAX_LENGTH),
             resource_arn: Some(FIREHOSE_ARN),
-            policy: Some("{\n  \"Version\" : \"2012-10-17\",\n  \"Statement\" : [ ]\n}".to_string()),
+            policy: Some(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": {
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": "logs:PutLogEvents",
+                    },
+                })
+                .to_string(),
+            ),
         },
     ]
 }
 
-/// The `policy.deliveryDestinationPolicy` a response carries, or `None` when the response
-/// carries no `policy` member at all.
+/// One resource-policy statement carrying `sid`: an effect, the service principal that
+/// delivers vended logs and the action it may take — the elements the IAM policy language
+/// requires of a resource-based statement.
+fn one_statement_policy(sid: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": sid,
+            "Effect": "Allow",
+            "Principal": {"Service": "delivery.logs.amazonaws.com"},
+            "Action": "logs:PutLogEvents",
+        }],
+    })
+    .to_string()
+}
+
+/// The `policy.deliveryDestinationPolicy` a response carries, or `None` when the reported
+/// `policy` structure carries none — which is what a destination no policy has been assigned
+/// to reports. The structure itself is always there, which is asserted here for every read.
 fn reported_policy(operation: &str, body: &Value, response: &Value) -> Option<String> {
-    let policy = response.get("policy")?;
+    let policy = response.get("policy").unwrap_or_else(|| {
+        panic!("{operation} {body}: the response carries the policy structure, got {response}")
+    });
+    assert!(
+        policy.is_object(),
+        "{operation} {body}: policy is the modelled structure, got {response}"
+    );
     Some(
         policy
-            .get("deliveryDestinationPolicy")
-            .and_then(Value::as_str)
+            .get("deliveryDestinationPolicy")?
+            .as_str()
             .unwrap_or_else(|| {
                 panic!(
                     "{operation} {body}: a reported policy carries deliveryDestinationPolicy, \
@@ -298,7 +330,7 @@ async fn a_namesake_of_another_resource_is_not_a_delivery_destination() {
     // One namesake per other namespace of this service.
     logs.ok(
         PUT_SOURCE,
-        &json!({"name": name, "resourceArn": BUCKET_ARN, "logType": "ACCESS_LOGS"}),
+        &json!({"name": name, "resourceArn": BUCKET_ARN, "logType": "S3_SERVER_ACCESS_LOGS"}),
     )
     .await;
     logs.ok(CREATE_LOG_GROUP, &json!({"logGroupName": name})).await;
@@ -356,7 +388,7 @@ async fn a_namesake_of_another_resource_is_not_a_delivery_destination() {
         .expect("case \"the delivery source namesake\": the source must be reported");
     assert_eq!(
         source.get("logType").and_then(Value::as_str),
-        Some("ACCESS_LOGS"),
+        Some("S3_SERVER_ACCESS_LOGS"),
         "case \"the delivery source namesake\": expected its own logType, got {source}"
     );
     assert!(

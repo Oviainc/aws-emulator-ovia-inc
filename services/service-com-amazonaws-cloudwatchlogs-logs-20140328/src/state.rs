@@ -1386,6 +1386,9 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
             TaggedResource::DeliveryDestination(name) => self
                 .delivery_destination(region, name)
                 .map(|destination| &destination.tags),
+            TaggedResource::LookupTable(name) => {
+                self.lookup_tables.get(name).map(|table| &table.tags)
+            }
         }
     }
 
@@ -1454,6 +1457,10 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
             TaggedResource::DeliveryDestination(name) => self
                 .delivery_destination_mut(region, name)
                 .map(|destination| &mut destination.tags),
+            TaggedResource::LookupTable(name) => self
+                .lookup_tables
+                .get_mut(name)
+                .map(|table| &mut table.tags),
         }
     }
 
@@ -2508,6 +2515,11 @@ pub struct DeliveryDestinationRecord {
     /// It is NOT one of the "delivery destination parameters" a later put overwrites: the
     /// policy is assigned by its own operation, so a put that updates the destination's
     /// parameters leaves it where it is.
+    ///
+    /// Held as the document the assignment read rather than as the bytes the caller rendered:
+    /// the whitespace between its JSON tokens is dropped on the way in
+    /// ([`service_common::json_document::minified`]), so every reader of this field reports the
+    /// same text whichever way the caller spaced it.
     pub policy: Option<String>,
 }
 
@@ -2735,6 +2747,53 @@ pub use vended_log_templates::{
     configuration_template_key, configuration_template_output_formats, configuration_templates,
     ConfigurationTemplateSource, CONFIGURATION_TEMPLATE_SOURCES,
 };
+
+/// The log types a delivery source over `resource_arn` may send, or `None` when this service
+/// publishes none for the resource's service.
+///
+/// A `logType` "defines the type of log that the source is sending", and which values are legal
+/// is a property of the SENDING SERVICE rather than of the member: the `logType` member's own
+/// catalogue lists them per service ("For CloudFront, the valid value is ACCESS_LOGS"), which is
+/// the same catalogue [`CONFIGURATION_TEMPLATE_SOURCES`] is built from, keyed by the service
+/// namespace of the resource's ARN ([`delivery_source_service`]). A resource whose service that
+/// catalogue does not name publishes no list here, so no log type can be judged against it.
+///
+/// One service sends the log types of EVERY row the catalogue holds for it — a service has one
+/// row per kind of resource, and a log type one of its resources sends is one that service
+/// sends — listed in the order the catalogue states them and without repeating a type two of
+/// its rows share.
+pub fn delivery_source_log_types(resource_arn: &str) -> Option<Vec<&'static str>> {
+    let service = delivery_source_service(resource_arn)?;
+    let mut published: Vec<&'static str> = Vec::new();
+    for source in CONFIGURATION_TEMPLATE_SOURCES
+        .iter()
+        .filter(|source| source.service == service)
+    {
+        for entry in source.log_types {
+            if !published.contains(&entry.log_type) {
+                published.push(entry.log_type);
+            }
+        }
+    }
+    (!published.is_empty()).then_some(published)
+}
+
+/// The refusal for a `logType` the resource named by `resource_arn` does not send
+/// ([`delivery_source_log_types`]), or `None` when it is one of them — or when this service
+/// publishes no list for that resource's service, which is no basis to refuse one.
+///
+/// The fixed text states that the provided log type is not valid and then the options that ARE
+/// supported, which is the one variable part: the log types the named resource's service sends,
+/// in the order the catalogue lists them.
+pub fn unsupported_log_type_message(resource_arn: &str, log_type: &str) -> Option<String> {
+    let supported = delivery_source_log_types(resource_arn)?;
+    (!supported.contains(&log_type)).then(|| {
+        format!(
+            "Provided LogType is not valid. Supported options are [{}].",
+            supported.join(", ")
+        )
+    })
+}
 
 /// The ARN service namespaces of the GLOBAL log senders: a resource of one of these lives in
 /// its partition rather than in a Region, which is why an ARN naming one carries an EMPTY
@@ -3429,6 +3488,24 @@ pub fn lookup_table_name_from_arn(arn: &str) -> Option<&str> {
 /// identified and `account_id` the account that identifier names.
 pub fn lookup_table_not_found_message(name: &str, account_id: &str) -> String {
     format!("Lookup table '{name}' not found in account '{account_id}'")
+}
+
+/// The refusal a lookup-table CREATE answers a name the account already holds a table under
+/// with. The sentence is the mirror of [`lookup_table_not_found_message`] — the same two
+/// variable parts, the table the request named and the account it was looked for in — because
+/// both state what was searched for and where.
+pub fn lookup_table_already_exists_message(name: &str, account_id: &str) -> String {
+    format!("Lookup table '{name}' already exists in account '{account_id}'")
+}
+
+/// The refusal a prefix-filtered lookup-table enumeration answers when the account holds no
+/// table whose name starts with that prefix: the request names a set of tables, so a prefix
+/// matching none names no resource at all.
+///
+/// Both variable parts are the request's and the caller's: the account the tables were looked
+/// for in and the prefix they were looked for under.
+pub fn lookup_tables_not_found_message(account_id: &str, prefix: &str) -> String {
+    format!("No lookup tables found for accountId '{account_id}' with prefix: '{prefix}'")
 }
 
 /// The same refusal for an operation that identifies the table by its `lookupTableArn`: that
@@ -5608,10 +5685,10 @@ fn is_log_group_name_pattern_char(character: char) -> bool {
 }
 
 /// The `LogGroupNameRegexPattern` `@pattern` as the service states it in a refusal: the
-/// modelled expression itself, anchors included — the one pattern-rendering rule this
-/// service words every constraint refusal with, stated on `requirement` in
-/// `crate::service`. It includes the per-alternative 24-character maximum the service
-/// accepts values past, which the emulator therefore does not enforce (see
+/// modelled expression itself, which is the form the pattern-rendering rule of
+/// `requirement` in `crate::service` states for a shape AWS publishes no other form for.
+/// It includes the per-alternative 24-character maximum the service accepts values past,
+/// which the emulator therefore does not enforce (see
 /// [`check_log_group_name_pattern`]).
 pub const LOG_GROUP_NAME_REGEX_PATTERN: &str =
     r"^(\^?[\.\-_\/#A-Za-z0-9]{3,24})(\|\^?[\.\-_\/#A-Za-z0-9]{3,24}){0,4}$";
@@ -6318,6 +6395,12 @@ pub enum TaggedResource {
     /// One delivery destination, by the `DeliveryDestination$name` it was created under in the
     /// Region that holds it.
     DeliveryDestination(String),
+    /// One lookup table, by the `LookupTable$lookupTableName` it was created under — the key
+    /// the store holds it by. It is here for the same reason the delivery resources are: the
+    /// model gives the resource its own tag member (`CreateLookupTable$tags`, "An optional list
+    /// of key-value pairs to associate with the resource") and this service stores it
+    /// ([`LookupTableRecord::tags`]).
+    LookupTable(String),
 }
 
 impl TaggedResource {
@@ -6330,6 +6413,7 @@ impl TaggedResource {
             Self::Delivery(_) => "delivery",
             Self::DeliverySource(_) => "delivery source",
             Self::DeliveryDestination(_) => "delivery destination",
+            Self::LookupTable(_) => "lookup table",
         }
     }
 }
@@ -6377,6 +6461,9 @@ pub fn tagged_resource(arn: &str) -> Option<TaggedResource> {
     }
     if let Some(id) = resource.strip_prefix(DELIVERY_ARN_PREFIX) {
         return (!id.is_empty()).then(|| TaggedResource::Delivery(id.to_string()));
+    }
+    if let Some(name) = lookup_table_name_from_arn(arn) {
+        return Some(TaggedResource::LookupTable(name.to_string()));
     }
     None
 }
@@ -6825,6 +6912,37 @@ pub const POLICY_REVISION_CONFLICT_MESSAGE: &str =
 /// per request value, so every name the account does not hold is refused identically.
 pub const DELIVERY_DESTINATION_NOT_FOUND_MESSAGE: &str =
     "Requested Delivery Destination does not exist in this account.";
+
+/// The refusal CloudWatch Logs answers the DELETE of a delivery-destination policy with when
+/// the destination it names holds no policy: the resource the delete addresses is the POLICY,
+/// not the destination, so a destination that exists and has had none assigned has nothing for
+/// the delete to remove. Like [`DELIVERY_DESTINATION_NOT_FOUND_MESSAGE`] the sentence is fixed
+/// for the error class and interpolates no destination name.
+pub const DELIVERY_DESTINATION_POLICY_NOT_FOUND_MESSAGE: &str =
+    "Delivery Destination Policy does not exist for this Delivery Destination.";
+
+/// The refusal `PutDeliveryDestinationPolicy` answers a `deliveryDestinationPolicy` that is
+/// not a delivery destination resource policy ([`is_delivery_destination_policy`]). The
+/// sentence is fixed for the error class: it states neither the destination nor anything of
+/// the document it would not take.
+pub const INVALID_DELIVERY_DESTINATION_POLICY_MESSAGE: &str =
+    "Invalid Delivery Destination resource Policy is provided.";
+
+/// Whether `document` is a delivery destination resource policy.
+///
+/// The operation "creates and assigns an IAM policy that grants permissions to CloudWatch Logs
+/// to deliver logs cross-account", so the document is an IAM JSON policy in its RESOURCE-based
+/// form — it states who the permission is granted to — which is the one grammar
+/// [`service_common::iam_policy`] states for every service of this emulator that takes such a
+/// document.
+///
+/// What the statements SAY is not judged: they govern a cross-account delivery nothing in this
+/// store performs, and the operation documents nothing about them beyond that the policy
+/// "must include two statements. One statement enables general logs delivery, and the other
+/// allows delivery to the chosen destination".
+pub fn is_delivery_destination_policy(document: &str) -> bool {
+    ::service_common::iam_policy::resource_policy_defect(document).is_none()
+}
 
 /// The refusal CloudWatch Logs builds from the request when the identifier a
 /// `DisassociateSourceFromS3TableIntegration` names is not an association of an S3 Table
