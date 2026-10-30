@@ -35,8 +35,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     AdvancedBackupSetting, AlreadyExistsException, BackupPlan, BackupRule, BackupRuleInput,
-    BackupSelection, FrameworkControl, InvalidParameterValueException, Lifecycle,
-    ResourceNotFoundException, ScanSetting,
+    BackupSelection, FrameworkControl, InvalidParameterValueException, InvalidRequestException,
+    Lifecycle, ResourceNotFoundException, ScanSetting,
 };
 
 /// The ARN namespace this service stamps into every ARN it mints
@@ -456,6 +456,21 @@ pub const MESSAGE_VAULT_ALREADY_EXISTS: &str = "Backup vault with the same name 
 /// No `Code`: this condition has no observed token.
 pub const MESSAGE_BACKUP_PLAN_NOT_FOUND: &str = "Cannot find Backup plan";
 
+/// The sentence AWS states for "the recovery point asked about is not one the
+/// named vault holds" — fixed, and worded as this service words the same
+/// condition for a backup job ([`MESSAGE_BACKUP_JOB_NOT_FOUND`]): it names no
+/// part of the request, so neither the vault nor the ARN asked about appears in
+/// it. It answers every way a (vault, ARN) pair can fail to name a stored
+/// recovery point. No `Code`: this condition has no observed token.
+pub const MESSAGE_RECOVERY_POINT_NOT_FOUND: &str = "Cannot find recovery point";
+
+/// The sentence AWS states for "the vault holding this recovery point is
+/// configured with a Backup Vault Lock, which still retains it" — fixed: it
+/// names the condition (the lock), not the request. No `Code`: this condition
+/// has no observed token.
+pub const MESSAGE_RECOVERY_POINT_LOCKED: &str =
+    "RecoveryPoint cannot be deleted or updated (Backup vault configured with Lock)";
+
 /// The sentence AWS states for "the backup selection asked about is not one the
 /// named plan holds" — fixed, and worded as this service words the same
 /// condition for a backup plan ([`MESSAGE_BACKUP_PLAN_NOT_FOUND`]): it names no
@@ -534,6 +549,24 @@ pub fn backup_plan_not_found() -> ResourceNotFoundException {
 pub fn backup_selection_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(MESSAGE_BACKUP_SELECTION_NOT_FOUND.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a (vault, `RecoveryPointArn`) pair that names no
+/// recovery point the account holds — see [`MESSAGE_RECOVERY_POINT_NOT_FOUND`].
+pub fn recovery_point_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(MESSAGE_RECOVERY_POINT_NOT_FOUND.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a call that would delete or change a recovery point
+/// its vault's lock still retains — see [`MESSAGE_RECOVERY_POINT_LOCKED`].
+pub fn recovery_point_locked() -> InvalidRequestException {
+    InvalidRequestException {
+        message: Some(MESSAGE_RECOVERY_POINT_LOCKED.to_string()),
         ..Default::default()
     }
 }
@@ -1448,6 +1481,67 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
         self.recovery_points_by_vault
             .get(vault_name)
             .map_or(0, |arns| i64::try_from(arns.len()).unwrap_or(i64::MAX))
+    }
+
+    /// Resolve the recovery point a (`BackupVaultName`, `RecoveryPointArn`) pair
+    /// addresses: one the named vault holds whose backup has settled.
+    ///
+    /// A vault this account does not hold, an ARN no stored recovery point
+    /// answers to, an ARN another vault holds, and one whose backup has not
+    /// reached a terminal state yet are ONE condition as far as a call that
+    /// addresses a recovery point is concerned: the recovery point asked about is
+    /// not one the named vault holds. All four answer the same modelled refusal
+    /// ([`recovery_point_not_found`]) and none of them tells the caller which it
+    /// was. A point whose backup is still running is deliberately on that side of
+    /// the line: the backup has reserved its ARN, but until the backup finishes
+    /// there is no stored recovery point to address.
+    pub fn stored_recovery_point(
+        &self,
+        vault_name: &str,
+        recovery_point_arn: &str,
+    ) -> Result<&RecoveryPoint, ResourceNotFoundException> {
+        self.recovery_points
+            .get(recovery_point_arn)
+            .filter(|point| point.backup_vault_name == vault_name)
+            .filter(|point| point.status != RECOVERY_POINT_STATUS_CREATING)
+            .ok_or_else(recovery_point_not_found)
+    }
+
+    /// Whether the lock on the vault holding `point` still retains it at `now`,
+    /// so a call that would delete or change it is refused
+    /// ([`recovery_point_locked`]).
+    ///
+    /// A Backup Vault Lock is what makes a recovery point's retention enforced by
+    /// the SERVICE rather than by permissions: while a vault holds one, a point in
+    /// it can only go once the retention it was stored under has elapsed. That
+    /// retention is the point's own lifecycle, counted from its creation — the
+    /// instant [`RecoveryPoint::calculated_lifecycle`] already computes for
+    /// `CalculatedLifecycle`, so the two can never disagree — and a point whose
+    /// lifecycle makes no deletion due is kept for as long as the lock stands.
+    /// The lock's own `MinRetentionDays` is not a second deadline here: it bounds
+    /// the retention a backup INTO the vault may be stored under, not when a
+    /// stored point may be deleted. A vault with no lock retains nothing this way.
+    pub fn lock_retains_recovery_point(&self, point: &RecoveryPoint, now: SystemTime) -> bool {
+        let locked = self
+            .vaults
+            .get(&point.backup_vault_name)
+            .is_some_and(|vault| vault.lock.is_some());
+        locked
+            && point
+                .calculated_lifecycle()
+                .and_then(|(_, delete_at)| delete_at)
+                .is_none_or(|delete_at| now < delete_at)
+    }
+
+    /// Remove one recovery point from the vault that holds it, from BOTH the
+    /// record map and the per-vault index, so the index keeps holding exactly the
+    /// ARNs `recovery_points` does and every count derived from it follows the
+    /// deletion.
+    pub fn remove_recovery_point(&mut self, vault_name: &str, recovery_point_arn: &str) {
+        self.recovery_points.remove(recovery_point_arn);
+        if let Some(arns) = self.recovery_points_by_vault.get_mut(vault_name) {
+            arns.retain(|held| held != recovery_point_arn);
+        }
     }
 
     /// Resolve a vault for a vault-scoped READ, deciding access before existence.

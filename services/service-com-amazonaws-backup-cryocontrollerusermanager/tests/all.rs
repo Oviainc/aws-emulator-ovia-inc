@@ -23,6 +23,8 @@ mod error_bodies;
 mod framework;
 #[path = "all/logically_air_gapped_vault.rs"]
 mod logically_air_gapped_vault;
+#[path = "all/recovery_point_deletion.rs"]
+mod recovery_point_deletion;
 #[path = "all/scheduled_runs_preview.rs"]
 mod scheduled_runs_preview;
 #[path = "all/state_roundtrip.rs"]
