@@ -532,6 +532,49 @@ pub const CODE_SIZE_ZIPPED_LIMIT: i64 = 52_428_800;
 /// as [`TOTAL_CODE_SIZE_LIMIT`].
 pub const CONCURRENT_EXECUTIONS_LIMIT: i32 = 1_000;
 
+/// The runtime identifiers Lambda no longer supports.
+///
+/// The model enumerates every runtime identifier the API accepts (`Runtime`) and says
+/// nothing about which of them are past their deprecation date, so the set is a CATALOG:
+/// the identifiers listed as deprecated in the AWS Lambda Developer Guide's "Runtime
+/// deprecation policy" (its "Deprecated runtimes" table), each of whose deprecation dates
+/// has passed. Every other member of `Runtime` is a supported runtime.
+pub const DEPRECATED_RUNTIMES: &[&str] = &[
+    "dotnetcore1.0",
+    "dotnetcore2.0",
+    "dotnetcore2.1",
+    "dotnetcore3.1",
+    "go1.x",
+    "java8",
+    "nodejs",
+    "nodejs10.x",
+    "nodejs12.x",
+    "nodejs14.x",
+    "nodejs16.x",
+    "nodejs18.x",
+    "nodejs4.3",
+    "nodejs4.3-edge",
+    "nodejs6.10",
+    "nodejs8.10",
+    "provided",
+    "python2.7",
+    "python3.6",
+    "python3.7",
+    "python3.8",
+    "ruby2.5",
+    "ruby2.7",
+];
+
+/// Whether `runtime` is one of the identifiers [`DEPRECATED_RUNTIMES`] holds.
+///
+/// A runtime identifier is a modelled `Runtime` enum value, matched exactly: the
+/// identifiers differ only in their version suffixes, so a prefix or case-folded match
+/// would read one runtime as another.
+#[must_use]
+pub fn is_deprecated_runtime(runtime: &str) -> bool {
+    DEPRECATED_RUNTIMES.contains(&runtime)
+}
+
 /// The simultaneous executions an account must leave unreserved.
 ///
 /// `PutFunctionConcurrency`'s own documentation states the rule: "You can reserve
@@ -4678,6 +4721,24 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
             .saturating_add(self.unreserved_provisioned_concurrency_except(None))
     }
 
+    /// Whether any function this account holds is configured with a runtime Lambda no
+    /// longer supports.
+    ///
+    /// A function runs the runtime its configuration names, and a published version keeps
+    /// the runtime it froze and still runs when it is invoked, so a deprecated runtime
+    /// anywhere among them — the unpublished configuration or any published version — is
+    /// one this account still has a function on. A function whose package type is an
+    /// image names no runtime at all, so it holds none to be deprecated.
+    #[must_use]
+    pub fn has_function_with_deprecated_runtime(&self) -> bool {
+        self.functions.values().any(|function| {
+            std::iter::once(&function.config)
+                .chain(function.versions.values().map(|version| &version.config))
+                .filter_map(|config| config.runtime.as_deref())
+                .any(is_deprecated_runtime)
+        })
+    }
+
     /// `AccountLimit`: the account's quotas, with the one limit that is not a constant
     /// computed from the store.
     ///
@@ -5573,6 +5634,49 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// sentence is the same for every resource that hits it.
 pub const TAG_LIMIT_EXCEEDED_MESSAGE: &str = "Number of tags exceeds resource tag limit.";
 
+/// The tag-key namespace AWS keeps for the tags it applies itself.
+///
+/// The Lambda Developer Guide's "Tag Lambda resources" states the restriction on a tag
+/// KEY: "Don't use the `aws:` prefix in tag keys, because it is reserved for Amazon Web
+/// Services use. You can't edit or delete tag keys with this prefix."
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Lambda's sentence for a request carrying a tag key it will not store.
+///
+/// It names the three conditions a key must meet and NOTHING of the request — not the
+/// resource, not the offending key — so the sentence is the same for every request that
+/// fails any of them.
+pub const INVALID_TAGS_MESSAGE: &str = "One or more of your tags had a problem, please \
+     ensure none of your tag names start with \"aws:\", none are empty, and there are no \
+     duplicate tags";
+
+/// Whether `key` lies in the namespace [`RESERVED_TAG_KEY_PREFIX`] reserves.
+///
+/// Compared without regard to case, and by BYTES rather than by characters, so a key
+/// whose first bytes are a multi-byte character is simply not reserved instead of
+/// panicking on a split character boundary.
+#[must_use]
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// Whether every key in `keys` is one Lambda will store: not empty, not in the reserved
+/// namespace, and named at most once.
+///
+/// This is the whole of what [`INVALID_TAGS_MESSAGE`] states, asked of the keys a single
+/// request carries, so every operation that STORES tags asks it the same way and refuses
+/// with the same sentence.
+#[must_use]
+pub fn tag_keys_are_storable<'a, I>(keys: I) -> bool
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    keys.into_iter()
+        .all(|key| !key.is_empty() && !is_reserved_tag_key(key) && seen.insert(key))
+}
+
 /// Why a `TaggableResource` — the `Resource` label of the `/2017-03-31/tags/{Resource}`
 /// operations — names no tag set.
 ///
@@ -5916,6 +6020,91 @@ pub fn resolve_layer_version_ref<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The keys a tag write may store, and the three ways a key is one Lambda refuses:
+    /// empty, in the reserved namespace, or named twice in one request.
+    #[test]
+    fn a_tag_key_is_storable_unless_it_is_empty_reserved_or_repeated() {
+        let cases: &[(&str, &[&str], bool)] = &[
+            ("no tags at all", &[], true),
+            ("one ordinary key", &["Project"], true),
+            (
+                "several ordinary keys, including the punctuation the key pattern admits",
+                &["Project", "cost.centre", "team/payments", "owner@example"],
+                true,
+            ),
+            // `aws:` is a PREFIX rule, not a substring one: a key that merely contains it,
+            // or starts with the letters without the colon, is the caller's own.
+            ("a key whose name starts with the letters only", &["awsome"], true),
+            ("a key carrying the prefix further in", &["cost:aws:share"], true),
+            ("an empty key", &[""], false),
+            ("an empty key beside an ordinary one", &["Project", ""], false),
+            ("a reserved key", &["aws:cloudformation:stack-name"], false),
+            (
+                "a reserved key written in another case",
+                &["AWS:CloudFormation:stack-name"],
+                false,
+            ),
+            ("the prefix alone", &["aws:"], false),
+            ("a reserved key beside an ordinary one", &["Project", "aws:created-by"], false),
+            ("one key named twice", &["Project", "Project"], false),
+        ];
+
+        for (case, keys, expected) in cases {
+            let actual = tag_keys_are_storable(keys.iter().copied());
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected storable={expected}, got {actual:?} for {keys:?}"
+            );
+        }
+    }
+
+    /// Only an exact identifier the catalog names is deprecated, and nothing the catalog
+    /// names is one of the supported runtimes the rows below hold.
+    ///
+    /// The supported set is written out here rather than read from the model: what is
+    /// under test is the CATALOG's membership, and a runtime identifier the model declares
+    /// is supported until the deprecation policy names it.
+    #[test]
+    fn a_runtime_is_deprecated_only_when_the_catalog_names_it_exactly() {
+        // Values of `Runtime` (`smithy_query(query="shape", shape="Runtime")`) that the
+        // deprecation policy does not name, so none of them is deprecated.
+        let supported = [
+            "nodejs20.x",
+            "nodejs22.x",
+            "python3.12",
+            "python3.13",
+            "java21",
+            "dotnet8",
+            "ruby3.3",
+            "provided.al2",
+            "provided.al2023",
+        ];
+        for runtime in supported {
+            assert!(
+                !is_deprecated_runtime(runtime),
+                "case {runtime:?}: a supported runtime must not be read as deprecated"
+            );
+        }
+        for runtime in DEPRECATED_RUNTIMES {
+            assert!(
+                is_deprecated_runtime(runtime),
+                "case {runtime:?}: the catalog's own entry must be read as deprecated"
+            );
+            assert!(
+                !supported.contains(runtime),
+                "case {runtime:?}: a runtime cannot be both supported and deprecated"
+            );
+        }
+        // The match is exact: a near miss of a catalogued identifier is a different
+        // runtime, not a deprecated one.
+        for runtime in ["python3", "python3.80", "java", "go1", "nodejs18"] {
+            assert!(
+                !is_deprecated_runtime(runtime),
+                "case {runtime:?}: only an exact identifier is deprecated"
+            );
+        }
+    }
 
     #[test]
     fn a_reported_instant_sorts_as_a_string_exactly_as_it_does_as_an_instant() {

@@ -391,6 +391,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .package_type
             .clone()
             .unwrap_or_else(|| crate::state::PACKAGE_TYPE_ZIP.to_string());
+
+        // The tags of the request are the ones the new function will carry, so they are
+        // judged by the rule a stored tag has to meet before anything is created.
+        if !crate::state::tag_keys_are_storable(
+            input
+                .tags
+                .iter()
+                .flat_map(|tags| tags.keys().map(String::as_str)),
+        ) {
+            return Err(invalid_parameter(
+                crate::state::INVALID_TAGS_MESSAGE.to_string(),
+            ));
+        }
+
         let code = package_code(&package_type, &input)?;
 
         // AWS's published Lambda quota "Function timeout: 900 seconds (15 minutes)" is

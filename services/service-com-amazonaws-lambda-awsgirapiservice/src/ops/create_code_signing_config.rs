@@ -150,6 +150,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The tags of the request are the ones the new configuration will carry, so they
+        // are judged by the rule a stored tag has to meet before anything is created.
+        if !crate::state::tag_keys_are_storable(
+            input
+                .tags
+                .iter()
+                .flat_map(|tags| tags.keys().map(String::as_str)),
+        ) {
+            return Err(
+                CreateCodeSigningConfigErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(crate::state::INVALID_TAGS_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
         let id = crate::state::mint_code_signing_config_id();

@@ -372,6 +372,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The tags of the request are the ones the new mapping will carry, so they are
+        // judged by the rule a stored tag has to meet before anything is created.
+        if !crate::state::tag_keys_are_storable(
+            input
+                .tags
+                .iter()
+                .flat_map(|tags| tags.keys().map(String::as_str)),
+        ) {
+            return Err(invalid_parameter(
+                crate::state::INVALID_TAGS_MESSAGE.to_string(),
+            ));
+        }
+
         // "Creates a mapping between an event source and an Lambda Event Function." The
         // event source is either a resource ARN (`EventSourceArn`) or a self-managed
         // Apache Kafka cluster (`SelfManagedEventSource`: "The self-managed Apache Kafka

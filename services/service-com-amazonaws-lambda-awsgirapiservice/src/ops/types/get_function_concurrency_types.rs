@@ -17,9 +17,68 @@ pub struct GetFunctionConcurrencyInput {
     pub function_name: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.lambda#GetFunctionConcurrencyResponse")]
+/// `GetFunctionConcurrencyOutput`, with its schema and serializer written out instead of
+/// derived.
+///
+/// WHY it is not `#[smithy_macros::smithy(shape = ...)]` like the input beside it: this
+/// response is the reserved-concurrency setting and nothing else, and the setting is
+/// REPORTED whether or not it is set — a function that reserves nothing answers
+/// `ReservedConcurrentExecutions` as JSON `null` rather than an object with no members,
+/// so a client reading the member off the response finds it either way. The derive emits
+/// one serialization arm per member and SKIPS an `Option` that is `None`, which is what
+/// left the body empty; everything else about the shape — the member name, its index and
+/// its JSON type — is what the derive would have emitted
+/// (`smithy_query(query="shape", shape="GetFunctionConcurrencyResponse",
+/// model_path="services/service-com-amazonaws-lambda-awsgirapiservice/smithy-model/com-amazonaws-lambda-awsgirapiservice.json")`).
 #[derive(Debug, Clone, Default)]
 pub struct GetFunctionConcurrencyOutput {
     pub reserved_concurrent_executions: Option<i32>,
 }
 
+#[allow(non_upper_case_globals)]
+impl GetFunctionConcurrencyOutput {
+    /// `ReservedConcurrentExecutions`, the one member the model declares.
+    const M_RESERVED_CONCURRENT_EXECUTIONS: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.lambda#GetFunctionConcurrencyResponse$ReservedConcurrentExecutions",
+                "com.amazonaws.lambda",
+                "ReservedConcurrentExecutions",
+            ),
+            ::aws_smithy_schema::ShapeType::Integer,
+            "ReservedConcurrentExecutions",
+            0,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.lambda#GetFunctionConcurrencyResponse",
+            "com.amazonaws.lambda",
+            "GetFunctionConcurrencyResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_RESERVED_CONCURRENT_EXECUTIONS],
+    );
+}
+
+pub static GET_FUNCTION_CONCURRENCY_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetFunctionConcurrencyOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetFunctionConcurrencyOutput {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        match self.reserved_concurrent_executions {
+            ::std::option::Option::Some(reserved) => {
+                s.write_integer(&Self::M_RESERVED_CONCURRENT_EXECUTIONS, reserved)?;
+            }
+            // Nothing is reserved for this function, which the member reports by being
+            // present and null rather than by being left out.
+            ::std::option::Option::None => {
+                s.write_null(&Self::M_RESERVED_CONCURRENT_EXECUTIONS)?;
+            }
+        }
+        Ok(())
+    }
+}

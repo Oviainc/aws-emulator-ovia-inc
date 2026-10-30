@@ -19,6 +19,8 @@ mod account_concurrency_floor_message;
 mod account_concurrency_metering;
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/account_settings_deprecated_runtime.rs"]
+mod account_settings_deprecated_runtime;
 #[path = "all/alias_deletion.rs"]
 mod alias_deletion;
 #[path = "all/alias_listing.rs"]
@@ -87,6 +89,8 @@ mod event_source_mapping_sqs_delivery;
 mod event_source_mapping_update;
 #[path = "all/event_source_mapping_update_omitted_members.rs"]
 mod event_source_mapping_update_omitted_members;
+#[path = "all/error_fault_class.rs"]
+mod error_fault_class;
 #[path = "all/event_source_mappings.rs"]
 mod event_source_mappings;
 // Declared in this span of the sorted list rather than at the head of this file or in its
@@ -109,6 +113,8 @@ mod function_code_update;
 mod function_concurrency;
 #[path = "all/function_concurrency_removal.rs"]
 mod function_concurrency_removal;
+#[path = "all/function_concurrency_reported_member.rs"]
+mod function_concurrency_reported_member;
 #[path = "all/function_configuration.rs"]
 mod function_configuration;
 #[path = "all/function_lifecycle.rs"]
@@ -169,6 +175,8 @@ mod refused_value_echo;
 mod resource_policy;
 #[path = "all/resource_policy_document.rs"]
 mod resource_policy_document;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/response_stream_invocation.rs"]

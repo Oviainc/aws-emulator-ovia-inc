@@ -188,6 +188,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?;
 
+        // The tags of the request are the ones the new provider will carry, so they are
+        // judged by the rule a stored tag has to meet before anything is created.
+        if !crate::state::tag_keys_are_storable(
+            input
+                .tags
+                .iter()
+                .flat_map(|tags| tags.keys().map(String::as_str)),
+        ) {
+            return Err(invalid_parameter(
+                crate::state::INVALID_TAGS_MESSAGE.to_string(),
+            ));
+        }
+
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();

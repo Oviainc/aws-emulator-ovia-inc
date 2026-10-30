@@ -53,6 +53,14 @@
 //! * `ServiceException` (HTTP 500) — The Lambda service encountered an internal error.
 //! * `TooManyRequestsException` (HTTP 429) — The request throughput limit was exceeded. For
 //!   more information, see Lambda quotas.
+//!
+//! ## Beyond the modelled output
+//!
+//! The answer carries `HasFunctionWithDeprecatedRuntime` beside the two members above —
+//! whether any function of this account is configured with a runtime Lambda no longer
+//! supports. The on-disk `GetAccountSettingsResponse` does not declare it, so the output
+//! shape's schema and serializer are written out in
+//! [`super::types::get_account_settings_types`] rather than derived; see the note there.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -143,11 +151,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // use; `AccountLimit` carries the account's quotas, with
         // `UnreservedConcurrentExecutions` reduced by every allocation those same
         // functions have committed — what they reserve, and the provisioned
-        // concurrency of the ones reserving nothing.
+        // concurrency of the ones reserving nothing. The deprecated-runtime flag is
+        // the third account-wide fact the answer carries: whether any of those same
+        // functions is configured with a runtime Lambda no longer supports.
         let store = state.lock();
         Ok(GetAccountSettingsOutput {
             account_limit: Some(store.account_limit()),
             account_usage: Some(store.account_usage()),
+            has_function_with_deprecated_runtime: store.has_function_with_deprecated_runtime(),
         })
     }
 }

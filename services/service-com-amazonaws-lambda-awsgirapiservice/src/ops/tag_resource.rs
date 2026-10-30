@@ -19,6 +19,12 @@
 //! that would leave it holding more is refused WHOLE — the resource keeps the tag set it
 //! had, rather than the prefix of the request that still fitted.
 //!
+//! A tag is stored only under a key Lambda stores tags under at all
+//! ([`crate::state::tag_keys_are_storable`]): a key in the `aws:` namespace is AWS's own,
+//! an empty key names nothing, and a key named twice in one request says two things about
+//! one tag. Such a request is refused with the modelled 400 and leaves the resource's tag
+//! set untouched.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -186,6 +192,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx);
 
+        // What Lambda will STORE a tag under is judged before anything is looked up or
+        // written: a key must be named, must not be in the namespace AWS keeps for its
+        // own tags, and must be named only once.
+        if !crate::state::tag_keys_are_storable(input.tags.keys().map(String::as_str)) {
+            return Err(invalid_tags());
+        }
+
         let mut store = state.lock();
         // The one tag map the store holds for the named resource — the same map
         // `ListTags` reports and `CreateFunction` filled in, never a second copy.
@@ -224,6 +237,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(TagResourceOutput)
     }
+}
+
+/// The modelled 400 a request carrying a tag key Lambda will not store is refused with.
+///
+/// The sentence names the three conditions and nothing of the request, so it is built
+/// from [`crate::state::INVALID_TAGS_MESSAGE`] alone.
+fn invalid_tags() -> TagResourceError {
+    TagResourceErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        r#type: None,
+        message: Some(crate::state::INVALID_TAGS_MESSAGE.to_string()),
+    })
+    .into()
 }
 
 /// The modelled error a `Resource` that names no tag set is refused with.

@@ -94,6 +94,11 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The class of fault every error body of this service names in its `Type` member, which
+/// no raise site carries because it is a property of the failure rather than of the call.
+/// Applied to every response [`StatedPerOperation`] answers; see the module's own header.
+pub mod fault_class;
+
 /// The largest single value ONE clause of this service's validation refusal quotes back.
 ///
 /// An AWS constraint message always quotes the value it refused in full, and the shared
@@ -449,11 +454,12 @@ where
             // below would make this future non-`Send`.
             let refused = stated_refusal::<O>(svc.definition().protocol(), req);
             if let Some((violations, stated)) = refused {
-                return svc
-                    .definition()
-                    .refusal_response(ProtocolError::Invalid(violations), Some(stated));
+                return fault_class::with_fault_class(
+                    svc.definition()
+                        .refusal_response(ProtocolError::Invalid(violations), Some(stated)),
+                );
             }
-            self.operation.run(svc, req, ctx).await
+            fault_class::with_fault_class(self.operation.run(svc, req, ctx).await)
         })
     }
 

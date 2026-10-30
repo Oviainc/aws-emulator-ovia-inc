@@ -16,11 +16,104 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-lambda-awsgirapiservice
 pub struct GetAccountSettingsInput {
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.lambda#GetAccountSettingsResponse")]
+/// `GetAccountSettingsOutput`, with its schema and serializer written out instead of
+/// derived.
+///
+/// WHY it is not `#[smithy_macros::smithy(shape = ...)]` like the input beside it: the
+/// account settings this service answers carry `HasFunctionWithDeprecatedRuntime` beside
+/// the two members the on-disk shape declares (`smithy_query(query="shape",
+/// shape="GetAccountSettingsResponse",
+/// model_path="services/service-com-amazonaws-lambda-awsgirapiservice/smithy-model/com-amazonaws-lambda-awsgirapiservice.json")`
+/// lists `AccountLimit` and `AccountUsage` only), and the derive refuses a Rust field
+/// that matches no Smithy member at all. Everything else about the shape — the member
+/// names, their order and their JSON types — is what the derive would have emitted.
 #[derive(Debug, Clone, Default)]
 pub struct GetAccountSettingsOutput {
     pub account_limit: Option<AccountLimit>,
     pub account_usage: Option<AccountUsage>,
+    /// Beyond the modelled members: whether any function this account holds runs a
+    /// runtime Lambda no longer supports, so a caller can ask that question without
+    /// walking every function. Always rendered, like the boolean it is.
+    pub has_function_with_deprecated_runtime: bool,
+}
+
+#[allow(non_upper_case_globals)]
+impl GetAccountSettingsOutput {
+    /// `AccountLimit`, the first member the model declares.
+    const M_ACCOUNT_LIMIT: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.lambda#GetAccountSettingsResponse$AccountLimit",
+            "com.amazonaws.lambda",
+            "AccountLimit",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        "AccountLimit",
+        0,
+    );
+
+    /// `AccountUsage`, the second member the model declares.
+    const M_ACCOUNT_USAGE: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.lambda#GetAccountSettingsResponse$AccountUsage",
+            "com.amazonaws.lambda",
+            "AccountUsage",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        "AccountUsage",
+        1,
+    );
+
+    /// `HasFunctionWithDeprecatedRuntime`, which the model does not declare — so its
+    /// shape id sits in the `com.amazonaws.lambda.recorded` namespace rather than the
+    /// service's own, where it can neither claim to be modelled nor collide with a
+    /// member the model may declare later.
+    const M_HAS_FUNCTION_WITH_DEPRECATED_RUNTIME: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.lambda.recorded#GetAccountSettingsResponse$HasFunctionWithDeprecatedRuntime",
+                "com.amazonaws.lambda.recorded",
+                "HasFunctionWithDeprecatedRuntime",
+            ),
+            ::aws_smithy_schema::ShapeType::Boolean,
+            "HasFunctionWithDeprecatedRuntime",
+            2,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.lambda#GetAccountSettingsResponse",
+            "com.amazonaws.lambda",
+            "GetAccountSettingsResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ACCOUNT_LIMIT,
+            &Self::M_ACCOUNT_USAGE,
+            &Self::M_HAS_FUNCTION_WITH_DEPRECATED_RUNTIME,
+        ],
+    );
+}
+
+pub static GET_ACCOUNT_SETTINGS_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetAccountSettingsOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetAccountSettingsOutput {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let ::std::option::Option::Some(limit) = self.account_limit.as_ref() {
+            s.write_struct(&Self::M_ACCOUNT_LIMIT, limit)?;
+        }
+        if let ::std::option::Option::Some(usage) = self.account_usage.as_ref() {
+            s.write_struct(&Self::M_ACCOUNT_USAGE, usage)?;
+        }
+        s.write_boolean(
+            &Self::M_HAS_FUNCTION_WITH_DEPRECATED_RUNTIME,
+            self.has_function_with_deprecated_runtime,
+        )?;
+        Ok(())
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.lambda#AccountLimit")]
@@ -39,4 +132,3 @@ pub struct AccountUsage {
     pub total_code_size: i64,
     pub function_count: i64,
 }
-
