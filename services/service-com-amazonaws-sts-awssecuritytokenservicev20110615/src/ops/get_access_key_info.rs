@@ -8,6 +8,9 @@
 //! `GetFederationToken` one. A key this service never minted belongs to the
 //! emulator's own account, the only account its long-term keys live in.
 //!
+//! A value that is not an access key id at all names no key in any account, so it is
+//! refused rather than resolved; see [`crate::state::is_access_key_id`].
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -150,6 +153,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{caller_may_call, long_term_identity};
+
+        // "When you pass an access key ID to this operation, it returns the ID of the
+        // Amazon Web Services account to which the keys belong" (this operation's
+        // documentation) — a question only an access key id has an answer to. The
+        // modelled `accessKeyIdType` bounds what may be SENT (`@length` 16..128,
+        // `@pattern ^[\w]*$`, both already enforced before this handler runs); a value
+        // inside those bounds that is not shaped like a key id AWS could have issued
+        // names no key at all, so it is refused here rather than resolved to an account.
+        // The refusal carries nothing of the request.
+        if !crate::state::is_access_key_id(&input.access_key_id) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::INVALID_ACCESS_KEY_ID_MESSAGE,
+            ));
+        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This service has no store on the engine it was mounted on, so it cannot

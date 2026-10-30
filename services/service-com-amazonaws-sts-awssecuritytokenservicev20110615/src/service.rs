@@ -408,8 +408,14 @@ where
             }
             // Every failure an operation answers — a modelled error, and a refusal the
             // centralized walk raised while it was being served — states its message with
-            // the escaping XML asks of a text node; see [`message_text`].
-            message_text::with_literal_message_text(self.operation.run(svc, req, ctx).await)
+            // the escaping XML asks of a text node; see [`message_text`]; and names the
+            // request it answers in the envelope's `<RequestId>`, which the framework's
+            // error renderers do not write (see
+            // [`::service_common::query_error_envelope`]). A successful response carries
+            // its own id in `ResponseMetadata` already and is returned untouched.
+            ::service_common::query_error_envelope::with_request_id(
+                message_text::with_literal_message_text(self.operation.run(svc, req, ctx).await),
+            )
         })
     }
 
@@ -427,9 +433,14 @@ where
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The generated entry, wrapped so the three failures the router renders OUTSIDE the
-    /// dispatch path state their message as a text node too (see [`message_text`]).
-    /// Identity, the protocol and the routing table are the generated entry's untouched.
-    entry: message_text::StatedMessageDefinition<Eng>,
+    /// dispatch path state their message as a text node too (see [`message_text`]) and name
+    /// the request they answer in the `awsQuery` error envelope's `<RequestId>`, as every
+    /// other error of this service does (see
+    /// [`::service_common::query_error_envelope`]). Identity, the protocol and the routing
+    /// table are the generated entry's untouched.
+    entry: ::service_common::query_error_envelope::RequestIdEnvelopeDefinition<
+        message_text::StatedMessageDefinition<Eng>,
+    >,
     /// The SAME shared engine the generated entry threaded into every operation, kept
     /// here too because the refusal wording below has to ask whether the account holds
     /// the credential a refused request presented, and the records that answer that are
@@ -469,7 +480,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             get_web_identity_token::GetWebIdentityToken,
         );
         Self {
-            entry: message_text::StatedMessageDefinition::new(Arc::clone(&engine)),
+            entry: ::service_common::query_error_envelope::RequestIdEnvelopeDefinition::new(
+                message_text::StatedMessageDefinition::new(Arc::clone(&engine)),
+            ),
             engine,
             protocol: QuerySignedCalls::new(),
             stated,

@@ -438,15 +438,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // once. A router without IAM mounted holds no role at all, which is the same
         // answer as a role the account does not hold.
         let iam = crate::state::iam_state(&*self.engine);
-        let (long_term, role) = match iam.as_ref() {
+        let (long_term, role, mfa_device) = match iam.as_ref() {
             Some(iam) => {
                 let iam = iam.lock();
                 (
                     long_term_identity(Some(&iam), &access_key_id),
                     crate::state::resolve_role(&iam, &input.role_arn),
+                    input
+                        .serial_number
+                        .as_deref()
+                        .and_then(|serial| crate::state::held_mfa_device(&iam, serial)),
                 )
             }
-            None => (long_term_identity(None, &access_key_id), None),
+            None => (long_term_identity(None, &access_key_id), None, None),
         };
 
         let mut registry = state.lock();
@@ -475,6 +479,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !caller_may_call(caller.kind, Self::NAME) {
             return Err(crate::scaffolded::Scaffolded::access_denied(
                 crate::state::session_credentials_message(Self::NAME),
+            ));
+        }
+
+        // "If the role being assumed requires MFA and if the TokenCode value is missing
+        // or expired, the AssumeRole call returns an 'access denied' error"
+        // (`AssumeRoleRequest$TokenCode`): the MFA challenge a request presents is
+        // authenticated against the device the account holds for the calling identity,
+        // the same way `GetSessionToken` decides one, before anything is minted.
+        if let Some(failed) = crate::state::mfa_challenge_failure(
+            mfa_device.as_ref(),
+            &caller.identity,
+            input.serial_number.as_deref(),
+            input.token_code.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                failed.message(),
             ));
         }
 
@@ -638,10 +658,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }));
         }
 
-        // SerialNumber and TokenCode name the caller's MFA device. A trust policy's MFA
-        // condition is not a string condition, so the shared evaluator leaves such a
-        // statement undecided and withholds the grant; nothing here reads the two
-        // members as evidence of an MFA-authenticated session.
+        // SerialNumber and TokenCode name the caller's MFA device; the challenge they
+        // carry was decided above. A trust policy's MFA condition is not a string
+        // condition, so the shared evaluator leaves such a statement undecided and
+        // withholds the grant.
         //
         // The duration ceiling is the lower of the role's own maximum and — when this
         // assume is itself made from a role session, which is role chaining — one hour.

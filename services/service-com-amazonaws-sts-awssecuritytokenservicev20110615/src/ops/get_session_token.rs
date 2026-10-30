@@ -7,6 +7,10 @@
 //! against the CALLER's own identity, so `GetCallerIdentity` signed with it reports
 //! the original caller rather than an assumed role.
 //!
+//! A request that presents an MFA challenge (`SerialNumber` with `TokenCode`) is
+//! authenticated against the MFA device the account holds for that identity before
+//! anything is minted; see [`crate::state::mfa_challenge_failure`].
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -227,12 +231,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let access_key_id = ::service_common::request_access_key_id(ctx.parts());
         // The identity a long-term key speaks for comes from the IAM store, read before
-        // the session lock is taken so the two are never held at once.
-        let long_term = {
+        // the session lock is taken so the two are never held at once — together with the
+        // MFA device the request's `SerialNumber` names, which the same store holds and
+        // the challenge below is decided against.
+        let (long_term, mfa_device) = {
             let iam = crate::state::iam_state(&*self.engine);
             match iam.as_ref() {
-                Some(iam) => long_term_identity(Some(&iam.lock()), &access_key_id),
-                None => long_term_identity(None, &access_key_id),
+                Some(iam) => {
+                    let iam = iam.lock();
+                    (
+                        long_term_identity(Some(&iam), &access_key_id),
+                        input
+                            .serial_number
+                            .as_deref()
+                            .and_then(|serial| crate::state::held_mfa_device(&iam, serial)),
+                    )
+                }
+                None => (long_term_identity(None, &access_key_id), None),
             }
         };
         let mut registry = state.lock();
@@ -255,9 +270,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // SerialNumber and TokenCode name the caller's MFA device. They gate the call
-        // only through an MFA condition in a policy, which this emulator holds no
-        // policies for; they are recorded nowhere and change nothing about the session.
+        // "MFA-enabled IAM users must call GetSessionToken and submit an MFA code that is
+        // associated with their MFA device … An incorrect MFA code causes the API to
+        // return an access denied error" (this operation's documentation), so a request
+        // that presents an MFA challenge is authenticated against the device the account
+        // holds for the calling identity BEFORE anything is minted: a challenge this
+        // account cannot validate must not be exchanged for working credentials.
+        if let Some(failed) = crate::state::mfa_challenge_failure(
+            mfa_device.as_ref(),
+            &caller.identity,
+            input.serial_number.as_deref(),
+            input.token_code.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                failed.message(),
+            ));
+        }
+
         let duration_seconds = input
             .duration_seconds
             .unwrap_or(VENDED_SESSION_DEFAULT_DURATION_SECONDS);

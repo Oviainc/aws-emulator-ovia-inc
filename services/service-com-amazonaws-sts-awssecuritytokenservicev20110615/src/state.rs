@@ -1554,6 +1554,201 @@ pub fn is_account_id(value: &str) -> bool {
     value.len() == 12 && value.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// How many characters an access key id has: "an access key ID (for example,
+/// AKIAIOSFODNN7EXAMPLE)" (`GetAccessKeyInfo`, this service's model) — twenty, which is
+/// also the length of every key id the emulator's own credential store mints.
+///
+/// The MODEL's `accessKeyIdType` is wider (`@length` 16..128, `@pattern ^[\w]*$`), because
+/// that type bounds what may be SENT; a value inside those bounds that is not an access
+/// key id at all is refused by this service rather than looked up
+/// ([`is_access_key_id`]).
+pub const ACCESS_KEY_ID_CHARS: usize = 20;
+
+/// How many characters of an access key id name the KIND of credential it is: four —
+/// "access key IDs beginning with AKIA are long-term credentials for an IAM user or the
+/// Amazon Web Services account root user. Access key IDs beginning with ASIA are temporary
+/// credentials that are created using STS operations" (`GetAccessKeyInfo`, this service's
+/// model).
+pub const ACCESS_KEY_ID_PREFIX_CHARS: usize = 4;
+
+/// The four-character prefixes an ACCESS KEY id carries: the two this operation's own
+/// documentation names — `AKIA` for a long-term key and `ASIA` for a temporary one — which
+/// are the only two kinds of credential an access key id names. Every other AWS unique-id
+/// prefix belongs to something that is not an access key (a user, a role, a group), so a
+/// value carrying one names no access key.
+pub const ACCESS_KEY_ID_PREFIXES: &[&str] = &["AKIA", "ASIA"];
+
+/// The prefix the emulator's own credential store mints its key ids under.
+///
+/// Those ids are the long-term key this emulator publishes and every session credential it
+/// vends — real credentials of this account, each resolvable to the identity it speaks for
+/// — so they are access key ids here whatever body they carry, which an AWS-issued id
+/// writes in one fixed alphabet ([`is_access_key_id`]).
+pub const EMULATOR_ACCESS_KEY_ID_PREFIX: &str = "EMULATOR";
+
+/// The alphabet the body of an AWS-issued access key id is written in: RFC 4648 base32
+/// (`A`–`Z` and `2`–`7`), the encoding AWS carries an id's owning account in — so the
+/// digits `0`, `1`, `8` and `9` never appear in one.
+const ACCESS_KEY_ID_BODY_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+/// Whether `value` is an access key id, and so names a key whose owning account is a
+/// question with an answer.
+///
+/// One is [`ACCESS_KEY_ID_CHARS`] characters of upper-case letters and digits, made of a
+/// four-character prefix naming the kind of credential ([`ACCESS_KEY_ID_PREFIXES`]) and a
+/// body in that base32 alphabet — or a key id this emulator itself issued
+/// ([`EMULATOR_ACCESS_KEY_ID_PREFIX`]). WHICH account an admitted id belongs to is a
+/// separate question, answered from this service's own session registry rather than from
+/// the id's bytes.
+///
+/// It is narrower than the modelled type, which admits lower case, underscores and any
+/// length from 16 to 128: a value the model admits but this rule rejects names no access
+/// key AWS could have issued, so there is no account to report for it.
+pub fn is_access_key_id(value: &str) -> bool {
+    if value.len() != ACCESS_KEY_ID_CHARS
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
+        return false;
+    }
+    if value.starts_with(EMULATOR_ACCESS_KEY_ID_PREFIX) {
+        return true;
+    }
+    let (prefix, body) = value.split_at(ACCESS_KEY_ID_PREFIX_CHARS);
+    ACCESS_KEY_ID_PREFIXES.contains(&prefix)
+        && body
+            .bytes()
+            .all(|b| ACCESS_KEY_ID_BODY_ALPHABET.contains(&b))
+}
+
+/// How AWS words the refusal of a value that is not an access key id: fixed text, with
+/// nothing of the request in it — the rejected value is never echoed.
+pub const INVALID_ACCESS_KEY_ID_MESSAGE: &str = "Access key ID is not valid.";
+
+/// An MFA device the account holds, reduced to what an MFA challenge is decided by.
+///
+/// Read from the IAM store in the same engine ([`held_mfa_device`]), so a challenge is
+/// decided against the devices the account actually holds rather than against anything
+/// the request asserts.
+#[derive(Debug, Clone)]
+pub struct HeldMfaDevice {
+    /// The serial number the device is addressed by — the value a request's
+    /// `SerialNumber` names it as.
+    pub serial_number: String,
+    /// [`::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::name_key`] of
+    /// the IAM user the device is enabled for: the challenge is the CALLER's, so a device
+    /// enabled for another user answers none of the caller's codes.
+    pub user_key: String,
+}
+
+/// The MFA device the account holds under `serial_number`, or `None` when it holds none.
+///
+/// A READ of the IAM store: the only MFA devices this emulator's IAM holds are the FIDO
+/// security keys its own device registry keeps, so that is where a serial number is
+/// resolved.
+pub fn held_mfa_device(iam: &IamState, serial_number: &str) -> Option<HeldMfaDevice> {
+    let device = iam.fido_security_key(serial_number)?;
+    Some(HeldMfaDevice {
+        serial_number: device.serial_number.clone(),
+        user_key: device.user_key.clone(),
+    })
+}
+
+/// The key the IAM store holds the user named by `arn` under, or `None` when `arn` is not
+/// an IAM user's ARN — which an assumed-role or federated-user ARN is not, and no MFA
+/// device is enabled for one.
+pub fn iam_user_key(arn: &str) -> Option<String> {
+    let named = ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::parse_entity_arn(
+        arn,
+    )?;
+    matches!(
+        named.kind,
+        ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::EntityKind::User
+    )
+    .then(|| {
+        ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::name_key(&named.name)
+    })
+}
+
+/// Why an MFA challenge failed, and how AWS words each case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MfaChallengeFailure {
+    /// The request named no device the code could be validated against: no serial number,
+    /// or a serial number naming no MFA device enabled for the calling identity.
+    SerialNotAssociated,
+    /// A device of the calling identity answers that serial number, but not the code the
+    /// request presented.
+    InvalidPassCode,
+}
+
+impl MfaChallengeFailure {
+    /// The sentence AWS refuses this case with — fixed text, carrying neither the serial
+    /// number nor the code the request presented.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::SerialNotAssociated => {
+                "MultiFactorAuthentication failed, unable to validate MFA code.  Please verify \
+                 your MFA serial number is valid and associated with this user."
+            }
+            Self::InvalidPassCode => {
+                "MultiFactorAuthentication failed with invalid MFA one time pass code."
+            }
+        }
+    }
+}
+
+/// Decide the MFA challenge a request presents, against the device the account holds.
+///
+/// "MFA-enabled IAM users must call `GetSessionToken` and submit an MFA code that is
+/// associated with their MFA device … an incorrect MFA code causes the API to return an
+/// access denied error" (`GetSessionToken`, this service's model), and "if the role being
+/// assumed requires MFA and if the `TokenCode` value is missing or expired, the
+/// `AssumeRole` call returns an 'access denied' error"
+/// (`AssumeRoleRequest$TokenCode`) — so a request that presents an MFA challenge is
+/// authenticated against the device enabled for the CALLING identity, and `Some(..)` is
+/// the refusal the caller gets instead of a credential.
+///
+/// `None` when the request presents no challenge at all (neither member), which is every
+/// request of an identity no policy requires MFA of. `device` is the record
+/// [`held_mfa_device`] read for the serial the request named.
+///
+/// A COMPLETE challenge is never authenticated today, and that is a fact about the devices
+/// the account can hold rather than about this rule: the only kind IAM holds is a FIDO
+/// security key, which authenticates by challenge and response and answers no one-time
+/// pass code, so no six-digit code presented against one is the code it would answer. A
+/// device kind that answers one — a virtual MFA device, whose seed `iam:CreateVirtualMFADevice`
+/// would hold, an operation that is still a 501 stub — is what makes the success path
+/// reachable, and it is read here through the device record rather than assumed.
+pub fn mfa_challenge_failure(
+    device: Option<&HeldMfaDevice>,
+    identity: &Identity,
+    serial_number: Option<&str>,
+    token_code: Option<&str>,
+) -> Option<MfaChallengeFailure> {
+    let serial_number = match (serial_number, token_code) {
+        // No challenge: nothing to validate, and nothing MFA-gated is claimed either.
+        (None, None) => return None,
+        (Some(serial_number), Some(_presented)) => serial_number,
+        // Half a challenge cannot be validated: a code with no device named to validate it
+        // against, or a device named with no code to validate.
+        _ => return Some(MfaChallengeFailure::SerialNotAssociated),
+    };
+    let enabled = device.filter(|device| {
+        device.serial_number == serial_number
+            && iam_user_key(&identity.arn).is_some_and(|user| user == device.user_key)
+    });
+    match enabled {
+        // The account holds no device of this identity under that serial, which is what
+        // the refusal tells the caller to check.
+        None => Some(MfaChallengeFailure::SerialNotAssociated),
+        // The serial IS this identity's, so what cannot be validated is the CODE: the
+        // device answers none, as the note above records.
+        Some(_device) => Some(MfaChallengeFailure::InvalidPassCode),
+    }
+}
+
 /// The SIZE, in bytes, of the serialized token one mint's session policies and session
 /// tags pack into.
 ///
