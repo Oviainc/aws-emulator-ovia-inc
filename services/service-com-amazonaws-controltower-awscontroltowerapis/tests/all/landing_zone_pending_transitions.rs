@@ -206,8 +206,9 @@ fn drift_the_landing_zone(engine: &engine::InMemoryEngine, arn: &str) {
 ///
 /// Nothing in this crate fails a landing-zone operation yet, so a row whose subject is what
 /// the clock does with a FAILED operation's parked transition seeds the failure into the
-/// log.
-fn fail_the_operation(engine: &engine::InMemoryEngine, identifier: &str) {
+/// log. Shared with `crate::landing_zone_decommission_cascade`, whose subject is what such a
+/// decommissioning deletes, so the two suites seed one failure the same way.
+pub(crate) fn fail_the_operation(engine: &engine::InMemoryEngine, identifier: &str) {
     let state = service_state(engine).expect("the service's own store");
     let mut store = state.lock();
     let record = store

@@ -79,6 +79,8 @@ mod in_flight_teardown_drift;
 mod inherited_enabled_baselines;
 #[path = "all/landing_zone_decommission.rs"]
 mod landing_zone_decommission;
+#[path = "all/landing_zone_decommission_cascade.rs"]
+mod landing_zone_decommission_cascade;
 #[path = "all/landing_zone_identifier.rs"]
 mod landing_zone_identifier;
 #[path = "all/landing_zone_lifecycle.rs"]

@@ -367,25 +367,6 @@ async fn an_arn_that_names_no_resource_is_not_found() {
     let router = emulator();
     let resources = resources(&router).await;
 
-    // A resource whose ARN this service DID mint and then tore down: the tags went with
-    // it, so the ARN names nothing again. The landing zone's create operation must be due
-    // before it can be deleted.
-    tokio::time::sleep(past_the_settle_span()).await;
-    let deleted = call(
-        &router,
-        "/delete-landingzone",
-        serde_json::json!({ "landingZoneIdentifier": resources[0].arn }),
-    )
-    .await;
-    assert_eq!(
-        deleted.status, 200,
-        "delete-landingzone: expected 200, got {} body {:?}",
-        deleted.status, deleted.body
-    );
-    // The delete is asynchronous: the landing zone (and its tags) go once the clock has
-    // made that operation due, so the ARN only names nothing after this wait.
-    tokio::time::sleep(past_the_settle_span()).await;
-
     // Every value satisfies `Arn`'s @length(20..2048) and
     // @pattern ^arn:aws[0-9a-zA-Z_\-:\/]+$, so the front door passes them and the
     // handler is what refuses them.
@@ -416,33 +397,10 @@ async fn an_arn_that_names_no_resource_is_not_found() {
             "another service's ARN",
             "arn:aws:s3:::emulator-tagging-bucket".to_string(),
         ),
-        (
-            "the landing zone's own ARN, after it was deleted",
-            resources[0].arn.clone(),
-        ),
     ];
 
     for (case, arn) in cases {
-        let applied = apply_tags(&router, &arn, &tags(&[("Team", "platform")])).await;
-        assert_eq!(
-            (applied.status, applied.error_code.as_deref()),
-            (404, Some("ResourceNotFoundException")),
-            "case {case:?}: expected TagResource to answer 404 ResourceNotFoundException, \
-             got {:?} body {:?}",
-            (applied.status, applied.error_code.as_deref()),
-            applied.body
-        );
-
-        let read = read_tags(&router, &arn).await;
-        assert_eq!(
-            (read.status, read.error_code.as_deref()),
-            (404, Some("ResourceNotFoundException")),
-            "case {case:?}: expected ListTagsForResource to answer 404 \
-             ResourceNotFoundException — a refused tagging persists nothing, so the ARN \
-             must not become an empty tag set — got {:?} body {:?}",
-            (read.status, read.error_code.as_deref()),
-            read.body
-        );
+        assert_not_found(&router, case, &arn).await;
     }
 
     // The resources that DO exist are untouched by the refusals.
@@ -458,6 +416,57 @@ async fn an_arn_that_names_no_resource_is_not_found() {
             read.body
         );
     }
+
+    // A resource whose ARN this service DID mint and then tore down: the tags went with
+    // it, so the ARN names nothing again. Taken last, because decommissioning a landing
+    // zone deletes what was deployed under it, the enablements above among them. The
+    // landing zone's create operation must be due before it can be deleted, and the delete
+    // due before the ARN names nothing.
+    tokio::time::sleep(past_the_settle_span()).await;
+    let deleted = call(
+        &router,
+        "/delete-landingzone",
+        serde_json::json!({ "landingZoneIdentifier": resources[0].arn }),
+    )
+    .await;
+    assert_eq!(
+        deleted.status, 200,
+        "delete-landingzone: expected 200, got {} body {:?}",
+        deleted.status, deleted.body
+    );
+    tokio::time::sleep(past_the_settle_span()).await;
+    assert_not_found(
+        &router,
+        "the landing zone's own ARN, after it was deleted",
+        &resources[0].arn,
+    )
+    .await;
+}
+
+/// Assert both tagging operations refuse `arn` with 404 `ResourceNotFoundException`, and
+/// that the refused `TagResource` persisted nothing — the ARN must stay a 404 rather than
+/// become an empty tag set.
+async fn assert_not_found(router: &MultiServiceRouter, case: &str, arn: &str) {
+    let applied = apply_tags(router, arn, &tags(&[("Team", "platform")])).await;
+    assert_eq!(
+        (applied.status, applied.error_code.as_deref()),
+        (404, Some("ResourceNotFoundException")),
+        "case {case:?}: expected TagResource to answer 404 ResourceNotFoundException, got \
+         {:?} body {:?}",
+        (applied.status, applied.error_code.as_deref()),
+        applied.body
+    );
+
+    let read = read_tags(router, arn).await;
+    assert_eq!(
+        (read.status, read.error_code.as_deref()),
+        (404, Some("ResourceNotFoundException")),
+        "case {case:?}: expected ListTagsForResource to answer 404 \
+         ResourceNotFoundException — a refused tagging persists nothing, so the ARN must \
+         not become an empty tag set — got {:?} body {:?}",
+        (read.status, read.error_code.as_deref()),
+        read.body
+    );
 }
 
 /// RULE: a resource's tag map is BOUNDED at `MAX_TAGS_PER_RESOURCE` — `TagMap`'s own

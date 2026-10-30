@@ -418,7 +418,11 @@ async fn every_idempotent_teardown_reports_the_operation_in_flight() {
     ));
 
     let enablement = &enablements()[0];
-    let enabled = enable(&router, enablement).await;
+    // Its own emulator: the half above decommissions this account's landing zone, and a
+    // decommissioning deletes the enablements deployed under it, so a shared store would
+    // tear this enablement down in the middle of the case.
+    let baseline_router = emulator();
+    let enabled = enable(&baseline_router, enablement).await;
     assert_eq!(
         enabled.status, 200,
         "case \"DisableBaseline\": expected the enable to return 200, got {} body {:?}",
@@ -426,13 +430,13 @@ async fn every_idempotent_teardown_reports_the_operation_in_flight() {
     );
     let enabled_baseline = enabled.string("arn");
     tokio::time::sleep(past_the_settle_span()).await;
-    let disabled = disable(&router, &enabled_baseline).await;
+    let disabled = disable(&baseline_router, &enabled_baseline).await;
     assert_eq!(
         disabled.status, 200,
         "case \"DisableBaseline\": expected the teardown to return 200, got {} body {:?}",
         disabled.status, disabled.body
     );
-    let disabled_again = disable(&router, &enabled_baseline).await;
+    let disabled_again = disable(&baseline_router, &enabled_baseline).await;
     assert_eq!(
         disabled_again.status, 200,
         "case \"DisableBaseline\": expected the repeat to return 200, got {} body {:?}",

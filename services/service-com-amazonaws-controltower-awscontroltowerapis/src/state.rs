@@ -5,7 +5,10 @@
 //! The landing zone is Control Tower's primary resource and AWS allows exactly ONE per
 //! account, so [`ComAmazonawsControltowerAwscontroltowerapisState::landing_zones`] holds
 //! at most one entry and the one-per-account rule is read off its size rather than from a
-//! separate flag.
+//! separate flag. Decommissioning it "deletes Amazon Web Services Control Tower resources
+//! deployed in accounts managed by Amazon Web Services Control Tower", so the enablements
+//! those resources are do not outlive it: applying a decommissioning empties
+//! `enabled_controls` and `enabled_baselines` too (see [`settle`]).
 //!
 //! Landing zone operations are a log keyed by `operationIdentifier`: a record outlives
 //! the landing zone it acted on, so `GetLandingZoneOperation` still resolves the
@@ -1382,11 +1385,24 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             }
             decommissioned.push(arn.clone());
         }
-        for arn in decommissioned {
-            self.landing_zones.remove(&arn);
+        for arn in &decommissioned {
+            self.landing_zones.remove(arn);
             // A tag entry never outlives the resource it tags, which is what keeps the tag
             // map bounded by the resource stores.
-            self.tags.remove(&arn);
+            self.tags.remove(arn);
+        }
+        // Decommissioning "deletes Amazon Web Services Control Tower resources deployed in
+        // accounts managed by Amazon Web Services Control Tower", not just the landing
+        // zone's own record, so applying one that leaves the account with no landing zone
+        // at all removes those resources too ([`remove_deployed_enablements`]). Hung off
+        // the removals actually APPLIED above rather than off the parked removal, so a
+        // decommissioning the clock has not applied — one not due yet, or one whose own
+        // operation FAILED — deletes nothing, exactly as it leaves the landing zone and its
+        // tags where they are.
+        //
+        // [`remove_deployed_enablements`]: Self::remove_deployed_enablements
+        if !decommissioned.is_empty() && self.landing_zones.is_empty() {
+            self.remove_deployed_enablements();
         }
 
         // A configuration a CREATE, an UPDATE or a RESET started deploying becomes the
@@ -1639,6 +1655,38 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
                 enabled_baseline.inheritance_drift_status =
                     Some(EnabledBaselineDriftStatus::InSync);
             }
+        }
+    }
+
+    /// Remove every control and baseline enablement this account holds, together with the
+    /// tags attached to them.
+    ///
+    /// What a decommissioned landing zone's governance deployed: an `EnabledControl` is the
+    /// Amazon Web Services resources `EnableControl` "creates on the specified
+    /// organizational unit and the accounts it contains", and an `EnabledBaseline` the same
+    /// for `EnableBaseline`, so neither is a resource of an account that holds no landing
+    /// zone any more — which is also why an enablement's reported `targetRegions` is read
+    /// off the deployed landing zone's governance ([`target_regions_of`]) rather than
+    /// captured when it was enabled.
+    ///
+    /// The three operation logs are untouched: a record outlives the resource it acted on,
+    /// exactly as a decommissioned landing zone's own `DELETE` record does, so every
+    /// identifier a caller was handed still resolves.
+    ///
+    /// [`target_regions_of`]: Self::target_regions_of
+    fn remove_deployed_enablements(&mut self) {
+        let deployed: Vec<String> = self
+            .enabled_controls
+            .keys()
+            .chain(self.enabled_baselines.keys())
+            .cloned()
+            .collect();
+        self.enabled_controls.clear();
+        self.enabled_baselines.clear();
+        for arn in deployed {
+            // A tag entry never outlives the resource it tags, which is what keeps the tag
+            // map bounded by the resource stores.
+            self.tags.remove(&arn);
         }
     }
 

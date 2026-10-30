@@ -7,6 +7,10 @@
 //! zone's removal for that entry's due instant, returning its `operationIdentifier`. The
 //! landing zone stays a reportable resource, `PROCESSING`, until the removal is due.
 //!
+//! What that removal takes with it is what decommissioning deletes: the Control Tower
+//! resources deployed in the managed accounts, which in this service are the control and
+//! baseline enablements, together with the tags of every resource removed.
+//!
 //! The operation carries `@idempotent`, so a repeat of the call while the
 //! decommissioning it started is still in flight reports that same
 //! `operationIdentifier`; only a DIFFERENT operation in flight against the landing zone
@@ -231,9 +235,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The delete is ASYNCHRONOUS: this call starts the decommissioning and the
         // landing zone stops existing when that operation completes, not when this call
         // returns. Until then the landing zone is still a resource — PROCESSING, listed,
-        // and tagged — and `crate::state`'s settle is what removes it (and its tags) once
-        // the clock has made the operation due. The operation log outlives the landing
-        // zone, so this identifier stays resolvable through GetLandingZoneOperation.
+        // and tagged — and `crate::state`'s settle is what removes it once the clock has
+        // made the operation due: the landing zone, its tags, and the Control Tower
+        // resources its governance had deployed in the managed accounts (every control and
+        // baseline enablement, and their tags), which is what decommissioning deletes. The
+        // operation log outlives the landing zone, so this identifier stays resolvable
+        // through GetLandingZoneOperation.
         let operation_identifier = store.record_landing_zone_deletion(&arn, now);
 
         Ok(DeleteLandingZoneOutput {

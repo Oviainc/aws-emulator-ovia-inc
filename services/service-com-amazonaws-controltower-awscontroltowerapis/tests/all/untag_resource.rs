@@ -302,23 +302,6 @@ async fn an_arn_that_names_no_resource_is_not_found() {
         );
     }
 
-    // A resource whose ARN this service DID mint and then tore down: its tags went with
-    // it, so the ARN names nothing again. The create must be due before the delete is
-    // accepted, and the delete due before the landing zone is gone.
-    tokio::time::sleep(past_the_settle_span()).await;
-    let deleted = call(
-        &router,
-        "/delete-landingzone",
-        serde_json::json!({ "landingZoneIdentifier": resources[0].arn }),
-    )
-    .await;
-    assert_eq!(
-        deleted.status, 200,
-        "delete-landingzone: expected 200, got {} body {:?}",
-        deleted.status, deleted.body
-    );
-    tokio::time::sleep(past_the_settle_span()).await;
-
     // Every value satisfies `Arn`'s @length(20..2048) and
     // @pattern ^arn:aws[0-9a-zA-Z_\-:\/]+$, so the front door passes it and the handler is
     // what refuses it.
@@ -349,27 +332,10 @@ async fn an_arn_that_names_no_resource_is_not_found() {
             "another service's ARN",
             "arn:aws:s3:::emulator-tagging-bucket".to_string(),
         ),
-        (
-            "the landing zone's own ARN, after it was deleted",
-            resources[0].arn.clone(),
-        ),
     ];
 
     for (case, arn) in cases {
-        let refused = remove_tags(&router, &arn, &["Owner"]).await;
-        assert_eq!(
-            (refused.status, refused.error_code.as_deref()),
-            (404, Some("ResourceNotFoundException")),
-            "case {case:?}: expected 404 ResourceNotFoundException, got {:?} body {:?}",
-            (refused.status, refused.error_code.as_deref()),
-            refused.body
-        );
-        assert!(
-            refused.string("message").contains(&arn),
-            "case {case:?}: expected the refusal to name the ARN it could not resolve, got \
-             {:?}",
-            refused.string("message")
-        );
+        assert_not_found(&router, case, &arn).await;
     }
 
     // The resources that DO exist still carry every tag: a refusal about another ARN
@@ -386,6 +352,49 @@ async fn an_arn_that_names_no_resource_is_not_found() {
             read.body
         );
     }
+
+    // A resource whose ARN this service DID mint and then tore down: its tags went with
+    // it, so the ARN names nothing again. Taken last, because decommissioning a landing
+    // zone deletes what was deployed under it, the enablements above among them. The create
+    // must be due before the delete is accepted, and the delete due before the landing zone
+    // is gone.
+    tokio::time::sleep(past_the_settle_span()).await;
+    let deleted = call(
+        &router,
+        "/delete-landingzone",
+        serde_json::json!({ "landingZoneIdentifier": resources[0].arn }),
+    )
+    .await;
+    assert_eq!(
+        deleted.status, 200,
+        "delete-landingzone: expected 200, got {} body {:?}",
+        deleted.status, deleted.body
+    );
+    tokio::time::sleep(past_the_settle_span()).await;
+    assert_not_found(
+        &router,
+        "the landing zone's own ARN, after it was deleted",
+        &resources[0].arn,
+    )
+    .await;
+}
+
+/// Assert `UntagResource` refuses `arn` with 404 `ResourceNotFoundException`, naming the
+/// ARN it could not resolve.
+async fn assert_not_found(router: &MultiServiceRouter, case: &str, arn: &str) {
+    let refused = remove_tags(router, arn, &["Owner"]).await;
+    assert_eq!(
+        (refused.status, refused.error_code.as_deref()),
+        (404, Some("ResourceNotFoundException")),
+        "case {case:?}: expected 404 ResourceNotFoundException, got {:?} body {:?}",
+        (refused.status, refused.error_code.as_deref()),
+        refused.body
+    );
+    assert!(
+        refused.string("message").contains(arn),
+        "case {case:?}: expected the refusal to name the ARN it could not resolve, got {:?}",
+        refused.string("message")
+    );
 }
 
 /// RULE: a key in the reserved namespace names a tag Amazon Web Services applies itself,
