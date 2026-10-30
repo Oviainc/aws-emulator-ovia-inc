@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ValidateFlowDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ValidateFlowDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ValidateFlowDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Analyses the flow definition the request carries and reports one
+//! [`FlowValidation`] per defect it finds, each carrying the modelled validation
+//! type, its severity and the typed `details` member for that type. A definition
+//! with no defects is answered with an EMPTY list.
+//!
+//! The operation is modelled `@readonly` and names no flow, so it is a pure
+//! function of the submitted definition: it reads no stored record and writes
+//! none, and a later caller sees exactly the state it saw before.
+//!
+//! What it checks, and why each check is owed:
+//!
+//! * declaration resolution — a connection's `source`/`target` must name a node
+//!   the definition declares, and its configuration must name an output, an input
+//!   or a condition that node declares;
+//! * node completeness — a node carries the configuration its `type` names,
+//!   unless the modelled configuration for that type is empty and there is
+//!   nothing to configure; a condition node carries a default condition; and a
+//!   loop node's body carries exactly one `LoopInput` and one `LoopController`
+//!   node;
+//! * graph properties — the flow starts at an `Input` node, ends at an `Output`
+//!   node, has no cycle, feeds each node input from at most one connection, and
+//!   reaches every node it declares.
+//!
+//! The graph properties are only decided once every connection resolves: a
+//! connection naming a node that is not there leaves the graph unknown, so
+//! reachability and cycles are not reported from a guess.
 //!
 //! ## Shape of an operation
 //!
@@ -109,6 +127,821 @@ impl From<ValidateFlowDefinitionErrorModeled> for ValidateFlowDefinitionError {
     }
 }
 
+/// The modelled `FlowNodeType` of the node a flow starts at: every flow path
+/// begins at an `Input` node.
+const INPUT_NODE_TYPE: &str = "Input";
+
+/// The modelled `FlowNodeType` of the node a flow ends at.
+const OUTPUT_NODE_TYPE: &str = "Output";
+
+/// The modelled `FlowNodeType` of the node a loop body is entered through.
+const LOOP_INPUT_NODE_TYPE: &str = "LoopInput";
+
+/// The modelled `FlowNodeType` of the node that decides whether a loop iterates
+/// again.
+const LOOP_CONTROLLER_NODE_TYPE: &str = "LoopController";
+
+/// The modelled `FlowConnectionType` of a connection that carries data from a
+/// node output into a node input.
+const DATA_CONNECTION_TYPE: &str = "Data";
+
+/// The modelled `FlowConnectionType` of a connection a condition node takes when
+/// one of its conditions holds.
+const CONDITIONAL_CONNECTION_TYPE: &str = "Conditional";
+
+/// The `FlowValidationSeverity` of a finding that stops the flow working at all.
+const SEVERITY_ERROR: &str = "Error";
+
+/// The `FlowValidationSeverity` of a finding the flow still runs with.
+const SEVERITY_WARNING: &str = "Warning";
+
+/// The name of a condition node's fallback condition — the path taken when no
+/// other condition of the node holds.
+const DEFAULT_CONDITION_NAME: &str = "default";
+
+/// The root a node input's expression addresses the data arriving on that input
+/// through (`FlowNodeInput$expression`).
+const NODE_INPUT_EXPRESSION_ROOT: &str = "$.data";
+
+/// The modelled `FlowNodeType` values whose configuration structure declares no
+/// member at all — `InputFlowNodeConfiguration`, `OutputFlowNodeConfiguration`,
+/// `IteratorFlowNodeConfiguration`, `CollectorFlowNodeConfiguration` and
+/// `LoopInputFlowNodeConfiguration` are all empty structures.
+///
+/// A node of one of these types has nothing to configure, so omitting its
+/// configuration leaves nothing out and is no defect; a node of any other type
+/// carries its behaviour in its configuration, and without it there is nothing to
+/// run.
+const NODE_TYPES_WITHOUT_CONFIGURATION: &[&str] = &[
+    INPUT_NODE_TYPE,
+    OUTPUT_NODE_TYPE,
+    "Iterator",
+    "Collector",
+    LOOP_INPUT_NODE_TYPE,
+];
+
+/// The most findings one response carries: `ValidateFlowDefinitionResponse`'s
+/// `validations` member is modelled `length ..100`.
+const MAX_VALIDATIONS: usize = 100;
+
+/// One finding, as the `FlowValidation` shape reports it: the modelled
+/// `FlowValidationType`, its severity, a message naming what is wrong and the
+/// `FlowValidationDetails` member that type carries.
+fn finding(
+    validation_type: &str,
+    severity: &str,
+    message: String,
+    details: FlowValidationDetails,
+) -> FlowValidation {
+    FlowValidation {
+        message,
+        severity: severity.to_string(),
+        details: Some(details),
+        r#type: Some(validation_type.to_string()),
+    }
+}
+
+/// The `FlowNodeType` a node configuration is the configuration FOR.
+///
+/// `FlowNode$type` is documented "This value must match the name of the key that
+/// you provide in the configuration", so the union member decides which node type
+/// the configuration can serve.
+fn configuration_node_type(configuration: &FlowNodeConfiguration) -> &'static str {
+    match configuration {
+        FlowNodeConfiguration::Input(_) => INPUT_NODE_TYPE,
+        FlowNodeConfiguration::Output(_) => OUTPUT_NODE_TYPE,
+        FlowNodeConfiguration::knowledgeBase(_) => "KnowledgeBase",
+        FlowNodeConfiguration::Condition(_) => "Condition",
+        FlowNodeConfiguration::Lex(_) => "Lex",
+        FlowNodeConfiguration::Prompt(_) => "Prompt",
+        FlowNodeConfiguration::lambdaFunction(_) => "LambdaFunction",
+        FlowNodeConfiguration::Storage(_) => "Storage",
+        FlowNodeConfiguration::Agent(_) => "Agent",
+        FlowNodeConfiguration::Retrieval(_) => "Retrieval",
+        FlowNodeConfiguration::Iterator(_) => "Iterator",
+        FlowNodeConfiguration::Collector(_) => "Collector",
+        FlowNodeConfiguration::inlineCode(_) => "InlineCode",
+        FlowNodeConfiguration::Loop(_) => "Loop",
+        FlowNodeConfiguration::loopInput(_) => LOOP_INPUT_NODE_TYPE,
+        FlowNodeConfiguration::loopController(_) => LOOP_CONTROLLER_NODE_TYPE,
+    }
+}
+
+/// The conditions a node declares: a condition node's own list, and nothing for
+/// every other node type, which declares no condition a connection can take.
+fn conditions_of(node: &FlowNode) -> &[FlowCondition] {
+    match node.configuration.as_ref() {
+        Some(FlowNodeConfiguration::Condition(configuration)) => &configuration.conditions,
+        _ => &[],
+    }
+}
+
+/// Whether `condition` is a condition node's fallback: AWS names that condition
+/// [`DEFAULT_CONDITION_NAME`], and it is the path taken when no expression of the
+/// node held.
+///
+/// The NAME decides, not the absence of an expression: a condition under another name
+/// is one of the node's tests whether or not it carries an expression, so it neither
+/// stands in for the fallback nor escapes the rule that a test refers to an input.
+fn is_default_condition(condition: &FlowCondition) -> bool {
+    condition.name == DEFAULT_CONDITION_NAME
+}
+
+/// Whether `name` occurs in `expression` as a name rather than as part of a
+/// longer word.
+fn mentions(expression: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let bytes = expression.as_bytes();
+    let is_name_byte = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    expression.match_indices(name).any(|(start, matched)| {
+        let end = start + matched.len();
+        (start == 0 || !is_name_byte(bytes[start - 1]))
+            && (end == bytes.len() || !is_name_byte(bytes[end]))
+    })
+}
+
+/// Whether `expression` addresses the data arriving on the input, which the
+/// expression language roots at [`NODE_INPUT_EXPRESSION_ROOT`] — either the root
+/// itself or a member or element reached from it.
+fn is_node_input_expression(expression: &str) -> bool {
+    let trimmed = expression.trim();
+    match trimmed.strip_prefix(NODE_INPUT_EXPRESSION_ROOT) {
+        None => false,
+        Some(rest) => rest.is_empty() || rest.starts_with('.') || rest.starts_with('['),
+    }
+}
+
+/// The output of `node` named `name`, if it declares one.
+fn output_named<'a>(node: &'a FlowNode, name: &str) -> Option<&'a FlowNodeOutput> {
+    node.outputs
+        .iter()
+        .flatten()
+        .find(|output| output.name == name)
+}
+
+/// The input of `node` named `name`, if it declares one.
+fn input_named<'a>(node: &'a FlowNode, name: &str) -> Option<&'a FlowNodeInput> {
+    node.inputs.iter().flatten().find(|input| input.name == name)
+}
+
+/// Every defect in `definition`, in the order the definition declares the node or
+/// connection each one is about.
+///
+/// This is the whole of `ValidateFlowDefinition`'s answer, and it is computed from
+/// the submitted definition alone.
+pub fn validate_definition(definition: &FlowDefinition) -> Vec<FlowValidation> {
+    let nodes: &[FlowNode] = definition.nodes.as_deref().unwrap_or_default();
+    let connections: &[FlowConnection] = definition.connections.as_deref().unwrap_or_default();
+    let mut findings = Vec::new();
+
+    // The first declaration of a name is the node that name selects, so every
+    // check resolves a reference the same way.
+    let mut nodes_by_name: ::std::collections::HashMap<&str, &FlowNode> =
+        ::std::collections::HashMap::new();
+    for node in nodes {
+        nodes_by_name.entry(node.name.as_str()).or_insert(node);
+    }
+
+    for node in nodes {
+        check_node(node, &mut findings);
+    }
+
+    if !nodes.iter().any(|node| node.r#type == INPUT_NODE_TYPE) {
+        findings.push(finding(
+            "MissingStartingNodes",
+            SEVERITY_ERROR,
+            format!("The flow has no starting node. A flow must contain a node of type {INPUT_NODE_TYPE}."),
+            FlowValidationDetails::missingStartingNodes(MissingStartingNodesFlowValidationDetails {}),
+        ));
+    }
+    if !nodes.iter().any(|node| node.r#type == OUTPUT_NODE_TYPE) {
+        findings.push(finding(
+            "MissingEndingNodes",
+            SEVERITY_ERROR,
+            format!("The flow has no ending node. A flow must contain a node of type {OUTPUT_NODE_TYPE}."),
+            FlowValidationDetails::missingEndingNodes(MissingEndingNodesFlowValidationDetails {}),
+        ));
+    }
+
+    let mut every_connection_resolves = true;
+    for connection in connections {
+        every_connection_resolves &= check_connection(connection, &nodes_by_name, &mut findings);
+    }
+    check_duplicate_connections(connections, &mut findings);
+
+    // A connection naming a node the definition does not declare leaves the graph
+    // unknown: its cycles and its reachable set are not decidable, so they are not
+    // reported until the references resolve.
+    if every_connection_resolves {
+        check_graph(nodes, connections, &mut findings);
+    }
+
+    findings.truncate(MAX_VALIDATIONS);
+    findings
+}
+
+/// The findings a single node carries on its own: whether it is configured for
+/// the type it declares, whether its input expressions address the incoming data,
+/// and the checks its node type adds.
+fn check_node(node: &FlowNode, findings: &mut Vec<FlowValidation>) {
+    match node.configuration.as_ref() {
+        None => {
+            if !NODE_TYPES_WITHOUT_CONFIGURATION.contains(&node.r#type.as_str()) {
+                findings.push(finding(
+                    "MissingNodeConfiguration",
+                    SEVERITY_ERROR,
+                    format!(
+                        "Node {} doesn't have a configuration. A node of type {} must carry its configuration.",
+                        node.name, node.r#type
+                    ),
+                    FlowValidationDetails::missingNodeConfiguration(
+                        MissingNodeConfigurationFlowValidationDetails {
+                            node: node.name.clone(),
+                        },
+                    ),
+                ));
+            }
+        }
+        Some(configuration) => {
+            let configured_for = configuration_node_type(configuration);
+            if configured_for != node.r#type {
+                findings.push(finding(
+                    "MissingNodeConfiguration",
+                    SEVERITY_ERROR,
+                    format!(
+                        "Node {} is of type {} but carries the configuration of a node of type {}.",
+                        node.name, node.r#type, configured_for
+                    ),
+                    FlowValidationDetails::missingNodeConfiguration(
+                        MissingNodeConfigurationFlowValidationDetails {
+                            node: node.name.clone(),
+                        },
+                    ),
+                ));
+            }
+            match configuration {
+                FlowNodeConfiguration::Condition(condition_configuration) => {
+                    check_condition_node(node, &condition_configuration.conditions, findings);
+                }
+                FlowNodeConfiguration::Loop(loop_configuration) => {
+                    check_loop_node(node, &loop_configuration.definition, findings);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for input in node.inputs.iter().flatten() {
+        if !is_node_input_expression(&input.expression) {
+            findings.push(finding(
+                "MalformedNodeInputExpression",
+                SEVERITY_ERROR,
+                format!(
+                    "The expression for input {} in node {} is malformed.",
+                    input.name, node.name
+                ),
+                FlowValidationDetails::malformedNodeInputExpression(
+                    MalformedNodeInputExpressionFlowValidationDetails {
+                        node: node.name.clone(),
+                        input: input.name.clone(),
+                        cause: format!(
+                            "An input expression must address the data arriving on the input, which expressions address through {NODE_INPUT_EXPRESSION_ROOT}."
+                        ),
+                    },
+                ),
+            ));
+        }
+    }
+}
+
+/// The findings of a condition node: it needs a fallback condition, no two of its
+/// conditions may test the same expression, and each condition must refer to one
+/// of the node's inputs — `FlowCondition$expression` is documented "You must
+/// refer to at least one of the inputs in the condition".
+fn check_condition_node(
+    node: &FlowNode,
+    conditions: &[FlowCondition],
+    findings: &mut Vec<FlowValidation>,
+) {
+    if !conditions.iter().any(is_default_condition) {
+        findings.push(finding(
+            "MissingDefaultCondition",
+            SEVERITY_ERROR,
+            format!(
+                "Node {} doesn't have a default condition. A condition node must have a condition named {DEFAULT_CONDITION_NAME} for the case where no other condition is satisfied.",
+                node.name
+            ),
+            FlowValidationDetails::missingDefaultCondition(
+                MissingDefaultConditionFlowValidationDetails {
+                    node: node.name.clone(),
+                },
+            ),
+        ));
+    }
+
+    let mut seen: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
+    for condition in conditions {
+        let Some(expression) = condition.expression.as_deref() else {
+            continue;
+        };
+        if !seen.insert(expression) {
+            findings.push(finding(
+                "DuplicateConditionExpression",
+                SEVERITY_ERROR,
+                format!(
+                    "Node {} defines the condition expression {expression} more than once.",
+                    node.name
+                ),
+                FlowValidationDetails::duplicateConditionExpression(
+                    DuplicateConditionExpressionFlowValidationDetails {
+                        node: node.name.clone(),
+                        expression: expression.to_string(),
+                    },
+                ),
+            ));
+        }
+        if is_default_condition(condition) {
+            continue;
+        }
+        if !node
+            .inputs
+            .iter()
+            .flatten()
+            .any(|input| mentions(expression, &input.name))
+        {
+            findings.push(finding(
+                "MalformedConditionExpression",
+                SEVERITY_ERROR,
+                format!(
+                    "The expression of condition {} in node {} is malformed.",
+                    condition.name, node.name
+                ),
+                FlowValidationDetails::malformedConditionExpression(
+                    MalformedConditionExpressionFlowValidationDetails {
+                        node: node.name.clone(),
+                        condition: condition.name.clone(),
+                        cause: "A condition must refer to at least one of the inputs of the node it is declared on.".to_string(),
+                    },
+                ),
+            ));
+        }
+    }
+}
+
+/// The findings of a loop node, read off the definition of its body: the body is
+/// entered through exactly one `LoopInput` node, iterates under exactly one
+/// `LoopController` node, and may not contain a node of a type a loop cannot run
+/// (the modelled `IncompatibleLoopNodeType` values).
+fn check_loop_node(
+    node: &FlowNode,
+    definition: &FlowDefinition,
+    findings: &mut Vec<FlowValidation>,
+) {
+    let body: &[FlowNode] = definition.nodes.as_deref().unwrap_or_default();
+    let count = |node_type: &str| body.iter().filter(|n| n.r#type == node_type).count();
+
+    match count(LOOP_INPUT_NODE_TYPE) {
+        0 => findings.push(finding(
+            "MissingLoopInputNode",
+            SEVERITY_ERROR,
+            format!(
+                "The loop definition of node {} has no node of type {LOOP_INPUT_NODE_TYPE}.",
+                node.name
+            ),
+            FlowValidationDetails::missingLoopInputNode(MissingLoopInputNodeFlowValidationDetails {
+                loop_node: node.name.clone(),
+            }),
+        )),
+        1 => {}
+        _ => findings.push(finding(
+            "MultipleLoopInputNodes",
+            SEVERITY_ERROR,
+            format!(
+                "The loop definition of node {} has more than one node of type {LOOP_INPUT_NODE_TYPE}.",
+                node.name
+            ),
+            FlowValidationDetails::multipleLoopInputNodes(
+                MultipleLoopInputNodesFlowValidationDetails {
+                    loop_node: node.name.clone(),
+                },
+            ),
+        )),
+    }
+
+    match count(LOOP_CONTROLLER_NODE_TYPE) {
+        0 => findings.push(finding(
+            "MissingLoopControllerNode",
+            SEVERITY_ERROR,
+            format!(
+                "The loop definition of node {} has no node of type {LOOP_CONTROLLER_NODE_TYPE}.",
+                node.name
+            ),
+            FlowValidationDetails::missingLoopControllerNode(
+                MissingLoopControllerNodeFlowValidationDetails {
+                    loop_node: node.name.clone(),
+                },
+            ),
+        )),
+        1 => {}
+        _ => findings.push(finding(
+            "MultipleLoopControllerNodes",
+            SEVERITY_ERROR,
+            format!(
+                "The loop definition of node {} has more than one node of type {LOOP_CONTROLLER_NODE_TYPE}.",
+                node.name
+            ),
+            FlowValidationDetails::multipleLoopControllerNodes(
+                MultipleLoopControllerNodesFlowValidationDetails {
+                    loop_node: node.name.clone(),
+                },
+            ),
+        )),
+    }
+
+    for inner in body {
+        if INCOMPATIBLE_LOOP_NODE_TYPE_VALUES.contains(&inner.r#type.as_str()) {
+            findings.push(finding(
+                "LoopIncompatibleNodeType",
+                SEVERITY_ERROR,
+                format!(
+                    "The loop definition of node {} contains node {} of type {}, which a loop can't contain.",
+                    node.name, inner.name, inner.r#type
+                ),
+                FlowValidationDetails::loopIncompatibleNodeType(
+                    LoopIncompatibleNodeTypeFlowValidationDetails {
+                        node: node.name.clone(),
+                        incompatible_node_type: inner.r#type.clone(),
+                        incompatible_node_name: inner.name.clone(),
+                    },
+                ),
+            ));
+        }
+    }
+}
+
+/// The findings of one connection, and whether both of its endpoints resolved to
+/// a declared node.
+fn check_connection(
+    connection: &FlowConnection,
+    nodes_by_name: &::std::collections::HashMap<&str, &FlowNode>,
+    findings: &mut Vec<FlowValidation>,
+) -> bool {
+    let source = nodes_by_name.get(connection.source.as_str()).copied();
+    let target = nodes_by_name.get(connection.target.as_str()).copied();
+
+    if source.is_none() {
+        findings.push(finding(
+            "UnknownConnectionSource",
+            SEVERITY_ERROR,
+            format!(
+                "Connection {} starts at node {}, which the flow doesn't define.",
+                connection.name, connection.source
+            ),
+            FlowValidationDetails::unknownConnectionSource(
+                UnknownConnectionSourceFlowValidationDetails {
+                    connection: connection.name.clone(),
+                },
+            ),
+        ));
+    }
+    if target.is_none() {
+        findings.push(finding(
+            "UnknownConnectionTarget",
+            SEVERITY_ERROR,
+            format!(
+                "Connection {} ends at node {}, which the flow doesn't define.",
+                connection.name, connection.target
+            ),
+            FlowValidationDetails::unknownConnectionTarget(
+                UnknownConnectionTargetFlowValidationDetails {
+                    connection: connection.name.clone(),
+                },
+            ),
+        ));
+    }
+
+    let missing_configuration = |findings: &mut Vec<FlowValidation>| {
+        findings.push(finding(
+            "MissingConnectionConfiguration",
+            SEVERITY_ERROR,
+            format!(
+                "Connection {} doesn't carry the configuration a connection of type {} requires.",
+                connection.name, connection.r#type
+            ),
+            FlowValidationDetails::missingConnectionConfiguration(
+                MissingConnectionConfigurationFlowValidationDetails {
+                    connection: connection.name.clone(),
+                },
+            ),
+        ));
+    };
+
+    match connection.configuration.as_ref() {
+        Some(FlowConnectionConfiguration::Data(data))
+            if connection.r#type == DATA_CONNECTION_TYPE =>
+        {
+            let source_output = source.and_then(|node| output_named(node, &data.source_output));
+            if source.is_some() && source_output.is_none() {
+                findings.push(finding(
+                    "UnknownConnectionSourceOutput",
+                    SEVERITY_ERROR,
+                    format!(
+                        "Connection {} starts at output {} of node {}, which that node doesn't define.",
+                        connection.name, data.source_output, connection.source
+                    ),
+                    FlowValidationDetails::unknownConnectionSourceOutput(
+                        UnknownConnectionSourceOutputFlowValidationDetails {
+                            connection: connection.name.clone(),
+                        },
+                    ),
+                ));
+            }
+            let target_input = target.and_then(|node| input_named(node, &data.target_input));
+            if target.is_some() && target_input.is_none() {
+                findings.push(finding(
+                    "UnknownConnectionTargetInput",
+                    SEVERITY_ERROR,
+                    format!(
+                        "Connection {} ends at input {} of node {}, which that node doesn't define.",
+                        connection.name, data.target_input, connection.target
+                    ),
+                    FlowValidationDetails::unknownConnectionTargetInput(
+                        UnknownConnectionTargetInputFlowValidationDetails {
+                            connection: connection.name.clone(),
+                        },
+                    ),
+                ));
+            }
+            if let (Some(output), Some(input)) = (source_output, target_input) {
+                if output.r#type != input.r#type {
+                    findings.push(finding(
+                        "IncompatibleConnectionDataType",
+                        SEVERITY_ERROR,
+                        format!(
+                            "Connection {} carries output {} of type {} into input {} of type {}. The data types must be the same.",
+                            connection.name,
+                            output.name,
+                            output.r#type,
+                            input.name,
+                            input.r#type
+                        ),
+                        FlowValidationDetails::incompatibleConnectionDataType(
+                            IncompatibleConnectionDataTypeFlowValidationDetails {
+                                connection: connection.name.clone(),
+                            },
+                        ),
+                    ));
+                }
+            }
+        }
+        Some(FlowConnectionConfiguration::Conditional(conditional))
+            if connection.r#type == CONDITIONAL_CONNECTION_TYPE =>
+        {
+            if let Some(source_node) = source {
+                if !conditions_of(source_node)
+                    .iter()
+                    .any(|condition| condition.name == conditional.condition)
+                {
+                    findings.push(finding(
+                        "UnknownConnectionCondition",
+                        SEVERITY_ERROR,
+                        format!(
+                            "Connection {} is taken on condition {} of node {}, which that node doesn't define.",
+                            connection.name, conditional.condition, connection.source
+                        ),
+                        FlowValidationDetails::unknownConnectionCondition(
+                            UnknownConnectionConditionFlowValidationDetails {
+                                connection: connection.name.clone(),
+                            },
+                        ),
+                    ));
+                }
+            }
+        }
+        // No configuration at all, or the configuration of the other connection
+        // type: either way the connection carries no configuration for the type it
+        // declares.
+        _ => missing_configuration(findings),
+    }
+
+    source.is_some() && target.is_some()
+}
+
+/// Two connections that start at the same node, end at the same node and carry
+/// the same configuration are the same connection declared twice.
+fn check_duplicate_connections(connections: &[FlowConnection], findings: &mut Vec<FlowValidation>) {
+    let signature = |connection: &FlowConnection| match connection.configuration.as_ref() {
+        None => "none".to_string(),
+        Some(FlowConnectionConfiguration::Data(data)) => {
+            format!("data {} {}", data.source_output, data.target_input)
+        }
+        Some(FlowConnectionConfiguration::Conditional(conditional)) => {
+            format!("conditional {}", conditional.condition)
+        }
+    };
+
+    let mut seen: ::std::collections::HashSet<(String, String, String)> =
+        ::std::collections::HashSet::new();
+    let mut reported: ::std::collections::HashSet<(String, String)> =
+        ::std::collections::HashSet::new();
+    for connection in connections {
+        let key = (
+            connection.source.clone(),
+            connection.target.clone(),
+            signature(connection),
+        );
+        if seen.insert(key)
+            || !reported.insert((connection.source.clone(), connection.target.clone()))
+        {
+            continue;
+        }
+        findings.push(finding(
+            "DuplicateConnections",
+            SEVERITY_ERROR,
+            format!(
+                "The flow defines more than one connection from node {} to node {} with the same configuration.",
+                connection.source, connection.target
+            ),
+            FlowValidationDetails::duplicateConnections(
+                DuplicateConnectionsFlowValidationDetails {
+                    source: connection.source.clone(),
+                    target: connection.target.clone(),
+                },
+            ),
+        ));
+    }
+}
+
+/// Where a depth-first walk has got to with a node.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Visit {
+    /// Not walked yet.
+    Unseen,
+    /// On the current path: an edge back to it closes a cycle.
+    OnPath,
+    /// Walked, and left behind.
+    Done,
+}
+
+/// The findings that are properties of the whole graph rather than of one node or
+/// connection: cycles, node inputs fed more than once, and nodes no path from a
+/// starting node reaches.
+fn check_graph(
+    nodes: &[FlowNode],
+    connections: &[FlowConnection],
+    findings: &mut Vec<FlowValidation>,
+) {
+    let mut position: ::std::collections::HashMap<&str, usize> =
+        ::std::collections::HashMap::new();
+    for (at, node) in nodes.iter().enumerate() {
+        position.entry(node.name.as_str()).or_insert(at);
+    }
+
+    let mut edges: Vec<Vec<(usize, &str)>> = vec![Vec::new(); nodes.len()];
+    for connection in connections {
+        if let (Some(&from), Some(&to)) = (
+            position.get(connection.source.as_str()),
+            position.get(connection.target.as_str()),
+        ) {
+            // `from` and `to` are positions of `nodes` taken from the index built
+            // above, so every index into `edges` and the walk's own vectors below is
+            // in range by construction — none of them is a value from the request.
+            edges[from].push((to, connection.name.as_str()));
+        }
+    }
+
+    // Cycles: every edge that closes the path a depth-first walk is on.
+    for connection in cycle_closing_connections(&edges) {
+        findings.push(finding(
+            "CyclicConnection",
+            SEVERITY_ERROR,
+            format!("Connection {connection} closes a cycle in the flow. The connections of a flow must not form a cycle."),
+            FlowValidationDetails::cyclicConnection(CyclicConnectionFlowValidationDetails {
+                connection,
+            }),
+        ));
+    }
+
+    // One node input takes the value of one connection, so two connections into
+    // the same input leave it undecided.
+    let mut per_input: Vec<(&str, &str, usize)> = Vec::new();
+    for connection in connections {
+        let Some(FlowConnectionConfiguration::Data(data)) = connection.configuration.as_ref()
+        else {
+            continue;
+        };
+        let key = (connection.target.as_str(), data.target_input.as_str());
+        match per_input
+            .iter_mut()
+            .find(|(node, input, _)| (*node, *input) == key)
+        {
+            Some(entry) => entry.2 += 1,
+            None => per_input.push((key.0, key.1, 1)),
+        }
+    }
+    for (node, input, count) in per_input {
+        if count > 1 {
+            findings.push(finding(
+                "MultipleNodeInputConnections",
+                SEVERITY_ERROR,
+                format!(
+                    "{count} connections end at input {input} of node {node}. One node input takes the value of one connection."
+                ),
+                FlowValidationDetails::multipleNodeInputConnections(
+                    MultipleNodeInputConnectionsFlowValidationDetails {
+                        node: node.to_string(),
+                        input: input.to_string(),
+                    },
+                ),
+            ));
+        }
+    }
+
+    // Reachability is only meaningful once the flow has a starting node at all;
+    // without one, every node is unreachable and `MissingStartingNodes` is the
+    // finding that says so.
+    let mut walk: Vec<usize> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.r#type == INPUT_NODE_TYPE)
+        .map(|(at, _)| at)
+        .collect();
+    if walk.is_empty() {
+        return;
+    }
+    let mut reached = vec![false; nodes.len()];
+    while let Some(at) = walk.pop() {
+        if reached[at] {
+            continue;
+        }
+        reached[at] = true;
+        for &(next, _) in &edges[at] {
+            if !reached[next] {
+                walk.push(next);
+            }
+        }
+    }
+    for (at, node) in nodes.iter().enumerate() {
+        if !reached[at] {
+            findings.push(finding(
+                "UnreachableNode",
+                SEVERITY_WARNING,
+                format!(
+                    "No path from a starting node of the flow reaches node {}.",
+                    node.name
+                ),
+                FlowValidationDetails::unreachableNode(UnreachableNodeFlowValidationDetails {
+                    node: node.name.clone(),
+                }),
+            ));
+        }
+    }
+}
+
+/// The name of every edge of `edges` that points back to a node the depth-first
+/// walk reaching it is still on — one name per such edge, which is one per cycle of
+/// the graph.
+///
+/// The walk carries its own stack rather than recursing, so its depth is bounded by
+/// the number of nodes however the definition is shaped. Each entry is a node and
+/// the next of its edges to walk.
+fn cycle_closing_connections(edges: &[Vec<(usize, &str)>]) -> Vec<String> {
+    let mut state = vec![Visit::Unseen; edges.len()];
+    let mut closing: Vec<String> = Vec::new();
+    let mut walk: Vec<(usize, usize)> = Vec::new();
+
+    for start in 0..edges.len() {
+        if state[start] != Visit::Unseen {
+            continue;
+        }
+        state[start] = Visit::OnPath;
+        walk.push((start, 0));
+        while let Some((at, edge)) = walk.pop() {
+            let Some(&(next, connection)) = edges[at].get(edge) else {
+                // Every edge of `at` is walked: it is behind the path now.
+                state[at] = Visit::Done;
+                continue;
+            };
+            walk.push((at, edge + 1));
+            match state[next] {
+                Visit::Unseen => {
+                    state[next] = Visit::OnPath;
+                    walk.push((next, 0));
+                }
+                Visit::OnPath => {
+                    if !closing.iter().any(|seen| seen == connection) {
+                        closing.push(connection.to_string());
+                    }
+                }
+                Visit::Done => {}
+            }
+        }
+    }
+    closing
+}
+
 /// The `ValidateFlowDefinition` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -145,18 +978,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ValidateFlowDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ValidateFlowDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ValidateFlowDefinition"))
+        // The operation is modelled `@readonly` and names no flow: its whole answer
+        // is computed from the definition this request carries, so it neither reads
+        // a stored record nor changes one, and a later caller sees the store exactly
+        // as it was.
+        let _ = (ctx, &self.engine);
+
+        Ok(ValidateFlowDefinitionOutput {
+            validations: validate_definition(&input.definition),
+        })
     }
 }

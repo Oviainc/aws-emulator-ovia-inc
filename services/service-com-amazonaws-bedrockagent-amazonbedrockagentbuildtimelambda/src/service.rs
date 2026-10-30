@@ -40,10 +40,23 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
-use std::sync::Arc;
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
+use std::sync::{Arc, LazyLock};
+
+/// This service's Smithy model: the one source for which of its members are
+/// `@sensitive`, and so for which values a refusal does not echo.
+const MODEL_JSON: &str =
+    include_str!("../smithy-model/com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda.json");
+
+/// The members of this model whose value a refusal WITHHOLDS, read off
+/// [`MODEL_JSON`] rather than listed here, so the decision cannot drift from the model
+/// as the model grows a `@sensitive` member.
+///
+/// This model marks a great many of them: `FlowDefinition` (so every value inside a
+/// flow definition), `Instruction`, `CollaborationInstruction`, `InlineCode`, an
+/// action group's `Payload`, a prompt's variants, templates, messages and metadata.
+static WITHHELD_MEMBERS: LazyLock<service_common::sensitive_members::WithheldMembers> =
+    LazyLock::new(|| service_common::sensitive_members::WithheldMembers::from_model(MODEL_JSON));
 
 /// The `com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -111,17 +124,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // The framework hands the refusal over structurally — one violation per
+        // offending value — and leaves the words to the service. This service states
+        // them AWS's way: the framework's envelope, clauses, member paths and
+        // requirements, with the VALUE half dropped from the clauses that state none.
+        //
+        // A clause states no value when the value is one the model marks `@sensitive`
+        // ([`WITHHELD_MEMBERS`]): a server does not echo back what the model says not
+        // to disclose. Everything else — the envelope, the member path, the
+        // `@pattern` expression and every other requirement — stays exactly as the
+        // framework worded it.
+        service_common::validation_message::aws_validation_refusal_withholding_with(
+            refusal,
+            // The expression a `@pattern` clause advertises is the model's own, as the
+            // framework already quotes it: nothing recorded for this service shows it
+            // quoted any other way, so only the value half below is restated.
+            |pattern| pattern.to_string(),
+            |path| WITHHELD_MEMBERS.withholds_value(path),
+        )
     }
 
     fn override_routing_error(

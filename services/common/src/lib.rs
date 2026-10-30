@@ -313,6 +313,9 @@ pub mod rpc_target;
 /// identities one account holds and the verification state of each, written by
 /// whichever surface records or deletes one and read by both.
 pub mod ses_identities;
+/// Which member paths a boundary refusal states no value for, read from a service's own
+/// Smithy model: the members it marks `@sensitive`.
+pub mod sensitive_members;
 pub mod shared_path;
 pub mod validation;
 pub mod validation_message;
@@ -326,7 +329,6 @@ pub mod web_media_type;
 /// takes one as a caller-supplied string — so X-Ray and a service that merely carries a
 /// trace header cannot disagree about what counts as one.
 pub mod xray_trace;
-
 pub use validation_message::aws_validation_refusal;
 
 use aws_smithy_runtime_api::http::Request as RuntimeApiRequest;
