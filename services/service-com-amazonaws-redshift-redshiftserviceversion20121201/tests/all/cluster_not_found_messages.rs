@@ -18,8 +18,9 @@
 //!
 //! The table spans what the rule generalises over: the operation (every family
 //! that dereferences a cluster — a configuration change, a cluster-scoped
-//! create, a namespace registration change, a read and a delete, including the
-//! two that name their cluster through a member other than `ClusterIdentifier`)
+//! create, a namespace registration change, a read and a delete, the partner
+//! integration and custom domain association families, including the two that
+//! name their cluster through a member other than `ClusterIdentifier`)
 //! and the identifier (its spelling, both documented length bounds, its case,
 //! one character off a stored name, and a cluster this account created and then
 //! deleted).
@@ -122,6 +123,52 @@ fn delete_cluster(identifier: &str) -> Vec<(String, String)> {
     ]
 }
 
+/// The account this emulator's clusters belong to, which every partner-family
+/// request names through its required `AccountId`.
+fn account_id() -> String {
+    engine::emulator_account_id().to_string()
+}
+
+/// The three members a partner-integration request carries beside its status:
+/// the account that owns the cluster, the cluster, and the (database, partner)
+/// pair the integration is keyed by.
+fn partner_members(identifier: &str) -> Vec<(String, String)> {
+    vec![
+        ("AccountId".to_string(), account_id()),
+        pair("ClusterIdentifier", identifier),
+        pair("DatabaseName", "analytics"),
+        pair("PartnerName", "datadog"),
+    ]
+}
+
+fn update_partner_status(identifier: &str) -> Vec<(String, String)> {
+    let mut params = partner_members(identifier);
+    params.push(pair("Status", state::PARTNER_INTEGRATION_INITIAL_STATUS));
+    params
+}
+
+/// An ACM certificate ARN of the form `CustomDomainCertificateArn`'s own pattern
+/// admits.
+fn certificate_arn() -> String {
+    "arn:aws:acm:us-west-2:000000000000:certificate/11111111-2222-3333-4444-555555555555"
+        .to_string()
+}
+
+fn custom_domain_association(identifier: &str) -> Vec<(String, String)> {
+    vec![
+        pair("ClusterIdentifier", identifier),
+        pair("CustomDomainName", "wording-probe.example.com"),
+        ("CustomDomainCertificateArn".to_string(), certificate_arn()),
+    ]
+}
+
+fn delete_custom_domain_association(identifier: &str) -> Vec<(String, String)> {
+    vec![
+        pair("ClusterIdentifier", identifier),
+        pair("CustomDomainName", "wording-probe.example.com"),
+    ]
+}
+
 /// A namespace registration change names its cluster through the provisioned arm
 /// of the modelled `NamespaceIdentifierUnion`, not through a `ClusterIdentifier`
 /// member of its own — so the rule is about the identifier the request carries,
@@ -178,6 +225,41 @@ fn operations() -> Vec<OperationCase> {
         (
             "CreateUsageLimit",
             create_usage_limit as Request,
+            Wording::NotFoundThenIdentifier,
+        ),
+        (
+            "DescribePartners",
+            partner_members as Request,
+            Wording::NotFoundThenIdentifier,
+        ),
+        (
+            "AddPartner",
+            partner_members as Request,
+            Wording::NotFoundThenIdentifier,
+        ),
+        (
+            "DeletePartner",
+            partner_members as Request,
+            Wording::NotFoundThenIdentifier,
+        ),
+        (
+            "UpdatePartnerStatus",
+            update_partner_status as Request,
+            Wording::NotFoundThenIdentifier,
+        ),
+        (
+            "CreateCustomDomainAssociation",
+            custom_domain_association as Request,
+            Wording::NotFoundThenIdentifier,
+        ),
+        (
+            "ModifyCustomDomainAssociation",
+            custom_domain_association as Request,
+            Wording::NotFoundThenIdentifier,
+        ),
+        (
+            "DeleteCustomDomainAssociation",
+            delete_custom_domain_association as Request,
             Wording::NotFoundThenIdentifier,
         ),
         (

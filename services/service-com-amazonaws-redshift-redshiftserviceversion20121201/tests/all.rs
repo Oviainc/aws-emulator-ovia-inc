@@ -49,6 +49,8 @@ mod cluster_versions;
 mod copy_cluster_snapshot;
 #[path = "all/custom_domain_and_partners.rs"]
 mod custom_domain_and_partners;
+#[path = "all/custom_domain_association_refusal_wording.rs"]
+mod custom_domain_association_refusal_wording;
 #[path = "all/default_cluster_parameters.rs"]
 mod default_cluster_parameters;
 #[path = "all/endpoint_access.rs"]

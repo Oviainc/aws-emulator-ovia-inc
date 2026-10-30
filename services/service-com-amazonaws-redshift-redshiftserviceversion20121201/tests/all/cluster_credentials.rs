@@ -532,7 +532,7 @@ async fn the_cluster_is_resolved_by_either_name() {
             vec![("CustomDomainName".to_string(), "absent.example.com".to_string())],
             404,
             "ClusterNotFound",
-            Some("CustomDomainAssociation not found: absent.example.com".to_string()),
+            Some("There aren't any associations linked to the custom domain name absent.example.com.".to_string()),
         ),
         (
             "both members naming different clusters",

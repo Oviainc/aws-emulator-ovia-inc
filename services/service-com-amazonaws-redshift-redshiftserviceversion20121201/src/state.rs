@@ -1656,7 +1656,12 @@ pub enum ClusterNotFoundWording {
     /// `Cluster not found: <ClusterIdentifier>` — what `RebootCluster`,
     /// `ModifyCluster`, `ModifyClusterIamRoles`, `EnableSnapshotCopy`,
     /// `DisableSnapshotCopy`, `ModifySnapshotCopyRetentionPeriod`,
-    /// `CreateClusterSnapshot` and `CreateUsageLimit` answer.
+    /// `CreateClusterSnapshot` and `CreateUsageLimit` answer, and the sentence
+    /// the two families that dereference a cluster without describing it —
+    /// partner integration (`AddPartner`, `DeletePartner`, `DescribePartners`,
+    /// `UpdatePartnerStatus`) and custom domain association
+    /// (`CreateCustomDomainAssociation`, `ModifyCustomDomainAssociation`,
+    /// `DeleteCustomDomainAssociation`) — are recorded answering too.
     NotFoundThenIdentifier,
     /// `Cluster <ClusterIdentifier> not found.` — what `DescribeClusters` and
     /// `DeleteCluster` answer, and the sentence every other cluster-scoped
@@ -7684,9 +7689,31 @@ pub const CUSTOM_DOMAIN_CERTIFICATE_VALIDITY: Duration =
     Duration::from_secs(395 * 24 * 60 * 60);
 
 /// What every operation on a custom domain association answers when the name it
-/// resolves names no association at all.
+/// resolves names no association at all: the sentence Amazon Redshift words
+/// `CustomDomainAssociationNotFoundFault` with, which states that nothing is
+/// linked to the name the request supplied rather than naming a resource type.
+///
+/// The fixed prose is the requirement and the `CustomDomainName` is taken from
+/// the request, so one condition reads the same way through every operation
+/// that resolves an association by its domain name.
 pub fn custom_domain_association_not_found_message(custom_domain_name: &str) -> String {
-    format!("CustomDomainAssociation not found: {custom_domain_name}")
+    format!(
+        "There aren't any associations linked to the custom domain name {custom_domain_name}."
+    )
+}
+
+/// The same refusal for a request that names the association it wants through
+/// the CERTIFICATE instead of the domain name
+/// (`DescribeCustomDomainAssociations$CustomDomainCertificateArn`): the same
+/// sentence about the member the value arrived on, so no refusal interpolates a
+/// certificate ARN into a sentence about a domain name.
+pub fn custom_domain_certificate_association_not_found_message(
+    custom_domain_certificate_arn: &str,
+) -> String {
+    format!(
+        "There aren't any associations linked to the custom domain certificate \
+         {custom_domain_certificate_arn}."
+    )
 }
 
 /// What an operation on the custom domain association OF a cluster answers when

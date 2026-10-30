@@ -173,15 +173,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.custom_domain_certificate_arn.as_deref(),
         );
         if matched.is_empty() {
-            let named = input
-                .custom_domain_name
-                .as_deref()
-                .or(input.custom_domain_certificate_arn.as_deref());
-            if let Some(named) = named {
+            // The refusal names the member the request resolved the association
+            // through, so the sentence is about the value the caller supplied.
+            let absent = match (
+                input.custom_domain_name.as_deref(),
+                input.custom_domain_certificate_arn.as_deref(),
+            ) {
+                (Some(name), _) => Some(st::custom_domain_association_not_found_message(name)),
+                (None, Some(arn)) => {
+                    Some(st::custom_domain_certificate_association_not_found_message(arn))
+                }
+                (None, None) => None,
+            };
+            if let Some(absent) = absent {
                 return Err(
                     DescribeCustomDomainAssociationsErrorModeled::CustomDomainAssociationNotFoundFault(
                         CustomDomainAssociationNotFoundFault {
-                            message: Some(st::custom_domain_association_not_found_message(named)),
+                            message: Some(absent),
                         },
                     )
                     .into(),
