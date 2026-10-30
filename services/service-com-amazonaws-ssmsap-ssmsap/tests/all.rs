@@ -39,6 +39,8 @@ mod configuration_checks;
 mod configuration_checks_in_flight;
 #[path = "all/database_arn_resource_kind.rs"]
 mod database_arn_resource_kind;
+#[path = "all/database_name_case.rs"]
+mod database_name_case;
 #[path = "all/delete_resource_permission.rs"]
 mod delete_resource_permission;
 #[path = "all/deregistration_window.rs"]

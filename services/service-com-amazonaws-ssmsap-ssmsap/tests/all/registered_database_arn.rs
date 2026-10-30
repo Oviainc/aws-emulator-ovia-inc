@@ -98,7 +98,7 @@ fn cases() -> Vec<Case> {
             database_names: &[],
             database_arn: "arn:aws:rds:us-east-1:000000000000:db:sap-prd".to_string(),
             expected_component: Some("PRD-HANA"),
-            expected: vec![("sap_prd", "TENANT", ArnSource::AsRegistered)],
+            expected: vec![("SAP_PRD", "TENANT", ArnSource::AsRegistered)],
         },
         // A last segment carrying characters the modelled `DatabaseId` pattern
         // (`[\w\d]+$`) does not admit.
@@ -110,7 +110,7 @@ fn cases() -> Vec<Case> {
             database_names: &[],
             database_arn: expected_arn("abap-punctuated-arn", "prod db.1"),
             expected_component: None,
-            expected: vec![("prod_db_1", "TENANT", ArnSource::AsRegistered)],
+            expected: vec![("PROD_DB_1", "TENANT", ArnSource::AsRegistered)],
         },
         // A trailing separator leaves the database named by the last NON-EMPTY segment.
         Case {

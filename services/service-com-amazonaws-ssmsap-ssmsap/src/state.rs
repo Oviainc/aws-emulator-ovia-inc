@@ -3127,7 +3127,9 @@ impl RegionState {
     /// database belongs to. The databases searched are the ones the registrations named
     /// ([`StoredApplication::databases`], which is also what `ListDatabases` reports), in
     /// the same (application id, database id) order that listing walks, so a reference two
-    /// applications of this Region both answer resolves to the same one on every call.
+    /// applications of this Region both answer resolves to the same one on every call. A
+    /// `DatabaseId` names the database whose id it is by the identity a database has here
+    /// ([`same_database_id`]), under which the case of a HANA database name is nothing.
     ///
     /// `None` when nothing this Region holds answers the reference — including a reference
     /// to a database of another Region, since the lookup only ever reaches this partition.
@@ -3161,7 +3163,7 @@ impl RegionState {
                 .into_iter()
                 .find(|database| {
                     database_arn.is_none_or(|arn| database.arn == arn)
-                        && database_id.is_none_or(|id| database.database_id == id)
+                        && database_id.is_none_or(|id| same_database_id(&database.database_id, id))
                         && component_id
                             .is_none_or(|id| database.component_id.as_deref() == Some(id))
                 })
@@ -3817,25 +3819,46 @@ pub fn arn_region(arn: &str) -> &str {
 
 /// The `DatabaseId` of the SAP HANA database named `database_name`.
 ///
-/// A database is identified by its name, so its id is a function of that name: every
-/// character the model's `DatabaseId` pattern (`[\w\d]+$`) does not admit is replaced by
-/// `_`, which that pattern does admit, and the result is cut to the modelled
-/// `DatabaseId` length bound (1..300). So a name of any form yields an id of the
-/// modelled form and the same name always yields the same id. A `DatabaseName` is at
-/// most 100 characters, so only a name taken off a longer ARN segment
-/// ([`database_name_from_arn`]) can reach that cut.
+/// A database is identified by its name, so its id is a CANONICAL function of that name —
+/// every name that names the same database yields the one id, which is the identity every
+/// read of a database resolves by ([`StoredApplication::databases`], [`same_credential`],
+/// [`database_type_for`], [`RegionState::resolve_database`]):
+///
+/// * every character the model's `DatabaseId` pattern (`[\w\d]+$`) does not admit is
+///   replaced by `_`, which that pattern does admit, so two names differing only in such
+///   characters are one database;
+/// * every ASCII letter is folded to upper case, because an SAP HANA database name is
+///   case-insensitive and HANA holds an unquoted identifier in upper case, so two names
+///   differing only in case are one database too;
+/// * the result is cut to the modelled `DatabaseId` length bound (1..300). A
+///   `DatabaseName` is at most 100 characters, so only a name taken off a longer ARN
+///   segment ([`database_name_from_arn`]) can reach that cut.
+///
+/// So a name of any form yields an id of the modelled form, and the same database always
+/// yields the same id — the name a caller declared is kept as declared and reported in
+/// `DatabaseName`, while the id, and the ARN minted from it, are that canonical form.
 pub fn database_id_from_name(database_name: &str) -> String {
     database_name
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || character == '_' {
-                character
+                character.to_ascii_uppercase()
             } else {
                 '_'
             }
         })
         .take(MAX_DATABASE_ID_LENGTH)
         .collect()
+}
+
+/// Whether the SAP HANA database `database_id` is the database the reference `reference`
+/// names, a `DatabaseId` a request carried.
+///
+/// A `DatabaseId` is the canonical form of a database's name
+/// ([`database_id_from_name`]), and the case of a HANA database name is not part of its
+/// identity, so a reference spelling the id in another case names that same database.
+pub fn same_database_id(database_id: &str, reference: &str) -> bool {
+    database_id.eq_ignore_ascii_case(reference)
 }
 
 /// Whether two `ApplicationCredential`s name the SAME credential of an application:
@@ -3896,11 +3919,14 @@ pub fn database_name_from_arn(database_arn: &str) -> Option<&str> {
 
 /// The `DatabaseType` of the SAP HANA database named `database_name`.
 ///
-/// The system database of a HANA system is the one named [`HANA_SYSTEM_DATABASE_NAME`]
-/// (HANA database names are case-insensitive); every other database of the system is a
-/// tenant database.
+/// The system database of a HANA system is the one named [`HANA_SYSTEM_DATABASE_NAME`];
+/// every other database of the system is a tenant database. WHICH database a name names
+/// is decided by the one identity the rest of this file resolves a database by
+/// ([`database_id_from_name`], of whose canonical form the system database's name already
+/// is), so a name this answers `SYSTEM` for is a name that derives the system database
+/// and no second one.
 pub fn database_type_for(database_name: &str) -> &'static str {
-    if database_name.eq_ignore_ascii_case(HANA_SYSTEM_DATABASE_NAME) {
+    if database_id_from_name(database_name) == HANA_SYSTEM_DATABASE_NAME {
         DATABASE_TYPE_SYSTEM
     } else {
         DATABASE_TYPE_TENANT

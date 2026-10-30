@@ -155,7 +155,7 @@ fn cases() -> Vec<Case> {
             kept: &[Resource::Derived("SYSTEMDB")],
         },
         // A name the `DatabaseId` form rewrites: every character the modelled `DatabaseId`
-        // pattern does not admit becomes `_`
+        // pattern does not admit becomes `_` and every ASCII letter is folded to upper case
         // (`service_com_amazonaws_ssmsap_ssmsap::state::database_id_from_name`), so the
         // ARN the tags and the grant are keyed by is not the name the credential carried.
         Case {
@@ -167,7 +167,7 @@ fn cases() -> Vec<Case> {
             remove: &["tnt-1"],
             connection: None,
             backint: false,
-            destroyed: &[Resource::Derived("tnt_1")],
+            destroyed: &[Resource::Derived("TNT_1")],
             kept: &[Resource::Derived("SYSTEMDB")],
         },
         Case {

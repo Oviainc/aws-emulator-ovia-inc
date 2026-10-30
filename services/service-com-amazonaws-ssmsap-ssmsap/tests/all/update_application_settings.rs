@@ -193,8 +193,8 @@ const CASES: &[Case] = &[
         remove: &[],
         backint: None,
         connect_database: None,
-        expected_credentials: &[("HDB", "sap/hdb/admin"), ("prod_db_1", "sap/prod/admin")],
-        expected_databases: &["HDB", "prod_db_1"],
+        expected_credentials: &[("HDB", "sap/hdb/admin"), ("PROD_DB_1", "sap/prod/admin")],
+        expected_databases: &["HDB", "PROD_DB_1"],
         expected_settings_named: &["credentials"],
     },
     // The AWS Backint Agent configuration ALONE: the credentials and databases the

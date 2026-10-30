@@ -23,7 +23,7 @@
 //! credential (two, three), whether the repeated declarations carry different secrets or
 //! the same one, where the repetition sits among declarations of other credentials, the
 //! FORM of the database name the repeated declarations spell (two spellings of one
-//! `DatabaseId`, two spellings that are different ids), how many distinct credentials the
+//! `DatabaseId`, two spellings differing only in case), how many distinct credentials the
 //! registration declares, and the `ApplicationType` carrying them.
 
 use std::collections::BTreeMap;
@@ -110,24 +110,25 @@ const CASES: &[Case] = &[
     },
     // Two SPELLINGS of one database: the `DatabaseId` a name yields is what identifies
     // the database (every character the modelled `DatabaseId` pattern `[\w\d]+$` does not
-    // admit becomes `_`), so these two name ONE credential.
+    // admit becomes `_`, and every ASCII letter is folded to upper case), so these two
+    // name ONE credential.
     Case {
         name: "two spellings of one DatabaseId",
         application_id: "punctuated-duplicate",
         application_type: "HANA",
         declared: &[("prod db.1", "sap/prod/first"), ("prod_db_1", "sap/prod/last")],
-        expected: &[("prod_db_1", "sap/prod/last")],
-        rotated: Some(("prod db.1", "prod_db_1")),
+        expected: &[("PROD_DB_1", "sap/prod/last")],
+        rotated: Some(("prod db.1", "PROD_DB_1")),
     },
-    // Two spellings that are DIFFERENT ids: the identity is the id, and nothing looser,
-    // so names differing in case are two databases with a credential each.
+    // Two spellings differing only in CASE: an SAP HANA database name is
+    // case-insensitive, so these name one database and one credential of it.
     Case {
-        name: "names differing only in case are different databases",
+        name: "names differing only in case are one database",
         application_id: "case-distinct",
         application_type: "HANA",
         declared: &[("HDB", "sap/upper/admin"), ("hdb", "sap/lower/admin")],
-        expected: &[("HDB", "sap/upper/admin"), ("hdb", "sap/lower/admin")],
-        rotated: None,
+        expected: &[("HDB", "sap/lower/admin")],
+        rotated: Some(("hDb", "HDB")),
     },
     // Distinct databases throughout: nothing collapses, and each is its own credential.
     Case {

@@ -68,7 +68,10 @@ struct Case {
 
 /// A `DatabaseName` at the top of the modelled `DatabaseName` length bound
 /// (`smithy_query(query="shape", shape="ApplicationCredential")`: length 1..100).
-const NAME_AT_LENGTH_BOUND: &str =
+///
+/// `pub(crate)` so the suites of this target spell the bound once:
+/// `tests/all/database_name_case.rs` drives the case rule on a name of that length.
+pub(crate) const NAME_AT_LENGTH_BOUND: &str =
     "D000000001000000000200000000030000000004000000000500000000060000000007000000000800000000090000000";
 
 /// The rows: one registration each, spanning database count, name form, application
@@ -104,7 +107,7 @@ fn cases() -> Vec<Case> {
             sid: Some("HDB"),
             database_names: &["systemdb"],
             expected_component: Some("HDB-HANA"),
-            expected: &[("systemdb", "SYSTEM")],
+            expected: &[("SYSTEMDB", "SYSTEM")],
         },
         Case {
             name: "two credentials naming one database are one database",
@@ -122,7 +125,7 @@ fn cases() -> Vec<Case> {
             sid: Some("HDB"),
             database_names: &["prod db.1"],
             expected_component: Some("HDB-HANA"),
-            expected: &[("prod_db_1", "TENANT")],
+            expected: &[("PROD_DB_1", "TENANT")],
         },
         Case {
             name: "a name carrying characters outside ASCII",
@@ -131,7 +134,7 @@ fn cases() -> Vec<Case> {
             sid: Some("HDB"),
             database_names: &["datenbankü"],
             expected_component: Some("HDB-HANA"),
-            expected: &[("datenbank_", "TENANT")],
+            expected: &[("DATENBANK_", "TENANT")],
         },
         Case {
             name: "a name at the top of the modelled length bound",
