@@ -17,7 +17,10 @@
 //! * the harness (`/harnesses/`): one [`HarnessRecord`] per `harnessId`, holding
 //!   the whole agent-loop configuration `CreateHarness` persisted, so
 //!   `GetHarness` reports exactly that and `DeleteHarness` reports what it
-//!   removed.
+//!   removed;
+//! * the token vault ([`TokenVaults`]): the KMS configuration each vault of the
+//!   account is encrypted under, so `SetTokenVaultCMK` and `GetTokenVault`
+//!   answer from one store.
 //!
 //! Helpers the handlers share (the region a request was signed for, the
 //! canonical ARNs, id minting, the clock-owed status transition, the response
@@ -39,7 +42,8 @@ use crate::ops::types::{
     HarnessEnvironmentArtifact, HarnessEnvironmentProvider, HarnessEnvironmentProviderRequest,
     HarnessHook, HarnessMemoryConfiguration, HarnessModelConfiguration, HarnessSkill,
     HarnessSystemContentBlock, HarnessTool, HarnessTruncationConfiguration, HarnessVersionSummary,
-    HttpTargetConfiguration, IndexedKey, InferenceTargetConfiguration, LifecycleConfiguration,
+    HttpTargetConfiguration, IndexedKey, InferenceTargetConfiguration, KmsConfiguration,
+    LifecycleConfiguration,
     McpTargetConfiguration, Memory, MemoryStrategy, MetadataConfiguration, NamespaceKeyEntry,
     NetworkConfiguration, PrivateEndpoint, ProtocolConfiguration, RequestHeaderConfiguration,
     ResourceNotFoundException,
@@ -1181,6 +1185,88 @@ pub fn effective_truncation_configuration(
     })
 }
 
+/// The `tokenVaultId` of the token vault an account holds without anything
+/// having created one: the vault a request naming no `tokenVaultId` addresses,
+/// and the workload-identity directory this service already mints into
+/// ([`workload_identity_arn`]).
+pub const DEFAULT_TOKEN_VAULT_ID: &str = "default";
+
+/// `KeyType` for a key the service itself owns — what a token vault no caller
+/// has re-keyed is encrypted under. The enum's full value list is
+/// `CustomerManagedKey | ServiceManagedKey` (`smithy_query shape=KeyType`).
+pub const KEY_TYPE_SERVICE_MANAGED: &str = "ServiceManagedKey";
+
+/// The resource noun [`resource_not_found`] names for a token vault.
+pub const RESOURCE_TOKEN_VAULT: &str = "token vault";
+
+/// One token vault: the KMS configuration its contents are encrypted under, and
+/// when that configuration was last set.
+///
+/// `kmsConfiguration` and `lastModifiedDate` are the only members any token
+/// vault response carries, so the record holds exactly those two.
+#[derive(Debug, Clone)]
+pub struct TokenVaultRecord {
+    pub kms_configuration: KmsConfiguration,
+    pub last_modified_at: SystemTime,
+}
+
+impl TokenVaultRecord {
+    /// A vault encrypted under the key the service manages — the configuration a
+    /// vault carries until a caller points it at a key of their own. The service
+    /// managed key is not the caller's, so no `kmsKeyArn` is reported for it.
+    pub fn service_managed(at: SystemTime) -> Self {
+        Self {
+            kms_configuration: KmsConfiguration {
+                key_type: KEY_TYPE_SERVICE_MANAGED.to_string(),
+                kms_key_arn: None,
+            },
+            last_modified_at: at,
+        }
+    }
+}
+
+/// The account's token vaults, keyed by `tokenVaultId`.
+///
+/// A newtype rather than a bare map because of one invariant no caller
+/// establishes: this service models no operation that creates a vault, so the
+/// default vault is present from the moment the account's state is, and a read
+/// neither finds it absent nor re-dates it.
+#[derive(Debug)]
+pub struct TokenVaults(BTreeMap<String, TokenVaultRecord>);
+
+impl Default for TokenVaults {
+    fn default() -> Self {
+        Self(BTreeMap::from([(
+            DEFAULT_TOKEN_VAULT_ID.to_string(),
+            TokenVaultRecord::service_managed(SystemTime::now()),
+        )]))
+    }
+}
+
+impl TokenVaults {
+    /// The vault `token_vault_id` addresses, or `None` when no vault of this
+    /// account carries that id.
+    pub fn get(&self, token_vault_id: &str) -> Option<&TokenVaultRecord> {
+        self.0.get(token_vault_id)
+    }
+
+    /// Point the vault `token_vault_id` addresses at `kms_configuration`,
+    /// stamping `at` as the instant it was last modified, and hand back the
+    /// stored record. `None`, writing nothing, when no vault carries that id:
+    /// this call re-keys a vault, it never creates one.
+    pub fn set_kms_configuration(
+        &mut self,
+        token_vault_id: &str,
+        kms_configuration: KmsConfiguration,
+        at: SystemTime,
+    ) -> Option<&TokenVaultRecord> {
+        let record = self.0.get_mut(token_vault_id)?;
+        record.kms_configuration = kms_configuration;
+        record.last_modified_at = at;
+        Some(record)
+    }
+}
+
 /// Per-service state for com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol. A handler reaches it through [`service_state`].
 ///
 /// Every map here is caller-driven growth, so every one is bounded:
@@ -1275,6 +1361,10 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// The keys of [`Self::harness_idempotency`] in the order they were first
     /// recorded, so the oldest record is the one evicted at the ceiling.
     harness_idempotency_order: VecDeque<String>,
+    /// The account's token vaults, keyed by `tokenVaultId`. Bounded by its own
+    /// type: no operation of this service creates a vault, so the map holds the
+    /// one default vault [`TokenVaults`] seeds and never grows.
+    pub token_vaults: TokenVaults,
     /// Bumped on every mint, so two runtimes created in the same instant with
     /// the same name still get distinct ids.
     mint_counter: u64,

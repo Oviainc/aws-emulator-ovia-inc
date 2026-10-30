@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetTokenVaultCMK
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetTokenVaultCMK`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetTokenVaultCMK::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the KMS configuration one token vault of the account is encrypted under.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +153,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetTokenVaultCMK` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetTokenVaultCMKErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetTokenVaultCMK"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SetTokenVaultCMKErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the token vault store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `tokenVaultId` is optional on the request and `@required` on the
+        // response: a request naming no vault addresses the account's default
+        // one — the vault this service's workload identities already live in.
+        let token_vault_id = input
+            .token_vault_id
+            .unwrap_or_else(|| crate::state::DEFAULT_TOKEN_VAULT_ID.to_string());
+
+        // The whole re-key happens under one lock, so two callers setting the
+        // CMK of one vault are ordered rather than interleaved: each is answered
+        // with the configuration it set, and the vault keeps the last one. There
+        // is no window in which a writer finds a half-applied configuration,
+        // which is what this operation's `ConcurrentModificationException`
+        // reports, so that error has no condition to fire on here.
+        let record = store
+            .token_vaults
+            .set_kms_configuration(&token_vault_id, input.kms_configuration, now)
+            .ok_or_else(|| {
+                SetTokenVaultCMKErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::ACTION_UPDATE,
+                        crate::state::RESOURCE_TOKEN_VAULT,
+                    ),
+                )
+            })?;
+
+        Ok(SetTokenVaultCMKOutput {
+            token_vault_id,
+            kms_configuration: record.kms_configuration.clone(),
+            last_modified_date: crate::state::timestamp(record.last_modified_at),
+        })
     }
 }

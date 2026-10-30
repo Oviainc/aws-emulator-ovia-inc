@@ -43,6 +43,8 @@ mod service_claim;
 mod signing_name_routing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/token_vault_cmk.rs"]
+mod token_vault_cmk;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;
 #[path = "all/workload_identity_lifecycle.rs"]
