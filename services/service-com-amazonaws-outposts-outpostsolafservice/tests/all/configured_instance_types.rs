@@ -63,6 +63,11 @@ const UNPUBLISHED_INSTANCE_TYPE: &str = "zz9.xlarge";
 /// service publishes no hardware configuration under.
 const UNPUBLISHED_SKU: &str = "OR-0000000";
 
+/// The modelled `CatalogItemStatus` a published configuration an order can still be
+/// placed for carries, as `smithy_query(query="shape", shape="CatalogItemStatus")`
+/// reports the value set (`AVAILABLE` | `DISCONTINUED`).
+const ORDERABLE_ITEM_STATUS: &str = "AVAILABLE";
+
 /// The route `GetOutpostInstanceTypes` binds, for one identifier form and one query
 /// string.
 fn route(identifier: &str, query: &str) -> String {
@@ -470,10 +475,26 @@ struct Ordered {
 async fn an_outpost_no_capacity_task_has_touched_is_configured_by_its_orders() {
     let outposts = Outposts::new();
     let catalog = catalog(&outposts).await;
-    let catalog_items = outposts.ok("GET", "/catalog/items", None).await["CatalogItems"]
+    let published = outposts.ok("GET", "/catalog/items", None).await["CatalogItems"]
         .as_array()
         .cloned()
         .unwrap_or_default();
+    assert!(
+        !published
+            .iter()
+            .any(|item| text(item, "CatalogItemId") == UNPUBLISHED_SKU),
+        "the row that orders {UNPUBLISHED_SKU:?} needs a SKU this service publishes nothing \
+         under, got {published:?}"
+    );
+    // The published configurations an order can be placed FOR: every row below orders
+    // the configuration it names, and an order is only taken for a configuration the
+    // catalog still offers (`crate::order_catalog_item_status`), so a row's position
+    // indexes that part of the catalog. Which configurations those are is read off the
+    // catalog's own `ItemStatus` rather than spelled out here.
+    let catalog_items: Vec<Value> = published
+        .into_iter()
+        .filter(|item| text(item, "ItemStatus") == ORDERABLE_ITEM_STATUS)
+        .collect();
     assert!(
         catalog_items.len() >= 2,
         "the published catalog must hold configurations to order, got {catalog_items:?}"

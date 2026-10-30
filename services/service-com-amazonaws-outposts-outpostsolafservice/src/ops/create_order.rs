@@ -4,7 +4,9 @@
 //! IMPLEMENTED: mints an `OrderId`, persists the order the request describes against
 //! the Outpost it names, and answers it from what was persisted — which is what
 //! `GetOrder` reads back. Every line item the request sent gets a minted `LineItemId`
-//! and the status a just-submitted item carries; an order taken from a quote is
+//! and the status a just-submitted item carries, and names a configuration the
+//! published catalog still offers — one published as no longer offered is refused; an
+//! order taken from a quote is
 //! submitted only from a quote this request resolves against — one offering the quote
 //! option named, associated with the Outpost the order is placed on, and with every
 //! ordering requirement of it met — and records that quote and moves it to
@@ -270,6 +272,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(record) => record.outpost.site_id.clone(),
             None => return Err(outpost_not_found().into()),
         };
+        // A line item orders one of the hardware configurations this service
+        // publishes, and the catalog records on each one whether it can still be
+        // ordered: a configuration published as no longer offered is not one an order
+        // can be placed for, so the SKU every line item names is resolved against the
+        // published catalog BEFORE anything is minted, exactly as every other
+        // reference this request carries is — the bad request the modelled
+        // `ValidationException` (HTTP 400) states, with no order stored. A `SkuCode`
+        // the catalog publishes nothing under resolves to no published configuration
+        // at all, so it carries no published status to refuse it by and is accepted,
+        // as the rest of this service's treatment of such a SKU is (see
+        // [`crate::state::CatalogItemRecord::is_orderable`]).
+        if line_items.iter().any(|requested| {
+            requested
+                .catalog_item_id
+                .as_deref()
+                .and_then(|catalog_item_id| store.catalog_item(catalog_item_id))
+                .is_some_and(|record| !record.is_orderable())
+        }) {
+            return Err(CreateOrderErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::order_catalog_item_report()),
+                },
+            )
+            .into());
+        }
         // A quote named for the order has to exist, and has to be one an order can
         // still be submitted from: the modelled `ORDER_SUBMITTED` is "An order has
         // been submitted for the quote" and `EXPIRED` is a quote past its own

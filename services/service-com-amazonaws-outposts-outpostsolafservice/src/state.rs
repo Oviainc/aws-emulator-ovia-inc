@@ -2270,6 +2270,20 @@ pub struct CatalogItemRecord {
 }
 
 impl CatalogItemRecord {
+    /// Whether an order can still be placed for the configuration this item
+    /// publishes: whether its published `CatalogItemStatus` is the one a
+    /// configuration that can still be ordered carries
+    /// ([`CATALOG_ITEM_STATUS_AVAILABLE`]).
+    ///
+    /// The question is asked of the status the catalog publishes NOW, so the one
+    /// operation that orders a published configuration reads it there rather than
+    /// keeping a second list of which SKUs are orderable. Anything other than that
+    /// status — [`CATALOG_ITEM_STATUS_DISCONTINUED`], or a status this service does
+    /// not publish an item in at all — is not a configuration still being offered.
+    pub fn is_orderable(&self) -> bool {
+        self.item.item_status.as_deref() == Some(CATALOG_ITEM_STATUS_AVAILABLE)
+    }
+
     /// Whether this item is of ANY of the classes a filter names.
     ///
     /// The class is a SINGLE-valued fact about an item, so the selection is the one
@@ -6003,6 +6017,25 @@ pub fn order_contents_report() -> String {
         LINE_ITEMS_MEMBER,
         "either the line items that make up the order or the quote to take them from \
          must be specified",
+    )])
+}
+
+/// The report an order for a published configuration that is no longer offered
+/// states.
+///
+/// A line item orders one of the hardware configurations this service publishes, and
+/// the catalog records on each one whether it can still be ordered
+/// ([`CatalogItemRecord::is_orderable`]): a configuration published as no longer
+/// offered is not one an order can be placed for, so the request is refused with
+/// nothing persisted. AWS publishes no wording for the refusal, so the sentence is the
+/// emulator's own; what a caller branches on is the modelled `ValidationException`
+/// code (HTTP 400). It is worded by the same rule as [`order_contents_report`] — the
+/// member and the requirement, never the value, so neither the SKU nor the status it
+/// is published in is rendered.
+pub fn order_catalog_item_report() -> String {
+    validation_report(&[clause(
+        LINE_ITEMS_MEMBER,
+        "every catalog item ordered must be one the catalog still offers",
     )])
 }
 

@@ -63,6 +63,8 @@ mod identifier_filter_rule;
 mod not_found_wording;
 #[path = "all/order_cancellation.rs"]
 mod order_cancellation;
+#[path = "all/order_catalog_item_status.rs"]
+mod order_catalog_item_status;
 #[path = "all/order_lifecycle.rs"]
 mod order_lifecycle;
 #[path = "all/order_listing.rs"]

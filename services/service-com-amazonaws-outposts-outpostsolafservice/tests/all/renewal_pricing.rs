@@ -61,6 +61,11 @@ use crate::site_and_outpost_lifecycle::{
 /// has no hardware facts for. The rows that use it assert it really is unpublished.
 pub(crate) const UNPUBLISHED_SKU: &str = "OR-0000001";
 
+/// The modelled `CatalogItemStatus` a published configuration an order can still be
+/// placed for carries, as `smithy_query(query="shape", shape="CatalogItemStatus")`
+/// reports the value set (`AVAILABLE` | `DISCONTINUED`).
+const ORDERABLE_ITEM_STATUS: &str = "AVAILABLE";
+
 /// How close a reported price has to be to the one the rule computes: the cent it is
 /// quoted to, which is also the precision the service rounds to.
 pub(crate) const CENT: f64 = 0.01;
@@ -97,14 +102,17 @@ pub(crate) fn cancelled(mut spec: OrderSpec) -> OrderSpec {
     spec
 }
 
-/// The catalog of orderable hardware configurations this service publishes, as
-/// `(CatalogItemId, vCPUs of EC2 capacity)` pairs.
+/// The hardware configurations this service publishes that an order can be placed
+/// FOR, as `(CatalogItemId, vCPUs of EC2 capacity)` pairs.
 ///
-/// The SKUs are the ones `ListCatalogItems` publishes over the wire. The capacity is
-/// read through the store seam [`crate::quote_lifecycle`] ages a quote through,
-/// because the modelled `CatalogItem` reports capacity per instance family rather
-/// than one total — it is the catalog's own published figure either way, never a
-/// number this suite picked.
+/// The SKUs are the ones `ListCatalogItems` publishes over the wire, narrowed to the
+/// configurations the catalog still offers: every row below places an order of the
+/// configuration it names, and an order is only taken for one the catalog still offers
+/// (`crate::order_catalog_item_status`). Which those are is read off the catalog's own
+/// `ItemStatus` rather than spelled out here. The capacity is read through the store
+/// seam [`crate::quote_lifecycle`] ages a quote through, because the modelled
+/// `CatalogItem` reports capacity per instance family rather than one total — it is the
+/// catalog's own published figure either way, never a number this suite picked.
 pub(crate) async fn published_catalog(outposts: &Outposts) -> Vec<(String, i64)> {
     let listed = outposts
         .ok("GET", "/catalog/items?MaxResults=1000", None)
@@ -116,6 +124,7 @@ pub(crate) async fn published_catalog(outposts: &Outposts) -> Vec<(String, i64)>
     let held = outposts.store().lock().catalog_items.clone();
     let mut catalog: Vec<(String, i64)> = items
         .iter()
+        .filter(|item| text(item, "ItemStatus") == ORDERABLE_ITEM_STATUS)
         .map(|item| {
             let sku = text(item, "CatalogItemId");
             let capacity = held

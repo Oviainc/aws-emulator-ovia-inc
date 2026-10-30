@@ -50,6 +50,11 @@ const PAYMENT_OPTION: &str = "ALL_UPFRONT";
 /// [`Catalog::discover`] rather than assumed.
 const UNPUBLISHED_SKU: &str = "OR-0000000";
 
+/// The modelled `CatalogItemStatus` a published configuration an order can still be
+/// placed for carries, as `smithy_query(query="shape", shape="CatalogItemStatus")`
+/// reports the value set (`AVAILABLE` | `DISCONTINUED`).
+const ORDERABLE_ITEM_STATUS: &str = "AVAILABLE";
+
 /// An account that is NOT the one this emulator serves: the owner of an Outpost shared
 /// with the caller through Resource Access Manager. A synthetic, non-routable
 /// placeholder in the same all-zero family as `engine::emulator_account_id`.
@@ -489,7 +494,14 @@ impl Catalog {
     }
 }
 
-/// The SKUs `ListCatalogItems` reports for one storage option.
+/// The SKUs `ListCatalogItems` reports for one storage option, narrowed to the
+/// configurations the catalog still offers.
+///
+/// Every case of this suite places an ORDER for the configuration it names, and
+/// `outposts:CreateOrder` takes an order only for a configuration the catalog still
+/// offers, so a configuration published as no longer offered is not one these rows can
+/// use. Which those are is read off the catalog's own `ItemStatus` rather than spelled
+/// out here.
 async fn catalog_skus(emulator: &Emulator, storage: &str) -> Vec<String> {
     let body = emulator
         .outposts_ok(
@@ -503,6 +515,7 @@ async fn catalog_skus(emulator: &Emulator, storage: &str) -> Vec<String> {
         .as_array()
         .unwrap_or_else(|| panic!("ListCatalogItems must carry CatalogItems: {body}"))
         .iter()
+        .filter(|item| string_at(item, "ItemStatus") == ORDERABLE_ITEM_STATUS)
         .map(|item| string_at(item, "CatalogItemId"))
         .collect()
 }
