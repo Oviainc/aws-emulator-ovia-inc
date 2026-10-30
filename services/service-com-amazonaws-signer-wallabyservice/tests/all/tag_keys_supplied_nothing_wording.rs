@@ -51,6 +51,11 @@ const ACCOUNT_ID: &str = "000000000000";
 /// leaves where it is when it rewords such a refusal's message.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
+/// The status a Signer success whose modelled output declares no members answers
+/// with: `TagResourceResponse` / `UntagResourceResponse` are `{}`, so there is
+/// nothing to report and the reply is `204 No Content`.
+const NO_CONTENT_STATUS: u16 = 204;
+
 /// The sentence this service states for a query-bound list member a request supplied
 /// nothing for, with the member's own name in it.
 fn supplied_nothing(member: &str) -> String {
@@ -177,8 +182,8 @@ async fn seed_tags(router: &MultiServiceRouter, arn: &str, tags: &BTreeMap<Strin
     )
     .await;
     assert_eq!(
-        answer.status, 200,
-        "seeding tags on {arn}: expected 200, got {} {:?}",
+        answer.status, NO_CONTENT_STATUS,
+        "seeding tags on {arn}: expected {NO_CONTENT_STATUS}, got {} {:?}",
         answer.status, answer.body
     );
 }
@@ -477,8 +482,8 @@ async fn tag_keys_that_carry_entries_are_applied() {
         )
         .await;
         assert_eq!(
-            answer.status, 200,
-            "case {case:?}: expected HTTP 200, got {} {:?}",
+            answer.status, NO_CONTENT_STATUS,
+            "case {case:?}: expected HTTP {NO_CONTENT_STATUS}, got {} {:?}",
             answer.status, answer.body
         );
         let remaining = tags_of(&router, &arn).await;

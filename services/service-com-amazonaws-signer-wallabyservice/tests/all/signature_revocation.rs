@@ -45,6 +45,13 @@ const REGION: &str = "us-west-2";
 /// Another region's endpoint, for the cases about which region holds a job.
 const OTHER_REGION: &str = "eu-west-1";
 
+/// The status `RevokeSignature` answers a successful revocation with.
+///
+/// Its modelled output is `smithy.api#Unit`, so the reply has nothing to report:
+/// `204 No Content`, the same envelope every other bodyless answer of this
+/// service carries.
+const NO_CONTENT_STATUS: u16 = 204;
+
 /// The access key id every request below is signed with — the caller identity a
 /// revocation records as the revoker, reported as an IAM principal ARN.
 const ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
@@ -320,8 +327,8 @@ async fn revoking_records_the_revocation_and_every_read_reports_it() {
         }
         let revoked = revoke_signature(&router, REGION, &job_id, request).await;
         assert_eq!(
-            revoked.status, 200,
-            "case {}: expected RevokeSignature 200, got {} {:?}",
+            revoked.status, NO_CONTENT_STATUS,
+            "case {}: expected RevokeSignature {NO_CONTENT_STATUS}, got {} {:?}",
             case.name, revoked.status, revoked.body
         );
         assert!(
@@ -404,8 +411,8 @@ async fn revoking_records_the_revocation_and_every_read_reports_it() {
         )
         .await;
         assert_eq!(
-            second.status, 200,
-            "case {}: expected a repeated RevokeSignature 200, got {} {:?}",
+            second.status, NO_CONTENT_STATUS,
+            "case {}: expected a repeated RevokeSignature {NO_CONTENT_STATUS}, got {} {:?}",
             case.name, second.status, second.body
         );
         let after_second = describe_job(&router, REGION, &job_id).await;
@@ -471,7 +478,7 @@ async fn revocation_follows_the_platforms_published_revocation_support() {
 
         if supported {
             assert_eq!(
-                answer.status, 200,
+                answer.status, NO_CONTENT_STATUS,
                 "case {platform_id:?}: a platform publishing revocation support must revoke, got \
                  {} {:?}",
                 answer.status, answer.body
@@ -621,8 +628,8 @@ async fn a_revocation_survives_the_jobs_completion() {
     )
     .await;
     assert_eq!(
-        revoked.status, 200,
-        "expected RevokeSignature 200 on an InProgress job, got {} {:?}",
+        revoked.status, NO_CONTENT_STATUS,
+        "expected RevokeSignature {NO_CONTENT_STATUS} on an InProgress job, got {} {:?}",
         revoked.status, revoked.body
     );
 

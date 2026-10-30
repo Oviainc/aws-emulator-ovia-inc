@@ -41,17 +41,14 @@ const CERTIFICATE_ARN: &str = "arn:aws:acm:us-west-2:000000000000:certificate/ab
 /// The status a Signer answer with no body carries, and the length such an answer
 /// states.
 ///
-/// Recorded: the empty-bodied profile answers of this service
-/// (`CancelSigningProfile`, `RevokeSigningProfile`) come back `204` carrying a
-/// stated length, while `RevokeSignature` answers the `200` its `@http` code
-/// declares with the same empty body. The LENGTH is the fact under test here, so
-/// each row names the status its own operation answers. An answer served over a
-/// socket reaches the client without the header on a `204` — the HTTP/1.1 writer
-/// this emulator is served by removes `content-length` there — so what is pinned
-/// is what the service itself states, which the in-process front door serves
-/// unchanged.
+/// Recorded: every empty-bodied answer of this service — the three operations
+/// whose output is `smithy.api#Unit` and the two tagging writers, whose response
+/// structures declare no members — comes back `204` carrying a stated length. An
+/// answer served over a socket reaches the client without the header on a `204`
+/// — the HTTP/1.1 writer this emulator is served by removes `content-length`
+/// there — so what is pinned is what the service itself states, which the
+/// in-process front door serves unchanged.
 const NO_CONTENT_STATUS: u16 = 204;
-const REVOKE_SIGNATURE_STATUS: u16 = 200;
 const NO_CONTENT_LENGTH: &str = "0";
 
 /// The IAM principal the emulator resolves a signed request as: the one IAM user
@@ -377,11 +374,13 @@ async fn a_create_without_signing_material_is_served_where_the_platform_needs_no
     );
 }
 
-/// Every answer of this service whose modelled output carries no body comes back
-/// `204` with an empty body that STATES its length.
+/// Every answer of this service whose modelled output carries no members comes
+/// back `204` with an empty body that STATES its length.
 ///
-/// One row per such operation (the three the model binds to `Unit`), each driven
-/// through the whole request walk.
+/// One row per operation the model binds to `Unit`, each driven through the whole
+/// request walk; the other half of that class — the tagging writers, whose
+/// response structures declare no members — is covered by the suite that tables
+/// the whole class.
 #[tokio::test]
 async fn an_answer_with_no_body_states_its_length() {
     let router = emulator();
@@ -450,7 +449,7 @@ async fn an_answer_with_no_body_states_its_length() {
             "PUT",
             format!("/signing-jobs/{job_id}/revoke"),
             Some(json!({ "reason": "key-compromise" })),
-            REVOKE_SIGNATURE_STATUS,
+            NO_CONTENT_STATUS,
         ),
         (
             "CancelSigningProfile",
@@ -671,8 +670,8 @@ async fn the_revoker_is_the_principal_the_credentials_resolve_to() {
         )
         .await;
         assert_eq!(
-            revoked_signature.status, REVOKE_SIGNATURE_STATUS,
-            "case {case:?}: expected RevokeSignature {REVOKE_SIGNATURE_STATUS}, got {} {:?}",
+            revoked_signature.status, NO_CONTENT_STATUS,
+            "case {case:?}: expected RevokeSignature {NO_CONTENT_STATUS}, got {} {:?}",
             revoked_signature.status, revoked_signature.body
         );
         let described = call(&router, caller, "GET", &format!("/signing-jobs/{job_id}"), None).await;

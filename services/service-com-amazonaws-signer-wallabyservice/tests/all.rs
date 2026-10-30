@@ -35,6 +35,9 @@ mod platform_id_character_class;
 #[path = "all/platform_listing.rs"]
 mod platform_listing;
 
+#[path = "all/policy_document_size.rs"]
+mod policy_document_size;
+
 #[path = "all/profile_lifecycle_contract.rs"]
 mod profile_lifecycle_contract;
 
@@ -100,3 +103,6 @@ mod supplied_nothing_refusal_wording;
 
 #[path = "all/tag_keys_supplied_nothing_wording.rs"]
 mod tag_keys_supplied_nothing_wording;
+
+#[path = "all/wire_probe.rs"]
+mod wire_probe;

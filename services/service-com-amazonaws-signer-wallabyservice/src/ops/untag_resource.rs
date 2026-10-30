@@ -175,7 +175,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // `UntagResourceResponse` declares no members, so a successful tag removal has
+    // nothing to report: the answer is the no-content one every such reply of
+    // this service carries, not the protocol default the route resolves to.
+    const SUCCESS_STATUS: u16 = crate::service::NO_CONTENT_STATUS;
 
     async fn handle(
         &self,

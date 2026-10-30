@@ -57,6 +57,18 @@ const ACCOUNT_ID: &str = "000000000000";
 /// An ACM certificate ARN for `signingMaterial`.
 const CERTIFICATE_ARN: &str = "arn:aws:acm:us-west-2:000000000000:certificate/abc";
 
+/// The status an admitted `TagResource` / `UntagResource` answers with.
+///
+/// Both response shapes declare no members (`smithy_query(query="shape",
+/// shape="TagResourceResponse,UntagResourceResponse")` — `{}`), so a successful
+/// write has nothing to report and the reply is `204 No Content`. The READ of the
+/// same route answers a document, so it keeps the `200` of a reply that carries
+/// one.
+const NO_CONTENT_STATUS: u16 = 204;
+
+/// The status a tagging READ answers with: it reports a document.
+const DOCUMENT_STATUS: u16 = 200;
+
 /// One emulator: a router carrying only this service, over one shared engine.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -371,8 +383,8 @@ async fn tagging_a_profile_round_trips_through_every_reader() {
 
         let written = tag_resource(&router, &arn, &case.tags).await;
         assert_eq!(
-            written.status, 200,
-            "case {label:?}: expected TagResource 200, got {} {:?}",
+            written.status, NO_CONTENT_STATUS,
+            "case {label:?}: expected TagResource {NO_CONTENT_STATUS}, got {} {:?}",
             written.status, written.body
         );
 
@@ -495,23 +507,23 @@ async fn writes_merge_and_removals_take_only_the_keys_they_name() {
 
         let first = tag_resource(&router, &arn, &case.first).await;
         assert_eq!(
-            first.status, 200,
-            "case {label:?}: expected the first TagResource 200, got {} {:?}",
+            first.status, NO_CONTENT_STATUS,
+            "case {label:?}: expected the first TagResource {NO_CONTENT_STATUS}, got {} {:?}",
             first.status, first.body
         );
         if !case.second.is_empty() {
             let second = tag_resource(&router, &arn, &case.second).await;
             assert_eq!(
-                second.status, 200,
-                "case {label:?}: expected the second TagResource 200, got {} {:?}",
+                second.status, NO_CONTENT_STATUS,
+                "case {label:?}: expected the second TagResource {NO_CONTENT_STATUS}, got {} {:?}",
                 second.status, second.body
             );
         }
         if !case.remove.is_empty() {
             let removed = untag_resource(&router, &arn, case.remove).await;
             assert_eq!(
-                removed.status, 200,
-                "case {label:?}: expected UntagResource 200, got {} {:?}",
+                removed.status, NO_CONTENT_STATUS,
+                "case {label:?}: expected UntagResource {NO_CONTENT_STATUS}, got {} {:?}",
                 removed.status, removed.body
             );
         }
@@ -558,7 +570,7 @@ async fn an_unresolvable_resource_arn_is_refused_the_same_way_by_every_tagging_o
         .str_member("profileVersion");
     assert_eq!(
         tag_resource(&router, &arn, &tags(&[("env", "prod")])).await.status,
-        200,
+        NO_CONTENT_STATUS,
         "seeding the tagged profile"
     );
 
@@ -688,7 +700,11 @@ struct TaggingStatusCase {
     stored_status: &'static str,
     /// The HTTP status EVERY operation bound to `/tags/{resourceArn}` answers in
     /// that status.
-    expected_status: u16,
+    ///
+    /// `None` when the status ADMITS the route, because the three operations then
+    /// answer the envelope each one's own output has: the read a document, the two
+    /// writers no content. A refusal is one status for all three.
+    refusal_status: Option<u16>,
 }
 
 /// One row per status a profile can be in when a tagging call arrives, plus the
@@ -701,25 +717,25 @@ fn tagging_status_cases() -> [TaggingStatusCase; 4] {
             case: "Active",
             profile: "Active_Tagging",
             stored_status: "Active",
-            expected_status: 200,
+            refusal_status: None,
         },
         TaggingStatusCase {
             case: "Revoked",
             profile: "Revoked_Tagging",
             stored_status: "Revoked",
-            expected_status: 200,
+            refusal_status: None,
         },
         TaggingStatusCase {
             case: "Canceled",
             profile: "Canceled_Tagging",
             stored_status: "Canceled",
-            expected_status: 400,
+            refusal_status: Some(400),
         },
         TaggingStatusCase {
             case: "Canceled then re-put",
             profile: "Reput_Tagging",
             stored_status: "Active",
-            expected_status: 200,
+            refusal_status: None,
         },
     ]
 }
@@ -738,13 +754,13 @@ async fn the_profiles_status_decides_which_tagging_calls_it_admits() {
     for row in tagging_status_cases() {
         let case = row.case;
         let name = row.profile;
-        let expected_status = row.expected_status;
+        let refusal_status = row.refusal_status;
         let router = emulator();
         let arn = seed_profile(&router, name).await;
         let seeded = tags(&[("env", "prod")]);
         assert_eq!(
             tag_resource(&router, &arn, &seeded).await.status,
-            200,
+            NO_CONTENT_STATUS,
             "case {case:?}: the profile must be taggable while Active"
         );
 
@@ -795,12 +811,18 @@ async fn the_profiles_status_decides_which_tagging_calls_it_admits() {
                 "TagResource" => tag_resource(&router, &arn, &added).await,
                 _ => untag_resource(&router, &arn, &["env"]).await,
             };
+            // Admitted, each operation answers the envelope its own output has;
+            // refused, all three answer the one refusal status.
+            let expected_status = refusal_status.unwrap_or(match operation {
+                "ListTagsForResource" => DOCUMENT_STATUS,
+                _ => NO_CONTENT_STATUS,
+            });
             assert_eq!(
                 answer.status, expected_status,
                 "case {case:?} on {operation}: expected HTTP {expected_status}, got {} {:?}",
                 answer.status, answer.body
             );
-            if expected_status == 200 {
+            if refusal_status.is_none() {
                 continue;
             }
             assert_eq!(
@@ -831,7 +853,7 @@ async fn the_profiles_status_decides_which_tagging_calls_it_admits() {
         // still viewable through it — and the map it reports is the one the three
         // calls left: what the admitted write and removal did, or the untouched
         // map a refused route changed nothing of.
-        let expected = if expected_status == 200 {
+        let expected = if refusal_status.is_none() {
             // The write added a key and the removal took the seeded one.
             added
         } else {
@@ -839,7 +861,7 @@ async fn the_profiles_status_decides_which_tagging_calls_it_admits() {
         };
         let profile = get_profile(&router, name).await;
         assert_eq!(
-            profile.status, 200,
+            profile.status, DOCUMENT_STATUS,
             "case {case:?}: a profile stays viewable in every status, got {} {:?}",
             profile.status, profile.body
         );
@@ -852,7 +874,7 @@ async fn the_profiles_status_decides_which_tagging_calls_it_admits() {
 
         // Where the route is admitted, its READ reports that same map — so the
         // row covers the body `ListTagsForResource` answers, not only the status.
-        if expected_status == 200 {
+        if refusal_status.is_none() {
             let listed = list_tags(&router, &arn).await;
             assert_eq!(
                 listed.tags().as_ref(),
@@ -903,12 +925,12 @@ async fn a_write_outside_the_modelled_tag_bounds_is_refused_and_stores_nothing()
     let allowed = tags(&[("owner", "aws:someone")]);
     assert_eq!(
         tag_resource(&router, &arn, &allowed).await.status,
-        200,
+        NO_CONTENT_STATUS,
         "a reserved prefix in a tag VALUE is not refused"
     );
     assert_eq!(
         untag_resource(&router, &arn, &["owner"]).await.status,
-        200,
+        NO_CONTENT_STATUS,
         "clearing the profile before the count cases"
     );
 
@@ -918,7 +940,7 @@ async fn a_write_outside_the_modelled_tag_bounds_is_refused_and_stores_nothing()
         .collect();
     assert_eq!(
         tag_resource(&router, &arn, &full).await.status,
-        200,
+        NO_CONTENT_STATUS,
         "expected the modelled maximum of {MAX_TAGS_PER_PROFILE} tags to be admitted"
     );
     // ... re-tagging a key the profile already holds never grows the map, so it
@@ -926,7 +948,7 @@ async fn a_write_outside_the_modelled_tag_bounds_is_refused_and_stores_nothing()
     let retag = tags(&[("key0", "replaced")]);
     assert_eq!(
         tag_resource(&router, &arn, &retag).await.status,
-        200,
+        NO_CONTENT_STATUS,
         "expected a re-tag at the maximum to be admitted"
     );
     // ... and one key BEYOND it is refused, leaving the map as it was.
@@ -1036,7 +1058,7 @@ async fn a_reserved_tag_key_is_refused_by_every_operation_that_takes_tag_keys() 
         let arn = seed_profile(&router, &profile).await;
         assert_eq!(
             tag_resource(&router, &arn, &seeded).await.status,
-            200,
+            NO_CONTENT_STATUS,
             "case {case:?}: seeding the profile's tags must succeed"
         );
 
@@ -1187,8 +1209,8 @@ async fn a_key_outside_the_reserved_namespace_round_trips_through_every_tag_oper
     for key in KEYS_OUTSIDE_THE_RESERVED_NAMESPACE {
         let write = tag_resource(&router, &arn, &tags(&[(key, "written")])).await;
         assert_eq!(
-            write.status, 200,
-            "case {key:?}: expected TagResource 200, got {} {:?}",
+            write.status, NO_CONTENT_STATUS,
+            "case {key:?}: expected TagResource {NO_CONTENT_STATUS}, got {} {:?}",
             write.status, write.body
         );
         assert_eq!(
@@ -1201,8 +1223,8 @@ async fn a_key_outside_the_reserved_namespace_round_trips_through_every_tag_oper
         );
         let removal = untag_resource(&router, &arn, &[key]).await;
         assert_eq!(
-            removal.status, 200,
-            "case {key:?}: expected UntagResource 200, got {} {:?}",
+            removal.status, NO_CONTENT_STATUS,
+            "case {key:?}: expected UntagResource {NO_CONTENT_STATUS}, got {} {:?}",
             removal.status, removal.body
         );
         assert!(
@@ -1363,7 +1385,7 @@ async fn a_tag_key_outside_the_modelled_alphabet_is_refused_by_every_tag_operati
     let arn = seed_profile(&router, "Alphabet_Keys").await;
     assert_eq!(
         tag_resource(&router, &arn, &seeded).await.status,
-        200,
+        NO_CONTENT_STATUS,
         "seeding the profile's tags must succeed"
     );
 
@@ -1458,8 +1480,8 @@ async fn a_tag_key_outside_the_modelled_alphabet_is_refused_by_every_tag_operati
     for key in KEYS_INSIDE_THE_MODELLED_ALPHABET {
         let write = tag_resource(&router, &arn, &tags(&[(key, "written")])).await;
         assert_eq!(
-            write.status, 200,
-            "case {key:?}: expected TagResource 200, got {} {:?}",
+            write.status, NO_CONTENT_STATUS,
+            "case {key:?}: expected TagResource {NO_CONTENT_STATUS}, got {} {:?}",
             write.status, write.body
         );
         assert_eq!(
@@ -1472,8 +1494,8 @@ async fn a_tag_key_outside_the_modelled_alphabet_is_refused_by_every_tag_operati
         );
         let removal = untag_resource(&router, &arn, &[key]).await;
         assert_eq!(
-            removal.status, 200,
-            "case {key:?}: expected UntagResource 200, got {} {:?}",
+            removal.status, NO_CONTENT_STATUS,
+            "case {key:?}: expected UntagResource {NO_CONTENT_STATUS}, got {} {:?}",
             removal.status, removal.body
         );
         assert!(
@@ -1536,7 +1558,11 @@ async fn a_tag_key_is_judged_against_the_modelled_length_bounds() {
         let written = tags(&[(key, "written")]);
 
         let write = tag_resource(&router, &arn, &written).await;
-        let expected_status = if row.admitted { 200 } else { 400 };
+        let expected_status = if row.admitted {
+            NO_CONTENT_STATUS
+        } else {
+            400
+        };
         assert_eq!(
             write.status, expected_status,
             "case {case:?}: expected TagResource {expected_status} for a {}-character key, got {} \
@@ -1569,7 +1595,7 @@ async fn a_tag_key_is_judged_against_the_modelled_length_bounds() {
             );
             assert_eq!(
                 untag_resource(&router, &arn, &[key]).await.status,
-                200,
+                NO_CONTENT_STATUS,
                 "case {case:?}: expected UntagResource to remove the admitted key"
             );
             assert_eq!(

@@ -50,6 +50,11 @@ const PLATFORM_ID: &str = "AWSLambda-SHA384-ECDSA";
 /// the condition a writer branches on, not the modelled shape's name.
 const ERROR_CODE_CONFLICT: &str = "PolicyRevisionIdMismatch";
 
+/// The status a Signer success whose modelled output declares no members answers
+/// with: the tagging writers' `TagResourceResponse` / `UntagResourceResponse` are
+/// `{}`, so there is nothing to report and the reply is `204 No Content`.
+const NO_CONTENT_STATUS: u16 = 204;
+
 /// One emulator: a router carrying only this service, over one shared engine.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -193,8 +198,8 @@ async fn seed_tag(router: &MultiServiceRouter, arn: &str, key: &str, value: &str
     )
     .await;
     assert_eq!(
-        answer.status, 200,
-        "seeding tag {key} on {arn}: expected 200, got {} {:?}",
+        answer.status, NO_CONTENT_STATUS,
+        "seeding tag {key} on {arn}: expected {NO_CONTENT_STATUS}, got {} {:?}",
         answer.status, answer.body
     );
 }
@@ -514,8 +519,8 @@ async fn the_same_route_with_the_parameter_supplied_is_served() {
     )
     .await;
     assert_eq!(
-        answer.status, 200,
-        "case \"tagKeys supplied\": expected HTTP 200, got {} {:?}",
+        answer.status, NO_CONTENT_STATUS,
+        "case \"tagKeys supplied\": expected HTTP {NO_CONTENT_STATUS}, got {} {:?}",
         answer.status, answer.body
     );
     let remaining = tags_of(&router, &arn).await;

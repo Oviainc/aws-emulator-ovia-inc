@@ -46,6 +46,10 @@ const EFFECTIVE_EPOCH_SECS: i64 = 1_700_000_000;
 /// A platform the published catalog carries that supports revocation.
 const PLATFORM_ID: &str = "AWSLambda-SHA384-ECDSA";
 
+/// The status a revoking call answers with: its modelled output is
+/// `smithy.api#Unit`, so the reply has nothing to report and is `204 No Content`.
+const NO_CONTENT_STATUS: u16 = 204;
+
 /// A SigV4 `Authorization` header whose credential scope names `signer`. The signature
 /// is never checked: this router runs with request authentication off.
 fn authorization() -> String {
@@ -304,8 +308,8 @@ fn a_revocation_written_through_the_control_plane_is_reported_at_both_signer_end
                 },
             );
             assert_eq!(
-                revoked.status, 200,
-                "case \"RevokeSignature\": expected HTTP 200, got {} {}",
+                revoked.status, NO_CONTENT_STATUS,
+                "case \"RevokeSignature\": expected HTTP {NO_CONTENT_STATUS}, got {} {}",
                 revoked.status, revoked.text
             );
 
@@ -361,8 +365,8 @@ fn a_revocation_written_through_the_control_plane_is_reported_at_both_signer_end
                 },
             );
             assert_eq!(
-                revoked.status, 204,
-                "case \"RevokeSigningProfile\": expected HTTP 204, got {} {}",
+                revoked.status, NO_CONTENT_STATUS,
+                "case \"RevokeSigningProfile\": expected HTTP {NO_CONTENT_STATUS}, got {} {}",
                 revoked.status, revoked.text
             );
 

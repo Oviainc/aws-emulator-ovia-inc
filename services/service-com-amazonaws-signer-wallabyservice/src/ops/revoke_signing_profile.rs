@@ -123,9 +123,11 @@ pub static REVOKE_SIGNING_PROFILE_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = 
 ///
 /// The model gives this operation an `@http` code of 200 with a `Unit` output,
 /// but the RECORDED AWS answer is `204 No Content` — and the wire is what an SDK
-/// or a client reads, so 204 is what this operation returns. A `Unit` output
-/// carries no body either way, so 204 loses nothing.
-pub const REVOKE_SIGNING_PROFILE_SUCCESS_STATUS: u16 = 204;
+/// or a client reads. The value is the one every answer of this service with
+/// nothing to report carries ([`crate::service::NO_CONTENT_STATUS`]), so the
+/// class is stated in one place; a `Unit` output carries no body either way, so
+/// 204 loses nothing.
+pub const REVOKE_SIGNING_PROFILE_SUCCESS_STATUS: u16 = crate::service::NO_CONTENT_STATUS;
 
 impl ::aws_smithy_schema::serde::SerializableStruct for RevokeSigningProfileOutput {
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }

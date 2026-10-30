@@ -84,8 +84,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-signer-wallabyservice.j
 pub struct RevokeSignatureOutput;
 
 impl RevokeSignatureOutput {
-    // `with_http` carries this operation's modelled response status. Remove it and
-    // the status falls back to the protocol default, so a modelled 204 answers 200.
+    // `with_http` carries this operation's response status. The model gives this
+    // operation `output: Unit` with no `@http(code:)` of its own, so the model's
+    // value is the protocol default 200; the RECORDED success of every call of
+    // this service whose output has nothing to report is 204 — an empty (Unit)
+    // output and No Content — and the wire is what a client reads, so 204 is what
+    // this emulator answers. Remove the trait and the status falls back to the
+    // protocol default, so a 204 would answer 200.
     pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
         ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
         ::aws_smithy_schema::ShapeType::Structure,
@@ -94,11 +99,19 @@ impl RevokeSignatureOutput {
     .with_http(::aws_smithy_schema::traits::HttpTrait::new(
         "PUT",
         "/signing-jobs/{jobId}/revoke",
-        Some(200u16),
+        Some(REVOKE_SIGNATURE_SUCCESS_STATUS),
     ));
 }
 
 pub static REVOKE_SIGNATURE_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &RevokeSignatureOutput::SCHEMA;
+
+/// The status a successful signature revocation answers with.
+///
+/// A `Unit` output has nothing to report, which is the class
+/// [`crate::service::NO_CONTENT_STATUS`] states the status of — the same status
+/// the two sibling `Unit`-output operations of this service answer, so one
+/// bodyless answer of this service is not framed differently from another.
+pub const REVOKE_SIGNATURE_SUCCESS_STATUS: u16 = crate::service::NO_CONTENT_STATUS;
 
 impl ::aws_smithy_schema::serde::SerializableStruct for RevokeSignatureOutput {
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
@@ -176,7 +189,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "RevokeSignature";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::REVOKE_SIGNATURE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = REVOKE_SIGNATURE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // The response status the protocol actually uses (the schema's `@http` code
+    // is the route's, not the answer's).
+    const SUCCESS_STATUS: u16 = REVOKE_SIGNATURE_SUCCESS_STATUS;
 
     async fn handle(
         &self,

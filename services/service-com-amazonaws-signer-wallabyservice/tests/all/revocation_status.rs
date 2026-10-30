@@ -53,6 +53,10 @@ const REGION: &str = "us-west-2";
 /// Another region's endpoint, for the cases about which region holds a resource.
 const OTHER_REGION: &str = "eu-west-1";
 
+/// The status a revoking call answers with: its modelled output is
+/// `smithy.api#Unit`, so the reply has nothing to report and is `204 No Content`.
+const NO_CONTENT_STATUS: u16 = 204;
+
 /// The access key id every request below is signed with.
 const ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
 
@@ -489,7 +493,7 @@ async fn only_the_entities_this_endpoint_revoked_are_reported() {
     for seeded in [&job_revoked, &both_revoked] {
         let revoked = revoke_signature(&router, REGION, &seeded.job_id).await;
         assert_eq!(
-            revoked.status, 200,
+            revoked.status, NO_CONTENT_STATUS,
             "revoking the signature of {}: got {} {:?}",
             seeded.profile_name, revoked.status, revoked.body
         );
@@ -647,7 +651,7 @@ async fn a_profile_revocation_applies_from_its_effective_instant() {
     // timestamps: its record names when trust ended, not from when.
     let revoked = revoke_signature(&router, REGION, &seeded.job_id).await;
     assert_eq!(
-        revoked.status, 200,
+        revoked.status, NO_CONTENT_STATUS,
         "revoking the signature: got {} {:?}",
         revoked.status, revoked.body
     );
@@ -769,7 +773,11 @@ async fn entities_this_endpoint_holds_no_record_for_are_not_revoked() {
     let router = emulator();
     let here = seed(&router, REGION, "Local_Profile", job_signing_platform(0)).await;
     let revoked = revoke_signature(&router, REGION, &here.job_id).await;
-    assert_eq!(revoked.status, 200, "revoking the signature: {:?}", revoked.body);
+    assert_eq!(
+        revoked.status, NO_CONTENT_STATUS,
+        "revoking the signature: {:?}",
+        revoked.body
+    );
     let revoked = revoke_profile(
         &router,
         REGION,
@@ -1068,7 +1076,11 @@ async fn asking_for_the_revocation_status_changes_nothing() {
     let router = emulator();
     let seeded = seed(&router, REGION, "Stable_Profile", job_signing_platform(0)).await;
     let revoked = revoke_signature(&router, REGION, &seeded.job_id).await;
-    assert_eq!(revoked.status, 200, "revoking the signature: {:?}", revoked.body);
+    assert_eq!(
+        revoked.status, NO_CONTENT_STATUS,
+        "revoking the signature: {:?}",
+        revoked.body
+    );
 
     let hashes = vec![certificate_hash("child", "root")];
     let job_before = describe_job(&router, REGION, &seeded.job_id).await;
