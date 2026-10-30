@@ -61,3 +61,5 @@ mod tag_not_found_status;
 mod tag_removal;
 #[path = "all/tag_selection_limit.rs"]
 mod tag_selection_limit;
+#[path = "all/walk_under_a_discovery_pass.rs"]
+mod walk_under_a_discovery_pass;

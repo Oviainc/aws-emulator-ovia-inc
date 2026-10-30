@@ -7,9 +7,9 @@
 //! of discovered instances — the first aggregates the records the second projects — so
 //! neither of these two decisions can belong to one list:
 //!
-//! * a request that BEGINS a walk materializes the discovery pass the account's settings ask
-//!   for, and a request CONTINUING one (it carries the cursor the previous page minted) runs
-//!   no pass, so a walk reports the inventory of the pass its first page ran;
+//! * EVERY report materializes the discovery pass the account's settings ask for, the
+//!   request CONTINUING a walk included: the pass is owed by the clock rather than by the
+//!   shape of the request, so no cursor buys a report the inventory of an earlier instant;
 //! * several filters select what satisfies ALL of them, which makes a multi-filter selection
 //!   exactly the intersection of what each of those filters selects on its own — and a
 //!   request carrying no filter at all selects everything.
@@ -43,23 +43,27 @@ const OTHER_REGION: &str = "us-east-1";
 
 /// One of the two lists, with everything that differs between them: where it is reached,
 /// which output member carries its page, and how one of its elements is identified.
-struct List {
+///
+/// `pub(crate)` because a walk of either list is a rule of its own
+/// (`tests/all/walk_under_a_discovery_pass.rs`), and the two lists are described once here
+/// rather than copied into a second suite.
+pub(crate) struct List {
     /// The operation, named in every assertion this list drives.
-    label: &'static str,
-    path: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) path: &'static str,
     /// The output member carrying the page's entries.
-    key: &'static str,
+    pub(crate) key: &'static str,
     /// How an entry of a reported page is identified.
-    reported: fn(&Value, &str) -> String,
+    pub(crate) reported: fn(&Value, &str) -> String,
     /// The same identity for a record held in the store: an instance list reports one
     /// element per record, a subscription list one per distinct (name, type) pair.
-    stored: fn(&DiscoveredInstanceRecord) -> String,
+    pub(crate) stored: fn(&DiscoveredInstanceRecord) -> String,
     /// The multi-filter rows this list's conjunction is asserted over; a list's filters can
     /// only name the `Filter$Name` values it documents.
-    conjunctions: fn() -> Vec<Conjunction>,
+    pub(crate) conjunctions: fn() -> Vec<Conjunction>,
 }
 
-const LISTS: &[List] = &[
+pub(crate) const LISTS: &[List] = &[
     List {
         label: "ListLinuxSubscriptions",
         path: SUBSCRIPTIONS,
@@ -113,7 +117,12 @@ fn member(entry: &Value, name: &str, case: &str) -> String {
 
 /// One page of `list`: the identities it reported, and the cursor that reaches the next
 /// page.
-async fn page(h: &Harness, list: &List, body: &Value, case: &str) -> (Vec<String>, Option<String>) {
+pub(crate) async fn page(
+    h: &Harness,
+    list: &List,
+    body: &Value,
+    case: &str,
+) -> (Vec<String>, Option<String>) {
     let reply = call(h, list.path, body).await;
     let entries = reply
         .ok(case)
@@ -289,10 +298,10 @@ fn identities(list: &List, seeds: &[Seed]) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn both_discovery_lists_materialize_a_pass_on_exactly_the_same_requests() {
+async fn both_discovery_lists_materialize_a_pass_on_every_report() {
     for list in LISTS {
-        // The rows differ along the page size, so the walk a continuation request belongs to
-        // is one, two and three pages long.
+        // The rows differ along the page size, so the walk whose continuation requests are
+        // observed here is one, two and three pages long.
         for page_size in [1_usize, 2, 3] {
             let case = &format!("{}: a walk in pages of {page_size}", list.label);
             let h = harness();
@@ -307,7 +316,7 @@ async fn both_discovery_lists_materialize_a_pass_on_exactly_the_same_requests() 
             );
 
             // Placed between the first page of the walk and its continuation: every pass
-            // drops it, so the list reports it for exactly as long as no pass has run.
+            // drops it, and every report runs a pass — so no page of the walk reports it.
             seed_discovered_instance(&h, DROPPED.record());
             let dropped_identity = (list.stored)(&DROPPED.record());
 
@@ -319,24 +328,34 @@ async fn both_discovery_lists_materialize_a_pass_on_exactly_the_same_requests() 
                     case,
                 )
                 .await;
+                assert!(
+                    !reported.contains(&dropped_identity),
+                    "case {case:?}: a request continuing a walk must run a pass too, which \
+                     drops {dropped_identity:?}, got {reported:?}"
+                );
                 walked.extend(reported);
                 cursor = next;
             }
-            assert!(
-                walked.contains(&dropped_identity),
-                "case {case:?}: a request continuing a walk must run no pass, so the walk must \
-                 still report {dropped_identity:?}, got {walked:?}"
+            // And the walk still reported every record the store held throughout it, once
+            // each: what keeps it whole under a pass is its cursor, not a frozen store.
+            let expected = identities(list, RETAINED);
+            let mut covered = walked.clone();
+            covered.sort();
+            assert_eq!(
+                covered, expected,
+                "case {case:?}: the walk must report {expected:?} once each, got {walked:?}"
             );
 
-            // A request that BEGINS a walk runs a pass, which holds the inventory of the
-            // Regions the settings discover now — so the same element is gone.
+            // The same of a request that BEGINS a walk: the record is placed again, and the
+            // pass that request runs holds the inventory of the Regions the settings
+            // discover now — so the same element is gone.
+            seed_discovered_instance(&h, DROPPED.record());
             let (first, token) = page(&h, list, &json!({}), case).await;
             assert!(
                 !first.contains(&dropped_identity),
                 "case {case:?}: a request beginning a walk must run a pass, which drops \
                  {dropped_identity:?}, got {first:?}"
             );
-            let expected = identities(list, RETAINED);
             let mut reported = first.clone();
             reported.sort();
             assert_eq!(
@@ -352,7 +371,7 @@ async fn both_discovery_lists_materialize_a_pass_on_exactly_the_same_requests() 
 }
 
 /// One multi-filter selection: the filters a request carries together.
-struct Conjunction {
+pub(crate) struct Conjunction {
     /// What this row is about, named in every assertion it drives.
     label: &'static str,
     filters: Vec<Value>,

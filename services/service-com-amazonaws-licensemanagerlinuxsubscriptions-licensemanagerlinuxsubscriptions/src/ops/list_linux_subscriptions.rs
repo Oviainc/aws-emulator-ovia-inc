@@ -170,14 +170,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no Region, so nothing is recorded for it and nothing an earlier pass found stays
         // behind; a pass over an unchanged inventory records what is already there.
         //
-        // WHETHER this request runs a pass is the discovery module's decision, not this
-        // handler's: the request's cursor is what it takes it on.
-        crate::state::discovery::materialize_for_report(
-            &*self.engine,
-            ctx,
-            input.next_token.as_deref(),
-        )
-        .await;
+        // Every report materializes one, the request that continues a walk included: the
+        // pass is owed at the instant the report is served, so what a page reports cannot
+        // depend on the cursor it carried or on what else was called before it. The walk is
+        // kept whole by its cursor instead, which names the element the previous page
+        // reported last.
+        crate::state::discovery::materialize_for_report(&*self.engine, ctx).await;
 
         // A pure read of the store: the page is aggregated from the instances discovery
         // has recorded, and nothing here writes.

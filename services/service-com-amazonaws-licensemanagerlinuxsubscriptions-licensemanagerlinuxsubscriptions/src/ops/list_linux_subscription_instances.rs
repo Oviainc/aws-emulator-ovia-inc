@@ -171,14 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The same discovery pass the sibling list materializes: both report from the ONE
         // store of discovered instances, so neither can be shown an inventory the other was
-        // not — which is why the decision about whether THIS request runs a pass is taken
-        // once, in the discovery module, from the request's cursor.
-        crate::state::discovery::materialize_for_report(
-            &*self.engine,
-            ctx,
-            input.next_token.as_deref(),
-        )
-        .await;
+        // not — which is why WHEN a report runs a pass is settled once, in the discovery
+        // module, and settled the same way for every request of either list.
+        crate::state::discovery::materialize_for_report(&*self.engine, ctx).await;
 
         // A pure read of the store: the page is built from the records discovery has
         // written, and nothing here writes.

@@ -31,10 +31,11 @@
 //! an unchanged inventory records the same records with the same
 //! `Instance$LastUpdatedTime`, so a read never changes what a later caller sees.
 //!
-//! WHICH reports run a pass is this module's own rule, stated once in
+//! WHEN a report runs a pass is this module's own rule, stated once in
 //! [`materialize_for_report`]: every report reads the one store a pass fills, so a report
 //! cannot decide for itself without two of them disagreeing about the inventory they
-//! answer from.
+//! answer from — and every report runs one, because the pass is owed by the CLOCK and not
+//! by the shape of the request that happened to arrive.
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
@@ -150,32 +151,25 @@ fn ec2(ctx: &smithy_server_runtime::OperationContext<'_>, region: &str) -> ::aws
 }
 
 /// Materialize, for ONE report of discovered data, the discovery pass the account's
-/// settings ask for — and decide whether that report runs one at all.
+/// settings ask for, and record what it found.
 ///
-/// `next_token` is the cursor the reporting request carried. A request CONTINUING a walk
-/// carries the cursor the previous page minted, which is a position in the list THAT page
-/// reported, so no pass runs for it: a refresh between two pages of one walk could move a
-/// record across the cursor and make the walk skip or repeat it. A walk therefore reports
-/// the inventory of the pass its first page ran.
+/// EVERY report runs one, whatever cursor its request carried. Discovery reads the
+/// inventory whether or not anybody calls, so the pass a report materializes is owed at the
+/// instant that report is served — by the clock, not by the shape of the request — and a
+/// request continuing a walk is served from the inventory of the instant IT runs exactly as
+/// the request that began the walk was. Which also makes the store's content independent of
+/// the CALL PATTERN that reached it: a walk cannot be shown one inventory or another
+/// depending on whether something else was called between two of its pages, and no report
+/// is answered from an inventory of an earlier instant than its own.
 ///
-/// The gate lives HERE rather than in the reports, because every operation that reports
+/// What keeps such a walk from skipping or repeating an element is its CURSOR and not a
+/// frozen store: [`crate::state::paginate`] resumes after the element the previous page
+/// reported LAST, named by that element's own identity in the list's order, so a pass that
+/// adds or removes a record between two pages can carry nothing across the cursor.
+///
+/// The rule lives HERE rather than in the reports, because every operation that reports
 /// discovered data reports from the one store this pass fills: were each to decide for
 /// itself, two of them could be shown inventories of different instants.
-pub async fn materialize_for_report<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    next_token: Option<&str>,
-) {
-    if next_token.is_some() {
-        return;
-    }
-    refresh_discovered_instances(engine, ctx).await;
-}
-
-/// Run the discovery pass this account's settings ask for, and record what it found.
-///
-/// Reached only through [`materialize_for_report`], which owns the one rule about WHEN a
-/// report runs a pass.
 ///
 /// What the store holds afterwards is what the account's CURRENT settings say is discovered:
 /// the inventory of the source Regions they name while `LinuxSubscriptionsDiscovery` is
@@ -194,7 +188,7 @@ pub async fn materialize_for_report<Eng: Send + Sync + 'static>(
 /// once before the first hop: the pass awaits repeatedly, the settings singleton can be
 /// rewritten while it does, and what the store may hold is decided by the settings AT THE
 /// INSTANT of each hop and each write.
-async fn refresh_discovered_instances<Eng: Send + Sync + 'static>(
+pub async fn materialize_for_report<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
 ) {
