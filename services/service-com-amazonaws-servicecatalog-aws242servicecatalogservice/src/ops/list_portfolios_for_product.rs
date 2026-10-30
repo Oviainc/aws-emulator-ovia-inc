@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPortfoliosForProduct
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPortfoliosForProduct`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPortfoliosForProduct::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +139,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPortfoliosForProduct` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPortfoliosForProductErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPortfoliosForProduct"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // A pure read: reporting the portfolios a product is associated with changes
+        // neither the product nor those portfolios, page tokens included — a token is
+        // derived from the portfolio id the next page resumes at, so handing one back
+        // records nothing.
+        let state = state.lock();
+
+        // The associations live ON the product, so a product this account does not hold
+        // has no portfolio list to report: that is the not-found case, not an empty
+        // page. AWS words the refusal as a lookup that resolved nothing — the catalog
+        // holds no product, local or default, under the requested id.
+        let Some(product) = state.products.get(&input.product_id) else {
+            return Err(
+                ListPortfoliosForProductErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "There are no local or default products with id {}",
+                            input.product_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A page token is this service's own opaque cursor — encoded and decoded by the
+        // crate-shared codec in `crate::state` — carrying the portfolio id the next page
+        // resumes AT. Anything that is not one of ours is a bad parameter.
+        let resume_at = match input.page_token.as_deref().filter(|t| !t.is_empty()) {
+            Some(token) => match crate::state::decode_page_cursor(token) {
+                Some(id) => Some(id),
+                None => {
+                    return Err(
+                        ListPortfoliosForProductErrorModeled::InvalidParametersException(
+                            InvalidParametersException {
+                                message: Some("PageToken is not a valid page token.".to_string()),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        // `PageSize` is modelled `0..100` with a default of 0, and 0 asks for no
+        // caller-imposed bound: the whole remaining set is returned, which the stored
+        // association count bounds — `crate::state::MAX_PORTFOLIOS` is a FINITE cap on
+        // the portfolios one product may be associated with, enforced by
+        // `AssociateProductWithPortfolio` before it stores one.
+        let page_size = if input.page_size > 0 {
+            input.page_size as usize
+        } else {
+            crate::state::MAX_PORTFOLIOS
+        };
+
+        // The associated ids are held in an ordered set, so the reported order is
+        // portfolio-id order — the same order `ListPortfolios` walks — and the cursor is
+        // a position in it, so a resumed walk skips exactly the pages already handed
+        // out. Each id is resolved against the live portfolio store, so every reported
+        // record is the one `DescribePortfolio` reports.
+        let mut portfolio_details = Vec::new();
+        let mut next_page_token = None;
+        for (id, portfolio) in product
+            .portfolio_ids
+            .iter()
+            .filter(|id| resume_at.as_deref().is_none_or(|resume| id.as_str() >= resume))
+            .filter_map(|id| state.portfolios.get(id).map(|portfolio| (id, portfolio)))
+        {
+            if portfolio_details.len() == page_size {
+                // More remain: hand back a cursor that resumes at this portfolio.
+                next_page_token = Some(crate::state::encode_page_cursor(id));
+                break;
+            }
+            portfolio_details.push(portfolio.detail());
+        }
+
+        Ok(ListPortfoliosForProductOutput {
+            portfolio_details: Some(portfolio_details),
+            next_page_token,
+        })
     }
 }

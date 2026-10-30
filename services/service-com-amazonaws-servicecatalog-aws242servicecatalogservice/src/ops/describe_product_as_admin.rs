@@ -178,11 +178,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             }
         };
-        // `SourcePortfolioId` narrows the lookup to a product reached through a SHARED
-        // portfolio. No portfolio holds a product yet (`AssociateProductWithPortfolio`
-        // is still scaffolded), so no stored product is reachable through one and a
-        // request that names a source portfolio finds nothing.
-        let product = product.filter(|_| input.source_portfolio_id.is_none());
+        // `SourcePortfolioId` names "the shared portfolio that the specified product is
+        // associated with", so it narrows the lookup to a product that portfolio holds:
+        // the stored association is what decides, and a product no such portfolio holds
+        // is not found through it.
+        let product = product.filter(|product| {
+            input
+                .source_portfolio_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .is_none_or(|portfolio_id| product.portfolio_ids.contains(portfolio_id))
+        });
 
         let Some(product) = product else {
             let identifier = input
@@ -194,11 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // rather than being left to read a bare not-found as "no such product".
             let message = match &input.source_portfolio_id {
                 Some(portfolio) => format!(
-                    "Product {identifier} not found in source portfolio {portfolio}: no \
-                     product is associated with a portfolio in this emulator, so none is \
-                     reachable through one."
+                    "There are no local or default products with id {identifier} associated with \
+                     portfolio {portfolio}"
                 ),
-                None => format!("Product {identifier} not found."),
+                None => format!("There are no local or default products with id {identifier}"),
             };
             return Err(DescribeProductAsAdminErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

@@ -156,23 +156,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with you or is associated with a portfolio." `ResourceInUseException` is
         // the modelled error for that, and it is answered before anything is removed,
         // so a refused delete leaves the product whole. A constraint names one
-        // product within one portfolio, so it is an association too.
-        let mut in_use = Vec::new();
-        if !product.portfolio_ids.is_empty() {
-            in_use.push("Portfolios");
-        }
-        if state
-            .constraints
-            .values()
-            .any(|constraint| constraint.product_id == input.id)
-        {
-            in_use.push("Constraints");
-        }
-        if let Some(kind) = in_use.first() {
+        // product within one portfolio, so it is an association too. AWS words this
+        // refusal as ONE sentence for the whole class — it names the product and the
+        // kinds of association that can hold it, not the one that did — so the message
+        // is the same whichever of them is in the way.
+        let in_use = !product.portfolio_ids.is_empty()
+            || state
+                .constraints
+                .values()
+                .any(|constraint| constraint.product_id == input.id);
+        if in_use {
             return Err(DeleteProductErrorModeled::ResourceInUseException(
                 ResourceInUseException {
                     message: Some(format!(
-                        "Product {} still has associated {kind}",
+                        "Product {} still assigned to Portfolio(s), has Users, or has Constraints.",
                         input.id
                     )),
                 },

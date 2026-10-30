@@ -16,9 +16,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, emulator, error_code, tag_list, tag_map};
+use crate::harness::{
+    associate_product_with_portfolio, call, create_constraint, create_portfolio, create_product,
+    emulator, error_code, tag_map,
+};
 
 /// One portfolio a case seeds.
 struct PortfolioSeed {
@@ -112,124 +114,6 @@ fn path_cases() -> Vec<PathCase> {
     ]
 }
 
-/// A `Parameters` document of the shape each constraint type documents
-/// (`smithy_query query="doc" shape="CreateConstraintInput" member="Parameters"`): the
-/// emulator stores it verbatim, so the only thing that matters here is that each row
-/// sends the document its type calls for.
-fn constraint_parameters(constraint_type: &str) -> String {
-    match constraint_type {
-        "LAUNCH" => r#"{"RoleArn":"arn:aws:iam::000000000000:role/SCBasicLaunchRole"}"#.to_string(),
-        "NOTIFICATION" => {
-            r#"{"NotificationArns":["arn:aws:sns:us-east-1:000000000000:topic"]}"#.to_string()
-        }
-        "STACKSET" => r#"{"AccountList":["000000000000"],"RegionList":["us-east-1"],"AdminRole":"arn:aws:iam::000000000000:role/AWSCloudFormationStackSetAdministrationRole","ExecutionRole":"AWSCloudFormationStackSetExecutionRole"}"#
-            .to_string(),
-        _ => r#"{"Rules":{"Required":{"Assertions":[]}}}"#.to_string(),
-    }
-}
-
-/// Create one portfolio and answer the id the service minted.
-async fn create_portfolio(
-    router: &MultiServiceRouter,
-    display_name: &str,
-    provider: &str,
-    tags: &[(&str, &str)],
-    token: &str,
-) -> String {
-    let mut request = json!({
-        "DisplayName": display_name,
-        "ProviderName": provider,
-        "IdempotencyToken": token,
-    });
-    if !tags.is_empty() {
-        request["Tags"] = tag_list(tags);
-    }
-    let (status, created) = call(router, "CreatePortfolio", &request).await;
-    assert_eq!(
-        status, 200,
-        "CreatePortfolio {display_name:?}: expected 200, got {status} with {created}"
-    );
-    created["PortfolioDetail"]["Id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("CreatePortfolio {display_name:?}: no Id in {created}"))
-        .to_string()
-}
-
-/// Create one CloudFormation product and answer the id the service minted.
-async fn create_product(router: &MultiServiceRouter, name: &str, token: &str) -> String {
-    let (status, created) = call(
-        router,
-        "CreateProduct",
-        &json!({
-            "Name": name,
-            "Owner": "acme",
-            "ProductType": "CLOUD_FORMATION_TEMPLATE",
-            "ProvisioningArtifactParameters": {
-                "Name": "v1",
-                "Type": "CLOUD_FORMATION_TEMPLATE",
-                // The accepted `Info` keys are the model's own:
-                // `ProvisioningArtifactProperties$Info` documents
-                // "Keys accepted: [ LoadTemplateFromURL, ImportFromPhysicalId ]".
-                "Info": {"LoadTemplateFromURL": "https://example.invalid/template.json"},
-            },
-            "IdempotencyToken": token,
-        }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "CreateProduct {name:?}: expected 200, got {status} with {created}"
-    );
-    created["ProductViewDetail"]["ProductViewSummary"]["ProductId"]
-        .as_str()
-        .unwrap_or_else(|| panic!("CreateProduct {name:?}: no ProductId in {created}"))
-        .to_string()
-}
-
-/// Associate a product with a portfolio, which is what creates a launch path.
-async fn associate(router: &MultiServiceRouter, product_id: &str, portfolio_id: &str) {
-    let (status, body) = call(
-        router,
-        "AssociateProductWithPortfolio",
-        &json!({"ProductId": product_id, "PortfolioId": portfolio_id}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "AssociateProductWithPortfolio({product_id}, {portfolio_id}): expected 200, got {status} \
-         with {body}"
-    );
-}
-
-/// Create one constraint on a portfolio-product pair.
-async fn create_constraint(
-    router: &MultiServiceRouter,
-    portfolio_id: &str,
-    product_id: &str,
-    constraint_type: &str,
-    description: &str,
-    token: &str,
-) {
-    let (status, created) = call(
-        router,
-        "CreateConstraint",
-        &json!({
-            "PortfolioId": portfolio_id,
-            "ProductId": product_id,
-            "Type": constraint_type,
-            "Description": description,
-            "Parameters": constraint_parameters(constraint_type),
-            "IdempotencyToken": token,
-        }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "CreateConstraint {constraint_type} on ({portfolio_id}, {product_id}): expected 200, got \
-         {status} with {created}"
-    );
-}
-
 /// The launch paths of a response, keyed by path id.
 fn paths_by_id(case: &str, listed: &Value) -> ListedPaths {
     let summaries = listed["LaunchPathSummaries"]
@@ -303,7 +187,7 @@ async fn launch_paths_are_the_portfolios_that_carry_the_product() {
         // test cannot come from another product's associations or constraints.
         let other_product_id = create_product(&router, "other-product", "other-token").await;
         for portfolio_id in &portfolio_ids {
-            associate(&router, &other_product_id, portfolio_id).await;
+            associate_product_with_portfolio(&router, &other_product_id, portfolio_id).await;
         }
         create_constraint(
             &router,
@@ -316,7 +200,7 @@ async fn launch_paths_are_the_portfolios_that_carry_the_product() {
         .await;
 
         for index in row.portfolios {
-            associate(&router, &product_id, &portfolio_ids[*index]).await;
+            associate_product_with_portfolio(&router, &product_id, &portfolio_ids[*index]).await;
         }
         for (position, (index, constraint_type, description)) in row.constraints.iter().enumerate() {
             create_constraint(
@@ -449,7 +333,7 @@ async fn a_path_lives_exactly_as_long_as_its_association() {
     for (case, want_held, expected) in steps {
         let want: BTreeSet<usize> = want_held.iter().copied().collect();
         for index in want.difference(&held).copied().collect::<Vec<_>>() {
-            associate(&router, &product_id, &ids[index]).await;
+            associate_product_with_portfolio(&router, &product_id, &ids[index]).await;
         }
         for index in held.difference(&want).copied().collect::<Vec<_>>() {
             let (status, body) = call(
@@ -521,7 +405,7 @@ async fn paging_walks_every_launch_path_exactly_once() {
                 &format!("portfolio-{i}"),
             )
             .await;
-            associate(&router, &product_id, &portfolio_id).await;
+            associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
             created.insert(portfolio_id);
         }
 
@@ -601,7 +485,7 @@ async fn the_default_page_size_bounds_nothing() {
                 &format!("portfolio-{i}"),
             )
             .await;
-            associate(&router, &product_id, &portfolio_id).await;
+            associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
             created.insert(portfolio_id);
         }
 
@@ -636,7 +520,7 @@ async fn a_bad_token_and_an_unknown_product_take_their_own_refusals() {
     let router = emulator();
     let portfolio_id = create_portfolio(&router, "alpha-portfolio", "acme", &[], "portfolio").await;
     let product_id = create_product(&router, "listed-product", "product-token").await;
-    associate(&router, &product_id, &portfolio_id).await;
+    associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
 
     // Rows differ along HOW the token is malformed: not hex at all, odd-length hex, hex
     // that is not UTF-8, and hex of a value no id form admits.
@@ -716,7 +600,7 @@ async fn listing_the_paths_changes_nothing() {
     )
     .await;
     let product_id = create_product(&router, "listed-product", "product-token").await;
-    associate(&router, &product_id, &portfolio_id).await;
+    associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
     create_constraint(
         &router,
         &portfolio_id,

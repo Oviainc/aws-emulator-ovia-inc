@@ -125,6 +125,136 @@ pub(crate) fn tag_list(pairs: &[(&str, &str)]) -> Value {
     )
 }
 
+/// Create one portfolio and answer the id the service minted.
+///
+/// The one portfolio seeder every suite in this crate drives, so two suites cannot seed
+/// a portfolio in two different ways.
+pub(crate) async fn create_portfolio(
+    router: &MultiServiceRouter,
+    display_name: &str,
+    provider: &str,
+    tags: &[(&str, &str)],
+    token: &str,
+) -> String {
+    let mut request = json!({
+        "DisplayName": display_name,
+        "ProviderName": provider,
+        "IdempotencyToken": token,
+    });
+    if !tags.is_empty() {
+        request["Tags"] = tag_list(tags);
+    }
+    let (status, created) = call(router, "CreatePortfolio", &request).await;
+    assert_eq!(
+        status, 200,
+        "CreatePortfolio {display_name:?}: expected 200, got {status} with {created}"
+    );
+    created["PortfolioDetail"]["Id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreatePortfolio {display_name:?}: no Id in {created}"))
+        .to_string()
+}
+
+/// Create one CloudFormation product and answer the id the service minted.
+pub(crate) async fn create_product(
+    router: &MultiServiceRouter,
+    name: &str,
+    token: &str,
+) -> String {
+    let (status, created) = call(
+        router,
+        "CreateProduct",
+        &json!({
+            "Name": name,
+            "Owner": "acme",
+            "ProductType": "CLOUD_FORMATION_TEMPLATE",
+            "ProvisioningArtifactParameters": {
+                "Name": "v1",
+                "Type": "CLOUD_FORMATION_TEMPLATE",
+                // The accepted `Info` keys are the model's own:
+                // `ProvisioningArtifactProperties$Info` documents
+                // "Keys accepted: [ LoadTemplateFromURL, ImportFromPhysicalId ]".
+                "Info": {"LoadTemplateFromURL": "https://example.invalid/template.json"},
+            },
+            "IdempotencyToken": token,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "CreateProduct {name:?}: expected 200, got {status} with {created}"
+    );
+    created["ProductViewDetail"]["ProductViewSummary"]["ProductId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateProduct {name:?}: no ProductId in {created}"))
+        .to_string()
+}
+
+/// Associate a product with a portfolio: the one stored relationship every suite that
+/// needs one creates the same way.
+pub(crate) async fn associate_product_with_portfolio(
+    router: &MultiServiceRouter,
+    product_id: &str,
+    portfolio_id: &str,
+) {
+    let (status, body) = call(
+        router,
+        "AssociateProductWithPortfolio",
+        &json!({"ProductId": product_id, "PortfolioId": portfolio_id}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "AssociateProductWithPortfolio({product_id}, {portfolio_id}): expected 200, got {status} \
+         with {body}"
+    );
+}
+
+/// A `Parameters` document of the shape each constraint type documents
+/// (`smithy_query query="doc" shape="CreateConstraintInput" member="Parameters"`): the
+/// emulator stores it verbatim, so the only thing that matters here is that each caller
+/// sends the document its type calls for.
+pub(crate) fn constraint_parameters(constraint_type: &str) -> String {
+    match constraint_type {
+        "LAUNCH" => r#"{"RoleArn":"arn:aws:iam::000000000000:role/SCBasicLaunchRole"}"#.to_string(),
+        "NOTIFICATION" => {
+            r#"{"NotificationArns":["arn:aws:sns:us-east-1:000000000000:topic"]}"#.to_string()
+        }
+        "STACKSET" => r#"{"AccountList":["000000000000"],"RegionList":["us-east-1"],"AdminRole":"arn:aws:iam::000000000000:role/AWSCloudFormationStackSetAdministrationRole","ExecutionRole":"AWSCloudFormationStackSetExecutionRole"}"#
+            .to_string(),
+        _ => r#"{"Rules":{"Required":{"Assertions":[]}}}"#.to_string(),
+    }
+}
+
+/// Create one constraint on a portfolio-product pair.
+pub(crate) async fn create_constraint(
+    router: &MultiServiceRouter,
+    portfolio_id: &str,
+    product_id: &str,
+    constraint_type: &str,
+    description: &str,
+    token: &str,
+) {
+    let (status, created) = call(
+        router,
+        "CreateConstraint",
+        &json!({
+            "PortfolioId": portfolio_id,
+            "ProductId": product_id,
+            "Type": constraint_type,
+            "Description": description,
+            "Parameters": constraint_parameters(constraint_type),
+            "IdempotencyToken": token,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "CreateConstraint {constraint_type} on ({portfolio_id}, {product_id}): expected 200, got \
+         {status} with {created}"
+    );
+}
+
 /// AWS mints a Service Catalog id as a `<prefix>-` followed by 12 lowercase base-36
 /// characters, which the modelled `Id` pattern `^[a-zA-Z0-9_\-]*$` admits.
 pub(crate) fn is_catalog_id(prefix: &str, id: &str) -> bool {

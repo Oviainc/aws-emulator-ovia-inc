@@ -21,5 +21,7 @@ mod harness;
 mod launch_paths;
 #[path = "all/portfolio_lifecycle.rs"]
 mod portfolio_lifecycle;
+#[path = "all/portfolios_for_product.rs"]
+mod portfolios_for_product;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
