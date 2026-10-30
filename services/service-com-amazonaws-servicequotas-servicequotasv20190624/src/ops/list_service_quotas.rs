@@ -157,7 +157,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `AppliedLevelEnum` filter rule ([`crate::state::requested_at_level`]),
             // asked here of the level each plane's records sit at rather than written
             // out again: `ALL` keeps both planes, and a caller that names no level is
-            // served the ACCOUNT one.
+            // served the ACCOUNT one. Which quotas HAVE the plane asked for is the
+            // view's own rule ([`crate::state::DefaultQuota::has_plane`]): a quota
+            // adjustable for an individual resource only has no account-wide record,
+            // so the listing carries none for it.
             if crate::state::requested_at_level(crate::state::LEVEL_ACCOUNT, level) {
                 quotas.extend(codes.iter().filter_map(|code| {
                     quotas_state.applied_quota_view(&region, &input.service_code, code, None)

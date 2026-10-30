@@ -504,6 +504,22 @@ impl DefaultQuota {
         self.adjustable_at_level == LEVEL_ACCOUNT || self.adjustable_at_level == LEVEL_ALL
     }
 
+    /// Whether this quota HAS the plane a call names: the per-resource plane when the
+    /// call names a resource context, the account-wide plane when it names none.
+    ///
+    /// The planes a quota has are exactly the ones its `AdjustableAtLevel` publishes
+    /// ([`Self::resource_adjustable`] and [`Self::account_adjustable`], the two halves
+    /// of the member's three values), so this is the ONE predicate every read and every
+    /// write of one plane asks, and no two of them can disagree about which planes a
+    /// quota has.
+    pub fn has_plane(&self, context: Option<&str>) -> bool {
+        if context.is_some() {
+            self.resource_adjustable()
+        } else {
+            self.account_adjustable()
+        }
+    }
+
     /// The `QuotaContext` of a record read on `context`'s plane — the resource context
     /// named, or `None` for the account-wide record.
     ///
@@ -511,22 +527,26 @@ impl DefaultQuota {
     /// so it carries NO context, which is what `QuotaContextInfo`'s own documentation
     /// says of a quota managed at the account level for each Region. Any other quota
     /// carries one, describing the plane the record answers for: `RESOURCE` scope
-    /// naming the resource asked for, or `ACCOUNT` scope for the account-wide record.
-    /// It is the SAME predicate the record's `QuotaAppliedAtLevel` is derived from, so
-    /// the two cannot disagree about which plane the record is.
+    /// naming the resource asked for, or `ACCOUNT` scope for the account-wide record of
+    /// a quota that HAS an account-wide plane ([`Self::has_plane`]). It is the SAME
+    /// predicate the record's `QuotaAppliedAtLevel` is derived from, so the two cannot
+    /// disagree about which plane the record is.
     pub fn context_info(&self, context: Option<&str>) -> Option<QuotaContextInfo> {
         if !self.resource_adjustable() {
             return None;
         }
+        // The scope is the plane the record answers for, and a record never names a
+        // plane the quota does not have: a record read for a resource answers at
+        // `RESOURCE` scope, and so does every record of a quota whose value can only
+        // ever be applied to an individual resource, which has no account-wide plane to
+        // answer on. Only a quota that HAS that plane reports `ACCOUNT` scope.
+        let scope = if context.is_some() || !self.account_adjustable() {
+            CONTEXT_SCOPE_RESOURCE
+        } else {
+            CONTEXT_SCOPE_ACCOUNT
+        };
         Some(QuotaContextInfo {
-            context_scope: Some(
-                if context.is_some() {
-                    CONTEXT_SCOPE_RESOURCE
-                } else {
-                    CONTEXT_SCOPE_ACCOUNT
-                }
-                .to_string(),
-            ),
+            context_scope: Some(scope.to_string()),
             context_scope_type: self.context_scope_type.clone(),
             context_id: context.map(str::to_string),
             adjustable_at_level: Some(self.adjustable_at_level.clone()),
@@ -1063,6 +1083,12 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         context: Option<&str>,
     ) -> Option<ServiceQuota> {
         let default = self.default_quota(service_code, quota_code)?;
+        // Only a plane the quota HAS has a record ([`DefaultQuota::has_plane`]): the
+        // account-wide record of a quota adjustable for an individual resource only
+        // does not exist, so no listing reports one.
+        if !default.has_plane(context) {
+            return None;
+        }
         let mut quota = self.quota_view(region, default, true, context);
         quota.value = Some(self.value_in_force(region, default, context));
         // The record answers for the plane it was read on: a value read for a
@@ -2140,6 +2166,20 @@ pub fn no_such_service_message(service_code: &str) -> String {
 /// naming one.
 pub fn no_such_quota_message(service_code: &str, quota_code: &str) -> String {
     format!("no quota with ServiceCode '{service_code}' and QuotaCode '{quota_code}' exists")
+}
+
+/// How this service states that a call named no resource context for a quota whose
+/// value can only ever be applied to an individual resource, for the modelled
+/// `IllegalArgumentException`.
+///
+/// ONE wording for the fact, wherever a call asks for the account-wide plane of a quota
+/// that has none: the reads of one applied quota, and the write that asks for an
+/// increase on a plane.
+pub fn no_account_plane_message(quota_code: &str) -> String {
+    format!(
+        "QuotaCode '{quota_code}' is adjustable for an individual resource only, so a ContextId \
+         is required"
+    )
 }
 
 /// How a tagging operation states that `resource_arn` names no applied quota of this

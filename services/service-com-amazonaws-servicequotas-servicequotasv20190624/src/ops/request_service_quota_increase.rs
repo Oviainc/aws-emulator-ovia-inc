@@ -177,7 +177,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let adjustable = default.adjustable;
         let resource_adjustable = default.resource_adjustable();
-        let account_adjustable = default.account_adjustable();
 
         match input.context_id.as_deref() {
             Some(context_id) if !resource_adjustable => {
@@ -194,20 +193,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
-            // The other half of the same rule: a quota with no account-wide plane can
-            // only be increased for one resource, so a request that names none has no
-            // plane to land on. It holds for any row the catalog publishes as
-            // `PER_RESOURCE`; today every row it publishes is either account-only or
-            // adjustable at both levels, so this arm guards the rule rather than a
-            // seeded quota, and keeps the refusal from depending on which rows exist.
-            None if !account_adjustable => {
+            // The other half of the same rule, asked through the one
+            // [`crate::state::DefaultQuota::has_plane`] predicate the read path asks:
+            // a quota with no account-wide plane can only be increased for one
+            // resource, so a request that names none has no plane to land on. It holds
+            // for any row the catalog publishes as `PER_RESOURCE`; today every row it
+            // publishes is either account-only or adjustable at both levels, so this
+            // arm guards the rule rather than a seeded quota, and keeps the refusal
+            // from depending on which rows exist.
+            None if !default.has_plane(None) => {
                 return Err(
                     RequestServiceQuotaIncreaseErrorModeled::IllegalArgumentException(
                         IllegalArgumentException {
-                            message: Some(format!(
-                                "QuotaCode '{}' is adjustable for an individual resource only, so \
-                                 a ContextId is required",
-                                input.quota_code
+                            message: Some(crate::state::no_account_plane_message(
+                                &input.quota_code,
                             )),
                         },
                     )
