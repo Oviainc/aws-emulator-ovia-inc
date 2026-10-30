@@ -264,6 +264,9 @@ pub const ACCEPT_DELEGATION_REQUEST: &str = "iam:AcceptDelegationRequest";
 /// `iam:GenerateOrganizationsAccessReport`.
 pub const GENERATE_ORGANIZATIONS_ACCESS_REPORT: &str = "iam:GenerateOrganizationsAccessReport";
 
+/// `iam:ListOrganizationsFeatures`.
+pub const LIST_ORGANIZATIONS_FEATURES: &str = "iam:ListOrganizationsFeatures";
+
 /// `iam:ListDelegationRequests`.
 pub const LIST_DELEGATION_REQUESTS: &str = "iam:ListDelegationRequests";
 

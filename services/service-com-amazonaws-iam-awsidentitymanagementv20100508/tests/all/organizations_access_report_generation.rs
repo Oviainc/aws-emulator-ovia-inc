@@ -144,6 +144,15 @@ pub(crate) fn record_organization(
     store.lock().organization = Some(state::Organization {
         organization_id: organization_id.to_string(),
         management_account_id: management_account_id.to_string(),
+        // An organization Organizations creates today has "All features" enabled, and a
+        // service has trusted access to it only once somebody enables that access — so this
+        // records an organization whose centralized root access is not set up at all, which
+        // is what the operations this helper serves are indifferent to. The suite about that
+        // access (`tests/all/organization_root_access_features.rs`) is what varies these.
+        all_features_enabled: true,
+        iam_trusted_access_enabled: false,
+        root_access_delegated_administrator_ids: Default::default(),
+        enabled_root_access_features: Default::default(),
     });
 }
 

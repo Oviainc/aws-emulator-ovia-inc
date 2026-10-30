@@ -1331,13 +1331,16 @@ pub struct FidoSecurityKey {
 }
 
 /// The organization the account belongs to, as IAM sees it: which organization it is,
-/// and which account manages it.
+/// which account manages it, and what it carries for centralized root access.
 ///
 /// IAM reads this where an operation of its own is served only to an organization's
 /// management account — `GenerateOrganizationsAccessReport` ("to call this operation, you
 /// must be signed in using your Organizations management account credentials") — so the
 /// two facts such a decision needs are held in ONE place: the organization's id, which an
-/// Organizations entity path names, and the account that manages it.
+/// Organizations entity path names, and the account that manages it. The centralized root
+/// access facts are held beside them, because they are facts about that SAME organization:
+/// its feature set, whether IAM has trusted access to it, which accounts administer that
+/// access, and which of the modelled features are enabled for it.
 #[derive(Debug, Clone)]
 pub struct Organization {
     /// "The unique identifier (ID) of an organization" (`OrganizationIdType`, pattern
@@ -1347,6 +1350,102 @@ pub struct Organization {
     /// the organization-wide operations to, and the account every other member is
     /// refused as.
     pub management_account_id: String,
+    /// Whether the organization has "All features" enabled, the Organizations feature set
+    /// the centralized root access operations require: a request against an organization
+    /// without it "was rejected because your organization does not have All features
+    /// enabled" (`OrganizationNotInAllFeaturesModeException`).
+    pub all_features_enabled: bool,
+    /// Whether trusted access is enabled for IAM in Organizations, the other standing
+    /// requirement of the centralized root access operations: without it a request "was
+    /// rejected because trusted access is not enabled for IAM in Organizations"
+    /// (`ServiceAccessNotEnabledException`).
+    pub iam_trusted_access_enabled: bool,
+    /// The member accounts registered as a delegated administrator for centralized root
+    /// access, which — beside [`Self::management_account_id`] — are the accounts those
+    /// operations are served to ("the account making the request is not the management
+    /// account or delegated administrator account for centralized root access",
+    /// `AccountNotManagementOrDelegatedAdministratorException`). A `BTreeSet`, because what
+    /// it holds is a SET of accounts rather than an order.
+    pub root_access_delegated_administrator_ids: BTreeSet<String>,
+    /// The centralized root access features currently enabled for the organization, held as
+    /// the SET of `FeatureType` values enabled (`ops::types::FEATURE_TYPE_VALUES`): what
+    /// `EnableOrganizationsRootCredentialsManagement` and `EnableOrganizationsRootSessions`
+    /// add to, what their `Disable` counterparts take away, and what
+    /// `ListOrganizationsFeatures` reports through [`Self::reported_root_access_features`].
+    pub enabled_root_access_features: BTreeSet<String>,
+}
+
+impl Organization {
+    /// Whether the centralized root access operations are served to `account_id`: the
+    /// organization's management account and the accounts registered as a delegated
+    /// administrator for that access are, and every other account — a member account of
+    /// this organization, or an account outside it — is not.
+    pub fn serves_root_access_to(&self, account_id: &str) -> bool {
+        self.management_account_id == account_id
+            || self
+                .root_access_delegated_administrator_ids
+                .contains(account_id)
+    }
+
+    /// The organization's enabled centralized root access features as a reported
+    /// `FeaturesListType` value: the `FeatureType` values the model declares
+    /// ([`crate::ops::types::FEATURE_TYPE_VALUES`]) that [`Self::enabled_root_access_features`]
+    /// holds, in the order the model declares them, so the list a read reports is the
+    /// modelled catalog narrowed to what is enabled rather than whatever spelling or order
+    /// a write happened to leave.
+    pub fn reported_root_access_features(&self) -> Vec<String> {
+        crate::ops::types::FEATURE_TYPE_VALUES
+            .iter()
+            .filter(|feature| self.enabled_root_access_features.contains(**feature))
+            .map(|feature| (*feature).to_string())
+            .collect()
+    }
+}
+
+/// Why the centralized root access operations are not served to a caller: the standing
+/// requirement of theirs the account does not meet, each the modelled error one of those
+/// operations answers with.
+///
+/// The requirements are the organization's, not one operation's, so they are decided in ONE
+/// place ([`ComAmazonawsIamAwsidentitymanagementv20100508State::centralized_root_access_organization`])
+/// and every operation that has them maps the answer onto its own error channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootAccessPrecondition {
+    /// The account belongs to no organization at all.
+    OrganizationNotFound,
+    /// Its organization does not have "All features" enabled.
+    OrganizationNotInAllFeaturesMode,
+    /// Trusted access is not enabled for IAM in Organizations.
+    ServiceAccessNotEnabled,
+    /// The account is neither the management account nor a delegated administrator for
+    /// centralized root access.
+    AccountNotManagementOrDelegatedAdministrator,
+}
+
+impl RootAccessPrecondition {
+    /// The message the refusal carries: the reason AWS states for this error, as the
+    /// modelled exception itself words it.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::OrganizationNotFound => {
+                "The request was rejected because no organization is associated with your \
+                 account."
+            }
+            Self::OrganizationNotInAllFeaturesMode => {
+                "The request was rejected because your organization does not have All features \
+                 enabled."
+            }
+            Self::ServiceAccessNotEnabled => {
+                "The request was rejected because trusted access is not enabled for IAM in \
+                 Organizations."
+            }
+            Self::AccountNotManagementOrDelegatedAdministrator => {
+                "The request was rejected because the account making the request is not the \
+                 management account or delegated administrator account for centralized root \
+                 access."
+            }
+        }
+    }
 }
 
 /// The organization an Organizations entity path names: the `o-…` segment it begins with.
@@ -1999,6 +2098,35 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             organization.organization_id == organization_id
                 && organization.management_account_id == account_id
         })
+    }
+
+    /// The organization `account_id` may read and change centralized root access for, or
+    /// the standing requirement of that access the account does not meet.
+    ///
+    /// The requirements are the ones the centralized root access operations all model, taken
+    /// in the order they narrow the caller down: there is an organization at all, it has "All
+    /// features" enabled, trusted access is enabled for IAM in it, and the account is the one
+    /// that administers that access. Decided here so each of those operations answers the
+    /// same question the same way and refuses the same account.
+    ///
+    /// A READ: it only consults the store, so asking changes nothing a later caller sees.
+    pub fn centralized_root_access_organization(
+        &self,
+        account_id: &str,
+    ) -> Result<&Organization, RootAccessPrecondition> {
+        let Some(organization) = self.organization.as_ref() else {
+            return Err(RootAccessPrecondition::OrganizationNotFound);
+        };
+        if !organization.all_features_enabled {
+            return Err(RootAccessPrecondition::OrganizationNotInAllFeaturesMode);
+        }
+        if !organization.iam_trusted_access_enabled {
+            return Err(RootAccessPrecondition::ServiceAccessNotEnabled);
+        }
+        if !organization.serves_root_access_to(account_id) {
+            return Err(RootAccessPrecondition::AccountNotManagementOrDelegatedAdministrator);
+        }
+        Ok(organization)
     }
 
     /// How many signing certificates the user keyed by `user_key` holds.

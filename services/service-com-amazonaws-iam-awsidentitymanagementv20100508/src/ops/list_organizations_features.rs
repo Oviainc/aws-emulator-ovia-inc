@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOrganizationsFeatures
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOrganizationsFeatures`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOrganizationsFeatures::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the centralized root access features enabled for the organization the account
+//! belongs to: the organization's id and the `FeatureType` values currently enabled for it,
+//! which `EnableOrganizationsRootCredentialsManagement` and
+//! `EnableOrganizationsRootSessions` turn on and their `Disable` counterparts turn off.
+//!
+//! The report is served only to an account that meets every standing requirement of that
+//! access, and each requirement it does not meet is the modelled error this operation
+//! declares for it: an account in no organization at all (the standalone account this
+//! emulator presents until AWS Organizations records otherwise) is answered
+//! `OrganizationNotFoundException`, an organization without "All features"
+//! `OrganizationNotInAllFeaturesModeException`, an organization IAM has no trusted access
+//! to `ServiceAccessNotEnabledException`, and an account that neither manages the
+//! organization nor administers that access
+//! `AccountNotManagementOrDelegatedAdministratorException`. Those requirements belong to
+//! the organization rather than to this operation, so they are decided in ONE place
+//! ([`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::centralized_root_access_organization`])
+//! that every centralized root access operation shares.
+//!
+//! A READ: it only consults the store, so listing the features changes nothing a later
+//! caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -111,6 +123,36 @@ impl From<ListOrganizationsFeaturesErrorModeled> for ListOrganizationsFeaturesEr
     }
 }
 
+/// The modelled error a standing requirement of centralized root access that the account
+/// does not meet is refused with: one requirement, one error shape, each carrying the
+/// reason that exception itself states.
+fn refusal(precondition: crate::state::RootAccessPrecondition) -> ListOrganizationsFeaturesError {
+    let message = Some(precondition.message().to_string());
+    match precondition {
+        crate::state::RootAccessPrecondition::OrganizationNotFound => {
+            ListOrganizationsFeaturesErrorModeled::OrganizationNotFoundException(
+                OrganizationNotFoundException { message },
+            )
+        }
+        crate::state::RootAccessPrecondition::OrganizationNotInAllFeaturesMode => {
+            ListOrganizationsFeaturesErrorModeled::OrganizationNotInAllFeaturesModeException(
+                OrganizationNotInAllFeaturesModeException { message },
+            )
+        }
+        crate::state::RootAccessPrecondition::ServiceAccessNotEnabled => {
+            ListOrganizationsFeaturesErrorModeled::ServiceAccessNotEnabledException(
+                ServiceAccessNotEnabledException { message },
+            )
+        }
+        crate::state::RootAccessPrecondition::AccountNotManagementOrDelegatedAdministrator => {
+            ListOrganizationsFeaturesErrorModeled::AccountNotManagementOrDelegatedAdministratorException(
+                AccountNotManagementOrDelegatedAdministratorException { message },
+            )
+        }
+    }
+    .into()
+}
+
 /// The `ListOrganizationsFeatures` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -144,21 +186,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        _input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOrganizationsFeatures` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOrganizationsFeaturesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOrganizationsFeatures"))
+        // The request carries no members at all (`ListOrganizationsFeaturesRequest` is
+        // empty), hence the unused input: what is reported comes from the store and from
+        // the account the call speaks for, whose signing key id `ctx` carries.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server error, so an unreachable store is reported
+            // through the crate's generic refusal channel.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the IAM store is unavailable",
+            ));
+        };
+        let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the organization is consulted. The request addresses the
+        // organization's own configuration rather than one entity in the account, so the
+        // decision is made on the account-wide resource
+        // ([`crate::state::authorization::ACCOUNT_WIDE_RESOURCE`]).
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_ORGANIZATIONS_FEATURES,
+            crate::state::authorization::ACCOUNT_WIDE_RESOURCE,
+        )?;
+
+        // The standing requirements of centralized root access, decided where every
+        // operation that carries them decides them. Each one the account does not meet is
+        // this operation's modelled error for it. The account a request speaks for is this
+        // emulator's (`engine::emulator_account_id`).
+        let organization =
+            match store.centralized_root_access_organization(::engine::emulator_account_id()) {
+                Ok(organization) => organization,
+                Err(precondition) => return Err(refusal(precondition)),
+            };
+
+        // "Specifies the features that are currently available in your organization": the
+        // features the organization holds enabled NOW, reported through the one reading of
+        // that set this crate has, beside the id of the organization they belong to.
+        Ok(ListOrganizationsFeaturesOutput {
+            organization_id: Some(organization.organization_id.clone()),
+            enabled_features: Some(organization.reported_root_access_features()),
+        })
     }
 }
