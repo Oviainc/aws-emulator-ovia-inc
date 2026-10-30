@@ -6326,13 +6326,73 @@ fn arn_resource_of<'a>(value: &'a str, vendor: &str) -> Option<&'a str> {
     Some(resource)
 }
 
+/// Whether `c` may appear in a topic or configuration name this service admits.
+///
+/// ONE character set for the two names a caller supplies and this service turns
+/// into a resource identity: ASCII alphanumerics and the three separators `.`,
+/// `_` and `-`. It is Apache Kafka's own name character set
+/// (`org.apache.kafka.common.internals.Topic.validate`), and the one Amazon MSK
+/// admits a configuration name from, so topic names and configuration names are
+/// tested against the same predicate rather than two copies of the same list. A
+/// cluster name is NOT governed by it: the model bounds `ClusterName`'s length
+/// and declares no character set for it.
+pub fn is_resource_name_character(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+}
+
+/// The first character of `name` that is outside the service's name character
+/// set, or `None` when every one of them is in it.
+///
+/// A name reaches the store only through this test: it becomes the resource's
+/// identity — it keys a name index and goes into the ARN — so a name carrying
+/// anything else names no resource this service could have issued.
+pub fn name_character_outside_set(name: &str) -> Option<char> {
+    name.chars().find(|c| !is_resource_name_character(*c))
+}
+
+/// What the service answers a name built from characters outside its name
+/// character set with.
+///
+/// The register the service's name validator refuses in: it reports that the
+/// name cannot be used and echoes no part of the request — not the name, not the
+/// offending character — exactly as the same validator's refusal of a name of
+/// the wrong length does ([`RESOURCE_NAME_LENGTH_MESSAGE`]). The same sentence
+/// for every name the set rejects, since one rule was broken.
+pub const RESOURCE_NAME_INVALID_CHARACTERS_MESSAGE: &str =
+    "The resource name contains invalid characters";
+
+/// What the service answers a name whose length is outside the bound with.
+///
+/// ONE sentence for both ends of the one constraint — a name too long and a name
+/// too short broke the same rule — and it echoes no part of the request, so a
+/// caller is not handed back a name the service refused to register.
+pub const RESOURCE_NAME_LENGTH_MESSAGE: &str =
+    "The resource name contains too many or too few characters";
+
+/// The shortest and the longest configuration name Amazon MSK registers: a
+/// 128-character name is created and read back byte-identical, while 129
+/// characters and the empty string are both refused, so the bound is closed at
+/// both ends.
+pub const MIN_CONFIGURATION_NAME_LENGTH: usize = 1;
+pub const MAX_CONFIGURATION_NAME_LENGTH: usize = 128;
+
+/// Whether `name` is of a length this service registers a configuration under.
+///
+/// Counted in CHARACTERS, not bytes: the bound is on the name a caller reads
+/// back, so a multi-byte character counts once — and a name outside it is
+/// refused rather than truncated into a resource nobody asked for.
+pub fn is_configuration_name_length(name: &str) -> bool {
+    (MIN_CONFIGURATION_NAME_LENGTH..=MAX_CONFIGURATION_NAME_LENGTH).contains(&name.chars().count())
+}
+
 /// Why `name` is not a legal Apache Kafka topic name, or `None` when it is.
 ///
 /// Apache Kafka's own rule (`org.apache.kafka.common.internals.Topic.validate`),
 /// which the MSK topic operations sit in front of: a name is at most
 /// [`MAX_TOPIC_NAME_LENGTH`] characters, is neither `.` nor `..`, and is made up
-/// only of `[a-zA-Z0-9._-]`. The returned sentence names the member and the
-/// constraint it broke, so a refusal says which part of the request was wrong.
+/// only of the service's name characters ([`is_resource_name_character`]). The
+/// returned sentence names the member and the constraint it broke, so a refusal
+/// says which part of the request was wrong.
 pub fn topic_name_error(name: &str) -> Option<String> {
     if name.is_empty() {
         return Some("A topic name must not be empty.".to_string());
@@ -6346,10 +6406,7 @@ pub fn topic_name_error(name: &str) -> Option<String> {
             "A topic name is at most {MAX_TOPIC_NAME_LENGTH} characters long, but this one is {length}."
         ));
     }
-    if let Some(illegal) = name
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
-    {
+    if let Some(illegal) = name_character_outside_set(name) {
         return Some(format!(
             "A topic name may contain only ASCII alphanumerics, '.', '_' and '-', but this one contains {illegal:?}."
         ));

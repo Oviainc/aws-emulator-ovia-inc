@@ -41,6 +41,8 @@ mod configuration_arn_refusal;
 mod configuration_deletion;
 #[path = "all/configuration_lifecycle.rs"]
 mod configuration_lifecycle;
+#[path = "all/configuration_name_character_set.rs"]
+mod configuration_name_character_set;
 #[path = "all/configuration_revision_listing.rs"]
 mod configuration_revision_listing;
 #[path = "all/configuration_revision_properties.rs"]

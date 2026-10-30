@@ -9,9 +9,13 @@
 //! A configuration name identifies a configuration within an account and region,
 //! so a name already in use in the signing region is refused with the modelled
 //! `ConflictException`, and a create past the region's quota with
-//! `TooManyRequestsException`. A `KafkaVersions` entry that names no Apache Kafka
-//! version this service publishes is refused with the modelled
-//! `BadRequestException`, before anything is stored.
+//! `TooManyRequestsException`. A name of a length outside the bound the service
+//! registers, or carrying a character outside the service's name character set
+//! (ASCII alphanumerics, `.`, `_` and `-`), names no configuration this service
+//! could have issued and is refused with the modelled `BadRequestException`. A
+//! `KafkaVersions` entry that names no Apache Kafka version this service
+//! publishes is refused with the modelled `BadRequestException`, before anything
+//! is stored.
 //!
 //! `Description` is optional, and an EMPTY description is no description: a
 //! request that names none and a request that names `""` store the same thing, so
@@ -183,14 +187,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
 
         // `Name` is the configuration's identity: it keys the (region, name)
-        // index and goes into the ARN, so a blank one names no resource and is
-        // refused rather than registered. Checked before the lock is taken: it
-        // depends on the request alone.
-        if input.name.trim().is_empty() {
+        // index and goes into the ARN, so its SIZE is bounded at both ends —
+        // no name at all names no resource, and a name past the service's
+        // ceiling is refused rather than stored, or silently truncated into a
+        // resource the caller never asked for. One constraint, so both ends
+        // answer the one sentence. Checked before the lock is taken: it depends
+        // on the request alone.
+        if !crate::state::is_configuration_name_length(&input.name) {
             return Err(
                 CreateConfigurationErrorModeled::BadRequestException(BadRequestException {
                     invalid_parameter: Some("name".to_string()),
-                    message: Some("name must not be blank.".to_string()),
+                    message: Some(crate::state::RESOURCE_NAME_LENGTH_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        // A name is the configuration's identity, so it is admitted only from
+        // the characters this service's names are built from: a name carrying
+        // anything else — a space, punctuation, a non-ASCII letter — names no
+        // configuration MSK would have issued, so it is refused rather than
+        // minted into an ARN and a name index this service's readers then have
+        // to parse. Checked before the lock is taken: it depends on the request
+        // alone, and a refusal stores nothing.
+        if crate::state::name_character_outside_set(&input.name).is_some() {
+            return Err(
+                CreateConfigurationErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("name".to_string()),
+                    message: Some(
+                        crate::state::RESOURCE_NAME_INVALID_CHARACTERS_MESSAGE.to_string(),
+                    ),
                 })
                 .into(),
             );

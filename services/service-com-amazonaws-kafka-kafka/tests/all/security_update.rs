@@ -163,7 +163,7 @@ impl Case {
                 "inCluster": in_transit
                     .get("inCluster")
                     .cloned()
-                    .unwrap_or_else(|| json!(true)),
+                    .unwrap_or(json!(true)),
             });
         }
         expected
