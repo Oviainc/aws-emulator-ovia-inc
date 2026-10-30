@@ -196,9 +196,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let observed = if other_account {
             Vec::new()
         } else {
+            // The instant this read is served at, sampled ONCE for the whole answer: whether
+            // the requested period has begun is a property of the REQUEST, so every reported
+            // service is admitted or rejected on this one sample rather than on a clock read
+            // per stored record.
+            let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
             state
                 .lock()
-                .observed_services(&input.start_time, &input.end_time)
+                .observed_services(&input.start_time, &input.end_time, &now)
         };
 
         // `MaxResults` carries both its range and a documented `@default`, so the page size is

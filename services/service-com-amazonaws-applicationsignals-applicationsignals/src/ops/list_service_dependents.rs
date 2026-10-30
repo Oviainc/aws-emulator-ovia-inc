@@ -204,9 +204,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::DEFAULT_SERVICE_DEPENDENT_PAGE,
         );
 
-        let observed = state
-            .lock()
-            .observed_dependents(&input.key_attributes, &input.start_time, &input.end_time);
+        // The instant this read is served at, sampled ONCE for the whole answer: whether the
+        // requested period has begun is a property of the REQUEST, so every reported edge is
+        // admitted or rejected on this one sample rather than on a clock read per stored
+        // record.
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let observed = state.lock().observed_dependents(
+            &input.key_attributes,
+            &input.start_time,
+            &input.end_time,
+            &now,
+        );
         // The cursor is an offset into the ordered set THIS request selects, so the selection
         // — the entity and the period its set is derived over — is bound into the token's tag,
         // and a token issued over another selection is refused rather than honoured as a

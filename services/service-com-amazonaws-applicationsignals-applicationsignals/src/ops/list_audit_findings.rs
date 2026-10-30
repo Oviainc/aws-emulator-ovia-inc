@@ -222,12 +222,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // other value, and an absent member asks for no extra context.
         let detailed = input.detail_level.as_deref() == Some(crate::state::DETAIL_LEVEL_DETAILED);
 
+        // The instant this read is served at, sampled ONCE for the whole answer: every
+        // assessment in it is of that instant, and whether the requested period has begun —
+        // a property of the REQUEST — is decided on it too, rather than on a clock read per
+        // stored objective.
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
         let findings = state.lock().audited_findings(
             &input.audit_targets,
             input.auditors.as_deref(),
             detailed,
             &input.start_time,
             &input.end_time,
+            &now,
         );
 
         // The findings are the projection the REQUEST selects — its targets, its auditor

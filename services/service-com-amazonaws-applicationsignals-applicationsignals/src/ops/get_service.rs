@@ -190,9 +190,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        let service = state
-            .lock()
-            .observed_service(&input.key_attributes, &input.start_time, &input.end_time);
+        // The instant this read is served at, sampled ONCE for the whole answer: whether the
+        // requested period has begun is a property of the REQUEST, so the projection below
+        // decides it from this one sample rather than from a clock read per stored record.
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let service = state.lock().observed_service(
+            &input.key_attributes,
+            &input.start_time,
+            &input.end_time,
+            &now,
+        );
 
         Ok(GetServiceOutput {
             service,

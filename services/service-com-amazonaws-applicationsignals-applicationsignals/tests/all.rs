@@ -145,6 +145,8 @@ mod time_ranged_reads;
 mod unissued_next_token;
 #[path = "all/untag_resource_kinds.rs"]
 mod untag_resource_kinds;
+#[path = "all/window_begun_one_decision.rs"]
+mod window_begun_one_decision;
 #[path = "all/window_instant_resolution.rs"]
 mod window_instant_resolution;
 #[path = "all/windowed_read_page_bound.rs"]

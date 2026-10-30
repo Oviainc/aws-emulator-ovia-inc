@@ -37,7 +37,10 @@ use crate::instrumentation_configuration_tags::router_with_engine;
 use crate::slo_lifecycle::{call, create};
 
 /// How many nanoseconds make a second.
-const NANOS_PER_SECOND: i64 = 1_000_000_000;
+///
+/// `pub(crate)` so the sibling suites that place an instant against a window bound compare
+/// on the one scale this one does.
+pub(crate) const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
 /// How far before the window's end the window starts: an hour, so every row's window has
 /// begun and the recorded creation falls inside it whenever it is not past the end.
@@ -59,7 +62,7 @@ const STATUS_INSUFFICIENT_DATA: &str = "INSUFFICIENT_DATA";
 
 /// One instant as the parts a `Timestamp` carries: epoch seconds and the nanoseconds within
 /// that second.
-type Instant = (i64, u32);
+pub(crate) type Instant = (i64, u32);
 
 /// The whole second every window here ends on: an hour in the past, so the window has begun
 /// and the requested end is behind the clock whatever the row shifts by.
@@ -76,7 +79,7 @@ fn base_second() -> i64 {
 
 /// `at` moved by `offset` nanoseconds, exactly — so a row can place a stored instant one
 /// nanosecond from a requested bound, including across a second boundary.
-fn shifted(at: Instant, offset: i64) -> Instant {
+pub(crate) fn shifted(at: Instant, offset: i64) -> Instant {
     let total = i128::from(at.0) * i128::from(NANOS_PER_SECOND)
         + i128::from(at.1)
         + i128::from(offset);
@@ -90,7 +93,7 @@ fn shifted(at: Instant, offset: i64) -> Instant {
 /// `at` in the ISO 8601 `date-time` form a query-bound `Timestamp` carries, with the
 /// fraction spelled to the nanosecond — the precision the REQUEST has to carry for the rule
 /// to be compared at it.
-fn query_instant(at: Instant) -> String {
+pub(crate) fn query_instant(at: Instant) -> String {
     let whole = DateTime::from_secs(at.0)
         .fmt(Format::DateTime)
         .unwrap_or_else(|error| panic!("unformattable instant {at:?}: {error}"));
@@ -111,7 +114,7 @@ fn body_instant(at: Instant) -> f64 {
 }
 
 /// The key attributes of one Application Signals service entity.
-fn entity(name: &str) -> Value {
+pub(crate) fn entity(name: &str) -> Value {
     json!({ "Type": "Service", "Name": name, "Environment": "prod" })
 }
 

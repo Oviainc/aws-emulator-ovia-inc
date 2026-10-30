@@ -229,12 +229,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // already owes are materialised first — exactly as the read that reports the
             // same records as a history does
             // ([`crate::state::ComAmazonawsApplicationsignalsApplicationsignalsState::expire_instrumentation_configurations`]).
+            //
+            // That ONE sample is also what the projection decides the request's own window
+            // condition on — whether the requested period has begun — so every reported
+            // service is admitted or rejected on the same instant the expiry pass used.
             let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
             let mut store = state.lock();
             store.expire_instrumentation_configurations(&now);
             store.observed_service_states(
                 &input.start_time,
                 &input.end_time,
+                &now,
                 input.attribute_filters.as_deref().unwrap_or_default(),
             )
         };

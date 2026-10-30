@@ -2743,13 +2743,16 @@ fn stated_instant(at: &DateTime) -> String {
 // The service topology the stored SLOs are evidence of
 // =============================================================================
 
-/// Whether a stored SLO is evidence of the entity it monitors over the requested window.
+/// Whether a stored SLO is evidence of the entity it monitors over a window ending at
+/// `window_end` — the half of the window test that looks at the RECORD.
 ///
 /// An SLO monitors its entity from the moment it is created until it is deleted, so the
 /// period it is evidence for is `[CreatedTime, now]`, and the two periods overlap exactly
-/// when the window does not END before the SLO existed and does not BEGIN after now. So a
-/// read over a past window reports an entity the account has only just started monitoring
-/// as absent, and a window entirely in the future observes nothing at all.
+/// when the window does not END before the SLO existed and does not BEGIN after now. The
+/// first of those is this test, one record at a time; the second says nothing about any
+/// record and is the request's own, decided once per read ([`window_has_begun`]). So a read
+/// over a past window reports an entity the account has only just started monitoring as
+/// absent, and a window entirely in the future observes nothing at all.
 ///
 /// Both bounds are compared on the module's one instant key ([`instant_nanos`]), the same
 /// one [`time_range_refusal`] orders a requested range by and
@@ -2757,19 +2760,22 @@ fn stated_instant(at: &DateTime) -> String {
 /// and a window a change read reports that SLO's writes in are therefore decided by one
 /// comparison at one resolution, so an SLO created a fraction of a microsecond after the
 /// window ended is outside it in every read.
-fn monitored_in_window(
-    slo: &ServiceLevelObjective,
-    window_start: &DateTime,
-    window_end: &DateTime,
-) -> bool {
-    instant_nanos(&slo.created_time) <= instant_nanos(window_end) && window_has_begun(window_start)
+fn monitored_in_window(slo: &ServiceLevelObjective, window_end: &DateTime) -> bool {
+    instant_nanos(&slo.created_time) <= instant_nanos(window_end)
 }
 
-/// Whether a window has begun: nothing has been observed in one that starts after now,
-/// however far ahead it ends. Compared on the same instant key as every other window test
-/// here ([`instant_nanos`]).
-fn window_has_begun(window_start: &DateTime) -> bool {
-    instant_nanos(window_start) <= instant_nanos(&DateTime::from(::std::time::SystemTime::now()))
+/// Whether the requested window had begun at `now`: nothing has been observed in one that
+/// starts after the instant the read is served at, however far ahead it ends. Compared on
+/// the same instant key as every other window test here ([`instant_nanos`]).
+///
+/// This asks about the REQUEST, not about any stored record, so every read decides it ONCE
+/// from the single clock sample its handler took when it started serving and applies that
+/// one answer to the whole projection — the way every other operation of this service uses
+/// its one sample. Re-sampling the clock per record would let one answer admit some entities
+/// and reject others on a condition they all share, so two reads of one window could
+/// disagree about which entities exist.
+fn window_has_begun(window_start: &DateTime, now: &DateTime) -> bool {
+    instant_nanos(window_start) <= instant_nanos(now)
 }
 
 /// A dedup/order key for one `Attributes` map: its entries in key order. Used only to
@@ -3096,20 +3102,26 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     }
 
     /// Every stored SLO that monitors the entity `key_attributes` identifies, over a window
-    /// ending at `window_end`.
+    /// ending at `window_end`, as of the instant `now` the read is served at.
     ///
     /// The requested attributes identify the entity, and an entity is identified by as few
     /// as one of its up to four `Attributes` entries, so an SLO matches when its own entity
     /// attributes hold every entry the request named ([`attributes_contain`] — the same
     /// match `ListServiceLevelObjectives` already applies to the same member).
+    ///
+    /// Whether the requested period has begun is the request's own condition, so it is
+    /// decided ONCE for the whole walk ([`window_has_begun`]): a period that has not begun
+    /// observed nothing, so there is no candidate record to visit at all.
     fn monitoring<'a>(
         &'a self,
         key_attributes: &'a HashMap<String, String>,
-        window_start: &'a DateTime,
+        window_start: &DateTime,
         window_end: &'a DateTime,
+        now: &DateTime,
     ) -> impl Iterator<Item = &'a ServiceLevelObjective> + 'a {
-        self.slos.values().filter(move |slo| {
-            monitored_in_window(slo, window_start, window_end)
+        let observable = window_has_begun(window_start, now).then(|| self.slos.values());
+        observable.into_iter().flatten().filter(move |slo| {
+            monitored_in_window(slo, window_end)
                 && attributes_contain(entity_of(slo).key_attributes.as_ref(), key_attributes)
         })
     }
@@ -3142,10 +3154,11 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         key_attributes: &HashMap<String, String>,
         window_start: &DateTime,
         window_end: &DateTime,
+        now: &DateTime,
     ) -> Service {
         let mut reported = key_attributes.clone();
         let mut discovered = false;
-        for slo in self.monitoring(key_attributes, window_start, window_end) {
+        for slo in self.monitoring(key_attributes, window_start, window_end, now) {
             discovered = true;
             if let Some(observed) = entity_of(slo).key_attributes {
                 if observed.len() > reported.len() {
@@ -3199,12 +3212,20 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         &self,
         window_start: &DateTime,
         window_end: &DateTime,
+        now: &DateTime,
     ) -> Vec<ServiceSummary> {
+        // The request's own half of the window test, decided ONCE for the whole answer: a
+        // period that has not begun by the instant this read is served at observed no
+        // service, so every reported entity is admitted or rejected by this one decision
+        // rather than by a clock read of its own ([`window_has_begun`]).
+        if !window_has_begun(window_start, now) {
+            return Vec::new();
+        }
         let mut by_identity: BTreeMap<String, HashMap<String, String>> = BTreeMap::new();
         for slo in self
             .slos
             .values()
-            .filter(|slo| monitored_in_window(slo, window_start, window_end))
+            .filter(|slo| monitored_in_window(slo, window_end))
         {
             let Some(attributes) = entity_of(slo).key_attributes else {
                 continue;
@@ -3252,9 +3273,10 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         key_attributes: &HashMap<String, String>,
         window_start: &DateTime,
         window_end: &DateTime,
+        now: &DateTime,
     ) -> Vec<ServiceOperation> {
         let mut by_name: BTreeMap<String, HashMap<String, String>> = BTreeMap::new();
-        for slo in self.monitoring(key_attributes, window_start, window_end) {
+        for slo in self.monitoring(key_attributes, window_start, window_end, now) {
             let entity = entity_of(slo);
             let Some(name) = entity.operation_name else {
                 continue;
@@ -3298,9 +3320,10 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         key_attributes: &HashMap<String, String>,
         window_start: &DateTime,
         window_end: &DateTime,
+        now: &DateTime,
     ) -> Vec<ServiceDependency> {
         let mut by_edge: BTreeMap<String, ServiceDependency> = BTreeMap::new();
-        for slo in self.monitoring(key_attributes, window_start, window_end) {
+        for slo in self.monitoring(key_attributes, window_start, window_end, now) {
             let entity = entity_of(slo);
             let (Some(operation_name), Some(dependency)) =
                 (entity.operation_name, entity.dependency_config)
@@ -3353,12 +3376,19 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         key_attributes: &HashMap<String, String>,
         window_start: &DateTime,
         window_end: &DateTime,
+        now: &DateTime,
     ) -> Vec<ServiceDependent> {
+        // Decided ONCE for the whole answer, as the sibling topology reads decide it: a
+        // period that has not begun by the instant this read is served at recorded no edge
+        // ([`window_has_begun`]).
+        if !window_has_begun(window_start, now) {
+            return Vec::new();
+        }
         let mut by_edge: BTreeMap<String, ServiceDependent> = BTreeMap::new();
         for slo in self
             .slos
             .values()
-            .filter(|slo| monitored_in_window(slo, window_start, window_end))
+            .filter(|slo| monitored_in_window(slo, window_end))
         {
             let entity = entity_of(slo);
             let Some(dependency) = entity.dependency_config else {
@@ -3421,6 +3451,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         &self,
         window_start: &DateTime,
         window_end: &DateTime,
+        now: &DateTime,
         filters: &[AttributeFilter],
     ) -> Vec<ServiceState> {
         let applied = (!filters.is_empty()).then(|| filters.to_vec());
@@ -3430,7 +3461,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         // never looks at it again.
         let mut records = self.change_records();
         records.retain(|(_, writes)| writes.iter().any(|record| record.inside(window)));
-        self.observed_services(window_start, window_end)
+        self.observed_services(window_start, window_end, now)
             .into_iter()
             .filter(|summary| {
                 filters
@@ -4209,16 +4240,17 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         detailed: bool,
         window_start: &DateTime,
         window_end: &DateTime,
+        now: &DateTime,
     ) -> Vec<AuditFinding> {
-        // The instant the audit is served at, read ONCE so every assessment in one answer is
-        // of the same instant. It bounds every assessed window: nothing in the future has
-        // been evaluated, however far ahead the requested period ends — the same rule
-        // [`window_has_begun`] applies to the period itself.
-        let now = DateTime::from(::std::time::SystemTime::now());
+        // `now` is the instant the audit is served at, sampled ONCE by the handler, so every
+        // assessment in one answer is of the same instant. It bounds every assessed window:
+        // nothing in the future has been evaluated, however far ahead the requested period
+        // ends — the same rule [`window_has_begun`] applies to the period itself, on that
+        // same one sample.
         let mut assessed: BTreeMap<String, &'static str> = BTreeMap::new();
         for target in targets {
             let kind = audit_target_kind(&target.data);
-            for name in self.audited(&target.data, window_start, window_end) {
+            for name in self.audited(&target.data, window_start, window_end, now) {
                 assessed.entry(name).or_insert(kind);
             }
         }
@@ -4236,7 +4268,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
                         slo,
                         window_start,
                         window_end,
-                        &now,
+                        now,
                     )]),
                     operation: entity.operation_name,
                     // Only the SLO auditor produces a result here, and the context it
@@ -4276,7 +4308,15 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         target: &AuditTargetEntity,
         window_start: &DateTime,
         window_end: &DateTime,
+        now: &DateTime,
     ) -> Vec<String> {
+        // The request's own half of the window test, decided ONCE for the whole answer from
+        // the instant this read is served at: a period that has not begun then evaluated
+        // nothing, so no target resolves to an objective in it ([`window_has_begun`], the
+        // same decision [`Self::monitoring`] below applies).
+        if !window_has_begun(window_start, now) {
+            return Vec::new();
+        }
         match target {
             AuditTargetEntity::Slo(entity) => {
                 let mut resolved: Option<&ServiceLevelObjective> = None;
@@ -4293,7 +4333,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
                     resolved = Some(slo);
                 }
                 resolved
-                    .filter(|slo| monitored_in_window(slo, window_start, window_end))
+                    .filter(|slo| monitored_in_window(slo, window_end))
                     .map(|slo| vec![slo.name.clone()])
                     .unwrap_or_default()
             }
@@ -4301,7 +4341,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
                 let Some(attributes) = audited_entity_attributes(entity) else {
                     return Vec::new();
                 };
-                self.monitoring(&attributes, window_start, window_end)
+                self.monitoring(&attributes, window_start, window_end, now)
                     .map(|slo| slo.name.clone())
                     .collect()
             }
@@ -4314,7 +4354,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
                 let Some(attributes) = audited_entity_attributes(service) else {
                     return Vec::new();
                 };
-                self.monitoring(&attributes, window_start, window_end)
+                self.monitoring(&attributes, window_start, window_end, now)
                     .filter(|slo| {
                         let assessed = entity_of(slo);
                         assessed.operation_name.as_deref() == Some(operation)
