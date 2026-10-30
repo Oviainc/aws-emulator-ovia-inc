@@ -95,7 +95,7 @@ const SILENCE: std::time::Duration = std::time::Duration::from_millis(1_500);
 const WINDOW_ROOM_SECS: f64 = 4.0;
 
 /// One CloudWatch call, requiring a 200.
-async fn cw(emulator: &Emulator, operation: &str, body: &Value) -> Value {
+pub async fn cw(emulator: &Emulator, operation: &str, body: &Value) -> Value {
     rpc(
         emulator,
         "monitoring",
@@ -311,7 +311,7 @@ async fn await_both_driven(
 }
 
 /// The alarm history items of `item_type` recorded for `name`.
-async fn history(emulator: &Emulator, name: &str, item_type: &str) -> Vec<Value> {
+pub async fn history(emulator: &Emulator, name: &str, item_type: &str) -> Vec<Value> {
     let reported = cw(
         emulator,
         "DescribeAlarmHistory",
@@ -336,7 +336,7 @@ async fn history(emulator: &Emulator, name: &str, item_type: &str) -> Vec<Value>
 /// notification off the queue can still read the history before the item accounting for it is
 /// written. So a count of them is read the way the queue is — until the item being asserted
 /// about is there — while the assertion that follows keeps the upper bound the rule states.
-async fn await_history(
+pub async fn await_history(
     emulator: &Emulator,
     name: &str,
     item_type: &str,
@@ -354,16 +354,17 @@ async fn await_history(
 
 /// Every notification that has arrived on one queue, accumulated across reads: a receive hides
 /// what it handed over, so a test that reads the queue several times has to keep what it saw.
-struct Mailbox {
+pub struct Mailbox {
     /// The queue every read below is made against.
     url: String,
-    /// The alarm notifications read so far, in arrival order.
-    arrived: Vec<Value>,
+    /// What arrived so far, in arrival order: each delivery as the SNS envelope it came in and
+    /// the alarm notification that envelope carried.
+    arrived: Vec<(Value, Value)>,
 }
 
 impl Mailbox {
     /// A mailbox over the queue at `url`.
-    fn over(url: &str) -> Self {
+    pub fn over(url: &str) -> Self {
         Self {
             url: url.to_string(),
             arrived: Vec::new(),
@@ -388,7 +389,7 @@ impl Mailbox {
             let notification: Value = serde_json::from_str(inner).unwrap_or_else(|error| {
                 panic!("a delivery is not an alarm notification ({error}): {inner}")
             });
-            self.arrived.push(notification);
+            self.arrived.push((envelope, notification));
             let receipt = message["ReceiptHandle"]
                 .as_str()
                 .unwrap_or_else(|| panic!("a received message carries a receipt handle: {message}"));
@@ -405,7 +406,12 @@ impl Mailbox {
 
     /// Read the queue until it has delivered `wanted` notifications for `alarm`, or the
     /// deadline passes.
-    async fn await_for(&mut self, emulator: &Emulator, alarm: &str, wanted: usize) -> Vec<Value> {
+    pub async fn await_for(
+        &mut self,
+        emulator: &Emulator,
+        alarm: &str,
+        wanted: usize,
+    ) -> Vec<Value> {
         let deadline = std::time::Instant::now() + DEADLINE;
         loop {
             self.read(emulator).await;
@@ -419,7 +425,7 @@ impl Mailbox {
 
     /// Read the queue for `span`, which is how a client establishes that a notification does
     /// NOT come.
-    async fn read_over(&mut self, emulator: &Emulator, span: std::time::Duration) {
+    pub async fn read_over(&mut self, emulator: &Emulator, span: std::time::Duration) {
         let deadline = std::time::Instant::now() + span;
         while std::time::Instant::now() < deadline {
             self.read(emulator).await;
@@ -428,18 +434,33 @@ impl Mailbox {
     }
 
     /// Every notification that named `alarm`.
-    fn of(&self, alarm: &str) -> Vec<Value> {
+    pub fn of(&self, alarm: &str) -> Vec<Value> {
+        self.delivered_to(alarm)
+            .map(|(_, notification)| notification.clone())
+            .collect()
+    }
+
+    /// The SNS envelope each of those notifications was delivered in.
+    pub fn envelopes_of(&self, alarm: &str) -> Vec<Value> {
+        self.delivered_to(alarm)
+            .map(|(envelope, _)| envelope.clone())
+            .collect()
+    }
+
+    /// Every delivery whose notification named `alarm`.
+    fn delivered_to<'mailbox>(
+        &'mailbox self,
+        alarm: &'mailbox str,
+    ) -> impl Iterator<Item = &'mailbox (Value, Value)> {
         self.arrived
             .iter()
-            .filter(|notification| notification["AlarmName"].as_str() == Some(alarm))
-            .cloned()
-            .collect()
+            .filter(move |(_, notification)| notification["AlarmName"].as_str() == Some(alarm))
     }
 }
 
 /// Turn the named alarm's actions off or on through the operation that writes the switch, and
 /// read the switch back the way a client does.
-async fn switch_actions(emulator: &Emulator, name: &str, on: bool) {
+pub async fn switch_actions(emulator: &Emulator, name: &str, on: bool) {
     let operation = if on {
         "EnableAlarmActions"
     } else {
@@ -504,7 +525,7 @@ fn assert_reports_transition(
 }
 
 /// The state value one `StateUpdate` history item records the alarm as having moved to.
-fn recorded_state(item: &Value) -> String {
+pub fn recorded_state(item: &Value) -> String {
     let data = item["HistoryData"].as_str().unwrap_or_default();
     let document: Value = serde_json::from_str(data)
         .unwrap_or_else(|error| panic!("HistoryData is not JSON ({error}): {data}"));

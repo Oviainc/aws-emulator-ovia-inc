@@ -27,7 +27,8 @@
 use serde_json::{json, Value};
 
 use crate::harness::{
-    element, emulator, given_queue, received_messages, rpc, sns, subscribe_queue, Emulator,
+    element, emulator, given_queue, grant_sns_delivery_from, received_messages, rpc, sns,
+    subscribe_queue, Emulator,
 };
 
 /// The service principal this emulator executes an alarm action as, which a topic policy names
@@ -63,34 +64,6 @@ async fn given_topic(emulator: &Emulator, name: &str, queue_arn: &str) -> String
     );
     subscribe_queue(emulator, &topic, queue_arn).await;
     topic
-}
-
-/// Grant the SNS service principal the send on the queue at `url`, scoped by `aws:SourceArn`
-/// to `topics` — the grant AWS documents for a queue subscribed to those topics, written the
-/// way a client that subscribes one queue to SEVERAL topics writes it.
-async fn grant_sns_delivery_from(emulator: &Emulator, url: &str, queue_arn: &str, topics: &[&str]) {
-    rpc(
-        emulator,
-        "sqs",
-        "AmazonSQS",
-        "SetQueueAttributes",
-        &json!({
-            "QueueUrl": url,
-            "Attributes": {"Policy": json!({
-                "Version": "2012-10-17",
-                "Statement": [{
-                    "Sid": "AllowSNSDelivery",
-                    "Effect": "Allow",
-                    "Principal": {"Service": "sns.amazonaws.com"},
-                    "Action": "sqs:SendMessage",
-                    "Resource": queue_arn,
-                    "Condition": {"ArnEquals": {"aws:SourceArn": topics}},
-                }],
-            })
-            .to_string()},
-        }),
-    )
-    .await;
 }
 
 /// The `Policy` attribute the topic `topic_arn` REPORTS, parsed: the document the publish

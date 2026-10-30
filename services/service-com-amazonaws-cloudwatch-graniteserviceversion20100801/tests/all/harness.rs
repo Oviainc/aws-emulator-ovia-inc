@@ -356,6 +356,41 @@ pub async fn grant_sns_delivery_on(emulator: &Emulator, url: &str, queue_arn: &s
     .await;
 }
 
+/// Grant the SNS service principal the send on the queue at `url`, scoped by `aws:SourceArn` to
+/// `topics` — the grant AWS documents for a queue subscribed to those topics, written the way a
+/// client that subscribes one queue to them writes it. The one definition of that grant, so the
+/// suites that assert a delivery the queue's own policy had to allow cannot each scope it their
+/// own way.
+pub async fn grant_sns_delivery_from(
+    emulator: &Emulator,
+    url: &str,
+    queue_arn: &str,
+    topics: &[&str],
+) {
+    rpc(
+        emulator,
+        "sqs",
+        "AmazonSQS",
+        "SetQueueAttributes",
+        &::serde_json::json!({
+            "QueueUrl": url,
+            "Attributes": {"Policy": ::serde_json::json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Sid": "AllowSNSDelivery",
+                    "Effect": "Allow",
+                    "Principal": {"Service": "sns.amazonaws.com"},
+                    "Action": "sqs:SendMessage",
+                    "Resource": queue_arn,
+                    "Condition": {"ArnEquals": {"aws:SourceArn": topics}},
+                }],
+            })
+            .to_string()},
+        }),
+    )
+    .await;
+}
+
 /// Subscribe the queue `queue_arn` to the topic `topic_arn`.
 pub async fn subscribe_queue(emulator: &Emulator, topic_arn: &str, queue_arn: &str) {
     sns(

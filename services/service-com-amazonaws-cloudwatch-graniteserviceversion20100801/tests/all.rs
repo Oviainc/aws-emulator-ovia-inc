@@ -101,6 +101,8 @@ mod insight_rules;
 mod list_metric_streams;
 #[path = "all/list_tags_for_resource_reads.rs"]
 mod list_tags_for_resource_reads;
+#[path = "all/live_published_actions_split.rs"]
+mod live_published_actions_split;
 #[path = "all/log_alarms.rs"]
 mod log_alarms;
 #[path = "all/managed_insight_rule_catalog.rs"]
