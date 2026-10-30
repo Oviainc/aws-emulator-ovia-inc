@@ -38,9 +38,11 @@ use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gat
 
 use backup_gateway::state::{service_state, METADATA_SYNC_SUCCEEDS_AFTER};
 
-use crate::gateway_lifecycle::{build_engine, build_router, call, create, Reply, REGION};
+use crate::gateway_lifecycle::{
+    build_engine, build_router, call, create, persisted_client_tags, Reply, REGION,
+};
 use crate::hypervisor_property_mappings::import;
-use crate::metadata_sync_over_the_wire::start_sync;
+use crate::metadata_sync_over_the_wire::{start_sync, syncable_hypervisor};
 
 /// Long enough past [`METADATA_SYNC_SUCCEEDS_AFTER`] that a sync started before the wait
 /// has fallen due on a loaded machine too.
@@ -66,21 +68,6 @@ fn tag_map<'a>(
         .into_iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect()
-}
-
-/// The tags `arn` carries according to the STORE, not the wire: what a response reports
-/// has to be the record that is really persisted.
-fn persisted_tags(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> BTreeMap<String, String> {
-    service_state(&**engine)
-        .expect("the in-memory engine must expose this state")
-        .lock()
-        .resource_tags(arn, SystemTime::now())
-        .map(|(_, tags)| {
-            tags.into_iter()
-                .map(|tag| (tag.key, tag.value))
-                .collect::<BTreeMap<String, String>>()
-        })
-        .unwrap_or_else(|| panic!("no resource stored under {arn}"))
 }
 
 async fn tag(router: &MultiServiceRouter, arn: &str, tags: &[(&str, &str)]) -> Reply {
@@ -176,15 +163,15 @@ async fn machines_of(router: &MultiServiceRouter, hypervisor_arn: &str) -> Vec<S
         .unwrap_or_default()
 }
 
-/// Import a hypervisor, sync it, wait for the sync to fall due, and hand back the ARNs of
-/// the machines its inventory now holds — the wire-only path from "no machines" to a
-/// machine a client can name.
+/// Import a hypervisor the sync's precondition is met for, sync it, wait for the sync to
+/// fall due, and hand back the ARNs of the machines its inventory now holds — the wire-only
+/// path from "no machines" to a machine a client can name.
 async fn synced_machines(
     router: &MultiServiceRouter,
     name: &str,
     host: &str,
 ) -> (String, Vec<String>) {
-    let hypervisor = import(router, name, host).await;
+    let hypervisor = syncable_hypervisor(router, name, host).await;
     let started = start_sync(router, &hypervisor).await;
     assert_eq!(
         started.status, 200,
@@ -401,7 +388,7 @@ async fn tagging_spans_every_resource_this_service_holds() {
                 "case {case:?}: after tagging, the resource must carry {expected:?}, \
                  ListTagsForResource reported {listed:?}"
             );
-            let stored = persisted_tags(&engine, arn);
+            let stored = persisted_client_tags(&engine, arn);
             assert_eq!(
                 stored, expected,
                 "case {case:?}: after tagging, the STORE must hold {expected:?}, it holds \
@@ -426,7 +413,7 @@ async fn tagging_spans_every_resource_this_service_holds() {
                  ListTagsForResource reported {after:?}",
                 row.remove
             );
-            let stored_after = persisted_tags(&engine, arn);
+            let stored_after = persisted_client_tags(&engine, arn);
             assert_eq!(
                 stored_after, left,
                 "case {case:?}: after removing {:?} the STORE must hold {left:?}, it holds \
@@ -478,7 +465,7 @@ async fn listing_tags_changes_nothing_a_later_caller_sees() {
                 listed, expected,
                 "case {case:?}: a repeated read must report {expected:?}, got {listed:?}"
             );
-            let stored = persisted_tags(&engine, arn);
+            let stored = persisted_client_tags(&engine, arn);
             assert_eq!(
                 stored, expected,
                 "case {case:?}: a read must leave the store holding {expected:?}, it holds \
@@ -530,7 +517,7 @@ async fn a_machines_tags_survive_a_resync_of_its_hypervisor() {
         listed, expected,
         "a re-sync must leave the machine's tags alone, got {listed:?}"
     );
-    let stored = persisted_tags(&engine, &machine);
+    let stored = persisted_client_tags(&engine, &machine);
     assert_eq!(
         stored, expected,
         "a re-sync must leave the STORE holding {expected:?}, it holds {stored:?}"
@@ -555,7 +542,8 @@ async fn the_tagging_operations_resolve_exactly_the_machines_the_service_reports
     // them yet — neither the listing that would hand a client the ARN, nor the read, nor
     // the tagging operations. Their ARNs are read out of the store (the only place they
     // exist before the sync falls due) with a clock far enough ahead to see them.
-    let in_flight_hypervisor = import(&router, "hv-agree-in-flight", "192.0.2.82").await;
+    let in_flight_hypervisor =
+        syncable_hypervisor(&router, "hv-agree-in-flight", "192.0.2.82").await;
     start_sync(&router, &in_flight_hypervisor).await;
     let pending = pending_machines(&engine, &in_flight_hypervisor);
     assert!(

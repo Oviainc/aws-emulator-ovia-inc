@@ -106,7 +106,8 @@
 //! the hypervisor record rather than in a map beside it, because that is the resource
 //! they belong to: `GetHypervisorPropertyMappings` reports the mappings of the record its
 //! `ServerArn` resolves to, and a hypervisor that carries none has no mappings resource
-//! to report ([`MissingResource::PropertyMappings`]).
+//! to report ([`MissingResource::PropertyMappings`]) and no metadata sync it can start
+//! ([`MAPPINGS_NOT_CONFIGURED`]).
 //! `PutHypervisorPropertyMappings` is what writes them
 //! ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::set_property_mappings`]),
 //! and only for a hypervisor this store HOLDS
@@ -117,6 +118,15 @@
 //! ([`MissingResource::Hypervisor`]), and for a record this store does hold, the appliance
 //! that serves it is what applies the mappings, so with none associated the request is
 //! refused ([`GATEWAY_OUT_OF_DATE`]) and nothing is written.
+//!
+//! Every resource a REQUEST of this API creates — a gateway and a hypervisor — carries the
+//! AWS-assigned system tags beside the client's own: who created it
+//! ([`CREATED_BY_TAG_KEY`], read off the signed request through [`request_created_by`])
+//! and when ([`CREATED_DATE_TAG_KEY`]). They are stamped when the record is minted and a
+//! tag read reports them AHEAD of the client's tags ([`reported_tags`]); they live in the
+//! reserved key namespace ([`is_reserved_tag_key`]), so a client can neither write nor
+//! remove one, and the client's own tags stay the map the tagging operations merge into
+//! and remove from.
 //!
 //! The gateway's APPLIANCE SOFTWARE UPDATE ([`StoredGateway::software_update`]) is
 //! written by `UpdateGatewaySoftwareNow` and by nothing else
@@ -129,7 +139,10 @@
 //!
 //! A hypervisor also carries the METADATA SYNC last started on it
 //! ([`StoredHypervisor::metadata_sync_started`]):
-//! `StartVirtualMachinesMetadataSync` persists the instant it was requested at, and the
+//! `StartVirtualMachinesMetadataSync` persists the instant it was requested at — for a
+//! hypervisor whose property mappings are configured, which is the sync's PRECONDITION
+//! ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::property_mappings_configured`])
+//! — and the
 //! `SyncMetadataStatus` and times a read reports are derived from that instant and the
 //! clock ([`StoredHypervisor::latest_metadata_sync_status_as_of`]) the way the
 //! hypervisor's own state is, so a read never moves a sync along and every reader agrees
@@ -283,34 +296,41 @@ pub const MAPPINGS_NOT_FOUND: &str = "MappingsNotFound";
 pub const MAPPINGS_NOT_FOUND_MESSAGE: &str = "The mappings are not found.";
 
 /// `AccessDeniedException$ErrorCode` for a metadata sync asked for a `HypervisorArn` this
-/// store holds no hypervisor under.
+/// store holds no property mappings for.
+///
+/// A metadata sync has a PRECONDITION: the hypervisor's property mappings
+/// ([`StoredPropertyMappings`], what `PutHypervisorPropertyMappings` sets) have to be
+/// configured before the sync is started, and a `HypervisorArn` this store holds none
+/// under — because the record carries no mappings, or because there is no record at all —
+/// is refused rather than synced. The refusal is a PERMISSION matter, the modelled
+/// `AccessDeniedException`, so it says nothing about whether the ARN names anything.
 ///
 /// `AccessDeniedException$ErrorCode` is REQUIRED and documented as "A description of why
 /// you have insufficient permissions"
-/// (`smithy_query(query="shape",shape="AccessDeniedException")`). A sync of a record the
-/// service does not hold is answered as a PERMISSION matter (HTTP 403) rather than as a
-/// missing resource, so the refusal says nothing about whether the ARN names anything.
-///
-/// Both halves of that — the shape and this `ErrorCode`, answered for an ARN naming no
-/// hypervisor at all — are what the recorded unit
-/// `backup-gateway.start-metadata-sync-state-transition` pins
+/// (`smithy_query(query="shape",shape="AccessDeniedException")`). Both halves — the shape
+/// and this `ErrorCode`, answered for an ARN naming no hypervisor at all — are what the
+/// recorded unit `backup-gateway.start-metadata-sync-state-transition` pins
 /// (`issues/things-that-now-work/20261023T110543Z-backup-gateway-startvirtualmachinesmetadatasync-stub.md`,
 /// whose check asserts an `AccessDeniedException` with this code for a nonexistent
 /// `HypervisorArn`, before any resource-existence lookup), so neither the value nor the
-/// answer being a refusal of that kind is this emulator's choice. It says nothing about a
-/// hypervisor the store DOES hold: the sync of such a record is conditioned on nothing
-/// ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::start_metadata_sync`]), and
-/// property mappings in particular are an optional tagging feature of the record
-/// ([`StoredPropertyMappings`]) rather than a precondition of a sync.
+/// answer being a refusal of that kind is this emulator's choice — and the gate firing
+/// before the existence lookup is why one ARN naming nothing and one naming an
+/// unconfigured record take the same answer.
 pub const MAPPINGS_NOT_CONFIGURED: &str = "MappingsNotConfigured";
 
-/// See [`MAPPINGS_NOT_CONFIGURED`]. The sentence the modelled shape itself states —
-/// `AccessDeniedException`'s own doc, "The operation cannot proceed because you have
-/// insufficient permissions" (`smithy_query(query="shape",shape="AccessDeniedException")`)
-/// — so the condition is named once, by the REQUIRED `ErrorCode`, and the message states
-/// the refusal in the model's own words rather than in invented ones.
+/// See [`MAPPINGS_NOT_CONFIGURED`]: the sentence AWS is recorded stating for that refusal,
+/// entirely fixed text with no part taken from the request.
 pub const MAPPINGS_NOT_CONFIGURED_MESSAGE: &str =
-    "The operation cannot proceed because you have insufficient permissions.";
+    "HypervisorPropertyMappings is not configured for the Hypervisor";
+
+/// The status this service answers the [`MAPPINGS_NOT_CONFIGURED`] refusal with.
+///
+/// NOT the status `AccessDeniedException`'s `@httpError` declares (403): AWS is recorded
+/// answering this precondition refusal 400, so the handler overrides the modelled status
+/// exactly as [`MissingResource::status_override`] does for a missing hypervisor — and the
+/// choice is stated here, beside this service's other refusal statuses, rather than in the
+/// handler.
+pub const MAPPINGS_NOT_CONFIGURED_STATUS: u16 = 400;
 
 /// `ValidationException$ErrorCode` for a request that only the backup gateway serving a
 /// hypervisor can carry out, made for a hypervisor NO gateway is associated with.
@@ -775,6 +795,66 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// member that targets that shape. Matched case-insensitively, as the reservation is.
 pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
+/// Whether `key` lies in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace — the keys AWS
+/// assigns itself and a client may not write ([`validate_tag_pair`]) or remove.
+///
+/// Matched case-insensitively, as the reservation is, so the one rule covers every
+/// spelling of the prefix.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.to_ascii_lowercase()
+        .starts_with(RESERVED_TAG_KEY_PREFIX)
+}
+
+/// The AWS-assigned tag key naming the identity that created a resource.
+///
+/// A resource created through this API carries the provenance AWS stamps on it, and the
+/// recorded wire of a tag read reports it ahead of the client's own tags
+/// ([`reported_tags`]). It is in the reserved namespace
+/// ([`RESERVED_TAG_KEY_PREFIX`]), so no client can write or remove it.
+pub const CREATED_BY_TAG_KEY: &str = "aws:createdBy";
+
+/// The AWS-assigned tag key naming WHEN a resource was created — the record's own
+/// creation instant, the companion of [`CREATED_BY_TAG_KEY`].
+pub const CREATED_DATE_TAG_KEY: &str = "aws:createdDate";
+
+/// The identity a request speaks for, as [`CREATED_BY_TAG_KEY`]'s value names it.
+///
+/// The colon-separated fields are the kind of principal the request was signed by, the
+/// credential it presented and the name that credential speaks for — the three facts a
+/// serving service can read off a signed request, resolved through the one rule every
+/// service of this emulator resolves a caller with
+/// (`::service_common::management_events::recorded_caller`), so two services naming one
+/// caller name it alike. A temporary credential speaks for a session whose name this
+/// service cannot resolve, and an unsigned request presents no credential at all: the
+/// fields that cannot be resolved are left off rather than guessed.
+///
+/// Read off the SIGNED REQUEST and never off its body: the creator of a resource is who
+/// called, not anything the caller asked for. Every field comes from the credential scope
+/// the caller itself presented, so the value discloses nothing to that caller it did not
+/// send; no secret is read or reported — a key id cannot sign a request.
+pub fn request_created_by(parts: &::http::request::Parts) -> String {
+    let caller = ::service_common::management_events::recorded_caller(parts);
+    match (caller.access_key_id, caller.user_name) {
+        (Some(key), Some(name)) => format!("{}:{key}:{name}", caller.principal_type),
+        (Some(key), None) => format!("{}:{key}", caller.principal_type),
+        (None, _) => caller.principal_type.to_string(),
+    }
+}
+
+/// WHO created a resource and WHEN: the provenance of the call that minted a record, and
+/// the two facts the AWS-assigned system tags report ([`system_tag_list`]).
+///
+/// One value rather than two parameters, because a creation has one creator and one
+/// instant: every writer of this store that mints a resource takes this, so neither fact
+/// can be supplied without the other.
+#[derive(Debug, Clone)]
+pub struct Creation {
+    /// The identity the creating request was signed by ([`request_created_by`]).
+    pub by: String,
+    /// The instant the record is created at — what its `created_time` keeps.
+    pub at: SystemTime,
+}
+
 /// One activation this service has ISSUED and no create has redeemed yet.
 ///
 /// Keyed in the store by the activation key itself: the key is what a create presents, so
@@ -826,6 +906,10 @@ pub struct StoredGateway {
     pub last_seen_time: SystemTime,
     /// When this record was created.
     pub created_time: SystemTime,
+    /// The identity that created this resource, as [`CREATED_BY_TAG_KEY`] names it
+    /// ([`request_created_by`]) — read off the request that created the record and kept
+    /// on it, so every later read of its tags reports the same creator.
+    pub created_by: String,
     /// `SoftwareVersion` of the appliance: the version it is running now, moved only by
     /// an appliance software update whose install has fallen due
     /// ([`Self::software_version_as_of`]).
@@ -933,9 +1017,10 @@ impl StoredGateway {
         }
     }
 
-    /// The persisted tags as the modelled `Tags` list, in key order.
+    /// Every tag a read of this resource reports: the AWS-assigned system tags, then the
+    /// client's own in key order ([`reported_tags`]).
     pub fn tag_list(&self) -> Vec<Tag> {
-        tag_list(&self.tags)
+        reported_tags(&self.created_by, self.created_time, &self.tags)
     }
 }
 
@@ -963,6 +1048,61 @@ fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
             value: value.clone(),
         })
         .collect()
+}
+
+/// Every tag a read reports for a resource this service CREATED for a caller: the two
+/// AWS-assigned system tags first ([`system_tag_list`]), then the client's own in key
+/// order ([`tag_list`]).
+///
+/// The two namespaces are kept apart in the record — the client's tags are the map
+/// `TagResource` merges into and `UntagResource` removes from, and the system pair is
+/// derived from the record's own provenance — so a client can neither write nor remove an
+/// AWS-assigned key ([`is_reserved_tag_key`]), and the system pair cannot be pushed out of
+/// its leading position by a client key that happens to sort below `aws:`.
+fn reported_tags(
+    created_by: &str,
+    created_time: SystemTime,
+    tags: &BTreeMap<String, String>,
+) -> Vec<Tag> {
+    system_tag_list(created_by, created_time)
+        .into_iter()
+        .chain(tag_list(tags))
+        .collect()
+}
+
+/// The AWS-assigned tags a resource created through this API carries: who created it
+/// ([`CREATED_BY_TAG_KEY`]) and when ([`CREATED_DATE_TAG_KEY`]).
+///
+/// Both are facts about the call that minted the record, so neither is derived from the
+/// request body and neither moves afterwards: a later read of one resource reports the
+/// creator and the creation instant the record has always had.
+fn system_tag_list(created_by: &str, created_time: SystemTime) -> Vec<Tag> {
+    vec![
+        Tag {
+            key: CREATED_BY_TAG_KEY.to_string(),
+            value: created_by.to_string(),
+        },
+        Tag {
+            key: CREATED_DATE_TAG_KEY.to_string(),
+            value: created_date(created_time),
+        },
+    ]
+}
+
+/// A creation instant as [`CREATED_DATE_TAG_KEY`]'s value spells it: a tag value is a
+/// string, so the instant is rendered as an ISO-8601 `date-time` (RFC 3339, as
+/// `aws_smithy_types` writes a `DateTime`), truncated to WHOLE SECONDS — the granularity a
+/// creation date is reported at.
+///
+/// An instant built from whole seconds has no rendering a formatter can refuse, and this
+/// runs on a request path, so the unreachable arm answers the empty string rather than
+/// panicking and costing every caller the store.
+fn created_date(created_time: SystemTime) -> String {
+    // Through the crate's one `SystemTime` -> `DateTime` conversion, then truncated: `secs`
+    // is the whole-second part of that instant.
+    ::aws_smithy_types::DateTime::from_secs(date_time(created_time).secs())
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
 }
 
 /// One persisted hypervisor.
@@ -1004,6 +1144,10 @@ pub struct StoredHypervisor {
     pub latest_metadata_sync_status_message: Option<String>,
     /// When this record was created.
     pub created_time: SystemTime,
+    /// The identity that created this resource — the same fact
+    /// [`StoredGateway::created_by`] keeps, read off the request that imported the record
+    /// ([`request_created_by`]).
+    pub created_by: String,
     /// The resource's tags, by key — the same representation [`StoredGateway::tags`]
     /// uses, so the tagging operations treat both resources alike.
     pub tags: BTreeMap<String, String>,
@@ -1118,9 +1262,12 @@ impl StoredHypervisor {
         }
     }
 
-    /// The persisted tags as the modelled `Tags` list, in key order.
+    /// Every tag a read of this resource reports: the AWS-assigned system tags, then the
+    /// client's own in key order ([`reported_tags`]) — the same rendering
+    /// [`StoredGateway::tag_list`] answers with, so the two resource types report their
+    /// tags alike.
     pub fn tag_list(&self) -> Vec<Tag> {
-        tag_list(&self.tags)
+        reported_tags(&self.created_by, self.created_time, &self.tags)
     }
 }
 
@@ -1199,6 +1346,12 @@ impl StoredVirtualMachine {
     }
 
     /// The persisted AWS tags as the modelled `Tags` list, in key order.
+    ///
+    /// No AWS-assigned system tag ([`system_tag_list`]) among them, unlike the two
+    /// resource types a REQUEST creates: no operation of this model creates a virtual
+    /// machine, so no caller created this record and there is no creating identity to
+    /// report. It reaches the service as part of the inventory a metadata sync reads off
+    /// the hypervisor it runs on ([`StoredVirtualMachine::discovered_time`]).
     pub fn tag_list(&self) -> Vec<Tag> {
         tag_list(&self.tags)
     }
@@ -1610,7 +1763,7 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         display_name: &str,
         gateway_type: &str,
         tags: BTreeMap<String, String>,
-        now: SystemTime,
+        creation: Creation,
     ) -> StoredGateway {
         let (gateway_id, arn) = self.mint_resource(MintedResource::Gateway, region);
         let record = StoredGateway {
@@ -1621,8 +1774,9 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
             activation_key: activation_key.to_string(),
             hypervisor_arn: None,
             hypervisor_id: None,
-            last_seen_time: now,
-            created_time: now,
+            last_seen_time: creation.at,
+            created_time: creation.at,
+            created_by: creation.by,
             software_version: GATEWAY_SOFTWARE_VERSION.to_string(),
             software_update: None,
             vpc_endpoint: None,
@@ -1865,7 +2019,7 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         &mut self,
         region: &str,
         configuration: HypervisorConfiguration,
-        now: SystemTime,
+        creation: Creation,
     ) -> StoredHypervisor {
         let (_, arn) = self.mint_resource(MintedResource::Hypervisor, region);
         let record = StoredHypervisor {
@@ -1875,11 +2029,12 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
             kms_key_arn: configuration.kms_key_arn,
             log_group_arn: None,
             state: HYPERVISOR_PENDING.to_string(),
-            online_due: Some(now + HYPERVISOR_PENDING_FOR),
+            online_due: Some(creation.at + HYPERVISOR_PENDING_FOR),
             last_successful_metadata_sync_time: None,
             latest_metadata_sync_status: None,
             latest_metadata_sync_status_message: None,
-            created_time: now,
+            created_time: creation.at,
+            created_by: creation.by,
             tags: configuration.tags,
             // An import starts no metadata sync: `StartVirtualMachinesMetadataSync` is
             // the operation that does, for a hypervisor that already exists.
@@ -2040,14 +2195,31 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         self.hypervisors.get(arn).cloned()
     }
 
+    /// Whether this store holds property mappings for the hypervisor `arn` names — the
+    /// PRECONDITION of a metadata sync ([`MAPPINGS_NOT_CONFIGURED`]).
+    ///
+    /// `false` both for a record carrying no mappings and for an ARN naming no record at
+    /// all: the question is whether the mappings a sync needs are configured, and neither
+    /// case has them, which is why the one refusal covers both and reveals nothing about
+    /// whether the resource exists. An EMPTY mapping list is configured — the mappings
+    /// resource exists and holds no mapping ([`StoredPropertyMappings`]), which is what
+    /// `GetHypervisorPropertyMappings` reports for it too.
+    pub fn property_mappings_configured(&self, arn: &str) -> bool {
+        self.hypervisors
+            .get(arn)
+            .is_some_and(|record| record.property_mappings.is_some())
+    }
+
     /// Start a metadata sync on the hypervisor stored under `arn` at `now`, and hand back
     /// the record as it is now STORED — read out of the map after the write, so what a
     /// caller gets is what the store holds.
     ///
-    /// `None` — nothing written — when this store holds no hypervisor under `arn`. That is
-    /// the ONLY thing a sync is conditioned on: a record this store holds is synced
-    /// whether or not it carries property mappings, which are the optional VMware-to-Amazon
-    /// tag mappings of the record ([`StoredPropertyMappings`]) and not a precondition.
+    /// `None` — nothing written — when this store holds no hypervisor under `arn`. Whether
+    /// the sync may be started at all is settled BEFORE this is reached: its precondition
+    /// is the hypervisor's property mappings
+    /// ([`Self::property_mappings_configured`], the refusal
+    /// [`MAPPINGS_NOT_CONFIGURED`] states), so a record reaching here has them and this
+    /// writes the sync it is asked for.
     ///
     /// What is persisted is the instant the sync was REQUESTED, the status and message
     /// that instant puts the record in, and the time of a sync that had already
@@ -2610,7 +2782,7 @@ pub fn validate_tag_pair(
     key_at: &str,
     value_at: &str,
 ) -> Result<(), String> {
-    if key.to_ascii_lowercase().starts_with(RESERVED_TAG_KEY_PREFIX) {
+    if is_reserved_tag_key(key) {
         return Err(crate::service::handler_constraint_violation(
             Some(key),
             key_at,

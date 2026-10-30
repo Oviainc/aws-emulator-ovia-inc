@@ -239,7 +239,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.gateway_display_name,
             &input.gateway_type,
             tags,
-            ::std::time::SystemTime::now(),
+            // WHO created the record and WHEN — the creator read off the SIGNED REQUEST and
+            // never off its body, which a later tag read reports as `aws:createdBy`.
+            crate::state::Creation {
+                by: crate::state::request_created_by(ctx.parts()),
+                at: ::std::time::SystemTime::now(),
+            },
         );
 
         // The record of a state-changing call: which gateway was minted, in which region,

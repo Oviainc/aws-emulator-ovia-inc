@@ -15,6 +15,13 @@
 //! has to span — partition, region, account, resource id, and a resource id longer than a
 //! machine name may be — are not all reachable over the wire of one emulator: a client can
 //! only address a region.
+//!
+//! A metadata sync's precondition is that the hypervisor's property mappings are
+//! configured (`metadata_sync_requires_property_mappings`), and the appliance that puts
+//! them is associated per region; so the wire case seeds the mappings straight into the
+//! `property_mappings` field `PutHypervisorPropertyMappings` writes, exactly as the
+//! `metadata_sync` suite does, and every call about the inventory itself goes over the
+//! wire.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -25,11 +32,12 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gateway;
 
 use backup_gateway::state::{
-    synced_inventory, VirtualMachineInventory, MAX_VIRTUAL_MACHINE_NAME,
+    synced_inventory, StoredPropertyMappings, VirtualMachineInventory, MAX_VIRTUAL_MACHINE_NAME,
     METADATA_SYNC_SUCCEEDS_AFTER, SYNCED_VIRTUAL_MACHINES,
 };
 
 use crate::gateway_lifecycle::{build_engine, build_router, call_in_region, Reply, REGION};
+use crate::hypervisor_property_mappings::{mapping, set_mappings};
 
 /// Long enough past [`METADATA_SYNC_SUCCEEDS_AFTER`] that a sync started before the wait
 /// has fallen due on a loaded machine too — the span the sibling suites wait.
@@ -191,6 +199,20 @@ async fn syncs_of_two_hypervisors_never_publish_the_same_machine() {
     let mut imported: Vec<(&Row, String)> = Vec::new();
     for row in &rows {
         let arn = import_in(&router, row.region, row.name, row.host).await;
+        // The sync's precondition: the record's property mappings, seeded here (see the
+        // module docs) so what the cases below compare is the inventory each sync
+        // publishes.
+        set_mappings(
+            &engine,
+            &arn,
+            Some(StoredPropertyMappings {
+                iam_role_arn: format!(
+                    "arn:aws:iam::{}:role/per-record",
+                    engine::EMULATOR_ACCOUNT_ID
+                ),
+                vmware_to_aws_tag_mappings: vec![mapping("tier", "gold", "Tier", "Gold")],
+            }),
+        );
         let started = start_sync_in(&router, row.region, &arn).await;
         assert_eq!(
             (started.status, started.str_at("/HypervisorArn")),

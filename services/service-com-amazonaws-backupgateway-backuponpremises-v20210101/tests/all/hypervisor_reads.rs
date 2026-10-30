@@ -30,7 +30,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gateway;
 
 use backup_gateway::state::{
-    service_state, HypervisorConfiguration, HYPERVISOR_ONLINE, HYPERVISOR_PENDING,
+    service_state, Creation, HypervisorConfiguration, HYPERVISOR_ONLINE, HYPERVISOR_PENDING,
     HYPERVISOR_PENDING_FOR,
 };
 
@@ -1171,7 +1171,10 @@ async fn a_record_imported_through_the_state_api_reads_back_the_same_way() {
             kms_key_arn: None,
             tags: BTreeMap::from([("env".to_string(), "test".to_string())]),
         },
-        SystemTime::now(),
+        Creation {
+            by: "SEEDED-CREATOR".to_string(),
+            at: SystemTime::now(),
+        },
     );
     assert!(
         matches_modelled_server_arn(&stored.arn),

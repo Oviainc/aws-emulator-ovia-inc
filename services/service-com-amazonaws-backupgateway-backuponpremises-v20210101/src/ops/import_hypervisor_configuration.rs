@@ -218,7 +218,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 kms_key_arn: input.kms_key_arn.clone(),
                 tags,
             },
-            ::std::time::SystemTime::now(),
+            // WHO created the record and WHEN — the creator read off the SIGNED REQUEST and
+            // never off its body, which a later tag read reports as `aws:createdBy`.
+            crate::state::Creation {
+                by: crate::state::request_created_by(ctx.parts()),
+                at: ::std::time::SystemTime::now(),
+            },
         );
 
         Ok(ImportHypervisorConfigurationOutput {

@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/aws_assigned_system_tags.rs"]
+mod aws_assigned_system_tags;
 #[path = "all/aws_tag_rules_span_every_tag_pair.rs"]
 mod aws_tag_rules_span_every_tag_pair;
 #[path = "all/bandwidth_rate_limit_schedule.rs"]
@@ -55,6 +57,8 @@ mod metadata_sync_is_not_gated_on_property_mappings;
 mod metadata_sync_over_the_wire;
 #[path = "all/metadata_sync_publication_is_one_instant.rs"]
 mod metadata_sync_publication_is_one_instant;
+#[path = "all/metadata_sync_requires_property_mappings.rs"]
+mod metadata_sync_requires_property_mappings;
 #[path = "all/metadata_sync_restart_supersedes_the_pending_sync.rs"]
 mod metadata_sync_restart_supersedes_the_pending_sync;
 #[path = "all/minted_hypervisor_identity.rs"]

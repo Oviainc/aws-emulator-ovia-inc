@@ -27,6 +27,9 @@ hex = { workspace = true }
 # Digest behind that fingerprint, so one hypervisor record's synced inventory is derived
 # from its whole ARN.
 sha2 = { workspace = true }
+# `management_events::recorded_caller`: the one rule every service of this emulator reads a
+# request's calling identity with, which the AWS-assigned `aws:createdBy` tag names.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

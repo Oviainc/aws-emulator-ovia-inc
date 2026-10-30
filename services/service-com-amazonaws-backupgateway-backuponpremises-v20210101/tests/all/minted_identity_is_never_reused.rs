@@ -32,7 +32,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gateway;
 
 use backup_gateway::state::{
-    arn_resource_id, service_state, HypervisorConfiguration, VirtualMachineInventory,
+    arn_resource_id, service_state, Creation, HypervisorConfiguration, VirtualMachineInventory,
     GATEWAY_OUT_OF_DATE, MAX_MINT_SEQUENCES,
 };
 
@@ -262,7 +262,10 @@ fn fill_registry_until_bounded(engine: &Arc<engine::InMemoryEngine>) -> (usize, 
                 host: format!("fill-{index}.example.internal"),
                 ..HypervisorConfiguration::default()
             },
-            SystemTime::now(),
+            Creation {
+                by: "SEEDED-CREATOR".to_string(),
+                at: SystemTime::now(),
+            },
         );
         store.remove_hypervisor(&imported.arn);
         let after = store.mint_sequence_count();

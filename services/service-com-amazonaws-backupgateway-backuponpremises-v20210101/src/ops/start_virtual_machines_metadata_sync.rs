@@ -11,23 +11,20 @@
 //! dated at the instant the sync falls due, so from that instant `ListVirtualMachines` and
 //! `GetVirtualMachine` report them. This is the ONLY file to touch for this operation.
 //!
-//! The sync is conditioned on NOTHING but the hypervisor the ARN resolves to: the model
-//! documents the operation as sending a request to sync the metadata of the specified
-//! virtual machines and states no precondition, and a hypervisor's PROPERTY MAPPINGS — the
-//! VMware-to-Amazon tag mappings `PutHypervisorPropertyMappings` sets — are an optional
-//! tagging feature of that record, not something the sync waits for. So a hypervisor this
-//! store holds is synced whether it carries mappings or none, which is what makes
-//! `ImportHypervisorConfiguration` → `StartVirtualMachinesMetadataSync` →
-//! `ListVirtualMachines` reachable for a client that only has the API
-//! (`tests/all/metadata_sync_is_not_gated_on_property_mappings.rs`,
-//! `tests/all/virtual_machine_inventory_sync.rs`).
-//!
-//! An ARN this store holds NO hypervisor under is refused with the modelled
-//! `AccessDeniedException` (HTTP 403), the answer that reveals nothing about whether the
-//! resource exists, which is what the recorded unit
+//! The sync has ONE precondition: the hypervisor's PROPERTY MAPPINGS — the
+//! VMware-to-Amazon tag mappings `PutHypervisorPropertyMappings` sets — must be configured
+//! for it ([`crate::state::ComAmazonawsBackupgatewayBackuponpremisesV20210101State::property_mappings_configured`]).
+//! A `HypervisorArn` this service holds no mappings under is REFUSED and nothing is
+//! written: with the modelled `AccessDeniedException`, `ErrorCode`
+//! [`crate::state::MAPPINGS_NOT_CONFIGURED`] and the sentence AWS states for it, answered
+//! at [`crate::state::MAPPINGS_NOT_CONFIGURED_STATUS`] rather than at the status that
+//! shape's `@httpError` declares. The gate is asked BEFORE any resource-existence lookup,
+//! which is what the recorded unit
 //! `backup-gateway.start-metadata-sync-state-transition` pins for a nonexistent
-//! `HypervisorArn` — see [`crate::state::MAPPINGS_NOT_CONFIGURED`] for the recorded
-//! `ErrorCode` and the record it is quoted from.
+//! `HypervisorArn`: a record with no mappings and an ARN with no record take the one
+//! answer, and it reveals neither
+//! (`tests/all/metadata_sync_requires_property_mappings.rs`,
+//! `tests/all/virtual_machine_inventory_sync.rs`).
 //!
 //! ## Shape of an operation
 //!
@@ -85,7 +82,10 @@
 //!
 //! * `AccessDeniedException` (HTTP 403) — The operation cannot proceed because you have
 //!   insufficient permissions. The refusal for a `HypervisorArn` this service holds no
-//!   hypervisor under, with `ErrorCode` [`crate::state::MAPPINGS_NOT_CONFIGURED`].
+//!   property mappings under, with `ErrorCode`
+//!   [`crate::state::MAPPINGS_NOT_CONFIGURED`] — answered at
+//!   [`crate::state::MAPPINGS_NOT_CONFIGURED_STATUS`], the status AWS is recorded stating
+//!   it with, rather than at the 403 the shape's `@httpError` declares.
 //! * `ResourceNotFoundException` (HTTP 404) — A resource that is required for the action
 //!   wasn't found. The only resource this operation resolves is the hypervisor, and an ARN
 //!   naming none takes the recorded permissions refusal above instead, so this shape is
@@ -129,6 +129,28 @@ impl From<StartVirtualMachinesMetadataSyncErrorModeled> for StartVirtualMachines
     fn from(modeled: StartVirtualMachinesMetadataSyncErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The refusal a sync takes when this service holds no property mappings for the
+/// `HypervisorArn` — the operation's precondition.
+///
+/// Every part of it is read off [`crate::state`] rather than composed here: the modelled
+/// `AccessDeniedException`, its REQUIRED `ErrorCode`
+/// ([`crate::state::MAPPINGS_NOT_CONFIGURED`]), the sentence AWS states for the condition
+/// ([`crate::state::MAPPINGS_NOT_CONFIGURED_MESSAGE`]) and the status this service answers
+/// it with ([`crate::state::MAPPINGS_NOT_CONFIGURED_STATUS`]), which is not the one the
+/// shape's `@httpError` declares — so the one condition has one answer however it is
+/// reached.
+fn mappings_not_configured() -> StartVirtualMachinesMetadataSyncError {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        StartVirtualMachinesMetadataSyncErrorModeled::AccessDeniedException(
+            AccessDeniedException {
+                error_code: crate::state::MAPPINGS_NOT_CONFIGURED.to_string(),
+                message: Some(crate::state::MAPPINGS_NOT_CONFIGURED_MESSAGE.to_string()),
+            },
+        ),
+        crate::state::MAPPINGS_NOT_CONFIGURED_STATUS,
+    )
 }
 
 /// The `StartVirtualMachinesMetadataSync` operation.
@@ -188,35 +210,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `HypervisorArn`'s length and pattern are refused by the boundary validator
         // before `handle` runs, so reaching here means the ARN is well formed.
         //
-        // The ONE question this operation asks is which hypervisor the ARN resolves to.
-        // Nothing else conditions the sync: the hypervisor's property mappings are the
-        // optional VMware-to-Amazon tag mappings of that record, so a hypervisor carrying
-        // none is synced like any other.
-        //
+        // The PRECONDITION of a sync: the hypervisor's property mappings — what
+        // `PutHypervisorPropertyMappings` writes — have to be configured before its
+        // virtual-machine metadata can be synced. The gate is asked BEFORE any
+        // resource-existence lookup, so an ARN naming no record at all and an ARN naming a
+        // record with no mappings take the one refusal and it reveals neither.
+        if !store.property_mappings_configured(&input.hypervisor_arn) {
+            return Err(mappings_not_configured());
+        }
+
         // The one write: the sync's own instant, and the inventory it discovers on the
         // hypervisor — the machines `ListVirtualMachines` and `GetVirtualMachine` report
         // once it falls due.
+        //
+        // The lookup cannot be empty here: mappings are held ON the hypervisor record, so
+        // the gate above only passes for a record this store holds, under the same guard.
+        // The invariant is asserted in a debug build, where a test sees it break; a release
+        // build answers the request rather than panicking on it.
         let started = store.start_metadata_sync(
             &input.hypervisor_arn,
             ::std::time::SystemTime::now(),
         );
+        debug_assert!(
+            started.is_some(),
+            "a hypervisor whose mappings this guard found configured must still be there"
+        );
         let Some(started) = started else {
-            // Nothing was written: this store holds no hypervisor under the ARN, so there
-            // is no record whose virtual machines could be synced. The answer is the
-            // modelled `AccessDeniedException` — "the operation cannot proceed because you
-            // have insufficient permissions" — which says nothing about whether the
-            // resource exists, and that is RECORDED and not a choice: the unit named in
-            // the module docs asserts this shape and `ErrorCode` for a `HypervisorArn`
-            // naming no hypervisor (see [`crate::state::MAPPINGS_NOT_CONFIGURED`]).
-            return Err(
-                StartVirtualMachinesMetadataSyncErrorModeled::AccessDeniedException(
-                    AccessDeniedException {
-                        error_code: crate::state::MAPPINGS_NOT_CONFIGURED.to_string(),
-                        message: Some(crate::state::MAPPINGS_NOT_CONFIGURED_MESSAGE.to_string()),
-                    },
-                )
-                .into(),
-            );
+            return Err(mappings_not_configured());
         };
 
         // The ARN comes back off the record the store now holds, not off the request.

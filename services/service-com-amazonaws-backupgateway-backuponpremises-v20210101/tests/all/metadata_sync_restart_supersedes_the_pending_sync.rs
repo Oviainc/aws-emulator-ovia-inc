@@ -65,7 +65,7 @@ use crate::gateway_lifecycle::{
     build_engine, build_router, call, epoch_secs, Reply, INSTANT_TOLERANCE_SECS, REGION,
 };
 use crate::hypervisor_property_mappings::import;
-use crate::metadata_sync_over_the_wire::start_sync;
+use crate::metadata_sync_over_the_wire::{start_sync, syncable_hypervisor};
 
 /// How many times [`observe`] re-takes one observation whose window held an instant the
 /// clock makes a published fact reportable at.
@@ -490,7 +490,8 @@ async fn a_restart_over_the_wire_keeps_the_inventory_and_the_successful_sync_tog
     let engine = build_engine();
     let router = build_router(&engine);
 
-    let hypervisor = import(&router, "hv-restart-over-the-wire", "192.0.2.141").await;
+    let hypervisor =
+        syncable_hypervisor(&router, "hv-restart-over-the-wire", "192.0.2.141").await;
 
     let first = start_sync(&router, &hypervisor).await;
     assert_eq!(

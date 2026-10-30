@@ -30,7 +30,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gateway;
 
 use backup_gateway::state::{
-    service_state, BACKUP_VM, DEFAULT_PAGE_SIZE, GATEWAY_SOFTWARE_VERSION, MAX_PAGE_SIZE,
+    service_state, Creation, BACKUP_VM, DEFAULT_PAGE_SIZE, GATEWAY_SOFTWARE_VERSION, MAX_PAGE_SIZE,
     MAX_STORED_GATEWAYS,
 };
 
@@ -130,9 +130,26 @@ impl Reply {
             .unwrap_or_else(|| panic!("no GatewayArn in {:?}", self.body))
     }
 
-    /// The returned `Tags` list as a map, so a test compares tag SETS and not the
-    /// order a list happens to carry.
+    /// The returned `Tags` list as a map of the CLIENT's own tags — the pairs a
+    /// `TagResource` (or a create) wrote.
+    ///
+    /// A map, not a list, so a test compares tag SETS and not the order a list happens to
+    /// carry; and the AWS-assigned system tags every resource a request creates also
+    /// carries (`aws:createdBy`, `aws:createdDate` —
+    /// `backup_gateway::state::is_reserved_tag_key`) are left out, because no client wrote
+    /// them and no client can write or remove one. Their presence, their keys and their
+    /// POSITION in the reported list are a rule of their own, pinned by the
+    /// `aws_assigned_system_tags` suite through [`Reply::reported_tags`].
     pub(crate) fn tags(&self) -> BTreeMap<String, String> {
+        self.reported_tags()
+            .into_iter()
+            .filter(|(key, _)| !backup_gateway::state::is_reserved_tag_key(key))
+            .collect()
+    }
+
+    /// The returned `Tags` list exactly as the reply carried it, in order: every pair,
+    /// AWS-assigned and client-written alike.
+    pub(crate) fn reported_tags(&self) -> Vec<(String, String)> {
         self.body
             .get("Tags")
             .and_then(Value::as_array)
@@ -202,6 +219,29 @@ pub(crate) fn hypervisor_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
         .expect("the in-memory engine must expose this state")
         .lock()
         .hypervisor_count()
+}
+
+/// The CLIENT tags `arn` carries according to the STORE, not the wire: what a response
+/// reports has to be the record that is really persisted.
+///
+/// The AWS-assigned system tags are left out for the same reason [`Reply::tags`] leaves
+/// them out of the wire's answer — no client wrote them — so the two are compared in one
+/// vocabulary.
+pub(crate) fn persisted_client_tags(
+    engine: &Arc<engine::InMemoryEngine>,
+    arn: &str,
+) -> BTreeMap<String, String> {
+    service_state(&**engine)
+        .expect("the in-memory engine must expose this state")
+        .lock()
+        .resource_tags(arn, SystemTime::now())
+        .map(|(_, tags)| {
+            tags.into_iter()
+                .filter(|tag| !backup_gateway::state::is_reserved_tag_key(&tag.key))
+                .map(|tag| (tag.key, tag.value))
+                .collect::<BTreeMap<String, String>>()
+        })
+        .unwrap_or_else(|| panic!("no resource stored under {arn}"))
 }
 
 /// The ARNs the STORE holds a hypervisor record for `host` under, read out of the records
@@ -1057,7 +1097,10 @@ async fn the_store_and_the_page_are_bounded() {
                 &format!("gw-seeded-{index}"),
                 BACKUP_VM,
                 BTreeMap::new(),
-                SystemTime::now(),
+                Creation {
+                    by: "SEEDED-CREATOR".to_string(),
+                    at: SystemTime::now(),
+                },
             );
         }
         assert_eq!(

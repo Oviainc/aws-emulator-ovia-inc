@@ -9,12 +9,14 @@
 //!
 //! The rules under test:
 //!
-//! 1. A metadata sync is conditioned on NOTHING but the hypervisor the ARN resolves to:
-//!    every record this store holds is synced, whatever property mappings it carries, and
-//!    only an ARN this store holds no hypervisor under is refused — with the modelled
-//!    `AccessDeniedException` (HTTP 403, `ErrorCode` `MappingsNotConfigured`), the answer
-//!    that reveals nothing about whether the resource exists. That refusal is the RECORDED
-//!    behaviour of this operation, pinned by the unit
+//! 1. A metadata sync has ONE precondition, the property mappings of the hypervisor the
+//!    ARN resolves to: a record whose mappings are configured is synced whatever they say,
+//!    and every `HypervisorArn` this store holds no mappings under — a record that never
+//!    had them, one whose mappings were cleared, and an ARN naming no record at all — is
+//!    refused with the modelled `AccessDeniedException` (`ErrorCode`
+//!    `MappingsNotConfigured`, at the recorded `MAPPINGS_NOT_CONFIGURED_STATUS`), the
+//!    answer that reveals nothing about whether the resource exists. That refusal is the
+//!    RECORDED behaviour of this operation, pinned by the unit
 //!    `backup-gateway.start-metadata-sync-state-transition`
 //!    (`issues/things-that-now-work/20261023T110543Z-backup-gateway-startvirtualmachinesmetadatasync-stub.md`,
 //!    whose check asserts that answer for a nonexistent `HypervisorArn`), and not a rule
@@ -40,8 +42,8 @@
 //! against a known store whatever that handler does. The workflow a client walks with wire
 //! calls only — import, create and associate a gateway, put the mappings, start the sync —
 //! is covered end-to-end by the sibling `metadata_sync_over_the_wire` suite, and the
-//! sibling `metadata_sync_is_not_gated_on_property_mappings` suite walks the shorter path
-//! a client needs for a sync alone.
+//! sibling `metadata_sync_requires_property_mappings` suite pins the precondition itself
+//! over the wire.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -53,9 +55,10 @@ use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gat
 
 use backup_gateway::state::{
     service_state, StoredPropertyMappings, VmwareToAwsTagMapping, HYPERVISOR_NOT_FOUND,
-    MAPPINGS_NOT_CONFIGURED, METADATA_SYNC_CREATED_MESSAGE, METADATA_SYNC_RUNNING_AFTER,
-    METADATA_SYNC_RUNNING_MESSAGE, METADATA_SYNC_SUCCEEDED_MESSAGE, METADATA_SYNC_SUCCEEDS_AFTER,
-    SYNC_METADATA_CREATED, SYNC_METADATA_RUNNING, SYNC_METADATA_SUCCEEDED,
+    MAPPINGS_NOT_CONFIGURED, MAPPINGS_NOT_CONFIGURED_MESSAGE, MAPPINGS_NOT_CONFIGURED_STATUS,
+    METADATA_SYNC_CREATED_MESSAGE, METADATA_SYNC_RUNNING_AFTER, METADATA_SYNC_RUNNING_MESSAGE,
+    METADATA_SYNC_SUCCEEDED_MESSAGE, METADATA_SYNC_SUCCEEDS_AFTER, SYNC_METADATA_CREATED,
+    SYNC_METADATA_RUNNING, SYNC_METADATA_SUCCEEDED,
 };
 
 use crate::gateway_lifecycle::{build_engine, build_router, call, create, epoch_secs, Reply, REGION};
@@ -400,11 +403,11 @@ async fn a_real_wait_alone_carries_the_sync_to_succeeded() {
     );
 }
 
-/// A sync is refused with the modelled `AccessDeniedException` — HTTP 403, `ErrorCode`
-/// `MappingsNotConfigured` — exactly for an ARN this store holds NO hypervisor under: a
-/// never-imported hypervisor ARN in any partition, each published bound of `ServerArn`,
-/// and an ARN that really names another resource of this service. Nothing is written for
-/// any of them.
+/// A sync is refused with the modelled `AccessDeniedException` — `ErrorCode`
+/// `MappingsNotConfigured` at [`MAPPINGS_NOT_CONFIGURED_STATUS`] — for an ARN this store
+/// holds no property mappings under: a never-imported hypervisor ARN in any partition,
+/// each published bound of `ServerArn`, and an ARN that really names another resource of
+/// this service. Nothing is written for any of them.
 #[tokio::test]
 async fn a_sync_is_refused_for_every_arn_no_hypervisor_is_stored_under() {
     let engine = build_engine();
@@ -447,15 +450,17 @@ async fn a_sync_is_refused_for_every_arn_no_hypervisor_is_stored_under() {
             (
                 reply.status,
                 reply.code.as_deref(),
-                reply.str_at("/ErrorCode")
+                reply.str_at("/ErrorCode"),
+                reply.str_at("/Message")
             ),
             (
-                403,
+                MAPPINGS_NOT_CONFIGURED_STATUS,
                 Some("AccessDeniedException"),
-                Some(MAPPINGS_NOT_CONFIGURED)
+                Some(MAPPINGS_NOT_CONFIGURED),
+                Some(MAPPINGS_NOT_CONFIGURED_MESSAGE)
             ),
             "case {case:?}: a sync for an ARN no hypervisor is stored under must be \
-             refused with 403 AccessDeniedException, got {} {:?}",
+             refused with {MAPPINGS_NOT_CONFIGURED_STATUS} AccessDeniedException, got {} {:?}",
             reply.status,
             reply.body
         );
@@ -477,12 +482,13 @@ async fn a_sync_is_refused_for_every_arn_no_hypervisor_is_stored_under() {
     );
 }
 
-/// The hypervisor's property mappings are not a precondition of a sync: a record this
-/// store holds is synced whatever mappings it carries — none, several, an empty list, or
-/// mappings since cleared — and each sync is persisted and carried along by the clock,
-/// where an ARN this store holds no hypervisor under is refused instead.
+/// The hypervisor's property mappings are the sync's precondition, and the only one: a
+/// record whose mappings are configured is synced whatever they say — several of them or an
+/// empty list — and each such sync is persisted and carried along by the clock, where a
+/// record carrying no mappings at all (never set, or set and then cleared) and an ARN this
+/// store holds no record under take the one refusal instead.
 #[tokio::test]
-async fn a_hypervisor_syncs_whatever_mappings_it_carries() {
+async fn a_configured_hypervisor_syncs_and_an_unconfigured_one_is_refused() {
     let engine = build_engine();
     let router = build_router(&engine);
 
@@ -523,15 +529,10 @@ async fn a_hypervisor_syncs_whatever_mappings_it_carries() {
     set_mappings(&engine, &cleared, None);
 
     let rows: Vec<(&str, &String)> = vec![
-        ("a hypervisor carrying no mappings at all", &bare),
         ("a hypervisor carrying two mappings", &mapped),
         (
             "a hypervisor carrying an empty mapping list",
             &empty_mappings,
-        ),
-        (
-            "a hypervisor whose mappings were set and then cleared",
-            &cleared,
         ),
     ];
 
@@ -587,25 +588,47 @@ async fn a_hypervisor_syncs_whatever_mappings_it_carries() {
         );
     }
 
-    // An ARN this store holds no hypervisor under is what the sync refuses, and an
-    // operation that reports the resource answers the same ARN as a missing hypervisor.
+    // A record with no mappings configured is refused exactly like an ARN this store holds
+    // no record under, and the refusal persists no sync.
     let ghost = hypervisor_arn_in("aws", "hv-ffffffffffffff04");
-    let for_ghost = start_sync(&router, &ghost).await;
-    assert_eq!(
+    let refused: Vec<(&str, &String)> = vec![
+        ("a hypervisor carrying no mappings at all", &bare),
         (
-            for_ghost.status,
-            for_ghost.code.as_deref(),
-            for_ghost.str_at("/ErrorCode")
+            "a hypervisor whose mappings were set and then cleared",
+            &cleared,
         ),
-        (
-            403,
-            Some("AccessDeniedException"),
-            Some(MAPPINGS_NOT_CONFIGURED)
-        ),
-        "an ARN naming no hypervisor must be refused 403 AccessDeniedException, got {} {:?}",
-        for_ghost.status,
-        for_ghost.body
-    );
+        ("an ARN naming no hypervisor at all", &ghost),
+    ];
+    for (case, arn) in &refused {
+        let reply = start_sync(&router, arn).await;
+        assert_eq!(
+            (
+                reply.status,
+                reply.code.as_deref(),
+                reply.str_at("/ErrorCode"),
+                reply.str_at("/Message")
+            ),
+            (
+                MAPPINGS_NOT_CONFIGURED_STATUS,
+                Some("AccessDeniedException"),
+                Some(MAPPINGS_NOT_CONFIGURED),
+                Some(MAPPINGS_NOT_CONFIGURED_MESSAGE)
+            ),
+            "case {case:?}: a sync with no configured mappings must be refused \
+             {MAPPINGS_NOT_CONFIGURED_STATUS} AccessDeniedException, got {} {:?}",
+            reply.status,
+            reply.body
+        );
+        if arn != &&ghost {
+            assert!(
+                sync_started(&engine, arn).is_none(),
+                "case {case:?}: a refused sync must persist no instant"
+            );
+        }
+    }
+
+    // And an operation that reports the resource answers the same missing ARN as a missing
+    // hypervisor, so the refusal above is this operation's own.
     let read = get_hypervisor(&router, &ghost).await;
     assert_eq!(
         (read.status, read.str_at("/ErrorCode")),

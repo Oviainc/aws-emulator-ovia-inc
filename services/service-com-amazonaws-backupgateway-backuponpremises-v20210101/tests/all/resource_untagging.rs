@@ -23,17 +23,13 @@
 //! and a hypervisor.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gateway;
-
-use backup_gateway::state::service_state;
-
 use crate::gateway_lifecycle::{
-    build_engine, build_router, call, create, never_created_arn, Reply, REGION,
+    build_engine, build_router, call, create, never_created_arn, persisted_client_tags, Reply,
+    REGION,
 };
 
 /// An ARN of this service naming `resource_type`/`id`, in the region the harness signs
@@ -52,21 +48,6 @@ fn tag_map<'a>(
         .into_iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect()
-}
-
-/// The tags `arn` carries according to the STORE, not the wire: what a response reports
-/// has to be the record that is really persisted.
-fn persisted_tags(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> BTreeMap<String, String> {
-    service_state(&**engine)
-        .expect("the in-memory engine must expose this state")
-        .lock()
-        .resource_tags(arn, std::time::SystemTime::now())
-        .map(|(_, tags)| {
-            tags.into_iter()
-                .map(|tag| (tag.key, tag.value))
-                .collect::<BTreeMap<String, String>>()
-        })
-        .unwrap_or_else(|| panic!("no resource stored under {arn}"))
 }
 
 /// Import one hypervisor and hand back the ARN the store minted for it — the second
@@ -293,7 +274,7 @@ async fn untag_resource_removes_exactly_the_listed_keys() {
                  ListTagsForResource reported {listed:?}",
                 row.remove
             );
-            let stored = persisted_tags(&engine, &arn);
+            let stored = persisted_client_tags(&engine, &arn);
             assert_eq!(
                 stored, expected,
                 "case {case:?}: after removing {:?} the STORE must hold {expected:?}, it \
