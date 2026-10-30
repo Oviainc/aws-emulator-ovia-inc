@@ -70,15 +70,28 @@ async fn cluster(emulator: &Emulator, name: &str, brokers: i64) -> String {
     emulator.create_ok(&request).await
 }
 
-/// The alias a cluster ARN gives its cluster: the name segment of
-/// `...:cluster/<name>/<id>`, which is what `KafkaClusterAlias` reports and what
-/// prefixes the names of topics replicated FROM that cluster.
-fn alias_of(cluster_arn: &str) -> &str {
-    cluster_arn
+/// The alias MSK derives for the cluster `cluster_arn` names: the cluster NAME
+/// truncated to 28 characters, a hyphen, and the final group of the uuid in the
+/// ARN's id segment (12 hex digits). That is what `KafkaClusterAlias` reports and
+/// what prefixes the names of topics replicated FROM that cluster. Spelled out
+/// here rather than built from the service's own helper, so the form is pinned by
+/// the suite instead of by the code under test.
+fn alias_of(cluster_arn: &str) -> String {
+    let mut segments = cluster_arn
         .splitn(6, ':')
         .nth(5)
-        .and_then(|resource| resource.split('/').nth(1))
         .unwrap_or_default()
+        .split('/')
+        .skip(1);
+    let name: String = segments
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(28)
+        .collect();
+    let id = segments.next().unwrap_or_default();
+    let tail = id.split('-').nth(4).unwrap_or_default();
+    format!("{name}-{tail}")
 }
 
 /// The ARN a topic named `topic` has on the cluster `cluster_arn`: that cluster's
@@ -432,6 +445,7 @@ async fn a_replicating_flow_makes_the_target_report_the_source_topics_it_selects
 
     for (row, source, target) in &prepared {
         let alias = alias_of(source);
+        let alias = alias.as_str();
         let mut expected: Vec<String> = row
             .topics
             .iter()
@@ -830,7 +844,7 @@ async fn a_replicated_topic_is_withdrawn_with_its_source_topic_and_its_replicato
     }
     sleep_past_replication();
 
-    let alias = alias_of(&source).to_string();
+    let alias = alias_of(&source);
     let orders = format!("{alias}.orders");
     let payments = format!("{alias}.payments");
     let reported = topic_names(&emulator, &target, case).await;
@@ -915,7 +929,7 @@ async fn an_updated_filter_decides_what_the_target_reports_next() {
     }
     sleep_past_replication();
 
-    let alias = alias_of(&source).to_string();
+    let alias = alias_of(&source);
     let reported = topic_names(&emulator, &target, case).await;
     assert_eq!(
         reported,

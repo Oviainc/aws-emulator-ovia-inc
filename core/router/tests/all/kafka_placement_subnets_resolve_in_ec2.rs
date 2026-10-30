@@ -330,6 +330,137 @@ struct RefusalRow {
     unknown: String,
 }
 
+/// A `CreateReplicator` body replicating between `source` and `target` (Amazon MSK cluster
+/// ARNs), with the replicator's own client interfaces placed in `subnets`.
+fn replicator_body(name: &str, source: &str, target: &str, subnets: &[String]) -> Value {
+    json!({
+        "replicatorName": name,
+        "serviceExecutionRoleArn":
+            "arn:aws:iam::000000000000:role/service-role/MskReplicatorRole",
+        "kafkaClusters": [
+            {
+                "amazonMskCluster": { "mskClusterArn": source },
+                "vpcConfig": { "subnetIds": subnets },
+            },
+            {
+                "amazonMskCluster": { "mskClusterArn": target },
+                "vpcConfig": { "subnetIds": subnets },
+            },
+        ],
+        "replicationInfoList": [{
+            "sourceKafkaClusterArn": source,
+            "targetKafkaClusterArn": target,
+            "targetCompressionType": "NONE",
+            "consumerGroupReplication": { "consumerGroupsToReplicate": [".*"] },
+            "topicReplication": { "topicsToReplicate": [".*"] },
+        }],
+    })
+}
+
+/// RULE: a replicator's own client interfaces are created in the subnets its setup names
+/// only once the Amazon MSK clusters that setup names have RESOLVED, so the two references
+/// are answered in that order: a setup whose clusters resolve is refused for a subnet EC2
+/// holds none of (`BadRequestException` naming that member), while a setup naming a cluster
+/// that does not exist is ADMITTED whatever its subnets say and converges to the modelled
+/// `FAILED` instead — the cluster is the reason the replicator cannot be provisioned, so
+/// the caller is told about that one rather than about a placement MSK never reaches.
+#[tokio::test]
+async fn a_replicator_s_subnets_are_resolved_once_its_clusters_have() {
+    let router = emulator();
+    let network = ec2_network(&router).await;
+    let source = create_v1_ok(
+        &router,
+        v1_body("replicator-source", 2, &network.subnets[..2]),
+        "replicator-source",
+    )
+    .await;
+    let target = create_v1_ok(
+        &router,
+        v1_body("replicator-target", 2, &network.subnets[..2]),
+        "replicator-target",
+    )
+    .await;
+    let absent = "arn:aws:kafka:us-west-2:000000000000:cluster/replicator-absent\
+                  /11111111-2222-4333-8444-555555555555-1";
+
+    // Rows differ along which reference does not resolve: the subnets alone (the clusters
+    // are EC2-backed clusters this emulator holds), the cluster alone, and BOTH at once.
+    for (index, (form, unknown)) in unresolvable_subnet_ids().into_iter().enumerate() {
+        let unknown_subnets = vec![network.subnets[0].clone(), unknown.clone()];
+
+        let refused = kafka(
+            &router,
+            "POST",
+            "/replication/v1/replicators",
+            Some(replicator_body(
+                &format!("subnet-only-{index}"),
+                &source,
+                &target,
+                &unknown_subnets,
+            )),
+        )
+        .await;
+        assert_eq!(
+            (refused.status, refused.error_code()),
+            (400, "BadRequestException"),
+            "case clusters resolve, subnet unknown in {form}: expected a 400 \
+             BadRequestException, got {} with {}",
+            refused.status,
+            refused.body
+        );
+        assert_eq!(
+            refused.invalid_parameter(),
+            "KafkaClusters[0].VpcConfig.SubnetIds",
+            "case clusters resolve, subnet unknown in {form}: expected the refusal to name \
+             the placement at fault, got {}",
+            refused.body
+        );
+        assert!(
+            refused.message().contains(unknown.as_str()),
+            "case clusters resolve, subnet unknown in {form}: expected the refusal to name \
+             {unknown:?}, got {}",
+            refused.body
+        );
+
+        // The same request with a cluster that does not exist: admitted, because the
+        // cluster reference is the one that decides whether the replicator is provisioned
+        // at all. The clock then owes it FAILED — asserted on the kafka service's own
+        // suite, which drives the convergence.
+        for (variant, (case, cluster_subnets)) in [
+            ("held", ("subnets EC2 holds", network.subnets[..2].to_vec())),
+            ("unknown", ("subnets EC2 does not", unknown_subnets.clone())),
+        ] {
+            let admitted = kafka(
+                &router,
+                "POST",
+                "/replication/v1/replicators",
+                Some(replicator_body(
+                    &format!("absent-cluster-{index}-{variant}"),
+                    absent,
+                    &target,
+                    &cluster_subnets,
+                )),
+            )
+            .await;
+            assert_eq!(
+                (admitted.status, admitted.error_code()),
+                (200, ""),
+                "case absent cluster with {case} ({form}): a create whose cluster does not \
+                 resolve is admitted, got {} with {}",
+                admitted.status,
+                admitted.body
+            );
+            assert_eq!(
+                admitted.body.get("replicatorState").and_then(Value::as_str),
+                Some("CREATING"),
+                "case absent cluster with {case} ({form}): an admitted create reports \
+                 CREATING, got {}",
+                admitted.body
+            );
+        }
+    }
+}
+
 /// Every Amazon MSK create that places a resource in a client VPC resolves the subnets it
 /// names against EC2: the ones EC2 holds are accepted and reported back, and every id EC2
 /// holds no subnet for is refused with `BadRequestException` while nothing is created.

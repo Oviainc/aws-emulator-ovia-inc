@@ -81,6 +81,8 @@ mod replication_info_update;
 mod replicator_lifecycle;
 #[path = "all/replicator_listing.rs"]
 mod replicator_listing;
+#[path = "all/replicator_provisioning.rs"]
+mod replicator_provisioning;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/scram_secret_cluster_state.rs"]
@@ -99,6 +101,8 @@ mod topic_apis_serverless_gate;
 mod topic_lifecycle;
 #[path = "all/topic_replication.rs"]
 mod topic_replication;
+#[path = "all/version_catalog_consistency.rs"]
+mod version_catalog_consistency;
 #[path = "all/vpc_connection_contention.rs"]
 mod vpc_connection_contention;
 #[path = "all/vpc_connection_lifecycle.rs"]

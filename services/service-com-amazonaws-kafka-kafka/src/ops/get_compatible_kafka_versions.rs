@@ -6,11 +6,12 @@
 //! when the caller names a cluster, from that cluster's stored Kafka version.
 //!
 //! * With `ClusterArn`: ONE `CompatibleKafkaVersion`, whose `SourceVersion` is the
-//!   version the stored cluster runs and whose `TargetVersions` are the catalogued
-//!   versions still offered and strictly newer than it (MSK upgrades in place and
-//!   does not downgrade, and a deprecated version is not an upgrade target).
+//!   version the stored cluster runs and whose `TargetVersions` are the upgrades
+//!   the catalog permits FROM that version
+//!   ([`crate::state::compatible_target_versions`]) — a per-source subset, empty
+//!   for a terminal version, never one blanket list shared by every source.
 //! * Without `ClusterArn` (the member is optional in the model): the whole matrix,
-//!   one entry per catalogued source version.
+//!   one entry per catalogued source version, each with its own target list.
 //!
 //! A `ClusterArn` that is not shaped like an MSK cluster ARN is a
 //! `BadRequestException`; a well-formed one this endpoint's region holds no cluster

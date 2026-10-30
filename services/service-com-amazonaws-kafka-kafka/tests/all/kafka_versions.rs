@@ -16,7 +16,7 @@
 use aws_smithy_types::base64;
 use serde_json::Value;
 use service_com_amazonaws_kafka_kafka::ops::types::KAFKA_VERSION_STATUS_VALUES;
-use service_com_amazonaws_kafka_kafka::state::{kafka_version_index, KAFKA_VERSION_CATALOG};
+use service_com_amazonaws_kafka_kafka::state::KAFKA_VERSION_CATALOG;
 
 use crate::kafka_harness::{pct, Emulator, Reply};
 
@@ -59,10 +59,13 @@ fn catalog() -> Vec<(String, String)> {
         .collect()
 }
 
-/// The status the stored catalog gives `version`, if it holds it at all — looked
-/// up the way the handler resolves a version.
+/// The status the stored catalog publishes for `version`, if it holds the version
+/// at all — looked up the way the handler resolves one.
 fn stored_status(version: &str) -> Option<&'static str> {
-    kafka_version_index(version).map(|index| KAFKA_VERSION_CATALOG[index].status)
+    KAFKA_VERSION_CATALOG
+        .iter()
+        .find(|entry| entry.version == version)
+        .map(|entry| entry.status)
 }
 
 /// Walk every page of `ListKafkaVersions` at `page_size`, asserting the per-page
@@ -146,18 +149,26 @@ async fn the_catalog_is_reported_with_every_version_and_its_support_status() {
 
     // Rows hand-written from the Amazon MSK developer guide's "Supported Apache
     // Kafka versions" list — entries of several SHAPES (three numbers, a fourth
-    // component, the `.tiered` variant and the `.x` spelling) and both support
-    // statuses, so the table spans the class rather than one example.
+    // component, the `.tiered` and `.link` spellings, the `.x` patch name and the
+    // `.kraft` metadata-mode lines) and both support statuses, so the table spans
+    // the class rather than one example.
     let expected: &[(&str, &str)] = &[
         ("1.1.1", "DEPRECATED"),
         ("2.4.1.1", "DEPRECATED"),
         ("2.8.0", "DEPRECATED"),
-        ("2.8.1", "ACTIVE"),
-        ("2.8.2.tiered", "ACTIVE"),
-        ("3.5.1", "ACTIVE"),
+        ("2.8.1", "DEPRECATED"),
+        ("2.8.2.tiered", "DEPRECATED"),
+        ("3.5.1", "DEPRECATED"),
         ("3.6.0", "ACTIVE"),
+        ("3.6.0.1", "DEPRECATED"),
         ("3.7.x", "ACTIVE"),
+        ("3.7.x.kraft", "ACTIVE"),
+        ("3.8.link", "DEPRECATED"),
         ("3.9.x", "ACTIVE"),
+        ("3.9.x.kraft", "ACTIVE"),
+        ("4.0.x.kraft", "ACTIVE"),
+        ("4.1.x.kraft", "ACTIVE"),
+        ("4.2.x.kraft", "DEPRECATED"),
     ];
     for (version, status) in expected {
         let found = versions.iter().find(|(name, _)| name == version);
@@ -173,8 +184,17 @@ async fn the_catalog_is_reported_with_every_version_and_its_support_status() {
         );
     }
 
+    // Both statuses are really served, so a client's deprecation check can fire:
+    // the catalog is not one blanket status.
+    for status in KAFKA_VERSION_STATUS_VALUES {
+        assert!(
+            versions.iter().any(|(_, served)| served == status),
+            "case status={status:?}: the catalog must serve it, got {versions:?}"
+        );
+    }
+
     // No version the service does not offer is reported, and the lookup agrees.
-    for absent in ["0.10.2.1", "2.0.0", "9.9.9", "3.9.x.kraft", "", "latest"] {
+    for absent in ["0.10.2.1", "2.0.0", "9.9.9", "3.9.x.zookeeper", "", "latest"] {
         assert!(
             !versions.iter().any(|(name, _)| name == absent),
             "case version={absent:?}: must not appear in the catalog, got {versions:?}"
@@ -186,7 +206,7 @@ async fn the_catalog_is_reported_with_every_version_and_its_support_status() {
     }
 
     // Every reported entry is well formed: a modelled status value, a non-empty
-    // version, and no duplicates.
+    // version, and no version reported twice — one version, one published status.
     let mut names: Vec<&str> = versions.iter().map(|(name, _)| name.as_str()).collect();
     let total = names.len();
     names.sort_unstable();
@@ -208,22 +228,44 @@ async fn the_catalog_is_reported_with_every_version_and_its_support_status() {
     }
 }
 
-/// RULE: the reported order is the catalog's own ascending version order —
-/// components compared numerically where they are numbers, so `2.4.1` precedes
-/// `2.4.1.1` and `2.8.1` precedes `3.1.1`.
+/// RULE: the reported order is the catalog's own published order, and it is
+/// STRICT: entries ascend by the `major.minor` release they name, then within one
+/// release by the patch the version spells out, then by the build line the
+/// version is on (the ZooKeeper-mode base version, then its `.kraft` version,
+/// then any other line) — so no version is ever reported twice and a client walks
+/// the lines in the order the service publishes them.
 #[tokio::test]
-async fn the_catalog_is_ordered_by_ascending_version() {
-    /// A version string as comparable components: a numeric component sorts
-    /// numerically and before a textual one (`3.7.x` after `3.7.1`), and a
-    /// prefix sorts before its extension (`3.7.x` before `3.7.x.kraft`).
-    fn key(version: &str) -> Vec<(u32, u32, String)> {
-        version
+async fn the_catalog_is_ordered_by_ascending_release() {
+    /// The published-order key of a version: the `major.minor` release, the build
+    /// line's rank at that release (ZooKeeper 0, KRaft 1, anything else 2), and
+    /// the patch components the version spells out, with `x` ("the newest patch of
+    /// this minor") above every numbered patch.
+    fn key(version: &str) -> ((u32, u32), u8, Vec<u32>) {
+        let line = version
+            .rsplit('.')
+            .next()
+            .filter(|last| *last != "x" && last.parse::<u32>().is_err())
+            .unwrap_or_default();
+        let rank = match line {
+            // Tiered storage is a storage option of the ZooKeeper-mode build, not
+            // a build of its own.
+            "" | "tiered" => 0,
+            "kraft" => 1,
+            _ => 2,
+        };
+        let numbers: Vec<u32> = version
             .split('.')
-            .map(|part| match part.parse::<u32>() {
-                Ok(number) => (0, number, String::new()),
-                Err(_) => (1, 0, part.to_string()),
+            .filter_map(|part| match part.parse::<u32>() {
+                Ok(number) => Some(number),
+                Err(_) if part == "x" => Some(u32::MAX),
+                Err(_) => None,
             })
-            .collect()
+            .collect();
+        let release = (
+            numbers.first().copied().unwrap_or_default(),
+            numbers.get(1).copied().unwrap_or_default(),
+        );
+        ((release), rank, numbers.into_iter().skip(2).collect())
     }
 
     let emulator = Emulator::new();
@@ -232,7 +274,8 @@ async fn the_catalog_is_ordered_by_ascending_version() {
         let (earlier, later) = (&pair[0].0, &pair[1].0);
         assert!(
             key(earlier) < key(later),
-            "case pair=({earlier:?}, {later:?}): the catalog must ascend, got {versions:?}"
+            "case pair=({earlier:?}, {later:?}): the catalog must ascend strictly, \
+             got {versions:?}"
         );
     }
 }

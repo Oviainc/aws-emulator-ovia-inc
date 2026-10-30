@@ -8,10 +8,13 @@
 //! one Kafka cluster is a `BadRequestException`, since the two cluster aliases are
 //! what distinguish the ends of a flow.
 //!
-//! The clusters a replicator names are NOT resolved against this service's cluster
-//! registry: `CreateReplicator` is asynchronous, so AWS accepts the request and
-//! reports the replicator `CREATING` whether or not the Kafka clusters it points
-//! at are reachable — only the replicator's own identity is validated here.
+//! The clusters a replicator names are not resolved while the request is ADMITTED:
+//! `CreateReplicator` is asynchronous, so AWS accepts the request and reports the
+//! replicator `CREATING` whether or not the Kafka clusters it points at exist. They
+//! are resolved while the replicator is PROVISIONED
+//! ([`crate::state::ComAmazonawsKafkaKafkaState::replicator_provisioning_failure`]),
+//! and a setup naming an Amazon MSK cluster that does not exist converges to
+//! `FAILED` carrying the modelled `StateInfo` instead of ever replicating.
 //!
 //! The SUBNETS each `KafkaClusters` entry names
 //! (`KafkaClusterClientVpcConfig$SubnetIds`) are a different matter: the
@@ -19,7 +22,8 @@
 //! resources rather than this service's, so they are resolved against the account's
 //! EC2 inventory ([`crate::state::network::placement_subnet_refusal`]) before any
 //! ARN is minted — a subnet the account does not have is a `BadRequestException`
-//! and no replicator record is written.
+//! and no replicator record is written. Those interfaces are only ever created for
+//! a setup whose clusters resolve, so that gate runs only when the clusters did.
 //!
 //! Authentication and authorization are NOT this handler's business: the emulator
 //! verifies every request signature centrally (see `AGENTS.md`), so the modelled
@@ -344,24 +348,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // subnet the account does not have. Resolved before the registry lock is
         // taken, because the call is made over the in-process callback and no mutex
         // is held across it.
-        for (index, cluster) in input.kafka_clusters.iter().enumerate() {
-            let subnet_ids = cluster
-                .vpc_config
-                .as_ref()
-                .map(|config| config.subnet_ids.clone())
-                .unwrap_or_default();
-            if let Some(reason) =
-                crate::state::network::placement_subnet_refusal(ctx, &region, &subnet_ids).await
-            {
-                return Err(CreateReplicatorErrorModeled::BadRequestException(
-                    BadRequestException {
-                        invalid_parameter: Some(format!(
-                            "KafkaClusters[{index}].VpcConfig.SubnetIds"
-                        )),
-                        message: Some(reason),
-                    },
-                )
-                .into());
+        //
+        // Only for a setup whose clusters resolve: MSK creates those interfaces
+        // while it provisions the replicator, and a replicator whose source or
+        // target cluster does not exist is never provisioned, so the first
+        // unresolved reference is the one the caller is answered about (below, as
+        // the provisioning failure the clock converges the replicator to).
+        let provisioning_failure = state
+            .lock()
+            .replicator_provisioning_failure(&input.kafka_clusters);
+        if provisioning_failure.is_none() {
+            for (index, cluster) in input.kafka_clusters.iter().enumerate() {
+                let subnet_ids = cluster
+                    .vpc_config
+                    .as_ref()
+                    .map(|config| config.subnet_ids.clone())
+                    .unwrap_or_default();
+                if let Some(reason) =
+                    crate::state::network::placement_subnet_refusal(ctx, &region, &subnet_ids).await
+                {
+                    return Err(CreateReplicatorErrorModeled::BadRequestException(
+                        BadRequestException {
+                            invalid_parameter: Some(format!(
+                                "KafkaClusters[{index}].VpcConfig.SubnetIds"
+                            )),
+                            message: Some(reason),
+                        },
+                    )
+                    .into());
+                }
             }
         }
 
@@ -392,6 +407,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             suffix,
             std::time::SystemTime::now(),
             input,
+            provisioning_failure,
         );
 
         let output = CreateReplicatorOutput {

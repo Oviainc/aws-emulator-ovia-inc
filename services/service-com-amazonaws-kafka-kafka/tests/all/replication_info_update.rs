@@ -74,17 +74,30 @@ impl End {
     }
 
     /// The alias this cluster is reported under, from
-    /// `KafkaClusterDescription$KafkaClusterAlias`: an MSK cluster is aliased by
-    /// the cluster name its ARN carries (`...:cluster/<name>/<id>`), and an Apache
-    /// Kafka cluster by the id the caller gave it.
+    /// `KafkaClusterDescription$KafkaClusterAlias`: MSK DERIVES an Amazon MSK
+    /// cluster's alias from its ARN — the cluster name truncated to 28 characters,
+    /// a hyphen, and the final group of the uuid in the ARN's id segment — while an
+    /// Apache Kafka cluster is aliased by the id the caller gave it. Spelled out
+    /// here rather than built from the service's own helper, so the form is pinned
+    /// by the suite instead of by the code under test.
     fn alias(&self) -> String {
         match self {
-            End::Msk(arn) => arn
-                .splitn(6, ':')
-                .nth(5)
-                .and_then(|resource| resource.split('/').nth(1))
-                .unwrap_or_default()
-                .to_string(),
+            End::Msk(arn) => {
+                let mut segments = arn
+                    .splitn(6, ':')
+                    .nth(5)
+                    .unwrap_or_default()
+                    .split('/')
+                    .skip(1);
+                let name: String = segments
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(28)
+                    .collect();
+                let id = segments.next().unwrap_or_default();
+                format!("{name}-{}", id.split('-').nth(4).unwrap_or_default())
+            }
             End::Apache(id) => id.clone(),
         }
     }
@@ -188,6 +201,18 @@ impl Setup {
                 .map(|flow| self.flow_json(flow))
                 .collect::<Vec<_>>(),
         })
+    }
+
+    /// The `ReplicatorState` the clock owes a replicator of this setup once the
+    /// activation span has passed: the terminal `FAILED` when the setup names an
+    /// Amazon MSK cluster that does not exist — no row here creates the cluster it
+    /// points at — and `RUNNING` when every end is a self-managed Apache Kafka
+    /// cluster, which is not a resource this service resolves.
+    fn settled_state(&self) -> &'static str {
+        match self.clusters.iter().any(|end| matches!(end, End::Msk(_))) {
+            true => "FAILED",
+            false => "RUNNING",
+        }
     }
 }
 
@@ -301,6 +326,9 @@ impl UpdateCase {
                 consumers[member] = submitted[member].clone();
             }
         }
+        // The one member neither shape carries, which the service filled in when
+        // the configuration was created and no update can change.
+        consumers["consumerGroupOffsetSyncMode"] = json!("LEGACY");
         json!({
             "consumerGroupReplication": consumers,
             "sourceKafkaClusterAlias": self.setup.clusters[source].alias(),
@@ -311,12 +339,15 @@ impl UpdateCase {
     }
 
     /// The `ReplicationInfoDescription` every replication this update does NOT
-    /// address must still be reported as: exactly what the create submitted.
+    /// address must still be reported as: what the create submitted, with the
+    /// service's own defaults applied to it.
     fn expected_untouched(&self, flow: usize) -> Value {
         let (source, target, compression) = self.setup.flows[flow];
         let created = self.setup.flow_json(flow);
+        let mut consumers = created["consumerGroupReplication"].clone();
+        consumers["consumerGroupOffsetSyncMode"] = json!("LEGACY");
         json!({
-            "consumerGroupReplication": created["consumerGroupReplication"],
+            "consumerGroupReplication": consumers,
             "sourceKafkaClusterAlias": self.setup.clusters[source].alias(),
             "targetCompressionType": compression,
             "targetKafkaClusterAlias": self.setup.clusters[target].alias(),
@@ -589,14 +620,15 @@ async fn an_addressed_replication_is_updated_and_read_back() {
             described.at("/kafkaClusters")
         );
 
-        // The state is non-terminal, so the clock owes the replicator RUNNING
-        // again — and the version it settles at is the one the update minted.
+        // The state is non-terminal, so the clock owes the replicator its settled
+        // state again — and the version it settles at is the one the update minted.
         sleep_past_running();
         let settled = describe(&emulator, &arn).await;
         assert_eq!(
             settled.at("/replicatorState").as_str(),
-            Some("RUNNING"),
-            "case {case}: an updated replicator must run again, got {}",
+            Some(row.setup.settled_state()),
+            "case {case}: expected replicatorState {}, got {}",
+            row.setup.settled_state(),
             settled.at("/replicatorState")
         );
         assert_eq!(

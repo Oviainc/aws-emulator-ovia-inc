@@ -30,9 +30,19 @@ use crate::kafka_harness::{assert_name_already_exists, pct, Emulator, Reply, ACC
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/service-role/MskReplicatorRole";
 
 /// The cluster-id segment of the MSK cluster ARNs these rows point at. The
-/// clusters themselves are never created: `CreateReplicator` is asynchronous and
-/// does not resolve them.
+/// clusters themselves are never created: `CreateReplicator` admits the request
+/// without resolving them, and the replicator then converges to `FAILED` because
+/// the Amazon MSK clusters it names do not exist.
 const GHOST_CLUSTER_ID: &str = "11111111-2222-4333-8444-555555555555-1";
+
+/// The `ReplicationStateInfo$Code` MSK reports for a replicator whose setup names
+/// an Amazon MSK cluster that does not exist, and the fixed text of the message
+/// that goes with it — whose one variable part is the cluster ARN the request
+/// named. Written out here rather than built from the service's own helper, so the
+/// wording is pinned by the suite instead of by the code under test.
+const INVALID_CLUSTER_CODE: &str = "InvalidInput.InvalidKafkaCluster";
+const INVALID_CLUSTER_MESSAGE: &str =
+    "The specified Amazon MSK Cluster does not exist. Cluster ARN: ";
 
 /// The message a replicator operation refuses an ARN it cannot resolve with:
 /// MSK's replicator APIs name the INPUT MEMBER at fault and then the service's
@@ -98,18 +108,40 @@ impl ClusterRef {
     /// The alias this cluster must be reported under.
     ///
     /// From `KafkaClusterDescription$KafkaClusterAlias` ("The alias of the Kafka
-    /// cluster. Used to prefix names of replicated topics."): an MSK cluster is
-    /// aliased by the cluster name its ARN carries (`...:cluster/<name>/<id>`), and
-    /// an Apache Kafka cluster by the id the caller gave it.
+    /// cluster. Used to prefix names of replicated topics."): MSK DERIVES an
+    /// Amazon MSK cluster's alias from its ARN — the cluster name truncated to 28
+    /// characters, a hyphen, and the final group of the uuid in the ARN's id
+    /// segment — while an Apache Kafka cluster is aliased by the id the caller
+    /// gave it. Spelled out here rather than built from the service's own helper,
+    /// so the form is pinned by the suite instead of by the code under test.
     fn alias(&self) -> String {
         match &self.kind {
-            ClusterKind::Msk(arn) => arn
-                .splitn(6, ':')
-                .nth(5)
-                .and_then(|resource| resource.split('/').nth(1))
-                .unwrap_or_default()
-                .to_string(),
+            ClusterKind::Msk(arn) => {
+                let mut segments = arn
+                    .splitn(6, ':')
+                    .nth(5)
+                    .unwrap_or_default()
+                    .split('/')
+                    .skip(1);
+                let name: String = segments
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(28)
+                    .collect();
+                let id = segments.next().unwrap_or_default();
+                format!("{name}-{}", id.split('-').nth(4).unwrap_or_default())
+            }
             ClusterKind::Apache(id) => id.clone(),
+        }
+    }
+
+    /// The Amazon MSK cluster ARN this entry names, if it names one: the reference
+    /// whose resolution decides whether the replicator can be provisioned.
+    fn msk_cluster_arn(&self) -> Option<&str> {
+        match &self.kind {
+            ClusterKind::Msk(arn) => Some(arn.as_str()),
+            ClusterKind::Apache(_) => None,
         }
     }
 
@@ -202,13 +234,17 @@ struct ReplicatorRequest {
 impl ReplicatorRequest {
     /// A minimal request: two ghost MSK clusters, one flow between them, and none
     /// of the optional members.
+    ///
+    /// The cluster names carry which END they are FIRST, because the alias MSK
+    /// derives keeps only the start of a name: two clusters whose names differ
+    /// only past that point would be reported under one alias.
     fn named(name: &str) -> Self {
         Self {
             name: name.to_string(),
             description: None,
             clusters: vec![
-                ClusterRef::msk(&format!("{name}-source")),
-                ClusterRef::msk(&format!("{name}-target")),
+                ClusterRef::msk(&format!("source-{name}")),
+                ClusterRef::msk(&format!("target-{name}")),
             ],
             flows: vec![Flow::new(0, 1, "NONE")],
             tags: Vec::new(),
@@ -279,27 +315,116 @@ impl ReplicatorRequest {
     }
 
     /// The `KafkaClusterDescription` the reader must report for cluster `index`:
-    /// exactly what was submitted, plus that cluster's alias.
+    /// exactly what was submitted, plus that cluster's derived alias, plus the
+    /// members the service fills in — a client VPC configuration reports the
+    /// security groups attached to the replicator's interfaces as an EMPTY list
+    /// when the request attached none, not as an absent member.
     fn expected_cluster(&self, index: usize) -> Value {
         let cluster = &self.clusters[index];
         let mut expected = cluster.to_json();
         expected["kafkaClusterAlias"] = json!(cluster.alias());
+        if let Some(vpc_config) = expected.get_mut("vpcConfig") {
+            if vpc_config.get("securityGroupIds").is_none() {
+                vpc_config["securityGroupIds"] = json!([]);
+            }
+        }
         expected
     }
 
     /// The `ReplicationInfoDescription` the reader must report for `flow`: the
-    /// submitted configuration, with each end named by ALIAS rather than by the ARN
-    /// or id the request used.
+    /// submitted configuration with the service's own defaults applied, with each
+    /// end named by ALIAS rather than by the ARN or id the request used.
     fn expected_flow(&self, flow: &Flow) -> Value {
         let submitted = self.flow_json(flow);
         json!({
-            "consumerGroupReplication": submitted["consumerGroupReplication"],
+            "consumerGroupReplication": applied_consumer_groups(
+                &submitted["consumerGroupReplication"],
+            ),
             "sourceKafkaClusterAlias": self.clusters[flow.source].alias(),
             "targetCompressionType": flow.compression,
             "targetKafkaClusterAlias": self.clusters[flow.target].alias(),
-            "topicReplication": submitted["topicReplication"],
+            "topicReplication": applied_topics(&submitted["topicReplication"]),
         })
     }
+
+    /// The ARN of the first Amazon MSK cluster this request's setup names. None of
+    /// the rows here creates the cluster it points at, so that is the reference
+    /// whose resolution fails while the replicator is provisioned.
+    fn unresolved_cluster_arn(&self) -> Option<&str> {
+        self.clusters.iter().find_map(ClusterRef::msk_cluster_arn)
+    }
+
+    /// The `ReplicatorState` the clock owes this request's replicator once the
+    /// activation span has passed: `FAILED` when its setup names an Amazon MSK
+    /// cluster that does not exist, and `RUNNING` when every cluster it names is a
+    /// self-managed Apache Kafka one, which is not a resource this service holds
+    /// and so resolves to nothing either way.
+    fn settled_state(&self) -> &'static str {
+        match self.unresolved_cluster_arn() {
+            Some(_) => "FAILED",
+            None => "RUNNING",
+        }
+    }
+
+    /// The `StateInfo` the reader must report once the replicator has settled: the
+    /// modelled code and message for a cluster that does not exist, naming the
+    /// offending ARN, and nothing at all for a replicator that is running.
+    fn expected_state_info(&self) -> Value {
+        match self.unresolved_cluster_arn() {
+            Some(arn) => json!({
+                "code": INVALID_CLUSTER_CODE,
+                "message": format!("{INVALID_CLUSTER_MESSAGE}{arn}"),
+            }),
+            None => Value::Null,
+        }
+    }
+}
+
+/// A submitted `topicReplication` with the service's defaults applied: a feature
+/// switch the request did not set is on, a selection it did not narrow excludes
+/// nothing, and the two configuration shapes carry the service's default type.
+fn applied_topics(submitted: &Value) -> Value {
+    let mut applied = submitted.clone();
+    for switch in [
+        "copyAccessControlListsForTopics",
+        "copyTopicConfigurations",
+        "detectAndCopyNewTopics",
+    ] {
+        if applied.get(switch).is_none() {
+            applied[switch] = json!(true);
+        }
+    }
+    if applied.get("topicsToExclude").is_none() {
+        applied["topicsToExclude"] = json!([]);
+    }
+    if applied.get("startingPosition").is_none() {
+        applied["startingPosition"] = json!({ "type": "LATEST" });
+    }
+    if applied.get("topicNameConfiguration").is_none() {
+        applied["topicNameConfiguration"] =
+            json!({ "type": "PREFIXED_WITH_SOURCE_CLUSTER_ALIAS" });
+    }
+    applied
+}
+
+/// The same for a submitted `consumerGroupReplication`.
+fn applied_consumer_groups(submitted: &Value) -> Value {
+    let mut applied = submitted.clone();
+    for switch in [
+        "detectAndCopyNewConsumerGroups",
+        "synchroniseConsumerGroupOffsets",
+    ] {
+        if applied.get(switch).is_none() {
+            applied[switch] = json!(true);
+        }
+    }
+    if applied.get("consumerGroupsToExclude").is_none() {
+        applied["consumerGroupsToExclude"] = json!([]);
+    }
+    if applied.get("consumerGroupOffsetSyncMode").is_none() {
+        applied["consumerGroupOffsetSyncMode"] = json!("LEGACY");
+    }
+    applied
 }
 
 /// `CreateReplicator` for `request`, signed for `region`.
@@ -584,8 +709,9 @@ async fn describe_reports_exactly_what_was_created() {
         );
         assert_eq!(
             reply.at("/replicatorState").as_str(),
-            Some("RUNNING"),
-            "case {case}: expected replicatorState RUNNING, got {}",
+            Some(row.settled_state()),
+            "case {case}: expected replicatorState {}, got {}",
+            row.settled_state(),
             reply.at("/replicatorState")
         );
         assert_eq!(
@@ -615,18 +741,14 @@ async fn describe_reports_exactly_what_was_created() {
                 reply.at("/replicatorDescription")
             ),
         }
-        // A replicator that carries no tags reports no `tags` member at all, the
-        // way every other absent request member is reported.
-        let expected_tags = if row.tags.is_empty() {
-            Value::Null
-        } else {
-            Value::Object(
-                row.tags
-                    .iter()
-                    .map(|(key, value)| (key.clone(), json!(value)))
-                    .collect::<Map<String, Value>>(),
-            )
-        };
+        // A replicator always has a tag set: an empty map when it carries no
+        // tags, the submitted pairs when it does.
+        let expected_tags = Value::Object(
+            row.tags
+                .iter()
+                .map(|(key, value)| (key.clone(), json!(value)))
+                .collect::<Map<String, Value>>(),
+        );
         assert_eq!(
             reply.at("/tags"),
             &expected_tags,
@@ -646,10 +768,14 @@ async fn describe_reports_exactly_what_was_created() {
                 reply.at("/logDelivery")
             ),
         }
-        // `StateInfo` explains a state that needs explaining; RUNNING does not.
-        assert!(
-            reply.at("/stateInfo").is_null(),
-            "case {case}: expected no stateInfo for a RUNNING replicator, got {}",
+        // `StateInfo` explains a state that needs explaining: the terminal FAILED
+        // a replicator whose clusters do not resolve converges to carries the
+        // reason, and a RUNNING one carries none.
+        assert_eq!(
+            reply.at("/stateInfo"),
+            &row.expected_state_info(),
+            "case {case}: expected stateInfo {}, got {}",
+            row.expected_state_info(),
             reply.at("/stateInfo")
         );
         let expected_clusters = Value::Array(
@@ -773,7 +899,12 @@ async fn a_flow_between_one_cluster_is_refused() {
             ..ReplicatorRequest::named("same-apache-id")
         },
         ReplicatorRequest {
-            clusters: vec![ClusterRef::msk("twin"), ClusterRef::apache("twin")],
+            // An MSK cluster and an Apache Kafka cluster whose id IS that MSK
+            // cluster's derived alias: two kinds of cluster, one alias.
+            clusters: vec![
+                ClusterRef::msk("twin"),
+                ClusterRef::apache(&ClusterRef::msk("twin").alias()),
+            ],
             flows: vec![Flow::new(0, 1, "SNAPPY")],
             ..ReplicatorRequest::named("same-alias-two-kinds")
         },
@@ -1213,7 +1344,16 @@ async fn an_unknown_or_malformed_replicator_arn_is_refused() {
 #[tokio::test]
 async fn a_new_replicator_runs_once_the_clock_owes_it() {
     let emulator = Emulator::new();
-    let row = ReplicatorRequest::named("settling");
+    // Self-managed Apache Kafka clusters, so the replicator has no Amazon MSK
+    // cluster to resolve and the transition the clock owes it is into `RUNNING`.
+    let row = ReplicatorRequest {
+        clusters: vec![
+            ClusterRef::apache("settling-source"),
+            ClusterRef::apache("settling-target"),
+        ],
+        flows: vec![Flow::new(0, 1, "NONE")],
+        ..ReplicatorRequest::named("settling")
+    };
     let arn = create_ok(&emulator, &row).await;
 
     let immediate = describe(&emulator, &arn).await;

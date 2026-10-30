@@ -102,9 +102,9 @@
 //! [`Replicator::replication_info_descriptions`] for `DescribeReplicator`.
 //!
 //! The service's Apache Kafka version catalog lives here too
-//! ([`KAFKA_VERSION_CATALOG`], with [`compatible_target_versions`] and
-//! [`kafka_version_order`]), for the same reason: it is the single list every
-//! version-aware operation answers from.
+//! ([`KAFKA_VERSION_CATALOG`], with [`kafka_version_status`] and
+//! [`compatible_target_versions`]), for the same reason: it is the single list
+//! every version-aware operation answers from.
 //!
 //! A cluster's resource-based policy is held ON that cluster record, as a
 //! [`ClusterPolicy`]: `PutClusterPolicy` attaches or replaces it through
@@ -161,7 +161,8 @@ use crate::ops::types::{
     LoggingInfo, MutableClusterInfo, NodeExporter, NodeExporterInfo, NodeInfo, OpenMonitoring,
     OpenMonitoringInfo, Prometheus, PrometheusInfo, Provisioned, ProvisionedRequest,
     ProvisionedThroughput, Rebalancing, ReplicationInfo, ReplicationInfoDescription,
-    ReplicationInfoSummary, ReplicatorSummary, S3DestinationConfiguration, Serverless,
+    ReplicationInfoSummary, ReplicationStartingPosition, ReplicationStateInfo,
+    ReplicationTopicNameConfiguration, ReplicatorSummary, S3DestinationConfiguration, Serverless,
     ServerlessClientAuthentication, ServerlessConnectivityInfo, ServerlessRequest, StorageInfo,
     TopicConfiguration, TopicInfo, TopicReplication, TopicReplicationUpdate, VpcConfig,
     ZookeeperAccess,
@@ -625,15 +626,34 @@ pub struct KafkaVersionEntry {
     pub status: &'static str,
 }
 
-/// Every Apache Kafka version this emulator's MSK knows, OLDEST FIRST, so the
-/// catalog order is the upgrade ladder itself.
+/// The variant name of the `.kraft` lines: the versions whose cluster metadata is
+/// held by a KRaft controller quorum instead of Apache ZooKeeper.
+pub const KAFKA_VERSION_VARIANT_KRAFT: &str = "kraft";
+
+/// The variant name of the `.tiered` spelling: a ZooKeeper-mode version with
+/// tiered storage, which MSK offers as a storage option of that same build (every
+/// release from 3.6.0 on carries it without a spelling of its own).
+pub const KAFKA_VERSION_VARIANT_TIERED: &str = "tiered";
+
+/// Every Apache Kafka version this emulator's MSK knows, each published ONCE, in
+/// the order the service publishes them: ascending by release, with a release's
+/// base version ahead of the variant lines built on it.
 ///
 /// Source: the Amazon MSK Developer Guide, "Supported Apache Kafka versions"
 /// (<https://docs.aws.amazon.com/msk/latest/developerguide/supported-kafka-versions.html>),
-/// which lists the versions MSK offers and the ones it has deprecated. MSK
-/// deprecated every version older than 2.8.1, which is the ACTIVE/DEPRECATED
-/// boundary below; a deprecated version is still a valid SOURCE version (a
-/// cluster already running it can be upgraded away from it) but never a target.
+/// which lists the versions MSK offers, the variants it offers them in (the
+/// `.kraft` metadata-mode lines, the `.tiered` storage line, the `.link` line)
+/// and the ones it has deprecated. A deprecated version is still a valid SOURCE
+/// version — a cluster already running it can be upgraded away from it — but
+/// never a target.
+///
+/// Where a version's published status and the upgrade matrix the service also
+/// publishes disagree about it, the status that AGREES WITH THE MATRIX is the one
+/// kept, because the matrix is the answer a caller acts on: `3.9.x` is offered as
+/// an upgrade from every older ZooKeeper-mode version, so it is ACTIVE here, while
+/// `4.2.x.kraft` is in no published target list, so it is DEPRECATED — which is
+/// why the newest KRaft release the catalog names is not an upgrade target and
+/// `4.1.x.kraft` is the terminal one.
 ///
 /// This is the one catalog: `GetCompatibleKafkaVersions` derives its matrix from
 /// it, so nothing has to keep a second copy of the version list in step.
@@ -653,84 +673,157 @@ pub const KAFKA_VERSION_CATALOG: &[KafkaVersionEntry] = &[
     KafkaVersionEntry { version: "2.7.1", status: KAFKA_VERSION_DEPRECATED },
     KafkaVersionEntry { version: "2.7.2", status: KAFKA_VERSION_DEPRECATED },
     KafkaVersionEntry { version: "2.8.0", status: KAFKA_VERSION_DEPRECATED },
-    KafkaVersionEntry { version: "2.8.1", status: KAFKA_VERSION_ACTIVE },
-    KafkaVersionEntry { version: "2.8.2.tiered", status: KAFKA_VERSION_ACTIVE },
-    KafkaVersionEntry { version: "3.1.1", status: KAFKA_VERSION_ACTIVE },
-    KafkaVersionEntry { version: "3.2.0", status: KAFKA_VERSION_ACTIVE },
-    KafkaVersionEntry { version: "3.3.1", status: KAFKA_VERSION_ACTIVE },
-    KafkaVersionEntry { version: "3.3.2", status: KAFKA_VERSION_ACTIVE },
-    KafkaVersionEntry { version: "3.4.0", status: KAFKA_VERSION_ACTIVE },
-    KafkaVersionEntry { version: "3.5.1", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "2.8.1", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "2.8.2.tiered", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "3.1.1", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "3.2.0", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "3.3.1", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "3.3.2", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "3.4.0", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "3.5.1", status: KAFKA_VERSION_DEPRECATED },
     KafkaVersionEntry { version: "3.6.0", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "3.6.0.1", status: KAFKA_VERSION_DEPRECATED },
     KafkaVersionEntry { version: "3.7.x", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "3.7.x.kraft", status: KAFKA_VERSION_ACTIVE },
     KafkaVersionEntry { version: "3.8.x", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "3.8.x.kraft", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "3.8.link", status: KAFKA_VERSION_DEPRECATED },
     KafkaVersionEntry { version: "3.9.x", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "3.9.x.kraft", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "4.0.x.kraft", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "4.1.x.kraft", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "4.2.x.kraft", status: KAFKA_VERSION_DEPRECATED },
 ];
 
-/// The versions a cluster running `source` can be upgraded to: every catalogued
-/// version that is still [`KAFKA_VERSION_ACTIVE`] and strictly NEWER than
-/// `source`, oldest first.
+/// The versions a cluster running `source` can be upgraded to: the per-source
+/// upgrade graph the catalog itself describes, in catalog order.
 ///
-/// Amazon MSK upgrades a cluster's Apache Kafka version in place and does not
-/// support downgrading, and a deprecated version cannot be upgraded to — so a
-/// version at or below the source, and every deprecated version, is excluded.
-/// `source` need not be catalogued: a cluster running a version this catalog
-/// does not list is still ordered against it by [`kafka_version_order`].
+/// Amazon MSK upgrades a cluster's Apache Kafka version IN PLACE, never
+/// downgrades, and never upgrades to a version it has deprecated — and an upgrade
+/// stays inside the source's own LINE ([`kafka_version_line`]), because a line is
+/// a different build of the broker rather than a later release of the same one.
+/// So a target must be [`KAFKA_VERSION_ACTIVE`], sit on the SAME line as the
+/// source and name a strictly newer release; the one cross-line move MSK offers
+/// is the KRaft migration, from a ZooKeeper-mode version to the `.kraft` version
+/// of its OWN release. A version with no newer active member of its line, and no
+/// KRaft version of its release, is terminal and reports an EMPTY list.
+///
+/// `source` need not be catalogued: a cluster running a version this catalog does
+/// not list is still placed against it by [`kafka_version_release`] and
+/// [`kafka_version_line`].
 pub fn compatible_target_versions(source: &str) -> Vec<String> {
+    let release = kafka_version_release(source);
+    let line = kafka_version_line(source);
     KAFKA_VERSION_CATALOG
         .iter()
+        .filter(|entry| is_offered_kafka_version(entry.version))
         .filter(|entry| {
-            entry.status == KAFKA_VERSION_ACTIVE
-                && kafka_version_order(entry.version, source) == std::cmp::Ordering::Greater
+            let target_release = kafka_version_release(entry.version);
+            match (line, kafka_version_line(entry.version)) {
+                // The same line, further along it.
+                (KafkaVersionLine::ZooKeeper, KafkaVersionLine::ZooKeeper)
+                | (KafkaVersionLine::Kraft, KafkaVersionLine::Kraft) => target_release > release,
+                // The KRaft migration: the same release, in KRaft metadata mode.
+                (KafkaVersionLine::ZooKeeper, KafkaVersionLine::Kraft) => {
+                    target_release == release
+                }
+                _ => false,
+            }
         })
         .map(|entry| entry.version.to_string())
         .collect()
 }
 
-/// Order two Apache Kafka version strings the way the upgrade ladder runs:
-/// component by component numerically, so `2.8.1` precedes `2.8.2.tiered` and
-/// `3.6.0` precedes `3.7.x`.
-///
-/// A `.x` component is MSK's name for "the newest patch of this minor", so it
-/// orders ABOVE every numbered patch of the same minor. Any other
-/// non-numeric component (the `tiered` of `2.8.2.tiered`) is a qualifier, which
-/// orders after the bare numeric version it qualifies and otherwise
-/// lexicographically — enough to give the catalog one total order without
-/// inventing semantics for it.
-pub fn kafka_version_order(left: &str, right: &str) -> std::cmp::Ordering {
-    kafka_version_key(left).cmp(&kafka_version_key(right))
+/// Which build of the broker a catalogued version is: the thing an upgrade stays
+/// inside, per [`compatible_target_versions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KafkaVersionLine {
+    /// A version whose cluster metadata is held by Apache ZooKeeper — the plain
+    /// releases, and the `.tiered` spelling of one, since tiered storage is a
+    /// storage option of that same build rather than a build of its own.
+    ZooKeeper,
+    /// A `.kraft` version: cluster metadata held by a KRaft controller quorum.
+    Kraft,
+    /// Any other spelling MSK publishes a release under. It names a build of its
+    /// own, with no upgrade path off it.
+    Other,
 }
 
-/// `(numeric components, qualifier)` for a version string — the sort key
-/// [`kafka_version_order`] compares. `Vec<u32>` compares lexicographically, so a
-/// version that is a prefix of another (`2.4.1` of `2.4.1.1`) orders below it.
-fn kafka_version_key(version: &str) -> (Vec<u32>, String) {
-    let mut numbers: Vec<u32> = Vec::new();
-    let mut qualifier = String::new();
-    for component in version.split('.') {
-        if !qualifier.is_empty() {
-            qualifier.push('.');
-            qualifier.push_str(component);
-        } else if let Ok(number) = component.parse::<u32>() {
-            numbers.push(number);
-        } else if component == "x" {
-            // "the latest patch of this minor": above every numbered patch.
-            numbers.push(u32::MAX);
-        } else {
-            qualifier.push_str(component);
-        }
+/// The line `version` belongs to, read from the trailing non-numeric component
+/// MSK spells the line with ([`KAFKA_VERSION_VARIANT_KRAFT`],
+/// [`KAFKA_VERSION_VARIANT_TIERED`]).
+///
+/// `x` is not a line: it is MSK's name for "the newest patch of this minor", so
+/// it belongs to the release ([`kafka_version_release`] reads it).
+pub fn kafka_version_line(version: &str) -> KafkaVersionLine {
+    match kafka_version_variant(version) {
+        KAFKA_VERSION_VARIANT_KRAFT => KafkaVersionLine::Kraft,
+        "" | KAFKA_VERSION_VARIANT_TIERED => KafkaVersionLine::ZooKeeper,
+        _ => KafkaVersionLine::Other,
     }
-    (numbers, qualifier)
+}
+
+/// The variant line `version` belongs to: `""` for a plain ZooKeeper-mode
+/// release, and otherwise the trailing non-numeric component MSK names the line
+/// with (`kraft`, `tiered`, `link`).
+///
+/// `x` is not a variant: it is MSK's name for "the newest patch of this minor",
+/// so it belongs to the release ([`kafka_version_release`] reads it).
+pub fn kafka_version_variant(version: &str) -> &str {
+    version
+        .rsplit('.')
+        .next()
+        .filter(|last| *last != "x" && last.parse::<u32>().is_err())
+        .unwrap_or_default()
+}
+
+/// The numeric release `version` names, as the components that order one release
+/// against another: `3.6.0` as `[3, 6, 0]`, `2.4.1.1` as `[2, 4, 1, 1]`, and a
+/// `.x` component — "the newest patch of this minor" — as the largest patch there
+/// can be, so `3.7.x` orders above every numbered `3.7` patch.
+///
+/// The variant component is NOT part of the release, so a line's base version and
+/// its variants name the same release (`3.9.x` and `3.9.x.kraft` are both release
+/// `3.9.x`), which is what makes the KRaft migration a move between lines at ONE
+/// release. `Vec<u32>` compares lexicographically, so a release that is a prefix
+/// of another (`2.4.1` of `2.4.1.1`) orders below it.
+pub fn kafka_version_release(version: &str) -> Vec<u32> {
+    version
+        .split('.')
+        .filter_map(|component| match component.parse::<u32>() {
+            Ok(number) => Some(number),
+            // "the latest patch of this minor": above every numbered patch.
+            Err(_) if component == "x" => Some(u32::MAX),
+            // The variant component, which names a line rather than a release.
+            Err(_) => None,
+        })
+        .collect()
 }
 
 /// Where `version` sits in [`KAFKA_VERSION_CATALOG`], or `None` when MSK knows
-/// no such version. This is the lookup a `ListKafkaVersions` pagination token
-/// resolves through, so a token can only ever name a position in the catalog
-/// itself.
+/// no such version. The catalog publishes each version once, so this is both the
+/// membership lookup and the position a `ListKafkaVersions` pagination token
+/// resolves through.
 pub fn kafka_version_index(version: &str) -> Option<usize> {
     KAFKA_VERSION_CATALOG
         .iter()
         .position(|entry| entry.version == version)
+}
+
+/// The support status the catalog publishes for `version`, or `None` when MSK
+/// knows no such version.
+pub fn kafka_version_status(version: &str) -> Option<&'static str> {
+    KAFKA_VERSION_CATALOG
+        .iter()
+        .find(|entry| entry.version == version)
+        .map(|entry| entry.status)
+}
+
+/// Whether the service still OFFERS `version`: whether the catalog publishes it
+/// and its status is [`KAFKA_VERSION_ACTIVE`]. This is what makes a version an
+/// upgrade target and what a deprecation check reads.
+pub fn is_offered_kafka_version(version: &str) -> bool {
+    kafka_version_status(version) == Some(KAFKA_VERSION_ACTIVE)
 }
 
 /// Marker that prefixes a version page token's plaintext, so a token minted for
@@ -1825,6 +1918,22 @@ pub const REPLICATOR_STATE_DELETING: &str = "DELETING";
 /// it accepted is being rolled out, until the clock owes it
 /// [`REPLICATOR_STATE_RUNNING`] again — another member of the same model enum.
 pub const REPLICATOR_STATE_UPDATING: &str = "UPDATING";
+/// The `ReplicatorState` value a replicator whose provisioning failed converges
+/// to — the terminal member of the same model enum. A replicator that reaches it
+/// reports WHY in `StateInfo` ([`Replicator::state_info`]).
+pub const REPLICATOR_STATE_FAILED: &str = "FAILED";
+
+/// The `ReplicationStateInfo$Code` Amazon MSK reports for a replicator it could
+/// not provision because an Amazon MSK cluster its setup names does not exist.
+/// A fixed token, not built from the request.
+pub const REPLICATION_CODE_INVALID_KAFKA_CLUSTER: &str = "InvalidInput.InvalidKafkaCluster";
+
+/// The `ReplicationStateInfo$Message` that goes with
+/// [`REPLICATION_CODE_INVALID_KAFKA_CLUSTER`]: one fixed sentence, whose one
+/// variable part is the cluster ARN the request named.
+pub fn invalid_kafka_cluster_message(cluster_arn: &str) -> String {
+    format!("The specified Amazon MSK Cluster does not exist. Cluster ARN: {cluster_arn}")
+}
 
 /// One Kafka cluster a replicator replicates between, under the alias the
 /// replicator knows it by.
@@ -2097,6 +2206,14 @@ pub struct Replicator {
     pub running_due: SystemTime,
     /// A `ReplicatorState` value.
     pub state: String,
+    /// Why provisioning this replicator failed, as the `ReplicationStateInfo` a
+    /// reader reports, or `None` when every cluster it names resolved.
+    ///
+    /// Decided when the create is ACCEPTED and kept here, because MSK resolves a
+    /// replicator's clusters while it provisions it rather than while it admits
+    /// the request: the clock then owes the replicator `FAILED` instead of
+    /// `RUNNING`, and this is the detail that says why.
+    pub failure: Option<ReplicationStateInfo>,
     /// Whether this record is a reference to a replicator created in another
     /// region (`IsReplicatorReference`).
     pub is_replicator_reference: bool,
@@ -2122,13 +2239,21 @@ impl Replicator {
     ///
     /// `region` is the caller's signing region, `suffix` the registry's monotonic
     /// counter (used as the 1-based ordinal `suffix + 1`, so one value seeds the
-    /// whole identity), `now` the creation instant, and `input` the submitted
-    /// configuration as `CreateReplicator` deserialized it.
+    /// whole identity), `now` the creation instant, `input` the submitted
+    /// configuration as `CreateReplicator` deserialized it, and `failure` the
+    /// provisioning failure the setup already carries (see [`Self::failure`]),
+    /// which the clock turns into [`REPLICATOR_STATE_FAILED`].
+    ///
+    /// The configuration is stored with the service's own defaults APPLIED
+    /// ([`applied_kafka_cluster`], [`applied_replication_info`]), so a member the
+    /// request left out is reported from the record like any other instead of
+    /// being absent from every reader.
     pub fn provisioned(
         region: &str,
         suffix: u64,
         now: SystemTime,
         input: CreateReplicatorInput,
+        failure: Option<ReplicationStateInfo>,
     ) -> Self {
         let name = input.replicator_name.as_str();
         let ordinal = suffix + 1;
@@ -2157,7 +2282,7 @@ impl Replicator {
                 // no cluster, so every stored entry carries the alias its MSK ARN
                 // or its Apache cluster id gives it.
                 alias: kafka_cluster_alias(&cluster).unwrap_or_default(),
-                cluster,
+                cluster: applied_kafka_cluster(cluster),
             })
             .collect();
         // Capped for the same reason as the cluster list above.
@@ -2165,6 +2290,7 @@ impl Replicator {
             .replication_info_list
             .into_iter()
             .take(MAX_FLOWS_PER_REPLICATOR)
+            .map(applied_replication_info)
             .collect();
         Self {
             current_version: current_version_token(&arn, 1),
@@ -2178,6 +2304,7 @@ impl Replicator {
             creation_time: now,
             running_due: now + REPLICATOR_ACTIVATION_DELAY,
             state: REPLICATOR_STATE_CREATING.to_string(),
+            failure,
             // A replicator created here is the replicator itself, never the
             // read-only reference AWS surfaces in the OTHER region of a
             // cross-region setup.
@@ -2207,18 +2334,34 @@ impl Replicator {
         }
     }
 
-    /// Apply the transition into `RUNNING` once `now` has reached
+    /// Apply the transition the clock owes this replicator once `now` has reached
     /// [`Self::running_due`] — out of `CREATING` after the create and out of
     /// `UPDATING` after an accepted change, the two non-terminal states a
-    /// replicator of this registry is reported in. Idempotent, and a no-op for
-    /// every other state: only a transition the clock already owed is
-    /// materialised here.
+    /// replicator of this registry is reported in. A replicator whose
+    /// provisioning failed ([`Self::failure`]) is owed `FAILED` rather than
+    /// `RUNNING`: the clusters it was created over did not resolve, so it never
+    /// starts replicating. Idempotent, and a no-op for every other state: only a
+    /// transition the clock already owed is materialised here.
     pub fn settle(&mut self, now: SystemTime) {
         let settling = self.state == REPLICATOR_STATE_CREATING
             || self.state == REPLICATOR_STATE_UPDATING;
         if settling && now >= self.running_due {
-            self.state = REPLICATOR_STATE_RUNNING.to_string();
+            self.state = match self.failure {
+                Some(_) => REPLICATOR_STATE_FAILED.to_string(),
+                None => REPLICATOR_STATE_RUNNING.to_string(),
+            };
         }
+    }
+
+    /// The `StateInfo` a reader reports for this replicator: the provisioning
+    /// failure, once the clock has moved the replicator into
+    /// [`REPLICATOR_STATE_FAILED`]. A state that explains itself — `CREATING`,
+    /// `RUNNING`, `UPDATING`, `DELETING` — carries none.
+    pub fn state_info(&self) -> Option<ReplicationStateInfo> {
+        if self.state == REPLICATOR_STATE_FAILED {
+            return self.failure.clone();
+        }
+        None
     }
 
     /// The instant this replicator's flows start replicating: the instant the
@@ -2234,10 +2377,11 @@ impl Replicator {
 
     /// Whether this replicator is replicating at `now`: from
     /// [`Self::replication_start`] on, which is exactly when a reader reports it
-    /// `RUNNING`. A deleted replicator leaves the registry, so no caller can ask
-    /// this about one.
+    /// `RUNNING`. A replicator whose provisioning failed never replicates
+    /// anything, whatever the clock says. A deleted replicator leaves the
+    /// registry, so no caller can ask this about one.
     pub fn replicates_at(&self, now: SystemTime) -> bool {
-        now >= self.replication_start()
+        self.failure.is_none() && now >= self.replication_start()
     }
 
     /// The Amazon MSK cluster ARNs this replicator replicates INTO, once each:
@@ -3678,6 +3822,36 @@ impl ComAmazonawsKafkaKafkaState {
             .get(&(region.to_string(), name.to_string()))
     }
 
+    /// The provisioning failure a replicator over `clusters` carries, or `None`
+    /// when every Amazon MSK cluster its setup names resolves.
+    ///
+    /// Amazon MSK ADMITS a `CreateReplicator` request on what the request itself
+    /// says and resolves the clusters while it provisions the replicator, so a
+    /// setup naming a cluster that does not exist is not refused: the replicator
+    /// is registered and the clock converges it to [`REPLICATOR_STATE_FAILED`]
+    /// carrying this detail. The FIRST entry that does not resolve is the one
+    /// reported, in submission order, so one setup yields one reason.
+    ///
+    /// Resolved against the whole registry rather than one region's clusters: a
+    /// replicator replicates BETWEEN regions, so a cluster of another region is a
+    /// cluster that exists. A `KafkaClusters` entry naming a self-managed Apache
+    /// Kafka cluster resolves to nothing here — that cluster is not a resource
+    /// this service holds.
+    pub fn replicator_provisioning_failure(
+        &self,
+        clusters: &[KafkaCluster],
+    ) -> Option<ReplicationStateInfo> {
+        let unresolved = clusters
+            .iter()
+            .filter_map(|cluster| cluster.amazon_msk_cluster.as_ref())
+            .map(|msk| msk.msk_cluster_arn.as_str())
+            .find(|arn| !self.clusters.contains_key(*arn))?;
+        Some(ReplicationStateInfo {
+            code: Some(REPLICATION_CODE_INVALID_KAFKA_CLUSTER.to_string()),
+            message: Some(invalid_kafka_cluster_message(unresolved)),
+        })
+    }
+
     /// Add `replicator` to every index that must know about it. The one insertion
     /// path, so the ARN registry and the (region, name) index cannot drift apart
     /// — and the one place the registry's ceiling is enforced, so it holds for
@@ -4567,10 +4741,22 @@ impl ConfigurationRevisionRecord {
     }
 }
 
-/// The alias of one `KafkaCluster` entry: an Amazon MSK cluster is aliased by its
-/// cluster name (the first segment of its ARN's resource part), and an Apache
-/// Kafka cluster by the id the caller gave it. The alias is what prefixes the
-/// names of replicated topics, per `KafkaClusterDescription$KafkaClusterAlias`.
+/// How many characters of a cluster's NAME the alias MSK derives for it carries.
+///
+/// The alias is the name truncated to this many characters, a hyphen and
+/// [`KAFKA_CLUSTER_ALIAS_ID_CHARS`] characters of the cluster's id, so it stays
+/// the same length whatever the name and tells two clusters whose names share a
+/// prefix apart.
+const KAFKA_CLUSTER_ALIAS_NAME_CHARS: usize = 28;
+
+/// How many hexadecimal digits of a cluster's own id (the uuid segment of its
+/// ARN) the alias carries, after the truncated name: the uuid's last group.
+const KAFKA_CLUSTER_ALIAS_ID_CHARS: usize = 12;
+
+/// The alias of one `KafkaCluster` entry: an Amazon MSK cluster is aliased by the
+/// alias MSK DERIVES from its ARN ([`msk_cluster_alias`]), and an Apache Kafka
+/// cluster by the id the caller gave it. The alias is what prefixes the names of
+/// replicated topics, per `KafkaClusterDescription$KafkaClusterAlias`.
 pub fn kafka_cluster_alias(cluster: &KafkaCluster) -> Option<String> {
     if let Some(msk) = cluster.amazon_msk_cluster.as_ref() {
         return flow_cluster_alias(Some(msk.msk_cluster_arn.as_str()), None);
@@ -4583,22 +4769,136 @@ pub fn kafka_cluster_alias(cluster: &KafkaCluster) -> Option<String> {
 
 /// The alias of the cluster a replication flow names at one end, from the ARN or
 /// the cluster id the flow carries. Same rule as [`kafka_cluster_alias`]: the
-/// cluster name for an MSK ARN, the id itself for an Apache Kafka cluster.
+/// derived alias for an MSK ARN, the id itself for an Apache Kafka cluster.
 pub fn flow_cluster_alias(arn: Option<&str>, id: Option<&str>) -> Option<String> {
     if let Some(arn) = arn.filter(|value| !value.is_empty()) {
-        return Some(cluster_name_in_arn(arn).unwrap_or(arn).to_string());
+        return Some(msk_cluster_alias(arn).unwrap_or_else(|| arn.to_string()));
     }
     id.filter(|value| !value.is_empty())
         .map(ToString::to_string)
 }
 
-/// The cluster name inside an MSK cluster ARN (`...:cluster/<name>/<id>`), or
-/// `None` when `value` is not an ARN of that form.
-fn cluster_name_in_arn(value: &str) -> Option<&str> {
-    if !is_cluster_arn(value) {
+/// The alias Amazon MSK knows the cluster `arn` names a replicator by, or `None`
+/// when `arn` is not an MSK cluster ARN.
+///
+/// DERIVED from the ARN, not read off it: MSK takes the cluster NAME, truncated
+/// to [`KAFKA_CLUSTER_ALIAS_NAME_CHARS`] characters, a hyphen, and the cluster's
+/// own id as [`KAFKA_CLUSTER_ALIAS_ID_CHARS`] hexadecimal digits
+/// ([`cluster_alias_id`]). So the alias identifies the cluster rather than just
+/// naming it: two clusters that share a name prefix, or the same name in two
+/// accounts, get different aliases, and an alias is one fixed shape however long
+/// the name is. One place, so the create and the describe projections of a
+/// replicator cannot disagree about it.
+pub fn msk_cluster_alias(arn: &str) -> Option<String> {
+    let mut segments = kafka_arn_resource(arn)?.split('/');
+    if segments.next()? != CLUSTER_RESOURCE_TYPE {
         return None;
     }
-    value.splitn(6, ':').nth(5)?.split('/').nth(1)
+    let name = segments.next().filter(|name| !name.is_empty())?;
+    let name: String = name.chars().take(KAFKA_CLUSTER_ALIAS_NAME_CHARS).collect();
+    let id = cluster_alias_id(segments.next().unwrap_or_default());
+    Some(format!("{name}-{id}"))
+}
+
+/// The [`KAFKA_CLUSTER_ALIAS_ID_CHARS`] hexadecimal digits of a cluster's id that
+/// its alias carries: the FINAL GROUP of the uuid the ARN's id segment names, and
+/// zeroes when that segment names no uuid — the alias keeps one shape either way,
+/// and an ARN that carries no cluster id contributes none of its own.
+fn cluster_alias_id(id: &str) -> String {
+    /// The widths of a uuid's hyphen-separated groups, the last of which is the
+    /// one an alias carries.
+    const UUID_GROUP_WIDTHS: [usize; 5] = [8, 4, 4, 4, KAFKA_CLUSTER_ALIAS_ID_CHARS];
+
+    // `splitn` with one field more than a uuid has leaves anything after the
+    // uuid — the ordinal this emulator's own cluster ARNs carry — in the last
+    // field, where it is not part of the uuid being read.
+    let groups: Vec<&str> = id.splitn(UUID_GROUP_WIDTHS.len() + 1, '-').collect();
+    let shaped = groups.len() >= UUID_GROUP_WIDTHS.len()
+        && groups
+            .iter()
+            .zip(UUID_GROUP_WIDTHS)
+            .all(|(group, width)| {
+                group.len() == width && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+    match shaped {
+        true => groups[UUID_GROUP_WIDTHS.len() - 1].to_string(),
+        false => "0".repeat(KAFKA_CLUSTER_ALIAS_ID_CHARS),
+    }
+}
+
+/// The `ReplicationStartingPositionType` a replication starts from when the
+/// request names no `StartingPosition`: the newest records, so an accepted
+/// replication does not begin by copying every record the source cluster still
+/// retains.
+pub const DEFAULT_REPLICATION_STARTING_POSITION: &str = "LATEST";
+
+/// The `ReplicationTopicNameConfigurationType` a replication uses when the
+/// request names no `TopicNameConfiguration`: replicated topic names are prefixed
+/// with the source cluster's alias, which is what
+/// `KafkaClusterDescription$KafkaClusterAlias` documents the alias is for ("Used
+/// to prefix names of replicated topics").
+pub const DEFAULT_REPLICATION_TOPIC_NAME_CONFIGURATION: &str =
+    "PREFIXED_WITH_SOURCE_CLUSTER_ALIAS";
+
+/// The `ConsumerGroupOffsetSyncMode` a replication uses when the request names
+/// none: the mode that needs nothing else in place, since the model documents
+/// `ENHANCED` as requiring a corresponding replicator replicating the other way
+/// (`smithy_query(query="doc",shape="ConsumerGroupOffsetSyncMode")`).
+pub const DEFAULT_CONSUMER_GROUP_OFFSET_SYNC_MODE: &str = "LEGACY";
+
+/// One submitted `KafkaCluster` as the service APPLIES it: the client VPC
+/// configuration reports the security groups attached to the replicator's network
+/// interfaces, which is an EMPTY list — not an absent member — when the request
+/// attached none.
+///
+/// Applied where the configuration is stored, so every reader of the record
+/// reports the same thing and no projection has to re-derive it.
+pub fn applied_kafka_cluster(mut cluster: KafkaCluster) -> KafkaCluster {
+    if let Some(vpc_config) = cluster.vpc_config.as_mut() {
+        vpc_config.security_group_ids.get_or_insert_with(Vec::new);
+    }
+    cluster
+}
+
+/// One submitted `ReplicationInfo` as the service APPLIES it: every member of the
+/// topic and consumer-group replication that the request left out is filled in
+/// with the value the service runs the replication with — a selection the request
+/// did not narrow excludes nothing, the two configuration shapes carry the
+/// service's default type, and a feature switch the request did not set is ON,
+/// because a replication MSK sets up keeps the target's topics, their
+/// configurations, their ACLs and their consumer groups matching the source
+/// unless it is told otherwise.
+///
+/// So a reader reports the whole configuration the replication RUNS under rather
+/// than only the subset the request happened to spell out.
+pub fn applied_replication_info(mut info: ReplicationInfo) -> ReplicationInfo {
+    let topics = &mut info.topic_replication;
+    topics.copy_access_control_lists_for_topics.get_or_insert(true);
+    topics.copy_topic_configurations.get_or_insert(true);
+    topics.detect_and_copy_new_topics.get_or_insert(true);
+    topics.topics_to_exclude.get_or_insert_with(Vec::new);
+    topics
+        .starting_position
+        .get_or_insert_with(|| ReplicationStartingPosition {
+            r#type: Some(DEFAULT_REPLICATION_STARTING_POSITION.to_string()),
+        })
+        .r#type
+        .get_or_insert_with(|| DEFAULT_REPLICATION_STARTING_POSITION.to_string());
+    topics
+        .topic_name_configuration
+        .get_or_insert_with(|| ReplicationTopicNameConfiguration {
+            r#type: Some(DEFAULT_REPLICATION_TOPIC_NAME_CONFIGURATION.to_string()),
+        })
+        .r#type
+        .get_or_insert_with(|| DEFAULT_REPLICATION_TOPIC_NAME_CONFIGURATION.to_string());
+    let groups = &mut info.consumer_group_replication;
+    groups.detect_and_copy_new_consumer_groups.get_or_insert(true);
+    groups.synchronise_consumer_group_offsets.get_or_insert(true);
+    groups.consumer_groups_to_exclude.get_or_insert_with(Vec::new);
+    groups
+        .consumer_group_offset_sync_mode
+        .get_or_insert_with(|| DEFAULT_CONSUMER_GROUP_OFFSET_SYNC_MODE.to_string());
+    info
 }
 
 impl Channel {

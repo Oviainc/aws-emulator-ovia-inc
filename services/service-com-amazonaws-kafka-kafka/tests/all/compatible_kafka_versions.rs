@@ -5,27 +5,27 @@
 //! from.
 //!
 //! The RULE under test: the compatible target versions of a source version are
-//! exactly the versions this service still offers (`ACTIVE` in
-//! [`KAFKA_VERSION_CATALOG`]) that are strictly NEWER than the source — MSK
-//! upgrades a cluster's Apache Kafka version in place, never downgrades, and never
-//! upgrades to a version it has deprecated. With a `ClusterArn` the single source
-//! version is the one the STORED cluster runs; without one, every catalogued
-//! version is a source.
+//! the upgrades the catalog permits FROM that version — a version the service
+//! still offers (`ACTIVE` in [`KAFKA_VERSION_CATALOG`]), on the SAME variant line
+//! as the source and naming a strictly newer release, plus the one cross-line
+//! move MSK offers: the `.kraft` version of the source's own release (the KRaft
+//! migration). MSK upgrades in place, never downgrades, never offers a version it
+//! has deprecated, and never moves a cluster between builds of the broker, so a
+//! source with nothing newer on its line is TERMINAL and reports an empty list.
+//! With a `ClusterArn` the single source version is the one the STORED cluster
+//! runs; without one, every catalogued entry is a source.
 //!
 //! Each suite asserts that rule over a TABLE whose rows differ along what the rule
 //! generalises over: where the source sits in the catalog (oldest, deprecated, the
-//! active boundary, the middle, the newest), how many components its version string
-//! has, whether it carries a qualifier (`2.8.2.tiered`) or a `.x` patch name, and
-//! whether the catalog lists it at all. The expected target lists are written out by
-//! hand from the catalog and are then cross-checked against the catalog's own order,
-//! so neither the handler nor its helper is asserted against itself.
-
-use std::cmp::Ordering;
+//! newest), how many components its version string has, which line it is on (plain
+//! ZooKeeper, `.tiered`, `.kraft`, `.link`), whether it has a KRaft version of its
+//! own release, whether it is terminal, and whether the catalog lists it at all.
+//! The expected target lists are written out by hand from the catalog and are then
+//! cross-checked against the catalog itself, so neither the handler nor its helper
+//! is asserted against itself.
 
 use serde_json::Value;
-use service_com_amazonaws_kafka_kafka::state::{
-    kafka_version_order, KAFKA_VERSION_ACTIVE, KAFKA_VERSION_CATALOG,
-};
+use service_com_amazonaws_kafka_kafka::state::{KAFKA_VERSION_ACTIVE, KAFKA_VERSION_CATALOG};
 
 use crate::kafka_harness::{pct, ClusterRequest, Emulator, Reply, ACCOUNT, REGION};
 
@@ -77,30 +77,70 @@ fn entries(reply: &Reply) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-/// The target versions the catalog ITSELF implies for a catalogued `source`: the
-/// `ACTIVE` entries that come after it in the catalog, which is ordered oldest
-/// first. Computed from the catalog's order alone — no version comparison — so it
-/// is an independent check of the handler's answer.
-fn targets_from_catalog_order(source: &str) -> Vec<String> {
-    let index = KAFKA_VERSION_CATALOG
-        .iter()
-        .position(|entry| entry.version == source)
-        .unwrap_or_else(|| panic!("{source} is not in the catalog"));
-    KAFKA_VERSION_CATALOG[index + 1..]
-        .iter()
-        .filter(|entry| entry.status == KAFKA_VERSION_ACTIVE)
-        .map(|entry| entry.version.to_string())
-        .collect()
+/// The target versions the catalog ITSELF implies for `source`, computed here
+/// from the published entries rather than from the service's helper, so it is an
+/// independent check of the handler's answer: an offered version (the status the
+/// catalog publishes for it is `ACTIVE`) that is either NEWER on the source's own
+/// upgradable line — ZooKeeper mode, which the `.tiered` spelling is on too, or
+/// KRaft — or the `.kraft` version of the source's own release. A source on any
+/// other line is terminal. In catalog order.
+fn targets_from_catalog(source: &str) -> Vec<String> {
+    /// The `(release, line)` of a version: the numeric components (with `x`
+    /// standing for the newest patch of a minor) and the build line — `""` for
+    /// ZooKeeper mode (the `.tiered` spelling included), `"kraft"` for the KRaft
+    /// versions, and `"other"` for a line that carries no upgrade path.
+    fn placed(version: &str) -> (Vec<u32>, &str) {
+        let line = match version
+            .rsplit('.')
+            .next()
+            .filter(|last| *last != "x" && last.parse::<u32>().is_err())
+            .unwrap_or_default()
+        {
+            "" | "tiered" => "",
+            "kraft" => "kraft",
+            _ => "other",
+        };
+        let release = version
+            .split('.')
+            .filter_map(|part| match part.parse::<u32>() {
+                Ok(number) => Some(number),
+                Err(_) if part == "x" => Some(u32::MAX),
+                Err(_) => None,
+            })
+            .collect();
+        (release, line)
+    }
+
+    let (source_release, source_line) = placed(source);
+    let mut targets: Vec<String> = Vec::new();
+    for entry in KAFKA_VERSION_CATALOG {
+        if published_status(entry.version) != Some(KAFKA_VERSION_ACTIVE) {
+            continue;
+        }
+        let (release, line) = placed(entry.version);
+        let permitted = if line == source_line {
+            source_line != "other" && release > source_release
+        } else {
+            source_line.is_empty() && line == "kraft" && release == source_release
+        };
+        if permitted && !targets.iter().any(|target| target == entry.version) {
+            targets.push(entry.version.to_string());
+        }
+    }
+    targets
 }
 
-/// Every version the service still offers, oldest first — what any source older
-/// than all of them must be able to upgrade to.
-fn all_active_versions() -> Vec<String> {
+/// The status the catalog publishes for `version`, which it publishes once.
+fn published_status(version: &str) -> Option<&'static str> {
     KAFKA_VERSION_CATALOG
         .iter()
-        .filter(|entry| entry.status == KAFKA_VERSION_ACTIVE)
-        .map(|entry| entry.version.to_string())
-        .collect()
+        .find(|entry| entry.version == version)
+        .map(|entry| entry.status)
+}
+
+/// Owned expectations from a borrowed table, so a row can write them inline.
+fn versions(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| (*name).to_string()).collect()
 }
 
 /// A minimal `CreateCluster` row running `kafka_version`.
@@ -111,86 +151,101 @@ fn cluster_on(name: &str, kafka_version: &'static str) -> ClusterRequest {
     }
 }
 
-/// The catalog is documented as ordered OLDEST FIRST, and both the matrix answer and
-/// the expectations above read it that way — so the order itself is pinned here: every
-/// entry must be strictly newer than the one before it under `kafka_version_order`.
-/// An out-of-order insertion would otherwise desync the catalog from the comparison
-/// the rule is computed with.
+/// The catalog is documented as published in one STRICT order, and the matrix answer
+/// reads it in that order — so the order itself is pinned here: entries ascend by the
+/// `major.minor` release they name, then by the patch the version spells out, then by
+/// the build line at that release, so no version is published twice. An out-of-order
+/// insertion would otherwise desync the catalog from the answers computed over it.
 #[test]
-fn the_catalog_is_ordered_oldest_first() {
+fn the_catalog_is_published_in_ascending_release_order() {
+    /// The published-order key of a version: its `major.minor` release, the rank of
+    /// the build line at that release (ZooKeeper 0 — which the `.tiered` storage
+    /// spelling is on too — KRaft 1, any other line 2), and the patch components
+    /// the version spells out, with `x` above every numbered patch.
+    fn key(version: &str) -> ((u32, u32), u8, Vec<u32>) {
+        let rank = match version
+            .rsplit('.')
+            .next()
+            .filter(|last| *last != "x" && last.parse::<u32>().is_err())
+            .unwrap_or_default()
+        {
+            "" | "tiered" => 0,
+            "kraft" => 1,
+            _ => 2,
+        };
+        let numbers: Vec<u32> = version
+            .split('.')
+            .filter_map(|part| match part.parse::<u32>() {
+                Ok(number) => Some(number),
+                Err(_) if part == "x" => Some(u32::MAX),
+                Err(_) => None,
+            })
+            .collect();
+        (
+            (
+                numbers.first().copied().unwrap_or_default(),
+                numbers.get(1).copied().unwrap_or_default(),
+            ),
+            rank,
+            numbers.into_iter().skip(2).collect(),
+        )
+    }
+
     for pair in KAFKA_VERSION_CATALOG.windows(2) {
         let (older, newer) = (pair[0].version, pair[1].version);
-        assert_eq!(
-            kafka_version_order(older, newer),
-            Ordering::Less,
-            "case {older:?} -> {newer:?}: the catalog must run oldest first, got {:?}",
-            kafka_version_order(older, newer)
+        assert!(
+            key(older) < key(newer),
+            "case {older:?} -> {newer:?}: the catalog must ascend strictly, got {:?} then {:?}",
+            key(older),
+            key(newer)
         );
     }
 }
 
 /// RULE: with a `ClusterArn`, the answer is one entry whose `sourceVersion` is the
-/// version the STORED cluster runs and whose `targetVersions` are the offered
-/// versions strictly newer than it.
+/// version the STORED cluster runs and whose `targetVersions` are the upgrades the
+/// catalog permits from it.
 ///
-/// Rows: the oldest catalogued version, a deprecated version with four components,
-/// the one just below the active boundary, the boundary itself, the qualified
-/// `2.8.2.tiered`, a middle release, a `.x` patch name, the newest version (no
-/// upgrade left) and a version the catalog does not list at all. The expected lists
-/// are written out from the catalog documented in `src/state.rs`.
+/// Rows: the oldest catalogued version, a deprecated four-component version, the
+/// `.tiered` spelling, the version at the active boundary, a four-component patch
+/// of it, a `.x` version that has a KRaft version of its own release, a KRaft
+/// source, the `.link` line (terminal), the newest KRaft version (nothing left),
+/// a deprecated KRaft version, and a version the catalog does not list at all. The
+/// expected lists are written out from the catalog documented in `src/state.rs`.
 #[tokio::test]
-async fn compatible_targets_are_the_offered_versions_newer_than_the_cluster() {
+async fn compatible_targets_are_the_upgrades_the_catalog_permits() {
     let emulator = Emulator::new();
-    let active = all_active_versions();
 
     let rows: Vec<(&'static str, Vec<String>)> = vec![
-        // Older than every offered version: all of them are reachable.
-        ("1.1.1", active.clone()),
-        ("2.4.1.1", active.clone()),
-        ("2.8.0", active.clone()),
-        // The oldest offered version: itself excluded, everything above it in.
+        // Older than every offered version, and on the ZooKeeper line: every
+        // offered version of that line is reachable, and no KRaft one is.
+        ("1.1.1", versions(&["3.6.0", "3.7.x", "3.8.x", "3.9.x"])),
+        ("2.4.1.1", versions(&["3.6.0", "3.7.x", "3.8.x", "3.9.x"])),
+        ("2.8.1", versions(&["3.6.0", "3.7.x", "3.8.x", "3.9.x"])),
+        // The tiered-storage spelling is that same build, so it climbs the same
+        // ladder.
+        ("2.8.2.tiered", versions(&["3.6.0", "3.7.x", "3.8.x", "3.9.x"])),
+        ("3.6.0", versions(&["3.7.x", "3.8.x", "3.9.x"])),
+        ("3.6.0.1", versions(&["3.7.x", "3.8.x", "3.9.x"])),
+        // A release that HAS a KRaft version: the migration to it is offered
+        // beside the newer ZooKeeper versions.
+        ("3.7.x", versions(&["3.7.x.kraft", "3.8.x", "3.9.x"])),
+        ("3.8.x", versions(&["3.8.x.kraft", "3.9.x"])),
+        ("3.9.x", versions(&["3.9.x.kraft"])),
+        // A KRaft source climbs the KRaft line only — there is no way back to
+        // ZooKeeper mode.
         (
-            "2.8.1",
-            vec![
-                "2.8.2.tiered".to_string(),
-                "3.1.1".to_string(),
-                "3.2.0".to_string(),
-                "3.3.1".to_string(),
-                "3.3.2".to_string(),
-                "3.4.0".to_string(),
-                "3.5.1".to_string(),
-                "3.6.0".to_string(),
-                "3.7.x".to_string(),
-                "3.8.x".to_string(),
-                "3.9.x".to_string(),
-            ],
+            "3.7.x.kraft",
+            versions(&["3.8.x.kraft", "3.9.x.kraft", "4.0.x.kraft", "4.1.x.kraft"]),
         ),
-        (
-            "2.8.2.tiered",
-            vec![
-                "3.1.1".to_string(),
-                "3.2.0".to_string(),
-                "3.3.1".to_string(),
-                "3.3.2".to_string(),
-                "3.4.0".to_string(),
-                "3.5.1".to_string(),
-                "3.6.0".to_string(),
-                "3.7.x".to_string(),
-                "3.8.x".to_string(),
-                "3.9.x".to_string(),
-            ],
-        ),
-        (
-            "3.6.0",
-            vec![
-                "3.7.x".to_string(),
-                "3.8.x".to_string(),
-                "3.9.x".to_string(),
-            ],
-        ),
-        ("3.8.x", vec!["3.9.x".to_string()]),
-        // The newest version there is: nothing to upgrade to.
-        ("3.9.x", Vec::new()),
+        ("3.9.x.kraft", versions(&["4.0.x.kraft", "4.1.x.kraft"])),
+        // The newest offered KRaft version: nothing to upgrade to.
+        ("4.1.x.kraft", Vec::new()),
+        // A deprecated KRaft version newer than every offered one: still a valid
+        // source, with no target above it.
+        ("4.2.x.kraft", Vec::new()),
+        // A line of its own with no newer member: terminal.
+        ("3.8.link", Vec::new()),
         // A version the catalog does not list, newer than every catalogued one:
         // still a valid source, with no target above it.
         ("9.9.9", Vec::new()),
@@ -227,32 +282,25 @@ async fn compatible_targets_are_the_offered_versions_newer_than_the_cluster() {
             "case version={version:?}: the source version must not be a target, got {targets:?}"
         );
         for target in targets {
-            let entry = KAFKA_VERSION_CATALOG
-                .iter()
-                .find(|entry| entry.version == *target);
-            assert!(
-                entry.is_some_and(|entry| entry.status == KAFKA_VERSION_ACTIVE),
+            assert_eq!(
+                published_status(target),
+                Some(KAFKA_VERSION_ACTIVE),
                 "case version={version:?}: target {target:?} is not an offered catalog version, got {targets:?}"
             );
         }
-        // And, for a catalogued source, the answer agrees with the catalog's own
-        // oldest-first order.
-        if KAFKA_VERSION_CATALOG
-            .iter()
-            .any(|entry| entry.version == *version)
-        {
-            assert_eq!(
-                targets,
-                &targets_from_catalog_order(version),
-                "case version={version:?}: the answer must match the catalog order, got {targets:?}"
-            );
-        }
+        // And the answer agrees with what the catalog itself implies.
+        assert_eq!(
+            targets,
+            &targets_from_catalog(version),
+            "case version={version:?}: the answer must match the catalog, got {targets:?}"
+        );
     }
 }
 
 /// RULE: with no `ClusterArn` the answer is the whole matrix — one entry per
-/// catalogued source version, in the catalog's order, each with the versions newer
-/// than it that the service still offers.
+/// catalogued source version, in the catalog's published order, each carrying the
+/// upgrades the catalog permits from it, so a client reading the matrix is offered
+/// a per-source subset rather than one blanket list.
 #[tokio::test]
 async fn the_matrix_covers_every_catalogued_source_version() {
     let emulator = Emulator::new();
@@ -279,19 +327,41 @@ async fn the_matrix_covers_every_catalogued_source_version() {
         );
         assert_eq!(
             targets,
-            &targets_from_catalog_order(source),
+            &targets_from_catalog(source),
             "case source={source:?}: expected {:?}, got {targets:?}",
-            targets_from_catalog_order(source)
+            targets_from_catalog(source)
         );
     }
-    // The newest catalogued version has no upgrade target, whichever it is.
-    let (newest, newest_targets) = answered
-        .last()
-        .expect("the catalog is not empty, so the matrix is not either");
+    // The matrix is a per-source graph, not one shared list: a terminal version
+    // reports no target at all, and two sources on different lines are offered
+    // different things.
+    let terminal: Vec<&(String, Vec<String>)> = answered
+        .iter()
+        .filter(|(_, targets)| targets.is_empty())
+        .collect();
     assert!(
-        newest_targets.is_empty(),
-        "case source={newest:?} (newest): expected no targets, got {newest_targets:?}"
+        !terminal.is_empty(),
+        "expected at least one source with no upgrade target, got {answered:?}"
     );
+    let distinct: std::collections::BTreeSet<Vec<String>> = answered
+        .iter()
+        .map(|(_, targets)| targets.clone())
+        .collect();
+    assert!(
+        distinct.len() > 1,
+        "expected the matrix to offer different targets per source, got {answered:?}"
+    );
+    // And no deprecated version is ever an upgrade target, whichever source names
+    // it.
+    for (source, targets) in &answered {
+        for target in targets {
+            assert_eq!(
+                published_status(target),
+                Some(KAFKA_VERSION_ACTIVE),
+                "case source={source:?}: target {target:?} is not offered"
+            );
+        }
+    }
 }
 
 /// RULE: a reader that models both errors separates a `ClusterArn` it cannot parse

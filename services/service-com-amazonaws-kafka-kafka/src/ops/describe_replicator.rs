@@ -6,9 +6,11 @@
 //! A value that is not shaped like a replicator ARN is a `BadRequestException`; a
 //! well-formed ARN this region holds no replicator for is a `NotFoundException`.
 //!
-//! REPORTING, not mutating: the one write it makes materialises the
-//! `CREATING` -> `RUNNING` transition the clock already owed THAT replicator,
-//! which was due at the same instant whether or not anybody called.
+//! REPORTING, not mutating: the one write it makes materialises the transition the
+//! clock already owed THAT replicator — `CREATING` into `RUNNING`, or into the
+//! terminal `FAILED` for a replicator whose provisioning could not resolve a
+//! cluster its setup names — which was due at the same instant whether or not
+//! anybody called.
 //!
 //! Authentication and authorization are NOT this handler's business: the emulator
 //! verifies every request signature centrally (see `AGENTS.md`), so the modelled
@@ -203,9 +205,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let replicator = {
             let mut state = state.lock();
             // Reporting only: the one write this makes materialises the
-            // CREATING -> RUNNING transition the clock already owed THIS
-            // replicator, which was due at the same instant whether or not
-            // anybody called.
+            // transition the clock already owed THIS replicator, which was due
+            // at the same instant whether or not anybody called.
             let settled = state.settled_replicator_in(
                 &region,
                 &input.replicator_arn,
@@ -245,12 +246,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             replicator_state: Some(replicator.state.clone()),
             service_execution_role_arn: Some(replicator.service_execution_role_arn.clone()),
             // `StateInfo` carries the code and message explaining a state that
-            // needs explaining; neither CREATING nor RUNNING does.
-            state_info: None,
-            // Absent, not an empty map, when the replicator carries no tags —
-            // the same way the other request-carried members report absence.
-            tags: Some(replicator.tags.clone().into_iter().collect())
-                .filter(|tags: &std::collections::HashMap<String, String>| !tags.is_empty()),
+            // needs explaining, which is the terminal FAILED a replicator whose
+            // provisioning could not resolve its clusters converges to; neither
+            // CREATING nor RUNNING needs explaining.
+            state_info: replicator.state_info(),
+            // The replicator's tag set, which is an EMPTY map — not an absent
+            // member — for a replicator that carries no tags: a resource always
+            // has a tag set, and `TagResource` can only add to one that is there.
+            tags: Some(replicator.tags.clone().into_iter().collect()),
             log_delivery: replicator.log_delivery.clone(),
         })
     }

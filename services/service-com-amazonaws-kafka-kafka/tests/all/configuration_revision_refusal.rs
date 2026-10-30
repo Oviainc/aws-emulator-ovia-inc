@@ -256,7 +256,7 @@ async fn a_cluster_update_refuses_an_unissued_revision_the_same_way() {
                 &format!("/v1/clusters/{}/version", pct(&cluster)),
                 Some(json!({
                     "currentVersion": current_version,
-                    "targetKafkaVersion": "3.5.1",
+                    "targetKafkaVersion": "3.6.0",
                     "configurationInfo": { "arn": configuration, "revision": revision },
                 })),
             )

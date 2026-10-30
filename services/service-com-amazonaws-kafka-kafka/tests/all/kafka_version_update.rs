@@ -158,17 +158,45 @@ fn assert_version_token(version: &str, case: &str) {
 
 /// Whether the catalog offers `target` as an update for a cluster running
 /// `source`, decided here from the PUBLISHED catalog rather than from the
-/// helper the handler uses: a target is offered when the service lists it, lists
-/// it as still offered, and it is strictly newer than the source. Source: the
-/// `KAFKA_VERSION_CATALOG` entries (the Amazon MSK Developer Guide's "Supported
-/// Apache Kafka versions"), plus the Developer Guide's rule that an MSK cluster's
-/// Apache Kafka version is updated in place and cannot be downgraded.
+/// helper the handler uses: a target is offered when the service still offers it
+/// (the catalog publishes it as `ACTIVE`) and it is either a strictly newer
+/// release on the SOURCE's own upgradable build line or the `.kraft` version of
+/// the source's own release — the KRaft migration. A source on a line MSK
+/// publishes no upgrade path off is terminal. Source: the `KAFKA_VERSION_CATALOG`
+/// entries (the Amazon MSK Developer Guide's "Supported Apache Kafka versions"),
+/// plus the Developer Guide's rule that an MSK cluster's Apache Kafka version is
+/// updated in place and cannot be downgraded.
 fn catalog_offers(source: &str, target: &str) -> bool {
-    KAFKA_VERSION_CATALOG.iter().any(|entry| {
-        entry.version == target
-            && entry.status == KAFKA_VERSION_ACTIVE
-            && version_key(target) > version_key(source)
-    })
+    let offered = KAFKA_VERSION_CATALOG
+        .iter()
+        .find(|entry| entry.version == target)
+        .is_some_and(|entry| entry.status == KAFKA_VERSION_ACTIVE);
+    if !offered {
+        return false;
+    }
+    let (source_release, source_line) = (version_key(source).0, build_line(source));
+    let (target_release, target_line) = (version_key(target).0, build_line(target));
+    if source_line == target_line {
+        return source_line != "other" && target_release > source_release;
+    }
+    source_line.is_empty() && target_line == "kraft" && target_release == source_release
+}
+
+/// The build line a version is on: `"kraft"` for the KRaft metadata-mode
+/// versions, `""` for the ZooKeeper-mode ones — which the `.tiered` spelling of a
+/// release is also on, tiered storage being a storage option of that build — and
+/// `"other"` for any other build, which carries no upgrade path.
+fn build_line(version: &str) -> &str {
+    match version
+        .rsplit('.')
+        .next()
+        .filter(|last| *last != "x" && last.parse::<u32>().is_err())
+        .unwrap_or_default()
+    {
+        "" | "tiered" => "",
+        "kraft" => "kraft",
+        _ => "other",
+    }
 }
 
 /// A version string as comparable components: each numeric component as itself,
@@ -202,16 +230,18 @@ fn version_key(version: &str) -> (Vec<u32>, String) {
 #[tokio::test]
 async fn an_update_lands_the_target_version_once_the_clock_owes_it() {
     // The rows differ along what the rule generalises over: the spelling of the
-    // target (three numeric components, the `2.8.2.tiered` qualifier, a `.x`
-    // minor), the size of the move (one patch, one minor, the whole ladder) and
-    // the support status of the source (a deprecated version is a valid source
-    // to move AWAY from).
+    // target (three numeric components, a `.x` minor, a `.kraft` version), the
+    // size of the move (one minor, the whole ladder), the build line it stays on
+    // (ZooKeeper, KRaft) and the one cross-line move there is (the KRaft
+    // migration), and the support status of the source (a deprecated version is a
+    // valid source to move AWAY from).
     let rows: &[(&str, &'static str, &str)] = &[
-        ("patch-bump", "3.3.1", "3.3.2"),
-        ("minor-bump", "2.8.1", "3.1.1"),
-        ("qualified-target", "2.8.1", "2.8.2.tiered"),
+        ("minor-bump", "3.6.0", "3.7.x"),
         ("x-minor-target", "3.6.0", "3.9.x"),
-        ("from-deprecated", "2.6.0", "2.8.1"),
+        ("kraft-migration", "3.9.x", "3.9.x.kraft"),
+        ("kraft-ladder", "3.7.x.kraft", "4.1.x.kraft"),
+        ("from-deprecated", "2.6.0", "3.6.0"),
+        ("from-tiered", "2.8.2.tiered", "3.6.0"),
         ("whole-ladder", "1.1.1", "3.9.x"),
     ];
 
@@ -419,20 +449,27 @@ async fn an_update_lands_the_target_version_once_the_clock_owes_it() {
 #[tokio::test]
 async fn only_a_target_the_service_offers_is_accepted() {
     // The rows differ along what the rule generalises over: the source's support
-    // status, and every way a target can fail to be an offered update — the
-    // version the cluster already runs, an older one, a newer one the service has
-    // deprecated, one it does not list at all, an abbreviated or differently
-    // cased spelling, and an empty value.
+    // status and build line, and every way a target can fail to be an offered
+    // update — the version the cluster already runs, an older one, a newer one the
+    // service has deprecated, one it does not list at all, an abbreviated or
+    // differently cased spelling, an empty value, and a version on another build
+    // line (a KRaft version of another release, and the way back to ZooKeeper
+    // mode, neither of which MSK offers).
     let rows: &[(&str, &'static str, &str)] = &[
-        // Offered: the next patch, a far newer minor, and the top of the ladder.
-        ("next-patch", "3.3.1", "3.3.2"),
+        // Offered: the next minor, a far newer minor, the top of the ladder, and
+        // the KRaft migration of the source's own release.
+        ("next-minor", "3.6.0", "3.7.x"),
         ("far-minor", "2.8.1", "3.7.x"),
         ("ladder-top", "3.8.x", "3.9.x"),
+        ("kraft-migration", "3.8.x", "3.8.x.kraft"),
         // Not offered.
         ("same-version", "3.4.0", "3.4.0"),
         ("one-patch-back", "3.3.2", "3.3.1"),
         ("far-downgrade", "3.6.0", "2.8.1"),
         ("newer-but-deprecated", "2.6.0", "2.7.0"),
+        ("newer-but-withdrawn", "3.9.x.kraft", "4.2.x.kraft"),
+        ("kraft-of-another-release", "3.8.x", "3.9.x.kraft"),
+        ("back-to-zookeeper", "3.9.x.kraft", "3.9.x"),
         ("uncatalogued", "3.4.0", "9.9.9"),
         ("abbreviated", "3.4.0", "3.5"),
         ("other-case", "3.6.0", "3.9.X"),
@@ -542,11 +579,11 @@ async fn the_cluster_is_resolved_before_the_body() {
     let bodies: &[(&str, Value)] = &[
         (
             "valid-body",
-            json!({ "currentVersion": version, "targetKafkaVersion": "3.5.1" }),
+            json!({ "currentVersion": version, "targetKafkaVersion": "3.6.0" }),
         ),
         (
             "stale-version",
-            json!({ "currentVersion": "K0000000000000", "targetKafkaVersion": "3.5.1" }),
+            json!({ "currentVersion": "K0000000000000", "targetKafkaVersion": "3.6.0" }),
         ),
         (
             "unoffered-target",
@@ -623,7 +660,7 @@ async fn a_stale_version_or_an_unupdatable_cluster_is_refused() {
         format!("{version}X"),
     ];
     for stale in &stale_rows {
-        let reply = update_to(&emulator, &arn, stale, "3.5.1").await;
+        let reply = update_to(&emulator, &arn, stale, "3.6.0").await;
         assert_eq!(
             (reply.status, reply.error_code()),
             (400, "BadRequestException"),
@@ -663,7 +700,7 @@ async fn a_stale_version_or_an_unupdatable_cluster_is_refused() {
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let reply = update_to(&emulator, &creating, &creating_version, "3.5.1").await;
+    let reply = update_to(&emulator, &creating, &creating_version, "3.6.0").await;
     assert_eq!(
         (reply.status, reply.error_code()),
         (400, "BadRequestException"),
@@ -689,7 +726,7 @@ async fn a_stale_version_or_an_unupdatable_cluster_is_refused() {
         .create_serverless_ok("serverless-version", &[vec!["subnet-a", "subnet-b"]], Some(true))
         .await;
     sleep_past_activation();
-    let reply = update_to(&emulator, &serverless, "K0000000000000", "3.5.1").await;
+    let reply = update_to(&emulator, &serverless, "K0000000000000", "3.6.0").await;
     assert_eq!(
         (reply.status, reply.error_code()),
         (400, "BadRequestException"),
@@ -756,7 +793,7 @@ async fn a_named_configuration_is_applied_with_the_new_version() {
             &cluster,
             json!({
                 "currentVersion": version,
-                "targetKafkaVersion": "3.5.1",
+                "targetKafkaVersion": "3.6.0",
                 "configurationInfo": { "arn": configuration_arn, "revision": revision },
             }),
         )
@@ -837,7 +874,7 @@ async fn a_named_configuration_is_applied_with_the_new_version() {
                     .at("/clusterInfo/currentBrokerSoftwareInfo/configurationRevision")
                     .as_i64(),
             ),
-            (Some("3.5.1"), Some(configuration_arn), Some(*revision)),
+            (Some("3.6.0"), Some(configuration_arn), Some(*revision)),
             "case {case}: expected the version and the configuration to land together, got {}",
             after.at("/clusterInfo/currentBrokerSoftwareInfo")
         );
@@ -851,7 +888,7 @@ async fn a_named_configuration_is_applied_with_the_new_version() {
         &cluster,
         json!({
             "currentVersion": version,
-            "targetKafkaVersion": "3.5.1",
+            "targetKafkaVersion": "3.6.0",
             "configurationInfo": { "arn": configuration.as_str(), "revision": 2 },
         }),
     )
@@ -869,7 +906,7 @@ async fn a_named_configuration_is_applied_with_the_new_version() {
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let second = update_to(&emulator, &cluster, &version, "3.6.0").await;
+    let second = update_to(&emulator, &cluster, &version, "3.7.x").await;
     assert_eq!(
         second.status, 200,
         "case config-kept: expected the second update to be accepted, got {} {}",
@@ -889,7 +926,7 @@ async fn a_named_configuration_is_applied_with_the_new_version() {
                 .at("/clusterInfo/currentBrokerSoftwareInfo/configurationRevision")
                 .as_i64(),
         ),
-        (Some("3.6.0"), Some(configuration.as_str()), Some(2)),
+        (Some("3.7.x"), Some(configuration.as_str()), Some(2)),
         "case config-kept: an update naming no configuration must keep the stored one, got {}",
         after.at("/clusterInfo/currentBrokerSoftwareInfo")
     );

@@ -489,7 +489,7 @@ async fn kafka_versions_must_name_versions_the_service_publishes() {
         ("only-entry-unknown", vec!["0.0.1-does-not-exist"]),
         ("newer-than-the-catalogue", vec!["9.9.9"]),
         ("truncated-patch-name", vec!["3.9"]),
-        ("extended-catalogued-name", vec!["3.6.0.1"]),
+        ("extended-catalogued-name", vec!["3.6.0.9"]),
         ("padded-catalogued-name", vec![" 3.6.0"]),
         ("empty-entry", vec![""]),
         ("first-of-three", vec!["0.0.1-does-not-exist", "2.8.1", "3.6.0"]),
