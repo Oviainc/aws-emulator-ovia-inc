@@ -110,16 +110,12 @@ pub(crate) fn seconds(body: &Value, member: &str) -> i64 {
     let raw = body
         .get(member)
         .unwrap_or_else(|| panic!("member {member} missing from {body}"));
-    // The model gives `Time` the `date-time` timestamp format; the vendored JSON codec
-    // carries no `@timestampFormat` onto member schemas, so it renders a timestamp in
-    // restJson1's default epoch-seconds form. Accept either rendering: what this suite
-    // asserts is the VALUE, and it keeps holding if the codec starts emitting ISO 8601.
-    if let Some(epoch) = raw.as_f64() {
-        return epoch as i64;
-    }
-    let text = raw.as_str().unwrap_or_else(|| {
-        panic!("member {member} must be an epoch or ISO 8601 timestamp, got {raw}")
-    });
+    // The model gives `Time` the `date-time` timestamp format, so the member is on the wire
+    // as an ISO 8601 string, never as restJson1's default epoch-seconds number. What this
+    // suite asserts is the VALUE; `tests/all/date_time_members_wire_form.rs` owns the form.
+    let text = raw
+        .as_str()
+        .unwrap_or_else(|| panic!("member {member} must be an ISO 8601 timestamp, got {raw}"));
     DateTime::from_str(text, Format::DateTime)
         .unwrap_or_else(|e| panic!("member {member} = {text:?} must parse as ISO 8601: {e}"))
         .secs()

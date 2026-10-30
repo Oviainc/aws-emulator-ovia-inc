@@ -17,7 +17,10 @@ pub struct GetRoomInput {
     pub identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivschat#GetRoomResponse")]
+/// `createTime`/`updateTime` target `Time` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `ivschat_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.ivschat#GetRoomResponse")`.
 #[derive(Debug, Clone, Default)]
 pub struct GetRoomOutput {
     pub arn: Option<String>,
@@ -31,4 +34,46 @@ pub struct GetRoomOutput {
     pub tags: Option<std::collections::HashMap<String, String>>,
     pub logging_configuration_identifiers: Option<Vec<String>>,
 }
+
+ivschat_schema_and_codec!(
+    GetRoomOutput,
+    GET_ROOM_OUTPUT_SCHEMA,
+    "com.amazonaws.ivschat#GetRoomResponse",
+    "com.amazonaws.ivschat",
+    "GetRoomResponse",
+    (M_ARN, arn, "arn", 0, string),
+    (M_ID, id, "id", 1, string),
+    (M_NAME, name, "name", 2, string),
+    (M_CREATE_TIME, create_time, "createTime", 3, date_time),
+    (M_UPDATE_TIME, update_time, "updateTime", 4, date_time),
+    (
+        M_MAXIMUM_MESSAGE_RATE_PER_SECOND,
+        maximum_message_rate_per_second,
+        "maximumMessageRatePerSecond",
+        5,
+        integer
+    ),
+    (
+        M_MAXIMUM_MESSAGE_LENGTH,
+        maximum_message_length,
+        "maximumMessageLength",
+        6,
+        integer
+    ),
+    (
+        M_MESSAGE_REVIEW_HANDLER,
+        message_review_handler,
+        "messageReviewHandler",
+        7,
+        struct_of(MessageReviewHandler)
+    ),
+    (M_TAGS, tags, "tags", 8, map_of_string),
+    (
+        M_LOGGING_CONFIGURATION_IDENTIFIERS,
+        logging_configuration_identifiers,
+        "loggingConfigurationIdentifiers",
+        9,
+        list_of_string
+    ),
+);
 

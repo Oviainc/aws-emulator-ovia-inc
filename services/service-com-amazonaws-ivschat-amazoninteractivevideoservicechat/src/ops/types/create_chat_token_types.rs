@@ -30,11 +30,38 @@ pub struct CreateChatTokenInput {
     pub attributes: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivschat#CreateChatTokenResponse")]
+/// `tokenExpirationTime`/`sessionExpirationTime` target `Time`
+/// (`@timestampFormat("date-time")`), so this shape's schema comes from
+/// `ivschat_schema_and_codec!` — see `types/date_time_wire.rs`. Member set, order and
+/// requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.ivschat#CreateChatTokenResponse")`.
 #[derive(Debug, Clone, Default)]
 pub struct CreateChatTokenOutput {
     pub token: Option<String>,
     pub token_expiration_time: Option<::aws_smithy_types::DateTime>,
     pub session_expiration_time: Option<::aws_smithy_types::DateTime>,
 }
+
+ivschat_schema_and_codec!(
+    CreateChatTokenOutput,
+    CREATE_CHAT_TOKEN_OUTPUT_SCHEMA,
+    "com.amazonaws.ivschat#CreateChatTokenResponse",
+    "com.amazonaws.ivschat",
+    "CreateChatTokenResponse",
+    (M_TOKEN, token, "token", 0, string),
+    (
+        M_TOKEN_EXPIRATION_TIME,
+        token_expiration_time,
+        "tokenExpirationTime",
+        1,
+        date_time
+    ),
+    (
+        M_SESSION_EXPIRATION_TIME,
+        session_expiration_time,
+        "sessionExpirationTime",
+        2,
+        date_time
+    ),
+);
 

@@ -36,7 +36,10 @@ pub struct ListRoomsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivschat#RoomSummary")]
+/// `createTime`/`updateTime` target `Time` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `ivschat_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.ivschat#RoomSummary")`.
 #[derive(Debug, Clone, Default)]
 pub struct RoomSummary {
     pub arn: Option<String>,
@@ -48,4 +51,32 @@ pub struct RoomSummary {
     pub tags: Option<std::collections::HashMap<String, String>>,
     pub logging_configuration_identifiers: Option<Vec<String>>,
 }
+
+ivschat_schema_and_codec!(
+    RoomSummary,
+    ROOM_SUMMARY_SCHEMA,
+    "com.amazonaws.ivschat#RoomSummary",
+    "com.amazonaws.ivschat",
+    "RoomSummary",
+    (M_ARN, arn, "arn", 0, string),
+    (M_ID, id, "id", 1, string),
+    (M_NAME, name, "name", 2, string),
+    (
+        M_MESSAGE_REVIEW_HANDLER,
+        message_review_handler,
+        "messageReviewHandler",
+        3,
+        struct_of(MessageReviewHandler)
+    ),
+    (M_CREATE_TIME, create_time, "createTime", 4, date_time),
+    (M_UPDATE_TIME, update_time, "updateTime", 5, date_time),
+    (M_TAGS, tags, "tags", 6, map_of_string),
+    (
+        M_LOGGING_CONFIGURATION_IDENTIFIERS,
+        logging_configuration_identifiers,
+        "loggingConfigurationIdentifiers",
+        7,
+        list_of_string
+    ),
+);
 
