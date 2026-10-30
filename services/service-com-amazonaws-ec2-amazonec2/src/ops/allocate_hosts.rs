@@ -253,8 +253,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // corpus says which code EC2 answers them with, and the one recorded pair of
                 // this kind is this operation's own, so they are left as they are rather than
                 // moved on a guess.
+                //
+                // The message is AWS's own sentence for this refusal class, entirely fixed and
+                // naming the two members it is about in their MODELLED spelling and in the
+                // order AWS names them, each single-quoted; nothing the caller sent reaches it.
                 return Err(invalid_request(
-                    "You cannot specify InstanceFamily and InstanceType in the same request",
+                    "You cannot set both 'InstanceType' and 'InstanceFamily'.",
                 ));
             }
             (None, None) => {

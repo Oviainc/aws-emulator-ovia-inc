@@ -17,6 +17,12 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The sentence this service refuses a request with, per refusal CLASS: the resource named in
+// that class's own words, the request's value interpolated in that class's own quoting and
+// position, and nothing repeated back by a class whose sentence interpolates nothing.
+// Declared beside `prefix_lists` for the reason the note above gives.
+#[path = "all/per_resource_refusal_wording.rs"]
+mod per_resource_refusal_wording;
 // What `ModifyTransitGateway` applies to a stored transit gateway, what it leaves alone,
 // what it refuses, and the `modifying` -> `available` move the clock owes the gateway.
 // Declared beside `prefix_lists` for the reason the note above gives: the sorted

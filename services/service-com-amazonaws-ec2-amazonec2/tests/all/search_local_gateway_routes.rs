@@ -408,17 +408,17 @@ async fn an_account_with_no_route_table_refuses_every_id_it_can_read() {
         (
             "lgw-00000000000000001",
             "InvalidLocalGatewayRouteTableID.Malformed",
-            "The local-gateway-route-table ID 'lgw-00000000000000001' is malformed",
+            "Invalid LocalGateway Route Table id lgw-00000000000000001",
         ),
         (
             "lgwrtb-00000000000000001",
             "InvalidLocalGatewayRouteTableID.Malformed",
-            "The local-gateway-route-table ID 'lgwrtb-00000000000000001' is malformed",
+            "Invalid LocalGateway Route Table id lgwrtb-00000000000000001",
         ),
         (
             "not-a-route-table-id",
             "InvalidLocalGatewayRouteTableID.Malformed",
-            "The local-gateway-route-table ID 'not-a-route-table-id' is malformed",
+            "Invalid LocalGateway Route Table id not-a-route-table-id",
         ),
     ];
     for (route_table_id, code, expected_message) in cases {

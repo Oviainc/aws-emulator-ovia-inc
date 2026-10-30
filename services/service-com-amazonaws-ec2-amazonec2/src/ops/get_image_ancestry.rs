@@ -97,8 +97,8 @@
 use super::types::*;
 use crate::state::{
     ComAmazonawsEc2Amazonec2State, account_can_see_image, dry_run_operation, image_creation_time,
-    image_id_is_well_formed, image_is_visible, invalid_ami_id_malformed, invalid_ami_id_not_found,
-    require_service_state,
+    image_id_is_well_formed, image_is_visible, invalid_ami_id_not_found, require_service_state,
+    unresolvable_image_id,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -174,9 +174,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         // Something that is not an AMI id at all is refused BEFORE any lookup, the way
-        // every image-id reader of this crate refuses one.
+        // every image-id reader of this crate refuses one. This operation's validator words
+        // that refusal as the IMAGE resource's own sentence — `The image ID '<id>' is
+        // malformed` ([`unresolvable_image_id`]) — rather than with the service's generic id
+        // template, which is what the describes of the account's images were recorded
+        // answering.
         if !image_id_is_well_formed(&input.image_id) {
-            return Err(invalid_ami_id_malformed(&input.image_id));
+            return Err(unresolvable_image_id(&input.image_id));
         }
 
         // "Checks whether you have the required permissions for the action, without

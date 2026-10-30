@@ -249,11 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // different answer from "no such attachment", and it does not depend on what is
         // stored.
         for attachment_id in requested {
-            state::require_well_formed_id(
-                state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
-                attachment_id,
-                state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
-            )?;
+            state::require_well_formed_transit_gateway_attachment_id(attachment_id)?;
         }
 
         let mut store = service_state.lock();

@@ -178,10 +178,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.transit_gateway_multicast_domain_id,
             state::INVALID_TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_MALFORMED,
         )?;
-        state::require_well_formed_id(
-            state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
+        state::require_well_formed_transit_gateway_attachment_id(
             &input.transit_gateway_attachment_id,
-            state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
         )?;
         // Every value named for a subnet is read against the subnet id form as well, before
         // anything is looked up: `InvalidSubnetID.Malformed` is the refusal EC2's error

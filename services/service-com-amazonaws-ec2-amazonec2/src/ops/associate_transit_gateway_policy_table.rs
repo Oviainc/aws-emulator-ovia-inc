@@ -151,10 +151,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.transit_gateway_policy_table_id,
             state::INVALID_TRANSIT_GATEWAY_POLICY_TABLE_ID_MALFORMED,
         )?;
-        state::require_well_formed_id(
-            state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
+        state::require_well_formed_transit_gateway_attachment_id(
             &input.transit_gateway_attachment_id,
-            state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
         )?;
 
         // "Checks whether you have the required permissions for the action, WITHOUT

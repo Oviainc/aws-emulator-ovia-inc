@@ -175,10 +175,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // transit gateway attachment id at all is refused as malformed, so "not an id of
         // this kind" never reads as "no such attachment" and is never answered by the
         // DryRun arm below either.
-        state::require_well_formed_id(
-            state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
+        state::require_well_formed_transit_gateway_attachment_id(
             &input.transit_gateway_attachment_id,
-            state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
         )?;
 
         // "The range of inside IP addresses that are used for BGP peering"

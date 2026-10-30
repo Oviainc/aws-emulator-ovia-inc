@@ -163,11 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // well-formed id is therefore accepted and recorded as the route's destination,
         // rather than refused as not found on the strength of a store that does not exist.
         if let Some(attachment_id) = input.transit_gateway_attachment_id.as_deref() {
-            state::require_well_formed_id(
-                state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
-                attachment_id,
-                state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
-            )?;
+            state::require_well_formed_transit_gateway_attachment_id(attachment_id)?;
         }
 
         // What the route DOES with the traffic that matches it: "the attachment to which

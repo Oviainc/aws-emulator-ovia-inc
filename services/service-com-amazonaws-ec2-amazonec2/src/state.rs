@@ -12480,14 +12480,77 @@ pub fn cidr_block_is_well_formed(value: &str) -> bool {
     }
 }
 
-/// Refuse something that is not a local gateway route table id at all: HTTP 400
-/// `InvalidLocalGatewayRouteTableID.Malformed`, worded the way AWS words a malformed id of
-/// this resource and built from the request's own value.
+/// Refuse something that is not a local gateway route table id at all, for an operation whose
+/// subject is the TABLE or an association with it: HTTP 400
+/// `InvalidLocalGatewayRouteTableID.Malformed`, `The local-gateway-route-table ID '<id>' is
+/// malformed`, built from the request's own value.
+///
+/// EC2's per-operation validators do NOT word this one refusal class the same way, so there is
+/// no single sentence for this resource: the operations that associate a resource WITH a table,
+/// and the describe of the tables themselves, answer this one, while the operations whose
+/// subject is a ROUTE of the table answer
+/// [`invalid_route_table_id_for_local_gateway_route`]'s instead. Which an operation answers is
+/// a fact of that operation's validator, kept in two writers rather than in one blanket one.
 pub fn invalid_local_gateway_route_table_id_malformed<E>(id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_LOCAL_GATEWAY_ROUTE_TABLE_ID_MALFORMED,
         400,
-        format!("The {RESOURCE_TYPE_LOCAL_GATEWAY_ROUTE_TABLE} ID '{id}' is malformed"),
+        format!(
+            "The {RESOURCE_TYPE_LOCAL_GATEWAY_ROUTE_TABLE} ID '{}' is malformed",
+            echoed_resource_id(id)
+        ),
+    )
+}
+
+/// Refuse something that is not a local gateway route table id at all, for an operation whose
+/// subject is a ROUTE of that table: HTTP 400 `InvalidLocalGatewayRouteTableID.Malformed`.
+///
+/// `Invalid LocalGateway Route Table id <id>` — a fixed prefix naming the resource in the prose
+/// spelling [`invalid_local_gateway_route_table_id_not_found`] uses, then the id the REQUEST
+/// sent, UNQUOTED and last, bounded by [`echoed_resource_id`]. The sentence the route
+/// operations' own validator words this refusal with; the table's other operations keep
+/// [`invalid_local_gateway_route_table_id_malformed`]'s, which is what their recorded refusals
+/// carry.
+pub fn invalid_route_table_id_for_local_gateway_route<E>(id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_LOCAL_GATEWAY_ROUTE_TABLE_ID_MALFORMED,
+        400,
+        format!(
+            "Invalid LocalGateway Route Table id {}",
+            echoed_resource_id(id)
+        ),
+    )
+}
+
+/// Refuse a `LocalGatewayRouteTableId` an operation whose subject is a ROUTE of the table
+/// cannot resolve: a malformed one with that validator's own sentence
+/// ([`invalid_route_table_id_for_local_gateway_route`]) before an unknown one with the
+/// resource's single `NotFound` sentence, the order [`require_well_formed_id`] documents.
+///
+/// The ONE place the route operations resolve their route table, so the create, the delete and
+/// the search of a route refuse the same id the same way. The resolution itself is
+/// [`require_known_local_gateway_route_table_worded`]'s, shared with the table's own
+/// operations, so only the sentence differs between the two.
+pub fn require_known_route_table_for_local_gateway_route<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    id: &str,
+) -> Result<(), Scaffolded<E>> {
+    require_known_local_gateway_route_table_worded(
+        store,
+        id,
+        invalid_route_table_id_for_local_gateway_route,
+    )
+}
+
+/// The form check [`require_known_route_table_for_local_gateway_route`] makes before it looks an
+/// id up, for a route operation that has to read the request's own FORM earlier — a `DryRun` is
+/// answered only once that form has been read.
+pub fn require_well_formed_route_table_id_for_local_gateway_route<E>(
+    id: &str,
+) -> Result<(), Scaffolded<E>> {
+    require_well_formed_local_gateway_route_table_id_worded(
+        id,
+        invalid_route_table_id_for_local_gateway_route,
     )
 }
 
@@ -12509,25 +12572,62 @@ pub fn invalid_local_gateway_route_table_id_not_found<E>(id: &str) -> Scaffolded
 ///
 /// The one form check [`require_known_local_gateway_route_table`] itself makes before it
 /// looks an id up, so an operation that needs it earlier asks the same question of the same
-/// reader.
+/// reader. The ROUTE operations ask it through
+/// [`require_well_formed_route_table_id_for_local_gateway_route`], which differs only in the
+/// sentence their validator words the refusal with.
 pub fn require_well_formed_local_gateway_route_table_id<E>(id: &str) -> Result<(), Scaffolded<E>> {
+    require_well_formed_local_gateway_route_table_id_worded(
+        id,
+        invalid_local_gateway_route_table_id_malformed,
+    )
+}
+
+/// The form half of resolving a local gateway route table id, with `malformed` writing the
+/// sentence the CALLING operation's validator words that refusal with.
+///
+/// The ONE reading of this id's form, so the two sentences EC2 answers this refusal class with
+/// cannot drift into two readings of what a route table id IS.
+fn require_well_formed_local_gateway_route_table_id_worded<E>(
+    id: &str,
+    malformed: fn(&str) -> Scaffolded<E>,
+) -> Result<(), Scaffolded<E>> {
     if !local_gateway_route_table_id_is_well_formed(id) {
-        return Err(invalid_local_gateway_route_table_id_malformed(id));
+        return Err(malformed(id));
     }
     Ok(())
 }
 
-/// Refuse a `LocalGatewayRouteTableId` this service cannot resolve: a malformed one before
-/// an unknown one, the order [`require_well_formed_id`] documents.
+/// Refuse a `LocalGatewayRouteTableId` an operation whose subject is the TABLE, or an
+/// association with it, cannot resolve: a malformed one before an unknown one, the order
+/// [`require_well_formed_id`] documents.
 ///
-/// The ONE place a local gateway route table id is resolved, so every operation that takes
-/// one refuses the same id the same way; the contract [`require_known_instance`] writes out
-/// for instances.
+/// The ONE place those operations resolve a local gateway route table id, so each refuses the
+/// same id the same way; the contract [`require_known_instance`] writes out for instances. The
+/// operations whose subject is a ROUTE of the table resolve it through
+/// [`require_known_route_table_for_local_gateway_route`] instead, which shares this resolution
+/// and differs only in the sentence it words a malformed id with.
 pub fn require_known_local_gateway_route_table<E>(
     store: &ComAmazonawsEc2Amazonec2State,
     id: &str,
 ) -> Result<(), Scaffolded<E>> {
-    require_well_formed_local_gateway_route_table_id(id)?;
+    require_known_local_gateway_route_table_worded(
+        store,
+        id,
+        invalid_local_gateway_route_table_id_malformed,
+    )
+}
+
+/// Resolve a local gateway route table id — malformed before unknown — with `malformed` writing
+/// the sentence the CALLING operation's validator words that refusal with.
+///
+/// The ONE lookup and the ONE ordering behind both of this resource's malformed sentences, so
+/// only the wording is per-validator.
+fn require_known_local_gateway_route_table_worded<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    id: &str,
+    malformed: fn(&str) -> Scaffolded<E>,
+) -> Result<(), Scaffolded<E>> {
+    require_well_formed_local_gateway_route_table_id_worded(id, malformed)?;
     if !store.local_gateway_route_tables.contains_key(id) {
         return Err(invalid_local_gateway_route_table_id_not_found(id));
     }
@@ -21542,13 +21642,16 @@ pub fn byoasn_not_found<E>(asn: &str) -> Scaffolded<E> {
 /// Distinct from [`invalid_cidr_not_found`] only in its WORDING, which says where the range
 /// was looked for: the BYOASN operations are addressed by a range IPAM manages
 /// (`ByoipCidr$IpamPoolId`), so a range the account brought to AWS but never moved to IPAM
-/// is as absent to them as one it never brought at all. The message names the range the
-/// request asked about, in EC2's "the value you sent, in parentheses" form.
-pub fn cidr_not_found_in_ipam<E>(cidr: &str) -> Scaffolded<E> {
+/// is as absent to them as one it never brought at all.
+///
+/// The sentence is ENTIRELY fixed and interpolates NO value: it says that the range the request
+/// asked about is not in IPAM without repeating it, so this refusal takes no argument and
+/// nothing a caller sent can reach it.
+pub fn cidr_not_found_in_ipam<E>() -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_CIDR_NOT_FOUND,
         400,
-        format!("The CIDR ({cidr}) could not be found in IPAM."),
+        "The requested CIDR could not be found in IPAM.".to_string(),
     )
 }
 
@@ -21844,7 +21947,7 @@ impl ComAmazonawsEc2Amazonec2State {
             status_message: None,
         };
         let Some(mut record) = self.byoip_cidr_in_ipam(cidr).cloned() else {
-            return Err(cidr_not_found_in_ipam(cidr));
+            return Err(cidr_not_found_in_ipam());
         };
         let associations = record
             .byoip_cidr
@@ -24606,10 +24709,12 @@ pub fn require_visible_image<E>(
 /// the describes of the account's images draw the distinction the shared
 /// [`require_visible_image`] keeps: [`invalid_ami_id_malformed`] for a value that is no AMI
 /// id at all and [`invalid_ami_id_not_found`] for a well-formed id no visible image has.
-/// Two recorded units pin the strict answer, `ec2-image-describes#task#4` for
-/// `DescribeImageAttribute` and `ec2-image-store-restore-error-paths#task#1` for
-/// `CreateStoreImageTask`, so the wording lives here rather than beside either caller. The
-/// message's one variable part is the id the request sent.
+/// Two recorded units pin the strict answer, `ec2-image-store-restore-error-paths#task#1` for
+/// `CreateStoreImageTask` and the recorded `DescribeImageAttribute` refusal, so the wording
+/// lives here rather than beside either caller. The message's one variable part is the id the
+/// request sent. `GetImageAncestry` words its MALFORMED refusal from here too while keeping the
+/// `.NotFound` of a well-formed id no visible image has, so a caller of it still tells the two
+/// apart.
 pub fn unresolvable_image_id<E>(image_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_AMI_ID_MALFORMED,
@@ -25309,11 +25414,16 @@ pub fn invalid_allocation_id_not_found<E>(allocation_id: &str) -> Scaffolded<E> 
 
 /// Refuse a request that named an Elastic IP address this account holds no allocation
 /// for: HTTP 400 `InvalidAddress.NotFound`.
+///
+/// ONE sentence for that code, whichever operation answers it — `The Elastic IP address
+/// '<address>' does not exist or is not available.`, naming the address from the REQUEST — so a
+/// recovery, an association, a release and a describe all read the same way; the refusal says
+/// nothing about WHICH of the two it is, because the account is told neither.
 pub fn invalid_address_not_found<E>(public_ip: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_ADDRESS_NOT_FOUND,
         400,
-        format!("Address '{public_ip}' not found"),
+        format!("The Elastic IP address '{public_ip}' does not exist or is not available."),
     )
 }
 
@@ -25502,17 +25612,20 @@ pub fn network_interface_id_is_well_formed(id: &str) -> bool {
 /// Refuse a request that named something that is not a network interface id: HTTP 400
 /// `InvalidNetworkInterfaceId.Malformed`.
 ///
-/// The message is the one EC2 answers a value it cannot read as a resource id with,
-/// [`invalid_id_message`]: the literal `Invalid id: ` and the offending value from the
-/// REQUEST, in DOUBLE quotes — the template this corpus records for the network interface
-/// family's own ids (a malformed network interface ATTACHMENT id is refused
-/// `Invalid id: "<value>"`), and the quoting the same template carries wherever a recording
-/// shows it.
+/// The message is this RESOURCE's own sentence — `The interface ID '<id>' is malformed`,
+/// naming the interface the way [`invalid_network_interface_id_not_found`] beside it names one
+/// and carrying the id the REQUEST sent, bounded by [`echoed_resource_id`] — rather than the
+/// resource-agnostic [`invalid_id_message`] template. An id of a resource BESIDE the interface
+/// keeps that template: a malformed network interface ATTACHMENT id is refused
+/// `Invalid id: "<value>"`, a different id space from this one.
 pub fn invalid_network_interface_id_malformed<E>(network_interface_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_NETWORK_INTERFACE_ID_MALFORMED,
         400,
-        invalid_id_message(network_interface_id),
+        format!(
+            "The interface ID '{}' is malformed",
+            echoed_resource_id(network_interface_id)
+        ),
     )
 }
 
@@ -26239,16 +26352,10 @@ impl ComAmazonawsEc2Amazonec2State {
 /// Refuse a request the Elastic IP address transfer surface has no transfer to act on:
 /// HTTP 400 `InvalidAddress.NotFound`.
 ///
-/// The message is the one the real service answers there — `The Elastic IP address
-/// '<address>' does not exist or is not available.`, naming the address from the request —
-/// which is a different sentence from [`invalid_address_not_found`]'s, that one being for an
-/// address the account holds no allocation for at all.
+/// Worded by the one writer of that code ([`invalid_address_not_found`]), so the transfer
+/// surface and every other operation that cannot resolve an address answer one sentence.
 pub fn address_transfer_not_available<E>(address: &str) -> Scaffolded<E> {
-    Scaffolded::service_error(
-        INVALID_ADDRESS_NOT_FOUND,
-        400,
-        format!("The Elastic IP address '{address}' does not exist or is not available."),
-    )
+    invalid_address_not_found(address)
 }
 
 // ---------------------------------------------------------------------------
@@ -30851,6 +30958,22 @@ pub const INVALID_VPC_ENDPOINT_SERVICE_ID_NOT_FOUND: &str =
 pub const INVALID_VPC_ENDPOINT_SERVICE_ID_MALFORMED: &str =
     "InvalidVpcEndpointServiceId.Malformed";
 
+/// Refuse a well-formed VPC endpoint service id this account holds no endpoint service for:
+/// HTTP 400 [`INVALID_VPC_ENDPOINT_SERVICE_ID_NOT_FOUND`].
+///
+/// The resource is named the way AWS names it in this refusal — `The VpcEndpointService Id
+/// '<id>' does not exist`, the shape's own name with `Id` spelt as one word — rather than in
+/// the prose an operation might reach for, with the id from the REQUEST. The ONE place this
+/// refusal is built, so every operation that resolves a `ServiceId` answers an unknown one
+/// identically.
+pub fn invalid_vpc_endpoint_service_id_not_found<E>(service_id: &str) -> Scaffolded<E> {
+    id_not_found(
+        INVALID_VPC_ENDPOINT_SERVICE_ID_NOT_FOUND,
+        "VpcEndpointService Id",
+        service_id,
+    )
+}
+
 /// `InvalidIpamPoolId.NotFound` (HTTP 400): the request named an IPAM pool id this account
 /// holds no pool for.
 pub const INVALID_IPAM_POOL_ID_NOT_FOUND: &str = "InvalidIpamPoolId.NotFound";
@@ -30957,11 +31080,29 @@ pub fn decide_transit_gateway_attachment<E>(
     // state, so whether this call is admissible is asked of the state the attachment is
     // ACTUALLY in rather than of the one it was left in.
     store.materialize_due_transitions();
+    // Which sentence an unresolvable id is refused with is a fact of the attachment KIND this
+    // operation acts on: a VPC attachment and a transit gateway peering attachment are the
+    // transit gateway's OWN resources, so they carry that family's prose
+    // ([`transit_gateway_attachment_deleted_or_absent`]); a client VPN attachment is the Client
+    // VPN endpoint's resource and keeps the service's shared `transit-gateway-attachment ID`
+    // template, the one every operation that takes an attachment id as a parameter of another
+    // action answers.
+    let owned_by_the_transit_gateway = matches!(
+        resource_type,
+        TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_VPC
+            | TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_PEERING
+    );
     let record = store
         .transit_gateway_attachments
         .get_mut(attachment_id)
         .filter(|record| record.view.resource_type() == resource_type)
-        .ok_or_else(|| invalid_transit_gateway_attachment_id_not_found(attachment_id))?;
+        .ok_or_else(|| {
+            if owned_by_the_transit_gateway {
+                transit_gateway_attachment_deleted_or_absent(attachment_id)
+            } else {
+                invalid_transit_gateway_attachment_id_not_found(attachment_id)
+            }
+        })?;
     let states = record.view.states();
     if record.view.state() != Some(states.pending_acceptance) {
         return Err(incorrect_state(format!(
@@ -30992,25 +31133,67 @@ pub fn unexpected_attachment_kind<E>(attachment_id: &str) -> Scaffolded<E> {
 
 /// The `ResourceType` an attachment is tagged and ARN'd under — the `transit-gateway-attachment`
 /// member of that enum (`smithy_query(query="shape",shape="ResourceType")`) — which is also how
-/// EC2's refusal below spells this resource kind, exactly as
-/// [`RESOURCE_TYPE_IPAM_INTERNET_REGISTRY_ASSOCIATION`] does for its own resource. A PER-RESOURCE
-/// spelling, not a blanket one: other resources of this service word the same refusal in prose
-/// ("The security group '…' does not exist", "The launch template ID '…' does not exist"), so each
-/// keeps the wording its own evidence shows.
+/// EC2 spells this resource kind in the SHARED refusal below, exactly as
+/// [`RESOURCE_TYPE_IPAM_INTERNET_REGISTRY_ASSOCIATION`] does for its own resource.
 pub const RESOURCE_TYPE_TRANSIT_GATEWAY_ATTACHMENT: &str = "transit-gateway-attachment";
 
 /// Refuse a well-formed transit gateway attachment id this account holds no attachment for:
 /// HTTP 400 [`INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND`], worded by the one writer of
 /// that refusal ([`id_not_found`]).
 ///
-/// The ONE place this refusal is built, so every operation that resolves an attachment id —
-/// whichever kind of attachment it acts on — answers an unknown id identically.
+/// The wording EC2 answers an operation that takes an attachment id as a PARAMETER of some
+/// other action with — an association, an announcement, a describe's id selection, and the
+/// acceptance of a CLIENT VPN attachment, whose resource is the Client VPN endpoint's rather
+/// than the transit gateway's. The two attachment kinds the transit gateway itself owns as
+/// resources are refused by [`transit_gateway_attachment_deleted_or_absent`] instead; which of
+/// the two an acceptance or rejection answers is decided in ONE place
+/// ([`decide_transit_gateway_attachment`]).
 pub fn invalid_transit_gateway_attachment_id_not_found<E>(attachment_id: &str) -> Scaffolded<E> {
     id_not_found(
         INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
         &format!("{RESOURCE_TYPE_TRANSIT_GATEWAY_ATTACHMENT} ID"),
         attachment_id,
     )
+}
+
+/// Refuse a well-formed id of an attachment the TRANSIT GATEWAY owns as a resource — a VPC
+/// attachment or a transit gateway peering attachment — that this account holds none of: HTTP
+/// 400 [`INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND`].
+///
+/// Worded the way the rest of the transit gateway family words the same refusal about its own
+/// resources — `<Resource> <id> was deleted or does not exist.`, the sentence
+/// [`invalid_transit_gateway_id_not_found`], [`invalid_transit_gateway_route_table_id_not_found`]
+/// and [`invalid_transit_gateway_multicast_domain_id_not_found`] already carry, with the id
+/// UNQUOTED and taken from the request.
+pub fn transit_gateway_attachment_deleted_or_absent<E>(attachment_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
+        400,
+        format!("Transit Gateway Attachment {attachment_id} was deleted or does not exist."),
+    )
+}
+
+/// Refuse something that is not a transit gateway attachment id at all: HTTP 400
+/// [`INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED`], BEFORE the id is looked up, so "not an
+/// id of this kind" is never reported as "no such attachment".
+///
+/// The ONE place this resource's malformed refusal is worded, for every operation that resolves
+/// a `TransitGatewayAttachmentId`: like
+/// [`require_well_formed_transit_gateway_route_table_id`] beside it, the message NAMES the
+/// resource rather than using the resource-agnostic wording of [`require_well_formed_id`]. The
+/// sentence is ENTIRELY fixed — this refusal interpolates no value, unlike the route table's —
+/// so nothing a caller sent reaches it.
+pub fn require_well_formed_transit_gateway_attachment_id<E>(
+    attachment_id: &str,
+) -> Result<(), Scaffolded<E>> {
+    if prefixed_id_is_well_formed(TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX, attachment_id) {
+        return Ok(());
+    }
+    Err(Scaffolded::service_error(
+        INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
+        400,
+        "Invalid Transit Gateway Attachment id.".to_string(),
+    ))
 }
 
 // =============================================================================

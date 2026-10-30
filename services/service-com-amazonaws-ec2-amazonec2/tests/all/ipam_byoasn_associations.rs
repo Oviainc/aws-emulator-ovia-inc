@@ -441,12 +441,13 @@ async fn a_range_ipam_does_not_manage_is_refused_as_not_found() {
             code, CIDR_NOT_FOUND,
             "case {case:?}: expected {CIDR_NOT_FOUND} for {cidr}, got {code:?} with body {body}"
         );
-        // The message is built from the request: it names the range the caller asked about.
+        // The message is AWS's own sentence for this refusal class: entirely fixed, naming no
+        // range, so the value the caller sent is not repeated back to it.
         let message = element(&body, "Message").map(|text| unescaped(&text));
         assert_eq!(
             message.as_deref(),
-            Some(format!("The CIDR ({cidr}) could not be found in IPAM.").as_str()),
-            "case {case:?}: expected the message to name {cidr}, got {message:?}"
+            Some("The requested CIDR could not be found in IPAM."),
+            "case {case:?}: expected the fixed IPAM refusal for {cidr}, got {message:?}"
         );
         for range in [&in_ipam, &outside_ipam] {
             let held = stored_associations(&engine, range);

@@ -146,11 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.transit_gateway_route_table_id,
         )?;
         if let Some(attachment_id) = input.transit_gateway_attachment_id.as_deref() {
-            state::require_well_formed_id(
-                state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
-                attachment_id,
-                state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
-            )?;
+            state::require_well_formed_transit_gateway_attachment_id(attachment_id)?;
         }
         if let Some(announcement_id) = input
             .transit_gateway_route_table_announcement_id

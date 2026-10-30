@@ -56,6 +56,11 @@ struct RejectableKind {
     view: fn() -> TransitGatewayAttachmentView,
     /// A `(element, value)` the attachment was stored with, which no request here names.
     stored_member: (&'static str, &'static str),
+    /// The sentence a well-formed id of this kind that names no attachment is refused with.
+    /// Per KIND, not per service: the attachments the transit gateway owns as resources carry
+    /// that family's prose, while a client VPN attachment — the Client VPN endpoint's
+    /// resource — keeps the service's shared `transit-gateway-attachment ID` template.
+    unknown_message: fn(&str) -> String,
 }
 
 /// Every kind of attachment this surface rejects. One row per kind, so the rejection is
@@ -71,6 +76,9 @@ fn rejectable_kinds() -> Vec<RejectableKind> {
             rejected: TRANSIT_GATEWAY_ATTACHMENT_STATE_REJECTED,
             view: pending_vpc_attachment,
             stored_member: ("vpcId", "vpc-0123456789abcdef0"),
+            unknown_message: |id| {
+                format!("Transit Gateway Attachment {id} was deleted or does not exist.")
+            },
         },
         RejectableKind {
             reject: "RejectTransitGatewayClientVpnAttachment",
@@ -83,6 +91,9 @@ fn rejectable_kinds() -> Vec<RejectableKind> {
             rejected: TRANSIT_GATEWAY_ATTACHMENT_STATE_REJECTED,
             view: pending_client_vpn_attachment,
             stored_member: ("clientVpnEndpointId", "cvpn-endpoint-0123456789abcdef0"),
+            unknown_message: |id| {
+                format!("The transit-gateway-attachment ID '{id}' does not exist")
+            },
         },
     ]
 }
@@ -261,18 +272,17 @@ async fn a_rejection_tells_a_value_that_is_no_attachment_id_from_an_unknown_one(
                 expected,
                 "case {case:?}: expected {expected:?}, got {body}"
             );
-            // The NotFound refusal names the resource kind as the `ResourceType` enum spells
-            // it — `transit-gateway-attachment`
-            // (`smithy_query(query="shape",shape="ResourceType")`) — and the id from the
-            // request, so the wording is derived rather than resource-specific prose.
+            // The NotFound refusal is worded per ATTACHMENT KIND: the attachments the transit
+            // gateway owns as resources carry that family's prose, the client VPN attachment
+            // the service's shared template. Either way the id comes from the REQUEST.
             if expected == ec2::state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND {
                 let message = unescaped(&element(&body, "Message").unwrap_or_default());
-                // The token SPELT OUT, so a change to the constant the handler formats with
-                // fails here rather than moving both sides of the comparison together.
+                // The sentence SPELT OUT, so a change to the wording the handler formats
+                // with fails here rather than moving both sides of the comparison together.
                 assert_eq!(
                     message,
-                    format!("The transit-gateway-attachment ID '{value}' does not exist"),
-                    "case {case:?}: expected the refusal to name the resource type and the \
+                    (kind.unknown_message)(value),
+                    "case {case:?}: expected the refusal to name the resource and the \
                      requested id, got {message:?} in {body}"
                 );
             }

@@ -278,15 +278,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Searches for routes in the specified local gateway route table"
         // (`SearchLocalGatewayRoutes`): the table is the thing being read, so an id the
         // account holds no table for is a refusal rather than a search that matched nothing.
-        // Resolved through the crate's ONE reader of a local gateway route table id
-        // ([`crate::state::require_known_local_gateway_route_table`]), so this operation
-        // refuses an id exactly as the create, modify and delete of a route do: something
+        // Resolved through the ROUTE operations' reader of a local gateway route table id
+        // ([`crate::state::require_known_route_table_for_local_gateway_route`]), so this
+        // operation refuses an id exactly as the create and delete of a route do: something
         // that is not an id of this resource is `.Malformed`, and a well-formed id of no
         // table of the account is `InvalidLocalGatewayRouteTableID.NotFound`. An account with
         // no Outpost holds no local gateway route table at all, so that is the answer it gets
         // for every well-formed id.
         let route_table_id = input.local_gateway_route_table_id.as_str();
-        crate::state::require_known_local_gateway_route_table(&store, route_table_id)?;
+        crate::state::require_known_route_table_for_local_gateway_route(&store, route_table_id)?;
         // Every route of the table, by the destination that names it there: the table record
         // is the only place a route lives, so a search reads the routes THROUGH the table it
         // just resolved rather than from a second store that could disagree.

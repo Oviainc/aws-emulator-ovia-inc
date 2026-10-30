@@ -190,8 +190,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // table id at all names nothing that could exist, so it is refused as malformed
         // rather than reported as a table the account does not have — a client cannot tell a
         // typo from a missing table otherwise, and goes on waiting for a table that can never
-        // appear. Read by the crate's ONE reader of this id, so a report of the tables refuses
-        // an id exactly as a search of one does.
+        // appear. Worded by the writer for the operations whose subject is the TABLE, which is
+        // not the sentence the ROUTE operations' own validator words the same class with.
         if let Some(malformed) = requested
             .iter()
             .find(|id| !crate::state::local_gateway_route_table_id_is_well_formed(id))

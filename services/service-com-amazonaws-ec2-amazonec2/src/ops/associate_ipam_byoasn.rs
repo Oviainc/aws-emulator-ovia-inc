@@ -200,8 +200,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // but never moved there with `MoveByoipCidrToIpam` — is nothing this operation can
         // act on, whatever the ASN turns out to be.
         if store.byoip_cidr_in_ipam(&cidr).is_none() {
-            // The range as the REQUEST wrote it, which is what the caller has to correct.
-            return Err(state::cidr_not_found_in_ipam(requested_cidr));
+            // AWS's sentence for this refusal class names no range, so the value the caller
+            // sent is not repeated back to it.
+            return Err(state::cidr_not_found_in_ipam());
         }
 
         // "Provisions your Autonomous System Number (ASN) for use in your Amazon Web

@@ -174,11 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state::require_well_formed_transit_gateway_route_table_id(
             &input.transit_gateway_route_table_id,
         )?;
-        state::require_well_formed_id(
-            state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
-            &input.peering_attachment_id,
-            state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
-        )?;
+        state::require_well_formed_transit_gateway_attachment_id(&input.peering_attachment_id)?;
 
         // "The tags specifications applied to the transit gateway route table announcement"
         // (`TagSpecifications`) — "you must specify the resource type to tag, otherwise the

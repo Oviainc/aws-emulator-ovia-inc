@@ -161,11 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // never answered by the DryRun arm below either. The ATTACHMENT's form is read
         // first, for the same reason its existence is resolved first below: it is the
         // resource this call acts on, the domain the scope it acts in.
-        state::require_well_formed_id(
-            state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
-            attachment_id,
-            state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
-        )?;
+        state::require_well_formed_transit_gateway_attachment_id(attachment_id)?;
         state::require_well_formed_id(
             state::TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_PREFIX,
             domain_id,

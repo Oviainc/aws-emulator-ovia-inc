@@ -253,11 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so "not an id of this kind" never reads as "no such attachment" and is never
         // answered by the DryRun arm below either.
         for attachment_id in requested {
-            state::require_well_formed_id(
-                state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
-                attachment_id,
-                state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
-            )?;
+            state::require_well_formed_transit_gateway_attachment_id(attachment_id)?;
         }
 
         // "Checks whether you have the required permissions for the action, WITHOUT

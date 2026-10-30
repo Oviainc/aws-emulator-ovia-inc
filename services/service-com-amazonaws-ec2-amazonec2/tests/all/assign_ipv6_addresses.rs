@@ -727,7 +727,7 @@ async fn an_assignment_it_cannot_make_is_refused_and_records_nothing() {
         (
             "a malformed id",
             "not-an-id",
-            "Invalid id: \"not-an-id\"".to_string(),
+            "The interface ID 'not-an-id' is malformed".to_string(),
         ),
         (
             "a well-formed id naming nothing",

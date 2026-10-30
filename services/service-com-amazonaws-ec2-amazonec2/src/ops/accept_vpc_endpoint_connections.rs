@@ -189,11 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused outright — the whole call is about that one service, so this is not a
         // per-endpoint failure that belongs in `Unsuccessful`.
         if !store.vpc_endpoint_services.contains_key(service_id) {
-            return Err(state::id_not_found(
-                state::INVALID_VPC_ENDPOINT_SERVICE_ID_NOT_FOUND,
-                "VPC endpoint service ID",
-                service_id,
-            ));
+            return Err(state::invalid_vpc_endpoint_service_id_not_found(service_id));
         }
 
         // Each endpoint is judged on its own and reported in `Unsuccessful` when it cannot
