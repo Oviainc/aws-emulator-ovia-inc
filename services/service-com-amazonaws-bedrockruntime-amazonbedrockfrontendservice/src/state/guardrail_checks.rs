@@ -13,7 +13,10 @@
 //!   is, and the offsets a finding carries are that recognizer's own zero-based
 //!   character offsets into the content block it was found in. The recognizer's
 //!   entity catalog is this service's catalog under other names for seven entities,
-//!   which [`SENSITIVE_INFORMATION_ENTITY_TYPES`] maps.
+//!   which [`SENSITIVE_INFORMATION_ENTITY_TYPES`] maps. A finding's confidence is
+//!   answered per DETECTION, from how completely the detected value determines the
+//!   entity ([`entity_confidence`]), so two detections of differing strength in one
+//!   response carry differing confidences.
 //! * the CONTENT-FILTER check scores every modelled category from the text. Three
 //!   of them — the ones about language — are classified by the English
 //!   profanity/abuse engine this emulator already analyses toxicity with
@@ -25,7 +28,11 @@
 //! * the PROMPT-ATTACK check runs a rule recognizer over the same text. A prompt
 //!   attack is an INSTRUCTION to the model, published as a small set of imperative
 //!   forms, so each modelled category is recognised by the forms it is published in,
-//!   and a finding's severity is the evidence class of the rule that placed it.
+//!   and a finding's severity is the evidence class of the rule that placed it. The
+//!   families overlap, and a message carries one attack, so the result ATTRIBUTES it
+//!   ([`prompt_attack_findings`]): the family the message exercises most strongly
+//!   among the ones asked about carries the severity, and a family read only below
+//!   that is answered at zero.
 //!
 //! A check the request does not configure is never evaluated and never reported. A
 //! check that IS configured answers about every category or entity type the request
@@ -41,7 +48,9 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 use rustrict::{Censor, Type};
-use service_com_amazonaws_comprehend_comprehend_20171127::ops::contains_pii_entities::detect_pii_spans;
+use service_com_amazonaws_comprehend_comprehend_20171127::ops::contains_pii_entities::{
+    detect_pii_spans, Evidence,
+};
 
 /// The order the content filter reports its verdicts in.
 ///
@@ -584,13 +593,20 @@ fn content_filter_findings(
 /// The severity a prompt-attack finding carries at each of the two evidence classes
 /// the check distinguishes ([`RuleEvidence`]).
 ///
-/// `GuardrailChecksPromptAttackResultEntry$severityScore` is modelled over 0..1 like
-/// the content filter's, but this check's verdict is not the profanity engine's
-/// three-level one, so its own two levels are stated here: a message that STATES the
-/// attack is close to certain, and one that only uses a phrase of the family is well
-/// above the middle of the range without being that.
-const STATED_ATTACK_SEVERITY: f64 = 0.9;
-const ALLUDED_ATTACK_SEVERITY: f64 = 0.6;
+/// `GuardrailChecksPromptAttackResultEntry$severityScore` is a `Double` over 0..1
+/// documented as "higher values indicate greater severity"
+/// (`smithy_query(query="shape",shape="GuardrailChecksPromptAttackResultEntry")`), so
+/// the two ENDS of that range are the two verdicts a recognizer can reach: a message
+/// that STATES the attack — it issues the published imperative of the family itself —
+/// exercises the category decisively and is reported at the top of the range, and one
+/// that only uses a phrase of the family, with no imperative of its own, a step below
+/// it. A category the message exercises in neither way is reported at the bottom of
+/// the range (zero) by [`prompt_attack_findings`]. The scale is this member's own
+/// `f64` one: the modelled type is a 64-bit `Double`, so no severity here is carried
+/// in a narrower float and widened on serialization, which cannot represent a value
+/// of this range exactly.
+const STATED_ATTACK_SEVERITY: f64 = 1.0;
+const ALLUDED_ATTACK_SEVERITY: f64 = 0.8;
 
 /// Every prompt-attack rule, compiled once, as the one rule type both category
 /// checks are read through ([`CategoryRule`]).
@@ -614,30 +630,22 @@ fn attack_rules() -> &'static [CategoryRule] {
             pattern: Regex::new(pattern).expect("a prompt-attack rule is a valid regex"),
         };
         vec![
-            // An instruction override: the message tells the model to drop what it
-            // was instructed with, or injects a new instruction channel into the
-            // content.
-            rule(
-                "PROMPT_INJECTION",
-                RuleEvidence::Stated,
-                r"(?i)\b(?:ignore|disregard|forget|override|replace)\b[^.!?\n]{0,40}?\b(?:instructions?|rules?|directions?|guidelines?|prompt)\b",
-            ),
-            rule(
-                "PROMPT_INJECTION",
-                RuleEvidence::Stated,
-                r"(?im)^\s*(?:system|assistant)\s*:",
-            ),
-            rule(
-                "PROMPT_INJECTION",
-                RuleEvidence::Alluded,
-                r"(?i)\bnew\s+(?:instructions?|rules?|directions?)\b",
-            ),
-            // Shedding the model's restrictions, including the named personas the
-            // family is published under.
+            // Shedding the behaviour the model was configured to follow: the family
+            // is published as a prompt designed to get the model past its own safety
+            // and moderation behaviour, so a message that asks for that behaviour to
+            // be dropped states this attack whichever part of it it names — the
+            // safety behaviour itself, the instructions the model operates under, or
+            // the restrictions it answers within — and the named personas the family
+            // is published under allude to it.
             rule(
                 "JAILBREAK",
                 RuleEvidence::Stated,
-                r"(?i)\b(?:bypass|disable|turn off|get around|work around)\b[^.!?\n]{0,40}?\b(?:guardrails?|safety|safeguards?|filters?|restrictions?|limitations?|policies)\b",
+                r"(?i)\b(?:bypass|disable|turn off|get around|work around|ignore|disregard|forget|override|drop)\b[^.!?\n]{0,40}?\b(?:guardrails?|safety|safeguards?|filters?|restrictions?|limitations?|polic(?:y|ies)|guidelines?|rules?|moderation)\b",
+            ),
+            rule(
+                "JAILBREAK",
+                RuleEvidence::Stated,
+                r"(?i)\b(?:ignore|disregard|forget|override|replace)\b[^.!?\n]{0,40}?\b(?:instructions?|directions?|prompts?|system (?:prompt|message))\b",
             ),
             rule(
                 "JAILBREAK",
@@ -648,6 +656,30 @@ fn attack_rules() -> &'static [CategoryRule] {
                 "JAILBREAK",
                 RuleEvidence::Alluded,
                 r"(?i)\b(?:jailbreak|do anything now|dan mode|developer mode|god mode)\b",
+            ),
+            // Putting the attacker's instructions in the place of the developer's:
+            // the family is published as a prompt that overrides the instructions
+            // the application gave the model with instructions of the attacker's
+            // own, so what STATES it is the injected instruction — a message that
+            // opens its own instruction channel in the content, or announces the
+            // instructions that are to replace them. Telling the model to drop the
+            // instructions it has, with no instruction of the attacker's own in it,
+            // only uses this family's phrase: it is the form the rule above reads as
+            // the jailbreak it states, and it is placed here as an allusion.
+            rule(
+                "PROMPT_INJECTION",
+                RuleEvidence::Stated,
+                r"(?im)^\s*(?:system|assistant)\s*:",
+            ),
+            rule(
+                "PROMPT_INJECTION",
+                RuleEvidence::Alluded,
+                r"(?i)\b(?:ignore|disregard|forget|override|replace)\b[^.!?\n]{0,40}?\b(?:instructions?|directions?|prompts?|system (?:prompt|message))\b",
+            ),
+            rule(
+                "PROMPT_INJECTION",
+                RuleEvidence::Alluded,
+                r"(?i)\bnew\s+(?:instructions?|rules?|directions?)\b",
             ),
             // Disclosing the instructions the model was given.
             rule(
@@ -670,18 +702,46 @@ fn attack_rules() -> &'static [CategoryRule] {
 }
 
 /// The prompt-attack result over `texts`: one entry per category the request named,
-/// in [`PROMPT_ATTACK_RESULT_ORDER`], carrying the strongest evidence any rule of
-/// that category placed in any message, and zero where no rule of it matched.
+/// in [`PROMPT_ATTACK_RESULT_ORDER`].
+///
+/// A message carries ONE prompt attack, and the families the modelled categories
+/// name overlap — the same words can be read as more than one of them — so the check
+/// ATTRIBUTES the attack rather than answering each category on its own: the entry
+/// for the family the message exercises most strongly, among the categories the
+/// request named, carries the severity its rules placed, and every other named
+/// category is answered at zero, the same answer a message that attacks in no way at
+/// all gets. Where two named families are exercised equally strongly — each stated
+/// by its own form, as a message that both sheds the model's behaviour and asks for
+/// its instructions does — both are reported: the attribution zeroes a family read
+/// only BELOW the strongest, not one read as strongly.
 fn prompt_attack_findings(
     requested: &BTreeSet<String>,
     texts: &[CheckedText],
 ) -> Vec<CategoryFinding> {
-    PROMPT_ATTACK_RESULT_ORDER
+    let placed: Vec<(&'static str, Option<f64>)> = PROMPT_ATTACK_RESULT_ORDER
         .into_iter()
         .filter(|category| requested.contains(*category))
-        .map(|category| CategoryFinding {
+        .map(|category| (category, placed_severity(attack_rules(), category, texts)))
+        .collect();
+
+    // The attack is attributed to the family it fits best among the ones asked
+    // about: the strongest evidence any of their rules placed anywhere in the
+    // conversation.
+    let attributed = placed
+        .iter()
+        .filter_map(|(_, severity)| *severity)
+        .max_by(f64::total_cmp);
+
+    placed
+        .into_iter()
+        // The family the attack is attributed to carries what its rules placed; a
+        // family read only below that is not what this attack is, so it is answered
+        // as not exercised.
+        .map(|(category, severity)| CategoryFinding {
             category,
-            severity_score: placed_severity(attack_rules(), category, texts).unwrap_or(0.0),
+            severity_score: severity
+                .filter(|placed| attributed.is_some_and(|strongest| *placed >= strongest))
+                .unwrap_or(0.0),
         })
         .collect()
 }
@@ -752,6 +812,84 @@ pub const SENSITIVE_INFORMATION_ENTITY_TYPES: [(&str, &str); 31] = [
     ),
 ];
 
+/// The confidence this check reports for a detection, by how completely the detected
+/// value itself determines the entity it was reported as.
+///
+/// `GuardrailChecksSensitiveInformationResultEntry$confidenceScore` is a `Double`
+/// over 0..1 documented as the confidence score FOR THE DETECTION, higher values
+/// indicating greater confidence
+/// (`smithy_query(query="shape",\
+/// shape="GuardrailChecksSensitiveInformationResultEntry")`), so it is answered per
+/// detected entity, from what the recognizer established about THAT value rather than
+/// from the entity type it was reported as. Three things determine a value:
+///
+/// * [`DETERMINED_ENTITY_CONFIDENCE`] — the value is fully determined: it carries the
+///   check its defining standard gives it and that check passed, or its form is a
+///   token nothing else takes (an address with a domain, a URI, a key with its
+///   documented prefix), so the value alone says what it is.
+/// * [`NUMBER_ENTITY_CONFIDENCE`] — the value is a bare number: digits and
+///   separators, identified only by how many digits it has and how they are grouped,
+///   and it carries as many as the published identifier of its kind does (a
+///   telephone number carrying its country or area code, which ITU-T E.164 makes
+///   part of the number).
+/// * [`PARTIAL_ENTITY_CONFIDENCE`] — the value is weaker than that: a short run of
+///   digits, which is only part of such an identifier (a subscriber number with no
+///   area code) and which ordinary numbers take too, or a value whose own form is
+///   ambiguous and which was admitted only because the surrounding text named what it
+///   is.
+///
+/// Two detections of differing strength in one response therefore carry differing
+/// scores. The scale is this member's own `f64` one: the sibling service that shares
+/// the recognizer models its score as a `Float` and calibrates its own classes on
+/// that scale, and widening one of those 32-bit values into this `Double` would
+/// serialize an artefact of the narrower type (no value of this range but zero and
+/// one is exactly representable in 32 bits), so this member's levels are stated here
+/// in the type it is modelled as and carried in it end to end.
+const DETERMINED_ENTITY_CONFIDENCE: f64 = 1.0;
+const NUMBER_ENTITY_CONFIDENCE: f64 = 0.8;
+const PARTIAL_ENTITY_CONFIDENCE: f64 = 0.6;
+
+/// How many digits an identifier written as a bare number carries before the number
+/// determines it on its own.
+///
+/// A telephone number is the published identifier that is written this way and
+/// nothing else: ITU-T E.164 makes the country code part of the number and the NANP
+/// the area code, which puts a complete one at ten digits, while the subscriber
+/// number alone is seven. Fewer digits than this is part of an identifier rather than
+/// one.
+const DETERMINING_DIGITS: usize = 10;
+
+/// The confidence a detection of `value`, established by `evidence`, carries on the
+/// scale above.
+fn entity_confidence(evidence: Evidence, value: &str) -> f64 {
+    match evidence {
+        // The value's own check passed, so nothing about the value is left open.
+        Evidence::Validated => DETERMINED_ENTITY_CONFIDENCE,
+        // The text had to name what the value is, so the value does not determine it.
+        Evidence::Context => PARTIAL_ENTITY_CONFIDENCE,
+        // A distinctive form with no check of its own: how much the form determines
+        // depends on whether it is a token or a number.
+        Evidence::Format => {
+            let digits = value.chars().filter(char::is_ascii_digit).count();
+            let bare_number = value.chars().all(|character| {
+                character.is_ascii_digit() || NUMBER_SEPARATORS.contains(&character)
+            });
+            if !bare_number {
+                DETERMINED_ENTITY_CONFIDENCE
+            } else if digits >= DETERMINING_DIGITS {
+                NUMBER_ENTITY_CONFIDENCE
+            } else {
+                PARTIAL_ENTITY_CONFIDENCE
+            }
+        }
+    }
+}
+
+/// What a number written for people to read carries between its digits: the
+/// separators E.164 and the NANP write a telephone number with, and the ones the
+/// other numeric identifiers are grouped by.
+const NUMBER_SEPARATORS: [char; 7] = [' ', '-', '.', '(', ')', '+', '/'];
+
 /// This service's entity type for a span the recognizer reported, or `None` for a
 /// recognizer type this service models no entity for.
 fn modelled_entity_type(recognized: &str) -> Option<&'static str> {
@@ -787,9 +925,18 @@ fn sensitive_information_findings(
                     truncated: true,
                 };
             }
+            // The value the recognizer placed, sliced out of the block by the
+            // finding's own character offsets: what it is made of is what decides
+            // how much it determines the entity.
+            let value: String = block
+                .text
+                .chars()
+                .skip(span.begin)
+                .take(span.end.saturating_sub(span.begin))
+                .collect();
             findings.push(EntityFinding {
                 entity_type,
-                confidence_score: f64::from(span.score),
+                confidence_score: entity_confidence(span.evidence, &value),
                 begin_offset: offset_i32(span.begin),
                 end_offset: offset_i32(span.end),
                 message_index: offset_i32(block.message_index),

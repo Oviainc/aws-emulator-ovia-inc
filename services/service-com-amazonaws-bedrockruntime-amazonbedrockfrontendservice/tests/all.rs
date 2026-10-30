@@ -39,6 +39,8 @@ mod guardrail_checks_evaluation;
 mod guardrail_checks_inline;
 #[path = "all/guardrail_checks_phone_numbers.rs"]
 mod guardrail_checks_phone_numbers;
+#[path = "all/guardrail_checks_scores.rs"]
+mod guardrail_checks_scores;
 #[path = "all/inference_stop_sequences.rs"]
 mod inference_stop_sequences;
 #[path = "all/resource_reference_refusals.rs"]
