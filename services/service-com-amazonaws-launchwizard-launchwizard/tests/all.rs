@@ -61,6 +61,8 @@ mod state_roundtrip;
 mod tag_key_rule_single_source;
 #[path = "all/update_deployment_dry_run_response.rs"]
 mod update_deployment_dry_run_response;
+#[path = "all/update_deployment_version_targets.rs"]
+mod update_deployment_version_targets;
 #[path = "all/validation_messages.rs"]
 mod validation_messages;
 #[path = "all/validation_report_single_source.rs"]

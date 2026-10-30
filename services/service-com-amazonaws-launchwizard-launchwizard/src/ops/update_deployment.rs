@@ -243,10 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
         // A version the caller names has to be one the catalogue holds for this
         // deployment's workload and pattern: naming one it does not is a resource that
-        // cannot be found rather than a setting that is merely odd. A pattern publishes
-        // several versions, so ANY of them is a version this deployment can be moved
-        // onto — the same published list `GetDeploymentPatternVersion` reports from, so
-        // a version a caller can read is a version it can ask for. Each refusal carries
+        // cannot be found rather than a setting that is merely odd. A refusal carries
         // the message of the KIND of resource that is missing, which for a name below
         // the pattern (resolved one statement above) is the kind that name identifies
         // and never the enclosing pattern's: a deployment pattern VERSION is its own
@@ -267,19 +264,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if input
-            .deployment_pattern_version_name
-            .as_ref()
-            .is_some_and(|requested| pattern.version(requested).is_none())
-        {
-            return Err(UpdateDeploymentErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(
-                        crate::state::DEPLOYMENT_PATTERN_VERSION_NOT_FOUND_MESSAGE.to_string(),
-                    ),
-                },
-            )
-            .into());
+        if let Some(requested) = input.deployment_pattern_version_name.as_deref() {
+            // The ONE statement of which version an update may move this deployment
+            // onto, over the pattern's published list
+            // (`state::DeploymentPattern::update_target_refusal`) — the same rule the
+            // read that reports a deployment's update targets answers from, so a
+            // version that read omits is a version this operation does not take, and a
+            // version it reports is one this operation applies. Each answer carries the
+            // error the model gives that KIND of failure: a version the catalogue does
+            // not publish is a resource that cannot be found, while the version the
+            // deployment already deploys is published and simply moves no version at
+            // all, which is an input the service cannot satisfy rather than a resource
+            // it cannot find.
+            match pattern.update_target_refusal(&deployed_pattern_version, requested) {
+                Some(crate::state::UpdateTargetRefusal::Unpublished) => {
+                    return Err(UpdateDeploymentErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(
+                                crate::state::DEPLOYMENT_PATTERN_VERSION_NOT_FOUND_MESSAGE
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                Some(crate::state::UpdateTargetRefusal::AlreadyDeployed) => {
+                    return Err(UpdateDeploymentErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                crate::state::DEPLOYMENT_PATTERN_VERSION_ALREADY_DEPLOYED_MESSAGE
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                None => {}
+            }
         }
         let warnings = crate::state::specification_warnings(pattern, &specifications);
         // A version the caller did not name is the one the deployment already deploys,

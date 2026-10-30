@@ -17,7 +17,8 @@
 //! * a deployment that is not there, is going away, or is asked for a version the
 //!   catalogue does not hold, is refused rather than updated (the refusal of a
 //!   deployment whose create or update is still IN FLIGHT has its own suite,
-//!   `tests/all/deployment_update_in_flight.rs`).
+//!   `tests/all/deployment_update_in_flight.rs`, and the refusal of the version a
+//!   deployment ALREADY deploys has `tests/all/update_deployment_version_targets.rs`).
 //!
 //! Every assertion is made over a TABLE spanning the class rather than over one call:
 //! every workload and deployment pattern the catalogue holds, settings maps of
@@ -177,11 +178,73 @@ struct SettingsRow {
 /// which is a state that takes no further update).
 struct VersionSuite {
     case: String,
+    workload: String,
+    pattern: String,
     /// The `WorkloadDeploymentPatternData` the versions are read off.
     data: Value,
     conforming: Map<String, Value>,
     refused_on: String,
     accepted_on: Vec<String>,
+}
+
+/// The versions `ListDeploymentPatternVersions` reports as the ones an update can move
+/// a deployment that currently deploys `from` onto: its `updateFromVersion` filter, in
+/// the order the catalogue publishes them.
+///
+/// The one place a suite asks the service which versions an update may name, so a suite
+/// that submits one is submitting what the read reports rather than a version written
+/// out here.
+pub(crate) async fn update_targets(
+    harness: &Harness,
+    case: &str,
+    workload: &str,
+    pattern: &str,
+    from: &str,
+) -> Vec<String> {
+    let body = harness
+        .ok(
+            case,
+            "/listDeploymentPatternVersions",
+            json!({
+                "workloadName": workload,
+                "deploymentPatternName": pattern,
+                "filters": [{"name": "updateFromVersion", "values": [from]}],
+            }),
+        )
+        .await;
+    body["deploymentPatternVersions"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: ListDeploymentPatternVersions reported no list: {body}")
+        })
+        .iter()
+        .map(|summary| {
+            summary["deploymentPatternVersionName"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: a reported version carries no name: {summary}")
+                })
+                .to_string()
+        })
+        .collect()
+}
+
+/// ONE version an update can move a deployment that currently deploys `from` onto — the
+/// first [`update_targets`] reports.
+pub(crate) async fn update_target_version(
+    harness: &Harness,
+    case: &str,
+    workload: &str,
+    pattern: &str,
+    from: &str,
+) -> String {
+    let targets = update_targets(harness, case, workload, pattern, from).await;
+    targets.into_iter().next().unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: the catalogue must publish a version an update can move a \
+             deployment on {from:?} onto"
+        )
+    })
 }
 
 /// An `UpdateDeployment` request body.
@@ -794,6 +857,8 @@ async fn an_update_may_only_name_a_version_the_catalogue_holds() {
         }
         suites.push(VersionSuite {
             case,
+            workload,
+            pattern,
             data,
             conforming,
             refused_on,
@@ -804,6 +869,8 @@ async fn an_update_may_only_name_a_version_the_catalogue_holds() {
 
     for VersionSuite {
         case,
+        workload,
+        pattern,
         data,
         conforming,
         refused_on: id,
@@ -822,6 +889,13 @@ async fn an_update_may_only_name_a_version_the_catalogue_holds() {
             .as_str()
             .unwrap_or_else(|| panic!("case {case:?}: no deploymentPatternVersionName reported"))
             .to_string();
+        // The version these deployments can be MOVED onto: a published version other
+        // than the one they already deploy, read off the service's own report of a
+        // deployment's update targets. The version a deployment already deploys is not
+        // one an update may name — see
+        // `tests/all/update_deployment_version_targets.rs` for that rule.
+        let target =
+            update_target_version(&harness, &case, &workload, &pattern, &pattern_version).await;
 
         // `WorkloadVersionName` / `DeploymentPatternVersionName` are len 5..30 with
         // pattern `^(([A-Za-z0-9][a-zA-Z0-9-]*)|(\d+\.\d+\.\d+))$`, so every row below
@@ -884,10 +958,10 @@ async fn an_update_may_only_name_a_version_the_catalogue_holds() {
                 0 => with_member(
                     &with_member(&base, "workloadVersionName", json!(workload_version)),
                     "deploymentPatternVersionName",
-                    json!(pattern_version),
+                    json!(target),
                 ),
                 1 => with_member(&base, "workloadVersionName", json!(workload_version)),
-                2 => with_member(&base, "deploymentPatternVersionName", json!(pattern_version)),
+                2 => with_member(&base, "deploymentPatternVersionName", json!(target)),
                 _ => base,
             };
             let case = format!("{case} naming {label}");
@@ -897,12 +971,17 @@ async fn an_update_may_only_name_a_version_the_catalogue_holds() {
                 Some(UPDATE_IN_PROGRESS),
                 "case {case:?}: a version the catalogue holds must be applied, got {answered}"
             );
-            // Whichever version was named, the event records the one the deployment now
-            // deploys — which is the version it was created against, since each row
-            // either names that version or names none, and a row that names none leaves
-            // the deployment on the version it already deploys.
+            // The event records the version the deployment now deploys: the one the row
+            // named where it named a pattern version, and otherwise the one it was
+            // created against, since a row that names none leaves the deployment on the
+            // version it already deploys.
+            let moved_onto = if index == 0 || index == 2 {
+                &target
+            } else {
+                &pattern_version
+            };
             let described = last_update_description(&events(&harness, &case, &row_id).await);
-            for version in [&workload_version, &pattern_version] {
+            for version in [&workload_version, moved_onto] {
                 assert!(
                     described.contains(version.as_str()),
                     "case {case:?}: the update event must name version {version:?}, got \

@@ -274,8 +274,9 @@ const UPDATE_FROM_VERSION: &str = "updateFromVersion";
 /// version numbers (`DeploymentPatternVersionFilterValue` is
 /// `^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$`), so the filter selects the versions an
 /// update can move a deployment onto from one of the versions it names — the rule
-/// `crate::state::DeploymentPattern::is_update_target` states, which is the same rule
-/// `UpdateDeployment` applies when it moves a deployment onto a version. Several values
+/// `crate::state::DeploymentPattern::update_target_refusal` states, read through its
+/// yes/no form `is_update_target`, which is the same rule `UpdateDeployment` applies
+/// when it moves a deployment onto a version. Several values
 /// on one filter are joined with OR, as this service documents for a filter's values
 /// ("If you specify multiple values for a filter, the values are joined with an `OR`",
 /// `DeploymentFilter$values`), so a value naming a version this pattern does not publish

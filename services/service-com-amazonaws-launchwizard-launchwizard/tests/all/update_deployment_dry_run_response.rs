@@ -37,7 +37,7 @@ use service_com_amazonaws_launchwizard_launchwizard::state::{
 use crate::deployment_lifecycle::{create, create_body, get};
 use crate::deployment_update::{
     conforming_specifications, error_message, events, every_pattern, pattern_data, update_body,
-    with_member,
+    update_target_version, with_member,
 };
 use crate::harness::Harness;
 
@@ -84,6 +84,12 @@ async fn rows(harness: &Harness) -> Vec<Row> {
                 panic!("case {case:?}: no deploymentPatternVersionName reported: {data}")
             })
             .to_string();
+        // A pattern version an update may MOVE this deployment onto, read off the
+        // service's own report of its update targets: the version it already deploys is
+        // refused rather than served, so naming that one would make the row a request
+        // the service would not serve.
+        let target_version =
+            update_target_version(harness, &case, &workload, &pattern, &pattern_version).await;
         let mut body = update_body(&id, &specifications);
         if index % 4 == 1 || index % 4 == 3 {
             body = with_member(&body, "workloadVersionName", json!(workload_version));
@@ -92,7 +98,7 @@ async fn rows(harness: &Harness) -> Vec<Row> {
             body = with_member(
                 &body,
                 "deploymentPatternVersionName",
-                json!(pattern_version),
+                json!(target_version),
             );
         }
         body = with_member(&body, "force", json!(index % 2 == 1));

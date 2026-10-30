@@ -154,6 +154,22 @@ pub const DEPLOYMENT_NOT_UPDATABLE_MESSAGE: &str =
 pub const DEPLOYMENT_UPDATE_IN_FLIGHT_MESSAGE: &str =
     "The specified deployment has an operation in progress and cannot be updated.";
 
+/// The message an update that names the deployment pattern version its deployment
+/// ALREADY deploys is refused with.
+///
+/// Moving a deployment onto the version it is already on moves no version at all, so
+/// that version is not one an update can name — see
+/// [`DeploymentPattern::update_target_refusal`] for the rule, and the read that reports
+/// a deployment's update targets answers from the same rule. Fixed and identifier-free
+/// like the two messages above, and CHOSEN for the same reason: AWS documents no
+/// wording, so only the status (HTTP 400) and the modelled `ValidationException` code
+/// are the contract. It names the operation that reports the versions an update CAN
+/// move the deployment onto, the way the specification refusals name the operation that
+/// publishes the schema they judged.
+pub const DEPLOYMENT_PATTERN_VERSION_ALREADY_DEPLOYED_MESSAGE: &str =
+    "The specified deployment already deploys the specified deployment pattern version; \
+     the versions an update can move it onto are reported by ListDeploymentPatternVersions.";
+
 /// The message a deployment lookup that finds nothing carries.
 ///
 /// Launch Wizard's `ResourceNotFoundException` message is FIXED per kind of resource
@@ -377,6 +393,19 @@ pub struct DeploymentPattern {
     pub specifications: Vec<SpecificationField>,
 }
 
+/// Why a version is not one an update can move a deployment onto — the answers
+/// [`DeploymentPattern::update_target_refusal`] gives, each naming the kind of failure
+/// it is rather than the message or status an operation reports for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateTargetRefusal {
+    /// The catalogue publishes no version of the pattern under the name the request
+    /// gave, so the resource it names cannot be found.
+    Unpublished,
+    /// The version named is the one the deployment already deploys, so the update it
+    /// asks for would move no version at all.
+    AlreadyDeployed,
+}
+
 impl DeploymentPattern {
     /// The version this pattern currently deploys: the NEWEST version the catalogue
     /// publishes for it, which is the one both pattern views report as
@@ -439,18 +468,41 @@ impl DeploymentPattern {
         }
     }
 
+    /// Why an update of a deployment that currently deploys `from_version` of this
+    /// pattern cannot move it onto `version` of it, or `None` when it can.
+    ///
+    /// The ONE statement of the update-target rule: an update names a version of the
+    /// pattern it deploys and this catalogue publishes several per pattern, so ANY
+    /// published version is one a deployment can be moved onto — except the one it
+    /// already deploys, which moves no version at all. `UpdateDeployment` answers each
+    /// variant with the error the model gives that kind of failure, and
+    /// [`DeploymentPattern::is_update_target`] — what the read that reports a
+    /// deployment's update targets answers from — selects exactly the versions this
+    /// returns `None` for, so the two cannot disagree about one version.
+    pub fn update_target_refusal(
+        &self,
+        from_version: &str,
+        version: &str,
+    ) -> Option<UpdateTargetRefusal> {
+        if self.version(version).is_none() {
+            Some(UpdateTargetRefusal::Unpublished)
+        } else if from_version == version {
+            Some(UpdateTargetRefusal::AlreadyDeployed)
+        } else {
+            None
+        }
+    }
+
     /// Whether an update of a deployment that currently deploys `from_version` of this
     /// pattern can move it onto `version` of it.
     ///
-    /// An update names a version of the pattern it deploys and this catalogue publishes
-    /// several per pattern, so ANY published version is one a deployment can be moved
-    /// onto (`UpdateDeployment`) — except the one it already deploys, which moves no
-    /// version at all. A starting version this pattern does not publish names no
-    /// deployment of this pattern, so nothing is an update away from it.
+    /// The rule itself is [`DeploymentPattern::update_target_refusal`]; this is its
+    /// yes/no form, over a STARTING version that is itself one the pattern publishes —
+    /// a starting version this pattern does not publish names no deployment of this
+    /// pattern, so nothing is an update away from it.
     pub fn is_update_target(&self, from_version: &str, version: &str) -> bool {
-        from_version != version
-            && self.version(from_version).is_some()
-            && self.version(version).is_some()
+        self.version(from_version).is_some()
+            && self.update_target_refusal(from_version, version).is_none()
     }
 
     /// This pattern as the `WorkloadDeploymentPatternDataSummary`

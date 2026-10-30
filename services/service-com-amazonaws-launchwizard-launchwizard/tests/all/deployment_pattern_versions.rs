@@ -16,7 +16,9 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
-use service_com_amazonaws_launchwizard_launchwizard::state::CATALOGUE_PATTERN_VERSIONS;
+use service_com_amazonaws_launchwizard_launchwizard::state::{
+    CATALOGUE_PATTERN_VERSIONS, DEPLOYMENT_PATTERN_VERSION_ALREADY_DEPLOYED_MESSAGE,
+};
 
 use crate::deployment_lifecycle::create;
 use crate::deployment_update::{
@@ -431,8 +433,11 @@ async fn a_version_the_read_reports_is_a_version_an_update_can_name() {
         kept,
     } in suites
     {
-        // Every version the version read reports is a version a deployment can be moved
-        // onto, and the event the update appends records the one it now deploys.
+        // Every version the version read reports is a version a deployment that is not
+        // already on it can be moved onto, and the event the update appends records the
+        // one it now deploys. The one version of the published set a deployment is
+        // ALREADY on is refused instead, because moving it there moves no version at all
+        // — the rule `tests/all/update_deployment_version_targets.rs` tables.
         for (row, version) in CATALOGUE_PATTERN_VERSIONS.iter().enumerate() {
             let id = &per_version[row];
             let summary = get_version(&harness, &case, &workload, &pattern, version).await;
@@ -441,17 +446,26 @@ async fn a_version_the_read_reports_is_a_version_an_update_can_name() {
                 .unwrap_or_default()
                 .to_string();
             let case = format!("{case}@{name}");
-            harness
-                .ok(
-                    &case,
-                    "/updateDeployment",
-                    with_member(
-                        &update_body(id, &specifications),
-                        "deploymentPatternVersionName",
-                        json!(name),
-                    ),
-                )
-                .await;
+            let body = with_member(
+                &update_body(id, &specifications),
+                "deploymentPatternVersionName",
+                json!(name),
+            );
+            // Every one of these deployments was created against the pattern's CURRENT
+            // version, so that is the version each of them already deploys.
+            if name == newest {
+                let refused = harness
+                    .refused(&case, "/updateDeployment", body, 400, "ValidationException")
+                    .await;
+                let message = error_message(&refused);
+                assert_eq!(
+                    message, DEPLOYMENT_PATTERN_VERSION_ALREADY_DEPLOYED_MESSAGE,
+                    "case {case:?}: the version a deployment already deploys is not one an \
+                     update can name, expected the fixed refusal, got {message:?}"
+                );
+                continue;
+            }
+            harness.ok(&case, "/updateDeployment", body).await;
             let described = update_description(&harness, &case, id).await;
             assert!(
                 described.contains(&format!("'{name}'")),
