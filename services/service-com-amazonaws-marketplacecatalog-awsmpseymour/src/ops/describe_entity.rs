@@ -175,11 +175,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `DescribeEntityRequest$EntityId` targets the wider `ResourceId`
-        // (`^[\w\-]+$`), which admits strings that are not entity ids at all.
-        // The id is checked against the form the model's own `EntityId` shape
-        // states BEFORE any lookup, so a malformed id is refused as a 422
-        // `ValidationException` and only a well-formed one reaches the lookup
-        // that answers 404.
+        // (`^[\w\-]+$`), which is not the syntax this service publishes for an
+        // entity id: it admits strings that are no entity id at all and refuses
+        // characters an entity id may hold. So the id is judged here, not at the
+        // boundary (`skip_validation` on `DescribeEntityInput`), against the form
+        // the model's own `EntityId` shape states and inside that shape's
+        // `@length` — BEFORE any lookup, so an id outside it is refused as a 422
+        // `ValidationException` naming the syntax it had to satisfy, and only a
+        // well-formed one reaches the lookup that answers 404. That is the same
+        // judgement, in the same two answers, a batch read of the same id makes
+        // per entry.
         if !crate::state::is_entity_id(&input.entity_id) {
             return Err(DescribeEntityErrorModeled::ValidationException(
                 crate::state::invalid_entity_id(&input.entity_id),

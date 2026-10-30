@@ -279,23 +279,52 @@ async fn an_entity_id_outside_the_published_form_is_refused_before_the_lookup() 
         );
     }
 
-    // `DescribeEntityRequest$EntityId` carries its OWN modelled pattern
-    // (`ResourceId`'s `^[\w\-]+$`), which admits neither `.` nor `/`. Such an id is
-    // refused by the boundary validator before the handler's `EntityId` check ever runs
-    // — a client `ValidationException` either way, never a served read and never a 5xx.
-    for entity_id in ["prod-abcdef.", "a0.b-c/d1", "prod/abcdef"] {
+    // `DescribeEntityRequest$EntityId` targets the wider `ResourceId`, whose `@pattern`
+    // (`^[\w\-]+$`) is not the syntax this service publishes for an entity id: it refuses
+    // the `.` and the `/` the published syntax admits. The published syntax is what
+    // decides, so an id holding them is well formed and reaches the lookup — the modelled
+    // 404, naming the entity that was asked for.
+    for entity_id in ["a0.b-c/d1", "prod/abcdef", "prod.abcdef"] {
         let answer = describe_entity(&router, entity_id).await;
-        assert!(
-            matches!(answer.status, 400 | 422),
-            "case {entity_id:?}: an id outside the member's own modelled pattern must be \
-             refused as a client error, got {} with {:?}",
+        assert_eq!(
+            (answer.status, answer.error_code()),
+            (404, "ResourceNotFoundException"),
+            "case {entity_id:?}: an id inside the published syntax must reach the lookup, \
+             got {} {:?} with {:?}",
             answer.status,
+            answer.error_code(),
             answer.body
         );
         assert_eq!(
+            answer.text("/Message"),
+            format!("Requested entity '{entity_id}' does not exist."),
+            "case {entity_id:?}: the 404 must name the entity asked for, got {:?}",
+            answer.body
+        );
+    }
+
+    // The same two characters do not make an id well formed on their own: one that leaves
+    // the published syntax by where it carries them is still the 422, in the sentence that
+    // quotes the syntax it had to satisfy.
+    for entity_id in ["prod-abcdef.", "/prod-abcdef", ".prod/abcdef"] {
+        let answer = describe_entity(&router, entity_id).await;
+        assert_eq!(
+            (answer.status, answer.error_code()),
+            (422, "ValidationException"),
+            "case {entity_id:?}: an id outside the published syntax must be refused before \
+             any lookup, got {} {:?} with {:?}",
+            answer.status,
             answer.error_code(),
-            "ValidationException",
-            "case {entity_id:?}: must answer ValidationException, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.text("/Message"),
+            format!(
+                "[Requested entity id '{entity_id}' is invalid. It should match with \
+                 {ENTITY_ID_PATTERN}.]"
+            ),
+            "case {entity_id:?}: the refusal must name the id and the required syntax, got \
+             {:?}",
             answer.body
         );
     }

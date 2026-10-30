@@ -14,9 +14,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-marketplacecatalog-awsm
 // `skip_validation` names `Catalog` for the reason given on `CancelChangeSetInput`: the
 // catalog syntax this service publishes is not the modelled `@pattern`, so the HANDLER
 // judges the member.
+//
+// It names `EntityId` for the same reason it is named on `EntityRequest`: this member
+// targets the wider `ResourceId` (`@pattern("^[\w\-]+$")`), which is not the syntax the
+// service publishes for an entity id — it admits strings no entity id can be (an
+// underscore, a single character) and refuses characters an entity id may hold (`.`,
+// `/`) — so the handler judges it (`crate::state::is_entity_id`, bounded by the member's
+// modelled `@length`), and answers the modelled `ValidationException` and its 422
+// quoting the syntax the service requires. Left at the boundary, `ResourceId`'s own
+// constraints would refuse such a value first, in wording this service never uses and
+// under the protocol's status rather than the modelled one, and one entity read and a
+// batch of them would answer the same id differently.
 #[smithy_macros::smithy(
     shape = "com.amazonaws.marketplacecatalog#DescribeEntityRequest",
-    skip_validation = ["Catalog"]
+    skip_validation = ["Catalog", "EntityId"]
 )]
 #[derive(Debug, Clone, Default)]
 pub struct DescribeEntityInput {

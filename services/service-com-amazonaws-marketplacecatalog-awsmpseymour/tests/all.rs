@@ -39,6 +39,8 @@ mod documented_entity_types;
 mod entity_id_list_contract;
 #[path = "all/entity_lock_in_flight.rs"]
 mod entity_lock_in_flight;
+#[path = "all/entity_read_agreement.rs"]
+mod entity_read_agreement;
 #[path = "all/entity_reads.rs"]
 mod entity_reads;
 #[path = "all/entity_type_projections.rs"]

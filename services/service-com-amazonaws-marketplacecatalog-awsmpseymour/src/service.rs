@@ -126,10 +126,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // `@pattern` before any handler runs, so this seam is the only place
         // that wording can be chosen — and the one place it is chosen for EVERY
         // operation and every member, rather than per operation. The members
-        // whose documented syntax is WIDER than the modelled pattern (`Catalog`,
-        // `Entity$Type`, `Entity$Identifier`, `EntityRequest$EntityId`,
-        // `ChangeSetName`, `ClientRequestToken`, `AssessmentIdentifier`,
-        // `NextToken`) carry `skip_validation` and are checked by their handler
+        // whose documented syntax is not the modelled pattern of the shape they
+        // target (`Catalog`, `Entity$Type`, `Entity$Identifier`, `EntityId` on
+        // both read paths, `ChangeSetName`, `ClientRequestToken`,
+        // `AssessmentIdentifier`, `NextToken`) carry `skip_validation` and are
+        // checked by their handler
         // instead, which answers the modelled `ValidationException` and its 422;
         // what reaches here is a member whose modelled pattern IS the syntax the
         // service publishes — `ResourceArn` above all, the member every tagging
