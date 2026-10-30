@@ -25,3 +25,5 @@ mod portfolio_lifecycle;
 mod portfolios_for_product;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_option_associations.rs"]
+mod tag_option_associations;

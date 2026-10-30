@@ -110,7 +110,7 @@ async fn the_portfolio_lifecycle_round_trips_through_stored_state() {
     assert_eq!(
         described["TagOptions"],
         json!([]),
-        "DescribePortfolio: no TagOption can be associated yet, so TagOptions must be empty: {described}"
+        "DescribePortfolio: nothing associated a TagOption with this portfolio, so TagOptions must be empty: {described}"
     );
     assert_eq!(
         described["Budgets"],

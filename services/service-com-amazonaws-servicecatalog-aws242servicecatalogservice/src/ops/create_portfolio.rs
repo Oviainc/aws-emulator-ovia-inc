@@ -213,6 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags,
             // A new portfolio has no principal associated with it yet.
             principals: std::collections::BTreeMap::new(),
+            // … and no TagOption until `AssociateTagOptionWithResource` associates
+            // one.
+            tag_option_ids: std::collections::BTreeSet::new(),
         };
 
         let detail = portfolio.detail();

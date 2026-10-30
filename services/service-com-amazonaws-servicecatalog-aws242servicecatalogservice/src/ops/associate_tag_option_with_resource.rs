@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateTagOptionWithResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateTagOptionWithResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateTagOptionWithResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +140,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateTagOptionWithResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateTagOptionWithResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateTagOptionWithResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut state = state.lock();
+
+        // Both halves of the pair must exist before anything is stored, so a refused
+        // association records nothing. The TagOption is checked first: it is the
+        // subject of the call, and the account has to hold one before any resource can
+        // carry it.
+        if !state.tag_options.contains_key(&input.tag_option_id) {
+            return Err(
+                AssociateTagOptionWithResourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "TagOption with ID {} not found",
+                            input.tag_option_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `ResourceId` identifies "the specified portfolio or product", so the stored
+        // resource under that id is what takes the association — either kind, through
+        // the one lookup both live behind. An id no portfolio and no product answers
+        // to names no resource that can carry a TagOption.
+        let Some(associated) = state.resource_tag_option_ids_mut(&input.resource_id) else {
+            return Err(
+                AssociateTagOptionWithResourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Resource not found: {}", input.resource_id)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // An association IS the (resource, TagOption) pair, so a pair already stored is
+        // what `DuplicateResourceException` ("The specified resource is a duplicate")
+        // refuses; the association already made stands unchanged.
+        if associated.contains(&input.tag_option_id) {
+            return Err(
+                AssociateTagOptionWithResourceErrorModeled::DuplicateResourceException(
+                    DuplicateResourceException {
+                        message: Some(format!(
+                            "TagOption with ID {} is already associated with resource {}",
+                            input.tag_option_id, input.resource_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The resource's quota, consulted for the pair that would grow the set and
+        // refused before it is stored, so a caller cannot grow one resource's
+        // associations without bound by repeating the call.
+        if associated.len() >= crate::state::MAX_TAG_OPTIONS_PER_RESOURCE {
+            return Err(
+                AssociateTagOptionWithResourceErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "A resource cannot hold more than {} associated TagOptions.",
+                            crate::state::MAX_TAG_OPTIONS_PER_RESOURCE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Nothing here turns on the TagOption's `Active` state: `UpdateTagOption` can
+        // deactivate a TagOption a resource already carries without dropping that
+        // association, so whether a resource may take one cannot depend on it either.
+        // `InvalidStateException` has nothing to refuse, because every stored portfolio
+        // and product is in a terminal state from the moment its create returns.
+        associated.insert(input.tag_option_id);
+
+        Ok(AssociateTagOptionWithResourceOutput {})
     }
 }

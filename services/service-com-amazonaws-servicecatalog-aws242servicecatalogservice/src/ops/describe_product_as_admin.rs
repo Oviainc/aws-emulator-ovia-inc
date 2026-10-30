@@ -223,10 +223,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect(),
             ),
             tags: Some(product.tag_list()),
-            // Nothing can associate a TagOption or a budget with a product yet (both
-            // association operations are still scaffolded), so the associated sets are
-            // empty rather than absent.
-            tag_options: Some(Vec::new()),
+            // The TagOptions `AssociateTagOptionWithResource` stored on this product,
+            // read back from the same set a portfolio's are: one resource's
+            // associations, rendered one way.
+            tag_options: Some(state.resource_tag_option_details(&product.id)),
+            // Nothing can associate a budget with a product yet
+            // (`AssociateBudgetWithResource` is still scaffolded), so that set is empty
+            // rather than absent.
             budgets: Some(Vec::new()),
         })
     }

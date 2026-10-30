@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-servicecatalog-aws242servicecatalogservice service.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{
@@ -38,6 +38,10 @@ pub struct Portfolio {
     /// associations were made in, which is the order
     /// `ListPrincipalsForPortfolio` reports and pages over.
     pub principals: BTreeMap<String, PrincipalAssociation>,
+    /// The TagOptions associated with this portfolio, by TagOption id. A set because
+    /// `AssociateTagOptionWithResource` addresses an association by the (resource,
+    /// TagOption) PAIR, so one resource holds each TagOption at most once.
+    pub tag_option_ids: BTreeSet<String>,
 }
 
 /// One portfolio-principal association: what was associated, and when in the
@@ -215,6 +219,10 @@ pub struct Product {
     /// live in several, and `AssociateProductWithPortfolio` addresses one association
     /// by the PAIR, so the set holds each portfolio once.
     pub portfolio_ids: std::collections::BTreeSet<String>,
+    /// The TagOptions associated with this product, by TagOption id — the same
+    /// association [`Portfolio::tag_option_ids`] holds, because
+    /// `AssociateTagOptionWithResource` takes either kind of resource.
+    pub tag_option_ids: BTreeSet<String>,
 }
 
 /// The `Status` a product carries from the moment it is created.
@@ -468,6 +476,13 @@ pub const MAX_PRODUCTS: usize = 500;
 /// figure.
 pub const MAX_SERVICE_ACTIONS: usize = 500;
 
+/// The most TagOptions one resource — a portfolio or a product — can carry,
+/// bounding every resource record and answered with the `LimitExceededException`
+/// that `AssociateTagOptionWithResource` models. The emulator's own bound, finite
+/// and small, checked before every association is stored; no AWS figure is quoted
+/// here.
+pub const MAX_TAG_OPTIONS_PER_RESOURCE: usize = 25;
+
 /// The most TagOptions this account can hold, which also bounds this store.
 ///
 /// `CreateTagOption` models `LimitExceededException` for a create past the account's
@@ -600,6 +615,67 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
     pub fn forget_constraint_tokens(&mut self, constraint_id: &str) {
         self.constraint_idempotency
             .retain(|_, id| id != constraint_id);
+    }
+
+    /// The TagOptions associated with the resource `resource_id` names, or `None`
+    /// when this account holds no such resource.
+    ///
+    /// `AssociateTagOptionWithResource` takes "the resource identifier" of a
+    /// portfolio OR a product, so both kinds resolve through this one lookup and no
+    /// handler has to know which maps a resource can live in.
+    pub fn resource_tag_option_ids(&self, resource_id: &str) -> Option<&BTreeSet<String>> {
+        self.portfolios
+            .get(resource_id)
+            .map(|portfolio| &portfolio.tag_option_ids)
+            .or_else(|| {
+                self.products
+                    .get(resource_id)
+                    .map(|product| &product.tag_option_ids)
+            })
+    }
+
+    /// The same set, for the handler that associates or disassociates a TagOption.
+    pub fn resource_tag_option_ids_mut(
+        &mut self,
+        resource_id: &str,
+    ) -> Option<&mut BTreeSet<String>> {
+        if let Some(portfolio) = self.portfolios.get_mut(resource_id) {
+            return Some(&mut portfolio.tag_option_ids);
+        }
+        self.products
+            .get_mut(resource_id)
+            .map(|product| &mut product.tag_option_ids)
+    }
+
+    /// The stored details of the TagOptions associated with `resource_id`, in
+    /// TagOption id order — the one list every response that reports a resource's
+    /// `TagOptions` carries, so a portfolio and a product report an association the
+    /// same way. Empty for a resource this account does not hold, which is a
+    /// not-found for the caller to answer.
+    pub fn resource_tag_option_details(&self, resource_id: &str) -> Vec<TagOptionDetail> {
+        self.resource_tag_option_ids(resource_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.tag_options.get(id))
+            .map(TagOption::detail)
+            .collect()
+    }
+
+    /// The portfolios and products `tag_option_id` is associated with, portfolios
+    /// first and each group in id order. A TagOption one of them still holds is in
+    /// use, which is what `DeleteTagOption` refuses a delete for.
+    pub fn resources_with_tag_option(&self, tag_option_id: &str) -> Vec<String> {
+        self.portfolios
+            .values()
+            .filter(|portfolio| portfolio.tag_option_ids.contains(tag_option_id))
+            .map(|portfolio| portfolio.id.clone())
+            .chain(
+                self.products
+                    .values()
+                    .filter(|product| product.tag_option_ids.contains(tag_option_id))
+                    .map(|product| product.id.clone()),
+            )
+            .collect()
     }
 
     /// Mint an unused portfolio id of AWS's form: `port-` followed by 12

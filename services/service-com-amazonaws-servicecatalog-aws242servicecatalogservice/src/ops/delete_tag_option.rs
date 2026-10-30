@@ -135,7 +135,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(crate::state::state_unavailable)?;
         let mut state = state.lock();
 
-        if state.tag_options.remove(&input.id).is_none() {
+        if !state.tag_options.contains_key(&input.id) {
             return Err(DeleteTagOptionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!("TagOption with ID {} not found", input.id)),
@@ -144,10 +144,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `ResourceInUseException` is the refusal for a TagOption still associated with a
-        // resource. Nothing can associate one yet (`AssociateTagOptionWithResource` is
-        // still scaffolded at 501), so no stored TagOption can be in use and that refusal
-        // is unreachable rather than guessed at here.
+        // "You cannot delete a TagOption if it is associated with a product or
+        // portfolio": a TagOption any resource still carries is in use, which is what
+        // `ResourceInUseException` refuses the delete for. Checked BEFORE the removal,
+        // so a refused delete leaves the TagOption and its associations intact, and the
+        // message names the resources still holding it.
+        let holders = state.resources_with_tag_option(&input.id);
+        if !holders.is_empty() {
+            return Err(DeleteTagOptionErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "TagOption with ID {} is associated with resource(s) {}",
+                        input.id,
+                        holders.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        state.tag_options.remove(&input.id);
         Ok(DeleteTagOptionOutput {})
     }
 }
