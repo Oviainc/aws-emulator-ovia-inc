@@ -8,9 +8,21 @@ use std::time::SystemTime;
 use crate::ops::types::{
     ConstraintDetail, ConstraintSummary, PortfolioDetail, ProductViewDetail, ProductViewSummary,
     ProvisioningArtifact as ModelledProvisioningArtifact, ProvisioningArtifactDetail,
-    ProvisioningArtifactSummary, ServiceActionDetail, ServiceActionSummary, SourceConnectionDetail,
-    Tag, TagOptionDetail,
+    ProvisioningArtifactSummary, ResourceDetail, ServiceActionDetail, ServiceActionSummary,
+    SourceConnectionDetail, Tag, TagOptionDetail,
 };
+
+/// The `ResourceType` naming a portfolio, one of the two kinds a TagOption can be
+/// associated with.
+///
+/// The model documents exactly these two values for the member that narrows a
+/// TagOption's resources (`smithy_query query="doc"
+/// shape="ListResourcesForTagOptionInput" member="ResourceType"`), and they are the
+/// two kinds `AssociateTagOptionWithResource` accepts as a `ResourceId`.
+pub const RESOURCE_TYPE_PORTFOLIO: &str = "Portfolio";
+
+/// The `ResourceType` naming a product; see [`RESOURCE_TYPE_PORTFOLIO`].
+pub const RESOURCE_TYPE_PRODUCT: &str = "Product";
 
 /// A persisted portfolio — the record every portfolio operation reads and writes.
 ///
@@ -67,6 +79,20 @@ impl Portfolio {
             description: self.description.clone(),
             created_time: Some(::aws_smithy_types::DateTime::from(self.created_time)),
             provider_name: Some(self.provider_name.clone()),
+        }
+    }
+
+    /// This record as the modelled `ResourceDetail` — the shape a list of the
+    /// resources associated with a TagOption carries. Every member is the same
+    /// stored value [`Self::detail`] reports, so one portfolio cannot read two
+    /// ways; a portfolio's `Name` is its display name.
+    pub fn resource_detail(&self) -> ResourceDetail {
+        ResourceDetail {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            name: Some(self.display_name.clone()),
+            description: self.description.clone(),
+            created_time: Some(::aws_smithy_types::DateTime::from(self.created_time)),
         }
     }
 
@@ -269,6 +295,20 @@ impl Product {
             product_arn: Some(self.arn.clone()),
             created_time: Some(::aws_smithy_types::DateTime::from(self.created_time)),
             source_connection: self.source_connection.clone(),
+        }
+    }
+
+    /// This record as the modelled `ResourceDetail`, the counterpart of
+    /// [`Portfolio::resource_detail`]: a product's `Description` is the short
+    /// description its `ProductViewSummary` carries, so a product reads the same
+    /// here as it does there.
+    pub fn resource_detail(&self) -> ResourceDetail {
+        ResourceDetail {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            description: self.short_description.clone(),
+            created_time: Some(::aws_smithy_types::DateTime::from(self.created_time)),
         }
     }
 
@@ -676,6 +716,45 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
                     .map(|product| product.id.clone()),
             )
             .collect()
+    }
+
+    /// The stored details of the resources `tag_option_id` is associated with, in
+    /// resource-id order, narrowed to one kind when `resource_type` names one
+    /// ([`RESOURCE_TYPE_PORTFOLIO`] or [`RESOURCE_TYPE_PRODUCT`]); `None`, or a kind
+    /// name that is empty, narrows nothing.
+    ///
+    /// The exact inverse of [`Self::resource_tag_option_details`] over the one stored
+    /// set of (resource, TagOption) pairs: a resource reports a TagOption precisely
+    /// when that TagOption reports the resource. Neither the model nor AWS's
+    /// documentation fixes an order for the list, so this service reports
+    /// resource-id order — one deterministic order across both kinds, which is also
+    /// the order its page cursor walks.
+    pub fn resource_details_with_tag_option(
+        &self,
+        tag_option_id: &str,
+        resource_type: Option<&str>,
+    ) -> Vec<ResourceDetail> {
+        let wanted = resource_type.filter(|kind| !kind.is_empty());
+        let wants = |kind: &str| wanted.is_none_or(|requested| requested == kind);
+        let mut details: Vec<ResourceDetail> = Vec::new();
+        if wants(RESOURCE_TYPE_PORTFOLIO) {
+            details.extend(
+                self.portfolios
+                    .values()
+                    .filter(|portfolio| portfolio.tag_option_ids.contains(tag_option_id))
+                    .map(Portfolio::resource_detail),
+            );
+        }
+        if wants(RESOURCE_TYPE_PRODUCT) {
+            details.extend(
+                self.products
+                    .values()
+                    .filter(|product| product.tag_option_ids.contains(tag_option_id))
+                    .map(Product::resource_detail),
+            );
+        }
+        details.sort_by(|left, right| left.id.cmp(&right.id));
+        details
     }
 
     /// Mint an unused portfolio id of AWS's form: `port-` followed by 12

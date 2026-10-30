@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourcesForTagOption
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourcesForTagOption`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourcesForTagOption::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +142,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourcesForTagOption` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourcesForTagOptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourcesForTagOption"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // A pure read: reporting the resources a TagOption reaches changes neither the
+        // TagOption nor those resources, page tokens included — a token is derived from
+        // the resource id the next page resumes at, so handing one back records nothing.
+        let state = state.lock();
+
+        // The TagOption is the subject of the call, so the account has to hold one
+        // before there is any association to report: an id no TagOption answers to is
+        // the not-found case, not an empty page.
+        if !state.tag_options.contains_key(&input.tag_option_id) {
+            return Err(
+                ListResourcesForTagOptionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "TagOption with ID {} not found",
+                            input.tag_option_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `ResourceType` narrows the report to one kind of resource, and the model
+        // documents exactly two kinds. A value naming neither names nothing a TagOption
+        // can be associated with, which is a bad parameter rather than an empty page; an
+        // absent or empty value narrows nothing.
+        let resource_type = input
+            .resource_type
+            .as_deref()
+            .filter(|kind| !kind.is_empty());
+        if let Some(kind) = resource_type {
+            if kind != crate::state::RESOURCE_TYPE_PORTFOLIO
+                && kind != crate::state::RESOURCE_TYPE_PRODUCT
+            {
+                return Err(
+                    ListResourcesForTagOptionErrorModeled::InvalidParametersException(
+                        InvalidParametersException {
+                            message: Some(format!(
+                                "ResourceType {kind} is not valid. Valid values are {} and {}.",
+                                crate::state::RESOURCE_TYPE_PORTFOLIO,
+                                crate::state::RESOURCE_TYPE_PRODUCT
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // A page token is this service's own opaque cursor — encoded and decoded by the
+        // crate-shared codec in `crate::state` — carrying the resource id the next page
+        // resumes AT. Anything that is not one of ours is a bad parameter.
+        let resume_at = match input.page_token.as_deref().filter(|t| !t.is_empty()) {
+            Some(token) => match crate::state::decode_page_cursor(token) {
+                Some(id) => Some(id),
+                None => {
+                    return Err(
+                        ListResourcesForTagOptionErrorModeled::InvalidParametersException(
+                            InvalidParametersException {
+                                message: Some("PageToken is not a valid page token.".to_string()),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        // `PageSize` is modelled `0..20` with a default of 0, and 0 asks for no
+        // caller-imposed bound: the whole remaining set is returned, which the FINITE
+        // bounds on how many portfolios and products this account can hold already cap.
+        let page_size = if input.page_size > 0 {
+            input.page_size as usize
+        } else {
+            crate::state::MAX_PORTFOLIOS + crate::state::MAX_PRODUCTS
+        };
+
+        // The reported set is the stored (resource, TagOption) pairs read from the
+        // resource side: exactly the resources whose own readers report this TagOption,
+        // in the one resource-id order the cursor below walks.
+        let mut resource_details = Vec::new();
+        let mut page_token = None;
+        for detail in state
+            .resource_details_with_tag_option(&input.tag_option_id, resource_type)
+            .into_iter()
+            .filter(|detail| {
+                resume_at
+                    .as_deref()
+                    .is_none_or(|resume| detail.id.as_deref().unwrap_or_default() >= resume)
+            })
+        {
+            if resource_details.len() == page_size {
+                // More remain: hand back a cursor that resumes at this resource.
+                page_token = detail.id.as_deref().map(crate::state::encode_page_cursor);
+                break;
+            }
+            resource_details.push(detail);
+        }
+
+        Ok(ListResourcesForTagOptionOutput {
+            resource_details: Some(resource_details),
+            page_token,
+        })
     }
 }
