@@ -137,11 +137,6 @@ impl From<StartMonitoringMemberErrorModeled> for StartMonitoringMemberError {
     }
 }
 
-/// What this operation answers when the account it was given is not a member account
-/// of the graph: the modelled 404, with a fixed sentence that echoes neither the
-/// account id nor the ARN.
-const NOT_A_MEMBER_MESSAGE: &str = "The specified account is not a member account of the behavior graph";
-
 /// The `StartMonitoringMember` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -199,18 +194,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::Member::settle`.
         graph.settle_members(now);
 
+        // "Sends a request to enable data ingest for a member account": what this
+        // operation resolves is a membership the account ACCEPTED — the only kind whose
+        // ingest there is to enable. An account the graph holds no record for at all has
+        // no such membership; a record that never got past invitation or verification is
+        // the same modelled 404, told apart by naming the one fact that makes it one.
+        // Neither refusal echoes the account id or the ARN.
         let member = graph.members.get_mut(&input.account_id).ok_or_else(|| {
             StartMonitoringMemberErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(NOT_A_MEMBER_MESSAGE.to_string()),
-                },
+                crate::state::no_such_membership(),
             )
         })?;
+        if !crate::state::is_accepted_membership(&member.status) {
+            return Err(StartMonitoringMemberErrorModeled::ResourceNotFoundException(
+                crate::state::invitation_not_accepted(),
+            )
+            .into());
+        }
 
         // "Sends a request to enable data ingest for a member account that has a status
-        // of ACCEPTED_BUT_DISABLED": that status is the only one this operation acts
-        // on. Any other is an invalid action on the membership, which is what
-        // `ConflictException` (409) states.
+        // of ACCEPTED_BUT_DISABLED": of the accepted memberships, that status is the
+        // only one this operation acts on. An accepted membership already ingesting is
+        // an invalid action on that membership, which is what `ConflictException` (409)
+        // states.
         if member.status != crate::state::MEMBER_STATUS_ACCEPTED_BUT_DISABLED {
             return Err(StartMonitoringMemberErrorModeled::ConflictException(
                 ConflictException {

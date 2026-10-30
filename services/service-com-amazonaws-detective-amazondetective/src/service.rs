@@ -60,6 +60,10 @@ const ACCOUNTS_PATH_PREFIX: &str = "accounts.";
 /// `UpdateDatasourcePackages$DatasourcePackages`' path prefix, likewise.
 const DATASOURCE_PACKAGES_PATH_PREFIX: &str = "datasourcePackages.";
 
+/// What completes a start-anchored regular expression into one that matches a whole
+/// value — the form a `@pattern` refusal reports. See [`reported_pattern`].
+const WHOLE_VALUE_PATTERN_SUFFIX: &str = ".*";
+
 /// How Detective states a refusal the framework described structurally.
 ///
 /// Two of its operations validate a member themselves rather than leaving it to the
@@ -77,14 +81,57 @@ const DATASOURCE_PACKAGES_PATH_PREFIX: &str = "datasourcePackages.";
 ///
 /// Everything else keeps the framework's generic `N validation error(s) detected: …`
 /// envelope, which is what AWS answers for the rest of this service's members
-/// (`GetInvestigation$InvestigationId`, say).
+/// (`GetInvestigation$InvestigationId`, say) — except that a `@pattern` clause inside it
+/// reports the expression the SERVICE states rather than the raw modelled one; see
+/// [`reported_pattern`].
 fn detective_refusal(violations: &[Violation]) -> Option<Refused> {
     unknown_datasource_packages(violations)
         .or_else(|| account_member_pattern(violations))
+        .or_else(|| pattern_as_reported(violations))
         .map(|message| Refused {
             code: VALIDATION_EXCEPTION_CODE.to_string(),
             message,
         })
+}
+
+/// How this service reports the regular expression a `@pattern` refusal refused
+/// against.
+///
+/// The service validates a value against the WHOLE of it, so the expression it reports
+/// is the whole-value form of the modelled pattern: a pattern anchored at the start but
+/// not terminated at the end is reported with the trailing `.*` that completes it, while
+/// one that already terminates (`…$`) is reported exactly as modelled. Recorded
+/// behaviour: the only member of this service whose pattern is unterminated
+/// (`StartInvestigation$EntityArn`, `smithy_query(query="shape",shape="EntityArn")`) is
+/// refused with `^arn:.*`, while every terminated one is refused with its own pattern.
+fn reported_pattern(pattern: &str) -> String {
+    if pattern.starts_with('^') && !pattern.ends_with('$') && !pattern.ends_with(".*") {
+        format!("{pattern}{WHOLE_VALUE_PATTERN_SUFFIX}")
+    } else {
+        pattern.to_string()
+    }
+}
+
+/// The framework's envelope re-rendered with every `@pattern` clause reporting the
+/// expression [`reported_pattern`] states, or `None` when no clause's rendering differs
+/// — in which case the framework's wording already is this service's.
+fn pattern_as_reported(violations: &[Violation]) -> Option<String> {
+    let reported: Vec<Violation> = violations
+        .iter()
+        .map(|violation| match &violation.kind {
+            ViolationKind::Pattern(pattern) => Violation {
+                kind: ViolationKind::Pattern(reported_pattern(pattern)),
+                ..violation.clone()
+            },
+            _ => violation.clone(),
+        })
+        .collect();
+    if reported.as_slice() == violations {
+        return None;
+    }
+    // The clause itself, the value it echoes and the member path it names are the
+    // framework's: only the expression it reports is this service's choice.
+    aws_smithy_schema_server::constraints::envelope(&reported)
 }
 
 /// The `UpdateDatasourcePackages` message naming every requested package outside the
@@ -190,9 +237,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // reword it. Two of this service's operations validate a member themselves
         // rather than leaving it to the generic constraint reporter, and
         // `detective_refusal` above states those two the way the service does —
-        // replacing the code and the message together. Everything else answers `None`,
-        // which keeps the framework's wording (the form AWS itself returns for the rest
-        // of this service's members).
+        // replacing the code and the message together. Everything else keeps the
+        // framework's envelope (the form AWS itself returns for the rest of this
+        // service's members), with the one adjustment `reported_pattern` makes to the
+        // expression a `@pattern` clause reports.
         match refusal {
             Refusal::Invalid(violations) => detective_refusal(violations),
             _ => None,

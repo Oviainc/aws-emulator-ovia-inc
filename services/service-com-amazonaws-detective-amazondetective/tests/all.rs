@@ -29,6 +29,8 @@ mod member_removal;
 mod member_verification_outcome;
 #[path = "all/not_found_and_validation_semantics.rs"]
 mod not_found_and_validation_semantics;
+#[path = "all/refusal_texts.rs"]
+mod refusal_texts;
 #[path = "all/start_investigation_scope_and_merits.rs"]
 mod start_investigation_scope_and_merits;
 #[path = "all/state_roundtrip.rs"]

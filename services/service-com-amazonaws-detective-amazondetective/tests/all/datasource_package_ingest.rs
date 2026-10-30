@@ -16,10 +16,9 @@
 //!    instant the package entered each state it has been in. A package an update leaves
 //!    in the state it was already in keeps the instant it got there, so the report says
 //!    when ingest last CHANGED rather than when it was last confirmed.
-//! 3. The report pages through every held package exactly once in one stable order,
-//!    emitting a `NextToken` only while packages remain, and refuses a token it did not
-//!    issue with the modelled `ValidationException`; `MaxResults` outside its modelled
-//!    `1..200` range is refused, and the report never changes what a later caller sees.
+//! 3. The report answers every package the graph holds in ONE response, carrying no
+//!    `NextToken` and refusing any `MaxResults` the request names — it is not a
+//!    paginated report — and it never changes what a later caller sees.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -90,60 +89,34 @@ async fn list_page(
     call(router, LIST_URI, &body).await
 }
 
-/// Every package `ListDatasourcePackages` reports for `graph_arn`, keyed by package, by
-/// following `NextToken` to the end at a page size of `max_results`.
+/// Every package `ListDatasourcePackages` reports for `graph_arn`, keyed by package.
 ///
-/// Asserts rule 3's page invariants on the way: no page is larger than the size asked
-/// for, no package is reported twice across the pages, and only a page that leaves
-/// packages behind carries a token.
+/// Asserts rule 3's response invariant on the way: the report is NOT paginated, so one
+/// call answers everything the graph holds and carries no `NextToken` to follow.
 async fn all_packages(
     router: &MultiServiceRouter,
     case: &str,
     graph_arn: &str,
-    max_results: Option<i32>,
 ) -> BTreeMap<String, Value> {
-    let mut collected: BTreeMap<String, Value> = BTreeMap::new();
-    let mut token: Option<String> = None;
-    for page in 0..=PACKAGES.len() + 1 {
-        let (status, answered) =
-            list_page(router, graph_arn, max_results, token.as_deref()).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: page {page}: expected 200, got {status} {answered:?}"
-        );
-        let reported = answered
-            .get("DatasourcePackages")
-            .and_then(Value::as_object)
-            .unwrap_or_else(|| {
-                panic!("case {case:?}: page {page}: expected DatasourcePackages, got {answered:?}")
-            });
-        if let Some(limit) = max_results {
-            assert!(
-                reported.len() <= limit as usize,
-                "case {case:?}: page {page}: expected at most {limit} entries, got {}",
-                reported.len()
-            );
-        }
-        for (package, detail) in reported {
-            let already = collected.insert(package.clone(), detail.clone());
-            assert!(
-                already.is_none(),
-                "case {case:?}: page {page}: {package} was reported twice, second time {detail:?}"
-            );
-        }
-        token = answered
-            .get("NextToken")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let Some(ref issued) = token else {
-            return collected;
-        };
-        assert!(
-            !reported.is_empty(),
-            "case {case:?}: page {page}: an empty page carried the token {issued:?}"
-        );
-    }
-    panic!("case {case:?}: the report never reached a last page, collected {collected:?}");
+    let (status, answered) = list_page(router, graph_arn, None, None).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200, got {status} {answered:?}"
+    );
+    assert_eq!(
+        answered.get("NextToken"),
+        None,
+        "case {case:?}: an unpaginated report issues no NextToken, got {answered:?}"
+    );
+    answered
+        .get("DatasourcePackages")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected DatasourcePackages, got {answered:?}")
+        })
+        .iter()
+        .map(|(package, detail)| (package.clone(), detail.clone()))
+        .collect()
 }
 
 /// The ingest state reported for each held package, in package order.
@@ -268,7 +241,7 @@ async fn an_accepted_update_starts_exactly_the_packages_it_names_and_stops_the_r
         let router = emulator();
         let graph_arn = create_graph_ok(&router, REGION, &json!({})).await;
         update_ok(&router, case, &graph_arn, &requested).await;
-        let reported = all_packages(&router, case, &graph_arn, None).await;
+        let reported = all_packages(&router, case, &graph_arn).await;
         let expected: Vec<(String, String)> = expected
             .into_iter()
             .map(|(package, state)| (package.to_string(), state.to_string()))
@@ -286,7 +259,7 @@ async fn an_accepted_update_starts_exactly_the_packages_it_names_and_stops_the_r
             );
         }
         // The report left the graph as it found it, so the next caller sees the same.
-        let again = all_packages(&router, case, &graph_arn, None).await;
+        let again = all_packages(&router, case, &graph_arn).await;
         assert_eq!(
             again, reported,
             "case {case:?}: a second report differed from the first"
@@ -319,7 +292,7 @@ async fn last_ingest_state_change_records_when_each_state_was_entered_and_nothin
     // A new graph ingests the mandatory package, and the instant it entered STARTED is
     // the only one it has been in.
     let case = "created";
-    let created = all_packages(&router, case, &graph_arn, None).await;
+    let created = all_packages(&router, case, &graph_arn).await;
     assert_eq!(
         reported_states(&created),
         vec![(
@@ -348,7 +321,7 @@ async fn last_ingest_state_change_records_when_each_state_was_entered_and_nothin
     tokio::time::sleep(TICK).await;
     let case = "started-all";
     update_ok(&router, case, &graph_arn, &PACKAGES).await;
-    let started_all = all_packages(&router, case, &graph_arn, None).await;
+    let started_all = all_packages(&router, case, &graph_arn).await;
     let mut optional_started: BTreeMap<&str, i64> = BTreeMap::new();
     for package in PACKAGES {
         let detail = detail_of(case, &started_all, package);
@@ -373,7 +346,7 @@ async fn last_ingest_state_change_records_when_each_state_was_entered_and_nothin
     tokio::time::sleep(TICK).await;
     let case = "confirmed-same-set";
     update_ok(&router, case, &graph_arn, &PACKAGES).await;
-    let confirmed = all_packages(&router, case, &graph_arn, None).await;
+    let confirmed = all_packages(&router, case, &graph_arn).await;
     assert_eq!(
         confirmed, started_all,
         "case {case:?}: confirming the set already ingested changed the report"
@@ -390,7 +363,7 @@ async fn last_ingest_state_change_records_when_each_state_was_entered_and_nothin
         &[MANDATORY_DATASOURCE_PACKAGE],
     )
     .await;
-    let narrowed = all_packages(&router, case, &graph_arn, None).await;
+    let narrowed = all_packages(&router, case, &graph_arn).await;
     for (package, entered) in &optional_started {
         let detail = detail_of(case, &narrowed, package);
         assert_eq!(
@@ -428,7 +401,7 @@ async fn last_ingest_state_change_records_when_each_state_was_entered_and_nothin
         &[MANDATORY_DATASOURCE_PACKAGE, "EKS_AUDIT"],
     )
     .await;
-    let restarted = all_packages(&router, case, &graph_arn, None).await;
+    let restarted = all_packages(&router, case, &graph_arn).await;
     let detail = detail_of(case, &restarted, "EKS_AUDIT");
     assert_eq!(
         detail
@@ -452,28 +425,25 @@ async fn last_ingest_state_change_records_when_each_state_was_entered_and_nothin
 }
 
 #[tokio::test]
-async fn the_report_pages_through_every_held_package_at_every_page_size() {
+async fn the_report_answers_every_held_package_in_one_response() {
     let router = emulator();
     let graph_arn = create_graph_ok(&router, REGION, &json!({})).await;
     update_ok(&router, "seed", &graph_arn, &PACKAGES).await;
     let expected: BTreeSet<String> = PACKAGES.iter().map(|p| (*p).to_string()).collect();
 
-    // The rows differ along the page size: each published bound of the modelled
-    // `MemberResultsLimit` range (1..200), a size that splits the held packages, one
-    // that exactly covers them, and the request that names none at all.
-    for max_results in [None, Some(1), Some(2), Some(3), Some(MAX_PAGE_SIZE as i32)] {
-        let case = format!("max-results-{max_results:?}");
-        let reported = all_packages(&router, &case, &graph_arn, max_results).await;
-        let keys: BTreeSet<String> = reported.keys().cloned().collect();
-        assert_eq!(
-            keys, expected,
-            "case {case:?}: expected every held package exactly once, got {keys:?}"
-        );
-    }
+    let reported = all_packages(&router, "one response", &graph_arn).await;
+    let keys: BTreeSet<String> = reported.keys().cloned().collect();
+    assert_eq!(
+        keys, expected,
+        "expected every held package exactly once, got {keys:?}"
+    );
 
-    // One past each published bound is refused by the modelled range.
-    for max_results in [0, -1, MAX_PAGE_SIZE as i32 + 1] {
-        let case = format!("out-of-range-{max_results}");
+    // Any `MaxResults` at all is refused: the rows differ along where the value sits
+    // relative to the modelled `MemberResultsLimit` range (1..200) — each published
+    // bound, a value inside it, and one past each bound, which the modelled range
+    // itself refuses first. Every row is the modelled `ValidationException` at 400.
+    for max_results in [1, 2, MAX_PAGE_SIZE as i32, 0, -1, MAX_PAGE_SIZE as i32 + 1] {
+        let case = format!("max-results-{max_results}");
         let (status, answered) = list_page(&router, &graph_arn, Some(max_results), None).await;
         assert_eq!(
             status, 400,
@@ -493,9 +463,11 @@ async fn a_pagination_token_the_report_did_not_issue_is_refused() {
     let graph_arn = create_graph_ok(&router, REGION, &json!({})).await;
     update_ok(&router, "seed", &graph_arn, &PACKAGES).await;
 
-    // The rows differ along HOW the token is wrong: not this service's encoding at all,
-    // this encoding wrapping something that is not a package, and a token for a
-    // different list operation's key space (a graph ARN).
+    // The rows differ along HOW the token is wrong — and since this report issues no
+    // token at all, every one of them is a token it did not issue: not this service's
+    // encoding at all, this encoding wrapping something that is not a package, a token
+    // for a different list operation's key space (a graph ARN), and this encoding
+    // wrapping a package name in the wrong case.
     let cases = [
         ("not-this-encoding", "not-a-token".to_string()),
         ("encodes-a-non-package", hex::encode("NOT_A_PACKAGE")),
@@ -523,16 +495,15 @@ async fn a_pagination_token_the_report_did_not_issue_is_refused() {
         );
     }
 
-    // The control: a token the report DID issue is accepted and names the rest.
-    let (status, first) = list_page(&router, &graph_arn, Some(1), None).await;
-    assert_eq!(status, 200, "first page: got {status} {first:?}");
-    let issued = first
-        .get("NextToken")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("the first of three pages carried no NextToken: {first:?}"));
-    let (status, second) = list_page(&router, &graph_arn, Some(2), Some(issued)).await;
-    assert_eq!(status, 200, "second page: got {status} {second:?}");
-    let keys: BTreeSet<String> = second
+    // The control: this report issues no token at all, so there is none to accept.
+    let (status, first) = list_page(&router, &graph_arn, None, None).await;
+    assert_eq!(status, 200, "the unpaginated report: got {status} {first:?}");
+    assert_eq!(
+        first.get("NextToken"),
+        None,
+        "the report must issue no NextToken, got {first:?}"
+    );
+    let keys: BTreeSet<String> = first
         .get("DatasourcePackages")
         .and_then(Value::as_object)
         .expect("DatasourcePackages")
@@ -541,7 +512,7 @@ async fn a_pagination_token_the_report_did_not_issue_is_refused() {
         .collect();
     assert_eq!(
         keys,
-        BTreeSet::from(["DETECTIVE_CORE".to_string(), "EKS_AUDIT".to_string()]),
-        "the token must name the packages the first page did not report, got {keys:?}"
+        PACKAGES.iter().map(|p| (*p).to_string()).collect::<BTreeSet<String>>(),
+        "one response must carry every held package, got {keys:?}"
     );
 }

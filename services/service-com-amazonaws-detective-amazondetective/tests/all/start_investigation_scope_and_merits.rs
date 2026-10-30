@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_detective_amazondetective::state::{
-    GRAPH_NOT_FOUND_MESSAGE, INVESTIGATION_ID_LEN,
+    INVESTIGATION_GRAPH_NOT_FOUND_MESSAGE, INVESTIGATION_ID_LEN,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -315,13 +315,14 @@ async fn a_well_formed_scope_window_is_refused_only_on_the_merits_of_the_request
         );
         if case.graph_is_stored {
             assert_ne!(
-                message, GRAPH_NOT_FOUND_MESSAGE,
+                message, INVESTIGATION_GRAPH_NOT_FOUND_MESSAGE,
                 "case {name:?}: the graph was found, got {message:?}"
             );
         } else {
             assert_eq!(
-                message, GRAPH_NOT_FOUND_MESSAGE,
-                "case {name:?}: expected the fixed graph-not-found message, got {message:?}"
+                message, INVESTIGATION_GRAPH_NOT_FOUND_MESSAGE,
+                "case {name:?}: expected the investigation surface's fixed \
+                 graph-not-found message, got {message:?}"
             );
         }
     }

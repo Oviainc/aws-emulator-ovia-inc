@@ -215,10 +215,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             match graph.members.remove(account_id) {
                 Some(_) => removed.push(account_id.clone()),
                 // There is no membership to remove, so the account cannot be processed —
-                // reported with the reason rather than counted as removed.
+                // reported with the one missing-membership text every refusal of this
+                // same condition carries, rather than counted as removed.
                 None => unprocessed_accounts.push(crate::state::unprocessed(
                     account_id,
-                    crate::state::NOT_A_MEMBER_REASON.to_string(),
+                    crate::state::NO_SUCH_MEMBERSHIP_MESSAGE.to_string(),
                 )),
             }
         }

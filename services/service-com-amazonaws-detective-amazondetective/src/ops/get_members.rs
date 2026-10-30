@@ -181,10 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(member) => member_details.push(member.detail()),
                 // No membership is stored for this account in this graph, so there is
                 // nothing to report about it: it goes in `UnprocessedAccounts` with
-                // the reason, rather than being invented as a member.
+                // the reason, rather than being invented as a member. The reason is the
+                // one missing-membership text every refusal of this same condition
+                // carries, so the batch report and the 404 cannot drift apart.
                 None => unprocessed_accounts.push(crate::state::unprocessed(
                     account_id,
-                    crate::state::NOT_A_MEMBER_REASON.to_string(),
+                    crate::state::NO_SUCH_MEMBERSHIP_MESSAGE.to_string(),
                 )),
             }
         }

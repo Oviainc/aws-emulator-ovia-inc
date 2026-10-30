@@ -130,11 +130,6 @@ impl From<RejectInvitationErrorModeled> for RejectInvitationError {
     }
 }
 
-/// What this operation answers when the calling account holds no invitation into the
-/// graph it named: the modelled 404, with a fixed sentence that echoes neither the
-/// account nor the ARN.
-const INVITATION_NOT_FOUND_MESSAGE: &str = "The specified invitation does not exist";
-
 /// The `RejectInvitation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -187,8 +182,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_epoch_millis();
 
         let mut store = state.lock();
+        // This is an INVITEE-side operation: what it resolves is the membership the
+        // calling account holds in the graph it named, so a graph this service does not
+        // hold and a graph that holds no membership for this caller are the one
+        // condition — "no such membership" — and are refused identically. Nothing in
+        // the refusal discloses whether the graph itself exists.
         let graph = store.graph_mut(&input.graph_arn).ok_or_else(|| {
-            RejectInvitationErrorModeled::ResourceNotFoundException(crate::state::graph_not_found())
+            RejectInvitationErrorModeled::ResourceNotFoundException(
+                crate::state::no_such_membership(),
+            )
         })?;
         // The verification `CreateMembers` started may have come due since, and the
         // status it moves to is the one this operation acts on. See
@@ -201,9 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|member| member.status.clone())
             .ok_or_else(|| {
                 RejectInvitationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(INVITATION_NOT_FOUND_MESSAGE.to_string()),
-                    },
+                    crate::state::no_such_membership(),
                 )
             })?;
         // Only an open invitation can be rejected. A membership in any other status is

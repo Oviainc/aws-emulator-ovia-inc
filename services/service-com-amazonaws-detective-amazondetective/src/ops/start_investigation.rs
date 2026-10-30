@@ -200,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         if store.graph(&input.graph_arn).is_none() {
             return Err(StartInvestigationErrorModeled::ResourceNotFoundException(
-                crate::state::graph_not_found(),
+                crate::state::investigation_graph_not_found(),
             )
             .into());
         }
@@ -220,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
         let graph = store.graph_mut(&input.graph_arn).ok_or_else(|| {
             StartInvestigationErrorModeled::ResourceNotFoundException(
-                crate::state::graph_not_found(),
+                crate::state::investigation_graph_not_found(),
             )
         })?;
 

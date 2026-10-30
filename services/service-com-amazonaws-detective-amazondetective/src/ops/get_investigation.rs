@@ -188,7 +188,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_epoch_millis();
         let mut store = state.lock();
         let graph = store.graph_mut(&input.graph_arn).ok_or_else(|| {
-            GetInvestigationErrorModeled::ResourceNotFoundException(crate::state::graph_not_found())
+            GetInvestigationErrorModeled::ResourceNotFoundException(
+                crate::state::investigation_graph_not_found(),
+            )
         })?;
         // The ONLY write this report makes: each investigation's run was due to finish
         // at an instant the clock has already passed, so it is materialised here rather

@@ -119,6 +119,23 @@ pub const MEMBER_STATUS_ACCEPTED_BUT_DISABLED: &str = "ACCEPTED_BUT_DISABLED";
 /// `MEMBER_STATUS_VALUES`.
 pub const MEMBER_STATUS_ENABLED: &str = "ENABLED";
 
+/// Whether `status` is one a member account reached by ACCEPTING its invitation (or by
+/// being enabled by the administrator), which is what makes the stored record a
+/// membership of the behavior graph's data plane.
+///
+/// From `MemberDetail$Status`: `ENABLED` is "the member account currently contributes
+/// data to the behavior graph. For invited accounts, the member account accepted the
+/// invitation", and `ACCEPTED_BUT_DISABLED` is "the account accepted the invitation, or
+/// was enabled by the Detective administrator account, but is prevented from
+/// contributing data". The other three are all pre-acceptance: an invitation sent and
+/// unanswered, a verification still running, and one that failed — of which the same
+/// member documents that "the member cannot be added to the behavior graph". An
+/// operation that acts on the membership itself therefore has nothing to act on unless
+/// this holds.
+pub fn is_accepted_membership(status: &str) -> bool {
+    status == MEMBER_STATUS_ENABLED || status == MEMBER_STATUS_ACCEPTED_BUT_DISABLED
+}
+
 /// The message every refusal of a behavior graph this service does not hold carries.
 ///
 /// Recorded behaviour: Detective answers a graph-scoped request naming a graph it
@@ -126,6 +143,47 @@ pub const MEMBER_STATUS_ENABLED: &str = "ENABLED";
 /// does not echo the caller-supplied ARN back. It is therefore a constant rather than
 /// a `format!`, and every operation that resolves a graph shares it.
 pub const GRAPH_NOT_FOUND_MESSAGE: &str = "Graph not found";
+
+/// The message the INVESTIGATION operations answer a behavior graph this service does
+/// not hold with.
+///
+/// Recorded behaviour: the operations bound under this service's `/investigations/`
+/// URIs word an unresolvable graph with this one fixed sentence — it names the input to
+/// inspect and interpolates nothing from the request — while the member-administration
+/// surface words the same condition as [`GRAPH_NOT_FOUND_MESSAGE`]. Each surface's text
+/// is therefore written exactly once, here, and shared by every operation of that
+/// surface that resolves a graph.
+pub const INVESTIGATION_GRAPH_NOT_FOUND_MESSAGE: &str =
+    "Graph Not Found. Please check the graphArn provided";
+
+/// The message every refusal of a MEMBERSHIP this service does not hold carries.
+///
+/// Recorded behaviour: whenever an operation cannot resolve the membership it was asked
+/// about — the invitation addressed to the calling account, or the member account an
+/// administrator named — Detective states it with this one fixed sentence, which
+/// discloses neither the account nor whether the graph itself exists. The same sentence
+/// is the `UnprocessedAccount$Reason` a batch reports for an account the graph holds no
+/// membership for, so the 404 message and the unprocessed reason are the one text and
+/// can never drift.
+pub const NO_SUCH_MEMBERSHIP_MESSAGE: &str = "No such membership";
+
+/// The message an operation that acts on a membership's data ingest answers a stored
+/// record the member account has not ACCEPTED with.
+///
+/// Recorded behaviour: the graph does hold a record for the account, but the account
+/// never accepted the invitation it was sent, so there is no ingest to act on — the
+/// modelled `ResourceNotFoundException` again, with this fixed sentence, which names the
+/// one fact that distinguishes it from [`NO_SUCH_MEMBERSHIP_MESSAGE`] and interpolates
+/// nothing from the request.
+pub const INVITATION_NOT_ACCEPTED_MESSAGE: &str = "invitation has not been accepted";
+
+/// The message `ListDatasourcePackages` refuses a present `MaxResults` with.
+///
+/// Recorded behaviour: this report is not paginated — a request carrying ANY
+/// `MaxResults` value is refused with the modelled `ValidationException`, and the
+/// sentence interpolates nothing from the request. See
+/// [`crate::ops::list_datasource_packages`].
+pub const MAX_RESULTS_MUST_BE_NULL_MESSAGE: &str = "Max results must be null";
 
 /// The most tag keys one behavior graph may hold.
 ///
@@ -597,6 +655,33 @@ pub fn graph_not_found() -> ResourceNotFoundException {
     }
 }
 
+/// The refusal the investigation operations answer a behavior graph this service does
+/// not hold with: the same modelled 404, carrying that surface's own
+/// [`INVESTIGATION_GRAPH_NOT_FOUND_MESSAGE`].
+pub fn investigation_graph_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(INVESTIGATION_GRAPH_NOT_FOUND_MESSAGE.to_string()),
+    }
+}
+
+/// The refusal every operation answers a membership this service does not hold with:
+/// the modelled 404, carrying [`NO_SUCH_MEMBERSHIP_MESSAGE`] rather than anything built
+/// from the request.
+pub fn no_such_membership() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(NO_SUCH_MEMBERSHIP_MESSAGE.to_string()),
+    }
+}
+
+/// The refusal an operation that acts on a membership's data ingest answers a stored
+/// record the account has not accepted with: the same modelled 404, carrying
+/// [`INVITATION_NOT_ACCEPTED_MESSAGE`].
+pub fn invitation_not_accepted() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(INVITATION_NOT_ACCEPTED_MESSAGE.to_string()),
+    }
+}
+
 /// Whether `key` begins with the reserved [`RESERVED_TAG_KEY_PREFIX`], compared
 /// case-insensitively the way the recorded refusal describes ("Customers cannot set
 /// tag keys starting with aws: (case insensitive)").
@@ -633,7 +718,7 @@ pub fn unknown_datasource_packages_message(packages: &[&str]) -> String {
 /// [`MANDATORY_DATASOURCE_PACKAGE`].
 pub fn missing_datasource_packages_message(packages: &[&str]) -> String {
     format!(
-        "UpdateDatasourcePackages request is missing mandatory datasource package(s): [{}]",
+        "UpdateDatasourcePackages request missing mandatory datasource package(s): [{}]",
         packages.join(", ")
     )
 }
@@ -815,11 +900,6 @@ pub fn decode_page_token(token: &str) -> Option<String> {
 /// no data for it at all: it neither administers the graph nor holds a membership in it,
 /// so the graph stores no data source package information of it to report.
 pub const NOT_INGESTED_FOR_REASON: &str = "The account is not an account of the behavior graph.";
-
-/// Why an account a batch named is reported unprocessed when the behavior graph holds no
-/// MEMBERSHIP for it: a membership is the record `MemberDetail` reports, so an account
-/// without one — the administrator included — has no member details in this graph.
-pub const NOT_A_MEMBER_REASON: &str = "The account is not a member account in the behavior graph.";
 
 /// Why the account that administers a behavior graph is reported unprocessed when a
 /// member-removal batch names it: `DeleteMembers` documents that "an administrator

@@ -2,7 +2,7 @@
 
 //! End-to-end HTTP tests for the part of `ListDatasourcePackages` that is about the
 //! REPORT rather than the ingest states themselves: which graph's records it reports,
-//! the order its pages walk them in, and the `NextToken` it will not accept.
+//! that it answers all of them at once, and the `NextToken` it will not accept.
 //!
 //! `datasource_package_ingest` asserts the write-then-read rule (what
 //! `UpdateDatasourcePackages` stores and what `LastIngestStateChange` then says); this
@@ -10,10 +10,9 @@
 //!
 //! 1. A report is scoped to the behavior graph the request names: it carries that
 //!    graph's records and no other graph's, however the two graphs differ.
-//! 2. The pages walk the held packages in ONE stable order — the order a package name
-//!    sorts in — so a `NextToken` names a position: at a page size of one each page
-//!    carries the next package in that order, and at a larger size each page carries the
-//!    next block of it.
+//! 2. The report is not paginated: one call carries every package the graph holds and
+//!    no `NextToken`, whatever the graph holds, and a request that names `MaxResults` is
+//!    refused instead of being served a part of the map.
 //! 3. A `NextToken` this operation did not issue is refused with the modelled
 //!    `ValidationException` (400) and one fixed sentence, for a token anywhere within
 //!    the modelled `PaginationToken` length of 1..1024 — the refusal never echoes it.
@@ -21,14 +20,16 @@
 use std::collections::BTreeSet;
 
 use serde_json::{json, Map, Value};
-use service_com_amazonaws_detective_amazondetective::state::MANDATORY_DATASOURCE_PACKAGE;
+use service_com_amazonaws_detective_amazondetective::state::{
+    MANDATORY_DATASOURCE_PACKAGE, MAX_PAGE_SIZE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::support::{call, call_in, create_graph_ok, emulator, error_code, error_message, REGION};
 
 /// Every value the modelled `DatasourcePackage` enum accepts
 /// (`smithy_query(query="shape",shape="DatasourcePackage")`), written in the order a
-/// package name sorts, which is the order rule 2 says the pages walk.
+/// package name sorts.
 const PACKAGES_IN_ORDER: [&str; 3] = ["ASFF_SECURITYHUB_FINDING", "DETECTIVE_CORE", "EKS_AUDIT"];
 
 /// `ListDatasourcePackages`' URI, from
@@ -154,51 +155,63 @@ async fn a_report_carries_the_named_graphs_records_and_no_other_graphs() {
 }
 
 #[tokio::test]
-async fn the_pages_walk_the_held_packages_in_one_stable_order() {
+async fn one_report_carries_every_held_package_whatever_the_graph_holds() {
     let router = emulator();
+
+    // The rows differ along HOW MANY packages the graph holds and WHICH: the one package
+    // a fresh graph starts with, one optional package beside it, and every modelled value
+    // at once. Each row is one emulator, so each gets its own graph.
+    let rows: [(&str, Vec<&str>); 3] = [
+        ("only-the-mandatory-package", vec![MANDATORY_DATASOURCE_PACKAGE]),
+        (
+            "the-mandatory-package-and-one-more",
+            vec![MANDATORY_DATASOURCE_PACKAGE, "EKS_AUDIT"],
+        ),
+        ("every-modelled-package", PACKAGES_IN_ORDER.to_vec()),
+    ];
+    for (case, packages) in rows {
+        let router = emulator();
+        let graph_arn = create_graph_ok(&router, REGION, &json!({})).await;
+        update_ok(&router, case, REGION, &graph_arn, &packages).await;
+
+        let (reported, token) = page_of(&router, case, &graph_arn, None, None).await;
+        assert_eq!(
+            token, None,
+            "case {case:?}: an unpaginated report issues no NextToken"
+        );
+        let expected: BTreeSet<String> = packages.iter().map(|p| (*p).to_string()).collect();
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected every held package in one response, got {reported:?}"
+        );
+    }
+
+    // And a request that asks for a page of them is refused rather than served part of
+    // the map: the rows differ along the size asked for, inside the modelled
+    // `MemberResultsLimit` range (1..200) and at each of its published bounds.
     let graph_arn = create_graph_ok(&router, REGION, &json!({})).await;
     update_ok(&router, "seed", REGION, &graph_arn, &PACKAGES_IN_ORDER).await;
-
-    // The rows differ along the page size, and each row's expectation is the SAME order
-    // cut into blocks of that size: a page size of one makes each page's single key fix
-    // its position, and a larger size makes each page the next block of that order. (The
-    // order WITHIN one page is not asserted anywhere: a JSON object's member order is not
-    // part of the protocol.)
-    for page_size in [1usize, 2, 3] {
-        let case = format!("page size {page_size}");
-        let expected: Vec<BTreeSet<String>> = PACKAGES_IN_ORDER
-            .chunks(page_size)
-            .map(|chunk| chunk.iter().map(|p| (*p).to_string()).collect())
-            .collect();
-
-        let mut walked: Vec<BTreeSet<String>> = Vec::new();
-        let mut token: Option<String> = None;
-        // One page per held package is the most a walk can need; one more would mean it
-        // is not making progress.
-        for page in 0..=PACKAGES_IN_ORDER.len() {
-            let case = format!("{case} page {page}");
-            let (keys, next) = page_of(
-                &router,
-                &case,
-                &graph_arn,
-                Some(page_size as i32),
-                token.as_deref(),
-            )
-            .await;
-            assert!(
-                keys.len() <= page_size,
-                "case {case:?}: expected at most {page_size} entries, got {keys:?}"
-            );
-            walked.push(keys);
-            match next {
-                Some(next) => token = Some(next),
-                None => break,
-            }
-        }
+    for max_results in [1, 2, 3, MAX_PAGE_SIZE as i32] {
+        let case = format!("max-results-{max_results}");
+        let (status, answered) = call(
+            &router,
+            LIST_URI,
+            &json!({ "GraphArn": graph_arn, "MaxResults": max_results }),
+        )
+        .await;
         assert_eq!(
-            walked, expected,
-            "case {case:?}: expected the sorted order cut into blocks of {page_size}, \
-             got {walked:?}"
+            status, 400,
+            "case {case:?}: expected 400, got {status} {answered:?}"
+        );
+        assert_eq!(
+            error_code(&answered),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {answered:?}"
+        );
+        assert_eq!(
+            answered.get("NextToken"),
+            None,
+            "case {case:?}: a refusal carries no NextToken, got {answered:?}"
         );
     }
 }
@@ -256,26 +269,18 @@ async fn a_next_token_this_report_did_not_issue_is_refused_without_being_echoed(
         );
     }
 
-    // The control: a token this report DID issue is accepted, and names the position the
-    // page before it stopped at.
-    let (first, token) = page_of(&router, "issued token", &graph_arn, Some(1), None).await;
-    let token = token.unwrap_or_else(|| panic!("the first of three pages carried no NextToken"));
-    let (second, _) = page_of(
-        &router,
-        "issued token",
-        &graph_arn,
-        Some(1),
-        Some(token.as_str()),
-    )
-    .await;
+    // The control: this report issues no token at all, so a caller has none to send.
+    let (first, token) = page_of(&router, "issued token", &graph_arn, None, None).await;
     assert_eq!(
-        first,
-        BTreeSet::from([PACKAGES_IN_ORDER[0].to_string()]),
-        "expected the first package in sorted order, got {first:?}"
+        token, None,
+        "the report must issue no NextToken, got {token:?}"
     );
     assert_eq!(
-        second,
-        BTreeSet::from([PACKAGES_IN_ORDER[1].to_string()]),
-        "expected the issued token to name the next package, got {second:?}"
+        first,
+        PACKAGES_IN_ORDER
+            .iter()
+            .map(|p| (*p).to_string())
+            .collect::<BTreeSet<String>>(),
+        "one response must carry every held package, got {first:?}"
     );
 }

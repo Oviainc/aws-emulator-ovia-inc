@@ -3,7 +3,7 @@
 //! @op ListDatasourcePackages
 //!
 //! IMPLEMENTED: the data source packages one behavior graph holds, with each one's
-//! ingest state and the instant it entered it, paginated in a stable order.
+//! ingest state and the instant it entered it — every one of them, in one response.
 //!
 //! ## Shape of an operation
 //!
@@ -111,32 +111,24 @@ impl From<ListDatasourcePackagesErrorModeled> for ListDatasourcePackagesError {
     }
 }
 
-/// The data source package a `NextToken` names, or the modelled `ValidationException`
-/// when the token is not one this operation issued.
+/// The refusal this operation answers a `NextToken` with.
 ///
-/// The token's own text is never echoed back: it is opaque to a caller, and a caller
-/// that invents one is told only that it is not a token from here. A token this
-/// operation issued always names a value of the modelled `DatasourcePackage` enum
-/// (`smithy_query(query="shape",shape="DatasourcePackage")`), which is what the store
-/// keys these records by.
-fn next_package(token: &str) -> Result<String, ListDatasourcePackagesError> {
-    crate::state::decode_page_token(token)
-        .filter(|package| DATASOURCE_PACKAGE_VALUES.contains(&package.as_str()))
-        .ok_or_else(|| {
-            ListDatasourcePackagesErrorModeled::ValidationException(ValidationException {
-                message: Some(
-                    "NextToken is not a pagination token issued by ListDatasourcePackages"
-                        .to_string(),
-                ),
-                error_code: Some("INVALID_REQUEST_BODY".to_string()),
-                error_code_reason: Some(
-                    "NextToken must be a token a previous ListDatasourcePackages response \
-                     returned"
-                        .to_string(),
-                ),
-            })
-            .into()
-        })
+/// This report is not paginated (see `handle`), so it issues no token at all and every
+/// token a request carries is therefore one it did not issue. The token's own text is
+/// never echoed back: it is opaque to a caller, and a caller that invents one is told
+/// only that it is not a token from here.
+fn not_an_issued_token() -> ListDatasourcePackagesError {
+    ListDatasourcePackagesErrorModeled::ValidationException(ValidationException {
+        message: Some(
+            "NextToken is not a pagination token issued by ListDatasourcePackages".to_string(),
+        ),
+        error_code: Some("INVALID_REQUEST_BODY".to_string()),
+        error_code_reason: Some(
+            "NextToken must be a token a previous ListDatasourcePackages response returned"
+                .to_string(),
+        ),
+    })
+    .into()
 }
 
 /// The `ListDatasourcePackages` operation.
@@ -180,16 +172,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // only reads. `GraphArn`'s pattern, `MaxResults`' 1..200 range and `NextToken`'s
         // 1..1024 length are modelled constraints the centralized walk refuses anything
         // outside of before this runs.
+        //
+        // Despite those two modelled members and the `@paginated` trait, this report is
+        // NOT paginated: it answers every package the graph holds in ONE response and
+        // issues no `NextToken`. A request that asks for a page size is therefore
+        // refused — with the fixed sentence for this class, which interpolates nothing
+        // from the request — rather than served a truncated view of the graph's ingest
+        // state together with a continuation token this service never hands out.
+        if input.max_results.is_some() {
+            return Err(ListDatasourcePackagesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::MAX_RESULTS_MUST_BE_NULL_MESSAGE.to_string()),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+        // No page is ever left over, so no token is ever issued: a token a request
+        // carries cannot be one of this operation's.
+        if input.next_token.is_some() {
+            return Err(not_an_issued_token());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListDatasourcePackagesErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the behavior graph store is unavailable".to_string()),
             })
         })?;
-
-        // The page size is the server's own decision, clamped whatever the request
-        // asked for, so no allocation below is sized by input.
-        let page_size = crate::state::page_size(input.max_results);
-        let start = input.next_token.as_deref().map(next_package).transpose()?;
 
         // A pure report: this operation reads the packages the graph stores and writes
         // nothing, so the next caller sees exactly what this one did.
@@ -200,31 +209,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // The packages are keyed by package name, so the walk has one stable total
-        // order and a token can name the package the next page starts at.
-        let remaining = match &start {
-            Some(package) => graph.datasource_packages.range(package.clone()..),
-            None => graph.datasource_packages.range::<String, _>(..),
-        };
-
-        // Reserve no more than the graph can actually yield.
-        let mut datasource_packages = ::std::collections::HashMap::with_capacity(
-            page_size.min(graph.datasource_packages.len()),
-        );
-        let mut next_token = None;
-        for (package, ingest) in remaining {
-            // The first package that does not fit becomes the next page's start, and
-            // only then is a `NextToken` emitted: the last page carries none.
-            if datasource_packages.len() == page_size {
-                next_token = Some(crate::state::encode_page_token(package));
-                break;
-            }
+        // Reserve no more than the graph can actually yield; the request sizes nothing.
+        let mut datasource_packages =
+            ::std::collections::HashMap::with_capacity(graph.datasource_packages.len());
+        for (package, ingest) in &graph.datasource_packages {
             datasource_packages.insert(package.clone(), ingest.detail());
         }
 
         Ok(ListDatasourcePackagesOutput {
             datasource_packages: Some(datasource_packages),
-            next_token,
+            // Not a paginated report: there is never a next page to name.
+            next_token: None,
         })
     }
 }

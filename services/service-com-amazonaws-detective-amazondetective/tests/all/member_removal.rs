@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_detective_amazondetective::state::{
-    ADMINISTRATOR_NOT_REMOVABLE_REASON, NOT_A_MEMBER_REASON,
+    ADMINISTRATOR_NOT_REMOVABLE_REASON, NO_SUCH_MEMBERSHIP_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -196,7 +196,7 @@ fn invited_members() -> Vec<String> {
 /// The table. The rows run IN ORDER against one graph, so a later row can act on a
 /// membership an earlier row removed (`already-removed-member` does exactly that).
 fn removal_cases() -> Vec<RemovalCase> {
-    let not_a_member = NOT_A_MEMBER_REASON.to_string();
+    let not_a_member = NO_SUCH_MEMBERSHIP_MESSAGE.to_string();
     let administrator = ADMINISTRATOR_NOT_REMOVABLE_REASON.to_string();
     // The modelled lower bound of `AccountIds` (1) and its upper bound (50) are both
     // rows: 45 strangers beside 5 members makes a batch of exactly 50.
@@ -364,7 +364,7 @@ async fn a_removal_batch_drops_the_memberships_it_names_and_reports_the_rest_unp
         ) {
             assert_eq!(
                 unprocessed.get(id).map(String::as_str),
-                Some(NOT_A_MEMBER_REASON),
+                Some(NO_SUCH_MEMBERSHIP_MESSAGE),
                 "case {name:?}: GetMembers must report {id:?} as no longer a member, got {unprocessed:?}"
             );
         }

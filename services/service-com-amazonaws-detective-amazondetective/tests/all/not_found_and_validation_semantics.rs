@@ -6,9 +6,9 @@
 //! a recording happened to carry:
 //!
 //! 1. A request naming a behavior graph the service does not hold is refused with the
-//!    modelled `ResourceNotFoundException` (404) carrying the service's own fixed
-//!    message, which never echoes the caller-supplied ARN — whatever the operation and
-//!    however the graph came to be absent.
+//!    modelled `ResourceNotFoundException` (404) carrying the fixed message that
+//!    operation's surface publishes, which never echoes the caller-supplied ARN —
+//!    whatever the operation and however the graph came to be absent.
 //! 2. A well-formed id of a resource scoped to a graph that the graph does not hold is
 //!    the same modelled 404, told apart from "no such graph" by its own fixed message;
 //!    an id outside its modelled constraints is still the framework's generic 400.
@@ -19,8 +19,10 @@
 //!    values it did not recognise and the mandatory package a request left out.
 //! 5. A tag key carrying the reserved `aws:` prefix (case-insensitively) is refused
 //!    with `BadRequestException` at HTTP 400 before any tag in the request is applied.
-//! 6. An operation that acts on a membership tells "not a member of this graph" (404)
-//!    apart from "a member, but not in the status this operation acts on" (409).
+//! 6. An operation that acts on a membership resolves one the member account ACCEPTED:
+//!    an account the graph holds no record of is the 404 with the missing-membership
+//!    text, a record that never got past invitation or verification is the same 404 under
+//!    the text that names that fact, and neither call changes the stored record.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -28,8 +30,9 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_detective_amazondetective::state::{
     service_state, DATASOURCE_PACKAGE_STATE_STARTED, DATASOURCE_PACKAGE_STATE_STOPPED,
-    GRAPH_NOT_FOUND_MESSAGE, INVESTIGATION_ID_LEN, INVESTIGATION_RUN_MILLIS,
-    MANDATORY_DATASOURCE_PACKAGE, MAX_TAGS_PER_GRAPH, RESERVED_TAG_KEY_MESSAGE,
+    GRAPH_NOT_FOUND_MESSAGE, INVESTIGATION_GRAPH_NOT_FOUND_MESSAGE, INVESTIGATION_ID_LEN,
+    INVESTIGATION_RUN_MILLIS, INVITATION_NOT_ACCEPTED_MESSAGE, MANDATORY_DATASOURCE_PACKAGE,
+    MAX_TAGS_PER_GRAPH, NO_SUCH_MEMBERSHIP_MESSAGE, RESERVED_TAG_KEY_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -55,6 +58,23 @@ struct GraphScopedCall {
     method: &'static str,
     uri: fn(&str) -> String,
     body: fn(&str) -> Value,
+}
+
+/// The fixed message rule 1 says the operation called `name` refuses an absent graph
+/// with.
+///
+/// Three refusal texts, each written exactly once in `crate::state` and shared by every
+/// operation it belongs to: the operations bound under this service's `/investigations/`
+/// URIs word an unresolvable graph with the investigation surface's sentence;
+/// `RejectInvitation` resolves the CALLING account's membership rather than the graph, so
+/// it words the same request as a missing membership and discloses nothing about the
+/// graph; every other graph-scoped operation carries the graph-not-found sentence.
+fn absent_graph_message(name: &str) -> &'static str {
+    match name {
+        "StartInvestigation" | "GetInvestigation" => INVESTIGATION_GRAPH_NOT_FOUND_MESSAGE,
+        "RejectInvitation" => NO_SUCH_MEMBERSHIP_MESSAGE,
+        _ => GRAPH_NOT_FOUND_MESSAGE,
+    }
 }
 
 /// The table for rule 1: EVERY operation of this service that resolves a behavior
@@ -193,9 +213,11 @@ async fn a_graph_the_service_does_not_hold_is_refused_with_its_own_fixed_message
                 "case {case:?}: expected ResourceNotFoundException, got {answered:?}"
             );
             let message = error_message(&answered);
+            let expected = absent_graph_message(call_case.name);
             assert_eq!(
-                message, GRAPH_NOT_FOUND_MESSAGE,
-                "case {case:?}: expected the fixed graph-not-found message, got {message:?}"
+                message, expected,
+                "case {case:?}: expected this surface's fixed absent-graph message, \
+                 got {message:?}"
             );
             assert!(
                 !message.contains(arn.as_str()),
@@ -494,7 +516,8 @@ async fn an_investigation_id_no_investigation_carries_is_the_modelled_not_found(
         );
         let message = error_message(&answered);
         assert_ne!(
-            message, GRAPH_NOT_FOUND_MESSAGE,
+            message,
+            absent_graph_message("GetInvestigation"),
             "case {id:?}: a missing investigation is not a missing graph, got {message:?}"
         );
         assert!(
@@ -713,7 +736,7 @@ async fn update_datasource_packages_validates_the_requested_package_set() {
         assert_eq!(
             message,
             format!(
-                "UpdateDatasourcePackages request is missing mandatory datasource package(s): \
+                "UpdateDatasourcePackages request missing mandatory datasource package(s): \
                  [{MANDATORY_DATASOURCE_PACKAGE}]"
             ),
             "case {case:?}: expected the missing-package message, got {message:?}"
@@ -973,8 +996,9 @@ async fn start_monitoring_member_tells_a_non_member_from_a_member_in_another_sta
     .await;
     assert_eq!(status, 200, "CreateMembers");
 
-    // Not a member of this graph: the modelled 404, and NOT the graph-not-found
-    // message — the graph was found. The rows differ along the account id.
+    // Not a member of this graph: the modelled 404 with the fixed missing-membership
+    // message — the graph WAS found, and the refusal is about the membership. The rows
+    // differ along the account id.
     for account in [account_id(1), account_id(2), "999999999999".to_string()] {
         let (status, answered) = call(
             &router,
@@ -992,9 +1016,9 @@ async fn start_monitoring_member_tells_a_non_member_from_a_member_in_another_sta
             "case {account:?}: expected ResourceNotFoundException, got {answered:?}"
         );
         let message = error_message(&answered);
-        assert_ne!(
-            message, GRAPH_NOT_FOUND_MESSAGE,
-            "case {account:?}: a non-member is not a missing graph, got {message:?}"
+        assert_eq!(
+            message, NO_SUCH_MEMBERSHIP_MESSAGE,
+            "case {account:?}: expected the fixed missing-membership message, got {message:?}"
         );
         assert!(
             !message.contains(account.as_str()),
@@ -1002,8 +1026,9 @@ async fn start_monitoring_member_tells_a_non_member_from_a_member_in_another_sta
         );
     }
 
-    // A member, but not in the one status this operation acts on: an invalid action on
-    // that membership, which is the modelled 409 — and the membership is unchanged.
+    // A record the graph DOES hold, but one the account never accepted: there is no
+    // ingest to enable, so this is the same modelled 404 under the text that names that
+    // fact — and the stored record is left exactly as it was.
     let (status, answered) = call(
         &router,
         "/graph/member/monitoringstate",
@@ -1011,13 +1036,18 @@ async fn start_monitoring_member_tells_a_non_member_from_a_member_in_another_sta
     )
     .await;
     assert_eq!(
-        status, 409,
-        "a member outside ACCEPTED_BUT_DISABLED: expected 409, got {status} {answered:?}"
+        status, 404,
+        "a membership the account never accepted: expected 404, got {status} {answered:?}"
     );
     assert_eq!(
         error_code(&answered),
-        "ConflictException",
-        "a member outside ACCEPTED_BUT_DISABLED: got {answered:?}"
+        "ResourceNotFoundException",
+        "a membership the account never accepted: got {answered:?}"
+    );
+    assert_eq!(
+        error_message(&answered),
+        INVITATION_NOT_ACCEPTED_MESSAGE,
+        "a membership the account never accepted: got {answered:?}"
     );
 
     let (status, got) = call(
@@ -1071,9 +1101,10 @@ async fn reject_invitation_reports_an_invitation_the_caller_does_not_hold() {
         "no invitation for the caller: got {answered:?}"
     );
     let message = error_message(&answered);
-    assert_ne!(
-        message, GRAPH_NOT_FOUND_MESSAGE,
-        "a missing invitation is not a missing graph, got {message:?}"
+    assert_eq!(
+        message, NO_SUCH_MEMBERSHIP_MESSAGE,
+        "an invitation the caller does not hold is the fixed missing-membership \
+         message, got {message:?}"
     );
 
     // The refused reject changed nothing: the graph and its member are still there.
