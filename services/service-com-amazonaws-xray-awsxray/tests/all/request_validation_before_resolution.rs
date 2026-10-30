@@ -566,9 +566,15 @@ async fn a_malformed_retrieval_token_is_refused_before_the_store_is_consulted() 
         "a minted RetrievalToken is {RETRIEVAL_TOKEN_HEX_DIGITS} hexadecimal digits, got {real:?}"
     );
 
+    // Assembled the way the mint assembles one — a check half derived from the
+    // identifying half — so these COULD have been issued, and were not.
+    let intact = |identity: &str| format!("{identity}{}", retrieval_token_check(identity));
+
     // Rows differ in HOW the token fails to be one this service could have
     // issued: its length either side of the minted width, a character outside
-    // hexadecimal, the UUID shape, surrounding space, and the empty string.
+    // hexadecimal, the UUID shape, surrounding space, the empty string, and a
+    // mintable value whose digits were re-cased — every character of a token is
+    // significant, so a case difference damages it like any other.
     // `RetrievalToken`'s modelled `@length` is 0..1020, so every row reaches the
     // handler rather than the request layer.
     let malformed = [
@@ -586,17 +592,14 @@ async fn a_malformed_retrieval_token_is_refused_before_the_store_is_consulted() 
             "the minted width and alphabet, carrying no check",
             "0".repeat(RETRIEVAL_TOKEN_HEX_DIGITS),
         ),
-    ];
-    // Assembled the way the mint assembles one — a check half derived from the
-    // identifying half — so these COULD have been issued, and were not.
-    let intact = |identity: &str| format!("{identity}{}", retrieval_token_check(identity));
-    let well_formed = [
-        ("an intact token nothing minted", intact("0000000000000000")),
-        ("another, over a different identity", intact("ffffffffffffffff")),
         (
             "upper-case hexadecimal",
             intact("0123456789abcdef").to_uppercase(),
         ),
+    ];
+    let well_formed = [
+        ("an intact token nothing minted", intact("0000000000000000")),
+        ("another, over a different identity", intact("ffffffffffffffff")),
     ];
 
     for (case, token) in &malformed {

@@ -4814,9 +4814,10 @@ pub enum RetrievalTokenDefect {
     NotTokenForm,
     /// The value has the minted width and the minted alphabet, but its check
     /// half does not derive from its identifying half
-    /// ([`retrieval_token_check`]) — a token damaged after it was issued. The
-    /// decoder read an execution id of the right shape and could not decode it,
-    /// so it names the value it could not decode.
+    /// ([`retrieval_token_check`]) — a token damaged after it was issued, by one
+    /// character or by many, the case of a digit included. The decoder read an
+    /// execution id of the right shape and could not decode it, so it names the
+    /// value it could not decode.
     UndecodableExecutionId,
 }
 
@@ -4835,17 +4836,22 @@ pub enum RetrievalTokenDefect {
 /// `ResourceNotFoundException` (HTTP 404) for an intact token whose retrieval was
 /// never started, has been evicted, or has timed out.
 ///
-/// Case-insensitive: the mint emits lowercase, but a token differing only in the
-/// case of its digits carries the same value, so it is answered as a retrieval
-/// that is not there rather than as a request that is wrong.
+/// The check is recomputed over the EXACT characters the request submitted, and
+/// nothing about them is folded: a retrieval token is an opaque string whose
+/// characters are each significant, so a value that differs from an issued one in
+/// the CASE of a digit is a value this service never issued — damaged in transit
+/// exactly like one whose digit changed to another value — and it is refused as a
+/// malformed parameter rather than resolved. Folding case here would also let a
+/// value pass this gate and then miss the store that resolves it, which is keyed
+/// by the exact string the mint emitted, so the caller would be told its
+/// retrieval is gone when what is wrong is the value it submitted.
 pub fn retrieval_token_defect(token: &str) -> Option<RetrievalTokenDefect> {
     if token.len() != RETRIEVAL_TOKEN_HEX_DIGITS
         || !token.chars().all(|digit| digit.is_ascii_hexdigit())
     {
         return Some(RetrievalTokenDefect::NotTokenForm);
     }
-    let lowered = token.to_ascii_lowercase();
-    let (identity, check) = lowered.split_at(RETRIEVAL_TOKEN_HEX_DIGITS / 2);
+    let (identity, check) = token.split_at(RETRIEVAL_TOKEN_HEX_DIGITS / 2);
     if retrieval_token_check(identity) == check {
         None
     } else {

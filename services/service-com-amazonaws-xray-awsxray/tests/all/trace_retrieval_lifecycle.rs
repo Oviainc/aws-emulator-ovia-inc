@@ -712,17 +712,18 @@ async fn a_malformed_token_is_a_bad_request_and_a_well_formed_unknown_one_is_not
             "an intact token whose check half was damaged",
             damage_last(&intact("0123456789abcdef")),
         ),
-    ];
-    let well_formed = [
+        // The token's characters are each significant, so a value differing
+        // from a mintable one only in the CASE of its digits is damaged too: it
+        // carries a check half that does not derive from its identifying half.
         (
-            "an intact token nothing minted",
-            intact("0123456789abcdef"),
-        ),
-        (
-            "the same, in upper case",
+            "an intact token in upper case",
             intact("0123456789abcdef").to_uppercase(),
         ),
     ];
+    let well_formed = [(
+        "an intact token nothing minted",
+        intact("0123456789abcdef"),
+    )];
     let operations = [
         "/ListRetrievedTraces",
         "/GetRetrievedTracesGraph",
