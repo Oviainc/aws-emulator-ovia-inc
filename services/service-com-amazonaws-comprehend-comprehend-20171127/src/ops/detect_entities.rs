@@ -154,7 +154,10 @@ const MAX_TEXT_BYTES: usize = 100_000;
 /// `LanguageCode` enum names is answered with the modelled
 /// `UnsupportedLanguageException` rather than with an entity list no analysis of that
 /// language produced.
-const ANALYSABLE_LANGUAGES: &[&str] = &["en"];
+///
+/// `pub(crate)` because the batch sibling reads the SAME list: whether a document can
+/// be analysed cannot depend on being submitted alone or in a batch.
+pub(crate) const ANALYSABLE_LANGUAGES: &[&str] = &["en"];
 
 /// The most tokens one candidate span may cover.
 ///
@@ -1359,7 +1362,11 @@ pub fn detect_entities(text: &str) -> Vec<Entity> {
 /// the caller's wait, not the blocking task, which runs to its natural end — or did
 /// not run at all, and in both cases nothing was analysed, so no entity may be
 /// fabricated for it.
-async fn recognize_entities(text: String) -> Result<Vec<Entity>, String> {
+///
+/// `pub(crate)` because every other caller recognises a document through this SAME
+/// seam — the batch sibling runs it once per document — so one document's entities
+/// cannot depend on which operation submitted it.
+pub(crate) async fn recognize_entities(text: String) -> Result<Vec<Entity>, String> {
     match ::tokio::time::timeout(
         RECOGNITION_TIME_BUDGET,
         ::tokio::task::spawn_blocking(move || detect_entities(&text)),

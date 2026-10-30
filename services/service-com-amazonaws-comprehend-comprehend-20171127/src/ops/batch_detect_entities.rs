@@ -1,24 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDetectEntities
-//! SCAFFOLDED, NOT IMPLEMENTED: the named-entity recognition itself. The batch
-//! PRECONDITIONS this operation documents ARE enforced here, each with the modelled
-//! error AWS answers it with: a `TextList` longer than [`MAX_BATCH_DOCUMENTS`] is
-//! refused wholesale with `BatchSizeLimitExceededException`, and a document larger
-//! than [`MAX_DOCUMENT_BYTES`] with `TextSizeLimitExceededException` — neither ever
-//! answers 501 again.
 //!
-//! A request that satisfies every precondition still answers HTTP 501
-//! `NotImplemented`, because the BATCH projection itself — one
-//! `BatchDetectEntitiesItemResult` per `TextList` index, with the per-document
-//! failures the modelled `ErrorList` carries — is unwritten. The recognition engine
-//! it needs now EXISTS in this crate: the single-document sibling `DetectEntities`
-//! is implemented and exports its in-process rule-and-lexicon recogniser as
-//! [`crate::ops::detect_entities::detect_entities`], so whoever implements this
-//! operation under its own issue calls that per document rather than inventing a
-//! `ResultList`. Until that wrapper is written the marker line above STAYS: this
-//! operation computes no result yet, so it belongs in the stub census
-//! (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`).
+//! IMPLEMENTED. Each document in `TextList` is analysed by the SAME in-process
+//! rule-and-lexicon recogniser the single-document sibling `DetectEntities` runs
+//! ([`crate::ops::detect_entities::recognize_entities`]), so a batch answers,
+//! document by document, exactly what that operation answers for the same text. The
+//! result of document `i` carries `Index` `i`, so `ResultList` is aligned with the
+//! input list and "sorted in ascending order by the Index field".
+//!
+//! Every documented batch PRECONDITION is a precondition OF THE REQUEST, checked
+//! before any document is analysed and refusing the call whole: a `TextList` longer
+//! than [`MAX_BATCH_DOCUMENTS`] with `BatchSizeLimitExceededException`, a document
+//! larger than [`MAX_DOCUMENT_BYTES`] with `TextSizeLimitExceededException`, and a
+//! `LanguageCode` the recogniser has no lexical resources for with
+//! `UnsupportedLanguageException` — so the batch is either analysed whole or refused
+//! whole, never answered with a partial `ResultList` beside a per-index `ErrorList`.
+//!
+//! The operation holds NO state: the answer is a function of `TextList` and
+//! `LanguageCode` alone, so repeating the call returns the same entities in the same
+//! order and nothing a later caller reads is changed by calling it.
 //!
 //! ## Shape of an operation
 //!
@@ -98,6 +99,13 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+// Batching changes how many documents one request carries, never how a document is
+// analysed, how large it may be, or which languages the recogniser has resources
+// for: the per-document recognition and that language list live with
+// `DetectEntities`, and the per-document byte quota lives with the state module, so
+// the two operations cannot drift apart.
+use super::detect_entities::{recognize_entities, ANALYSABLE_LANGUAGES};
 
 /// The most documents one `BatchDetectEntities` request may carry: the ONE ceiling
 /// the whole `BatchDetect*` family shares,
@@ -230,11 +238,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Every precondition holds, and what remains is the inference itself: see
-        // this module's header for why that is the one thing still answered with the
-        // 501 rather than with an invented `ResultList`.
-        Err(crate::scaffolded::Scaffolded::not_implemented(
-            "BatchDetectEntities",
-        ))
+        // Membership of the `LanguageCode` enum is enforced at the boundary; whether
+        // this emulator's recogniser has lexical resources for that language is not.
+        // One `LanguageCode` covers the whole batch ("All documents must be in the
+        // same language"), so a language the recogniser cannot read refuses the call
+        // rather than failing each document in turn. Checked after the two quotas
+        // AWS itself applies, since this restriction is the emulator's own.
+        if !ANALYSABLE_LANGUAGES.contains(&input.language_code.as_str()) {
+            return Err(
+                BatchDetectEntitiesErrorModeled::UnsupportedLanguageException(
+                    UnsupportedLanguageException {
+                        message: Some(format!(
+                            "Amazon Comprehend can't process the language {}: this emulator's \
+                             entity recognizer has lexical resources for {} only.",
+                            input.language_code,
+                            ANALYSABLE_LANGUAGES.join(", ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every precondition holds, so the whole batch is analysed: `ResultList` is
+        // built in input order, so it is "sorted in ascending order by the Index
+        // field" and every entry's `Index` is its document's own zero-based position
+        // — the only mapping a caller has back to its input.
+        //
+        // Each document goes through the same recognition seam the single-document
+        // operation uses, so the engine runs off the async worker and the `.await`
+        // between documents is a yield point: a 25-document batch cannot hold a
+        // runtime worker for the whole call.
+        let mut result_list = Vec::new();
+        for (position, text) in input.text_list.into_iter().enumerate() {
+            let entities = recognize_entities(text).await.map_err(|message| {
+                BatchDetectEntitiesErrorModeled::InternalServerException(InternalServerException {
+                    message: Some(message),
+                })
+            })?;
+            result_list.push(BatchDetectEntitiesItemResult {
+                index: i32::try_from(position).ok(),
+                entities: Some(entities),
+            });
+        }
+
+        Ok(BatchDetectEntitiesOutput {
+            result_list,
+            // "A list containing one object for each document that contained an
+            // error": a document an ACCEPTED call could not analyse. Every condition
+            // this operation can detect — the batch size, a document's size, the
+            // language — refuses the request instead, and the recogniser answers for
+            // any accepted document, so an accepted batch leaves no document
+            // unanalysed and the list is empty, as the modelled member's own sentence
+            // provides for ("If there are no errors in the batch, the ErrorList is
+            // empty"). A document carrying no recognisable entity is a result with an
+            // empty `Entities` list rather than an error.
+            error_list: Vec::new(),
+        })
     }
 }

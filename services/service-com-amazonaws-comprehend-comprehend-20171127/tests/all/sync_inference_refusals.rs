@@ -45,16 +45,12 @@ const BATCH_SIZE_LIMIT_MESSAGE: &str =
 
 /// Every batch inference operation this emulator implements, with the HTTP status a
 /// request that satisfies both quotas answers with.
-///
-/// `BatchDetectEntities` answers the scaffold's 501 for the recognition itself (its
-/// own stub issue), which is exactly why it belongs here: the quotas are refusals of
-/// the REQUEST, so they are decided before the operation's own analysis is reached.
 const BATCH_OPERATIONS: &[(&str, u16)] = &[
     ("BatchDetectSentiment", 200),
     ("BatchDetectDominantLanguage", 200),
     ("BatchDetectSyntax", 200),
     ("BatchDetectKeyPhrases", 200),
-    ("BatchDetectEntities", 501),
+    ("BatchDetectEntities", 200),
 ];
 
 /// A well-formed document every batch operation accepts.
