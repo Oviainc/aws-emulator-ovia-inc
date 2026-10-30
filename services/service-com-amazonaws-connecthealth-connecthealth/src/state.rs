@@ -9,7 +9,8 @@
 //!
 //! Helpers several operations share (id minting, ARN building, the opaque pagination
 //! cursor, the one status step a `Subscription` transition takes, and every response
-//! projection — `SubscriptionDescription`,
+//! projection — `SubscriptionDescription` and the create's own same-member-set
+//! `CreateSubscriptionOutput`,
 //! `WebAppConfiguration`, `EncryptionContext`, and the recorded `accountId` /
 //! `onboardingGeneration` pair) live here rather than being copied
 //! into each `src/ops/*.rs`: `src/lib.rs` is generated, so this module is the crate's
@@ -21,11 +22,11 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    CreateWebAppConfiguration, EncryptionContext, InputDataConfig, InsightsContext, InsightsOutput,
-    InternalServerException, MedicalScribeChannelDefinition, MedicalScribeListeningSessionDetails,
-    MedicalScribePostStreamActionSettingsResponse, MedicalScribePostStreamActionsResult,
-    OutputDataConfig, PatientInsightsEncounterContext, PatientInsightsPatientContext,
-    SubscriptionDescription, UserContext, WebAppConfiguration,
+    CreateSubscriptionOutput, CreateWebAppConfiguration, EncryptionContext, InputDataConfig,
+    InsightsContext, InsightsOutput, InternalServerException, MedicalScribeChannelDefinition,
+    MedicalScribeListeningSessionDetails, MedicalScribePostStreamActionSettingsResponse,
+    MedicalScribePostStreamActionsResult, OutputDataConfig, PatientInsightsEncounterContext,
+    PatientInsightsPatientContext, SubscriptionDescription, UserContext, WebAppConfiguration,
 };
 
 /// The region an emulated ARN carries when the request names none.
@@ -778,6 +779,11 @@ impl Subscription {
     }
 
     /// This record as the modelled `SubscriptionDescription` four operations return.
+    ///
+    /// The ONE projection of a stored subscription: every operation that reports one
+    /// goes through here (see [`Self::create_output`] for the create, whose output shape
+    /// is a distinct Rust type carrying the same member set), so no two responders can
+    /// disagree about a member of one record.
     pub fn description(&self) -> SubscriptionDescription {
         SubscriptionDescription {
             domain_id: self.domain_id.clone(),
@@ -788,6 +794,38 @@ impl Subscription {
             last_updated_at: to_timestamp(self.last_updated_at),
             activated_at: self.activated_at.map(to_timestamp),
             deactivated_at: self.deactivated_at.map(to_timestamp),
+        }
+    }
+
+    /// This record as the `CreateSubscriptionOutput` `CreateSubscription` answers with.
+    ///
+    /// `CreateSubscriptionOutput` is a distinct generated type from
+    /// `SubscriptionDescription`, but it carries the identical member set, so it is the
+    /// SAME projection re-typed rather than a second one: this re-types
+    /// [`Self::description`] member for member instead of reading the record again.
+    /// Destructuring is deliberate — if either shape gains or loses a member, this stops
+    /// compiling instead of letting the create's view of a subscription drift from the
+    /// view every other responder reports.
+    pub fn create_output(&self) -> CreateSubscriptionOutput {
+        let SubscriptionDescription {
+            domain_id,
+            subscription_id,
+            arn,
+            status,
+            created_at,
+            last_updated_at,
+            activated_at,
+            deactivated_at,
+        } = self.description();
+        CreateSubscriptionOutput {
+            domain_id,
+            subscription_id,
+            arn,
+            status,
+            created_at,
+            last_updated_at,
+            activated_at,
+            deactivated_at,
         }
     }
 }

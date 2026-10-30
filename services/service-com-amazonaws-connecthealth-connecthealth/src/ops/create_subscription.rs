@@ -220,21 +220,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // started on it.
             scribe_sessions: ::std::collections::BTreeMap::new(),
         };
-        // `or_insert` hands back the record it STORED, so every field rendered below is
-        // read out of the store rather than echoed from the request.
+        // `or_insert` hands back the record it STORED, so the response is projected out
+        // of the store rather than echoed from the request.
         let stored = domain
             .subscriptions
             .entry(subscription_id)
             .or_insert(subscription);
-        Ok(CreateSubscriptionOutput {
-            domain_id: stored.domain_id.clone(),
-            subscription_id: stored.subscription_id.clone(),
-            arn: stored.arn.clone(),
-            status: stored.status.as_wire().to_string(),
-            created_at: crate::state::to_timestamp(stored.created_at),
-            last_updated_at: crate::state::to_timestamp(stored.last_updated_at),
-            activated_at: stored.activated_at.map(crate::state::to_timestamp),
-            deactivated_at: stored.deactivated_at.map(crate::state::to_timestamp),
-        })
+        // The ONE projection of a stored subscription, single-homed in `crate::state`
+        // beside `Subscription::description` — the same computation the four other
+        // subscription responders report through, re-typed onto this operation's output
+        // shape, so this create cannot describe a record differently from them.
+        Ok(stored.create_output())
     }
 }
