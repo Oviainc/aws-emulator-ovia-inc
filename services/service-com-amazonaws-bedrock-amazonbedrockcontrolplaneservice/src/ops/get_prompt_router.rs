@@ -160,9 +160,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(GetPromptRouterErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no prompt router {} exists in this account",
-                        input.prompt_router_arn
+                    message: Some(crate::state::prompt_router_not_found_message(
+                        &input.prompt_router_arn,
                     )),
                 },
             )

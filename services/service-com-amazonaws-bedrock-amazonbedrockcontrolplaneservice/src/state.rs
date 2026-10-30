@@ -18,9 +18,11 @@
 //! `ops/list_enforced_guardrails_configuration.rs` reports, so the configuration one
 //! request stores is the configuration the next request lists.
 //!
-//! And it holds the prompt routers `ops/create_prompt_router.rs` mints and
-//! `ops/get_prompt_router.rs` reads back, so a router created by one request is the
-//! router every later request sees.
+//! And it holds the prompt routers `ops/create_prompt_router.rs` mints,
+//! `ops/get_prompt_router.rs` reads back, `ops/list_prompt_routers.rs` reports and
+//! `ops/delete_prompt_router.rs` removes, so a router created by one request is the
+//! router every later request sees and a router one request deleted is gone for every
+//! later one.
 //!
 //! And it holds the model import jobs `ops/create_model_import_job.rs` mints and
 //! `ops/get_model_import_job.rs` reads back, together with the instant each job's
@@ -392,6 +394,29 @@ pub fn duplicate_prompt_router_message(prompt_router_name: &str) -> String {
         "Failed to create the resource because the prompt router with name \
          {prompt_router_name} already exists."
     )
+}
+
+/// What this service answers as its `ValidationException` message for a delete addressing a
+/// prompt router Amazon Bedrock itself publishes ([`PROMPT_ROUTER_TYPE_DEFAULT`]).
+///
+/// RECORDED behaviour, and a FIXED sentence: Amazon Bedrock reports that the caller is not
+/// permitted to delete such a router and quotes no part of the request in it — not the ARN,
+/// not the router's name — so the sentence has no variable part to fill in.
+pub const DEFAULT_PROMPT_ROUTER_DELETE_REFUSED_MESSAGE: &str =
+    "You don't have the permission to delete the default prompt router.";
+
+/// What a request addressing a prompt router this account and region holds none of answers
+/// as its `ResourceNotFoundException` message.
+///
+/// RECORDED behaviour, and a message BUILT FROM THE REQUEST: Amazon Bedrock states that it
+/// cannot find the router and names the `PromptRouterArn` the request carried, so the rule
+/// is "name the ARN the request addressed" rather than one recorded ARN. Stated once here
+/// because the message belongs to the RESOURCE rather than to one operation, the way
+/// [`CUSTOM_MODEL_NOT_FOUND_MESSAGE`] is: a read and a delete of an ARN that resolves to no
+/// router both report the same thing.
+#[must_use]
+pub fn prompt_router_not_found_message(prompt_router_arn: &str) -> String {
+    format!("Cannot find prompt router {prompt_router_arn}.")
 }
 
 /// The most tags one resource of this service may carry.
@@ -3942,6 +3967,22 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// The prompt router a `PromptRouterArn` names.
     pub fn prompt_router(&self, arn: &str) -> Option<&PromptRouter> {
         self.prompt_routers.get(arn)
+    }
+
+    /// Forget the prompt router `arn` names, together with its name index entry and the
+    /// idempotency token that minted it — so a delete leaves nothing behind for a later
+    /// create of the same name to collide with or for a replayed token to hand back, and
+    /// both maps stay bounded by the LIVE routers exactly as [`Self::remove_custom_model`]
+    /// keeps that family's maps bounded.
+    ///
+    /// Hands back the record that was removed, or `None` when this store held no router
+    /// under that ARN — which is what tells a delete there was nothing to remove.
+    pub fn remove_prompt_router(&mut self, arn: &str) -> Option<PromptRouter> {
+        let router = self.prompt_routers.remove(arn)?;
+        self.prompt_router_names.retain(|_, minted| minted != arn);
+        self.prompt_router_create_tokens
+            .retain(|_, minted| minted != arn);
+        Some(router)
     }
 
     /// Mint a fresh prompt router id: the resource half of a

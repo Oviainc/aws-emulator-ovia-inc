@@ -21,6 +21,12 @@
 //!    two routers.
 //! 5. **`models` needs at least one entry**, which the model documents but declares no
 //!    `@length` for.
+//! 6. **A delete forgets the router the ARN names**, whatever configuration it carries and
+//!    whichever region it was minted in: a read, a listing and a second delete all report
+//!    it gone, and the name and the idempotency token it held are free again.
+//! 7. **A router Amazon Bedrock publishes is not the account's to delete**, so deleting one
+//!    is refused and that router stays readable and listed, while an ARN resolving to no
+//!    router at all is not found.
 //!
 //! Every expectation is derived from the model, cited per row
 //! (`smithy_query(query="operation",operation="CreatePromptRouter,GetPromptRouter")` /
@@ -81,6 +87,30 @@ async fn create_in_region(emu: &Emulator, region: &str, body: Value) -> crate::s
 async fn get(emu: &Emulator, arn: &str) -> crate::support::Reply {
     emu.call("GET", &format!("/prompt-routers/{}", label(arn)), None)
         .await
+}
+
+async fn get_in_region(emu: &Emulator, region: &str, arn: &str) -> crate::support::Reply {
+    emu.call_in_region(
+        region,
+        "GET",
+        &format!("/prompt-routers/{}", label(arn)),
+        None,
+    )
+    .await
+}
+
+async fn delete_in_region(emu: &Emulator, region: &str, arn: &str) -> crate::support::Reply {
+    emu.call_in_region(
+        region,
+        "DELETE",
+        &format!("/prompt-routers/{}", label(arn)),
+        None,
+    )
+    .await
+}
+
+async fn delete(emu: &Emulator, arn: &str) -> crate::support::Reply {
+    delete_in_region(emu, REGION, arn).await
 }
 
 async fn list_in_region(emu: &Emulator, region: &str, query: &str) -> crate::support::Reply {
@@ -568,17 +598,7 @@ async fn getting_a_router_that_does_not_exist_is_not_found() {
 
     for arn in rows {
         let reply = get(&emu, &arn).await;
-        assert_eq!(
-            reply.status, 404,
-            "case {arn:?}: an unknown router must be 404, got {} {:?}",
-            reply.status, reply.body
-        );
-        assert_eq!(
-            reply.error.as_deref(),
-            Some("ResourceNotFoundException"),
-            "case {arn:?}: expected ResourceNotFoundException, got {:?}",
-            reply.error
-        );
+        assert_not_found(&arn, &arn, &reply);
     }
 }
 
@@ -801,6 +821,319 @@ async fn the_listing_pages_through_every_router_exactly_once() {
             seen, all,
             "case {case:?}: the pages must partition the listing in ARN order, got {seen:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// 7. The delete: the router it forgets, and the two it refuses.
+// ---------------------------------------------------------------------------------------
+
+/// The sentence Amazon Bedrock states for a delete addressing a router it publishes itself.
+/// It quotes no part of the request, so there is nothing in it to fill in per row.
+const DEFAULT_ROUTER_DELETE_REFUSED: &str =
+    "You don't have the permission to delete the default prompt router.";
+
+/// Assert `reply` is the 404 a `PromptRouterArn` resolving to no router of this account and
+/// region gets, naming the ARN the request carried.
+fn assert_not_found(case: &str, arn: &str, reply: &crate::support::Reply) {
+    assert_eq!(
+        (reply.status, reply.error.as_deref().map(error_code)),
+        (404, Some("ResourceNotFoundException")),
+        "case {case:?}: expected 404 ResourceNotFoundException for {arn}, got {} {:?}",
+        reply.status,
+        reply.body
+    );
+    // Amazon Bedrock states that it cannot find the router and names the
+    // `PromptRouterArn` the request carried; that ARN is the sentence's only variable part,
+    // so it is built from the request rather than compared against one recorded ARN.
+    let expected = format!("Cannot find prompt router {arn}.");
+    assert_eq!(
+        reply.get("message"),
+        json!(expected),
+        "case {case:?}: expected the message {expected:?}, got {:?}",
+        reply.body
+    );
+}
+
+/// One router a row creates and then deletes: the members the create carries differ per row,
+/// and none of them changes what the delete does.
+struct DeletedRouter {
+    case: &'static str,
+    region: &'static str,
+    name: &'static str,
+    /// Which rows of [`MODEL_ARNS`] this router routes between, in request order.
+    models: &'static [usize],
+    /// Which row of [`MODEL_ARNS`] it falls back to.
+    fallback: usize,
+    description: Option<&'static str>,
+    tags: &'static [(&'static str, &'static str)],
+    quality_difference: f64,
+    token: Option<&'static str>,
+}
+
+/// The create body for one row, carrying only the members that row names.
+fn deleted_router_body(row: &DeletedRouter) -> Value {
+    let mut body = json!({
+        "promptRouterName": row.name,
+        "models": row.models
+            .iter()
+            .map(|index| json!({ "modelArn": MODEL_ARNS[*index] }))
+            .collect::<Vec<Value>>(),
+        "fallbackModel": { "modelArn": MODEL_ARNS[row.fallback] },
+        "routingCriteria": { "responseQualityDifference": row.quality_difference },
+    });
+    if let Some(description) = row.description {
+        body["description"] = json!(description);
+    }
+    if !row.tags.is_empty() {
+        body["tags"] = Value::Array(
+            row.tags
+                .iter()
+                .map(|(key, value)| json!({ "key": key, "value": value }))
+                .collect(),
+        );
+    }
+    if let Some(token) = row.token {
+        body["clientRequestToken"] = json!(token);
+    }
+    body
+}
+
+#[tokio::test]
+async fn a_delete_forgets_the_router_its_arn_names() {
+    let emu = emulator();
+
+    // The router every row must leave alone: a delete removes the router its ARN names and
+    // no other.
+    let bystander = create(&emu, create_body("delete bystander", 5.0))
+        .await
+        .text("promptRouterArn");
+
+    // Rows differ along what the deleted router carries — the number of target models, the
+    // presence of a description and of tags, the accepted routing criteria, the region the
+    // create addressed and whether the create carried a `clientRequestToken`.
+    // `DeletePromptRouter` addresses a router by its `PromptRouterArn` alone
+    // (`smithy_query(query="operation",operation="DeletePromptRouter")`), so none of them
+    // changes what the delete does.
+    let rows: &[DeletedRouter] = &[
+        DeletedRouter {
+            case: "a minimal router of the signing region",
+            region: REGION,
+            name: "deleted minimal",
+            models: &[0],
+            fallback: 0,
+            description: None,
+            tags: &[],
+            quality_difference: 0.0,
+            token: None,
+        },
+        DeletedRouter {
+            case: "a described and tagged router of two models",
+            region: REGION,
+            name: "deleted described 2",
+            models: &[1, 2],
+            fallback: 1,
+            description: Some("routes between two models"),
+            tags: &[("team", "search"), ("env", "test")],
+            quality_difference: 35.0,
+            token: None,
+        },
+        DeletedRouter {
+            case: "a router minted under a clientRequestToken",
+            region: REGION,
+            name: "deleted idempotent",
+            models: &[0, 3],
+            fallback: 3,
+            description: None,
+            tags: &[("owner", "platform")],
+            quality_difference: 100.0,
+            token: Some("DeletedRouterToken1"),
+        },
+        DeletedRouter {
+            case: "a router of another region, deleted there",
+            region: "eu-central-1",
+            name: "deleted elsewhere",
+            models: &[2, 3],
+            fallback: 2,
+            description: Some("routes.in another region"),
+            tags: &[],
+            quality_difference: 5.0,
+            token: Some("DeletedRouterToken2"),
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let created = create_in_region(&emu, row.region, deleted_router_body(row)).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreatePromptRouter must answer 200, got {} {:?}",
+            created.status, created.body
+        );
+        let arn = created.text("promptRouterArn");
+
+        let before = get_in_region(&emu, row.region, &arn).await;
+        assert_eq!(
+            before.status, 200,
+            "case {case:?}: the router must be readable before the delete, got {} {:?}",
+            before.status, before.body
+        );
+        assert!(
+            listed_arns(&list_in_region(&emu, row.region, "type=custom").await).contains(&arn),
+            "case {case:?}: the listing must report {arn} before the delete"
+        );
+
+        let deleted = delete_in_region(&emu, row.region, &arn).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case:?}: a delete of {arn} must answer 200, got {} {:?}",
+            deleted.status, deleted.body
+        );
+        assert!(
+            deleted.body.is_null()
+                || matches!(&deleted.body, Value::Object(members) if members.is_empty()),
+            "case {case:?}: DeletePromptRouter's output has no members, got {:?}",
+            deleted.body
+        );
+
+        // The router is gone from every way of reaching it, and a second delete finds
+        // nothing left — which is what makes two deletes racing for one router answer
+        // exactly one success.
+        assert_not_found(case, &arn, &get_in_region(&emu, row.region, &arn).await);
+        assert_not_found(case, &arn, &delete_in_region(&emu, row.region, &arn).await);
+        let listed = listed_arns(&list_in_region(&emu, row.region, "type=custom").await);
+        assert!(
+            !listed.contains(&arn),
+            "case {case:?}: the listing must not report the deleted {arn}, it reported \
+             {listed:?}"
+        );
+        assert!(
+            listed_arns(&list_in_region(&emu, REGION, "type=custom").await).contains(&bystander),
+            "case {case:?}: the delete must leave {bystander} alone"
+        );
+
+        // The name the deleted router held is free again: it is unique among the LIVE
+        // routers of the account and region. For a row that carried a
+        // `clientRequestToken`, this same request is also a REPLAY of that token, so it
+        // asserts the token cannot hand back a router that no longer exists either.
+        let again = create_in_region(&emu, row.region, deleted_router_body(row)).await;
+        assert_eq!(
+            again.status, 200,
+            "case {case:?}: the name {:?} must be free again, got {} {:?}",
+            row.name, again.status, again.body
+        );
+        let minted_again = again.text("promptRouterArn");
+        assert_ne!(
+            minted_again, arn,
+            "case {case:?}: the re-create must mint a router of its own, not the deleted one"
+        );
+        let read_again = get_in_region(&emu, row.region, &minted_again).await;
+        assert_eq!(
+            read_again.status, 200,
+            "case {case:?}: the re-created router must be readable, got {} {:?}",
+            read_again.status, read_again.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_router_amazon_bedrock_publishes_cannot_be_deleted() {
+    // `PromptRouterType` is `[custom, default]`, and `default` names the routers Amazon
+    // Bedrock itself publishes
+    // (`smithy_query(query="shape",shape="PromptRouterType")`) — the ones the `type=default`
+    // listing reports, which is where each row's ARNs come from rather than from a
+    // hand-written id.
+    let emu = emulator();
+
+    for region in [REGION, "us-east-1", "ap-southeast-2"] {
+        let published = listed_arns(&list_in_region(&emu, region, "type=default").await);
+        assert!(
+            !published.is_empty(),
+            "case {region:?}: expected at least one published router to delete, got none"
+        );
+
+        for arn in &published {
+            let case = format!("{region} / {arn}");
+            let refused = delete_in_region(&emu, region, arn).await;
+            assert_eq!(
+                (refused.status, refused.error.as_deref().map(error_code)),
+                (400, Some("ValidationException")),
+                "case {case:?}: a published router must be refused 400 ValidationException, \
+                 got {} {:?}",
+                refused.status,
+                refused.body
+            );
+            assert_eq!(
+                refused.get("message"),
+                json!(DEFAULT_ROUTER_DELETE_REFUSED),
+                "case {case:?}: expected the message {DEFAULT_ROUTER_DELETE_REFUSED:?}, \
+                 got {:?}",
+                refused.body
+            );
+
+            // The refusal changed nothing: the published router is still the router a read
+            // of that ARN reports.
+            let read = get_in_region(&emu, region, arn).await;
+            assert_eq!(
+                read.status, 200,
+                "case {case:?}: the published router must still be readable, got {} {:?}",
+                read.status, read.body
+            );
+            assert_eq!(
+                read.get("type"),
+                json!("default"),
+                "case {case:?}: the router a refusal left in place is the published one, \
+                 got {:?}",
+                read.body
+            );
+        }
+
+        let still = listed_arns(&list_in_region(&emu, region, "type=default").await);
+        assert_eq!(
+            still, published,
+            "case {region:?}: every published router must still be listed, got {still:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn deleting_a_router_that_resolves_to_none_is_not_found() {
+    let emu = emulator();
+    let arn = create(&emu, create_body("deleted once", 5.0))
+        .await
+        .text("promptRouterArn");
+    let id = arn
+        .strip_prefix(&arn_prefix(REGION))
+        .expect("the minted ARN is under this region")
+        .to_string();
+    let first = delete(&emu, &arn).await;
+    assert_eq!(
+        first.status, 200,
+        "the first delete must be admitted, got {} {:?}",
+        first.status, first.body
+    );
+
+    // Rows: an id nothing minted; the id of this account's router under ANOTHER region; a
+    // PUBLISHED router's id under another region, which names that region's router and not
+    // one of the region this request addresses; and the router this test already deleted.
+    let rows = [
+        (
+            "an id nothing minted",
+            format!("{}00000000000z", arn_prefix(REGION)),
+        ),
+        (
+            "this account's router id in another region",
+            format!("{}{id}", arn_prefix("eu-central-1")),
+        ),
+        (
+            "a published router of another region",
+            format!("{}anthropic.claude:1", arn_prefix("eu-central-1")),
+        ),
+        ("a router this account already deleted", arn.clone()),
+    ];
+
+    for (case, candidate) in rows {
+        assert_not_found(case, &candidate, &delete(&emu, &candidate).await);
     }
 }
 
