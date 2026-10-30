@@ -213,11 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the one the request arrived at.
         let modified_at_ms = crate::state::now_ms();
 
-        // Regional resource, and one that has reached DELETED is gone as far as this
-        // operation is concerned — the same reading `AssociateEipToVlan` takes.
+        // The environment this request addresses, resolved through the rule every handler
+        // that acts on an environment shares (`live_environment_in_region_mut`) — the
+        // same reading `AssociateEipToVlan` takes.
         let environment = state
-            .environment_in_region_mut(&region, &input.environment_id)
-            .filter(|environment| environment.state != crate::state::STATE_DELETED)
+            .live_environment_in_region_mut(&region, &input.environment_id)
             .ok_or_else(|| {
                 DisassociateEipFromVlanErrorModeled::ResourceNotFoundException(
                     crate::state::environment_not_found(&input.environment_id),

@@ -234,13 +234,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same call just materialised onto the record it is about to change.
         let modified_at_ms = crate::state::now_ms();
 
-        // Regional resource: an environment exists at the endpoint of the Region it was
-        // created in. One that has reached DELETED is gone as far as this operation is
-        // concerned: "The resource might not be specified correctly, or it may have a
-        // state of DELETED" (`ResourceNotFoundException` doc).
+        // The environment this request addresses, resolved through the rule every handler
+        // that acts on an environment shares (`live_environment_in_region`): an
+        // environment exists at the endpoint of the Region it was created in, and one
+        // that has reached DELETED is gone.
         let environment = state
-            .environment_in_region(&region, &input.environment_id)
-            .filter(|environment| environment.state != crate::state::STATE_DELETED)
+            .live_environment_in_region(&region, &input.environment_id)
             .ok_or_else(|| {
                 AssociateEipToVlanErrorModeled::ResourceNotFoundException(
                     crate::state::environment_not_found(&input.environment_id),

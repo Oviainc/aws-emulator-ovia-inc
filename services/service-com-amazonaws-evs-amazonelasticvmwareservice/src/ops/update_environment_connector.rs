@@ -233,14 +233,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a change the same call just materialised onto the connector.
         let modified_at_ms = crate::state::now_ms();
 
-        // Regional resource: an environment exists at the endpoint of the Region it was
-        // created in, so its connectors can only be updated from that Region. An
-        // environment or connector that has reached DELETED is gone as far as an update
-        // is concerned: "The resource might not be specified correctly, or it may have a
-        // state of DELETED" (`ResourceNotFoundException` doc).
+        // The environment this update addresses, resolved through the rule every handler
+        // that acts on an environment shares (`live_environment_in_region_mut`): an
+        // environment exists at the endpoint of the Region it was created in, so its
+        // connectors can only be updated from that Region, and an environment that has
+        // reached DELETED is gone. The connector carries the same rule of its own,
+        // applied below.
         let environment = state
-            .environment_in_region_mut(&region, &input.environment_id)
-            .filter(|environment| environment.state != crate::state::STATE_DELETED)
+            .live_environment_in_region_mut(&region, &input.environment_id)
             .ok_or_else(|| {
                 UpdateEnvironmentConnectorErrorModeled::ResourceNotFoundException(
                     crate::state::environment_not_found(&input.environment_id),

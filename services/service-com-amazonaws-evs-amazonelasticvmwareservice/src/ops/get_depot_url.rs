@@ -197,14 +197,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // at this instant before it is resolved.
         state.materialise_due_transitions();
 
-        // Regional resource: an environment exists at the endpoint of the Region it was
-        // created in, so a request from any other Region is a miss — as is one naming an
-        // environment that has reached DELETED: "The resource might not be specified
-        // correctly, or it may have a state of DELETED" (`ResourceNotFoundException`
-        // doc).
+        // The environment this request addresses, resolved through the rule every handler
+        // that acts on an environment shares (`live_environment_in_region_mut`): a
+        // request from any other Region is a miss, as is one naming an environment that
+        // has reached DELETED.
         let environment = state
-            .environment_in_region_mut(&region, &input.environment_id)
-            .filter(|environment| environment.state != crate::state::STATE_DELETED)
+            .live_environment_in_region_mut(&region, &input.environment_id)
             .ok_or_else(|| {
                 GetDepotUrlErrorModeled::ResourceNotFoundException(
                     crate::state::environment_not_found(&input.environment_id),

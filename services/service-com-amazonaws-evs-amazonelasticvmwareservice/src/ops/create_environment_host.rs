@@ -259,12 +259,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // environment is borrowed.
         let host_name_is_taken = state.host_name_is_taken(&input.host.host_name);
 
-        // This operation declares no `ResourceNotFoundException`, so an environment id
-        // that names nothing is refused with the ValidationException that names it. An
-        // environment that has reached DELETED is gone for this purpose too.
+        // The environment this create addresses, resolved through the rule every handler
+        // that acts on an environment shares (`live_environment_in_region_mut`). This
+        // operation declares no `ResourceNotFoundException`, so an environment id that
+        // resolves to nothing is refused with the ValidationException that names it.
         let environment = state
-            .environment_in_region_mut(&region, &input.environment_id)
-            .filter(|environment| environment.state != crate::state::STATE_DELETED)
+            .live_environment_in_region_mut(&region, &input.environment_id)
             .ok_or_else(|| {
                 CreateEnvironmentHostErrorModeled::ValidationException(
                     crate::state::environment_not_found_validation(&input.environment_id),

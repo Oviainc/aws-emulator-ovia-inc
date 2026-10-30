@@ -62,6 +62,8 @@ mod entitlement_connector;
 mod entitlement_vm_id_identity;
 #[path = "all/entitlements.rs"]
 mod entitlements;
+#[path = "all/environment_addressing_rule.rs"]
+mod environment_addressing_rule;
 #[path = "all/environment_check_input_recompute.rs"]
 mod environment_check_input_recompute;
 #[path = "all/environment_child_change_stamps.rs"]

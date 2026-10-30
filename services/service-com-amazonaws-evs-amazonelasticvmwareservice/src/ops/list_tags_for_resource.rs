@@ -165,12 +165,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // these environments, which was due whether or not anybody read them.
         state.materialise_due_transitions();
 
-        // The ARN is resolved against the Region the request was signed for, and only
-        // to an environment that still exists: a resource of another Region's endpoint
-        // and one that has reached `DELETED` are both gone for addressing purposes.
+        // The ARN is resolved through the rule every handler that acts on an environment
+        // shares (`live_environment_by_arn`): against the Region the request was signed
+        // for, and only to a record that has not reached DELETED — a resource of another
+        // Region's endpoint and one that is gone are both gone for addressing purposes.
         let environment = state
-            .environment_by_arn(&region, &input.resource_arn)
-            .filter(|environment| environment.state != crate::state::STATE_DELETED)
+            .live_environment_by_arn(&region, &input.resource_arn)
             .ok_or_else(|| {
                 // The tagging surface's own not-found refusal: HTTP 400, the fixed
                 // resource-agnostic message, and the request's `resourceArn` echoed.

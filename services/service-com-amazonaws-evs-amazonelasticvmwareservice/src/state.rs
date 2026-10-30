@@ -1610,6 +1610,24 @@ impl StoredEnvironment {
         self.state == STATE_CREATING
     }
 
+    /// Whether this record is still an environment a request can ADDRESS: one that has
+    /// not reached [`STATE_DELETED`].
+    ///
+    /// A `DELETED` environment is gone, so a request that names it resolves to nothing
+    /// ("The resource might not be specified correctly, or it may have a `state` of
+    /// `DELETED`", `ResourceNotFoundException` doc). Every other state is addressable —
+    /// the environment is being built (`CREATING`), built (`CREATED`), on its way out
+    /// (`DELETING`, whose own refusals are stated per operation) or concluded without
+    /// one (`CREATE_FAILED`).
+    ///
+    /// The one predicate behind
+    /// [`ComAmazonawsEvsAmazonelasticvmwareserviceState::live_environment_in_region`]
+    /// and its three siblings, so every path that resolves the environment a request
+    /// ACTS ON resolves exactly the same records.
+    pub fn is_live(&self) -> bool {
+        self.state != STATE_DELETED
+    }
+
     /// Apply the owed lifecycle transition if `now` has reached its due instant, and
     /// the status change every entitlement of this environment is owed with it.
     ///
@@ -2998,6 +3016,64 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
         self.environments.values_mut().find(|environment| {
             environment.region == region && environment.environment_arn == resource_arn
         })
+    }
+
+    /// The environment `environment_id` ADDRESSES: the record this service holds IN
+    /// `region` that is still one a request can act on.
+    ///
+    /// Both halves of the addressing rule in one place — the Region scope of
+    /// [`Self::environment_in_region`] and the liveness rule of
+    /// [`StoredEnvironment::is_live`] — so a handler that resolves the environment a
+    /// request acts on asks for both at once and no two of them can disagree about
+    /// which environments resolve.
+    ///
+    /// The two readers that deliberately report a finished environment —
+    /// `GetEnvironment`, which describes the record whatever state it has reached, and
+    /// `ListEnvironments`, which filters by `EnvironmentState` on request — resolve
+    /// through [`Self::environment_in_region`] instead.
+    pub fn live_environment_in_region(
+        &self,
+        region: &str,
+        environment_id: &str,
+    ) -> Option<&StoredEnvironment> {
+        self.environment_in_region(region, environment_id)
+            .filter(|environment| environment.is_live())
+    }
+
+    /// Mutable form of [`Self::live_environment_in_region`]: the record a request that
+    /// CHANGES an environment, or something belonging to it, resolves to.
+    ///
+    /// Exactly the same records as the reading form, because an environment that is gone
+    /// is gone for a writer too.
+    pub fn live_environment_in_region_mut(
+        &mut self,
+        region: &str,
+        environment_id: &str,
+    ) -> Option<&mut StoredEnvironment> {
+        self.environment_in_region_mut(region, environment_id)
+            .filter(|environment| environment.is_live())
+    }
+
+    /// The environment an ARN ADDRESSES: the ARN form of
+    /// [`Self::live_environment_in_region`], for the tagging operations, which name a
+    /// resource by ARN rather than by id.
+    pub fn live_environment_by_arn(
+        &self,
+        region: &str,
+        resource_arn: &str,
+    ) -> Option<&StoredEnvironment> {
+        self.environment_by_arn(region, resource_arn)
+            .filter(|environment| environment.is_live())
+    }
+
+    /// Mutable form of [`Self::live_environment_by_arn`].
+    pub fn live_environment_by_arn_mut(
+        &mut self,
+        region: &str,
+        resource_arn: &str,
+    ) -> Option<&mut StoredEnvironment> {
+        self.environment_by_arn_mut(region, resource_arn)
+            .filter(|environment| environment.is_live())
     }
 
     /// Whether some environment IN `region` already carries `name`. `CreateEnvironment`

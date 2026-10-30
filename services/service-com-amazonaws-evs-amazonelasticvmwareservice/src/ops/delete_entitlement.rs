@@ -218,14 +218,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // evaluated.
         state.materialise_due_transitions();
 
-        // Regional resource: an environment exists at the endpoint of the Region it was
-        // created in, so its entitlements can only be deleted from that Region. An
-        // environment that has reached DELETED is gone as far as this call is concerned:
-        // "The resource might not be specified correctly, or it may have a state of
-        // DELETED" (`ResourceNotFoundException` doc).
+        // The environment this call addresses, resolved through the rule every handler
+        // that acts on an environment shares (`live_environment_in_region_mut`): an
+        // environment exists at the endpoint of the Region it was created in, so its
+        // entitlements can only be deleted from that Region, and an environment that has
+        // reached DELETED is gone.
         let environment = state
-            .environment_in_region_mut(&region, &input.environment_id)
-            .filter(|environment| environment.state != crate::state::STATE_DELETED)
+            .live_environment_in_region_mut(&region, &input.environment_id)
             .ok_or_else(|| {
                 DeleteEntitlementErrorModeled::ResourceNotFoundException(
                     crate::state::environment_not_found(&input.environment_id),
