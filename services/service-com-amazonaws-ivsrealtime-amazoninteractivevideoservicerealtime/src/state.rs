@@ -3743,6 +3743,15 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
         self.next_id
     }
 
+    /// The highest sequence this store has handed out: every page position any listing
+    /// of this service can have issued lies in `1..=issued_through()`, because a
+    /// position is the sequence of a record the store drew from [`Self::next_sequence`],
+    /// which counts up from one. A token naming any other position was issued by
+    /// nothing, so the page-token codec reads none from it.
+    pub fn issued_through(&self) -> u64 {
+        self.next_id
+    }
+
     // -----------------------------------------------------------------------
     // The region's view of this store
     //
@@ -4876,9 +4885,10 @@ pub fn encode_page_token(region: &str, after_sequence: u64) -> String {
 }
 
 /// The creation sequence a `nextToken` resumes after in `region`'s page, or `None` when
-/// the token was not issued by [`encode_page_token`] for that same scope.
-pub fn decode_page_token(region: &str, token: &str) -> Option<u64> {
-    decode_after(PAGE_TOKEN_PREFIX, &[region], NO_FILTERS, token)
+/// the token was not issued by [`encode_page_token`] for that same scope, or names a
+/// position no page of this store ever ended at (`issued_through`, see [`decode_after`]).
+pub fn decode_page_token(region: &str, issued_through: u64, token: &str) -> Option<u64> {
+    decode_after(PAGE_TOKEN_PREFIX, &[region], NO_FILTERS, issued_through, token)
 }
 
 /// The opaque `nextToken` a `ListParticipants` page ends with: the join sequence of
@@ -4913,12 +4923,14 @@ pub fn decode_participant_page_token(
     stage_arn: &str,
     session_id: &str,
     filters: &[FilterTerm<'_>],
+    issued_through: u64,
     token: &str,
 ) -> Option<u64> {
     decode_after(
         PARTICIPANT_PAGE_TOKEN_PREFIX,
         &[region, stage_arn, session_id],
         filters,
+        issued_through,
         token,
     )
 }
@@ -4951,12 +4963,14 @@ pub fn decode_participant_event_page_token(
     stage_arn: &str,
     session_id: &str,
     participant_id: &str,
+    issued_through: u64,
     token: &str,
 ) -> Option<u64> {
     decode_after(
         PARTICIPANT_EVENT_PAGE_TOKEN_PREFIX,
         &[region, stage_arn, session_id, participant_id],
         NO_FILTERS,
+        issued_through,
         token,
     )
 }
@@ -4984,12 +4998,14 @@ pub fn encode_stage_session_page_token(
 pub fn decode_stage_session_page_token(
     region: &str,
     stage_arn: &str,
+    issued_through: u64,
     token: &str,
 ) -> Option<u64> {
     decode_after(
         STAGE_SESSION_PAGE_TOKEN_PREFIX,
         &[region, stage_arn],
         NO_FILTERS,
+        issued_through,
         token,
     )
 }
@@ -5020,12 +5036,14 @@ pub fn decode_replica_page_token(
     region: &str,
     source_stage_arn: &str,
     participant_id: &str,
+    issued_through: u64,
     token: &str,
 ) -> Option<u64> {
     decode_after(
         REPLICA_PAGE_TOKEN_PREFIX,
         &[region, source_stage_arn, participant_id],
         NO_FILTERS,
+        issued_through,
         token,
     )
 }
@@ -5045,11 +5063,16 @@ pub fn encode_storage_configuration_page_token(region: &str, after_sequence: u64
 /// The creation sequence a storage-configuration `nextToken` resumes after, or `None`
 /// when the token was not issued by [`encode_storage_configuration_page_token`] for that
 /// same scope — a token of another listing or of another region included.
-pub fn decode_storage_configuration_page_token(region: &str, token: &str) -> Option<u64> {
+pub fn decode_storage_configuration_page_token(
+    region: &str,
+    issued_through: u64,
+    token: &str,
+) -> Option<u64> {
     decode_after(
         STORAGE_CONFIGURATION_PAGE_TOKEN_PREFIX,
         &[region],
         NO_FILTERS,
+        issued_through,
         token,
     )
 }
@@ -5069,11 +5092,16 @@ pub fn encode_encoder_configuration_page_token(region: &str, after_sequence: u64
 /// The creation sequence an encoder-configuration `nextToken` resumes after, or `None`
 /// when the token was not issued by [`encode_encoder_configuration_page_token`] for that
 /// same scope — a token of another listing or of another region included.
-pub fn decode_encoder_configuration_page_token(region: &str, token: &str) -> Option<u64> {
+pub fn decode_encoder_configuration_page_token(
+    region: &str,
+    issued_through: u64,
+    token: &str,
+) -> Option<u64> {
     decode_after(
         ENCODER_CONFIGURATION_PAGE_TOKEN_PREFIX,
         &[region],
         NO_FILTERS,
+        issued_through,
         token,
     )
 }
@@ -5103,12 +5131,14 @@ pub fn encode_ingest_configuration_page_token(
 pub fn decode_ingest_configuration_page_token(
     region: &str,
     filters: &[FilterTerm<'_>],
+    issued_through: u64,
     token: &str,
 ) -> Option<u64> {
     decode_after(
         INGEST_CONFIGURATION_PAGE_TOKEN_PREFIX,
         &[region],
         filters,
+        issued_through,
         token,
     )
 }
@@ -5136,9 +5166,16 @@ pub fn encode_composition_page_token(
 pub fn decode_composition_page_token(
     region: &str,
     filters: &[FilterTerm<'_>],
+    issued_through: u64,
     token: &str,
 ) -> Option<u64> {
-    decode_after(COMPOSITION_PAGE_TOKEN_PREFIX, &[region], filters, token)
+    decode_after(
+        COMPOSITION_PAGE_TOKEN_PREFIX,
+        &[region],
+        filters,
+        issued_through,
+        token,
+    )
 }
 
 /// One filter member of a listing request: the member's name as the model declares it,
@@ -5177,17 +5214,35 @@ fn encode_after(
 
 /// The position `token` names under `prefix` within the scope `scope` and `filters` name,
 /// or `None` when it names none there.
+///
+/// A token names a position only when it is one [`encode_after`] really could have
+/// issued, which is two requirements beyond the framing:
+///
+/// * the position is one this store has handed out — inside `issued_through`, the
+///   sequences [`ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState::issued_through`]
+///   counts — since the encoder only ever writes the sequence of a record the store holds;
+/// * the token is BYTE-IDENTICAL to what the encoder writes for that position, so a
+///   payload spelt any other way than the encoder spells it (a sign, a leading zero, any
+///   other base64 rendering of the same bytes) is a token this listing never issued.
+///
+/// Both are the same rule as the scope marker's: a `nextToken` resumes a listing only
+/// when that listing issued it, and anything else is refused rather than read as a
+/// position.
 fn decode_after(
     prefix: &str,
     scope: &[&str],
     filters: &[FilterTerm<'_>],
+    issued_through: u64,
     token: &str,
 ) -> Option<u64> {
     let decoded = String::from_utf8(::aws_smithy_types::base64::decode(token).ok()?).ok()?;
-    decoded
+    let after_sequence: u64 = decoded
         .strip_prefix(&scope_marker(prefix, scope, filters))?
         .parse()
-        .ok()
+        .ok()?;
+    ((1..=issued_through).contains(&after_sequence)
+        && encode_after(prefix, scope, filters, after_sequence) == token)
+        .then_some(after_sequence)
 }
 
 /// `prefix` followed by every term of `scope` and then every filter member, each written

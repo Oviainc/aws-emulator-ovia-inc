@@ -168,19 +168,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than read as "start from the beginning" — including a token from this
         // service's other listings, and one this listing issued in ANOTHER region, each
         // of which names a position among records these pages do not hold.
+        // How far the store's page positions go, so the codec reads a position only out
+        // of a token this listing could have issued.
+        let issued_through = state.lock().issued_through();
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
-                crate::state::decode_encoder_configuration_page_token(&region, token).ok_or_else(
-                    || {
-                        crate::state::validation_failed(
-                            ListEncoderConfigurationsErrorModeled::ValidationException,
-                            // The one rule this service words a foreign page token with,
-                            // shared with its other listings.
-                            crate::state::foreign_page_token_message(Self::NAME),
-                        )
-                    },
-                )?,
+                crate::state::decode_encoder_configuration_page_token(
+                    &region,
+                    issued_through,
+                    token,
+                )
+                .ok_or_else(|| {
+                    crate::state::validation_failed(
+                        ListEncoderConfigurationsErrorModeled::ValidationException,
+                        // The one rule this service words a foreign page token with,
+                        // shared with its other listings.
+                        crate::state::foreign_page_token_message(Self::NAME),
+                    )
+                })?,
             ),
         };
         let page_size = input

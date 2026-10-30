@@ -248,6 +248,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names a position among records these pages do not hold. A position is an
         // ordinal among the participants ONE request's terms select, so the token is read
         // only for the session and the filter this request itself names.
+        // How far the store's page positions go, so the codec reads a position only out
+        // of a token this listing could have issued.
+        let issued_through = state.lock().issued_through();
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
@@ -256,6 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &input.stage_arn,
                     &input.session_id,
                     &filters,
+                    issued_through,
                     token,
                 )
                 .ok_or_else(|| {

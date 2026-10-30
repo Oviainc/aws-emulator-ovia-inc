@@ -160,10 +160,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused rather than read as "start from the beginning" — including one this
         // listing issued in ANOTHER region, whose position is an ordinal among that
         // region's stages and not among these.
+        // How far the store's page positions go, so the codec reads a position only out
+        // of a token this listing could have issued.
+        let issued_through = state.lock().issued_through();
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
-                crate::state::decode_page_token(&region, token).ok_or_else(|| {
+                crate::state::decode_page_token(&region, issued_through, token).ok_or_else(|| {
                     crate::state::validation_failed(
                         ListStagesErrorModeled::ValidationException,
                         // The one rule this service words a foreign page token with, shared

@@ -166,6 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a position is an ordinal among one participant's replicas, so the token is read
         // only for the scope this request itself names; see
         // `crate::state::decode_replica_page_token`.
+        // How far the store's page positions go, so the codec reads a position only out
+        // of a token this listing could have issued.
+        let issued_through = state.lock().issued_through();
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
@@ -173,6 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &region,
                     &input.source_stage_arn,
                     &input.participant_id,
+                    issued_through,
                     token,
                 )
                 .ok_or_else(|| {

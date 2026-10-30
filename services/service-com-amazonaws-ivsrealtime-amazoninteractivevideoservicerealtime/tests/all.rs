@@ -89,6 +89,8 @@ mod minted_identities;
 mod page_token_filter_scope;
 #[path = "all/page_token_scope.rs"]
 mod page_token_scope;
+#[path = "all/page_token_spelling.rs"]
+mod page_token_spelling;
 #[path = "all/participant_events.rs"]
 mod participant_events;
 #[path = "all/participant_ingest_configuration.rs"]
