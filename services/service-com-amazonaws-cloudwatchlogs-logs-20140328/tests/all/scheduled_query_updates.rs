@@ -53,10 +53,11 @@ const VALIDATION: &str = "ValidationException";
 
 /// The refusal sentence of each class, pinned LITERALLY here rather than built with the helper
 /// the handler itself calls, so a wording that is wrong but consistent with the implementation
-/// cannot pass. `ResourceNotFoundException` is documented as "The specified resource does not
-/// exist.", which this service states naming the resource KIND that is missing; the managed-query
-/// refusal names the query the request asked for.
-const NOT_FOUND_MESSAGE: &str = "The specified scheduled query does not exist.";
+/// cannot pass. The missing-query refusal names the identifier the request asked for; the
+/// managed-query refusal names the query the request asked for.
+fn not_found_message(identifier: &str) -> String {
+    format!("Scheduled query with identifier {identifier} not found")
+}
 
 fn managed_refusal_message(name: &str) -> String {
     format!("The scheduled query {name} is managed by CloudWatch and cannot be updated.")
@@ -739,7 +740,7 @@ async fn an_update_of_an_unknown_identifier_is_refused_and_writes_nothing() {
             code, NOT_FOUND,
             "case {identifier:?}: expected {NOT_FOUND}, got {code} {message:?}"
         );
-        let expected = NOT_FOUND_MESSAGE;
+        let expected = not_found_message(&identifier);
         assert_eq!(
             message, expected,
             "case {identifier:?}: expected the refusal {expected:?}, got {message:?}"

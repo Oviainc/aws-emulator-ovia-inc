@@ -209,14 +209,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.identifier,
                 &region,
             )
-            // An identifier this account holds no query under at all is refused the way every
-            // operation of this service refuses a resource that is not there.
+            // An identifier this account holds no query under at all is refused as a scheduled
+            // query that is not there, naming the identifier the request asked for.
             .ok_or_else(|| {
                 GetScheduledQueryError::from(
                     GetScheduledQueryErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: Some(crate::state::resource_not_found_message(
-                                "scheduled query",
+                            message: Some(crate::state::scheduled_query_not_found_message(
+                                &input.identifier,
                             )),
                         },
                     ),

@@ -93,7 +93,27 @@ pub fn service_managed_scheduled_queries<Eng: Send + Sync + 'static>(
 /// rule rather than one taken from the service. Replace it with the service's own sentence when
 /// that becomes known.
 pub fn managed_query_not_writable_message(name: &str) -> String {
-    format!("The scheduled query {name} is managed by CloudWatch and cannot be updated.")
+    managed_query_refusal_message(name, "updated")
+}
+
+/// The refusal CloudWatch Logs answers a DELETE of a scheduled query the service manages for a
+/// log alarm with.
+///
+/// The same rule as [`managed_query_not_writable_message`], for the write that would remove the
+/// query rather than reconfigure it: the query exists because the alarm's
+/// `ScheduledQueryConfiguration` states it, so it stops existing when that alarm stops stating
+/// it and not because a caller's delete of a scheduled query named it.
+///
+/// UNVERIFIED WORDING: see [`managed_query_not_writable_message`].
+pub fn managed_query_not_deletable_message(name: &str) -> String {
+    managed_query_refusal_message(name, "deleted")
+}
+
+/// The ONE sentence both refusals above state, so a caller's write of a service-managed query is
+/// refused in the same words whichever write it was; `attempted` names what the request asked of
+/// the query.
+fn managed_query_refusal_message(name: &str, attempted: &str) -> String {
+    format!("The scheduled query {name} is managed by CloudWatch and cannot be {attempted}.")
 }
 
 /// The scheduled query one log alarm's configuration describes, or `None` when that alarm has

@@ -296,12 +296,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            // An identifier this account holds no scheduled query under at all is refused the
-            // way every operation of this service refuses a resource that is not there.
+            // An identifier this account holds no scheduled query under at all is refused as a
+            // scheduled query that is not there, naming the identifier the request asked for.
             return Err(
                 UpdateScheduledQueryErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::resource_not_found_message("scheduled query")),
+                        message: Some(crate::state::scheduled_query_not_found_message(
+                            &input.identifier,
+                        )),
                     },
                 )
                 .into(),

@@ -28,7 +28,7 @@
 use serde_json::{json, Map, Value};
 
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
-    log_group_arn, resource_not_found_message, scheduled_query_arn,
+    log_group_arn, scheduled_query_arn, scheduled_query_not_found_message,
     ComAmazonawsCloudwatchlogsLogs20140328State, ScheduledQueryRecord, MAX_SCHEDULED_QUERIES,
 };
 
@@ -728,7 +728,7 @@ async fn a_read_of_an_unknown_identifier_is_refused() {
             code, NOT_FOUND,
             "case {identifier:?}: expected {NOT_FOUND}, got {code} {message:?}"
         );
-        let expected = resource_not_found_message("scheduled query");
+        let expected = scheduled_query_not_found_message(&identifier);
         assert_eq!(
             message, expected,
             "case {identifier:?}: expected the refusal {expected:?}, got {message:?}"

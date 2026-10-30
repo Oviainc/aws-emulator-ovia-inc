@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteScheduledQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteScheduledQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteScheduledQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the one scheduled query the account holds under the requested identifier — "The ARN
+//! or name of the scheduled query to delete", so either form reaches the same stored query —
+//! and refuses an identifier the account holds none under. The whole configuration goes with
+//! the record that held it ("This operation also removes any configured actions and associated
+//! resources"), so the name it occupied is free for a later create and every later read of it
+//! reports nothing. The query CloudWatch MANAGES for a log alarm is held by that alarm's own
+//! configuration ([`crate::state::log_alarm_queries`]), so a delete naming one is refused
+//! rather than acted on, exactly as a write of its configuration is.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +143,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteScheduledQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteScheduledQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The Region the request was signed for, needed only to name the service-managed query
+        // of a log alarm whose configuration states no ARN of its own — the same way every other
+        // reader and writer of scheduled queries uses it.
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteScheduledQueryError::from(
+                DeleteScheduledQueryErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        // "Deletes a scheduled query and stops all future executions. This operation also
+        // removes any configured actions and associated resources." The query's whole
+        // configuration — its query string, its schedule, its destinations and its tags — lives
+        // in the one stored record, so removing that record is what removes the query: nothing
+        // runs on its schedule any more, the name it held is free for a later create, and every
+        // later read of it reports nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteScheduledQuery"))
+        // The log store's guard is taken and released here, before the alarm store is read
+        // below, so the two services' stores are never locked at once.
+        if state
+            .lock()
+            .remove_scheduled_query(&input.identifier)
+            .is_some()
+        {
+            return Ok(DeleteScheduledQueryOutput {});
+        }
+
+        // The scheduled query CloudWatch manages for a log alarm is a query this account holds,
+        // so an identifier naming one names something that IS there — but it exists because that
+        // alarm's configuration states it, so it stops existing when the alarm stops stating it
+        // and not because this operation named it.
+        if let Some(managed) = crate::state::log_alarm_queries::service_managed_scheduled_query(
+            &*self.engine,
+            &input.identifier,
+            &region,
+        ) {
+            return Err(DeleteScheduledQueryErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        crate::state::log_alarm_queries::managed_query_not_deletable_message(
+                            &managed.name,
+                        ),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // An identifier this account holds no scheduled query under at all — including the one a
+        // delete that already removed its query names a second time — is refused as a scheduled
+        // query that is not there, naming the identifier the request asked for.
+        Err(
+            DeleteScheduledQueryErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::scheduled_query_not_found_message(
+                    &input.identifier,
+                )),
+            })
+            .into(),
+        )
     }
 }

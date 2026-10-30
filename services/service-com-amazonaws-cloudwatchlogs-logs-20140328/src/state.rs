@@ -1433,6 +1433,22 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
         self.scheduled_queries.get_mut(key)
     }
 
+    /// Remove the scheduled query `identifier` names, returning the record that was stored
+    /// under it, or `None` when the account holds none under it.
+    ///
+    /// Resolved exactly as the readers resolve one (see [`Self::scheduled_query`]), so a
+    /// removal addressed by an ARN and a removal addressed by a name reach the same query —
+    /// and the whole configuration goes with the record, because the record is where all of it
+    /// (the query, the schedule, the destinations and the tags) lives.
+    pub fn remove_scheduled_query(&mut self, identifier: &str) -> Option<ScheduledQueryRecord> {
+        let key = if self.scheduled_queries.contains_key(identifier) {
+            identifier.to_string()
+        } else {
+            scheduled_query_name_from_identifier(identifier).to_string()
+        };
+        self.scheduled_queries.remove(&key)
+    }
+
     /// The same tag set, to write. See [`Self::resource_tags`].
     pub fn resource_tags_mut(
         &mut self,
@@ -6884,6 +6900,18 @@ pub fn mint_s3_table_integration_source_identifier(seq: u64) -> String {
 /// missing resource the same way.
 pub fn resource_not_found_message(resource_kind: &str) -> String {
     format!("The specified {resource_kind} does not exist.")
+}
+
+/// The refusal CloudWatch Logs answers when the missing resource is a SCHEDULED QUERY: the
+/// service names the `ScheduledQueryIdentifier` the request asked for ("The ARN or name of the
+/// scheduled query") rather than stating the resource kind alone, and states it unterminated,
+/// so a caller reading the refusal sees WHICH query was not found — whichever form it named it
+/// by.
+///
+/// Every operation that resolves a `ScheduledQueryIdentifier` refuses a query the account does
+/// not hold through this one sentence, so the reads and the writes of a scheduled query agree.
+pub fn scheduled_query_not_found_message(identifier: &str) -> String {
+    format!("Scheduled query with identifier {identifier} not found")
 }
 
 /// The refusal CloudWatch Logs answers when the missing resource is one the request
