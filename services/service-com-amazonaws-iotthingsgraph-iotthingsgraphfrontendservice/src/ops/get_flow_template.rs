@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFlowTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFlowTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFlowTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the stored workflow, at the revision the request names or the
+//! latest one, with the definition document byte-identical to the one that was uploaded.
 //!
 //! ## Shape of an operation
 //!
@@ -144,20 +137,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFlowTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFlowTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFlowTemplate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetFlowTemplateErrorModeled::InternalFailureException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // `id` is documented as "The ID of the workflow", so an id that names some other
+        // kind of entity is a bad request rather than a workflow that happens to be
+        // missing.
+        if crate::state::parse_workflow_urn(&input.id).is_none() {
+            return Err(invalid_request(format!(
+                "Value '{}' at 'id' is not the id of a workflow",
+                input.id
+            )));
+        }
+
+        let store = state.lock();
+        let Some(record) = store.flow_templates.get(&input.id) else {
+            return Err(not_found(format!(
+                "The workflow {} does not exist",
+                input.id
+            )));
+        };
+        let revision = match input.revision_number {
+            None => record.latest_revision(),
+            Some(revision_number) => record.revision(revision_number).ok_or_else(|| {
+                not_found(format!(
+                    "The workflow {} has no revision {revision_number}",
+                    input.id
+                ))
+            })?,
+        };
+
+        Ok(GetFlowTemplateOutput {
+            description: Some(FlowTemplateDescription {
+                summary: Some(record.summary(revision)),
+                definition: Some(DefinitionDocument {
+                    language: revision.definition_language.clone(),
+                    text: revision.definition_text.clone(),
+                }),
+                validated_namespace_version: revision.validated_namespace_version(),
+            }),
+        })
     }
+}
+
+/// This operation's modelled client-input error, carrying `message`.
+fn invalid_request(message: impl Into<String>) -> GetFlowTemplateError {
+    GetFlowTemplateErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// This operation's modelled "no such workflow (or revision)" error.
+fn not_found(message: impl Into<String>) -> GetFlowTemplateError {
+    GetFlowTemplateErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.into()),
+    })
+    .into()
 }

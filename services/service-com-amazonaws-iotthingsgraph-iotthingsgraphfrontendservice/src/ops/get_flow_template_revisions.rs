@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFlowTemplateRevisions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFlowTemplateRevisions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFlowTemplateRevisions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: lists every stored revision of one workflow, oldest first, one page of
+//! `maxResults` at a time behind an opaque `nextToken` the next call resumes from.
 //!
 //! ## Shape of an operation
 //!
@@ -150,20 +143,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFlowTemplateRevisions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFlowTemplateRevisionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFlowTemplateRevisions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetFlowTemplateRevisionsErrorModeled::InternalFailureException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        if crate::state::parse_workflow_urn(&input.id).is_none() {
+            return Err(invalid_request(format!(
+                "Value '{}' at 'id' is not the id of a workflow",
+                input.id
+            )));
+        }
+
+        // The page size is the modelled `maxResults` range or nothing, which is what
+        // bounds how much one response amplifies.
+        let Some(page_size) = crate::state::page_size(input.max_results) else {
+            return Err(invalid_request(format!(
+                "Value '{}' at 'maxResults' failed to satisfy constraint: Member must \
+                 have value between 1 and {}",
+                input.max_results.unwrap_or_default(),
+                crate::state::MAX_PAGE_SIZE
+            )));
+        };
+
+        // The token is scoped to THIS workflow's revisions, so one minted for another
+        // workflow cannot resume this listing.
+        let scope_digest = crate::state::page_scope_digest(&[PAGE_SCOPE, &input.id]);
+        let resume_at: Option<i64> = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(cursor) if cursor.scope_digest == scope_digest => {
+                    match cursor.resume_key.parse::<i64>() {
+                        Ok(revision_number) => Some(revision_number),
+                        Err(_) => {
+                            return Err(invalid_request(
+                                "Value at 'nextToken' is not a token this service issued",
+                            ))
+                        }
+                    }
+                }
+                Some(_) => {
+                    return Err(invalid_request(
+                        "Value at 'nextToken' was issued for a different workflow's revisions",
+                    ))
+                }
+                None => {
+                    return Err(invalid_request(
+                        "Value at 'nextToken' is not a token this service issued",
+                    ))
+                }
+            },
+        };
+
+        let store = state.lock();
+        let Some(record) = store.flow_templates.get(&input.id) else {
+            return Err(GetFlowTemplateRevisionsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("The workflow {} does not exist", input.id)),
+                },
+            )
+            .into());
+        };
+
+        // One more than the page is read, so the token is minted only when a revision
+        // really follows the last one reported.
+        let mut summaries = Vec::new();
+        let mut next_token = None;
+        for revision in record
+            .revisions()
+            .filter(|revision| resume_at.is_none_or(|from| revision.revision_number >= from))
+        {
+            if summaries.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(
+                    &crate::state::PageCursor {
+                        scope_digest: scope_digest.clone(),
+                        resume_key: revision.revision_number.to_string(),
+                    },
+                ));
+                break;
+            }
+            summaries.push(record.summary(revision));
+        }
+
+        Ok(GetFlowTemplateRevisionsOutput {
+            summaries: Some(summaries),
+            next_token,
+        })
     }
+}
+
+/// The enumeration a `nextToken` from this operation belongs to, mixed into the token's
+/// scope digest together with the workflow id.
+const PAGE_SCOPE: &str = "GetFlowTemplateRevisions";
+
+/// This operation's modelled client-input error, carrying `message`.
+fn invalid_request(message: impl Into<String>) -> GetFlowTemplateRevisionsError {
+    GetFlowTemplateRevisionsErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

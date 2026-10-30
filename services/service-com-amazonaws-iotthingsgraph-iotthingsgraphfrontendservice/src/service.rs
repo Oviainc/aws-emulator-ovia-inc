@@ -45,6 +45,26 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+use aws_smithy_schema_server::constraints::Violation;
+
+/// The wire error code every operation of this service refuses a bad input with
+/// (`com.amazonaws.iotthingsgraph#InvalidRequestException`, HTTP 400).
+const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
+
+/// The `InvalidRequestException` message for a framework refusal: how many members were
+/// refused, then one clause per refused member naming it and the constraint it failed.
+fn invalid_request_envelope(violations: &[Violation]) -> String {
+    let clauses: Vec<String> = violations
+        .iter()
+        .map(|violation| violation.message())
+        .collect();
+    format!(
+        "{} validation error(s) detected: {}",
+        clauses.len(),
+        clauses.join("; ")
+    )
+}
+
 /// The `com-amazonaws-iotthingsgraph-iotthingsgraphfrontendservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -98,15 +118,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // Every operation this service models declares `InvalidRequestException`
+        // (HTTP 400) as its client-input error and none declares a
+        // `ValidationException`, so a value outside a modelled bound — an `id` outside
+        // the `Urn` pattern, a `maxResults` outside 1..250, an absent `definition` —
+        // has to carry that code rather than the framework's default: a client
+        // branches on the code, and `InvalidRequestException` is the only one this
+        // service's errors give it. The message states one clause per violated member,
+        // naming the member and the constraint it failed. An authentication refusal
+        // keeps the framework's wording: it is not an input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) if !violations.is_empty() => Some(Refused {
+                code: INVALID_REQUEST_EXCEPTION.to_string(),
+                message: invalid_request_envelope(violations),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

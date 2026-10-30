@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFlowTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFlowTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFlowTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reads the workflow's name out of the GraphQL definition document, mints
+//! the `urn:tdm:<region>/<account>/default:workflow:<name>` id and the workflow ARN,
+//! stores the definition as revision 1, and reports the summary of that revision.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +143,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFlowTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFlowTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFlowTemplate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFlowTemplateErrorModeled::InternalFailureException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // The workflow's NAME comes from the definition document: this operation takes no
+        // id, so the document is the only thing that can say which workflow it defines.
+        let definition = crate::state::parse_definition(&input.definition.text)
+            .map_err(|error| invalid_request(error.message()))?;
+
+        let region = crate::state::request_region(ctx);
+        let id = crate::state::workflow_id(
+            &crate::state::user_namespace_path(&region),
+            &definition.workflow_name,
+        );
+        // A name long enough to push the derived id past the modelled `Urn` length is
+        // refused here rather than stored under an id no read could ask for.
+        if id.chars().count() > crate::state::MAX_URN_LENGTH {
+            return Err(invalid_request(format!(
+                "The workflow id derived from 'definition.text' is {} characters long, \
+                 which exceeds the maximum of {}",
+                id.chars().count(),
+                crate::state::MAX_URN_LENGTH
+            )));
+        }
+
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let mut store = state.lock();
+        if store.flow_templates.contains_key(&id) {
+            return Err(CreateFlowTemplateErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!("The workflow {id} already exists")),
+                },
+            )
+            .into());
+        }
+        if store.flow_templates.len() >= crate::state::MAX_FLOW_TEMPLATES {
+            return Err(CreateFlowTemplateErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The maximum number of workflows ({}) has been reached",
+                        crate::state::MAX_FLOW_TEMPLATES
+                    )),
+                },
+            )
+            .into());
+        }
+        let Some(stored_bytes) = store.definition_bytes_after(input.definition.text.len()) else {
+            return Err(CreateFlowTemplateErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Storing this definition would take the workflow definitions held \
+                         by this account past the maximum of {} bytes",
+                        crate::state::MAX_STORED_DEFINITION_BYTES
+                    )),
+                },
+            )
+            .into());
+        };
+        let record = crate::state::FlowTemplateRecord {
+            id: id.clone(),
+            arn: crate::state::workflow_arn(&region, &definition.workflow_name),
+            first_revision: crate::state::FlowTemplateRevision {
+                revision_number: crate::state::FIRST_REVISION_NUMBER,
+                // Stored verbatim: a later read has to hand back the document that was
+                // uploaded, not a re-rendering of it.
+                definition_language: input.definition.language.clone(),
+                definition_text: input.definition.text.clone(),
+                compatible_namespace_version: input.compatible_namespace_version,
+                referenced_entity_ids: definition.referenced_entity_ids,
+                created_at: now,
+            },
+            appended_revisions: Vec::new(),
+        };
+        let summary = record.summary(&record.first_revision);
+        store.flow_templates.insert(id, record);
+        store.stored_definition_bytes = stored_bytes;
+
+        Ok(CreateFlowTemplateOutput {
+            summary: Some(summary),
+        })
     }
 }
+
+/// This operation's modelled client-input error, carrying `message`.
+fn invalid_request(message: impl Into<String>) -> CreateFlowTemplateError {
+    CreateFlowTemplateErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+

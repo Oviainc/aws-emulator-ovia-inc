@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchFlowTemplates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchFlowTemplates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchFlowTemplates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: lists the stored workflows at their latest revision, narrowed by the
+//! `DEVICE_MODEL_ID` filter, one page of `maxResults` at a time behind an opaque
+//! `nextToken` the next call resumes from.
 //!
 //! ## Shape of an operation
 //!
@@ -144,20 +138,175 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchFlowTemplates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchFlowTemplatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchFlowTemplates"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SearchFlowTemplatesErrorModeled::InternalFailureException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // The page size is the modelled `maxResults` range or nothing: an out-of-range
+        // value is refused rather than quietly turned into a full page. The boundary
+        // validator already refuses one; this is the handler's own bound on how much one
+        // response amplifies.
+        let Some(page_size) = crate::state::page_size(input.max_results) else {
+            return Err(invalid_request(format!(
+                "Value '{}' at 'maxResults' failed to satisfy constraint: Member must \
+                 have value between 1 and {}",
+                input.max_results.unwrap_or_default(),
+                crate::state::MAX_PAGE_SIZE
+            )));
+        };
+
+        let filters = input.filters.unwrap_or_default();
+        // The work this search costs is the stored workflows times the criteria each is
+        // matched against, so the criteria a request may choose are bounded before any
+        // record is read.
+        if filters.len() > crate::state::MAX_SEARCH_FILTERS {
+            return Err(invalid_request(format!(
+                "Value at 'filters' names {} filters, which exceeds the maximum of {}",
+                filters.len(),
+                crate::state::MAX_SEARCH_FILTERS
+            )));
+        }
+        for filter in &filters {
+            // Keyed on the filter's NAME rather than applied to every filter: the
+            // modelled `FlowTemplateFilterName` carries exactly one value today, so a
+            // name the model adds later is refused here instead of being answered with
+            // device-model matching it does not mean.
+            if filter.name != DEVICE_MODEL_ID_FILTER {
+                return Err(invalid_request(format!(
+                    "Value '{}' at 'filters.member.name' is not a filter this operation \
+                     supports",
+                    filter.name
+                )));
+            }
+            // `FlowTemplateFilter$value` is required but carries no modelled minimum
+            // length, and a filter that names no value states no criterion at all.
+            if filter.value.is_empty() {
+                return Err(invalid_request(format!(
+                    "Value at 'filters.member.value' must name at least one {} to \
+                     search for",
+                    filter.name
+                )));
+            }
+            if filter.value.len() > crate::state::MAX_SEARCH_FILTER_VALUES {
+                return Err(invalid_request(format!(
+                    "Value at 'filters.member.value' names {} values, which exceeds the \
+                     maximum of {}",
+                    filter.value.len(),
+                    crate::state::MAX_SEARCH_FILTER_VALUES
+                )));
+            }
+        }
+
+        // A page continues ONE enumeration, so the token carries a digest of the
+        // operation and the filter set that produced it: a token this service did not
+        // mint, or one handed back with different filters, is a refusal rather than a
+        // silently different search.
+        let canonical_filters = canonical_filters(&filters);
+        let scope_digest = crate::state::page_scope_digest(&[PAGE_SCOPE, &canonical_filters]);
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(cursor) if cursor.scope_digest == scope_digest => Some(cursor.resume_key),
+                Some(_) => {
+                    return Err(invalid_request(
+                        "Value at 'nextToken' was issued for a different search",
+                    ))
+                }
+                None => {
+                    return Err(invalid_request(
+                        "Value at 'nextToken' is not a token this service issued",
+                    ))
+                }
+            },
+        };
+
+        let store = state.lock();
+        let matching = store
+            .flow_templates
+            .range::<String, _>(resume_at.as_ref().map_or(
+                (::std::ops::Bound::Unbounded, ::std::ops::Bound::Unbounded),
+                |key| (::std::ops::Bound::Included(key), ::std::ops::Bound::Unbounded),
+            ))
+            .map(|(_, record)| record)
+            // Every value of every filter has to hold: "multiple values function as AND
+            // criteria in the search" (`SearchFlowTemplatesRequest$filters`).
+            .filter(|record| {
+                filters
+                    .iter()
+                    .filter(|filter| filter.name == DEVICE_MODEL_ID_FILTER)
+                    .all(|filter| {
+                        filter
+                            .value
+                            .iter()
+                            .all(|value| record.latest_revision().references_device_model(value))
+                    })
+            });
+
+        // One more than the page is read, so the token is minted only when a workflow
+        // really follows the last one reported.
+        let mut summaries = Vec::new();
+        let mut next_token = None;
+        for record in matching {
+            if summaries.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(
+                    &crate::state::PageCursor {
+                        scope_digest: scope_digest.clone(),
+                        resume_key: record.id.clone(),
+                    },
+                ));
+                break;
+            }
+            summaries.push(record.summary(record.latest_revision()));
+        }
+
+        Ok(SearchFlowTemplatesOutput {
+            summaries: Some(summaries),
+            next_token,
+        })
     }
+}
+
+/// The enumeration a `nextToken` from this operation belongs to, mixed into the token's
+/// scope digest so a token minted elsewhere cannot resume a template search.
+const PAGE_SCOPE: &str = "SearchFlowTemplates";
+
+/// The only filter this operation supports: "the only valid filter is `DEVICE_MODEL_ID`"
+/// (`SearchFlowTemplatesRequest$filters`), which is also the one value the modelled
+/// `FlowTemplateFilterName` enum carries.
+const DEVICE_MODEL_ID_FILTER: &str = "DEVICE_MODEL_ID";
+
+/// The filter set rendered so that two requests asking the same question render the same
+/// text and two asking different questions cannot.
+///
+/// Each name and value is length-prefixed, so no value's own `:` or `|` can make one
+/// filter set render as another; values and filters are sorted, because AND criteria do
+/// not depend on the order they arrive in.
+fn canonical_filters(filters: &[FlowTemplateFilter]) -> String {
+    let mut rendered: Vec<String> = filters
+        .iter()
+        .map(|filter| {
+            let mut values: Vec<&str> = filter.value.iter().map(String::as_str).collect();
+            values.sort_unstable();
+            let mut out = format!("{}:{}", filter.name.len(), filter.name);
+            for value in values {
+                out.push_str(&format!(":{}:{value}", value.len()));
+            }
+            out
+        })
+        .collect();
+    rendered.sort();
+    rendered.join("|")
+}
+
+/// This operation's modelled client-input error, carrying `message`.
+fn invalid_request(message: impl Into<String>) -> SearchFlowTemplatesError {
+    SearchFlowTemplatesErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

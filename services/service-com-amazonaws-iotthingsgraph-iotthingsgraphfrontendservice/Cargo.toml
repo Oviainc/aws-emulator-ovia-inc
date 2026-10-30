@@ -21,13 +21,16 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Spec-compliant GraphQL parser, with explicit recursion and token limits: a workflow's
+# DefinitionDocument carries GraphQL text, and the workflow it defines is named by that
+# document's operation definition.
+apollo-parser = "0.8"
+# Digest and hex coding for the opaque pagination tokens this service mints.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
