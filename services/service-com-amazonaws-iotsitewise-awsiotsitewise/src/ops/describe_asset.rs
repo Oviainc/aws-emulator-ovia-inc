@@ -194,6 +194,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&id)
             .ok_or_else(|| not_found(&input.asset_id))?;
 
+        // An asset composite model is an INSTANCE of a composite model of the
+        // asset's model, so WHICH composite models this asset has and what each
+        // one is called are read from that model's stored record, while the
+        // properties each one carries are this asset's own materialised ones. An
+        // asset cannot exist without the model it was created from, so a model
+        // that is not there would be a server-side fault; it is carried as an
+        // `Option` rather than refused so an unreachable state cannot deny a
+        // resource that is really there its other members.
+        //
+        // Both members report the composite models the model holds DIRECTLY — the
+        // ones nested inside no other composite model — which is what the
+        // summaries member documents: "The list of the immediate child custom
+        // composite model summaries for the asset". A nested composite model is
+        // reported by the composite model it sits in, through
+        // `DescribeAssetCompositeModel`, whose output is the only one that carries
+        // the nesting; `DescribeAssetModel` reports the model side of the same
+        // list at the same depth.
+        let model = store.asset_models.get(&record.asset_model_id);
+        let top_level = model
+            .map(crate::state::AssetModelRecord::top_level_composite_model_ids)
+            .unwrap_or_default();
+        let asset_composite_models = model.filter(|_| !top_level.is_empty()).map(|model| {
+            top_level
+                .iter()
+                .filter_map(|composite_id| {
+                    let composite = model.composite_model(composite_id)?;
+                    Some(AssetCompositeModel {
+                        id: Some(composite_id.clone()),
+                        external_id: composite.external_id.clone(),
+                        name: composite.name.clone(),
+                        description: composite.description.clone(),
+                        r#type: composite.r#type.clone(),
+                        // `excludeProperties` asks for the asset without its
+                        // property list, so it blanks a composite model's
+                        // properties as well as the top-level ones: a caller that
+                        // asked not to be sent properties must not receive them by
+                        // the composite-model route.
+                        properties: if input.exclude_properties {
+                            Vec::new()
+                        } else {
+                            record.composite_properties(composite_id)
+                        },
+                    })
+                })
+                .collect()
+        });
+        let asset_composite_model_summaries = model
+            .filter(|_| !top_level.is_empty())
+            .map(|model| {
+                top_level
+                    .iter()
+                    .filter_map(|composite_id| model.asset_composite_model_summary(composite_id))
+                    .collect()
+            });
+
         Ok(DescribeAssetOutput {
             asset_id: record.id.clone(),
             asset_external_id: record.external_id.clone(),
@@ -201,18 +256,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             asset_name: record.name.clone(),
             asset_model_id: record.asset_model_id.clone(),
             // `excludeProperties` asks for the asset without its property list.
+            // `assetProperties` carries the asset's BASE properties only: "This
+            // object doesn't include properties that you define in composite
+            // models. You can find composite model properties in the
+            // assetCompositeModels object."
             asset_properties: if input.exclude_properties {
                 Vec::new()
             } else {
-                record.properties.clone()
+                record.base_properties()
             },
             asset_hierarchies: record.hierarchies.clone(),
-            asset_composite_models: None,
+            asset_composite_models,
             asset_creation_date: crate::state::to_date_time(record.creation_date),
             asset_last_update_date: crate::state::to_date_time(record.last_update_date),
             asset_status: record.status(now),
             asset_description: record.description.clone(),
-            asset_composite_model_summaries: None,
+            asset_composite_model_summaries,
         })
     }
 }

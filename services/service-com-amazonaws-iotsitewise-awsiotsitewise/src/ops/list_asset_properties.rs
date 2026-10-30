@@ -179,51 +179,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| not_found(&input.asset_id))?;
 
         // The enumeration order: the asset's own properties in definition order, then
-        // each composite model's properties, composite models in their stored order.
-        // Stable across calls, which is what makes `nextToken` resumable.
-        let mut summaries: Vec<AssetPropertySummary> = asset
+        // each composite model's properties, composite models in their stored order —
+        // the order the asset's one flat property list was materialised in. Stable
+        // across calls, which is what makes `nextToken` resumable.
+        let summaries: Vec<AssetPropertySummary> = asset
             .properties
             .iter()
-            .map(|property| summarize(property, None, &[]))
+            .filter(|property| {
+                include_composite || crate::state::composite_model_of_property(property).is_none()
+            })
+            .map(summarize)
             .collect();
-        if include_composite {
-            // An asset composite model is an INSTANCE of a composite model of the
-            // asset's model, so its properties are materialised from that model's
-            // stored definitions — exactly as `CreateAsset` materialises the
-            // top-level ones, through the one shared rule. An asset cannot exist
-            // without the model it was created from, so a model that is not there is
-            // a server-side failure rather than a refusal of this request.
-            let model = store
-                .asset_models
-                .get(&asset.asset_model_id)
-                .ok_or_else(internal_failure)?;
-            // `composite_models` is the FLAT list of every composite model the
-            // asset model holds, at any nesting depth — a nested one is linked to
-            // its parent through `composite_model_links` rather than held inside
-            // it — so walking it once reaches every composite model's properties,
-            // and the path prefix below carries the whole chain each sits in.
-            for composite in &model.composite_models {
-                // A composite model and a property definition both carry an id in
-                // every stored record: a create either takes the caller's id or
-                // mints one, and a record without one would be unaddressable — no
-                // request could name it and no asset property could inherit its
-                // id, which is the same rule `CreateAsset` and
-                // `DescribeAssetCompositeModel` materialise asset properties
-                // under. So neither skip below can drop a property this store
-                // actually holds; they only keep this walk total.
-                let Some(composite_id) = composite.id.as_deref() else {
-                    continue;
-                };
-                let prefix = model.asset_composite_model_path(composite_id);
-                for definition in store.composite_model_properties(model, composite_id) {
-                    let Some(property) = crate::state::asset_property_from_model(&definition)
-                    else {
-                        continue;
-                    };
-                    summaries.push(summarize(&property, Some(composite_id), &prefix));
-                }
-            }
-        }
 
         // This enumeration's resume point is a summary's [`page_key`], and the page
         // walk every paginated listing of this service shares takes it from there: it
@@ -259,29 +225,17 @@ const DEFAULT_FILTER: &str = "BASE";
 const FILTER_ALL: &str = "ALL";
 
 /// One stored asset property as a `ListAssetProperties` summary.
-///
-/// `composite_id` is the asset composite model the property belongs to, or `None`
-/// for one of the asset's own (base) properties; `prefix` is that composite
-/// model's path from the root of the asset, empty for a base property.
-fn summarize(
-    property: &AssetProperty,
-    composite_id: Option<&str>,
-    prefix: &[AssetCompositeModelPathSegment],
-) -> AssetPropertySummary {
+fn summarize(property: &AssetProperty) -> AssetPropertySummary {
     // `path` is "the structured path to the property from the root of the asset":
     // the composite models the property sits inside, outermost first, then the
-    // property itself. Derived from the same stored records the summary's other
-    // members come from, so the two cannot disagree.
-    let mut path: Vec<AssetPropertyPathSegment> = prefix
-        .iter()
-        .map(|segment| AssetPropertyPathSegment {
-            id: segment.id.clone(),
-            name: segment.name.clone(),
-        })
-        .collect();
-    path.push(AssetPropertyPathSegment {
-        id: Some(property.id.clone()),
-        name: Some(property.name.clone()),
+    // property itself. A composite model's property carries that path as it was
+    // materialised; one of the asset's own sits inside no composite model, so its
+    // path is the property alone.
+    let path = property.path.clone().unwrap_or_else(|| {
+        vec![AssetPropertyPathSegment {
+            id: Some(property.id.clone()),
+            name: Some(property.name.clone()),
+        }]
     });
 
     AssetPropertySummary {
@@ -289,14 +243,14 @@ fn summarize(
         external_id: property.external_id.clone(),
         // The alias and the notification are set per asset property, by
         // `UpdateAssetProperty`, so they are reported from the stored property
-        // rather than from the definition it was materialised from. A composite
-        // model's property is not alias-bearing yet — `UpdateAssetProperty`
-        // addresses only the asset's own properties — which is why the composite
-        // rows come from a freshly materialised property and report neither.
+        // rather than from the definition it was materialised from — for a
+        // composite model's property exactly as for one of the asset's own, since
+        // both are materialised on the asset and both are addressable by id.
         alias: property.alias.clone(),
         unit: property.unit.clone(),
         notification: property.notification.clone(),
-        asset_composite_model_id: composite_id.map(ToString::to_string),
+        asset_composite_model_id: crate::state::composite_model_of_property(property)
+            .map(ToString::to_string),
         path: Some(path),
     }
 }

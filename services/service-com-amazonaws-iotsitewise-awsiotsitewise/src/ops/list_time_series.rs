@@ -225,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|series| disassociated_summary(series, &region))
                     .collect();
                 for asset in store.assets.values() {
-                    for property in &asset.properties {
+                    for property in asset.time_series_properties() {
                         summaries.push(property_summary(asset, property, &region));
                     }
                 }

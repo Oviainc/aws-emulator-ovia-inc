@@ -211,33 +211,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| composite_not_found(&input.asset_composite_model_id))?;
 
         let path = model.asset_composite_model_path(&composite_model_id);
-        // This asset's properties for the composite model are materialised from
-        // the composite model's property definitions exactly as `CreateAsset`
-        // materialises the model's top-level ones — through the one shared rule,
-        // so an asset property carries the id of the definition it came from.
-        let properties = store
-            .composite_model_properties(model, &composite_model_id)
-            .iter()
-            .filter_map(|definition| {
-                let mut property = crate::state::asset_property_from_model(definition)?;
-                // `path` is the structured path to the property from the root of
-                // the asset: the composite models it sits inside, outermost
-                // first, then the property itself.
-                let mut property_path: Vec<AssetPropertyPathSegment> = path
-                    .iter()
-                    .map(|segment| AssetPropertyPathSegment {
-                        id: segment.id.clone(),
-                        name: segment.name.clone(),
-                    })
-                    .collect();
-                property_path.push(AssetPropertyPathSegment {
-                    id: Some(property.id.clone()),
-                    name: Some(property.name.clone()),
-                });
-                property.path = Some(property_path);
-                Some(property)
-            })
-            .collect();
+        // The properties this asset carries for the composite model are the ones
+        // materialised onto it when it was created from the model (and
+        // re-materialised whenever that model's definitions changed), so each one
+        // reports the alias and notification set on it per asset as well as the
+        // `path` that addresses it from the root of the asset.
+        let properties = asset.composite_properties(&composite_model_id);
 
         Ok(DescribeAssetCompositeModelOutput {
             asset_id: asset.id.clone(),

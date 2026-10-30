@@ -106,6 +106,7 @@ use crate::ops::types::{
     AssetModelCompositeModel,
     AssetModelCompositeModelPathSegment, AssetModelCompositeModelSummary, AssetModelHierarchy,
     AssetModelProperty, AssetModelPropertyDefinition, AssetModelStatus, AssetProperty,
+    AssetPropertyPathSegment,
     AssetPropertyValue, AssetStatus, AssetSummary, ComputationModelConfiguration,
     ComputationModelDataBindingValue, ComputationModelStatus, ComputeNode,
     ComputeNodeExecutionDetails,
@@ -1352,6 +1353,10 @@ pub struct InterfaceRelationshipRecord {
 
 /// A stored asset. `properties` is materialised from the referenced model's
 /// property definitions at create time, so property writes and reads resolve.
+/// It is ONE flat list holding the asset's own (base) properties and the ones
+/// each composite model of that model contributes, the latter carrying the
+/// `path` that addresses them from the root of the asset; see
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::materialise_asset_properties`].
 #[derive(Debug, Clone)]
 pub struct AssetRecord {
     pub id: String,
@@ -1396,6 +1401,47 @@ impl AssetRecord {
     /// reach a handler and both must name the same stored property.
     pub fn property(&self, label: &str) -> Option<&AssetProperty> {
         self.properties.get(self.property_position(label)?)
+    }
+
+    /// The asset's own (BASE) properties: the ones materialised from its model's
+    /// top-level property definitions.
+    ///
+    /// What `DescribeAsset` reports in `assetProperties`, which "doesn't include
+    /// properties that you define in composite models", and what
+    /// `ListAssetProperties` enumerates under its default `BASE` filter.
+    pub fn base_properties(&self) -> Vec<AssetProperty> {
+        self.properties
+            .iter()
+            .filter(|property| composite_model_of_property(property).is_none())
+            .cloned()
+            .collect()
+    }
+
+    /// The properties this asset's instance of composite model `composite_id`
+    /// carries, in the order they were materialised.
+    pub fn composite_properties(&self, composite_id: &str) -> Vec<AssetProperty> {
+        self.properties
+            .iter()
+            .filter(|property| composite_model_of_property(property) == Some(composite_id))
+            .cloned()
+            .collect()
+    }
+
+    /// This asset's properties, ONE per distinct property id: what addresses a
+    /// time series of this asset.
+    ///
+    /// Two composite models of one asset model may reuse the SAME component
+    /// model, so the asset carries that component's definition once per
+    /// composite model that contributes it; the instances share the definition's
+    /// id, hence the one series that id addresses. Every enumeration of an
+    /// asset's time series goes through here, so a shared definition is not
+    /// listed as two streams.
+    pub fn time_series_properties(&self) -> Vec<&AssetProperty> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        self.properties
+            .iter()
+            .filter(|property| seen.insert(property.id.as_str()))
+            .collect()
     }
 
     /// The asset's status as of `now`; see [`AssetModelRecord::status`].
@@ -4512,38 +4558,107 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// THAT ASSET, addressed by the same `(assetId, propertyId)` pair as one
     /// declared on the model directly, so this is the ONE definition of "the
     /// property that pair names" and every operation addressed that way resolves
-    /// here. A composite model's contribution comes from
-    /// [`Self::composite_model_properties`] and is materialised through the shared
-    /// [`asset_property_from_model`], so the property a listing reports and the one
-    /// a data-plane read resolves are the same property.
+    /// here. BOTH kinds are materialised onto the asset's own list by
+    /// [`Self::materialise_asset_properties`], so the property a listing reports
+    /// and the one a data-plane read resolves are the same STORED property, with
+    /// the alias and the notification `UpdateAssetProperty` set on it.
     ///
-    /// Owned rather than borrowed because an asset's instance of a composite
-    /// model's property is materialised on demand; the asset's own properties are
-    /// cloned so both cases answer the same type. An instance materialised here
-    /// carries no alias and no notification: those are written per asset property
-    /// by `UpdateAssetProperty`, which addresses the asset's own list.
+    /// Owned rather than borrowed, so a caller can go on using the store while it
+    /// holds the answer.
     pub fn resolve_asset_property(&self, asset_id: &str, label: &str) -> Option<AssetProperty> {
-        let asset = self.assets.get(asset_id)?;
-        if let Some(property) = asset.property(label) {
-            return Some(property.clone());
+        self.assets.get(asset_id)?.property(label).cloned()
+    }
+
+    /// The asset-model property definition an asset property of a model-`model`
+    /// asset was materialised from: one of the model's own top-level
+    /// definitions, or one a composite model of it contributes.
+    ///
+    /// The inverse of [`Self::materialise_asset_properties`], asked by every
+    /// operation that reports or defaults a member the asset property does not
+    /// carry itself (a property's `type`, the `unit` a definition declares), so
+    /// a composite model's property answers those from its definition exactly as
+    /// a base property does.
+    pub fn asset_model_property_definition(
+        &self,
+        model: &AssetModelRecord,
+        property_id: &str,
+    ) -> Option<AssetModelProperty> {
+        if let Some(found) = model
+            .properties
+            .iter()
+            .find(|property| property.id.as_deref() == Some(property_id))
+        {
+            return Some(found.clone());
         }
-        let model = self.asset_models.get(&asset.asset_model_id)?;
-        // `composite_models` is the FLAT list of every composite model the asset
-        // model holds, at any nesting depth, so walking it once reaches every
-        // property any of them contributes.
         model
             .composite_models
             .iter()
             .filter_map(|composite| composite.id.as_deref())
             .flat_map(|composite_id| self.composite_model_properties(model, composite_id))
-            .filter_map(|definition| asset_property_from_model(&definition))
-            .find(|property| {
-                matches_id_label(
-                    Some(property.id.as_str()),
-                    property.external_id.as_deref(),
-                    label,
-                )
-            })
+            .find(|property| property.id.as_deref() == Some(property_id))
+    }
+
+    /// Every asset property an asset created from `model` carries, in the order
+    /// a reader enumerates them, together with the value each one starts its
+    /// series with.
+    ///
+    /// An asset instantiated from an asset model carries an INSTANCE of every
+    /// composite model that model holds, so the list is the model's own
+    /// top-level property definitions followed by the definitions each composite
+    /// model contributes — through [`Self::composite_model_properties`], so a
+    /// component-model-based composite model contributes the properties of the
+    /// component model it reuses. One FLAT list, so every operation that
+    /// addresses an asset property by id reaches a composite model's property
+    /// exactly as it reaches a base one; which of the two a property is is read
+    /// off the `path` it carries (see [`composite_model_of_property`]).
+    ///
+    /// Two composite models may reuse the same component model, so one
+    /// definition can appear once per composite model that contributes it, each
+    /// instance under its own path and all of them sharing the definition's id
+    /// — hence the one time series that id addresses
+    /// ([`AssetRecord::time_series_properties`]).
+    ///
+    /// Shared by the create that materialises an asset and the propagation that
+    /// re-materialises it, so the two cannot disagree about what an asset of a
+    /// model carries.
+    pub fn materialise_asset_properties(
+        &self,
+        model: &AssetModelRecord,
+        now: SystemTime,
+    ) -> MaterialisedAssetProperties {
+        let mut materialised = MaterialisedAssetProperties::default();
+        let mut seen: HashSet<String> = HashSet::new();
+        for definition in &model.properties {
+            materialise_one(definition, None, now, &mut seen, &mut materialised);
+        }
+        // `composite_models` is the FLAT list of every composite model the asset
+        // model holds, at any nesting depth — a nested one is linked to its
+        // parent through `composite_model_links` rather than held inside it — so
+        // walking it once reaches every composite model's properties, and the
+        // path prefix carries the whole chain each sits in.
+        for composite in &model.composite_models {
+            let Some(composite_id) = composite.id.as_deref() else {
+                continue;
+            };
+            let prefix: Vec<AssetPropertyPathSegment> = model
+                .asset_composite_model_path(composite_id)
+                .into_iter()
+                .map(|segment| AssetPropertyPathSegment {
+                    id: segment.id,
+                    name: segment.name,
+                })
+                .collect();
+            for definition in self.composite_model_properties(model, composite_id) {
+                materialise_one(
+                    &definition,
+                    Some(&prefix),
+                    now,
+                    &mut seen,
+                    &mut materialised,
+                );
+            }
+        }
+        materialised
     }
 
     /// Append `value` to the `(asset_id, property_id)` series, keeping it sorted
@@ -5997,6 +6112,12 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// reports `UPDATING` until the transition this call owes falls due, exactly as
     /// [`AssetRecord::begin_update`] records it for a direct `UpdateAsset`.
     ///
+    /// "Property definitions" is everything the model declares a property by, so
+    /// the definitions each COMPOSITE model of it contributes are propagated on
+    /// the same terms as its own: a composite model added to the model reaches
+    /// the assets already created from it, and one removed from it takes its
+    /// per-asset properties with it.
+    ///
     /// `asset_model_id` is a stored id, not a label: resolve it with
     /// [`Self::resolve_asset_model_id`] first. Does nothing when no stored model
     /// has that id, or when no asset was created from it.
@@ -6004,8 +6125,15 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         let Some(model) = self.asset_models.get(asset_model_id) else {
             return;
         };
-        // Cloned so the per-asset writes below are not borrowing the model.
-        let definitions = model.properties.clone();
+        // Materialised ONCE, through the shared rule, and owned, so the per-asset
+        // writes below are not borrowing the model: what an asset of this model
+        // carries does not depend on which asset it is. The value each property
+        // STARTS with is taken from the same place, indexed by property id so
+        // the per-property lookups below cost nothing: an asset carries one
+        // property per definition of its model and of every composite model of
+        // it, so a linear scan per property would be quadratic in that count.
+        let materialised = self.materialise_asset_properties(model, now);
+        let initial_values = materialised.initial_values_by_id();
         let hierarchy_definitions = model.hierarchies.clone();
         let asset_ids: Vec<String> = self
             .assets
@@ -6019,25 +6147,32 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                 continue;
             };
             let carried = ::std::mem::take(&mut asset.properties);
-            // A stored model property without an id would make an unaddressable
-            // asset property, so it is skipped rather than materialised with an
-            // empty id — the same filter `CreateAsset` applies.
-            //
-            // The same pass collects what a property this asset did not carry
-            // STARTS with: it is materialised HERE for the first time, so it takes
-            // the sample its definition declares exactly as a property materialised
-            // by a create does (see [`initial_property_sample`]). A property the
-            // asset already carried keeps the series written to it.
-            let mut properties: Vec<AssetProperty> = Vec::with_capacity(definitions.len());
+            // Where each property this asset already carried sits, so the pass
+            // below is one constant-time lookup per property rather than a scan.
+            // The FIRST occurrence of an id wins, because that is the one
+            // [`AssetRecord::property_position`] resolves and so the one every
+            // write of an alias or a notification landed on: an id two composite
+            // models reusing a component model contribute twice names one
+            // definition, one series and one binding.
+            let mut held_at: HashMap<&str, usize> = HashMap::new();
+            for (at, property) in carried.iter().enumerate() {
+                held_at.entry(property.id.as_str()).or_insert(at);
+            }
+            // What a property this asset did not carry STARTS with: it is
+            // materialised HERE for the first time, so it takes the sample its
+            // definition declares exactly as a property materialised by a create
+            // does (see [`initial_property_sample`]). A property the asset
+            // already carried keeps the series written to it.
+            let mut properties = materialised.properties.clone();
             let mut seeded: Vec<(String, AssetPropertyValue)> = Vec::new();
-            for definition in &definitions {
-                let Some(mut property) = asset_property_from_model(definition) else {
-                    continue;
-                };
-                let held = carried.iter().find(|held| held.id == property.id);
-                if held.is_none() {
-                    if let Some(sample) = initial_property_sample(definition, now) {
-                        seeded.push((property.id.clone(), sample));
+            let mut seeded_ids: HashSet<String> = HashSet::new();
+            for property in &mut properties {
+                let held = held_at
+                    .get(property.id.as_str())
+                    .and_then(|at| carried.get(*at));
+                if held.is_none() && seeded_ids.insert(property.id.clone()) {
+                    if let Some(sample) = initial_values.get(property.id.as_str()) {
+                        seeded.push((property.id.clone(), (*sample).clone()));
                     }
                 }
                 // An alias and a notification are not inherited from a
@@ -6045,8 +6180,11 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                 // ones set on it by `UpdateAssetProperty`.
                 property.alias = held.and_then(|held| held.alias.clone());
                 property.notification = held.and_then(|held| held.notification.clone());
-                properties.push(property);
             }
+            let kept: HashSet<String> = properties
+                .iter()
+                .map(|property| property.id.clone())
+                .collect();
             let hierarchies: Vec<AssetHierarchy> = hierarchy_definitions
                 .iter()
                 .map(|hierarchy| AssetHierarchy {
@@ -6067,9 +6205,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                 .collect();
             let dropped_properties: Vec<AssetProperty> = carried
                 .into_iter()
-                .filter(|property| {
-                    !properties.iter().any(|kept| kept.id == property.id)
-                })
+                .filter(|property| !kept.contains(&property.id))
                 .collect();
             asset.properties = properties;
             asset.hierarchies = hierarchies;
@@ -6514,6 +6650,97 @@ pub fn asset_property_from_model(property: &AssetModelProperty) -> Option<AssetP
         unit: property.unit.clone(),
         path: None,
     })
+}
+
+/// What an asset created from one asset model carries: the flat property list
+/// [`AssetRecord::properties`] holds, and the value each of those properties
+/// starts its series with.
+///
+/// Produced by
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::materialise_asset_properties`]
+/// — the one rule for "the properties of an asset of this model" — so the create
+/// that materialises an asset and the propagation that re-materialises it cannot
+/// disagree.
+#[derive(Debug, Default, Clone)]
+pub struct MaterialisedAssetProperties {
+    /// Every property the asset carries: the model's own top-level definitions
+    /// first, then the ones each composite model of it contributes.
+    pub properties: Vec<AssetProperty>,
+    /// `(propertyId, value)` for each property whose definition declares the
+    /// value it starts with; see [`initial_property_sample`].
+    pub initial_values: Vec<(String, AssetPropertyValue)>,
+}
+
+impl MaterialisedAssetProperties {
+    /// The values properties start their series with, indexed by property id.
+    ///
+    /// What a caller re-materialising many assets from one model asks per
+    /// property, so the lookup is constant-time rather than a scan of the list.
+    pub fn initial_values_by_id(&self) -> HashMap<&str, &AssetPropertyValue> {
+        self.initial_values
+            .iter()
+            .map(|(id, value)| (id.as_str(), value))
+            .collect()
+    }
+}
+
+/// Materialise ONE definition into `materialised`, under the composite-model
+/// path `prefix` (`None` for one of the asset's own top-level definitions).
+///
+/// Two composite models may reuse the SAME component model, so one definition
+/// can be contributed by more than one of them: the asset then carries that
+/// property once per composite model that contributes it, each instance under
+/// its own path, which is what the composite-model views of the asset report.
+/// They share the definition's id, hence the one time series that id addresses,
+/// so the value the series STARTS with is seeded once — `seen` is what keeps a
+/// second instance from seeding it again.
+fn materialise_one(
+    definition: &AssetModelProperty,
+    prefix: Option<&[AssetPropertyPathSegment]>,
+    now: SystemTime,
+    seen: &mut HashSet<String>,
+    materialised: &mut MaterialisedAssetProperties,
+) {
+    let Some(mut property) = asset_property_from_model(definition) else {
+        return;
+    };
+    let first = seen.insert(property.id.clone());
+    // `path` is "the structured path to the property from the root of the
+    // asset": the composite models the property sits inside, outermost first,
+    // then the property itself. A property of the asset's own definitions sits
+    // inside none, so it carries no path — which is also what tells the two
+    // apart wherever a response has to (see [`composite_model_of_property`]).
+    if let Some(prefix) = prefix {
+        let mut path = prefix.to_vec();
+        path.push(AssetPropertyPathSegment {
+            id: Some(property.id.clone()),
+            name: Some(property.name.clone()),
+        });
+        property.path = Some(path);
+    }
+    if first {
+        if let Some(sample) = initial_property_sample(definition, now) {
+            materialised
+                .initial_values
+                .push((property.id.clone(), sample));
+        }
+    }
+    materialised.properties.push(property);
+}
+
+/// The `assetCompositeModelId` of the composite model that contributes
+/// `property` to the asset carrying it, or `None` for one of the asset's own
+/// (base) properties.
+///
+/// Read off the property's own `path` — "the structured path to the property
+/// from the root of the asset", whose last segment is the property and whose
+/// segment before it is the composite model that holds it — so the membership
+/// and the path a response reports come from ONE stored value and cannot drift
+/// apart. A base property carries no path.
+pub fn composite_model_of_property(property: &AssetProperty) -> Option<&str> {
+    let path = property.path.as_deref()?;
+    let holder = path.len().checked_sub(2)?;
+    path[holder].id.as_deref()
 }
 
 /// Which of the four property types a `PropertyType` sets, named as the shape's

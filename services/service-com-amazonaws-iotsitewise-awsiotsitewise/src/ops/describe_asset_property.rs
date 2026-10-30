@@ -212,74 +212,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let model = store.asset_models.get(&asset.asset_model_id);
 
         // A property of the asset itself — the normal case this operation documents
-        // as reported in `assetProperty`.
+        // as reported in `assetProperty` — or one declared by a composite model of
+        // the asset's model, which this operation reports in `compositeModel`
+        // instead: "If you describe an asset property in a composite model, this
+        // response includes the asset property information in compositeModel."
+        //
+        // Both are materialised on the asset and addressable by id, so ONE lookup
+        // finds either; the property's own `path` says which it is, and for a
+        // composite model's property names the composite model that holds it.
         if let Some(stored) = asset.property(&input.property_id) {
             // The property TYPE is read from the model's definition as it stands
             // NOW, not snapshotted at create time: "If you update the default value
             // in the model, this operation's response includes the new default
-            // value."
-            let definition = model.and_then(|model| {
-                model
-                    .properties
-                    .iter()
-                    .find(|property| property.id.as_deref() == Some(stored.id.as_str()))
-            });
+            // value." A composite model's property takes its definition from the
+            // composite model that contributes it, through the same shared
+            // resolver every other view of one uses.
+            let definition = model
+                .and_then(|model| store.asset_model_property_definition(model, &stored.id));
+            let composite_model_id = crate::state::composite_model_of_property(stored);
+            let composite = composite_model_id
+                .and_then(|composite_id| model?.composite_model(composite_id));
             return Ok(DescribeAssetPropertyOutput {
                 asset_id: asset.id.clone(),
                 asset_external_id: asset.external_id.clone(),
                 asset_name: asset.name.clone(),
                 asset_model_id: asset.asset_model_id.clone(),
-                asset_property: Some(property_of(stored, definition)),
-                composite_model: None,
+                asset_property: match composite {
+                    Some(_) => None,
+                    None => Some(property_of(stored, definition.as_ref())),
+                },
+                composite_model: composite.map(|composite| CompositeModelProperty {
+                    name: composite.name.clone(),
+                    r#type: composite.r#type.clone(),
+                    id: composite.id.clone(),
+                    external_id: composite.external_id.clone(),
+                    asset_property: property_of(stored, definition.as_ref()),
+                }),
             });
-        }
-
-        // A property declared by one of the model's composite models, which this
-        // operation reports in `compositeModel` instead: "If you describe an asset
-        // property in a composite model, this response includes the asset property
-        // information in compositeModel."
-        if let Some(model) = model {
-            for composite in &model.composite_models {
-                let Some(composite_id) = composite.id.as_deref() else {
-                    continue;
-                };
-                // What a composite model contributes comes from the one shared
-                // resolver, so a property contributed by the component model a
-                // composite model reuses is describable here exactly as the
-                // listings of that composite model report it.
-                let contributed = store.composite_model_properties(model, composite_id);
-                let Some(definition) = contributed.iter().find(|property| {
-                    // A definition with no id names no addressable property, so it
-                    // is passed over rather than reported with a blank one — and
-                    // the scan of this composite model carries on past it. Every
-                    // create path mints one
-                    // (`crate::state::property_definitions_to_properties`), so this
-                    // only guards a state no stored model reaches; both label forms
-                    // stay resolvable for every definition that was stored.
-                    property.id.as_deref().is_some_and(|id| !id.is_empty())
-                        && crate::state::matches_id_label(
-                            property.id.as_deref(),
-                            property.external_id.as_deref(),
-                            &input.property_id,
-                        )
-                }) else {
-                    continue;
-                };
-                return Ok(DescribeAssetPropertyOutput {
-                    asset_id: asset.id.clone(),
-                    asset_external_id: asset.external_id.clone(),
-                    asset_name: asset.name.clone(),
-                    asset_model_id: asset.asset_model_id.clone(),
-                    asset_property: None,
-                    composite_model: Some(CompositeModelProperty {
-                        name: composite.name.clone(),
-                        r#type: composite.r#type.clone(),
-                        id: composite.id.clone(),
-                        external_id: composite.external_id.clone(),
-                        asset_property: property_of_definition(definition),
-                    }),
-                });
-            }
         }
 
         Err(not_found(format!(
@@ -303,27 +272,6 @@ fn property_of(stored: &AssetProperty, definition: Option<&AssetModelProperty>) 
         unit: stored.unit.clone(),
         r#type: definition.map(|definition| definition.r#type.clone()),
         path: stored.path.clone(),
-    }
-}
-
-/// The `Property` a composite model's property definition reports.
-///
-/// A composite model's properties are declared on the asset model and this
-/// emulator materialises no per-asset instance of them, so the two members only
-/// a materialised property can carry — the alias and the notification topic,
-/// both written by `UpdateAssetProperty`, which addresses the asset's own
-/// property list — are absent rather than invented.
-fn property_of_definition(definition: &AssetModelProperty) -> Property {
-    Property {
-        id: definition.id.clone().unwrap_or_default(),
-        external_id: definition.external_id.clone(),
-        name: definition.name.clone(),
-        alias: None,
-        notification: None,
-        data_type: definition.data_type.clone(),
-        unit: definition.unit.clone(),
-        r#type: Some(definition.r#type.clone()),
-        path: None,
     }
 }
 

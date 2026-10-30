@@ -383,6 +383,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         );
 
+        // The model's property definitions changed, and "each asset created from
+        // the model inherits the updated asset model's property … definitions", so
+        // the composite model this call removed takes its per-asset properties off
+        // every asset created from the model — the same propagation
+        // `UpdateAssetModel` runs.
+        store.propagate_asset_model_definitions(&asset_model_id, now);
+
         Ok(DeleteAssetModelCompositeModelOutput {
             asset_model_id: Some(asset_model_id),
             asset_model_status,

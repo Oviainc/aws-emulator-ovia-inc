@@ -344,13 +344,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => store
                 .asset_models
                 .get(&asset_model_id)
-                .and_then(|model| {
-                    model
-                        .properties
-                        .iter()
-                        .find(|property| property.id.as_deref() == Some(property_id.as_str()))
-                })
-                .and_then(|property| property.unit.clone()),
+                .and_then(|model| store.asset_model_property_definition(model, &property_id))
+                .and_then(|property| property.unit),
         };
         let topic =
             crate::state::property_notification_topic(&asset_model_id, &asset_id, &property_id);

@@ -522,7 +522,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             asset_model_composite_model_id: composite_model_id.clone(),
             asset_model_composite_model_path: record.composite_model_path(&composite_model_id),
             asset_model_status: record.status(now),
-            asset_model_id: Some(asset_model_id),
+            asset_model_id: Some(asset_model_id.clone()),
         };
 
         // The token is spent only now that the create has succeeded: a refused
@@ -536,6 +536,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &composite_model_id,
             now,
         );
+
+        // The model's property definitions changed, and "each asset created from
+        // the model inherits the updated asset model's property … definitions", so
+        // the composite model this call added reaches every asset already created
+        // from the model — the same propagation `UpdateAssetModel` runs.
+        store.propagate_asset_model_definitions(&asset_model_id, now);
 
         Ok(output)
     }

@@ -283,29 +283,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Each asset property is materialised from a model property definition and
-        // inherits its id, so property writes and reads resolve against the asset. A
-        // stored model property without an id would make an unaddressable asset
-        // property, so it is skipped rather than materialised with an empty id —
-        // the rule the shared `asset_property_from_model` carries, so every view of
-        // an asset's properties materialises them the same way.
+        // inherits its id, so property writes and reads resolve against the asset.
+        // The asset carries an INSTANCE of every composite model its model holds,
+        // so the list spans the model's own top-level definitions and the ones
+        // each composite model contributes — one flat list, through the one shared
+        // rule, so every view of an asset's properties materialises them the same
+        // way and the propagation that re-materialises them cannot disagree.
         //
-        // The same pass collects the value each materialised property STARTS with,
+        // The same rule collects the value each materialised property STARTS with,
         // which for an attribute definition is the default value the model declares:
         // that default is the property's value on every asset created from the model,
         // so the series starts with it at this asset's creation instant rather than
-        // empty. One pass, so the id filter cannot say one thing here and another
-        // there — a definition that materialises no property seeds no value either.
-        let mut properties: Vec<AssetProperty> = Vec::with_capacity(model.properties.len());
-        let mut initial_values: Vec<(String, AssetPropertyValue)> = Vec::new();
-        for property in &model.properties {
-            let Some(materialised) = crate::state::asset_property_from_model(property) else {
-                continue;
-            };
-            if let Some(sample) = crate::state::initial_property_sample(property, now) {
-                initial_values.push((materialised.id.clone(), sample));
-            }
-            properties.push(materialised);
-        }
+        // empty.
+        let materialised = store.materialise_asset_properties(model, now);
+        let properties = materialised.properties;
+        let initial_values = materialised.initial_values;
         // An asset starts with one (empty) hierarchy per model hierarchy definition.
         let hierarchies: Vec<AssetHierarchy> = model
             .hierarchies

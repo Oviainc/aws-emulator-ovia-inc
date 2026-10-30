@@ -1270,10 +1270,10 @@ fn materialise(
                         Cell::Str(property.name.clone()),
                         text(property.alias.as_deref()),
                         text(property.external_id.as_deref()),
-                        // A composite model's properties are not materialised on an
-                        // asset by this emulator, so every row here is a property of
-                        // the asset itself.
-                        Cell::Null,
+                        // The composite model that contributes the property, read
+                        // off the path it carries; a property of the asset's own
+                        // definitions sits inside none.
+                        text(crate::state::composite_model_of_property(property)),
                         Cell::Str(property.data_type.clone()),
                     ];
                     charge_row(budget, &row)?;
@@ -1285,7 +1285,7 @@ fn materialise(
         "raw_time_series" | "latest_value_time_series" => {
             let latest_only = view == "latest_value_time_series";
             for asset in store.assets.values() {
-                for property in &asset.properties {
+                for property in asset.time_series_properties() {
                     let series = store
                         .property_values
                         .get(&asset.id)

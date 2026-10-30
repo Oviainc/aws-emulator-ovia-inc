@@ -379,6 +379,8 @@ mod hierarchy_label_resolution;
 mod asset_hierarchies;
 #[path = "all/asset_lifecycle.rs"]
 mod asset_lifecycle;
+#[path = "all/asset_composite_model_instances.rs"]
+mod asset_composite_model_instances;
 #[path = "all/asset_model_composite_model.rs"]
 mod asset_model_composite_model;
 #[path = "all/asset_model_composite_model_delete.rs"]
