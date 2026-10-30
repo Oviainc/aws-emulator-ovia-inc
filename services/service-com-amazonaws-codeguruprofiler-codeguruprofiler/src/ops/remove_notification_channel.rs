@@ -166,22 +166,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
-        // The channel is the resource this request names, so a channel id the stored
-        // configuration does not hold is the operation's own
-        // ResourceNotFoundException: "The resource specified in the request does not
-        // exist."
+        // The RESOURCE this request addresses is the profiling group, resolved above;
+        // `channelId` is a parameter of the request. So a well-formed id the resolved
+        // group's stored configuration does not hold is an invalid parameter value —
+        // the operation's ValidationException (400), "The parameter is not valid." —
+        // and ResourceNotFoundException (404) stays reserved for the group itself not
+        // existing. The message states the lookup that found nothing.
         if !group.remove_notification_channel(&input.channel_id) {
-            return Err(
-                RemoveNotificationChannelErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!(
-                            "profiling group {} has no notification channel {}",
-                            input.profiling_group_name, input.channel_id
-                        ),
-                    },
-                )
-                .into(),
-            );
+            return Err(RemoveNotificationChannelErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::notification_channel_not_found_message(
+                        &input.channel_id,
+                        &input.profiling_group_name,
+                    ),
+                },
+            )
+            .into());
         }
 
         Ok(RemoveNotificationChannelOutput {

@@ -2136,6 +2136,27 @@ pub fn notification_group_not_found_message(name: &str) -> String {
     )
 }
 
+/// How the NOTIFICATION surface says that the profiling group a request names holds no
+/// channel with the `channelId` the request addressed: it states the LOOKUP it performed —
+/// the channel id asked about, the group it was looked for in, and the account that group
+/// belongs to.
+///
+/// This refusal is the operation's `ValidationException` (400), NOT a 404: a notification
+/// request addresses the profiling GROUP, and the channel id is a parameter of it, so an
+/// id the group's stored configuration does not hold is an invalid parameter value, while
+/// `ResourceNotFoundException` stays reserved for the group itself not existing
+/// ([`notification_group_not_found_message`], [`group_not_found_message`]).
+///
+/// The account is this emulator's own ([`::engine::emulator_account_id`]), which is the
+/// account every resource it mints lives in — the same one the group's ARN carries.
+pub fn notification_channel_not_found_message(channel_id: &str, group_name: &str) -> String {
+    format!(
+        "Channel not found with channelId: {channel_id}, profilingGroupName: {group_name} \
+         and AccountId: {}",
+        ::engine::emulator_account_id()
+    )
+}
+
 /// How `UpdateProfilingGroup` says that the profiling group a request names does not
 /// exist: it states the lookup it performed — the account it was scoped to and the
 /// `profilingGroupName` member it looked the group up by — and the operation that could

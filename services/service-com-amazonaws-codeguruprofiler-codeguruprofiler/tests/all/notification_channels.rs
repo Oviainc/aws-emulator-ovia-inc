@@ -271,18 +271,20 @@ async fn a_channel_id_names_a_channel_only_inside_its_own_group() {
         }
         for (why, id) in &foreign {
             let answer = remove(&harness, case.second, id).await;
+            // The group exists, so the id is a parameter the configuration cannot
+            // resolve: the operation's ValidationException (400), never a 404.
             assert_eq!(
                 answer.status,
-                404,
-                "case {label}: removing an id {why} from {} must answer 404, got {} / {}",
+                400,
+                "case {label}: removing an id {why} from {} must answer 400, got {} / {}",
                 case.second,
                 answer.status,
                 String::from_utf8_lossy(&answer.body)
             );
             assert_eq!(
                 answer.error_code(),
-                "ResourceNotFoundException",
-                "case {label}: removing an id {why} must be ResourceNotFoundException, got {}",
+                "ValidationException",
+                "case {label}: removing an id {why} must be ValidationException, got {}",
                 String::from_utf8_lossy(&answer.body)
             );
         }
@@ -319,8 +321,8 @@ async fn a_channel_id_names_a_channel_only_inside_its_own_group() {
         let again = remove(&harness, case.second, SHARED_ID).await;
         assert_eq!(
             again.status,
-            404,
-            "case {label}: removing {SHARED_ID} from {} twice must answer 404, got {} / {}",
+            400,
+            "case {label}: removing {SHARED_ID} from {} twice must answer 400, got {} / {}",
             case.second,
             again.status,
             String::from_utf8_lossy(&again.body)
@@ -427,10 +429,12 @@ async fn deleting_a_profiling_group_takes_its_notification_configuration_with_it
             "case {case}: a re-created group must report no channels, got {:?}",
             reported_ids(case, &get(&harness, group).await)
         );
+        // The re-created group EXISTS, so an id only the deleted group ever held is an
+        // unresolvable parameter of a request about a group that is there: 400.
         let orphan = remove(&harness, group, &stored[0]).await;
         assert_eq!(
             orphan.status,
-            404,
+            400,
             "case {case}: a channel of the deleted group must not be found in the new one, \
              got {} / {}",
             orphan.status,

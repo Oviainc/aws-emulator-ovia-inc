@@ -448,7 +448,7 @@ async fn a_configuration_grows_with_each_add_and_shrinks_with_each_remove() {
 }
 
 #[tokio::test]
-async fn a_configuration_nobody_stored_is_not_found_and_an_unknown_channel_is_not_found() {
+async fn a_configuration_nobody_stored_is_not_found_and_an_unknown_channel_is_refused() {
     let harness = Harness::new();
     let group = "known-group";
     let uri = "arn:aws:sns:us-east-1:000000000000:anomalies";
@@ -484,8 +484,10 @@ async fn a_configuration_nobody_stored_is_not_found_and_an_unknown_channel_is_no
         );
     }
 
-    // A channel id the stored configuration does not hold is the same 404 — before and
-    // after the group holds a channel at all.
+    // A channel id the stored configuration does not hold is a parameter the EXISTING
+    // group cannot resolve, so it is the 400 ValidationException — before and after the
+    // group holds a channel at all. (The message template is asserted over its own
+    // table in `crate::unknown_channel_refusal`.)
     for (case, stored) in [("empty configuration", false), ("one channel", true)] {
         if stored {
             assert_eq!(add(&harness, group, &[channel_body(None, uri)]).await.status, 200);
@@ -493,15 +495,15 @@ async fn a_configuration_nobody_stored_is_not_found_and_an_unknown_channel_is_no
         let answer = remove(&harness, group, "99999999-8888-7777-6666-555555555555").await;
         assert_eq!(
             answer.status,
-            404,
-            "case {case}: removing an unknown channel id must be 404, got {} {}",
+            400,
+            "case {case}: removing an unknown channel id must be 400, got {} {}",
             answer.status,
             String::from_utf8_lossy(&answer.body)
         );
         assert_eq!(
             answer.error_code(),
-            "ResourceNotFoundException",
-            "case {case}: removing an unknown channel id must be ResourceNotFoundException, got {}",
+            "ValidationException",
+            "case {case}: removing an unknown channel id must be ValidationException, got {}",
             String::from_utf8_lossy(&answer.body)
         );
     }

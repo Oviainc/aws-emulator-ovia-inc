@@ -97,6 +97,8 @@ mod state_roundtrip;
 mod stored_profile_representation;
 #[path = "all/tag_resource.rs"]
 mod tag_resource;
+#[path = "all/unknown_channel_refusal.rs"]
+mod unknown_channel_refusal;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;
 #[path = "all/update_profiling_group.rs"]
