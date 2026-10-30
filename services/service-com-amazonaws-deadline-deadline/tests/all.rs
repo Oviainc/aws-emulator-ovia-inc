@@ -21,3 +21,5 @@ mod farm_queue_job;
 mod fleet;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/storage_profile.rs"]
+mod storage_profile;

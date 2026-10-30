@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStorageProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStorageProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStorageProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +152,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStorageProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStorageProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStorageProfile"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateStorageProfileErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // A storage profile lives under its farm, so an unknown farm is a 404 and nothing
+        // is created.
+        if store.farm(&input.farm_id).is_none() {
+            return Err(CreateStorageProfileErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+
+        // `clientToken` is `@idempotencyToken`: a retry of the same create must answer
+        // with the resource the first call made, not make a second one.
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, &input.farm_id, token));
+        if let Some(key) = token.as_deref() {
+            if let Some(storage_profile_id) = store.remembered_resource(key).map(str::to_string) {
+                if store
+                    .storage_profile(&input.farm_id, &storage_profile_id)
+                    .is_some()
+                {
+                    return Ok(CreateStorageProfileOutput { storage_profile_id });
+                }
+            }
+        }
+
+        // A farm holds at most this many storage profiles: each one is a caller-driven
+        // insert that only a delete releases.
+        if store.farm(&input.farm_id).is_some_and(|farm| {
+            farm.storage_profiles.len() >= crate::state::MAX_STORAGE_PROFILES_PER_FARM
+        }) {
+            return Err(CreateStorageProfileErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded(
+                    crate::state::RESOURCE_TYPE_STORAGE_PROFILE,
+                    "You exceeded the number of storage profiles this emulator stores for \
+                     one farm. Delete a storage profile and try again.",
+                ),
+            )
+            .into());
+        }
+
+        // The minted id satisfies the modeled `^sp-[0-9a-f]{32}$` label pattern.
+        let storage_profile_id = store.mint_id("sp");
+        let profile = crate::state::StorageProfile {
+            storage_profile_id: storage_profile_id.clone(),
+            farm_id: input.farm_id.clone(),
+            display_name: input.display_name,
+            os_family: input.os_family,
+            file_system_locations: input.file_system_locations,
+            created_at: ::std::time::SystemTime::now(),
+            created_by: crate::state::caller_principal(ctx),
+            // Nothing has updated this profile yet, so it reports no update stamp until
+            // something does.
+            updated_at: None,
+            updated_by: None,
+        };
+
+        let Some(farm) = store.farms.get_mut(&input.farm_id) else {
+            return Err(CreateStorageProfileErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        };
+        farm.storage_profiles
+            .insert(storage_profile_id.clone(), profile);
+        if let Some(key) = token {
+            store.remember_resource(key, &storage_profile_id);
+        }
+
+        Ok(CreateStorageProfileOutput { storage_profile_id })
     }
 }

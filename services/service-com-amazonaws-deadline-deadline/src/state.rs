@@ -93,6 +93,12 @@ pub const RESOURCE_TYPE_FLEET: &str = "fleet";
 pub const RESOURCE_TYPE_JOB: &str = "job";
 /// `resourceType` this service reports for a budget in `ResourceNotFoundException`.
 pub const RESOURCE_TYPE_BUDGET: &str = "budget";
+/// `resourceType` this service reports for a storage profile in
+/// `ResourceNotFoundException`. The model documents the member only as "the type of the
+/// resource that couldn't be found" and enumerates no values, so a resource type is
+/// spelled the way the model spells that resource everywhere else — the member name
+/// `storageProfileId` names it `storageProfile`.
+pub const RESOURCE_TYPE_STORAGE_PROFILE: &str = "storageProfile";
 
 /// How many client tokens the store remembers at once.
 ///
@@ -123,6 +129,9 @@ pub const MAX_FLEETS_PER_FARM: usize = 500;
 
 /// How many budgets one farm holds at once. See [`MAX_FARMS`].
 pub const MAX_BUDGETS_PER_FARM: usize = 500;
+
+/// How many storage profiles one farm holds at once. See [`MAX_FARMS`].
+pub const MAX_STORAGE_PROFILES_PER_FARM: usize = 500;
 
 /// How many bytes of job templates this emulator stores at once.
 ///
@@ -160,6 +169,30 @@ pub struct Farm {
     /// its farm's path (`/2023-10-12/farms/{farmId}/budgets/{budgetId}`), so it hangs off
     /// the farm exactly as a queue does.
     pub budgets: HashMap<String, Budget>,
+    /// Every storage profile of this farm, keyed by `storageProfileId`. A storage profile
+    /// is reached only through its farm's path
+    /// (`/2023-10-12/farms/{farmId}/storage-profiles/{storageProfileId}`), so it hangs off
+    /// the farm exactly as a queue does.
+    pub storage_profiles: HashMap<String, StorageProfile>,
+}
+
+/// A persisted storage profile, as `CreateStorageProfile` stored it under its farm.
+///
+/// A storage profile is a description of where resources live — an operating-system
+/// family and a list of file system locations — so it carries no status: the create
+/// answers with a profile that is already everything it will ever be, and nothing is
+/// owed by the clock.
+#[derive(Debug, Clone)]
+pub struct StorageProfile {
+    pub storage_profile_id: String,
+    pub farm_id: String,
+    pub display_name: String,
+    pub os_family: String,
+    pub file_system_locations: Option<Vec<crate::ops::types::FileSystemLocation>>,
+    pub created_at: SystemTime,
+    pub created_by: String,
+    pub updated_at: Option<SystemTime>,
+    pub updated_by: Option<String>,
 }
 
 /// A persisted fleet, as `CreateFleet` stored it under its farm.
@@ -532,6 +565,20 @@ impl ComAmazonawsDeadlineDeadlineState {
     /// Mutable form of [`budget`](Self::budget).
     pub fn budget_mut(&mut self, farm_id: &str, budget_id: &str) -> Option<&mut Budget> {
         self.farms.get_mut(farm_id)?.budgets.get_mut(budget_id)
+    }
+
+    /// The storage profile `storage_profile_id` names UNDER `farm_id`: a profile of
+    /// another farm is not found here, because the model reaches a storage profile only
+    /// through its own farm's path.
+    pub fn storage_profile(
+        &self,
+        farm_id: &str,
+        storage_profile_id: &str,
+    ) -> Option<&StorageProfile> {
+        self.farms
+            .get(farm_id)?
+            .storage_profiles
+            .get(storage_profile_id)
     }
 
     /// The job `job_id` names under `farm_id`/`queue_id`, with any clock-owed lifecycle
