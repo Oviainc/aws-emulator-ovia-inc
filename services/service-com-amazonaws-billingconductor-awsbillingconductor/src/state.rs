@@ -239,14 +239,44 @@ pub fn billing_period_range_length(inclusive_start: &str, exclusive_end: &str) -
     Some(end - start)
 }
 
+/// Is a half-open range ordered, i.e. does it cover anything at all?
+///
+/// The bound names carry the rule on every axis the crate orders — billing periods,
+/// usage: the INCLUSIVE lower bound is in the range and the EXCLUSIVE upper bound is
+/// not, so the range covers something only when the upper bound comes strictly after
+/// the lower one. An absent lower bound is open below and an absent upper bound open
+/// above, so either one absent orders.
+pub fn half_open_range_is_ordered<T: PartialOrd>(
+    inclusive_begin: Option<T>,
+    exclusive_end: Option<T>,
+) -> bool {
+    match (inclusive_begin, exclusive_end) {
+        (Some(begin), Some(end)) => begin < end,
+        _ => true,
+    }
+}
+
+/// Do two half-open ranges of one axis cover a common point?
+///
+/// Exactly when EACH of them begins strictly before the other ends, which is
+/// [`half_open_range_is_ordered`] read across the two ranges, an absent bound being
+/// open as it is there.
+pub fn half_open_ranges_overlap<T: PartialOrd>(
+    (first_begin, first_end): (Option<T>, Option<T>),
+    (second_begin, second_end): (Option<T>, Option<T>),
+) -> bool {
+    half_open_range_is_ordered(first_begin, second_end)
+        && half_open_range_is_ordered(second_begin, first_end)
+}
+
 /// Does the half-open bound `start` come strictly before `end`? An absent `start` is
 /// the unbounded past and an absent `end` the unbounded future, so either one absent
 /// orders. Both bounds are the month counts [`billing_period_key`] returns.
+///
+/// The billing-period axis of the crate's one half-open comparison,
+/// [`half_open_range_is_ordered`].
 pub fn billing_period_precedes(start: Option<i64>, end: Option<i64>) -> bool {
-    match (start, end) {
-        (Some(start), Some(end)) => start < end,
-        _ => true,
-    }
+    half_open_range_is_ordered(start, end)
 }
 
 /// One half-open span of billing periods, `[InclusiveStartBillingPeriod,
@@ -686,6 +716,81 @@ pub type PricingRuleRate = (Option<f64>, Option<TieringRecord>);
 /// type): the reason, the member at fault and the message.
 pub type ValidationRefusal = (&'static str, &'static str, String);
 
+/// The member path a refusal naming a tiering configuration's custom tiers carries:
+/// the `CustomTiers` member of the request's `Tiering`.
+pub const CUSTOM_TIERS_MEMBER: &str = "Tiering.CustomTiers";
+
+/// Does each custom tier price a non-empty usage range, and no two of them the same
+/// usage — or is that the refusal the request earns?
+///
+/// A `CustomTier` carries a half-open usage range ("The inclusive start of the usage
+/// range that this tier applies to" / "The exclusive end of the usage range that this
+/// tier applies to. If you don't specify a value, this tier applies to all usage that
+/// is greater than or equal to `BeginRangeInclusive`") and its rate is the one
+/// "applied to the usage that falls within this tier". So a tier whose exclusive end
+/// is at or below its inclusive begin prices no usage at all, and two tiers covering
+/// one unit of usage leave the rate for that unit undecided: either way the
+/// configuration prices usage in a way the service cannot apply, which is what
+/// `ValidationExceptionReason` enumerates `ILLEGAL_TIERING_INPUT` for.
+///
+/// `Err` carries the `(reason, member, message)` of the modelled `ValidationException`
+/// the calling operation refuses the request with, exactly as the other shared rules
+/// here do, so every path that sets a rule's tiers judges them the same way.
+pub fn check_custom_tiers_price_distinct_usage(
+    custom_tiers: &[crate::ops::types::CustomTier],
+) -> Result<(), ValidationRefusal> {
+    for tier in custom_tiers {
+        let begin = tier.begin_range_inclusive;
+        // Both bounds are numbers at or above zero by the time a request reaches here —
+        // the model constrains each of them to `range{min:0}`, which the boundary walk
+        // refuses a non-finite or negative value by — so comparing them decides the
+        // range.
+        //
+        // Only a tier that STATES an end can state one covering nothing: an absent end
+        // leaves the tier open, so there is no bound to report either.
+        if let Some(end) = tier.end_range_exclusive {
+            if !half_open_range_is_ordered(Some(begin), Some(end)) {
+                return Err((
+                    "ILLEGAL_TIERING_INPUT",
+                    CUSTOM_TIERS_MEMBER,
+                    format!(
+                        "the exclusive end of a custom tier's usage range must be greater than \
+                         its inclusive begin, but the tier beginning at {begin} ends at {end}"
+                    ),
+                ));
+            }
+        }
+    }
+    // Two of these ranges share usage only if two NEIGHBOURING ones do once they are
+    // ordered by their inclusive begin: a range reaching past a later one reaches past
+    // every range beginning in between. So one ordering pass decides the whole set, and
+    // the work a request's tiers cost stays proportional to the list the request
+    // already carried rather than to every pair of it.
+    let mut ranges: Vec<(f64, Option<f64>)> = custom_tiers
+        .iter()
+        .map(|tier| (tier.begin_range_inclusive, tier.end_range_exclusive))
+        .collect();
+    ranges.sort_by(|left, right| left.0.total_cmp(&right.0));
+    for ((earlier_begin, earlier_end), (later_begin, later_end)) in
+        ranges.iter().zip(ranges.iter().skip(1))
+    {
+        if half_open_ranges_overlap(
+            (Some(*earlier_begin), *earlier_end),
+            (Some(*later_begin), *later_end),
+        ) {
+            return Err((
+                "ILLEGAL_TIERING_INPUT",
+                CUSTOM_TIERS_MEMBER,
+                format!(
+                    "no two custom tiers may price the same usage, but the tiers beginning at \
+                     {earlier_begin} and {later_begin} cover common usage"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The rate members a pricing rule of `rule_type` must hold, or the refusal the
 /// request earns.
 ///
@@ -699,10 +804,13 @@ pub type ValidationRefusal = (&'static str, &'static str, String);
 ///
 /// `Ok` carries the `(ModifierPercentage, Tiering)` pair to store; `Err` carries
 /// the `(reason, member, message)` of the modelled `ValidationException` the
-/// calling operation refuses the request with. BOTH paths that set a rule's rate
-/// decide it here, so one rule has one behaviour: `UpdatePricingRule` passes the
-/// stored record merged with the request, and `CreatePricingRule` — which has no
-/// stored record behind it — passes the request's own members as the whole rate.
+/// calling operation refuses the request with. The tiers a `TIERING` rule prices by
+/// are judged here too, by [`check_custom_tiers_price_distinct_usage`], so one rule
+/// is never stored pricing usage the service cannot apply. BOTH paths that set a
+/// rule's rate decide it here, so one rule has one behaviour: `UpdatePricingRule`
+/// passes the stored record merged with the request, and `CreatePricingRule` — which
+/// has no stored record behind it — passes the request's own members as the whole
+/// rate.
 pub fn reconcile_pricing_rule_rate(
     rule_type: &str,
     modifier_percentage: Option<f64>,
@@ -725,6 +833,15 @@ pub fn reconcile_pricing_rule_rate(
                 "Tiering",
                 format!("a {TIERING_PRICING_RULE_TYPE} pricing rule needs a tiering configuration"),
             ));
+        }
+        // The tiers the rule will price by have to describe usage the service can
+        // actually price — the shared rule above, applied on every path that sets a
+        // rule's tiers.
+        if let Some(custom_tiers) = tiering
+            .as_ref()
+            .and_then(|tiering| tiering.custom_tiers.as_deref())
+        {
+            check_custom_tiers_price_distinct_usage(custom_tiers)?;
         }
         return Ok((None, tiering));
     }

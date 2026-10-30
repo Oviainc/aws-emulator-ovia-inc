@@ -153,7 +153,9 @@ fn end_billing_period(
 /// billing period EXCLUSIVE, the same half-open span a write's
 /// `CustomLineItemBillingPeriodRange` names, with an absent bound open. A generation is
 /// selected when its own half-open span shares at least one billing period with that
-/// span. Every generation reaching this filter applies in some billing period, because a
+/// span, which is the crate's one half-open overlap decision
+/// ([`crate::state::half_open_ranges_overlap`]) on the billing-period axis. Every
+/// generation reaching this filter applies in some billing period, because a
 /// generation that applies in none is a version of the item nowhere and is not reported
 /// at all ([`crate::state::CustomLineItemRecord::versions`]).
 fn in_filter(
@@ -164,19 +166,22 @@ fn in_filter(
     let Some(filter) = filter else {
         return true;
     };
-    let start = crate::state::billing_period_key(start_billing_period);
-    let end = end_billing_period.and_then(crate::state::billing_period_key);
-    let not_after_filter = filter
-        .end_billing_period
-        .as_deref()
-        .and_then(crate::state::billing_period_key)
-        .is_none_or(|filter_end| start.is_none_or(|start| start < filter_end));
-    let not_before_filter = filter
-        .start_billing_period
-        .as_deref()
-        .and_then(crate::state::billing_period_key)
-        .is_none_or(|filter_start| end.is_none_or(|end| end > filter_start));
-    not_after_filter && not_before_filter
+    crate::state::half_open_ranges_overlap(
+        (
+            crate::state::billing_period_key(start_billing_period),
+            end_billing_period.and_then(crate::state::billing_period_key),
+        ),
+        (
+            filter
+                .start_billing_period
+                .as_deref()
+                .and_then(crate::state::billing_period_key),
+            filter
+                .end_billing_period
+                .as_deref()
+                .and_then(crate::state::billing_period_key),
+        ),
+    )
 }
 
 /// One generation of the item, as this operation reports a version.

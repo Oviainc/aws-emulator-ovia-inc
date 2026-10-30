@@ -115,6 +115,8 @@ mod pricing_rule_association_periods;
 mod pricing_rule_billing_periods;
 #[path = "all/pricing_rule_core_loop.rs"]
 mod pricing_rule_core_loop;
+#[path = "all/pricing_rule_custom_tier_usage_ranges.rs"]
+mod pricing_rule_custom_tier_usage_ranges;
 #[path = "all/pricing_rule_lifecycle.rs"]
 mod pricing_rule_lifecycle;
 #[path = "all/pricing_rule_rate_exclusivity.rs"]
