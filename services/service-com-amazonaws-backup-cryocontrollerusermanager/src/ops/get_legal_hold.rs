@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLegalHold
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLegalHold`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLegalHold::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers from the stored legal hold ([`crate::state::LegalHoldRecord`]) the
+//! requested id names, so a read reports what `CreateLegalHold` stored and a
+//! read of an id this account holds nothing under is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +153,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLegalHold` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLegalHoldErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLegalHold"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        // `LegalHoldId` is the `@httpLabel` and `@required`: a request without
+        // it names no resource and is refused before this handler runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetLegalHoldErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the backup vault store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let mut store = state.lock();
+        // The one write this report performs: the hold asked about was owed its
+        // `CREATING` -> `ACTIVE` transition at its own settle instant, whether
+        // or not anybody read it — so this read and `ListLegalHolds` can never
+        // disagree about its status.
+        store.settle_legal_holds(now);
+        let hold = store
+            .legal_hold(&input.legal_hold_id)
+            .map_err(GetLegalHoldErrorModeled::ResourceNotFoundException)?;
+
+        // The members the list reports come from the ONE projection
+        // `ListLegalHolds` and `CreateLegalHold` answer from, so the three reads
+        // of one hold cannot disagree; the rest are the record's own.
+        let listed = hold.listed();
+        Ok(GetLegalHoldOutput {
+            title: listed.title,
+            status: listed.status,
+            description: listed.description,
+            legal_hold_id: listed.legal_hold_id,
+            legal_hold_arn: listed.legal_hold_arn,
+            creation_date: listed.creation_date,
+            cancellation_date: listed.cancellation_date,
+            cancel_description: hold.cancel_description.clone(),
+            retain_record_until: hold
+                .retain_record_until
+                .map(::aws_smithy_types::DateTime::from),
+            recovery_point_selection: Some(hold.recovery_point_selection.clone()),
+        })
     }
 }

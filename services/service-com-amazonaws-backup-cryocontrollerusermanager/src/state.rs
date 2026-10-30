@@ -18,6 +18,9 @@
 //! * [`BackupSelectionRecord`] — one resource selection of such a plan.
 //! * [`FrameworkRecord`] — the audit framework `CreateFramework` inserts, whose
 //!   controls and deployment status every framework read answers from.
+//! * [`LegalHoldRecord`] — the legal hold `CreateLegalHold` inserts, whose
+//!   stored members every legal-hold read projects through
+//!   [`LegalHoldRecord::listed`].
 //!
 //! `recovery_points_by_vault` is the ONLY per-vault list: both
 //! `ListRecoveryPointsByBackupVault`'s page and `DescribeBackupVault`'s
@@ -38,7 +41,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::ops::types::{
     AdvancedBackupSetting, AlreadyExistsException, BackupPlan, BackupRule, BackupRuleInput,
     BackupSelection, CopyJob, FrameworkControl, InvalidParameterValueException,
-    InvalidRequestException, Lifecycle, ResourceNotFoundException, ScanSetting,
+    InvalidRequestException, LegalHold, Lifecycle, MissingParameterValueException,
+    RecoveryPointSelection, ResourceNotFoundException, ScanSetting,
 };
 
 /// The ARN namespace this service stamps into every ARN it mints
@@ -197,6 +201,11 @@ pub const MAX_SELECTIONS_PER_PLAN: usize = 100;
 /// per Region too, and answers `LimitExceededException` for a create past it.
 pub const MAX_FRAMEWORKS: usize = 500;
 
+/// The most legal holds this emulator keeps. An EMULATOR-CHOSEN ceiling, for
+/// the reason given on [`MAX_VAULTS`]; AWS caps the legal holds an account may
+/// hold too, and answers `LimitExceededException` for a create past it.
+pub const MAX_LEGAL_HOLDS: usize = 500;
+
 /// The most controls this emulator keeps in ONE framework. An EMULATOR-CHOSEN
 /// ceiling, for the reason given on [`MAX_RULES_PER_PLAN`]: the list is sized by
 /// the request and stored verbatim.
@@ -267,6 +276,22 @@ pub const VAULT_SETTLE_AFTER: Duration = Duration::from_millis(500);
 /// with it, and the due instant is stored on the framework
 /// ([`FrameworkRecord::settles_at`]) so no handler ever sleeps for it.
 pub const FRAMEWORK_SETTLE_AFTER: Duration = Duration::from_secs(3);
+
+/// How long after a create the legal hold settles from `CREATING` to `ACTIVE`.
+///
+/// A CHOSEN span, not a documented one: AWS takes as long as placing the hold on
+/// the recovery points its selection matches needs. It is deliberately non-zero
+/// so a caller that reads the hold straight after creating it still observes the
+/// transient `CREATING` status, and the due instant is stored on the hold
+/// ([`LegalHoldRecord::settles_at`]) so no handler ever sleeps for it.
+pub const LEGAL_HOLD_SETTLE_AFTER: Duration = Duration::from_secs(3);
+
+/// `LegalHoldStatus` of a legal hold whose creation has not settled yet (model
+/// enum `LegalHoldStatus`: `CREATING | ACTIVE | CANCELING | CANCELED`).
+pub const LEGAL_HOLD_STATUS_CREATING: &str = "CREATING";
+
+/// `LegalHoldStatus` of a legal hold that is in force (same enum).
+pub const LEGAL_HOLD_STATUS_ACTIVE: &str = "ACTIVE";
 
 /// `DeploymentStatus` of a framework whose deployment has not settled yet, as
 /// the model lists the statuses for `Framework$DeploymentStatus`
@@ -340,6 +365,22 @@ pub fn framework_arn(region: &str, name: &str, uniquifier: &str) -> String {
         ARN_NAMESPACE,
         region,
         &format!("framework:{name}-{uniquifier}"),
+    )
+}
+
+/// The ARN of a legal hold:
+/// `arn:aws:backup:<region>:<account>:legal-hold:<id>`.
+///
+/// `legal-hold` is the resource type a legal hold is addressed by, spelled in
+/// full and separated by `:` as [`backup_vault_arn`] spells `backup-vault` and
+/// [`recovery_point_arn`] spells `recovery-point`; the model's doc example for
+/// `LegalHold$LegalHoldArn` shows a recovery point's ARN instead, which names no
+/// legal hold at all.
+pub fn legal_hold_arn(region: &str, legal_hold_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("legal-hold:{legal_hold_id}"),
     )
 }
 
@@ -576,6 +617,18 @@ pub const ERROR_CODE_MAX_RESULTS_INVALID: &str = "ERROR_3607";
 /// The sentence AWS states for that condition — fixed, like the ones above.
 pub const MESSAGE_MAX_RESULTS_INVALID: &str = "Max Results is invalid";
 
+/// The sentence AWS states for "the legal hold asked about is not one this
+/// account holds" — fixed, and worded as this service words the same condition
+/// for a recovery point ([`MESSAGE_RECOVERY_POINT_NOT_FOUND`]): it names no part
+/// of the request, so the id asked about does not appear in it. No `Code`: this
+/// condition has no observed token.
+pub const MESSAGE_LEGAL_HOLD_NOT_FOUND: &str = "Cannot find legal hold";
+
+/// The sentence AWS states for "the legal hold this create would make selects no
+/// recovery points" — fixed, like the ones above: it names no part of the
+/// request. No `Code`: this condition has no observed token.
+pub const MESSAGE_MISSING_RESOURCE_SELECTION: &str = "Missing Resource Selection.";
+
 /// The values the model's `AggregationPeriod` enum admits, in model order
 /// (`smithy_query(query="shape", shape="AggregationPeriod")`). The summary
 /// operations name this list in the message they refuse an unknown period with,
@@ -629,6 +682,25 @@ pub fn backup_vault_not_found(vault_name: &str) -> ResourceNotFoundException {
 pub fn backup_plan_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(MESSAGE_BACKUP_PLAN_NOT_FOUND.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a legal hold id this account does not hold.
+pub fn legal_hold_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(MESSAGE_LEGAL_HOLD_NOT_FOUND.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a legal-hold create that names no recovery-point
+/// selection: `RecoveryPointSelection` carries no `@required` trait, so the
+/// boundary validator passes a request without it, while a hold that selects no
+/// recovery points holds nothing — AWS answers the missing-parameter refusal.
+pub fn missing_recovery_point_selection() -> MissingParameterValueException {
+    MissingParameterValueException {
+        message: Some(MESSAGE_MISSING_RESOURCE_SELECTION.to_string()),
         ..Default::default()
     }
 }
@@ -847,6 +919,60 @@ pub fn rejected_max_results(max_results: Option<i32>) -> Option<InvalidParameter
         message: Some(MESSAGE_MAX_RESULTS_INVALID.to_string()),
         ..Default::default()
     })
+}
+
+/// The modelled refusal for a `RecoveryPointSelection` AWS does not accept, or
+/// `None` when every member of the selection is one it does.
+///
+/// ONE check and ONE sentence for the selection in this service, for the reason
+/// given on [`rejected_window_minutes`]: the members target unpatterned `string`
+/// shapes, so the framework's boundary validator passes anything, while each one
+/// still has a form it must take —
+///
+/// * `VaultNames` names backup vaults, so an entry outside the model's
+///   `BackupVaultName` pattern ([`is_modelled_vault_name`]) names no vault this
+///   service could hold;
+/// * `ResourceIdentifiers` names protected resources, which are addressed by ARN
+///   ([`rejected_arn`], whose sentence is shared with every other ARN-valued
+///   member);
+/// * a `DateRange` bound after `now` selects recovery points that cannot exist:
+///   "Both values are required. Future DateTime values are not permitted" (the
+///   model doc for `DateRange`).
+pub fn rejected_recovery_point_selection(
+    selection: &RecoveryPointSelection,
+    now: SystemTime,
+) -> Option<InvalidParameterValueException> {
+    for name in selection.vault_names.iter().flatten() {
+        if !is_modelled_vault_name(name) {
+            return Some(InvalidParameterValueException {
+                message: Some(format!(
+                    "RecoveryPointSelection VaultNames entry {name} is not a backup vault name"
+                )),
+                ..Default::default()
+            });
+        }
+    }
+    for identifier in selection.resource_identifiers.iter().flatten() {
+        if let Some(refusal) =
+            rejected_arn("RecoveryPointSelection ResourceIdentifiers", identifier)
+        {
+            return Some(refusal);
+        }
+    }
+    let range = selection.date_range.as_ref()?;
+    for (member, at) in [("FromDate", range.from_date), ("ToDate", range.to_date)] {
+        let in_future = SystemTime::try_from(at).is_ok_and(|at| at > now);
+        if in_future {
+            return Some(InvalidParameterValueException {
+                message: Some(format!(
+                    "RecoveryPointSelection DateRange {member} is in the future, and future \
+                     DateTime values are not permitted"
+                )),
+                ..Default::default()
+            });
+        }
+    }
+    None
 }
 
 /// The modelled refusal for an `AggregationPeriod` the model's enum does not
@@ -1360,6 +1486,64 @@ impl FrameworkRecord {
     }
 }
 
+/// A legal hold as `CreateLegalHold` stored it: the title, description and
+/// recovery-point selection the caller gave, plus the id and ARN this service
+/// minted, the instant it recorded and the status its own clock moves.
+///
+/// A legal hold is addressed by `LegalHoldId` (the `@httpLabel` of every
+/// hold-scoped operation), so that id is the key this record is stored under,
+/// and the selection is kept verbatim: it has no member the service fills, so a
+/// read reports what was stored.
+#[derive(Debug, Clone)]
+pub struct LegalHoldRecord {
+    pub id: String,
+    pub arn: String,
+    pub title: String,
+    pub description: String,
+    pub creation_date: SystemTime,
+    /// Where the hold is in its life: one of the statuses the model lists for
+    /// `LegalHoldStatus`.
+    pub status: String,
+    /// When the creation this record is in becomes due to settle.
+    pub settles_at: SystemTime,
+    /// The `IdempotencyToken` the create carried, which a repeated create
+    /// replays.
+    pub idempotency_token: Option<String>,
+    /// The criteria the hold selects recovery points by, exactly as given. Not
+    /// optional on the record: a hold IS the hold it places on the recovery
+    /// points its selection names, so a create without one is refused.
+    pub recovery_point_selection: RecoveryPointSelection,
+    /// The tags the create assigned to the hold.
+    pub tags: BTreeMap<String, String>,
+    /// When the hold was cancelled, which `CancelLegalHold` records; `None`
+    /// while the hold has never been cancelled.
+    pub cancellation_date: Option<SystemTime>,
+    /// Why the hold was cancelled, which `CancelLegalHold` records with the
+    /// cancellation instant above.
+    pub cancel_description: Option<String>,
+    /// How long the cancelled hold's record is retained, which
+    /// `CancelLegalHold` records from the days the caller asked for.
+    pub retain_record_until: Option<SystemTime>,
+}
+
+impl LegalHoldRecord {
+    /// The ONE list projection of a stored legal hold, so every operation that
+    /// reports holds reports the same members of the same record.
+    pub fn listed(&self) -> LegalHold {
+        LegalHold {
+            title: Some(self.title.clone()),
+            status: Some(self.status.clone()),
+            description: Some(self.description.clone()),
+            legal_hold_id: Some(self.id.clone()),
+            legal_hold_arn: Some(self.arn.clone()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
+            cancellation_date: self
+                .cancellation_date
+                .map(::aws_smithy_types::DateTime::from),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-backup-cryocontrollerusermanager. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsBackupCryocontrollerusermanagerState {
@@ -1384,6 +1568,8 @@ pub struct ComAmazonawsBackupCryocontrollerusermanagerState {
     pub backup_selections: BTreeMap<(String, String), BackupSelectionRecord>,
     /// Frameworks by `FrameworkName`. Bounded by [`MAX_FRAMEWORKS`].
     pub frameworks: BTreeMap<String, FrameworkRecord>,
+    /// Legal holds by `LegalHoldId`. Bounded by [`MAX_LEGAL_HOLDS`].
+    pub legal_holds: BTreeMap<String, LegalHoldRecord>,
     /// `StartBackupJob`'s `IdempotencyToken` -> what it replays. Bounded by
     /// [`MAX_IDEMPOTENCY_TOKENS`] and [`IDEMPOTENCY_TOKEN_TTL`].
     pub idempotency_tokens: BTreeMap<String, IdempotencyRecord>,
@@ -1557,6 +1743,35 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
                 && now >= framework.settles_at
             {
                 framework.deployment_status = FRAMEWORK_DEPLOYMENT_STATUS_COMPLETED.to_string();
+            }
+        }
+    }
+
+    /// Resolve a legal hold for a read, by the id it is stored under.
+    pub fn legal_hold(&self, id: &str) -> Result<&LegalHoldRecord, ResourceNotFoundException> {
+        self.legal_holds.get(id).ok_or_else(legal_hold_not_found)
+    }
+
+    /// The legal hold an `IdempotencyToken` created, if this account still holds
+    /// one: "Retrying a successful request with the same idempotency token
+    /// results in a success message with no action taken" (model doc for the
+    /// member), so a create that repeats a token answers with the hold it
+    /// already made rather than making a second one.
+    pub fn legal_hold_by_idempotency_token(&self, token: &str) -> Option<&LegalHoldRecord> {
+        self.legal_holds
+            .values()
+            .find(|hold| hold.idempotency_token.as_deref() == Some(token))
+    }
+
+    /// Materialise the transition the clock has already made due for every legal
+    /// hold: the `CREATING` -> `ACTIVE` transition a create that reports a
+    /// non-terminal status owes. Like [`Self::settle_frameworks`] this is the
+    /// only write a reporting operation performs — each hold was owed its
+    /// activation at its own `settles_at` whether or not anybody called.
+    pub fn settle_legal_holds(&mut self, now: SystemTime) {
+        for hold in self.legal_holds.values_mut() {
+            if hold.status == LEGAL_HOLD_STATUS_CREATING && now >= hold.settles_at {
+                hold.status = LEGAL_HOLD_STATUS_ACTIVE.to_string();
             }
         }
     }

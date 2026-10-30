@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLegalHold
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLegalHold`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLegalHold::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores one legal hold ([`crate::state::LegalHoldRecord`]) under the id this
+//! service mints for it, so `ListLegalHolds` reports exactly the holds that were
+//! created and each of them reports the title, description and selection its
+//! create was given. The hold is returned in the non-terminal status AWS reports
+//! for a fresh one, and its clock owes the move to `ACTIVE`. A create that names
+//! no recovery-point selection holds nothing, and is refused as missing that
+//! parameter even though the model does not mark it `@required`.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +163,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLegalHold` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLegalHoldErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `Title` and `Description` are `@required`: a request that leaves
+        // either out is refused before this handler runs, and `crate::service`
+        // words that refusal as this service's own
+        // `MissingParameterValueException`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLegalHold"))
+        // `RecoveryPointSelection` carries no `@required` trait, so the boundary
+        // validator passes a request that leaves it out — but a legal hold IS
+        // the hold it places on the recovery points its selection names, so AWS
+        // requires the member and refuses a request without it with the
+        // modelled missing-parameter exception (`crate::state` words it, once
+        // for this service).
+        let Some(selection) = input.recovery_point_selection else {
+            return Err(CreateLegalHoldErrorModeled::MissingParameterValueException(
+                crate::state::missing_recovery_point_selection(),
+            )
+            .into());
+        };
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateLegalHoldErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the backup vault store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // The selection rules are `crate::state`'s, shared with every other
+        // operation that takes a recovery-point selection, so the two cannot
+        // drift. Applied before anything is stored.
+        if let Some(refusal) = crate::state::rejected_recovery_point_selection(&selection, now) {
+            return Err(
+                CreateLegalHoldErrorModeled::InvalidParameterValueException(refusal).into(),
+            );
+        }
+
+        let mut store = state.lock();
+        // Materialise the activations the clock has already made due, so a
+        // replayed token answers from the hold's current status rather than from
+        // the one it carried when it was made.
+        store.settle_legal_holds(now);
+
+        // A repeated `IdempotencyToken` replays the hold that token created: no
+        // second hold, and the same identifiers the first call answered with.
+        if let Some(existing) = input
+            .idempotency_token
+            .as_deref()
+            .and_then(|token| store.legal_hold_by_idempotency_token(token))
+        {
+            return Ok(legal_hold_created(existing));
+        }
+
+        // The store is in memory and every request can add to it, so the number
+        // of holds it keeps is bounded. AWS answers the same modelled error once
+        // an account reaches its own legal-hold quota.
+        if store.legal_holds.len() >= crate::state::MAX_LEGAL_HOLDS {
+            return Err(CreateLegalHoldErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this emulator keeps at most {} legal holds",
+                        crate::state::MAX_LEGAL_HOLDS
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let id = store.next_id(now);
+        let record = crate::state::LegalHoldRecord {
+            arn: crate::state::legal_hold_arn(&region, &id),
+            id,
+            title: input.title,
+            description: input.description,
+            creation_date: now,
+            // The hold is not in force the instant the create answers, so it
+            // starts in the non-terminal status AWS reports for a fresh hold and
+            // settles when the clock makes that due.
+            status: crate::state::LEGAL_HOLD_STATUS_CREATING.to_string(),
+            settles_at: now
+                .checked_add(crate::state::LEGAL_HOLD_SETTLE_AFTER)
+                .unwrap_or(now),
+            idempotency_token: input.idempotency_token,
+            recovery_point_selection: selection,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // Nothing has cancelled this hold; `CancelLegalHold` is what records
+            // a cancellation instant, reason and record retention on it.
+            cancellation_date: None,
+            cancel_description: None,
+            retain_record_until: None,
+        };
+        let output = legal_hold_created(&record);
+        store.legal_holds.insert(record.id.clone(), record);
+        Ok(output)
+    }
+}
+
+/// What this operation answers for the legal hold it stored — the same answer a
+/// replayed `IdempotencyToken` gets, so a retry cannot report identifiers that
+/// differ from the ones the first call reported.
+///
+/// Every member comes off the stored record through
+/// [`crate::state::LegalHoldRecord::listed`], the projection a read of the same
+/// hold answers from, so the create and that read cannot disagree.
+fn legal_hold_created(record: &crate::state::LegalHoldRecord) -> CreateLegalHoldOutput {
+    let listed = record.listed();
+    CreateLegalHoldOutput {
+        title: listed.title,
+        status: listed.status,
+        description: listed.description,
+        legal_hold_id: listed.legal_hold_id,
+        legal_hold_arn: listed.legal_hold_arn,
+        creation_date: listed.creation_date,
+        recovery_point_selection: Some(record.recovery_point_selection.clone()),
     }
 }
