@@ -2033,10 +2033,16 @@ pub const MANAGED_THING_RESOURCE_NAME: &str = "Managed Thing";
 /// the resource kind an [`IdempotencyKey`] of a `CreateOtaTaskConfiguration` carries.
 pub const OTA_TASK_CONFIGURATION_RESOURCE_TYPE: &str = "OtaTaskConfiguration";
 
-/// The OTA-task-configuration resource as the subject of its own 404 sentence
+/// The OTA-task-configuration resource as the subject of its READ path's 404 sentence
 /// ([`not_found_for_id_message`]), the way [`MANAGED_THING_RESOURCE_NAME`] is the subject of
 /// a managed thing's.
 pub const OTA_TASK_CONFIGURATION_RESOURCE_SUBJECT: &str = "OTA task configuration";
+
+/// The same resource as the subject of its DELETE path's 404 sentence
+/// ([`failed_to_delete_message`]), which spells it the way that sentence does — the
+/// deleting path words its own refusal, down to how it names the resource, exactly as a
+/// connector destination's mutating path words its own ([`cannot_be_found_message`]).
+pub const OTA_TASK_CONFIGURATION_DELETE_SUBJECT: &str = "Ota task configuration";
 
 /// How a MUTATION of this service states that the resource its `Identifier` named does
 /// not exist: the resource's type, the identifier the request carried, and that it was
@@ -2049,6 +2055,19 @@ pub const OTA_TASK_CONFIGURATION_RESOURCE_SUBJECT: &str = "OTA task configuratio
 /// carries states its 404 through here, so one phrasing serves them all.
 pub fn identifier_not_found_message(resource_type: &str, identifier: &str) -> String {
     format!("{resource_type} for identifier '{identifier}' not found")
+}
+
+/// How a DELETE states that it found nothing to delete: that the delete failed, the
+/// resource it was to remove, and that no such resource exists. No identifier is named, so
+/// the sentence is the same for every request.
+///
+/// The recorded 404 of a `DeleteOtaTaskConfiguration` whose `Identifier` this region holds
+/// no configuration under reads `Failed to delete Ota task configuration, resource does not
+/// exist.` — a different sentence from the one the READ of that same identifier states
+/// ([`not_found_for_id_message`]), so a delete reaches for this rather than reusing its
+/// resource's read-path reason.
+pub fn failed_to_delete_message(resource_subject: &str) -> String {
+    format!("Failed to delete {resource_subject}, resource does not exist.")
 }
 
 /// How a MUTATION states that the resource it was to change does not exist WITHOUT naming
@@ -2254,18 +2273,31 @@ pub fn not_found_for_id_message(resource_subject: &str, identifier: &str) -> Str
     format!("{resource_subject} not found for id: {identifier}")
 }
 
-/// The modelled `ResourceNotFoundException` every operation that resolves an OTA task
-/// configuration by the `Identifier` its request carries answers when this region holds
-/// none: the identifier-quoting reason above, and nothing else.
+/// The modelled `ResourceNotFoundException` a READ of an OTA task configuration answers
+/// when this region holds none under the `Identifier` its request carries: the
+/// identifier-quoting reason above, and nothing else.
 ///
 /// The `ResourceId` and `ResourceType` members stay ABSENT, as they do for an event log
 /// configuration ([`event_log_configuration_not_found`]): the identifier is already in the
 /// reason, and the recorded body carries no other member.
-pub fn ota_task_configuration_not_found(identifier: &str) -> ResourceNotFoundException {
+pub fn ota_task_configuration_not_found_on_read(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(not_found_for_id_message(
             OTA_TASK_CONFIGURATION_RESOURCE_SUBJECT,
             identifier,
+        )),
+        resource_id: None,
+        resource_type: None,
+    }
+}
+
+/// The modelled `ResourceNotFoundException` a DELETE of an OTA task configuration answers
+/// for the same absence: the same empty-membered body with the DELETING path's reason
+/// ([`failed_to_delete_message`]), which names no identifier.
+pub fn ota_task_configuration_not_found_on_delete() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(failed_to_delete_message(
+            OTA_TASK_CONFIGURATION_DELETE_SUBJECT,
         )),
         resource_id: None,
         resource_type: None,

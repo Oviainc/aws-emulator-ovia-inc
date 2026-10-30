@@ -12,11 +12,12 @@
 //! under is that same 404, whatever made it absent — never created, already deleted, or
 //! created in another region — and a request a modelled constraint refuses changes nothing.
 //!
-//! Each resource states its 404 in its own words, which is what a client reads:
-//! an event log configuration's reason is fixed text naming nothing from the request
-//! ([`EVENT_LOG_ABSENT_REASON`]), an OTA task configuration's quotes the identifier
-//! ([`ota_task_absent_reason`]), and neither carries the optional `ResourceId` or
-//! `ResourceType` member of the error shape.
+//! Each resource states its 404 in the words of the PATH that resolved it, which is what a
+//! client reads: an event log configuration's reason is fixed text naming nothing from the
+//! request ([`EVENT_LOG_ABSENT_REASON`]), a READ of an OTA task configuration quotes the
+//! identifier ([`ota_task_absent_reason`]) where a DELETE of one states that it found
+//! nothing to delete ([`OTA_TASK_DELETE_ABSENT_REASON`]), and none of them carries the
+//! optional `ResourceId` or `ResourceType` member of the error shape.
 //!
 //! The recorded units this was derived from (a scoped and a wildcard event log
 //! configuration deleted then read, an OTA task configuration deleted then read, and a
@@ -85,11 +86,17 @@ const EVENT_LOG_ABSENT_REASON: &str = "Event log configuration doesn't exist";
 /// written out here for the same reason.
 const UNSCOPED_RESOURCE_ID: &str = "unknown";
 
-/// The sentence this service states for an absent OTA task configuration: fixed text plus
-/// the identifier the request carried.
+/// The sentence a READ of an absent OTA task configuration states: fixed text plus the
+/// identifier the request carried.
 fn ota_task_absent_reason(identifier: &str) -> String {
     format!("OTA task configuration not found for id: {identifier}")
 }
+
+/// The sentence a DELETE that finds no OTA task configuration to delete states, written out
+/// here for the same reason as the others. It has no variable part, so it is the same for
+/// every request.
+const OTA_TASK_DELETE_ABSENT_REASON: &str =
+    "Failed to delete Ota task configuration, resource does not exist.";
 
 /// One HTTP answer, reduced to what the assertions read.
 struct Reply {
@@ -497,16 +504,15 @@ async fn deleting_an_ota_task_configuration_removes_it_from_the_store() {
             "case {case:?}: the delete must have removed the record under {id:?}"
         );
 
-        let reason = ota_task_absent_reason(&id);
         assert_absent(
             &format!("{case}/get after the delete"),
             &call(&router, "GET", &path, None).await,
-            &reason,
+            &ota_task_absent_reason(&id),
         );
         assert_absent(
             &format!("{case}/second delete"),
             &call(&router, "DELETE", &path, None).await,
-            &reason,
+            OTA_TASK_DELETE_ABSENT_REASON,
         );
 
         // A create repeating the row's `ClientToken` must mint a new record rather than
@@ -702,7 +708,7 @@ async fn a_write_that_resolves_nothing_or_is_refused_changes_nothing() {
                 None,
             )
             .await,
-            &ota_task_absent_reason(unknown),
+            OTA_TASK_DELETE_ABSENT_REASON,
         );
     }
 

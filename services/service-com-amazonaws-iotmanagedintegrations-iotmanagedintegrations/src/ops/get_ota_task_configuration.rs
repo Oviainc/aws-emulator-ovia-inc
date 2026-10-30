@@ -163,10 +163,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let configuration = store
             .ota_task_configuration_in(&region, &input.identifier)
             .ok_or_else(|| {
-                // One sentence states an absent configuration, whatever operation
-                // resolved it: it quotes the identifier the request carried.
+                // The READ path's reason for an absent configuration: it quotes the
+                // identifier the request carried.
                 GetOtaTaskConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::ota_task_configuration_not_found(&input.identifier),
+                    crate::state::ota_task_configuration_not_found_on_read(&input.identifier),
                 )
             })?;
 

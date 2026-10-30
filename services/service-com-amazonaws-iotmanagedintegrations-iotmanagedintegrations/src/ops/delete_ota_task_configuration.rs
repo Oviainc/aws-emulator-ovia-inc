@@ -5,7 +5,8 @@
 //! REMOVES the over-the-air (OTA) task configuration `crate::state`'s
 //! `ota_task_configurations` store holds under the `Identifier` the request names, so every
 //! later read of that identifier resolves to the modelled `ResourceNotFoundException`. An
-//! `Identifier` this region's endpoint holds no configuration under is that same 404.
+//! `Identifier` this region's endpoint holds no configuration under is the modelled
+//! `ResourceNotFoundException` too, worded by this deleting path's own reason.
 //!
 //! ## Shape of an operation
 //!
@@ -193,11 +194,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if !removed {
             audit(&akid, &region, "not-found");
-            // The one sentence this resource's 404s carry, read and mutation alike: it
-            // quotes the identifier the request named.
+            // The DELETING path states its own refusal: that the delete found nothing to
+            // remove, naming no identifier. The read path's identifier-quoting sentence is
+            // its own and is not reused here.
             return Err(
                 DeleteOtaTaskConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::ota_task_configuration_not_found(&input.identifier),
+                    crate::state::ota_task_configuration_not_found_on_delete(),
                 )
                 .into(),
             );
