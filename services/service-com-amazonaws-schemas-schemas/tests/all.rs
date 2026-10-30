@@ -37,6 +37,8 @@ mod discoverer_deletion;
 mod discoverer_state;
 #[path = "all/duplicate_create_refusals.rs"]
 mod duplicate_create_refusals;
+#[path = "all/empty_next_token.rs"]
+mod empty_next_token;
 #[path = "all/empty_response_framing.rs"]
 mod empty_response_framing;
 #[path = "all/empty_result_statuses.rs"]

@@ -3832,6 +3832,14 @@ fn decode_next_token(selection: &str, token: &str, now: SystemTime) -> Option<St
 /// and ages the one it was given, so a token older than [`NEXT_TOKEN_TTL`] resumes
 /// nothing.
 ///
+/// `token` is the `NextToken` the request carried, and a request that carried NONE —
+/// whether the member was absent or present with nothing in it — asks for the FIRST
+/// page: the documentation of every `NextToken` member of this service says the first
+/// page is requested by leaving the token empty, and a parameter sent with an empty
+/// value has been left empty exactly as an omitted one has. That is how the siblings
+/// that select these same listings already read an empty value, so no listing of this
+/// service refuses a value the rest of its members treat as "nothing was sent".
+///
 /// Returns `Err` for a token this service did not mint for this selection, and for
 /// one that has expired — the caller answers that with its own modelled client error.
 pub fn page_by_key<K: AsRef<str>, V>(
@@ -3842,7 +3850,9 @@ pub fn page_by_key<K: AsRef<str>, V>(
     now: SystemTime,
 ) -> Result<Page<V>, InvalidToken> {
     let after = match token {
-        None => None,
+        // No token at all, and a token left empty, both name no position: the page
+        // starts at the beginning of the selection.
+        None | Some("") => None,
         Some(token) => Some(decode_next_token(selection, token, now).ok_or(InvalidToken)?),
     };
     let mut remaining =
@@ -4634,12 +4644,51 @@ mod tests {
         assert!(second.next_token.is_none(), "and terminates");
     }
 
+    /// A token left EMPTY names no position, so the page starts at the beginning of
+    /// the selection — the same page a request carrying no token at all is served.
+    #[test]
+    fn an_empty_token_serves_the_first_page() {
+        let entries = vec![("a", 1), ("b", 2), ("c", 3)];
+        for page_size in [1_usize, 2, 3, 10] {
+            let omitted = page_by_key(
+                entries.clone().into_iter(),
+                SELECTION,
+                None,
+                page_size,
+                served_at(),
+            )
+            .expect("no token at all");
+            let empty = page_by_key(
+                entries.clone().into_iter(),
+                SELECTION,
+                Some(""),
+                page_size,
+                served_at(),
+            )
+            .unwrap_or_else(|_| {
+                panic!("case {page_size}: an empty token must serve the first page")
+            });
+            assert_eq!(
+                empty.items, omitted.items,
+                "case {page_size}: expected the first page {:?}, got {:?}",
+                omitted.items, empty.items
+            );
+            assert_eq!(
+                empty.next_token, omitted.next_token,
+                "case {page_size}: expected the token the first page mints {:?}, got {:?}",
+                omitted.next_token, empty.next_token
+            );
+        }
+    }
+
     /// A token this service did not mint is refused rather than silently restarting
     /// the listing from the top.
     #[test]
     fn a_foreign_token_is_refused() {
         let entries = vec![("a", 1)];
-        for foreign in ["not-a-token", "zz", "6162", "", ".", "..", "6162.6162"] {
+        // The empty value is NOT in this table: a token left empty is no token at
+        // all, and is covered by `an_empty_token_serves_the_first_page`.
+        for foreign in ["not-a-token", "zz", "6162", " ", ".", "..", "6162.6162"] {
             assert!(
                 page_by_key(
                     entries.clone().into_iter(),

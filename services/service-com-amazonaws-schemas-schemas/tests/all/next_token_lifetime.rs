@@ -44,7 +44,10 @@ const LIST_DISCOVERERS_URI: &str = "/v1/discoverers";
 const REGISTRY: &str = "token-lifetime";
 
 /// The `DiscovererId`s one listing answer reports, in the order it lists them.
-fn discoverer_ids(answer: &Answer) -> Vec<String> {
+///
+/// Shared with the sibling suites that page `ListDiscoverers`, so no two of them read
+/// a discoverer listing's items differently.
+pub(crate) fn discoverer_ids(answer: &Answer) -> Vec<String> {
     answer.body["Discoverers"]
         .as_array()
         .unwrap_or_else(|| panic!("expected a Discoverers array in {:?}", answer.body))
