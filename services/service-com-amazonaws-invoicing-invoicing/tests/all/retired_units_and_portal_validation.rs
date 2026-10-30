@@ -697,7 +697,12 @@ fn seed_preference(engine: &Arc<engine::InMemoryEngine>, arn: &str, portal: &str
             supplier_identifier: "AN09876543210".to_string(),
             selector: None,
             procurement_portal_shared_secret: None,
-            procurement_portal_instance_endpoint: None,
+            // The endpoint the test e-invoice of a portal validation is delivered to, so
+            // the send that issues a code can confirm that delivery and answer the
+            // modelled 200 (see `crate::refused_procurement_portal_writes`).
+            procurement_portal_instance_endpoint: Some(
+                "https://portal.example.com/cxml".to_string(),
+            ),
             purchase_order_retrieval_endpoint: None,
             test_env_preference: None,
             einvoice_delivery_enabled: false,

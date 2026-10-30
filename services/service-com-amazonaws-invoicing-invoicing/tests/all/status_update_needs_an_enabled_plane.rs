@@ -22,13 +22,18 @@
 //!   that plane is disabled — with and without a status reason, and with and without the
 //!   other plane enabled and stated in the same request, so the refusal is asserted to
 //!   write neither plane;
-//! * the same statuses asked for again once a configuration write has enabled the plane,
-//!   read back and then re-read after a configuration write that changes nothing about it.
+//! * the statuses a CALLER may carry a plane to, asked for once a configuration write has
+//!   enabled the plane and its validation has been completed, read back and then re-read
+//!   after a configuration write that changes nothing about it.
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
+
+use crate::refused_procurement_portal_writes::{
+    emulator_with_engine, validate_preference, PORTAL_INSTANCE_ENDPOINT,
+};
 
 /// Every value `ProcurementPortalPreferenceStatus` admits (`smithy_query(query="shape",
 /// shape="ProcurementPortalPreferenceStatus")`).
@@ -41,6 +46,11 @@ const STATUS_VALUES: &[&str] = &[
     "ACTIVE",
     "SUSPENDED",
 ];
+
+/// The statuses a CALLER may ask an enabled plane to take once its validation is complete,
+/// in the order the lifecycle reaches them — two of the values above; the rest are the
+/// ones the service assigns itself.
+const CALLER_REQUESTED_STATUSES: &[&str] = &["TEST_INITIALIZED", "ACTIVE"];
 
 /// The status an enabled plane carries until something moves it, one of the values above.
 const PENDING_VERIFICATION: &str = "PENDING_VERIFICATION";
@@ -144,7 +154,9 @@ fn contact(name: &str) -> Value {
     json!([{ "Name": name, "Email": format!("{}@example.com", name.to_lowercase().replace(' ', ".")) }])
 }
 
-/// A create request for one identity, stating the two enable flags under test.
+/// A create request for one identity, stating the two enable flags under test — and the
+/// endpoint the test e-invoice of a portal validation is delivered to, so the send that
+/// issues a code can confirm that delivery.
 fn create_request(
     portal: &str,
     buyer: &str,
@@ -160,6 +172,7 @@ fn create_request(
         "SupplierIdentifier": supplier,
         "EinvoiceDeliveryEnabled": einvoice,
         "PurchaseOrderRetrievalEnabled": purchase_order,
+        "ProcurementPortalInstanceEndpoint": PORTAL_INSTANCE_ENDPOINT,
         "Contacts": contact("Plane Contact"),
     })
 }
@@ -316,16 +329,21 @@ async fn a_status_stated_for_a_disabled_plane_is_refused_and_writes_nothing() {
 /// that leaves that plane's configuration as it was reports the same status and the same
 /// reason.
 ///
-/// The rows are each plane crossed with every status the modelled enum admits: the plane
+/// The rows are each plane crossed with the statuses a CALLER may carry it to: the plane
 /// starts disabled (so the same request is refused), is enabled by a configuration write
-/// (so it reports the unverified starting status), is moved by the status update, and is
+/// (so it reports the unverified starting status), is carried off that status by a
+/// completed validation, is then moved by the status updates the lifecycle provides, and is
 /// read again after a configuration write that changes nothing about it.
 #[tokio::test]
 async fn enabling_a_plane_gives_it_a_status_the_update_moves_and_a_later_write_keeps() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
 
     for (index, (plane, status)) in (0..PLANES.len())
-        .flat_map(|plane| STATUS_VALUES.iter().map(move |status| (plane, *status)))
+        .flat_map(|plane| {
+            CALLER_REQUESTED_STATUSES
+                .iter()
+                .map(move |status| (plane, *status))
+        })
         .enumerate()
     {
         let (label, enabled_member, status_member, reason_member) = PLANES[plane];
@@ -377,15 +395,24 @@ async fn enabling_a_plane_gives_it_a_status_the_update_moves_and_a_later_write_k
             "case {case:?}: a plane nothing has verified reports {PENDING_VERIFICATION}, \
              got {enabled}"
         );
-        let version_before = version(&enabled);
 
-        request[reason_member] = json!(reason);
-        ok(
-            &router,
-            "UpdateProcurementPortalPreferenceStatus",
-            &request,
-        )
-        .await;
+        // A completed validation is what carries a plane off the unverified status, and
+        // only from there can a caller ask for the moves the lifecycle provides.
+        validate_preference(&router, &engine, &arn).await;
+        let walk = CALLER_REQUESTED_STATUSES
+            .iter()
+            .position(|reachable| *reachable == status)
+            .map(|target| &CALLER_REQUESTED_STATUSES[..target + 1])
+            .unwrap_or_else(|| panic!("case {case:?}: the row's status has to be reachable"));
+        let version_before = version(&get_preference(&router, &arn).await);
+
+        for asked_for in walk {
+            request[status_member] = json!(asked_for);
+            if *asked_for == status {
+                request[reason_member] = json!(reason);
+            }
+            ok(&router, "UpdateProcurementPortalPreferenceStatus", &request).await;
+        }
         let moved = get_preference(&router, &arn).await;
         assert_eq!(
             member(&moved, status_member),
@@ -397,10 +424,12 @@ async fn enabling_a_plane_gives_it_a_status_the_update_moves_and_a_later_write_k
             json!(reason),
             "case {case:?}: the plane reports the reason stated with that status, got {moved}"
         );
+        let expected_version = version_before + walk.len() as i64;
         assert_eq!(
             version(&moved),
-            version_before + 1,
-            "case {case:?}: the write advances Version by one, got {}",
+            expected_version,
+            "case {case:?}: each applied write advances Version by one, so it is \
+             {expected_version}, got {}",
             version(&moved)
         );
 

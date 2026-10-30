@@ -14,6 +14,17 @@
 //! An ARN that names no stored preference is the modelled `ResourceNotFoundException`
 //! (HTTP 404) — there is nothing to validate, and no validation state is created for it.
 //!
+//! Issuing the code is one half of what the call does; the other is DELIVERING the test
+//! e-invoice that carries it to the endpoint the preference configures for it, and whether
+//! that delivery can be CONFIRMED is what decides the answer: a delivery is confirmed by
+//! the endpoint it reached, so a preference that configures no endpoint for its test
+//! e-invoice ([`test_einvoice_delivery_endpoint`]) leaves the service with nothing to
+//! confirm and the call answers the modelled `ValidationException` (HTTP 400) stating that
+//! the delivery was not confirmed. The code it issued stays outstanding either way, which
+//! is what that refusal's own remedy rests on: a caller that finds the code in the portal's
+//! rejected-invoice log submits it to `VerifyProcurementPortalValidation` and completes the
+//! verification.
+//!
 //! The code never travels on the wire: the modelled output carries only
 //! `ProcurementPortalPreferenceArn`, because the real service delivers the code through
 //! the procurement portal the preference configures. A caller completes the flow by
@@ -29,12 +40,13 @@
 //! with the ARN the first call returned and issues no second code, so the code that call
 //! issued stays outstanding and the attempts already made against it still count.
 //!
-//! Issuing a code writes no CONFIGURATION: `Version` is "the version number of the
-//! procurement portal preference configuration" and `LastUpdateDate` is when the
-//! preference was last updated, so neither moves here, and no plane's verification status
-//! moves either — nothing has verified the connection until a code comes back. A later
+//! Issuing a code writes no CONFIGURATION: no configuration member moves here, and no
+//! plane's verification status moves either — nothing has verified the connection until a
+//! code comes back. What the call DOES write is the validation state of the preference, so
+//! it advances `Version` and `LastUpdateDate` the way every applied write of this resource
+//! does ([`crate::state::StoredProcurementPortalPreference::record_write`]) — a later
 //! `GetProcurementPortalPreference` / `ListProcurementPortalPreferences` therefore reports
-//! exactly what the last successful configuration write left.
+//! the configuration the last configuration write left, at the version this call produced.
 //!
 //! ## Shape of an operation
 //!
@@ -148,6 +160,90 @@ impl From<SendProcurementPortalValidationErrorModeled> for SendProcurementPortal
     }
 }
 
+/// `ConnectionTestingMethod$TEST_ENV_REPLAY_TEST` — the connection test whose document is
+/// replayed into the procurement portal's TEST environment, one of the two methods a
+/// preference's `EinvoiceDeliveryPreference` states as "the method to use for testing the
+/// connection to the procurement portal" (`smithy_query(query="shape",
+/// shape="EinvoiceDeliveryPreference,ConnectionTestingMethod")`; under the other,
+/// `PROD_ENV_DOLLAR_TEST`, the document goes to the portal the preference itself
+/// configures).
+const CONNECTION_TEST_IN_THE_TEST_ENVIRONMENT: &str = "TEST_ENV_REPLAY_TEST";
+
+/// The endpoint the test e-invoice carrying the issued code is delivered to, or `None` for
+/// a preference that configures none.
+///
+/// Which endpoint that is follows the connection-testing method the preference's
+/// `EinvoiceDeliveryPreference` states: a test REPLAYED into the portal's test environment
+/// goes to that environment's own delivery endpoint
+/// (`TestEnvPreference$ProcurementPortalInstanceEndpoint`, "the endpoint URL where
+/// e-invoices are delivered in the test environment"), and a test document delivered to the
+/// portal the preference itself configures goes to
+/// `ProcurementPortalInstanceEndpoint`, "the endpoint URL where e-invoices are delivered to
+/// the procurement portal" (`smithy_query(query="shape",
+/// shape="ProcurementPortalPreference,TestEnvPreference")`). Both members are optional, so
+/// a preference may state neither.
+fn test_einvoice_delivery_endpoint(preference: &ProcurementPortalPreference) -> Option<&str> {
+    let replayed_into_the_test_environment = preference
+        .einvoice_delivery_preference
+        .as_ref()
+        .is_some_and(|delivery| {
+            delivery.connection_testing_method == CONNECTION_TEST_IN_THE_TEST_ENVIRONMENT
+        });
+    if replayed_into_the_test_environment {
+        return preference
+            .test_env_preference
+            .as_ref()
+            .and_then(|test_env| test_env.procurement_portal_instance_endpoint.as_deref());
+    }
+    preference.procurement_portal_instance_endpoint.as_deref()
+}
+
+/// Whether the service can CONFIRM that the test e-invoice carrying the issued code
+/// reached the procurement portal.
+///
+/// A delivery is confirmed by the endpoint it was delivered TO, so the service can confirm
+/// one only for a preference that configures the endpoint its test e-invoice goes to
+/// ([`test_einvoice_delivery_endpoint`]): a preference that configures none leaves the
+/// service with nowhere to deliver the document and nothing to confirm, and the call
+/// answers the modelled 400 instead of the ARN.
+///
+/// Recorded behaviour: the refusal AWS answers names exactly that outcome — the code "may
+/// have been sent but rejected by your procurement portal's business-rule validation", the
+/// remedy is the portal's rejected-invoice log, and the last resort is to "verify your
+/// portal configuration" ([`TEST_EINVOICE_DELIVERY_NOT_CONFIRMED`]).
+fn test_einvoice_delivery_is_confirmable(preference: &ProcurementPortalPreference) -> bool {
+    test_einvoice_delivery_endpoint(preference).is_some()
+}
+
+/// The sentence a send is refused with when the delivery of the test e-invoice cannot be
+/// confirmed: it states that the delivery was not confirmed, that the code may still have
+/// reached the portal and been rejected by its business-rule validation, where to find it
+/// there, and what to do when it is not there.
+///
+/// Recorded behaviour, and FIXED text for this error class: it reproduces nothing of the
+/// request and nothing of the preference's state — the outcome it reports is the same for
+/// every preference whose connection test the service cannot confirm.
+const TEST_EINVOICE_DELIVERY_NOT_CONFIRMED: &str = "We could not confirm delivery of the test \
+     e-invoice. The OTP may have been sent but rejected by your procurement portal's \
+     business-rule validation. Check your portal's rejected-invoice log for the OTP (for \
+     example, in Coupa open Setup then Integrations then cXML Errors; in SAP Business Network \
+     review your Invoice Rules) and submit it to complete verification. If the OTP is not \
+     there, verify your portal configuration or contact support.";
+
+/// That refusal as this operation's modelled `ValidationException` (HTTP 400), keyed the
+/// way this plane's bodies key their text ([`MessageKey::Capitalised`]).
+fn test_einvoice_delivery_not_confirmed() -> ValidationException {
+    ValidationException {
+        message: Some(TEST_EINVOICE_DELIVERY_NOT_CONFIRMED.to_string()),
+        // `other` is one of the model's `ValidationExceptionReason` values
+        // ([`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]): no member of the
+        // request is at fault — the delivery the call attempted was not confirmed.
+        reason: Some("other".to_string()),
+        message_key: MessageKey::Capitalised,
+        ..Default::default()
+    }
+}
+
 /// The `SendProcurementPortalValidation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -254,11 +350,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names — so the write goes through
         // [`crate::state::StoredProcurementPortalPreference::issue_validation`], which
         // records the code and starts that count again. Nothing of the preference's
-        // CONFIGURATION is touched, so `Version` and `LastUpdateDate` stay at what the
-        // last successful write left them and no plane's verification status moves —
-        // nothing has verified the connection until that code comes back through
-        // `VerifyProcurementPortalValidation`.
+        // CONFIGURATION is touched and no plane's verification status moves — nothing has
+        // verified the connection until that code comes back through
+        // `VerifyProcurementPortalValidation` — but the write itself is one version of the
+        // resource, which that helper records.
         stored.issue_validation(code, issued_at);
+
+        // The code is issued; whether the test e-invoice carrying it got THROUGH to the
+        // portal is the other half of this call, and for a connection test the service
+        // does not drive it cannot be confirmed. The code stays outstanding, because the
+        // refusal's own remedy is to submit the code the portal logged as rejected.
+        if !test_einvoice_delivery_is_confirmable(&stored.preference) {
+            return Err(
+                SendProcurementPortalValidationErrorModeled::ValidationException(
+                    test_einvoice_delivery_not_confirmed(),
+                )
+                .into(),
+            );
+        }
 
         store.record_result(
             Self::NAME,

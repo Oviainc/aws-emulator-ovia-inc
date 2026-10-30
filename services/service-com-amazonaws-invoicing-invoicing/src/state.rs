@@ -41,19 +41,18 @@
 //! computed per read. There is no point-in-time read on this plane, so a DELETE erases
 //! the entry rather than tombstoning it as an invoice unit's delete does.
 //!
-//! `Version` and `LastUpdateDate` are advanced by the calls that SUCCESSFULLY write a
-//! preference's configuration — the create, the configuration update and the status
-//! update — and by nothing else: `Version` is "the version number of the procurement
-//! portal preference configuration", so a call that answered an error wrote no
-//! configuration and leaves both exactly as the last successful write left them. The
-//! validation calls keep their own record of what the flow tried: the code
+//! `Version` and `LastUpdateDate` are advanced by the calls that SUCCESSFULLY WRITE a
+//! preference — the create, the configuration update, the status update, and the
+//! validation calls that record a code or a submission against it — and by nothing else
+//! ([`StoredProcurementPortalPreference::record_write`]): one version per write the
+//! service applied, so a call that answered an error before writing anything leaves both
+//! exactly as the last write left them. What the validation calls write is the code
 //! `SendProcurementPortalValidation` issued ([`IssuedPortalValidation`]) and how many
 //! submissions have been refused since it was issued
 //! ([`StoredProcurementPortalPreference::failed_verification_attempts`], which
 //! [`StoredProcurementPortalPreference::issue_validation`] starts again with each code,
-//! because the budget a refusal reports is one code's). Neither is a
-//! modelled member, so starting or refusing a validation changes nothing a reader
-//! observes.
+//! because the budget a refusal reports is one code's). Neither is a modelled member, so a
+//! reader reports the WRITE those calls performed rather than what they wrote.
 //!
 //! The PORTALS themselves are not stored beside the preferences, because no operation of
 //! this service creates one: they are the catalog [`procurement_portals`] derives from
@@ -563,9 +562,9 @@ pub struct StoredProcurementPortalPreference {
     /// budget it is stated against.
     ///
     /// It is state the service keeps ABOUT the preference and no modelled member reports
-    /// it, so keeping it moves nothing a reader of the preference sees: in particular a
-    /// refused submission leaves `Version` and `LastUpdateDate` alone, because it wrote
-    /// no configuration.
+    /// it, so a reader sees the COUNT itself nowhere; what a reader does see is that the
+    /// submission was recorded, because recording it is a write of the preference
+    /// ([`Self::record_write`]).
     pub failed_verification_attempts: u32,
 }
 
@@ -585,6 +584,33 @@ pub struct IssuedPortalValidation {
 }
 
 impl StoredProcurementPortalPreference {
+    /// Record that this preference was WRITTEN at `at`: the next `Version` and the instant
+    /// the write happened at.
+    ///
+    /// `Version` is "the version number of the procurement portal preference
+    /// configuration" and `LastUpdateDate` is "the date and time when the procurement
+    /// portal preference was last updated" (`smithy_query(query="shape",
+    /// shape="ProcurementPortalPreference")`). That documented wording of `Version` names
+    /// the CONFIGURATION, while the recorded lifecycle counts more than the configuration
+    /// writes: it reports version 4 for a preference after a create, one configuration
+    /// write, a refused send and a refused code submission. So what the pair reports is
+    /// the LAST WRITE this preference took — one version per write the service applied,
+    /// whatever that write touched, and nothing for a call that wrote nothing. RECORDED
+    /// behaviour is the grounding for counting the two validation writes; the model's
+    /// wording does not license them on its own.
+    ///
+    /// Every write of a stored preference goes through here — the configuration writes (the
+    /// create's first version aside, which has no previous one to advance), the status
+    /// update, and the validation writes that record a code or a submission against it —
+    /// so no path can take half of the pair or advance it twice for one write, and a caller
+    /// that compares the version it wrote against the version it reads back is comparing
+    /// one counter. A call the service REFUSES before it writes anything never reaches
+    /// here, which is what keeps a refusal invisible to a later reader.
+    pub fn record_write(&mut self, at: DateTime) {
+        self.preference.version = self.preference.version.saturating_add(1);
+        self.preference.last_update_date = at;
+    }
+
     /// Record `code` as the validation outstanding for this preference, issued at
     /// `issued_at` — the write the call that ISSUES a code performs.
     ///
@@ -595,6 +621,10 @@ impl StoredProcurementPortalPreference {
     /// nothing has been submitted against yet has its whole budget. Every call that
     /// issues a code goes through here, so the fresh code and the fresh count cannot come
     /// apart.
+    ///
+    /// Recording the code is a WRITE of the preference, so it advances the pair
+    /// [`Self::record_write`] keeps, exactly as the writes that state a configuration or a
+    /// status do.
     pub fn issue_validation(&mut self, code: String, issued_at: DateTime) {
         self.validation = Some(IssuedPortalValidation {
             code,
@@ -602,6 +632,7 @@ impl StoredProcurementPortalPreference {
             verified_at: None,
         });
         self.failed_verification_attempts = 0;
+        self.record_write(issued_at);
     }
 
     /// What identifies this preference apart from its ARN: the portal it talks to and
@@ -723,7 +754,7 @@ pub const STATUS_VALIDATED: &str = "VALIDATED";
 
 /// What a COMPLETED portal validation leaves on the preference it validated, in one place:
 /// every plane still waiting for the connection to be verified reports
-/// [`STATUS_VALIDATED`], and the write is dated. Answers whether anything moved.
+/// [`STATUS_VALIDATED`].
 ///
 /// A plane's status is "the current status of the e-invoice delivery preference" / of the
 /// purchase order retrieval preference (`smithy_query(query="shape",
@@ -736,17 +767,17 @@ pub const STATUS_VALIDATED: &str = "VALIDATED";
 /// is "the reason for the current" status, so a plane that moves reports no reason until
 /// one is stated for the status it now holds.
 ///
-/// A plane that moved is a write of the resource, so it advances `Version` and stamps
-/// `LastUpdateDate` exactly as the other write that moves a status does
-/// (`crate::ops::update_procurement_portal_preference_status`) — the two paths to one
-/// status cannot leave a reader disagreeing. A validation that completes with no plane
-/// waiting changed no member a reader reports, so it is no version of the resource.
+/// A plane that moved reports the status it moved to and no reason. Whether any plane
+/// moved decides nothing else: a validation that completes with no plane waiting still
+/// COMPLETED, and the write that records it is the caller's
+/// ([`StoredProcurementPortalPreference::record_write`]) — one version of the resource
+/// either way — so this answers nothing back.
 ///
 /// It lives beside the preference registry rather than in one operation's module for the
 /// reason [`PORTAL_COUPA`] states: it is one rule about the RESOURCE's verification state,
 /// the third face of the rule [`apply_plane_verification_statuses`] and
 /// [`check_plane_enabled_for_status`] hold between them.
-pub fn apply_completed_verification(preference: &mut ProcurementPortalPreference) -> bool {
+pub fn apply_completed_verification(preference: &mut ProcurementPortalPreference) {
     // Each plane as the pair the rule acts on: the status it reports and the reason stated
     // for that status. The fields are disjoint, so both planes are borrowed at once and the
     // rule below is written once for the two of them.
@@ -760,19 +791,131 @@ pub fn apply_completed_verification(preference: &mut ProcurementPortalPreference
             &mut preference.purchase_order_retrieval_preference_status_reason,
         ),
     ];
-    let mut moved = false;
     for (status, reason) in planes {
         if status.as_deref() == Some(STATUS_PENDING_VERIFICATION) {
             *status = Some(STATUS_VALIDATED.to_string());
             *reason = None;
-            moved = true;
         }
     }
-    if moved {
-        preference.version = preference.version.saturating_add(1);
-        preference.last_update_date = now();
+}
+
+/// `ProcurementPortalPreferenceStatus$TEST_INITIALIZED` — the status a plane reports once
+/// the connection test its configuration names has been started. One of the values the
+/// modelled enum admits
+/// ([`crate::ops::types::PROCUREMENT_PORTAL_PREFERENCE_STATUS_VALUES`]).
+pub const STATUS_TEST_INITIALIZED: &str = "TEST_INITIALIZED";
+
+/// `ProcurementPortalPreferenceStatus$TEST_INITIALIZATION_FAILED` — the status a plane
+/// reports when the service could not START that connection test.
+pub const STATUS_TEST_INITIALIZATION_FAILED: &str = "TEST_INITIALIZATION_FAILED";
+
+/// `ProcurementPortalPreferenceStatus$TEST_FAILED` — the status a plane reports when the
+/// connection test ran and did not pass.
+pub const STATUS_TEST_FAILED: &str = "TEST_FAILED";
+
+/// `ProcurementPortalPreferenceStatus$ACTIVE` — the status a plane reports once the
+/// feature it describes is activated.
+pub const STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `ProcurementPortalPreferenceStatus$SUSPENDED` — the status a plane reports once the
+/// service has suspended the feature it describes.
+pub const STATUS_SUSPENDED: &str = "SUSPENDED";
+
+/// The statuses a plane takes because the SERVICE put it there, so a caller cannot ask for
+/// one of them.
+///
+/// `UpdateProcurementPortalPreferenceStatus` is documented as updating the status of a
+/// preference "including the activation state of e-invoice delivery and purchase order
+/// retrieval features" (`smithy_query(query="doc",
+/// shape="UpdateProcurementPortalPreferenceStatus")`), so what a CALLER states through it
+/// is the activation of a feature — asking for the connection test
+/// ([`STATUS_TEST_INITIALIZED`]) and activating what passed it ([`STATUS_ACTIVE`]). Every
+/// other value of the enum reports an outcome the service itself reached: the connection
+/// being unverified or verified ([`STATUS_PENDING_VERIFICATION`], [`STATUS_VALIDATED`],
+/// which this service's own validation flow writes), the test not starting or not passing
+/// ([`STATUS_TEST_INITIALIZATION_FAILED`], [`STATUS_TEST_FAILED`]) and the feature being
+/// suspended ([`STATUS_SUSPENDED`]).
+///
+/// Recorded behaviour: a caller-requested move into a status of this set is refused with
+/// the sentence [`transition_is_awss_to_make`] words, which names the service as the only
+/// one that makes it.
+const SERVICE_ASSIGNED_STATUSES: &[&str] = &[
+    STATUS_PENDING_VERIFICATION,
+    STATUS_VALIDATED,
+    STATUS_TEST_INITIALIZATION_FAILED,
+    STATUS_TEST_FAILED,
+    STATUS_SUSPENDED,
+];
+
+/// The moves a CALLER may ask one plane of a preference to make, as `(from, to)` pairs: the
+/// lifecycle `ProcurementPortalPreferenceStatus` describes, walked by the only two statuses
+/// a caller states ([`SERVICE_ASSIGNED_STATUSES`] names the rest).
+///
+/// A connection test is asked for once the portal connection has been verified, and again
+/// after a test that did not start or did not pass; what passed the test is then activated.
+/// A move this table does not carry is refused with the sentence
+/// [`transition_is_not_allowed`] words.
+const CALLER_REQUESTED_TRANSITIONS: &[(&str, &str)] = &[
+    (STATUS_VALIDATED, STATUS_TEST_INITIALIZED),
+    (STATUS_TEST_INITIALIZATION_FAILED, STATUS_TEST_INITIALIZED),
+    (STATUS_TEST_FAILED, STATUS_TEST_INITIALIZED),
+    (STATUS_TEST_INITIALIZED, STATUS_ACTIVE),
+];
+
+/// The rule sentence a move only the service makes violates: it names the member being
+/// written, the status the plane holds and the status the request asked for.
+fn transition_is_awss_to_make(status_member: &str, current: &str, requested: &str) -> String {
+    format!("Transition of {status_member} from {current} to {requested} can only be done by AWS")
+}
+
+/// The rule sentence a move the lifecycle does not provide violates, worded from the same
+/// three parts.
+fn transition_is_not_allowed(status_member: &str, current: &str, requested: &str) -> String {
+    format!("Transition of {status_member} from {current} to {requested} is not allowed")
+}
+
+/// Which rules a caller-requested move of ONE plane violates, in the order a refusal
+/// states them — empty for a move the caller may ask for.
+///
+/// A plane's status is "the current status of the e-invoice delivery preference" / of the
+/// purchase order retrieval preference (`smithy_query(query="shape",
+/// shape="ProcurementPortalPreference")`), so the statuses are the states of one portal
+/// connection and a request that states one asks for a MOVE between them, out of the status
+/// the preference holds now. Two rules decide whether that move is a caller's to ask for:
+/// the status asked for has to be one a caller states at all
+/// ([`SERVICE_ASSIGNED_STATUSES`]), and the pair has to be a move the lifecycle provides
+/// ([`CALLER_REQUESTED_TRANSITIONS`]). Both are reported when both are violated, which is
+/// how the recorded refusal of a move into a service-assigned status reads.
+///
+/// A request that states the status the plane ALREADY holds asks for no move, so there is
+/// no transition for either rule to be about and it violates neither — it states a reason
+/// for the status the plane holds.
+///
+/// The rule lives beside the preference registry, for the reason [`PORTAL_COUPA`] states:
+/// it is one rule about the RESOURCE's verification state, the fourth face of the rule
+/// [`apply_plane_verification_statuses`], [`apply_completed_verification`] and
+/// [`check_plane_enabled_for_status`] hold between them — the statuses this service's own
+/// validation flow writes are exactly the ones a caller cannot ask for.
+pub fn caller_requested_transition_violations(
+    status_member: &str,
+    current: Option<&str>,
+    requested: &str,
+) -> Vec<String> {
+    // A plane the configuration enables always holds a status
+    // ([`apply_plane_verification_statuses`]); a plane that holds none has had nothing
+    // verified, which is the status a plane starts at.
+    let current = current.unwrap_or(STATUS_PENDING_VERIFICATION);
+    if current == requested {
+        return Vec::new();
     }
-    moved
+    let mut violations = Vec::new();
+    if SERVICE_ASSIGNED_STATUSES.contains(&requested) {
+        violations.push(transition_is_awss_to_make(status_member, current, requested));
+    }
+    if !CALLER_REQUESTED_TRANSITIONS.contains(&(current, requested)) {
+        violations.push(transition_is_not_allowed(status_member, current, requested));
+    }
+    violations
 }
 
 /// The plane a status update may move: the other face of the rule

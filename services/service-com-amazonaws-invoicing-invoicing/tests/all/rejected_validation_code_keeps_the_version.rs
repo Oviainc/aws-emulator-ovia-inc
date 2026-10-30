@@ -1,104 +1,149 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a REFUSED submission of a procurement-portal validation code leaves behind for
-//! the OTHER preferences in the registry, driven end to end over this service's wire
-//! protocol.
+//! The version a REFUSED submission of a procurement-portal validation code leaves is kept
+//! by every later READ of the preference, driven end to end over this service's wire
+//! protocol with the shared harness of `refused_procurement_portal_writes`.
 //!
-//! The rule under test is the one `refused_procurement_portal_writes.rs` states and whose
-//! harness this suite reuses rather than copying: a call that answers an error wrote no
-//! configuration, so it leaves every member a reader reports — `Version` and
-//! `LastUpdateDate` included — exactly as the last SUCCESSFUL write left them
-//! (`smithy_query(query="shape", shape="ProcurementPortalPreference")`: `Version` is "the
-//! version number of the procurement portal preference configuration"). This suite takes
-//! it one resource further out: a refused submission against ONE preference writes nothing
-//! anywhere, so a second preference — at its own version, with a validation code of its
-//! own outstanding — is untouched by it, including when the code submitted is that second
-//! preference's own.
+//! The rule under test: a reader reports the state the last WRITE left and performs none of
+//! its own, so reading a preference — through `GetProcurementPortalPreference`, through the
+//! listing, or through the supplier walk the same preferences feed — can never move the
+//! `Version` or the `LastUpdateDate` a refused submission's recorded attempt left behind
+//! (`smithy_query(query="shape", shape="ProcurementPortalPreference")`: `LastUpdateDate` is
+//! "the date and time when the procurement portal preference was last updated"). Which
+//! preference the refused submission wrote at all is the rule
+//! `rejected_validation_code_leaves_other_preferences_alone` spans.
 //!
-//! The rows are the forms a submitted code can be wrong in; the shared helpers (the
-//! router, the wire call, the create, the reader, and the code issue the portal flow needs)
-//! come from `refused_procurement_portal_writes`, so there is one harness for this plane.
+//! The rows are how many submissions were refused before the reads, so the version held
+//! across them is not one a single attempt happens to leave.
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::refused_procurement_portal_writes::{
-    accepted_update_round, arn_of, call, emulator_with_engine, get_preference, issue_code,
-    minimal_create, ok, outstanding_code, shifted, PORTAL_NAMES,
+    arn_of, call, create_with_confirmable_delivery, emulator_with_engine, get_preference,
+    issue_code, last_update, listed_summary, ok, shifted, version, PORTAL_NAMES,
 };
 
-/// RULE: a refused submission of a validation code writes nothing, so no preference in
-/// the registry moves — not the one the code was submitted for, and not any other.
-///
-/// The rows are the forms a wrong code takes: a digit-shifted copy of the code issued for
-/// the subject, a longer code, a non-digit code, a one-character code, and the code
-/// issued for the bystander preference (wrong for the subject, and no licence to touch
-/// the bystander either).
+/// How many times each row reads the preference back after the refusals: more than once,
+/// because a read that writes is only visible in the SECOND read after it.
+const READS: usize = 3;
+
+/// RULE: a reader of a procurement portal preference reports what the last write left and
+/// writes nothing itself, so the `Version` and `LastUpdateDate` a refused code submission
+/// left are the ones every later read reports — however many reads, and through whichever
+/// reader of the plane.
 #[tokio::test]
-async fn a_rejected_validation_code_leaves_the_other_preferences_alone() {
+async fn the_version_a_rejected_code_left_survives_every_read() {
     let (router, engine) = emulator_with_engine();
 
-    let subject = arn_of(
-        &ok(
-            &router,
-            "CreateProcurementPortalPreference",
-            &minimal_create(PORTAL_NAMES[0], "BUYER-SUBJECT", "SUPPLIER-SUBJECT"),
-        )
-        .await,
-    );
-    let bystander = arn_of(
-        &ok(
-            &router,
-            "CreateProcurementPortalPreference",
-            &minimal_create(PORTAL_NAMES[1], "BUYER-BYSTANDER", "SUPPLIER-BYSTANDER"),
-        )
-        .await,
-    );
-    // One successful write on the bystander, so the version it has to keep is not the one
-    // a create happens to leave.
-    ok(
-        &router,
-        "PutProcurementPortalPreference",
-        &accepted_update_round(&bystander, 1),
-    )
-    .await;
-
-    let issued = issue_code(&router, &engine, &subject).await;
-    let bystanders_code = issue_code(&router, &engine, &bystander).await;
-    let before = get_preference(&router, &bystander).await;
-
-    let wrong_codes = [
-        shifted(&issued),
-        "12345678".to_string(),
-        "not-a-code".to_string(),
-        "7".to_string(),
-        bystanders_code.clone(),
-    ];
-    for wrong in &wrong_codes {
-        assert_ne!(
-            wrong, &issued,
-            "case {wrong:?}: the row's code has to be the wrong one for the subject"
+    for (index, refused_submissions) in [1_usize, 2, 4].into_iter().enumerate() {
+        let portal = PORTAL_NAMES[index % PORTAL_NAMES.len()];
+        let arn = arn_of(
+            &ok(
+                &router,
+                "CreateProcurementPortalPreference",
+                &create_with_confirmable_delivery(
+                    portal,
+                    &format!("BUYER-READS-{index}"),
+                    &format!("SUPPLIER-READS-{index}"),
+                ),
+            )
+            .await,
         );
-        let (status, body) = call(
+        let issued = issue_code(&router, &engine, &arn).await;
+        let wrong = shifted(&issued);
+
+        for attempt in 1..=refused_submissions {
+            let (status, body) = call(
+                &router,
+                "VerifyProcurementPortalValidation",
+                &json!({"ProcurementPortalPreferenceArn": arn, "Code": wrong}),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {portal} attempt {attempt}: expected HTTP 400, got {status} {body}"
+            );
+        }
+
+        // What those refusals left: the create, the issued code and one write per recorded
+        // attempt.
+        let left = get_preference(&router, &arn).await;
+        let expected_version = 2 + refused_submissions as i64;
+        assert_eq!(
+            version(&left),
+            expected_version,
+            "case {portal}: the create, the issued code and {refused_submissions} recorded \
+             attempts leave Version {expected_version}, got {left}"
+        );
+
+        // And no reader moves it, however often it is called.
+        for round in 1..=READS {
+            let read = get_preference(&router, &arn).await;
+            assert_eq!(
+                read, left,
+                "case {portal} read {round}: a read reports what the last write left and \
+                 writes nothing, got {read}"
+            );
+
+            let summary = listed_summary(&router, &arn).await;
+            assert_eq!(
+                version(&summary),
+                version(&left),
+                "case {portal} read {round}: the listing reports the version the read does, \
+                 got {summary}"
+            );
+            assert_eq!(
+                last_update(&summary),
+                last_update(&left),
+                "case {portal} read {round}: the listing reports the instant the read does, \
+                 got {summary}"
+            );
+
+            // The supplier walk is served from the same stored preferences, so it is a
+            // reader of them too.
+            let suppliers = ok(
+                &router,
+                "ListProcurementPortalSuppliers",
+                &json!({"PortalIdentifier": portal.to_ascii_lowercase().replace('_', "-")}),
+            )
+            .await;
+            assert!(
+                suppliers.get("ProcurementPortalSuppliers").is_some(),
+                "case {portal} read {round}: the supplier walk answers a list, got {suppliers}"
+            );
+            let after_walk = get_preference(&router, &arn).await;
+            assert_eq!(
+                after_walk, left,
+                "case {portal} read {round}: walking the suppliers of a portal writes none \
+                 of its preferences, got {after_walk}"
+            );
+        }
+
+        // The code the refusals were measured against is still the outstanding one, so the
+        // reads did not consume it either.
+        let completed = ok(
             &router,
             "VerifyProcurementPortalValidation",
-            &json!({"ProcurementPortalPreferenceArn": subject, "Code": wrong}),
+            &json!({"ProcurementPortalPreferenceArn": arn, "Code": issued}),
         )
         .await;
         assert_eq!(
-            status, 400,
-            "case {wrong:?}: expected HTTP 400, got {status} {body}"
+            arn_of(&completed),
+            arn,
+            "case {portal}: the issued code still completes the validation after the reads, \
+             got {completed}"
         );
-        let after = get_preference(&router, &bystander).await;
+        let after_verify = get_preference(&router, &arn).await;
         assert_eq!(
-            after, before,
-            "case {wrong:?}: another preference's refused submission must not touch this \
-             one, got {after}"
+            version(&after_verify),
+            expected_version + 1,
+            "case {portal}: the completed validation is the next version after what the \
+             reads left, got {after_verify}"
         );
-        assert_eq!(
-            outstanding_code(&engine, &bystander).as_deref(),
-            Some(bystanders_code.as_str()),
-            "case {wrong:?}: another preference's refused submission must not retire this \
-             one's code"
+        assert_ne!(
+            after_verify.get("EinvoiceDeliveryPreferenceStatus"),
+            Option::<&Value>::None,
+            "case {portal}: the validated plane reports a status, got {after_verify}"
         );
     }
 }

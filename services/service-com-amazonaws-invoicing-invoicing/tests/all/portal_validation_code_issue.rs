@@ -24,10 +24,11 @@
 //!   issues no second code, while any other send issues a fresh one;
 //! * a completed validation can be started again: the next send issues a code of its own
 //!   and the consumed one completes nothing;
-//! * issuing a code writes no configuration, so no member a reader reports moves — and
-//!   neither does completing the validation, whose only reported effect is the
-//!   verification status of the planes it validated (the rule
-//!   `completed_validation_moves_the_plane_status` spans).
+//! * issuing a code writes no CONFIGURATION, so no configuration member a reader reports
+//!   moves — what the write does advance is the `Version` and `LastUpdateDate` every
+//!   applied write of the resource advances — and neither does completing the validation,
+//!   whose only reported effect besides those two is the verification status of the planes
+//!   it validated (the rule `completed_validation_moves_the_plane_status` spans).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -38,8 +39,8 @@ use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 use service_com_amazonaws_invoicing_invoicing::state::ComAmazonawsInvoicingInvoicingState;
 
 use crate::refused_procurement_portal_writes::{
-    accepted_update_round, arn_of, call, emulator_with_engine, get_preference, minimal_create, ok,
-    outstanding_code, PORTAL_NAMES,
+    accepted_update_round, arn_of, call, create_with_confirmable_delivery, emulator_with_engine,
+    get_preference, minimal_create, ok, outstanding_code, PORTAL_NAMES,
 };
 
 /// How many decimal digits an issued validation code has: the form
@@ -75,8 +76,8 @@ fn stored_preferences(engine: &Arc<engine::InMemoryEngine>) -> usize {
 
 /// What a reader reports for a preference APART from the members a status write moves:
 /// each plane's verification status and status reason, and the `Version` and
-/// `LastUpdateDate` such a write advances. What is left is the preference's configuration,
-/// which a call of the validation flow never writes.
+/// `LastUpdateDate` every applied write of the resource advances. What is left is the
+/// preference's configuration, which a call of the validation flow never writes.
 fn configuration(preference: &Value) -> Value {
     let mut configuration = preference.clone();
     if let Some(members) = configuration.as_object_mut() {
@@ -169,8 +170,9 @@ fn rows() -> Vec<Row> {
 /// RULE: the call that starts a validation issues the validation code the flow runs on and
 /// records it against the named preference as the outstanding one; the submission of that
 /// code is what completes the validation, and a code an earlier start issued is retired by
-/// the code the next one issues. Issuing writes no configuration, so nothing a reader
-/// reports moves.
+/// the code the next one issues. Recording a code writes no CONFIGURATION, so nothing a
+/// reader reports of it moves — only the `Version` and `LastUpdateDate` every applied write
+/// of the resource advances.
 #[tokio::test]
 async fn every_send_issues_a_code_the_verify_then_accepts() {
     let (router, engine) = emulator_with_engine();
@@ -183,7 +185,7 @@ async fn every_send_issues_a_code_the_verify_then_accepts() {
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &minimal_create(
+                &create_with_confirmable_delivery(
                     row.portal,
                     &format!("BUYER-ISSUE-{index}"),
                     &format!("SUPPLIER-ISSUE-{index}"),
@@ -209,6 +211,8 @@ async fn every_send_issues_a_code_the_verify_then_accepts() {
             row.label,
             row.writes_after_create
         );
+        // Every write that follows, counted as it is made.
+        let mut writes = expected_version;
 
         // Nothing is outstanding before the first send, so no code could be submitted.
         assert_eq!(
@@ -228,6 +232,7 @@ async fn every_send_issues_a_code_the_verify_then_accepts() {
                 &json!({"ProcurementPortalPreferenceArn": arn}),
             )
             .await;
+            writes += 1;
             let issued = outstanding_code(&engine, &arn)
                 .unwrap_or_else(|| panic!("case {case}: the send must issue a code"));
             assert_eq!(
@@ -249,13 +254,21 @@ async fn every_send_issues_a_code_the_verify_then_accepts() {
             outstanding = issued;
         }
 
-        // Issuing codes wrote no configuration: `Version` is "the version number of the
-        // procurement portal preference configuration", and these calls wrote none.
+        // Issuing codes wrote no configuration: what the sends advanced is the version
+        // every applied write of this resource advances, and nothing else a reader reports.
         let after_sends = get_preference(&router, &arn).await;
         assert_eq!(
-            after_sends, before,
-            "case {}: issuing a code must leave every reported member as it was, got \
+            configuration(&after_sends),
+            configuration(&before),
+            "case {}: issuing a code must leave every configuration member as it was, got \
              {after_sends}",
+            row.label
+        );
+        assert_eq!(
+            version(&after_sends),
+            writes,
+            "case {}: each issued code is one version of the resource, so Version is \
+             {writes}, got {after_sends}",
             row.label
         );
 
@@ -268,6 +281,7 @@ async fn every_send_issues_a_code_the_verify_then_accepts() {
                 &json!({"ProcurementPortalPreferenceArn": arn, "Code": stale}),
             )
             .await;
+            writes += 1;
             assert_eq!(
                 status, 400,
                 "case {} / a retired code: expected HTTP 400, got {status} {body}",
@@ -288,6 +302,7 @@ async fn every_send_issues_a_code_the_verify_then_accepts() {
             &json!({"ProcurementPortalPreferenceArn": arn, "Code": outstanding}),
         )
         .await;
+        writes += 1;
         assert_eq!(
             arn_of(&completed),
             arn,
@@ -331,9 +346,9 @@ async fn every_send_issues_a_code_the_verify_then_accepts() {
         }
         assert_eq!(
             version(&after_verify),
-            expected_version + 1,
-            "case {}: the status write a completed validation performs is one version of \
-             the resource, got {after_verify}",
+            writes,
+            "case {}: the completed validation is one more version of the resource, so \
+             Version is {writes}, got {after_verify}",
             row.label
         );
     }
@@ -360,7 +375,7 @@ async fn a_replayed_send_issues_no_second_code() {
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &minimal_create(
+                &create_with_confirmable_delivery(
                     PORTAL_NAMES[index % PORTAL_NAMES.len()],
                     &format!("BUYER-REPLAY-{index}"),
                     &format!("SUPPLIER-REPLAY-{index}"),
@@ -434,7 +449,7 @@ async fn a_completed_validation_can_be_started_again() {
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &minimal_create(
+                &create_with_confirmable_delivery(
                     portal,
                     &format!("BUYER-REDO-{index}"),
                     &format!("SUPPLIER-REDO-{index}"),

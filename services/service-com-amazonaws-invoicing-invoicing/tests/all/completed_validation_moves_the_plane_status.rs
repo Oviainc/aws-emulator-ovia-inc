@@ -21,18 +21,19 @@
 //!   validated status and reports no reason for it, leaves a plane the configuration
 //!   disables without a status at all, and writes no configuration — over every
 //!   combination of the two enable flags, in the single-resource read and in the listing;
-//! * a status an explicit status update already carried past the unverified one is KEPT,
-//!   with its reason, by a later completed validation — over every status the enum admits
-//!   and both planes;
-//! * the write a completed validation performs is one version of the resource exactly when
-//!   a plane moved: a validation completed with no plane awaiting verification advances
-//!   neither `Version` nor `LastUpdateDate`.
+//! * a status a caller already carried past the unverified one is KEPT, with its reason, by
+//!   a later completed validation — over the statuses a caller can carry a plane to and
+//!   both planes;
+//! * each call of the flow is one version of the resource: the send that issues the code
+//!   and the verify that completes the validation each write it once, whether or not a
+//!   plane moved.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
 use crate::refused_procurement_portal_writes::{
-    arn_of, emulator_with_engine, get_preference, issue_code, ok, PORTAL_NAMES,
+    accepted_update_round, arn_of, emulator_with_engine, get_preference, issue_code, ok,
+    without_write_markers, PORTAL_INSTANCE_ENDPOINT, PORTAL_NAMES,
 };
 
 /// The status an enabled plane holds while nothing has verified its portal connection, and
@@ -42,18 +43,13 @@ use crate::refused_procurement_portal_writes::{
 const PENDING_VERIFICATION: &str = "PENDING_VERIFICATION";
 const VALIDATED: &str = "VALIDATED";
 
-/// Every value `ProcurementPortalPreferenceStatus` admits (`smithy_query(query="shape",
-/// shape="ProcurementPortalPreferenceStatus")`), so the rule is asserted on statuses this
-/// flow does not itself produce as well as on the two it moves between.
-const STATUS_VALUES: &[&str] = &[
-    "PENDING_VERIFICATION",
-    "VALIDATED",
-    "TEST_INITIALIZED",
-    "TEST_INITIALIZATION_FAILED",
-    "TEST_FAILED",
-    "ACTIVE",
-    "SUSPENDED",
-];
+/// The statuses a CALLER can carry a plane to, in the order the lifecycle reaches them:
+/// the validated status a completed validation leaves, then the connection test a caller
+/// asks for and the activation that follows it. The rest of the enum — the unverified
+/// status, the two test failures and the suspension — is what the service assigns itself,
+/// so no status update can put a plane there (`smithy_query(query="shape",
+/// shape="ProcurementPortalPreferenceStatus")` lists all seven).
+const CALLER_REACHABLE_STATUSES: &[&str] = &[VALIDATED, "TEST_INITIALIZED", "ACTIVE"];
 
 /// The two planes of a preference, each as the members the model spells for it: a label,
 /// the flag that enables the plane, its status and its status reason.
@@ -80,7 +76,9 @@ fn contact(name: &str) -> Value {
     json!([{ "Name": name, "Email": format!("{}@example.com", name.to_lowercase().replace(' ', ".")) }])
 }
 
-/// A create request for one identity, stating the two enable flags under test.
+/// A create request for one identity, stating the two enable flags under test — and the
+/// endpoint the test e-invoice of a portal validation is delivered to, so the send that
+/// issues a code can confirm that delivery.
 fn create_request(
     portal: &str,
     buyer: &str,
@@ -96,6 +94,7 @@ fn create_request(
         "SupplierIdentifier": supplier,
         "EinvoiceDeliveryEnabled": einvoice,
         "PurchaseOrderRetrievalEnabled": purchase_order,
+        "ProcurementPortalInstanceEndpoint": PORTAL_INSTANCE_ENDPOINT,
         "Contacts": contact("Initial Contact"),
     })
 }
@@ -272,53 +271,50 @@ async fn completing_a_validation_validates_every_plane_awaiting_verification() {
             "case {case}: completing a validation writes no configuration, got {after}"
         );
 
-        // The status write is one version of the resource, and only when a plane moved:
-        // the configuration that enables neither plane has nothing to verify.
-        let moved = *einvoice || *purchase_order;
-        let expected_version = version(&before) + i64::from(moved);
+        // The status write is one version of the resource, and so is the code the send
+        // issued: two calls of the flow, two writes, whether or not a plane moved.
+        let expected_version = version(&before) + 2;
         assert_eq!(
             version(&after),
             expected_version,
             "case {case}: expected Version {expected_version} after the verify, got {after}"
         );
-        if moved {
-            assert!(
-                last_update_date(&after) >= last_update_date(&before),
-                "case {case}: a status the verify moved dates the resource at or after the \
-                 last write, got {:?} against {:?}",
-                last_update_date(&after),
-                last_update_date(&before)
-            );
-        } else {
-            assert_eq!(
-                last_update_date(&after),
-                last_update_date(&before),
-                "case {case}: a validation that moved no plane is no update of the resource, \
-                 got {after}"
-            );
-        }
+        assert!(
+            last_update_date(&after) >= last_update_date(&before),
+            "case {case}: the calls of the flow date the resource at or after the last \
+             write, got {:?} against {:?}",
+            last_update_date(&after),
+            last_update_date(&before)
+        );
     }
 }
 
 /// RULE: a completed verification carries a plane off the UNVERIFIED status only — a plane
-/// whose status an explicit status update already carried elsewhere keeps that status and
-/// the reason stated with it, so completing a verification never walks a plane's state
-/// backwards.
+/// a caller already carried further along the lifecycle keeps that status and the reason
+/// stated with it, so completing a verification never walks a plane's state backwards.
 ///
-/// The rows are each plane crossed with every status the modelled enum admits, the plane's
-/// partner left awaiting verification, so what the verify moves and what it keeps are both
-/// asserted on every row.
+/// The rows are each plane crossed with every status a CALLER can carry it to
+/// ([`CALLER_REACHABLE_STATUSES`]), its partner plane left disabled at the create and
+/// enabled again afterwards so that it IS awaiting verification when the second validation
+/// completes — what the verify moves and what it keeps are therefore both asserted on every
+/// row.
 #[tokio::test]
 async fn a_completed_validation_keeps_a_status_moved_past_the_unverified_one() {
     let (router, engine) = emulator_with_engine();
 
     for (index, (plane, moved_to)) in (0..PLANES.len())
-        .flat_map(|plane| STATUS_VALUES.iter().map(move |status| (plane, *status)))
+        .flat_map(|plane| {
+            CALLER_REACHABLE_STATUSES
+                .iter()
+                .map(move |status| (plane, *status))
+        })
         .enumerate()
     {
         let (label, _, status_member, reason_member) = PLANES[plane];
         let other = 1 - plane;
         let portal = PORTAL_NAMES[index % PORTAL_NAMES.len()];
+        // Only the row's plane is enabled to start with, so the first validation moves it
+        // alone and its partner has a status only once a configuration write enables it.
         let arn = arn_of(
             &ok(
                 &router,
@@ -327,8 +323,8 @@ async fn a_completed_validation_keeps_a_status_moved_past_the_unverified_one() {
                     portal,
                     &format!("BUYER-MOVED-{index}"),
                     &format!("SUPPLIER-MOVED-{index}"),
-                    true,
-                    true,
+                    plane == 0,
+                    plane == 1,
                 ),
             )
             .await,
@@ -336,52 +332,69 @@ async fn a_completed_validation_keeps_a_status_moved_past_the_unverified_one() {
         let case = format!("{label} at {moved_to} on {portal}");
         let reason = format!("{label} was moved to {moved_to} for this case");
 
-        let mut update = json!({"ProcurementPortalPreferenceArn": arn});
-        update[status_member] = json!(moved_to);
-        update[reason_member] = json!(reason);
+        // The validated status is where a completed validation leaves the plane; the
+        // statuses past it are the moves a caller asks for, one update each.
+        complete_validation(&router, &engine, &arn).await;
+        let target = CALLER_REACHABLE_STATUSES
+            .iter()
+            .position(|status| *status == moved_to)
+            .unwrap_or_else(|| panic!("case {case}: the row's status has to be reachable"));
+        let walk = &CALLER_REACHABLE_STATUSES[1..target + 1];
+        for status in walk {
+            let mut update = json!({"ProcurementPortalPreferenceArn": arn});
+            update[status_member] = json!(status);
+            if *status == moved_to {
+                update[reason_member] = json!(reason);
+            }
+            ok(&router, "UpdateProcurementPortalPreferenceStatus", &update).await;
+        }
+        // The reason a reader reports is the one stated with the update that set the
+        // current status, so a plane the validation alone carried reports none.
+        let expected_reason = (!walk.is_empty()).then_some(reason.as_str());
+
+        // Enabling the partner plane gives it the unverified status, which is what the
+        // next completed validation has to move while the row's plane keeps what it holds.
         ok(
             &router,
-            "UpdateProcurementPortalPreferenceStatus",
-            &update,
+            "PutProcurementPortalPreference",
+            &accepted_update_round(&arn, index as i64),
         )
         .await;
         let before = get_preference(&router, &arn).await;
+        assert_plane_state(
+            &case,
+            &before,
+            "read before the second verify",
+            other,
+            (Some(PENDING_VERIFICATION), None),
+        );
         let version_before = version(&before);
 
         complete_validation(&router, &engine, &arn).await;
 
-        // The plane the update moved keeps what the update stated, unless that update left
-        // it at the unverified status — in which case this verification is what carries it
-        // off it, and the reason stated for the status it left does not follow it.
-        let kept = moved_to != PENDING_VERIFICATION;
-        let expected = if kept {
-            (moved_to, Some(reason.as_str()))
-        } else {
-            (VALIDATED, None)
-        };
         let after = get_preference(&router, &arn).await;
         let summary = summary_of(&router, &arn).await;
         for (reader, reported) in [("read", &after), ("listing", &summary)] {
-            assert_plane_state(&case, reported, reader, plane, (Some(expected.0), expected.1));
+            assert_plane_state(&case, reported, reader, plane, (Some(moved_to), expected_reason));
             // The partner plane was awaiting verification, so this verification moved it.
             assert_plane_state(&case, reported, reader, other, (Some(VALIDATED), None));
         }
 
-        // One write per completed validation that moved a plane, whether it moved one plane
-        // or both.
+        // Two calls of the flow, two writes of the resource.
         assert_eq!(
             version(&after),
-            version_before + 1,
-            "case {case}: expected Version {} after the verify, got {after}",
-            version_before + 1
+            version_before + 2,
+            "case {case}: expected Version {} after the second verify, got {after}",
+            version_before + 2
         );
 
-        // A SECOND completed validation finds no plane awaiting verification, so it moves
-        // nothing a reader reports.
+        // A THIRD completed validation finds no plane awaiting verification, so it moves
+        // nothing a reader reports beyond the two members its own writes advance.
         complete_validation(&router, &engine, &arn).await;
         let after_again = get_preference(&router, &arn).await;
         assert_eq!(
-            after_again, after,
+            without_write_markers(&after_again),
+            without_write_markers(&after),
             "case {case}: a validation completed with no plane awaiting verification moves \
              nothing, got {after_again}"
         );

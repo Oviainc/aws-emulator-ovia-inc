@@ -305,10 +305,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // configuration" (`smithy_query(query="doc",
             // shape="ProcurementPortalPreference", member="Version")`), so a write of that
             // configuration reports the next one, and `LastUpdateDate` is the instant it
-            // changed at. `CreateDate` is not touched: when a resource was created does
-            // not change because it was updated.
-            preference.version = preference.version.saturating_add(1);
-            preference.last_update_date = updated_at;
+            // changed at: the one pair every applied write of this resource advances
+            // (`crate::state::StoredProcurementPortalPreference::record_write`, which also
+            // states what grounds the writes beyond the configuration ones).
+            // `CreateDate` is not touched: when a resource was created does not change
+            // because it was updated.
+            stored.record_write(updated_at);
         }
 
         Ok(PutProcurementPortalPreferenceOutput {

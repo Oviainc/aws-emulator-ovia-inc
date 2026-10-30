@@ -26,8 +26,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
 use crate::refused_procurement_portal_writes::{
-    arn_of, call, emulator_with_engine, error_code, error_text, invalid_code_sentence, issue_code,
-    minimal_create, ok, outstanding_code, shifted, PORTAL_NAMES, VERIFICATION_ATTEMPT_BUDGET,
+    arn_of, call, create_with_confirmable_delivery, emulator_with_engine, error_code, error_text,
+    get_preference, invalid_code_sentence, issue_code, ok, outstanding_code, shifted, version,
+    without_write_markers, PORTAL_NAMES, VERIFICATION_ATTEMPT_BUDGET,
 };
 
 /// How many submissions one round refuses: one past the budget, so each round also shows
@@ -168,7 +169,7 @@ async fn a_freshly_issued_code_is_refused_from_the_first_attempt() {
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &minimal_create(
+                &create_with_confirmable_delivery(
                     row.portal,
                     &format!("BUYER-BUDGET-{index}"),
                     &format!("SUPPLIER-BUDGET-{index}"),
@@ -285,7 +286,7 @@ async fn a_replayed_send_starts_no_fresh_budget() {
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &minimal_create(
+                &create_with_confirmable_delivery(
                     PORTAL_NAMES[index % PORTAL_NAMES.len()],
                     &format!("BUYER-REPLAY-BUDGET-{index}"),
                     &format!("SUPPLIER-REPLAY-BUDGET-{index}"),
@@ -352,19 +353,22 @@ async fn a_fresh_code_restarts_only_its_own_preferences_count() {
     let (router, engine) = emulator_with_engine();
 
     let mut arns: Vec<String> = Vec::new();
+    let mut created: Vec<Value> = Vec::new();
     for (index, portal) in PORTAL_NAMES.iter().enumerate() {
-        arns.push(arn_of(
+        let arn = arn_of(
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &minimal_create(
+                &create_with_confirmable_delivery(
                     portal,
                     &format!("BUYER-ISOLATED-{index}"),
                     &format!("SUPPLIER-ISOLATED-{index}"),
                 ),
             )
             .await,
-        ));
+        );
+        created.push(get_preference(&router, &arn).await);
+        arns.push(arn);
     }
 
     // Every preference spends its budget against the code issued for it.
@@ -408,23 +412,29 @@ async fn a_fresh_code_restarts_only_its_own_preferences_count() {
         .await;
     }
 
-    // And no preference's reported configuration moved under any of it.
+    // And no preference's reported CONFIGURATION moved under any of it, while the version
+    // each one reports counts the writes that preference took.
     for (index, arn) in arns.iter().enumerate() {
-        let body = ok(
-            &router,
-            "GetProcurementPortalPreference",
-            &json!({"ProcurementPortalPreferenceArn": arn}),
-        )
-        .await;
-        let version = body
-            .get("ProcurementPortalPreference")
-            .and_then(|preference| preference.get("Version"))
-            .and_then(Value::as_i64);
+        let reported = get_preference(&router, arn).await;
         assert_eq!(
-            version,
-            Some(1),
+            without_write_markers(&reported),
+            without_write_markers(&created[index]),
             "case preference {index}: a refused submission and a fresh code write no \
-             configuration, got {body}"
+             configuration, got {reported}"
+        );
+        let writes = 1 // the create
+            + 1 // the code issued for this preference
+            + i64::from(VERIFICATION_ATTEMPT_BUDGET) // the submissions refused against it
+            + if index == refreshed {
+                2 // its fresh code, and the submission refused against that
+            } else {
+                1 // the submission refused after another preference's fresh code
+            };
+        assert_eq!(
+            version(&reported),
+            writes,
+            "case preference {index}: expected Version {writes}, one per write it took, got \
+             {reported}"
         );
     }
 }

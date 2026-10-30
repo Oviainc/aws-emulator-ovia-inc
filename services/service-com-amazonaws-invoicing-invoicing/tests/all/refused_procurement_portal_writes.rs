@@ -8,20 +8,21 @@
 //! The rule under test: `ProcurementPortalPreference$Version` is "the version number of
 //! the procurement portal preference configuration" and `LastUpdateDate` is "the date and
 //! time when the procurement portal preference was last updated"
-//! (`smithy_query(query="shape", shape="ProcurementPortalPreference")`), so a call that
-//! answers an error wrote no configuration and leaves BOTH exactly as the last successful
-//! write left them — however many times it is repeated. The version a reader sees is
-//! therefore one plus the number of calls that successfully wrote the resource, and no
-//! refusal of any operation on this plane shifts it.
+//! (`smithy_query(query="shape", shape="ProcurementPortalPreference")`), so a call the
+//! service refuses BEFORE it writes anything leaves BOTH exactly as the last write left
+//! them — however many times it is repeated. The version a reader sees is therefore one
+//! plus the number of calls that wrote the resource, and a refusal that wrote nothing never
+//! shifts it.
 //!
 //! Each test is a table rather than one request: the rows span the refusal classes this
-//! plane answers (the code submission, the configuration update, the status update and a
-//! conflicting create — 400 and 409 alike), the portals a preference can route to, the
-//! ORDER refusals and successful calls arrive in, and — for the validation flow, whose
-//! refusal keeps a failed-attempt count of its own — whether a validation code is
-//! OUTSTANDING when the submitted one is refused. A code is made outstanding through the
-//! call that issues one, `SendProcurementPortalValidation`, and then read from state,
-//! because the modelled response carries only the ARN.
+//! plane answers (the configuration update, the status update — its empty request, its
+//! unmodelled status and the transitions a caller may not ask for — and a conflicting
+//! create: 400 and 409 alike), the portals a preference can route to, the ORDER refusals
+//! and successful calls arrive in, and — for the validation flow, whose refusal keeps a
+//! failed-attempt count of its own — whether a validation code is OUTSTANDING when the
+//! submitted one is refused. A code is made outstanding through the call that issues one,
+//! `SendProcurementPortalValidation`, and then read from state, because the modelled
+//! response carries only the ARN.
 
 use std::sync::Arc;
 
@@ -43,6 +44,10 @@ const PORTAL_REQUIRING_PUNCH_OUT_CONFIG: &str = "COUPA";
 /// `ProcurementPortalPreferenceStatus` admits (`smithy_query(query="shape",
 /// shape="ProcurementPortalPreferenceStatus")`).
 const STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The status a plane reports once the connection test its configuration names has been
+/// started — the move a caller may ask for out of the validated status.
+pub(crate) const STATUS_TEST_INITIALIZED: &str = "TEST_INITIALIZED";
 
 /// How many submissions of a validation code a refusal of this service counts against —
 /// the budget AWS's recorded refusal states.
@@ -146,6 +151,39 @@ pub(crate) fn minimal_create(portal: &str, buyer: &str, supplier: &str) -> Value
     })
 }
 
+/// The endpoint a preference configures as "the endpoint URL where e-invoices are delivered
+/// to the procurement portal" (`ProcurementPortalInstanceEndpoint`,
+/// `smithy_query(query="shape", shape="ProcurementPortalPreference")`), inside that
+/// member's `^\S+$`.
+pub(crate) const PORTAL_INSTANCE_ENDPOINT: &str = "https://portal.example.com/cxml";
+
+/// A create request like [`minimal_create`], configuring in addition the endpoint the test
+/// e-invoice of a portal validation is delivered to — so the service can CONFIRM that
+/// delivery and `SendProcurementPortalValidation` answers the modelled 200 rather than the
+/// delivery-unconfirmed refusal.
+pub(crate) fn create_with_confirmable_delivery(portal: &str, buyer: &str, supplier: &str) -> Value {
+    let mut request = minimal_create(portal, buyer, supplier);
+    request["ProcurementPortalInstanceEndpoint"] = json!(PORTAL_INSTANCE_ENDPOINT);
+    request
+}
+
+/// Carry every enabled plane of `arn` to [`STATUS_VALIDATED`] by completing its portal
+/// validation — the path a caller has to the statuses a status update may then ask for,
+/// because the statuses the service assigns itself are not a caller's to state.
+pub(crate) async fn validate_preference(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    arn: &str,
+) {
+    let code = issue_code(router, engine, arn).await;
+    ok(
+        router,
+        "VerifyProcurementPortalValidation",
+        &json!({"ProcurementPortalPreferenceArn": arn, "Code": code}),
+    )
+    .await;
+}
+
 /// The preference `arn` names, as `GetProcurementPortalPreference` reports it.
 pub(crate) async fn get_preference(router: &MultiServiceRouter, arn: &str) -> Value {
     let body = ok(
@@ -161,7 +199,7 @@ pub(crate) async fn get_preference(router: &MultiServiceRouter, arn: &str) -> Va
 
 /// The summary `ListProcurementPortalPreferences` reports for `arn`, so a refusal is
 /// checked against both readers of this plane rather than only the single-resource one.
-async fn listed_summary(router: &MultiServiceRouter, arn: &str) -> Value {
+pub(crate) async fn listed_summary(router: &MultiServiceRouter, arn: &str) -> Value {
     let body = ok(router, "ListProcurementPortalPreferences", &json!({})).await;
     body.get("ProcurementPortalPreferences")
         .and_then(Value::as_array)
@@ -178,7 +216,7 @@ async fn listed_summary(router: &MultiServiceRouter, arn: &str) -> Value {
 }
 
 /// The reported `Version` of a preference or its summary.
-fn version(preference: &Value) -> i64 {
+pub(crate) fn version(preference: &Value) -> i64 {
     preference
         .get("Version")
         .and_then(Value::as_i64)
@@ -186,11 +224,23 @@ fn version(preference: &Value) -> i64 {
 }
 
 /// The reported `LastUpdateDate`, as the epoch-seconds number it travels as.
-fn last_update(preference: &Value) -> f64 {
+pub(crate) fn last_update(preference: &Value) -> f64 {
     preference
         .get("LastUpdateDate")
         .and_then(Value::as_f64)
         .unwrap_or_else(|| panic!("expected a LastUpdateDate in {preference}"))
+}
+
+/// A reported preference WITHOUT the two members a write of it advances, so what is left
+/// is everything a write has to leave alone.
+pub(crate) fn without_write_markers(preference: &Value) -> Value {
+    let mut stripped = preference.clone();
+    if let Some(members) = stripped.as_object_mut() {
+        for advanced_by_every_write in ["Version", "LastUpdateDate"] {
+            members.remove(advanced_by_every_write);
+        }
+    }
+    stripped
 }
 
 /// The preference one row drives its calls against: its ARN and the identity it holds,
@@ -251,12 +301,6 @@ fn verify_unissued_code(subject: &Subject) -> Value {
     json!({"ProcurementPortalPreferenceArn": subject.arn, "Code": "123456"})
 }
 
-/// The same submission with a code of another shape, so nothing here is keyed to one
-/// code's form.
-fn verify_unissued_code_of_another_shape(subject: &Subject) -> Value {
-    json!({"ProcurementPortalPreferenceArn": subject.arn, "Code": "a-code-nothing-issued"})
-}
-
 /// A status update that states no plane's status, so it asks for no update.
 fn status_update_stating_nothing(subject: &Subject) -> Value {
     json!({"ProcurementPortalPreferenceArn": subject.arn})
@@ -278,31 +322,35 @@ fn status_update_outside_the_enum(subject: &Subject) -> Value {
     })
 }
 
+/// A status update asking a plane to take a status the SERVICE assigns itself, which is
+/// not a caller's to state.
+fn status_update_into_a_service_assigned_status(subject: &Subject) -> Value {
+    json!({
+        "ProcurementPortalPreferenceArn": subject.arn,
+        "EinvoiceDeliveryPreferenceStatus": "SUSPENDED",
+        "EinvoiceDeliveryPreferenceStatusReason": "a suspension the caller asked for",
+    })
+}
+
+/// A status update asking for a move the lifecycle does not provide out of the status the
+/// preference holds, to a status a caller does state for a plane that reached it.
+fn status_update_into_an_unreachable_status(subject: &Subject) -> Value {
+    json!({
+        "ProcurementPortalPreferenceArn": subject.arn,
+        "PurchaseOrderRetrievalPreferenceStatus": STATUS_ACTIVE,
+    })
+}
+
 /// A create of the identity the subject preference already holds, which is the conflict a
 /// second create of one resource is.
 fn conflicting_create(subject: &Subject) -> Value {
     minimal_create(subject.portal, &subject.buyer, &subject.supplier)
 }
 
-/// Every refusal class this plane answers for a preference that EXISTS, one row each.
+/// Every refusal class this plane answers for a preference that EXISTS and that the
+/// service refuses BEFORE writing anything, one row each.
 fn refusal_classes() -> Vec<Refusal> {
     vec![
-        Refusal {
-            label: "a code submitted while none is outstanding",
-            portal: PORTAL_NAMES[2],
-            operation: "VerifyProcurementPortalValidation",
-            request: verify_unissued_code,
-            http_status: 400,
-            error_code: "ValidationException",
-        },
-        Refusal {
-            label: "a submitted code of another shape",
-            portal: PORTAL_NAMES[0],
-            operation: "VerifyProcurementPortalValidation",
-            request: verify_unissued_code_of_another_shape,
-            http_status: 400,
-            error_code: "ValidationException",
-        },
         Refusal {
             label: "a status update stating no plane",
             portal: PORTAL_NAMES[1],
@@ -324,6 +372,22 @@ fn refusal_classes() -> Vec<Refusal> {
             portal: PORTAL_NAMES[3],
             operation: "UpdateProcurementPortalPreferenceStatus",
             request: status_update_outside_the_enum,
+            http_status: 400,
+            error_code: "ValidationException",
+        },
+        Refusal {
+            label: "a status update into a status the service assigns itself",
+            portal: PORTAL_NAMES[0],
+            operation: "UpdateProcurementPortalPreferenceStatus",
+            request: status_update_into_a_service_assigned_status,
+            http_status: 400,
+            error_code: "ValidationException",
+        },
+        Refusal {
+            label: "a status update into a status the lifecycle does not reach from here",
+            portal: PORTAL_NAMES[1],
+            operation: "UpdateProcurementPortalPreferenceStatus",
+            request: status_update_into_an_unreachable_status,
             http_status: 400,
             error_code: "ValidationException",
         },
@@ -378,14 +442,15 @@ async fn subject_at_version_two(
     subject
 }
 
-/// RULE: a call that answers an error writes no configuration, so it leaves every member
-/// a reader reports — `Version` and `LastUpdateDate` included — exactly as the last
-/// SUCCESSFUL write left them, however many times that call is repeated.
+/// RULE: a call the service refuses BEFORE it writes anything leaves every member a reader
+/// reports — `Version` and `LastUpdateDate` included — exactly as the last write left them,
+/// however many times that call is repeated.
 ///
 /// The rows are the refusal classes this plane answers for a preference that exists: the
-/// code submission's two, the status update's three, the configuration update's, and a
-/// conflicting create (a 409, so the rule is not read as being about 400 alone), spread
-/// across the portals `ProcurementPortalName` admits.
+/// status update's five (its empty request, a reason without its status, a status outside
+/// the modelled enum, and the two kinds of move a caller may not ask for), the
+/// configuration update's, and a conflicting create (a 409, so the rule is not read as
+/// being about 400 alone), spread across the portals `ProcurementPortalName` admits.
 #[tokio::test]
 async fn a_refused_call_leaves_the_preference_where_the_last_successful_write_left_it() {
     let router = emulator();
@@ -443,19 +508,19 @@ struct Step {
     operation: &'static str,
     request: fn(&Subject) -> Value,
     /// Whether this call SUCCEEDS at all — which is not the same thing as writing the
-    /// configuration: the validation start succeeds and writes none.
+    /// resource: a send that cannot confirm its delivery, and a refused submission, write.
     succeeds: bool,
-    /// Whether this call writes the CONFIGURATION — which is exactly when the reported
+    /// Whether this call WRITES the preference — which is exactly when the reported
     /// version advances.
-    writes_configuration: bool,
+    writes: bool,
 }
 
-/// A status update that moves one plane to a status the modelled enum admits, so it
-/// SUCCEEDS.
+/// A status update that asks the e-invoice plane for the move a caller may make out of the
+/// validated status, so it SUCCEEDS.
 fn accepted_status_update(subject: &Subject) -> Value {
     json!({
         "ProcurementPortalPreferenceArn": subject.arn,
-        "EinvoiceDeliveryPreferenceStatus": STATUS_ACTIVE,
+        "EinvoiceDeliveryPreferenceStatus": STATUS_TEST_INITIALIZED,
     })
 }
 
@@ -467,57 +532,61 @@ fn step(label: &'static str) -> Step {
             operation: "SendProcurementPortalValidation",
             request: send_validation,
             succeeds: true,
-            writes_configuration: false,
+            writes: true,
         },
         "accepted send with a token" => Step {
             label,
             operation: "SendProcurementPortalValidation",
             request: send_validation_with_token,
             succeeds: true,
-            writes_configuration: false,
+            writes: true,
         },
         "refused verify" => Step {
             label,
             operation: "VerifyProcurementPortalValidation",
             request: verify_unissued_code,
             succeeds: false,
-            writes_configuration: false,
+            // The refusal RECORDS the attempt it reports against the preference, which is
+            // a write of it.
+            writes: true,
         },
         "refused status update" => Step {
             label,
             operation: "UpdateProcurementPortalPreferenceStatus",
             request: status_update_stating_nothing,
             succeeds: false,
-            writes_configuration: false,
+            writes: false,
         },
         "accepted update" => Step {
             label,
             operation: "PutProcurementPortalPreference",
             request: accepted_update,
             succeeds: true,
-            writes_configuration: true,
+            writes: true,
         },
         "accepted status update" => Step {
             label,
             operation: "UpdateProcurementPortalPreferenceStatus",
             request: accepted_status_update,
             succeeds: true,
-            writes_configuration: true,
+            writes: true,
         },
         other => panic!("case {other}: no such step"),
     }
 }
 
-/// RULE: the reported `Version` is one plus the number of calls that SUCCESSFULLY wrote
-/// the preference's CONFIGURATION, and `LastUpdateDate` moves only with those calls — so
-/// interleaving refusals, and calls that succeed without writing a configuration, with the
-/// writes, in any order, cannot shift either.
+/// RULE: the reported `Version` counts the calls that WROTE the preference — one per
+/// applied write, whatever that write touched — and `LastUpdateDate` moves only with them,
+/// so interleaving calls the service refuses before writing anything, in any order, cannot
+/// shift either.
 ///
-/// The rows are orders in which those three kinds of call arrive: no configuration write
-/// first, some between the writes, and a sequence with no configuration write at all.
+/// The rows are orders in which those kinds of call arrive: refusals before the
+/// configuration writes, refusals between them, and a sequence with no configuration write
+/// at all — the validation calls among them, which write the preference's validation state
+/// without writing its configuration.
 #[tokio::test]
-async fn the_version_counts_the_successful_writes_only() {
-    let router = emulator();
+async fn the_version_counts_the_applied_writes_only() {
+    let (router, engine) = emulator_with_engine();
 
     let sequences: Vec<(&str, Vec<&str>)> = vec![
         (
@@ -560,7 +629,7 @@ async fn the_version_counts_the_successful_writes_only() {
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &minimal_create(portal, &buyer, &supplier),
+                &create_with_confirmable_delivery(portal, &buyer, &supplier),
             )
             .await,
         );
@@ -570,14 +639,17 @@ async fn the_version_counts_the_successful_writes_only() {
             buyer,
             supplier,
         };
+        // A completed validation first, because the move a scripted status update asks for
+        // is one a caller may only make out of the validated status. Those two calls write
+        // the preference as well, which is what the baseline below reads.
+        validate_preference(&router, &engine, &subject.arn).await;
 
-        // The create left the first version; every later successful write adds one.
-        let mut successful_writes = 0;
         let mut reported = get_preference(&router, &subject.arn).await;
+        let mut writes = version(&reported);
         assert_eq!(
-            version(&reported),
-            1,
-            "case {label}: a create leaves the first version, got {reported}"
+            writes, 3,
+            "case {label}: the create, the issued code and the completed validation are \
+             three writes, got {reported}"
         );
 
         for step_label in sequence {
@@ -585,8 +657,8 @@ async fn the_version_counts_the_successful_writes_only() {
             let previous_last_update = last_update(&reported);
             let request = (step.request)(&subject);
             let (status, body) = call(&router, step.operation, &request).await;
-            if step.writes_configuration {
-                successful_writes += 1;
+            if step.writes {
+                writes += 1;
             }
             if step.succeeds {
                 assert_eq!(
@@ -603,18 +675,17 @@ async fn the_version_counts_the_successful_writes_only() {
             }
 
             reported = get_preference(&router, &subject.arn).await;
-            let expected_version = 1 + successful_writes;
             assert_eq!(
                 version(&reported),
-                expected_version,
-                "case {label} / {}: expected Version {expected_version} after \
-                 {successful_writes} successful writes, got {reported}",
+                writes,
+                "case {label} / {}: expected Version {writes} after {writes} applied \
+                 writes, got {reported}",
                 step.label
             );
-            if step.writes_configuration {
+            if step.writes {
                 assert!(
                     last_update(&reported) >= previous_last_update,
-                    "case {label} / {}: a successful write stamps the instant it changed \
+                    "case {label} / {}: an applied write stamps the instant it changed \
                      at, got {reported}",
                     step.label
                 );
@@ -622,8 +693,8 @@ async fn the_version_counts_the_successful_writes_only() {
                 assert_eq!(
                     last_update(&reported),
                     previous_last_update,
-                    "case {label} / {}: a call that wrote no configuration must not \
-                     restamp LastUpdateDate, got {reported}",
+                    "case {label} / {}: a call that wrote nothing must not restamp \
+                     LastUpdateDate, got {reported}",
                     step.label
                 );
             }
@@ -631,7 +702,7 @@ async fn the_version_counts_the_successful_writes_only() {
             let summary = listed_summary(&router, &subject.arn).await;
             assert_eq!(
                 version(&summary),
-                expected_version,
+                writes,
                 "case {label} / {}: the listing reports the version the read does, got \
                  {summary}",
                 step.label
@@ -809,16 +880,15 @@ fn rejected_code_rows() -> Vec<RejectedCode> {
 }
 
 /// RULE (the same one, over the state the validation flow keeps): a submitted validation
-/// code that is REFUSED writes no configuration, so the preference a reader reports —
-/// `Version` and `LastUpdateDate` with it — stays exactly where the last successful write
-/// left it, however many submissions are refused; the failed-attempt count the refusal
-/// states is service-side bookkeeping no modelled member carries, so it is what advances
-/// instead.
+/// code that is REFUSED is RECORDED as the attempt its refusal reports, which is a write of
+/// the preference — so `Version` advances by exactly one per refused submission and
+/// `LastUpdateDate` is restamped, while every CONFIGURATION member a reader reports stays
+/// exactly where the last configuration write left it.
 ///
 /// The rows add the dimension the table above cannot reach: whether a code really is
 /// outstanding when the submitted one is wrong, which is the OTP retry a client makes.
 #[tokio::test]
-async fn a_rejected_validation_code_writes_no_configuration() {
+async fn a_rejected_validation_code_records_the_attempt_it_reports() {
     let (router, engine) = emulator_with_engine();
 
     for (index, row) in rejected_code_rows().iter().enumerate() {
@@ -828,21 +898,27 @@ async fn a_rejected_validation_code_writes_no_configuration() {
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &minimal_create(row.portal, &buyer, &supplier),
+                &create_with_confirmable_delivery(row.portal, &buyer, &supplier),
             )
             .await,
         );
+        // Every write this row performs on top of the create, counted as it is made,
+        // because the version under test is one per applied write.
+        let mut writes = 1;
 
-        // Reach the version this row submits its wrong code at, through the calls that
-        // really do write the configuration.
+        // Reach the version this row submits its wrong code at.
         for round in 0..row.writes_after_create {
             if row.write_with_status_update {
+                // A status update may only ask for a move the lifecycle provides, so the
+                // plane is carried to the validated status first — two writes of its own.
+                validate_preference(&router, &engine, &arn).await;
+                writes += 2;
                 ok(
                     &router,
                     "UpdateProcurementPortalPreferenceStatus",
                     &json!({
                         "ProcurementPortalPreferenceArn": arn,
-                        "EinvoiceDeliveryPreferenceStatus": STATUS_ACTIVE,
+                        "EinvoiceDeliveryPreferenceStatus": STATUS_TEST_INITIALIZED,
                     }),
                 )
                 .await;
@@ -854,23 +930,25 @@ async fn a_rejected_validation_code_writes_no_configuration() {
                 )
                 .await;
             }
+            writes += 1;
         }
 
         let issued = if row.issue_a_code {
-            Some(issue_code(&router, &engine, &arn).await)
+            let code = issue_code(&router, &engine, &arn).await;
+            writes += 1;
+            Some(code)
         } else {
             None
         };
         let before = get_preference(&router, &arn).await;
         let before_summary = listed_summary(&router, &arn).await;
-        let expected_version = 1 + row.writes_after_create;
         assert_eq!(
             version(&before),
-            expected_version,
-            "case {}: the create and {} successful writes leave Version \
-             {expected_version}, got {before}",
+            writes,
+            "case {}: the create and the {} writes after it leave Version {writes}, got \
+             {before}",
             row.label,
-            row.writes_after_create
+            writes - 1
         );
 
         let wrong = (row.wrong_code)(issued.as_deref());
@@ -881,9 +959,8 @@ async fn a_rejected_validation_code_writes_no_configuration() {
             row.label
         );
 
-        // Repeated past the attempt budget, because the defect this pins showed up as a
-        // version that drifted one step per refused submission: a client retrying an OTP
-        // must see no configuration change at all.
+        // Repeated past the attempt budget, so the rule holds across it: each refusal
+        // records one attempt, so each is one version of the resource and no more.
         for attempt in 1..=REPEATED_SUBMISSIONS {
             let (status, body) = call(
                 &router,
@@ -891,9 +968,11 @@ async fn a_rejected_validation_code_writes_no_configuration() {
                 &json!({"ProcurementPortalPreferenceArn": arn, "Code": wrong}),
             )
             .await;
+            writes += 1;
             assert_eq!(
                 status, 400,
-                "case {} attempt {attempt} with {wrong:?}: expected HTTP 400, got {status} {body}",
+                "case {} attempt {attempt} with {wrong:?}: expected HTTP 400, got {status} {body}"
+                ,
                 row.label
             );
             assert_eq!(
@@ -903,8 +982,8 @@ async fn a_rejected_validation_code_writes_no_configuration() {
                  ValidationException, got {body}",
                 row.label
             );
-            // The count the refusal states is the one thing a refused submission moves,
-            // and it is REPORTED rather than persisted into the resource.
+            // The count the refusal states is what the submission moved, and recording it
+            // is the write a reader sees.
             assert_eq!(
                 error_text(&body),
                 invalid_code_sentence(attempt),
@@ -915,16 +994,38 @@ async fn a_rejected_validation_code_writes_no_configuration() {
 
             let after = get_preference(&router, &arn).await;
             assert_eq!(
-                after, before,
+                without_write_markers(&after),
+                without_write_markers(&before),
                 "case {} attempt {attempt} with {wrong:?}: a refused code must leave every \
-                 reported member as it was, got {after}",
+                 configuration member as it was, got {after}",
+                row.label
+            );
+            assert_eq!(
+                version(&after),
+                writes,
+                "case {} attempt {attempt} with {wrong:?}: the recorded attempt is one \
+                 version of the resource, so Version is {writes}, got {after}",
+                row.label
+            );
+            assert!(
+                last_update(&after) >= last_update(&before),
+                "case {} attempt {attempt} with {wrong:?}: recording the attempt stamps \
+                 the instant it happened at, got {after}",
                 row.label
             );
             let after_summary = listed_summary(&router, &arn).await;
             assert_eq!(
-                after_summary, before_summary,
+                without_write_markers(&after_summary),
+                without_write_markers(&before_summary),
                 "case {} attempt {attempt} with {wrong:?}: the listing must report the same \
                  summary, got {after_summary}",
+                row.label
+            );
+            assert_eq!(
+                version(&after_summary),
+                writes,
+                "case {} attempt {attempt} with {wrong:?}: the listing reports the version \
+                 the read does, got {after_summary}",
                 row.label
             );
             assert_eq!(
@@ -936,21 +1037,22 @@ async fn a_rejected_validation_code_writes_no_configuration() {
             );
         }
 
-        // The configuration the refusals left untouched is still writable, and THAT write
-        // is what advances the version — so the rule is not "this resource stopped
-        // versioning".
+        // The configuration the refusals left untouched is still writable, and that write
+        // advances the version by exactly one more — so the rule is one version per write,
+        // not "this resource stopped versioning".
         ok(
             &router,
             "PutProcurementPortalPreference",
             &accepted_update_round(&arn, row.writes_after_create + 1),
         )
         .await;
+        writes += 1;
         let after_write = get_preference(&router, &arn).await;
         assert_eq!(
             version(&after_write),
-            expected_version + 1,
-            "case {}: the successful write after the refusals advances Version by exactly \
-             one, got {after_write}",
+            writes,
+            "case {}: the configuration write after the refusals advances Version by \
+             exactly one, got {after_write}",
             row.label
         );
         assert!(

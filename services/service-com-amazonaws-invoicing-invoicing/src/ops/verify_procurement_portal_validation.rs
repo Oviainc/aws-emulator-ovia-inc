@@ -25,10 +25,11 @@
 //! budget it counts against ([`MAX_VERIFICATION_ATTEMPTS`]). The budget is per issued
 //! code, so the call that issues one starts that count again
 //! ([`crate::state::StoredProcurementPortalPreference::issue_validation`]) and the first
-//! submission refused against a fresh code is its first attempt. It changes nothing a reader
-//! of the preference can observe: no modelled member moves, and `Version` — "the version
-//! number of the procurement portal preference configuration" — and `LastUpdateDate` stay
-//! at what the last SUCCESSFUL write left them, because this call wrote no configuration.
+//! submission refused against a fresh code is its first attempt. Recording that attempt is
+//! a WRITE of the preference, so it advances `Version` and `LastUpdateDate` the way every
+//! applied write of this resource does
+//! ([`crate::state::StoredProcurementPortalPreference::record_write`]) — no plane's status
+//! moves with it, because nothing was verified.
 //!
 //! ## Shape of an operation
 //!
@@ -288,21 +289,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if outstanding != Some(input.code.as_str()) {
                 // The refused submission counts against the attempt budget of the code
                 // outstanding for this preference, which the refusal reports — a budget
-                // the next issued code starts again. No modelled member of the preference
-                // moves with it: the call completed no validation and wrote no
-                // configuration, so `Version` and `LastUpdateDate` keep the values the
-                // last successful write left and a later read reports them unchanged.
+                // the next issued code starts again. Recording it is a WRITE of the
+                // preference, so it advances the one pair every write of this resource
+                // advances (`crate::state::StoredProcurementPortalPreference::record_write`):
+                // a later reader reports the version this submission produced, while a
+                // call refused before it wrote anything leaves that pair alone.
                 stored.failed_verification_attempts =
                     stored.failed_verification_attempts.saturating_add(1);
+                let refused_at = crate::state::now();
+                let attempt = stored.failed_verification_attempts;
+                stored.record_write(refused_at);
                 return Err(
                     VerifyProcurementPortalValidationErrorModeled::ValidationException(
                         ValidationException {
                             // Stated from the attempt this submission just made against
                             // this preference, so the refusal reports WHICH attempt
                             // failed rather than one constant sentence.
-                            message: Some(invalid_code_message(
-                                stored.failed_verification_attempts,
-                            )),
+                            message: Some(invalid_code_message(attempt)),
                             // `invalidInput` is one of the model's
                             // `ValidationExceptionReason` values
                             // (`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`).
@@ -328,8 +331,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // every plane still waiting for the portal connection to be verified now
             // reports the validated status, the rule
             // `crate::state::apply_completed_verification` holds for whichever call
-            // completes a validation.
+            // completes a validation. Completing it is a write of the preference either
+            // way, so it advances the one pair every write of this resource advances.
             crate::state::apply_completed_verification(&mut stored.preference);
+            stored.record_write(verified_at);
         }
 
         store.record_result(

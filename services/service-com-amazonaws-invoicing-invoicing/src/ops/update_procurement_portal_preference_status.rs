@@ -35,6 +35,13 @@
 //!   [`crate::state::apply_plane_verification_statuses`] the create and the configuration
 //!   update apply, so no write of this resource can leave it reporting a status for a
 //!   plane its configuration disables;
+//! * a status stated for a plane that asks for a MOVE the caller may not make — into a
+//!   status the service assigns itself, or between a pair the lifecycle does not provide —
+//!   is refused with the modelled `ValidationException` and writes nothing: the rule
+//!   [`crate::state::caller_requested_transition_violations`] holds, consulted for every
+//!   plane the request states before anything is written, and the refusal states the
+//!   DETAIL the request asked for together with every rule that detail violates
+//!   ([`invalid_status_transition`]);
 //! * an ARN this service holds no preference for is the modelled
 //!   `ResourceNotFoundException`.
 //!
@@ -239,6 +246,89 @@ fn reason_without_status((status_member, reason_member): (&str, &str)) -> Valida
     }
 }
 
+/// The detail of this request a refusal of its status transition states back: the account
+/// the preference belongs to, the preference the request names, and the status members it
+/// stated — the request as the rule that refused it saw it.
+///
+/// Written as a JSON object in the model's member order, with each member spelled the way
+/// the service's own refusals spell it (the model's member name, lower-camel-cased), and
+/// each value written through `serde_json` so a caller-supplied reason carrying a quote or
+/// a backslash cannot break out of the object. The object is assembled by joining those
+/// serialised pairs rather than through a `serde_json::Map`, because that map orders its
+/// keys and the order here is the MODEL's member order. A member the request did not state
+/// is left out: the detail is what the request carried.
+fn stated_detail(
+    procurement_portal_preference_arn: &str,
+    einvoice: Option<&(String, Option<String>)>,
+    purchase_order: Option<&(String, Option<String>)>,
+) -> String {
+    let mut members: Vec<(&str, &str)> = vec![
+        // The account every resource of this emulator belongs to, which the preference
+        // itself reports as `AwsAccountId`.
+        ("awsAccountId", ::engine::emulator_account_id()),
+        (
+            "procurementPortalPreferenceArn",
+            procurement_portal_preference_arn,
+        ),
+    ];
+    for (stated, status_key, reason_key) in [
+        (
+            einvoice,
+            "einvoiceDeliveryPreferenceStatus",
+            "einvoiceDeliveryPreferenceStatusReason",
+        ),
+        (
+            purchase_order,
+            "purchaseOrderRetrievalPreferenceStatus",
+            "purchaseOrderRetrievalPreferenceStatusReason",
+        ),
+    ] {
+        if let Some((status, reason)) = stated {
+            members.push((status_key, status));
+            if let Some(reason) = reason {
+                members.push((reason_key, reason));
+            }
+        }
+    }
+    let body = members
+        .into_iter()
+        .map(|(key, value)| {
+            format!(
+                "{}:{}",
+                ::serde_json::Value::String(key.to_string()),
+                ::serde_json::Value::String(value.to_string())
+            )
+        })
+        .collect::<Vec<String>>()
+        .join(",");
+    format!("{{{body}}}")
+}
+
+/// The 400 a request is refused with when a status it states asks for a move the caller may
+/// not make: it states the DETAIL the request asked for ([`stated_detail`]) and every rule
+/// that detail violates ([`crate::state::caller_requested_transition_violations`]), joined
+/// in the order the rules are stated.
+///
+/// Recorded behaviour: the refusal reads as the detail the request carried followed by the
+/// rules it is invalid because of, and it is keyed the way this plane's bodies key their
+/// text ([`MessageKey::Capitalised`]). A caller-supplied status reason is part of that
+/// detail, so the sentence is kept inside the bound every message member of this model
+/// carries (`crate::service::validation::bounded_message`).
+fn invalid_status_transition(detail: &str, violations: &[String]) -> ValidationException {
+    ValidationException {
+        message: Some(crate::service::validation::bounded_message(format!(
+            "Given detail {detail} in request is invalid because [{}]",
+            violations.join(", ")
+        ))),
+        // `invalidInput` is one of the model's `ValidationExceptionReason` values
+        // ([`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]): the status the
+        // request stated is not one this resource may be moved to from where it is.
+        reason: Some("invalidInput".to_string()),
+        message_key: MessageKey::Capitalised,
+        ..Default::default()
+    }
+}
+
 /// The 400 a request is refused with when it states no plane's status at all: this
 /// operation updates a status, and such a request names none to update.
 fn no_status_stated() -> ValidationException {
@@ -396,6 +486,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
 
+            // Only a move a CALLER may ask for is applied: a status the service assigns
+            // itself, or a pair the lifecycle does not provide, is refused with the rules
+            // it violates, the rule `crate::state::caller_requested_transition_violations`
+            // holds. Both planes are consulted before anything is written and their
+            // violations are stated in one refusal, so a request this refuses leaves the
+            // preference — its statuses, its `Version` and its `LastUpdateDate` — exactly
+            // as the last successful write left it.
+            let mut violations: Vec<String> = Vec::new();
+            for (stated, held, status_member) in [
+                (
+                    einvoice.as_ref(),
+                    stored.preference.einvoice_delivery_preference_status.as_deref(),
+                    EINVOICE_DELIVERY_MEMBERS.0,
+                ),
+                (
+                    purchase_order.as_ref(),
+                    stored
+                        .preference
+                        .purchase_order_retrieval_preference_status
+                        .as_deref(),
+                    PURCHASE_ORDER_RETRIEVAL_MEMBERS.0,
+                ),
+            ] {
+                if let Some((requested, _)) = stated {
+                    violations.extend(crate::state::caller_requested_transition_violations(
+                        status_member,
+                        held,
+                        requested,
+                    ));
+                }
+            }
+            if !violations.is_empty() {
+                let detail = stated_detail(
+                    &input.procurement_portal_preference_arn,
+                    einvoice.as_ref(),
+                    purchase_order.as_ref(),
+                );
+                return Err(
+                    UpdateProcurementPortalPreferenceStatusErrorModeled::ValidationException(
+                        invalid_status_transition(&detail, &violations),
+                    )
+                    .into(),
+                );
+            }
+
             let preference = &mut stored.preference;
 
             // A plane the request states takes the stated status, and its reason becomes
@@ -411,9 +546,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             // Every write of this resource advances its `Version` and stamps
-            // `LastUpdateDate` with the instant it changed at; `CreateDate` is not touched.
-            preference.version = preference.version.saturating_add(1);
-            preference.last_update_date = crate::state::now();
+            // `LastUpdateDate` with the instant it changed at, the one pair
+            // `crate::state::StoredProcurementPortalPreference::record_write` keeps;
+            // `CreateDate` is not touched.
+            stored.record_write(crate::state::now());
         }
 
         store.record_result(

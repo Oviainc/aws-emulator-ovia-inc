@@ -24,9 +24,11 @@
 //!   not-found, the listing omits it, its tags go with it and the identity it held is
 //!   free again — asserted over several portals and identities;
 //! * `SendProcurementPortalValidation` ISSUES a validation code for the preference and
-//!   answers with its ARN, writing none of its configuration — asserted over preferences
-//!   differing in which portal endpoints they configure, and over the codes a caller that
-//!   never received the issued one could submit;
+//!   answers with its ARN when the service can confirm the delivery of the test e-invoice
+//!   carrying it, and the modelled 400 when it cannot, writing none of the preference's
+//!   configuration either way — asserted over preferences differing in which portal
+//!   endpoints they configure, and over the codes a caller that never received the issued
+//!   one could submit;
 //! * repeating an update lands the same configuration, and a delete's `ClientToken`
 //!   replay answers with the ARN it removed.
 
@@ -34,6 +36,10 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
+
+// The members every applied write of this resource advances, stripped in ONE place for
+// every suite of this plane that compares a configuration across such a write.
+use crate::refused_procurement_portal_writes::without_write_markers;
 
 /// The status each enabled plane of a preference carries until a validation moves it: one
 /// of the values `ProcurementPortalPreferenceStatus` admits (`smithy_query(query="shape",
@@ -667,43 +673,49 @@ async fn a_delete_removes_the_preference_from_every_reader() {
     }
 }
 
-/// RULE: the call that starts a validation ISSUES the validation code the flow runs on
-/// — the model documents it as initiating the validation process by issuing a validation
-/// code — so it answers the modelled 200 with the ARN it was asked about, whatever the
-/// preference configures. The code never travels on the wire (the modelled output carries
-/// only the ARN, because the real service delivers it through the portal), and issuing it
-/// writes no CONFIGURATION: the preference reports the same `Version` and
-/// `LastUpdateDate` a reader saw before it, and a code the caller did not receive still
-/// completes nothing.
+/// RULE: the call that starts a validation ISSUES the validation code the flow runs on —
+/// the model documents it as initiating the validation process by issuing a validation code
+/// — and answers the modelled 200 with the ARN it was asked about when the service can
+/// CONFIRM the delivery of the test e-invoice carrying that code, which it can for a
+/// preference that configures the endpoint the document goes to and cannot for one that
+/// configures none. The code never travels on the wire (the modelled output carries only
+/// the ARN, because the real service delivers it through the portal), issuing it writes no
+/// CONFIGURATION — only the `Version` and `LastUpdateDate` every applied write of the
+/// resource advances — and a code the caller did not receive still completes nothing.
 ///
-/// The rows differ along which portal endpoints the preference configures (none, the
-/// portal instance endpoint, the test environment's endpoint, both), because the endpoint
-/// is where the real service delivers the code — and none of them is a reason to answer
-/// differently.
+/// The rows differ along which portal endpoints the preference configures (none, the portal
+/// instance endpoint, the test environment's endpoint, both), because the endpoint is where
+/// the real service delivers the code: with no connection-testing method stated, the test
+/// e-invoice goes to the portal's own delivery endpoint, so that is the one that decides
+/// the answer.
 #[tokio::test]
-async fn a_send_issues_a_validation_code_and_writes_no_configuration() {
+async fn a_send_issues_a_validation_code_and_confirms_what_it_can_deliver() {
     let router = emulator();
 
-    let rows: Vec<(&str, Option<&str>, Option<&str>)> = vec![
-        ("no endpoint configured", None, None),
+    // (label, the portal instance endpoint, the test environment's endpoint, the answer)
+    let rows: Vec<(&str, Option<&str>, Option<&str>, u16)> = vec![
+        ("no endpoint configured", None, None, 400),
         (
             "a portal instance endpoint",
             Some("https://portal.example.com/invoices"),
             None,
+            200,
         ),
         (
             "a test environment endpoint",
             None,
             Some("https://test.portal.example.com/invoices"),
+            400,
         ),
         (
             "both endpoints",
             Some("https://portal.example.com/invoices"),
             Some("https://test.portal.example.com/invoices"),
+            200,
         ),
     ];
 
-    for (index, (label, endpoint, test_endpoint)) in rows.iter().enumerate() {
+    for (index, (label, endpoint, test_endpoint, expected_status)) in rows.iter().enumerate() {
         let mut create = minimal_create(
             PORTAL_NAMES[index % PORTAL_NAMES.len()],
             &format!("BUYER-SEND-{index}"),
@@ -726,39 +738,68 @@ async fn a_send_issues_a_validation_code_and_writes_no_configuration() {
 
         // The answer is the same on a first call, on a repeat, and on the `ClientToken`
         // replay of that repeat — which answers with the ARN the call it replays returned.
+        // Only the two calls that ISSUE a code write the resource: the replay issues none.
+        let mut issued_codes = 0;
         for attempt in ["no token", "with a token", "the token replayed"] {
             let mut request = json!({"ProcurementPortalPreferenceArn": arn});
             if attempt != "no token" {
                 request["ClientToken"] = json!("send-token-1");
             }
+            let replayed = attempt == "the token replayed" && *expected_status == 200;
             let (status, body) = call(&router, "SendProcurementPortalValidation", &request).await;
+            if !replayed {
+                issued_codes += 1;
+            }
             assert_eq!(
-                status, 200,
-                "case {label} ({attempt}): expected HTTP 200, got {status} {body}"
+                status,
+                if replayed { 200 } else { *expected_status },
+                "case {label} ({attempt}): expected HTTP {expected_status}, got {status} {body}"
             );
-            assert_eq!(
-                body.get("ProcurementPortalPreferenceArn")
-                    .and_then(Value::as_str),
-                Some(arn.as_str()),
-                "case {label} ({attempt}): the answer names the preference it was asked \
-                 about, got {body}"
-            );
-            // The code is delivered out of band: no member of the answer carries it.
-            assert_eq!(
-                body.as_object().map(|members| members.len()),
-                Some(1),
-                "case {label} ({attempt}): the answer carries the ARN alone, got {body}"
-            );
+            if status == 200 {
+                assert_eq!(
+                    body.get("ProcurementPortalPreferenceArn")
+                        .and_then(Value::as_str),
+                    Some(arn.as_str()),
+                    "case {label} ({attempt}): the answer names the preference it was asked \
+                     about, got {body}"
+                );
+                // The code is delivered out of band: no member of the answer carries it.
+                assert_eq!(
+                    body.as_object().map(|members| members.len()),
+                    Some(1),
+                    "case {label} ({attempt}): the answer carries the ARN alone, got {body}"
+                );
+            } else {
+                assert_eq!(
+                    error_code(&body),
+                    "ValidationException",
+                    "case {label} ({attempt}): expected the modelled validation error, got \
+                     {body}"
+                );
+            }
         }
 
-        // Issuing a code wrote no configuration: `Version` is the version number of the
-        // CONFIGURATION, so it stays where the last successful configuration write left
-        // it however many codes were issued, `LastUpdateDate` is untouched, and no plane's
-        // status moved — nothing has verified the connection until a code comes back.
+        // Issuing a code wrote no configuration: every configuration member stays where the
+        // last configuration write left it and no plane's status moved — nothing has
+        // verified the connection until a code comes back. What the issues DID advance is
+        // the version every applied write of this resource advances.
         let after = get_preference(&router, &arn).await;
+        let expected_version = before
+            .get("Version")
+            .and_then(Value::as_i64)
+            .unwrap_or_default()
+            + issued_codes;
         assert_eq!(
-            after, before,
-            "case {label}: issuing a code must leave every reported member as it was, got {after}"
+            after.get("Version").and_then(Value::as_i64),
+            Some(expected_version),
+            "case {label}: expected Version {expected_version}, one per issued code, got \
+             {after}"
+        );
+        assert_eq!(
+            without_write_markers(&after),
+            without_write_markers(&before),
+            "case {label}: issuing a code must leave every configuration member as it was, \
+             got {after}"
         );
 
         // A caller that never received the issued code completes nothing: these rows are

@@ -19,7 +19,7 @@
 //!
 //! * every combination of the two enable flags, reached by a create and then by an update
 //!   from every other combination, so both directions of each plane are covered;
-//! * a status (and reason) an explicit status update moved survives an update that leaves
+//! * a status (and reason) a caller moved a plane to survives an update that leaves
 //!   the plane enabled, goes when an update disables that plane, and does not come back
 //!   when a later update enables it again;
 //! * two preferences holding one configuration report the same plane state however they
@@ -30,23 +30,21 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
+use crate::refused_procurement_portal_writes::{
+    emulator_with_engine, validate_preference, PORTAL_INSTANCE_ENDPOINT,
+};
+
 /// The status an enabled plane carries until something moves it: one of the values
 /// `ProcurementPortalPreferenceStatus` admits (`smithy_query(query="shape",
 /// shape="ProcurementPortalPreferenceStatus")`).
 const PENDING_VERIFICATION: &str = "PENDING_VERIFICATION";
 
-/// Values `ProcurementPortalPreferenceStatus` admits OTHER than the one an enabled plane
-/// starts at (`smithy_query(query="shape",
-/// shape="ProcurementPortalPreferenceStatus")`) — the statuses an explicit status update
-/// can move a plane to.
-const MOVED_STATUSES: &[&str] = &[
-    "ACTIVE",
-    "SUSPENDED",
-    "TEST_FAILED",
-    "TEST_INITIALIZATION_FAILED",
-    "TEST_INITIALIZED",
-    "VALIDATED",
-];
+/// The statuses a CALLER can carry a plane to, in the order the lifecycle reaches them:
+/// the validated status a completed validation leaves, then the connection test a caller
+/// asks for and the activation that follows it. The other values
+/// `ProcurementPortalPreferenceStatus` admits are the ones the service assigns itself, so
+/// no request can move a plane to them.
+const MOVED_STATUSES: &[&str] = &["VALIDATED", "TEST_INITIALIZED", "ACTIVE"];
 
 /// Every value `ProcurementPortalName` accepts (`smithy_query(query="shape",
 /// shape="ProcurementPortalName")`).
@@ -134,7 +132,9 @@ fn contact(name: &str) -> Value {
     json!([{ "Name": name, "Email": format!("{}@example.com", name.to_lowercase().replace(' ', ".")) }])
 }
 
-/// A create request for one identity, stating the two enable flags under test.
+/// A create request for one identity, stating the two enable flags under test — and the
+/// endpoint the test e-invoice of a portal validation is delivered to, so the send that
+/// issues a code can confirm that delivery.
 fn create_request(
     portal: &str,
     buyer: &str,
@@ -150,6 +150,7 @@ fn create_request(
         "SupplierIdentifier": supplier,
         "EinvoiceDeliveryEnabled": einvoice,
         "PurchaseOrderRetrievalEnabled": purchase_order,
+        "ProcurementPortalInstanceEndpoint": PORTAL_INSTANCE_ENDPOINT,
         "Contacts": contact("Initial Contact"),
     })
 }
@@ -284,18 +285,18 @@ async fn a_plane_reports_a_verification_status_only_while_it_is_enabled() {
 /// disables the plane reports neither, and a later write that enables the plane again
 /// reports the unverified starting status rather than the status the plane last held.
 ///
-/// The rows are each plane crossed with every status an explicit status update can move a
-/// plane to other than the starting one, so nothing here is keyed to one status value.
+/// The rows are each plane crossed with every status a CALLER can carry a plane to
+/// ([`MOVED_STATUSES`]), so nothing here is keyed to one status value.
 #[tokio::test]
 async fn disabling_a_plane_drops_the_status_it_was_moved_to() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
 
     for (index, (plane, moved_to)) in (0..PLANES.len())
         .flat_map(|plane| MOVED_STATUSES.iter().map(move |status| (plane, *status)))
         .enumerate()
     {
         let (label, flag, status_member, reason_member) = PLANES[plane];
-        let other_flag = PLANES[1 - plane].1;
+        let (_, other_flag, other_status_member, _) = PLANES[1 - plane];
         let portal = PORTAL_NAMES[index % PORTAL_NAMES.len()];
         let created = ok(
             &router,
@@ -313,15 +314,27 @@ async fn disabling_a_plane_drops_the_status_it_was_moved_to() {
         let case = format!("{label} moved to {moved_to} on {portal}");
         let reason = format!("{label} was moved for this case");
 
-        let mut move_status = json!({"ProcurementPortalPreferenceArn": arn});
-        move_status[status_member] = json!(moved_to);
-        move_status[reason_member] = json!(reason);
-        ok(
-            &router,
-            "UpdateProcurementPortalPreferenceStatus",
-            &move_status,
-        )
-        .await;
+        // A completed validation carries both planes off the unverified status; the moves
+        // past it are the ones a caller asks for, one update each, with the reason stated
+        // on the update that sets the status under test.
+        validate_preference(&router, &engine, &arn).await;
+        let target = MOVED_STATUSES
+            .iter()
+            .position(|reachable| *reachable == moved_to)
+            .unwrap_or_else(|| panic!("case {case:?}: the row's status has to be reachable"));
+        for asked_for in &MOVED_STATUSES[..target + 1] {
+            let mut move_status = json!({"ProcurementPortalPreferenceArn": arn});
+            move_status[status_member] = json!(asked_for);
+            if *asked_for == moved_to {
+                move_status[reason_member] = json!(reason);
+            }
+            ok(
+                &router,
+                "UpdateProcurementPortalPreferenceStatus",
+                &move_status,
+            )
+            .await;
+        }
 
         // An update that leaves the plane enabled is not what moves a status, so the
         // status and the reason the status update left are what the plane still reports.
@@ -350,7 +363,14 @@ async fn disabling_a_plane_drops_the_status_it_was_moved_to() {
             disabled.get(flag)
         );
         assert_plane_state(&case, &disabled, plane, None);
-        assert_plane_state(&case, &disabled, 1 - plane, Some(PENDING_VERIFICATION));
+        // The other plane stayed enabled throughout, so it still reports the status the
+        // completed validation left it at.
+        assert_eq!(
+            disabled.get(other_status_member).and_then(Value::as_str),
+            Some(MOVED_STATUSES[0]),
+            "case {case:?}: the plane this write left enabled keeps its status, got {:?}",
+            disabled.get(other_status_member)
+        );
         let listed = summary_of(&router, &arn).await;
         assert_plane_state(&case, &listed, plane, None);
 

@@ -43,6 +43,8 @@ mod procurement_portal_preference_plane_state;
 mod procurement_portal_preference_reads;
 #[path = "all/procurement_portal_preference_status.rs"]
 mod procurement_portal_preference_status;
+#[path = "all/procurement_portal_preference_status_machine.rs"]
+mod procurement_portal_preference_status_machine;
 #[path = "all/procurement_portal_preferences.rs"]
 mod procurement_portal_preferences;
 #[path = "all/procurement_portal_supplier_page_tokens.rs"]
@@ -55,6 +57,8 @@ mod procurement_portals;
 mod refused_procurement_portal_writes;
 #[path = "all/rejected_validation_code_keeps_the_version.rs"]
 mod rejected_validation_code_keeps_the_version;
+#[path = "all/rejected_validation_code_leaves_other_preferences_alone.rs"]
+mod rejected_validation_code_leaves_other_preferences_alone;
 #[path = "all/reported_arn_fits_the_modelled_bound.rs"]
 mod reported_arn_fits_the_modelled_bound;
 #[path = "all/request_derived_refusal_message_bound.rs"]
