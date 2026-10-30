@@ -337,6 +337,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let created_at = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
+        // So a manager whose teardown has already come due — and every configuration it
+        // owned — is gone from the store before this request measures what the store
+        // holds, rather than this create being refused for records the clock already
+        // reclaimed and whose removal no other call has to come along and materialise.
+        store.settle(created_at);
 
         // The store is finite: a create that would take it past its cap is refused
         // rather than growing it, the way the service refuses one past its quota.

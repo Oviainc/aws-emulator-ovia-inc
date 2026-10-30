@@ -59,5 +59,7 @@ mod service_settings_read_path;
 mod state_roundtrip;
 #[path = "all/status_summaries.rs"]
 mod status_summaries;
+#[path = "all/store_bounds_after_teardown.rs"]
+mod store_bounds_after_teardown;
 #[path = "all/target_regions_required.rs"]
 mod target_regions_required;
