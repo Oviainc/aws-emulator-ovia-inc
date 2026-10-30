@@ -258,6 +258,13 @@ mod refusal_message_rule;
 #[path = "all/workspace_scoped_absence.rs"]
 mod workspace_scoped_absence;
 
+// `dataset_read_workspace_resolution` is declared HERE, beside the absence suite
+// it belongs with, for the reason the notes above give: the sorted list and the
+// END of this file are both where every concurrent iotsitewise change puts a
+// declaration of its own. Fold it into the list once the churn settles.
+#[path = "all/dataset_read_workspace_resolution.rs"]
+mod dataset_read_workspace_resolution;
+
 // Same reasoning: this suite's alphabetical place is inside the sorted list, the
 // stretch every concurrent iotsitewise change lands a declaration of its own in,
 // so it is declared up here with the other suites kept out of that stretch. Fold

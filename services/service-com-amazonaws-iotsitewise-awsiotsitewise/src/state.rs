@@ -6118,10 +6118,55 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// the assets already created from it, and one removed from it takes its
     /// per-asset properties with it.
     ///
+    /// A composite model that names a `COMPONENT_MODEL` contributes THAT model's
+    /// definitions, read from its stored record rather than copied when the
+    /// composite model was created (see
+    /// [`Self::composite_model_properties`]) — so a change to a component model
+    /// changes what an asset of every model REUSING it carries, and those assets
+    /// inherit it on the same terms as the assets of the model that changed.
+    /// Walked transitively, because a model reused here may itself be reused
+    /// elsewhere, and each model is re-materialised at most once so a reuse graph
+    /// that closes on itself still terminates.
+    ///
     /// `asset_model_id` is a stored id, not a label: resolve it with
     /// [`Self::resolve_asset_model_id`] first. Does nothing when no stored model
     /// has that id, or when no asset was created from it.
     pub fn propagate_asset_model_definitions(&mut self, asset_model_id: &str, now: SystemTime) {
+        let mut pending = vec![asset_model_id.to_string()];
+        let mut propagated: HashSet<String> = HashSet::new();
+        while let Some(model_id) = pending.pop() {
+            if !propagated.insert(model_id.clone()) {
+                continue;
+            }
+            self.propagate_definitions_to_own_assets(&model_id, now);
+            pending.extend(self.asset_models_reusing(&model_id));
+        }
+    }
+
+    /// The stored asset models holding a composite model whose component model is
+    /// `asset_model_id`: the composition relationships of that model, read from
+    /// the holder's side, which is the one place a composite model's reuse link
+    /// is recorded.
+    fn asset_models_reusing(&self, asset_model_id: &str) -> Vec<String> {
+        self.asset_models
+            .values()
+            .filter(|holder| {
+                holder.composite_models.iter().any(|composite| {
+                    composite
+                        .id
+                        .as_deref()
+                        .and_then(|composite_id| holder.composed_asset_model_id(composite_id))
+                        == Some(asset_model_id)
+                })
+            })
+            .map(|holder| holder.id.clone())
+            .collect()
+    }
+
+    /// Re-materialise the assets created from asset model `asset_model_id` ONLY,
+    /// which is one step of [`Self::propagate_asset_model_definitions`]: the
+    /// models reusing this one are walked there.
+    fn propagate_definitions_to_own_assets(&mut self, asset_model_id: &str, now: SystemTime) {
         let Some(model) = self.asset_models.get(asset_model_id) else {
             return;
         };
