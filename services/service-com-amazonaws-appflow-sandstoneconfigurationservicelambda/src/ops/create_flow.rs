@@ -172,14 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A schedule is what makes a scheduled flow run, so AppFlow cannot create one
         // without it. Every other modelled constraint was already enforced at the
         // boundary, before this handler ran.
-        if input.trigger_config.trigger_type == crate::state::TRIGGER_TYPE_SCHEDULED
-            && input
-                .trigger_config
-                .trigger_properties
-                .as_ref()
-                .and_then(|properties| properties.scheduled.as_ref())
-                .is_none()
-        {
+        if crate::state::scheduled_trigger_missing_schedule(&input.trigger_config) {
             return Err(CreateFlowErrorModeled::ValidationException(ValidationException {
                 message: Some(
                     "triggerConfig.triggerProperties.scheduled is required when triggerType is Scheduled"
@@ -288,6 +281,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             flow_arn: crate::state::flow_arn(&region, &flow_name),
             flow_name: flow_name.clone(),
             client_token: input.client_token,
+            // No `UpdateFlow` has re-defined this flow yet.
+            last_update_client_token: None,
             description: input.description,
             kms_arn: input.kms_arn,
             flow_status,

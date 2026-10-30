@@ -81,6 +81,20 @@ pub const MAX_FLOWS_PER_ACCOUNT: usize = 1000;
 /// likely to read are the ones kept.
 pub const MAX_EXECUTIONS_PER_FLOW: usize = 100;
 
+/// `true` when a `Scheduled` trigger carries no schedule.
+///
+/// A schedule is what makes a scheduled flow run, so AppFlow cannot store such a
+/// definition without one. Shared by every operation that stores a definition
+/// (`CreateFlow`, `UpdateFlow`), so the two cannot enforce it differently.
+pub fn scheduled_trigger_missing_schedule(trigger_config: &TriggerConfig) -> bool {
+    trigger_config.trigger_type == TRIGGER_TYPE_SCHEDULED
+        && trigger_config
+            .trigger_properties
+            .as_ref()
+            .and_then(|properties| properties.scheduled.as_ref())
+            .is_none()
+}
+
 /// A flow's `flowStatus` (`smithy_query(query="shape", shape="FlowStatus")`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowStatus {
@@ -173,6 +187,12 @@ pub struct Flow {
     /// carried one. Held HERE rather than in a store-wide map, so the token is
     /// reclaimed by `DeleteFlow` with the flow it identifies.
     pub client_token: Option<String>,
+    /// The `@idempotencyToken` of the LAST `UpdateFlow` that re-defined this flow, when
+    /// it carried one. Held beside the definition that token applied, so a retry of that
+    /// same update is answered without re-applying it, and a DIFFERENT request reusing
+    /// the token is refused. Separate from [`Flow::client_token`], which belongs to the
+    /// create: the two operations are different calls and their tokens are their own.
+    pub last_update_client_token: Option<String>,
     pub description: Option<String>,
     pub kms_arn: Option<String>,
     pub flow_status: FlowStatus,
@@ -215,6 +235,19 @@ impl Flow {
             &self.tags,
             self.metadata_catalog_config.as_ref(),
         )
+    }
+
+    /// The DATA SCHEMA this flow's definition declares, as one comparable value.
+    ///
+    /// It is drawn from the flow's `tasks`: the field mappings (a `Map` task's source
+    /// and destination fields), the field data types (`SOURCE_DATA_TYPE` /
+    /// `DESTINATION_DATA_TYPE` / `DATA_TYPE` task properties) and the partition keys (a
+    /// `Partition` task's `ORDERED_PARTITION_KEYS_LIST` property) all live there — see
+    /// `smithy_query(query="shape", shape="Task,TaskType,OperatorPropertiesKeys")`.
+    /// Those are exactly the settings `schemaVersion` counts a change to
+    /// (`smithy_query(query="doc", shape="DescribeFlowResponse", member="schemaVersion")`).
+    pub fn schema_descriptor(&self) -> ::serde_json::Value {
+        schema_descriptor(&self.tasks)
     }
 
     /// Give every run the terminal status the CLOCK already owed it.
@@ -510,6 +543,74 @@ pub fn definition_descriptor(
         "tasks": tasks,
         "metadataCatalogConfig": catalog,
     }))
+}
+
+/// The task types whose source and destination fields ARE a source-to-destination
+/// field mapping: `Map` maps one field onto another, `Map_all` maps every field
+/// (`smithy_query(query="shape", shape="TaskType")`).
+const MAPPING_TASK_TYPES: [&str; 2] = ["Map", "Map_all"];
+
+/// The task properties that declare the DATA TYPE of a field
+/// (`smithy_query(query="shape", shape="OperatorPropertiesKeys")`).
+const DATA_TYPE_PROPERTIES: [&str; 3] = ["DATA_TYPE", "SOURCE_DATA_TYPE", "DESTINATION_DATA_TYPE"];
+
+/// The task property that declares a flow's PARTITION KEYS, carried by a `Partition`
+/// task (the same `OperatorPropertiesKeys` enum).
+const PARTITION_KEYS_PROPERTY: &str = "ORDERED_PARTITION_KEYS_LIST";
+
+/// The DATA SCHEMA a list of `tasks` declares, as one comparable value.
+///
+/// It is exactly the three settings `schemaVersion` counts a change to — the
+/// source-to-destination field mappings, the field data types and the partition keys —
+/// and nothing else, so a task that declares none of them (a filter, a validation)
+/// contributes nothing and a flow that gains one keeps its schema version. The entries
+/// are SORTED, because a mapping is a mapping wherever it sits in the list: re-ordering
+/// the same tasks does not re-describe the data.
+///
+/// It exists for ONE comparison, and `serde_json::Value`'s own equality decides it:
+/// two task lists declare the same schema exactly when every entry matches.
+pub fn schema_descriptor(tasks: &[Task]) -> ::serde_json::Value {
+    let mut entries: Vec<String> = Vec::new();
+    for task in tasks {
+        let mut entry = ::serde_json::Map::new();
+        if MAPPING_TASK_TYPES.contains(&task.task_type.as_str()) {
+            entry.insert(
+                "mapping".to_string(),
+                ::serde_json::json!({
+                    "sourceFields": task.source_fields,
+                    "destinationField": task.destination_field,
+                }),
+            );
+        }
+        let properties = task.task_properties.as_ref();
+        let data_types: BTreeMap<&str, &str> = DATA_TYPE_PROPERTIES
+            .iter()
+            .filter_map(|key| {
+                properties
+                    .and_then(|properties| properties.get(*key))
+                    .map(|declared| (*key, declared.as_str()))
+            })
+            .collect();
+        if !data_types.is_empty() {
+            entry.insert("dataTypes".to_string(), ::serde_json::json!(data_types));
+        }
+        if let Some(partition_keys) =
+            properties.and_then(|properties| properties.get(PARTITION_KEYS_PROPERTY))
+        {
+            entry.insert(
+                "partitionKeys".to_string(),
+                ::serde_json::json!(partition_keys),
+            );
+        }
+        if entry.is_empty() {
+            continue;
+        }
+        // Rendered to a string so the entries can be ordered at all; `Map`'s own
+        // ordering is already deterministic, so equal entries render equal.
+        entries.push(::serde_json::Value::Object(entry).to_string());
+    }
+    entries.sort();
+    ::serde_json::json!(entries)
 }
 
 /// A fresh run identifier. Opaque and unique, matching `ExecutionId`'s `^\S+$`

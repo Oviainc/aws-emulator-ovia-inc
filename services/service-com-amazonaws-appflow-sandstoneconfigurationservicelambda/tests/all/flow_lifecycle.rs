@@ -27,7 +27,7 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=unverified";
 
 /// The account every generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// Longer than the span a run takes to settle, so a call made after this sleep must
 /// observe the terminal status the clock owed it.
@@ -47,35 +47,35 @@ fn appflow_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// One AppFlow service on one shared engine.
-fn appflow() -> MultiServiceRouter {
+pub(crate) fn appflow() -> MultiServiceRouter {
     appflow_with_engine().0
 }
 
 /// What the service answered: the HTTP status, the wire error code (empty on success)
 /// and the parsed body.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
-    error: String,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) error: String,
+    pub(crate) body: Value,
 }
 
 impl Answer {
-    fn is_ok(&self) -> bool {
+    pub(crate) fn is_ok(&self) -> bool {
         self.status == 200
     }
 
     /// A member of the response body, or `Value::Null` when it is absent.
-    fn get(&self, member: &str) -> &Value {
+    pub(crate) fn get(&self, member: &str) -> &Value {
         self.body.get(member).unwrap_or(&Value::Null)
     }
 
-    fn string(&self, member: &str) -> &str {
+    pub(crate) fn string(&self, member: &str) -> &str {
         self.get(member).as_str().unwrap_or_default()
     }
 }
 
-async fn call(router: &MultiServiceRouter, uri_path: &str, body: &Value) -> Answer {
+pub(crate) async fn call(router: &MultiServiceRouter, uri_path: &str, body: &Value) -> Answer {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("https://appflow.us-east-1.amazonaws.com{uri_path}"))
@@ -118,7 +118,7 @@ async fn call(router: &MultiServiceRouter, uri_path: &str, body: &Value) -> Answ
 /// recursively. Members the service fills in itself (a modelled default, a server-set
 /// field) are therefore allowed, while a stored member that came back changed or
 /// missing is not.
-fn contains(actual: &Value, expected: &Value) -> bool {
+pub(crate) fn contains(actual: &Value, expected: &Value) -> bool {
     match (actual, expected) {
         (Value::Object(actual), Value::Object(expected)) => expected
             .iter()
@@ -134,7 +134,7 @@ fn contains(actual: &Value, expected: &Value) -> bool {
     }
 }
 
-fn s3_source(bucket: &str) -> Value {
+pub(crate) fn s3_source(bucket: &str) -> Value {
     json!({
         "connectorType": "S3",
         "sourceConnectorProperties": {
@@ -143,7 +143,7 @@ fn s3_source(bucket: &str) -> Value {
     })
 }
 
-fn s3_destination(bucket: &str) -> Value {
+pub(crate) fn s3_destination(bucket: &str) -> Value {
     json!({
         "connectorType": "S3",
         "destinationConnectorProperties": {
@@ -152,7 +152,7 @@ fn s3_destination(bucket: &str) -> Value {
     })
 }
 
-fn salesforce_source(object: &str) -> Value {
+pub(crate) fn salesforce_source(object: &str) -> Value {
     json!({
         "connectorType": "Salesforce",
         "apiVersion": "57.0",
@@ -169,7 +169,7 @@ fn marketo_source(object: &str) -> Value {
     })
 }
 
-fn event_bridge_destination(object: &str) -> Value {
+pub(crate) fn event_bridge_destination(object: &str) -> Value {
     json!({
         "connectorType": "EventBridge",
         "destinationConnectorProperties": { "EventBridge": { "object": object } }
@@ -178,7 +178,7 @@ fn event_bridge_destination(object: &str) -> Value {
 
 /// A `Map` task moving one field, with an operator the model lists for the connector
 /// (`smithy_query(query="shape", shape="S3ConnectorOperator")` — `PROJECTION`).
-fn map_task(source_field: &str, destination_field: &str) -> Value {
+pub(crate) fn map_task(source_field: &str, destination_field: &str) -> Value {
     json!({
         "taskType": "Map",
         "sourceFields": [source_field],
@@ -188,7 +188,7 @@ fn map_task(source_field: &str, destination_field: &str) -> Value {
     })
 }
 
-fn filter_task(source_fields: &[&str]) -> Value {
+pub(crate) fn filter_task(source_fields: &[&str]) -> Value {
     json!({
         "taskType": "Filter",
         "sourceFields": source_fields,
@@ -196,11 +196,11 @@ fn filter_task(source_fields: &[&str]) -> Value {
     })
 }
 
-fn on_demand_trigger() -> Value {
+pub(crate) fn on_demand_trigger() -> Value {
     json!({ "triggerType": "OnDemand" })
 }
 
-fn scheduled_trigger(expression: &str) -> Value {
+pub(crate) fn scheduled_trigger(expression: &str) -> Value {
     json!({
         "triggerType": "Scheduled",
         "triggerProperties": {
@@ -212,7 +212,7 @@ fn scheduled_trigger(expression: &str) -> Value {
     })
 }
 
-fn event_trigger() -> Value {
+pub(crate) fn event_trigger() -> Value {
     json!({ "triggerType": "Event" })
 }
 
@@ -1247,6 +1247,7 @@ fn stored_flow(flow_name: &str) -> Flow {
         flow_arn: format!("arn:aws:appflow:us-east-1:{ACCOUNT}:flow/{flow_name}"),
         flow_name: flow_name.to_string(),
         client_token: None,
+        last_update_client_token: None,
         description: None,
         kms_arn: None,
         flow_status: FlowStatus::Draft,
