@@ -31,7 +31,11 @@ use crate::user_lifecycle::{call, element, elements, error_code, router};
 
 /// Whether `id` has the 8-4-4-4-12 lowercase-hex form an AWS request id carries. The value
 /// itself is per-run, so this form is the whole requirement on it.
-fn is_request_id(id: &str) -> bool {
+///
+/// Shared with `tests/all/error_request_id_across_operations.rs`, which holds the same rule
+/// across the service's operations rather than across the layers that render a failure, so
+/// the form is read exactly one way.
+pub(crate) fn is_request_id(id: &str) -> bool {
     let groups: Vec<&str> = id.split('-').collect();
     groups.len() == 5
         && groups

@@ -59,6 +59,8 @@ mod entities_for_policy;
 mod enum_refusal_wording;
 #[path = "all/error_envelope_request_id.rs"]
 mod error_envelope_request_id;
+#[path = "all/error_request_id_across_operations.rs"]
+mod error_request_id_across_operations;
 #[path = "all/fixed_refusal_wording.rs"]
 mod fixed_refusal_wording;
 #[path = "all/group_attached_policies.rs"]
