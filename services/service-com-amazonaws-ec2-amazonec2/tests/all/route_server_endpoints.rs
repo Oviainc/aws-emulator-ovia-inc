@@ -1,28 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for `DescribeRouteServerEndpoints` and the two creates an endpoint
-//! needs under it (`CreateRouteServer` and `CreateRouteServerEndpoint`), driven over the
+//! End-to-end cover for `DescribeRouteServerEndpoints`, the two creates an endpoint needs
+//! under it (`CreateRouteServer` and `CreateRouteServerEndpoint`) and the
+//! `DeleteRouteServerEndpoint` that takes one down, driven over the
 //! wire the service actually speaks: `ec2Query` — an
 //! `application/x-www-form-urlencoded` POST whose body carries
 //! `Action=DescribeRouteServerEndpoints`, answered with XML (README.md / OPERATIONS.md
 //! "Wire protocol"). ec2Query is selected by the `ec2` signing name in the request's SigV4
 //! credential scope, so every call here carries one.
 //!
-//! The rule under test: a describe REPORTS THE STORE — every stored route server endpoint
-//! unless the request narrows it by `RouteServerEndpointIds` or by a filter, in
-//! `RouteServerEndpointId` order, cut into `MaxResults`-sized pages followed by a token
-//! exactly while a further endpoint remains; an id that names no endpoint of the account is
-//! an error rather than an absent row; a filter name the operation does not answer is
-//! refused rather than read as "no results"; a token this service did not mint is refused;
-//! a dry run reports nothing; and reading changes nothing a later caller sees, beside the
-//! `pending` -> `available` move the clock already owed.
+//! The rules under test:
 //!
-//! Every table row is a distinct input along what the rule generalises over — how many ids
+//! * a describe REPORTS THE STORE — every stored route server endpoint
+//!   unless the request narrows it by `RouteServerEndpointIds` or by a filter, in
+//!   `RouteServerEndpointId` order, cut into `MaxResults`-sized pages followed by a token
+//!   exactly while a further endpoint remains; an id that names no endpoint of the account is
+//!   an error rather than an absent row; a filter name the operation does not answer is
+//!   refused rather than read as "no results"; a token this service did not mint is refused;
+//!   a dry run reports nothing; and reading changes nothing a later caller sees, beside the
+//!   `pending` -> `available` move the clock already owed;
+//! * a DELETE takes the endpoint the request names DOWN — it answers that stored endpoint,
+//!   member for member, in the non-terminal `deleting` state the clock then owes `deleted`,
+//!   whatever state the endpoint was in before the call; an id resolving to no endpoint of
+//!   the account is refused with `InvalidRouteServerEndpointId.NotFound`; and an endpoint
+//!   whose deletion is already underway is refused with `IncorrectState` rather than deleted
+//!   twice.
+//!
+//! Every table row is a distinct input along what the rules generalise over — how many ids
 //! the request names and in what order, which attribute a filter selects on (each name the
 //! operation answers, including a tag by key and by key/value), the page size at the
-//! smallest bound the model publishes and past the whole report, the tag count, and which
-//! route server and subnet an endpoint belongs to — so the one case a recording happens to
-//! contain is one row among many rather than the specification.
+//! smallest bound the model publishes and past the whole report, the tag count, which
+//! route server and subnet an endpoint belongs to, whether a delete arrives while the
+//! endpoint is coming up or once it is up, and the form of an id that names nothing — so the
+//! one case a recording happens to contain is one row among many rather than the
+//! specification.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -880,4 +891,399 @@ async fn describe_route_server_endpoints_refuses_a_foreign_token_and_performs_no
         reported, stored,
         "case \"DryRun=false\": expected every endpoint, got {reported:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A delete takes the endpoint down
+// ---------------------------------------------------------------------------
+
+/// One `DeleteRouteServerEndpoint` call naming `id`, as its HTTP status and XML body.
+async fn delete_endpoint(router: &MultiServiceRouter, id: &str) -> (u16, String) {
+    call(
+        router,
+        "DeleteRouteServerEndpoint",
+        &[param("RouteServerEndpointId", id)],
+    )
+    .await
+}
+
+/// The state `DescribeRouteServerEndpoints` reports the endpoint `id` in, read over the wire
+/// so a delete's own answer is never what a later read is checked against.
+async fn described_state(case: &str, router: &MultiServiceRouter, id: &str) -> String {
+    let body = describe(case, router, &indexed("RouteServerEndpointId", &[id])).await;
+    endpoint_state(case, &body, id)
+}
+
+/// One row of the delete table: a distinct input along what the rule generalises over — which
+/// route server and subnet the endpoint belongs to, how many tags it carries, and whether the
+/// delete arrives while the endpoint is still coming up or once it is up.
+struct DeleteEndpointCase<'a> {
+    case: &'a str,
+    route_server_id: &'a str,
+    subnet_id: &'a str,
+    tags: Vec<(&'a str, &'a str)>,
+    wait_for_available: bool,
+}
+
+/// The rule: `DeleteRouteServerEndpoint` takes the endpoint the request names DOWN — it
+/// answers that STORED endpoint, member for member, in the non-terminal `deleting` state the
+/// clock then owes the terminal `deleted` one transition later, whatever state the endpoint
+/// was in before the call, and the record stays reported in both delete states.
+///
+/// The rows differ in which route server the endpoint hangs off, which subnet it sits in (and
+/// so which VPC and which network interface address), how many tags it carries, and whether
+/// the delete arrives while the endpoint is still coming up or after it is up.
+#[tokio::test]
+async fn delete_route_server_endpoint_puts_the_endpoint_into_deleting_and_owes_it_deleted() {
+    let router = emulator();
+    let subnets = subnet_ids(&router).await;
+    assert!(
+        subnets.len() >= 2,
+        "the account must hold at least two subnets to place two endpoints into, got {subnets:?}"
+    );
+    let first_server = create_route_server("the first route server", &router, "64512").await;
+    let second_server = create_route_server("the second route server", &router, "4200000000").await;
+
+    let cases: Vec<DeleteEndpointCase<'_>> = vec![
+        DeleteEndpointCase {
+            case: "an untagged endpoint deleted while it is still coming up",
+            route_server_id: &first_server,
+            subnet_id: &subnets[0],
+            tags: Vec::new(),
+            wait_for_available: false,
+        },
+        DeleteEndpointCase {
+            case: "a tagged endpoint of the same route server deleted once it is available",
+            route_server_id: &first_server,
+            subnet_id: &subnets[1],
+            tags: vec![("role", "bgp"), ("tier", "edge")],
+            wait_for_available: true,
+        },
+        DeleteEndpointCase {
+            case: "an endpoint of the second route server deleted once it is available",
+            route_server_id: &second_server,
+            subnet_id: &subnets[0],
+            tags: vec![("owner", "network")],
+            wait_for_available: true,
+        },
+    ];
+
+    let mut deleted: Vec<(&str, String)> = Vec::new();
+    for DeleteEndpointCase {
+        case,
+        route_server_id,
+        subnet_id,
+        tags,
+        wait_for_available,
+    } in cases
+    {
+        let (id, created) = create_endpoint(case, &router, route_server_id, subnet_id, &tags).await;
+
+        if wait_for_available {
+            tokio::time::sleep(Duration::from_millis(900)).await;
+        }
+        let before = described_state(case, &router, &id).await;
+        if wait_for_available {
+            assert_eq!(
+                before,
+                ec2::state::ROUTE_SERVER_ENDPOINT_STATE_AVAILABLE,
+                "case {case:?}: expected the endpoint to be available before the delete, \
+                 got {before:?}"
+            );
+        } else {
+            // The create's own move may already have fallen due on a loaded machine, so what
+            // this row fixes is that the endpoint is still COMING UP OR UP when the delete
+            // arrives — the delete's own answer is asserted below either way.
+            assert!(
+                before == ec2::state::ROUTE_SERVER_ENDPOINT_STATE_PENDING
+                    || before == ec2::state::ROUTE_SERVER_ENDPOINT_STATE_AVAILABLE,
+                "case {case:?}: expected the endpoint to be coming up or up before the \
+                 delete, got {before:?}"
+            );
+        }
+
+        let (status, body) = delete_endpoint(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from the delete, got {status} with body {body}"
+        );
+        let answered = endpoint_state(case, &body, &id);
+        assert_eq!(
+            answered,
+            ec2::state::ROUTE_SERVER_ENDPOINT_STATE_DELETING,
+            "case {case:?}: expected the delete to answer the deleting state, got {answered:?}"
+        );
+        // The answer is the STORED endpoint: every member but the state is the one the create
+        // stored, whatever the delete did to it.
+        let expected_members = endpoint_members(case, &created, &id);
+        let delete_members = endpoint_members(case, &body, &id);
+        assert_eq!(
+            delete_members, expected_members,
+            "case {case:?}: expected the stored members {expected_members:?} from the \
+             delete, got {delete_members:?}"
+        );
+        let expected_tags = endpoint_tags(case, &created, &id);
+        let delete_tags = endpoint_tags(case, &body, &id);
+        assert_eq!(
+            delete_tags, expected_tags,
+            "case {case:?}: expected the tags {expected_tags:?} from the delete, \
+             got {delete_tags:?}"
+        );
+
+        // Straight after the call the terminal move is not yet due, so the reader still
+        // reports the transient state a caller acting immediately has to cope with.
+        let reading = described_state(case, &router, &id).await;
+        assert_eq!(
+            reading,
+            ec2::state::ROUTE_SERVER_ENDPOINT_STATE_DELETING,
+            "case {case:?}: expected deleting before the terminal move fell due, \
+             got {reading:?}"
+        );
+        deleted.push((case, id));
+    }
+
+    // The clock owes every deleted endpoint its terminal state, including the one deleted
+    // while it was still coming up: that endpoint's `available` move is off, not merely late.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    for (case, id) in &deleted {
+        let state = described_state(case, &router, id).await;
+        assert_eq!(
+            state,
+            ec2::state::ROUTE_SERVER_ENDPOINT_STATE_DELETED,
+            "case {case:?}: expected deleted once the terminal move fell due, got {state:?}"
+        );
+    }
+
+    // Every endpoint is still reported, so the delete moved the records rather than losing
+    // them.
+    let body = describe("after the deletes", &router, &[]).await;
+    let reported = reported_ids(&body);
+    let mut expected: Vec<String> = deleted.iter().map(|(_, id)| id.clone()).collect();
+    expected.sort();
+    assert_eq!(
+        reported, expected,
+        "expected every deleted endpoint to still be reported, got {reported:?}"
+    );
+}
+
+/// The rule: a `DeleteRouteServerEndpoint` whose `RouteServerEndpointId` resolves to no
+/// endpoint of the account is refused with HTTP 400 `InvalidRouteServerEndpointId.NotFound`,
+/// naming the id the request sent, and deletes nothing.
+///
+/// The rows differ in the FORM of the id that names nothing — a well-formed long id, a short
+/// one, a string that is no id at all, the id of another kind of resource (the route server
+/// the endpoint hangs off, and the subnet it sits in), and a stored endpoint's id with one
+/// character changed.
+#[tokio::test]
+async fn delete_route_server_endpoint_refuses_an_id_that_names_nothing() {
+    let router = emulator();
+    let subnets = subnet_ids(&router).await;
+    let route_server = create_route_server("a route server", &router, "64512").await;
+    let (stored, _) = create_endpoint(
+        "an endpoint that must survive every refusal",
+        &router,
+        &route_server,
+        &subnets[0],
+        &[],
+    )
+    .await;
+
+    // (case, the id the request names)
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "a well-formed long id nothing was created under",
+            "rse-00000000000000000".to_string(),
+        ),
+        (
+            "another well-formed long id nothing was created under",
+            "rse-00000000000000099".to_string(),
+        ),
+        (
+            "a short-form id nothing was created under",
+            "rse-abcd1234".to_string(),
+        ),
+        (
+            "a string that is not an id at all",
+            "not-an-endpoint".to_string(),
+        ),
+        (
+            "the id of the route server rather than of its endpoint",
+            route_server.clone(),
+        ),
+        (
+            "the id of the subnet rather than of the endpoint in it",
+            subnets[0].clone(),
+        ),
+        (
+            "the stored endpoint's id with one character changed",
+            format!("{}0", &stored[..stored.len() - 1]),
+        ),
+    ];
+
+    for (case, id) in cases {
+        let (status, body) = delete_endpoint(&router, &id).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        let code = error_code(&body);
+        assert_eq!(
+            code,
+            ec2::state::INVALID_ROUTE_SERVER_ENDPOINT_ID_NOT_FOUND,
+            "case {case:?}: expected {expected}, got {code:?} with body {body}",
+            expected = ec2::state::INVALID_ROUTE_SERVER_ENDPOINT_ID_NOT_FOUND
+        );
+        let message = error_message(&body);
+        let expected = format!(
+            "The {kind} ID '{id}' does not exist",
+            kind = ec2::state::RESOURCE_TYPE_ROUTE_SERVER_ENDPOINT,
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the message {expected:?}, got {message:?}"
+        );
+    }
+
+    // Nothing was deleted: the one stored endpoint is still in the state its create left it
+    // in.
+    let state = described_state("after the refusals", &router, &stored).await;
+    assert!(
+        state == ec2::state::ROUTE_SERVER_ENDPOINT_STATE_PENDING
+            || state == ec2::state::ROUTE_SERVER_ENDPOINT_STATE_AVAILABLE,
+        "expected the stored endpoint to be untouched by a refused delete, got {state:?}"
+    );
+}
+
+/// The rule: an endpoint whose deletion has already been asked for has nothing left to
+/// delete, so a second `DeleteRouteServerEndpoint` is refused with HTTP 400 `IncorrectState`
+/// naming the state the endpoint is in — in either delete state — and "If you have the
+/// required permissions, the error response is DryRunOperation" (`DryRun`): a dry run of a
+/// delete that would have succeeded reports that outcome with HTTP 412 and deletes nothing,
+/// while a dry run of one that would have been refused is refused with its own reason
+/// instead.
+#[tokio::test]
+async fn delete_route_server_endpoint_refuses_a_second_delete_and_performs_no_dry_run() {
+    let router = emulator();
+    let subnets = subnet_ids(&router).await;
+    let route_server = create_route_server("a route server", &router, "64512").await;
+
+    // Two endpoints: one the dry runs probe, one deleted outright so the second delete is
+    // exercised in both delete states.
+    let (probed, _) = create_endpoint(
+        "the probed endpoint",
+        &router,
+        &route_server,
+        &subnets[0],
+        &[],
+    )
+    .await;
+    let (doomed, _) = create_endpoint(
+        "the deleted endpoint",
+        &router,
+        &route_server,
+        &subnets[subnets.len() - 1],
+        &[],
+    )
+    .await;
+
+    // (case, the id the probe names, the status it must answer, the code it must carry)
+    let probes: Vec<(&str, String, u16, &str)> = vec![
+        (
+            "a dry run of a delete that would have succeeded",
+            probed.clone(),
+            412,
+            ec2::state::DRY_RUN_OPERATION,
+        ),
+        (
+            "a dry run naming an id that resolves to no endpoint",
+            "rse-00000000000000000".to_string(),
+            400,
+            ec2::state::INVALID_ROUTE_SERVER_ENDPOINT_ID_NOT_FOUND,
+        ),
+    ];
+    for (case, id, expected_status, expected_code) in probes {
+        let (status, body) = call(
+            &router,
+            "DeleteRouteServerEndpoint",
+            &[
+                param("RouteServerEndpointId", &id),
+                param("DryRun", "true"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} with body {body}"
+        );
+        let code = error_code(&body);
+        assert_eq!(
+            code, expected_code,
+            "case {case:?}: expected {expected_code}, got {code:?} with body {body}"
+        );
+    }
+    let probed_state = described_state("the probed endpoint", &router, &probed).await;
+    assert!(
+        probed_state == ec2::state::ROUTE_SERVER_ENDPOINT_STATE_PENDING
+            || probed_state == ec2::state::ROUTE_SERVER_ENDPOINT_STATE_AVAILABLE,
+        "a dry run must delete nothing: expected the probed endpoint to be coming up or up, \
+         got {probed_state:?}"
+    );
+
+    let (status, body) = delete_endpoint(&router, &doomed).await;
+    assert_eq!(
+        status, 200,
+        "expected HTTP 200 from the first delete, got {status} with body {body}"
+    );
+
+    // A second delete, while the first is still underway and once it has finished, and a dry
+    // run of one: each is refused for the state the endpoint is in.
+    // (case, whether to wait for the terminal state first, whether the probe is a dry run)
+    let refusals: [(&str, bool, bool); 3] = [
+        (
+            "a second delete while the first is still underway",
+            false,
+            false,
+        ),
+        (
+            "a dry run of a second delete, which is refused first",
+            false,
+            true,
+        ),
+        ("a second delete once the first has finished", true, false),
+    ];
+    for (case, wait, dry_run) in refusals {
+        if wait {
+            tokio::time::sleep(Duration::from_millis(900)).await;
+        }
+        let mut params = vec![param("RouteServerEndpointId", &doomed)];
+        if dry_run {
+            params.push(param("DryRun", "true"));
+        }
+        let (status, body) = call(&router, "DeleteRouteServerEndpoint", &params).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        let code = error_code(&body);
+        assert_eq!(
+            code,
+            ec2::state::INCORRECT_STATE,
+            "case {case:?}: expected {expected}, got {code:?} with body {body}",
+            expected = ec2::state::INCORRECT_STATE
+        );
+        let expected_state = if wait {
+            ec2::state::ROUTE_SERVER_ENDPOINT_STATE_DELETED
+        } else {
+            ec2::state::ROUTE_SERVER_ENDPOINT_STATE_DELETING
+        };
+        let message = error_message(&body);
+        let expected = format!(
+            "{kind} '{doomed}' is in the '{expected_state}' state.",
+            kind = ec2::state::RESOURCE_TYPE_ROUTE_SERVER_ENDPOINT,
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the message {expected:?}, got {message:?}"
+        );
+    }
 }

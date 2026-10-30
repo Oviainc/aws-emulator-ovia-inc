@@ -3639,6 +3639,12 @@ pub struct ComAmazonawsEc2Amazonec2State {
     pub route_server_endpoints: BTreeMap<String, RouteServerEndpoint>,
     /// When each route server endpoint's `pending` -> `available` transition falls due.
     pub route_server_endpoint_available_at: BTreeMap<String, Instant>,
+    /// When each DELETING route server endpoint's `deleting` -> `deleted` transition falls
+    /// due. One entry per endpoint a `DeleteRouteServerEndpoint` has started taking down,
+    /// written by [`Self::begin_route_server_endpoint_deletion`] and applied by
+    /// [`Self::materialize_due_transitions`]; an endpoint nobody asked to delete has no
+    /// entry.
+    pub route_server_endpoint_deleted_at: BTreeMap<String, Instant>,
     /// A `CreateRouteServerEndpoint` `ClientToken` and the `RouteServerEndpointId` that
     /// request minted.
     pub route_server_endpoint_client_tokens: HashMap<String, String>,
@@ -4330,6 +4336,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             instance_event_tag_registrations: BTreeMap::new(),
             route_server_endpoints: BTreeMap::new(),
             route_server_endpoint_available_at: BTreeMap::new(),
+            route_server_endpoint_deleted_at: BTreeMap::new(),
             route_server_endpoint_client_tokens: HashMap::new(),
             route_server_peers: BTreeMap::new(),
             route_server_peer_available_at: BTreeMap::new(),
@@ -7976,6 +7983,21 @@ impl ComAmazonawsEc2Amazonec2State {
                 if let Some(endpoint) = route_server_endpoints.get_mut(route_server_endpoint_id) {
                     if endpoint.state.as_deref() == Some(ROUTE_SERVER_ENDPOINT_STATE_PENDING) {
                         endpoint.state = Some(ROUTE_SERVER_ENDPOINT_STATE_AVAILABLE.to_string());
+                    }
+                }
+                false
+            });
+        // An endpoint goes down the same way it came up: `DeleteRouteServerEndpoint` answers
+        // it in the non-terminal `deleting` state, so the clock owes it the terminal
+        // `deleted` one TRANSITION_DELAY later whether or not anybody calls again.
+        self.route_server_endpoint_deleted_at
+            .retain(|route_server_endpoint_id, due_at| {
+                if now < *due_at {
+                    return true;
+                }
+                if let Some(endpoint) = route_server_endpoints.get_mut(route_server_endpoint_id) {
+                    if endpoint.state.as_deref() == Some(ROUTE_SERVER_ENDPOINT_STATE_DELETING) {
+                        endpoint.state = Some(ROUTE_SERVER_ENDPOINT_STATE_DELETED.to_string());
                     }
                 }
                 false
@@ -35299,6 +35321,14 @@ pub const ROUTE_SERVER_ENDPOINT_STATE_PENDING: &str = "pending";
 /// A route server endpoint that is usable: `RouteServerEndpointState`'s `available`.
 pub const ROUTE_SERVER_ENDPOINT_STATE_AVAILABLE: &str = "available";
 
+/// A route server endpoint being taken down: `RouteServerEndpointState`'s `deleting`, which
+/// is what `DeleteRouteServerEndpoint` answers with until [`TRANSITION_DELAY`] has passed.
+pub const ROUTE_SERVER_ENDPOINT_STATE_DELETING: &str = "deleting";
+
+/// A route server endpoint whose deletion is finished: that same enum's terminal `deleted`
+/// member, which the clock owes a `deleting` endpoint one [`TRANSITION_DELAY`] later.
+pub const ROUTE_SERVER_ENDPOINT_STATE_DELETED: &str = "deleted";
+
 /// A route server peer still coming up: `RouteServerPeerState`'s `pending`.
 pub const ROUTE_SERVER_PEER_STATE_PENDING: &str = "pending";
 
@@ -35489,6 +35519,42 @@ impl ComAmazonawsEc2Amazonec2State {
             Instant::now() + TRANSITION_DELAY,
         );
         route_server_endpoint_id
+    }
+
+    /// Start taking down the route server endpoint `route_server_endpoint_id` and answer it
+    /// as the store then holds it — `None` when the account holds no endpoint of that id.
+    ///
+    /// The counterpart of [`Self::begin_route_server_peer_deletion`], on the same clock and
+    /// under the same rule: the endpoint is put into the non-terminal
+    /// [`ROUTE_SERVER_ENDPOINT_STATE_DELETING`] now and the terminal
+    /// [`ROUTE_SERVER_ENDPOINT_STATE_DELETED`] falls due one [`TRANSITION_DELAY`] later,
+    /// which is STORED rather than slept for, so a caller reading straight after the delete
+    /// still sees the endpoint going down. Any `pending` -> `available` move still owed is
+    /// dropped here: an endpoint asked to delete while it was coming up must not come up
+    /// afterwards.
+    ///
+    /// The record STAYS in the store, because an endpoint in either delete state is still
+    /// reported — `deleting` and `deleted` are both `RouteServerEndpointState` members, which
+    /// the `state` filter of `DescribeRouteServerEndpoints` selects on — so its
+    /// caller-chosen bytes stay charged to the store's budget, which still holds them, its
+    /// network interface address stays held, and it still counts against
+    /// [`MAX_ROUTE_SERVER_RECORDS`], which bounds the records this process holds.
+    pub fn begin_route_server_endpoint_deletion(
+        &mut self,
+        route_server_endpoint_id: &str,
+    ) -> Option<RouteServerEndpoint> {
+        let endpoint = self
+            .route_server_endpoints
+            .get_mut(route_server_endpoint_id)?;
+        endpoint.state = Some(ROUTE_SERVER_ENDPOINT_STATE_DELETING.to_string());
+        let endpoint = endpoint.clone();
+        self.route_server_endpoint_available_at
+            .remove(route_server_endpoint_id);
+        self.route_server_endpoint_deleted_at.insert(
+            route_server_endpoint_id.to_string(),
+            Instant::now() + TRANSITION_DELAY,
+        );
+        Some(endpoint)
     }
 
     /// Insert a route server peer of the endpoint `route_server_endpoint_id` in `pending`
