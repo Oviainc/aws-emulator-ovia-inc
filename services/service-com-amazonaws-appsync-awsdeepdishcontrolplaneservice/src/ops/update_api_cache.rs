@@ -212,9 +212,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+        // An API that holds no cache has none to change, and the refusal names both
+        // this call and WHY there is no cache.
         let Some(cache) = api.api_cache.as_mut() else {
+            let message = crate::state::absent_cache_message(
+                crate::state::CacheCall::Update,
+                api.api_cache_was_deleted(),
+            );
             return Err(UpdateApiCacheErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::CACHE_NOT_FOUND_MESSAGE.to_string()),
+                message: Some(message),
             })
             .into());
         };

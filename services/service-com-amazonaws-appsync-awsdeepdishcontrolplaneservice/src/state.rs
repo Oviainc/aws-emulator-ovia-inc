@@ -63,8 +63,18 @@ pub struct GraphqlApiRecord {
     pub api_keys: BTreeMap<String, ApiKeyRecord>,
     /// The API's cache, or `None` while it has none: an API holds at most one
     /// `ApiCache` (`CreateApiCache` "Creates a cache for the GraphQL API", and
-    /// `GetApiCache` resolves it from the `apiId` alone).
+    /// `GetApiCache` resolves it from the `apiId` alone). Written through
+    /// [`GraphqlApiRecord::put_api_cache`] and [`GraphqlApiRecord::take_api_cache`],
+    /// which keep it and [`Self::api_cache_deleted`] in step.
     pub api_cache: Option<ApiCacheRecord>,
+    /// Whether a cache of this API was torn down, i.e. whether the empty cache slot
+    /// above is empty because a delete emptied it rather than because nothing ever
+    /// filled it. The two are distinguishable to a caller — a call that finds a cache
+    /// that was deleted is answered differently from one that finds an API that never
+    /// had a cache — so the distinction is kept here rather than recomputed from
+    /// anything the request carries. Cleared by a create that fills the slot again,
+    /// which leaves no deletion behind.
+    pub api_cache_deleted: bool,
     /// The data sources created under this API, keyed by their caller-supplied
     /// name — the name is what every data-source operation addresses one by, so it
     /// identifies the data source within its API and no second key is needed.
@@ -81,6 +91,28 @@ pub struct GraphqlApiRecord {
 }
 
 impl GraphqlApiRecord {
+    /// Store `cache` as this API's cache.
+    ///
+    /// The slot now holds an instance, so nothing about it was torn down: a create
+    /// that fills the slot again leaves no deletion behind for a later read to report.
+    pub fn put_api_cache(&mut self, cache: ApiCacheRecord) {
+        self.api_cache = Some(cache);
+        self.api_cache_deleted = false;
+    }
+
+    /// Tear down this API's cache, recording that the slot was emptied by a delete.
+    pub fn take_api_cache(&mut self) {
+        self.api_cache = None;
+        self.api_cache_deleted = true;
+    }
+
+    /// Whether this API's cache slot is empty BECAUSE a delete emptied it — the one
+    /// case a call reports as a torn-down cache rather than as one that was never
+    /// configured.
+    pub fn api_cache_was_deleted(&self) -> bool {
+        self.api_cache.is_none() && self.api_cache_deleted
+    }
+
     /// This record as the modelled `GraphqlApi` shape.
     ///
     /// The single projection used by create, get and list, so all three answer the
@@ -174,11 +206,15 @@ impl ApiCacheRecord {
         self.status = CACHE_AVAILABLE.to_string();
     }
 
-    /// Whether the instance has finished being provisioned, i.e. carries the status
-    /// that reports it "available for use" ([`CACHE_AVAILABLE`]) rather than one of the
-    /// statuses in which the service is still working on it.
-    pub fn is_available(&self) -> bool {
-        self.status == CACHE_AVAILABLE
+    /// Whether the instance was ever created, i.e. whether the create that minted it
+    /// ran to completion.
+    ///
+    /// `false` only for the two statuses the model defines as the creation itself —
+    /// [`CACHE_CREATING`] ("The instance is currently creating") and [`CACHE_FAILED`]
+    /// ("The instance has failed creation"). Every other status belongs to an instance
+    /// that exists, whatever the service is doing to it at the moment.
+    pub fn was_created(&self) -> bool {
+        self.status != CACHE_CREATING && self.status != CACHE_FAILED
     }
 
     /// Discard every entry the cache holds, as of `now`.
@@ -2387,6 +2423,10 @@ pub const CACHE_CREATING: &str = "CREATING";
 /// The `ApiCacheStatus` a cache whose settings are being applied carries.
 pub const CACHE_MODIFYING: &str = "MODIFYING";
 
+/// The `ApiCacheStatus` of an instance the service could not bring up. Source: the
+/// `ApiCacheStatus` enum, which defines it as "The instance has failed creation".
+pub const CACHE_FAILED: &str = "FAILED";
+
 /// The `ApiCacheStatus` a provisioned cache carries: "The instance is available for
 /// use."
 pub const CACHE_AVAILABLE: &str = "AVAILABLE";
@@ -2400,19 +2440,82 @@ pub const CACHE_AVAILABLE: &str = "AVAILABLE";
 /// [`ApiCacheRecord::settle`] applies it.
 pub const CACHE_SPAN: Duration = Duration::from_millis(500);
 
-/// The text `NotFoundException` (HTTP 404) carries for an API that holds no cache: the
-/// absent resource and the call that would create it.
-pub const CACHE_NOT_FOUND_MESSAGE: &str =
-    "Unable to get the cache as it doesn't exist, please create the cache first.";
+/// One of the cache operations an API's cache is addressed by — the call a refusal
+/// about that cache names.
+///
+/// AppSync's absent-cache refusal names the call that was attempted rather than the
+/// resource alone, so each handler hands its own variant to
+/// [`absent_cache_message`] and no handler borrows another's wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheCall {
+    /// `GetApiCache`.
+    Get,
+    /// `UpdateApiCache`.
+    Update,
+    /// `DeleteApiCache`.
+    Delete,
+    /// `FlushApiCache`.
+    Flush,
+}
+
+impl CacheCall {
+    /// The verb a refusal names this call by: what the caller was trying to do to the
+    /// cache.
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Update => "update",
+            Self::Delete => "delete",
+            Self::Flush => "flush",
+        }
+    }
+}
+
+/// The text `NotFoundException` (HTTP 404) carries when `call` found no cache to
+/// address on an API that never had one: the call that was attempted, the absent
+/// resource, and the call that would create it.
+pub fn cache_not_found_message(call: CacheCall) -> String {
+    format!(
+        "Unable to {} the cache as it doesn't exist, please create the cache first.",
+        call.verb()
+    )
+}
+
+/// The text `NotFoundException` (HTTP 404) carries when `call` found no cache to
+/// address on an API whose cache was torn down
+/// ([`GraphqlApiRecord::api_cache_was_deleted`]): a cache that was deleted is not a
+/// cache that was never configured, so the refusal names the deletion and points the
+/// caller at re-creating it rather than at creating a first one.
+pub fn cache_deleted_message(call: CacheCall) -> String {
+    format!(
+        "Unable to {} the cache as it has been deleted, please re-create the cache.",
+        call.verb()
+    )
+}
+
+/// The text `NotFoundException` (HTTP 404) carries when `call` found no cache to
+/// address, for either reason an API can have none: `was_deleted` says whether a delete
+/// emptied the cache slot, which the refusal reports as such.
+///
+/// [`CacheCall::Delete`] is the one call that asks for the absence itself, so its
+/// refusal names only the absent resource; the recorded refusal of a delete that finds
+/// no cache carries the never-configured text whether or not a cache was there before.
+pub fn absent_cache_message(call: CacheCall, was_deleted: bool) -> String {
+    if was_deleted && call != CacheCall::Delete {
+        cache_deleted_message(call)
+    } else {
+        cache_not_found_message(call)
+    }
+}
 
 /// The text `BadRequestException` (HTTP 400) carries for a create on an API that
-/// already holds a cache: an API holds at most one.
-pub const CACHE_ALREADY_EXISTS_MESSAGE: &str =
-    "The API already has a cache. Delete the existing cache before creating another one.";
+/// already holds a cache: an API holds at most one, so caching is either enabled on it
+/// or not.
+pub const CACHE_ALREADY_EXISTS_MESSAGE: &str = "The API has already enabled caching.";
 
-/// The text `BadRequestException` (HTTP 400) carries for a delete of a cache that is
-/// not [`CACHE_AVAILABLE`]: one sentence for the whole not-deletable class, naming
-/// neither the API nor the status the instance is in.
+/// The text `BadRequestException` (HTTP 400) carries for a delete of an instance that
+/// was never created ([`ApiCacheRecord::was_created`]): one sentence for the whole
+/// not-deletable class, naming neither the API nor the status the instance is in.
 pub const CACHE_NOT_DELETABLE_MESSAGE: &str =
     "Cannot delete cache as it is either not available or its creation failed.";
 

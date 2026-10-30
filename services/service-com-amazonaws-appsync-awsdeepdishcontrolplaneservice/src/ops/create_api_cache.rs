@@ -234,7 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A fresh instance is reported in the non-terminal `CREATING` status and
         // becomes available when the clock says so; nothing sleeps for it.
-        api.api_cache = Some(crate::state::ApiCacheRecord {
+        api.put_api_cache(crate::state::ApiCacheRecord {
             ttl: input.ttl,
             api_caching_behavior: input.api_caching_behavior,
             r#type: input.r#type,

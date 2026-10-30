@@ -182,19 +182,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        // An API that holds no cache — because none was created, or because an earlier
-        // delete already removed it — has no cache to delete.
+        // An API that holds no cache has nothing to tear down, whether a delete
+        // emptied the cache slot or nothing ever filled it: a teardown asks for the
+        // absence itself, so its refusal names this call and the absent resource (see
+        // `crate::state::absent_cache_message`).
         let Some(cache) = api.api_cache.as_ref() else {
+            let message = crate::state::absent_cache_message(
+                crate::state::CacheCall::Delete,
+                api.api_cache_was_deleted(),
+            );
             return Err(DeleteApiCacheErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::CACHE_NOT_FOUND_MESSAGE.to_string()),
+                message: Some(message),
             })
             .into());
         };
 
-        // The teardown precondition: an instance that has not finished being
-        // provisioned cannot be torn down. The refusal writes nothing, so the cache is
-        // still reported afterwards in whatever status it is in.
-        if !cache.is_available() {
+        // The teardown precondition: an instance whose CREATION has not completed
+        // cannot be torn down — it is still being created, or its creation failed.
+        // Once it has been created it is deletable whatever the service is doing to it
+        // at the moment, so settings being applied to an existing instance never make
+        // it undeletable. The refusal writes nothing, so the cache is still reported
+        // afterwards in whatever status it is in.
+        if !cache.was_created() {
             return Err(DeleteApiCacheErrorModeled::BadRequestException(BadRequestException {
                 message: Some(crate::state::CACHE_NOT_DELETABLE_MESSAGE.to_string()),
                 ..Default::default()
@@ -204,8 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Removing the record is what makes the cache gone: `GetApiCache`,
         // `FlushApiCache` and `UpdateApiCache` all answer not-found for this API
-        // afterwards, and a `CreateApiCache` is no longer a duplicate.
-        api.api_cache = None;
+        // afterwards, and a `CreateApiCache` is no longer a duplicate. The teardown is
+        // recorded with it, so a later read reports a cache that was deleted rather
+        // than one that never existed.
+        api.take_api_cache();
 
         // The modelled response carries no members.
         Ok(DeleteApiCacheOutput {})

@@ -3,13 +3,12 @@
 //! `DeleteApiCache`, end to end over HTTP.
 //!
 //! One rule, asserted over a table that spans the class rather than a single recorded
-//! request: an API's cache instance is torn down only from the status that reports it
-//! available for use. From any other status the delete is refused with the operation's
-//! modelled `BadRequestException` (400) carrying AppSync's fixed sentence for that
-//! class, and the instance is left exactly where it was; from the available status it
-//! answers 200 with a response that carries no members and the cache stops existing, so
-//! every later reader of that API answers not-found and a fresh create is accepted
-//! again.
+//! request: an API's cache instance is torn down once it has been created. While the
+//! create itself has not completed the delete is refused with the operation's modelled
+//! `BadRequestException` (400) carrying AppSync's fixed sentence for that class, and the
+//! instance is left exactly where it was; once the instance exists the delete answers
+//! 200 with a response that carries no members and the cache stops existing, so every
+//! later reader of that API answers not-found and a fresh create is accepted again.
 //!
 //! The `call`/`create_api`/`Answer` harness is the error-contract suite's.
 
@@ -34,9 +33,6 @@ const CACHE_SPAN: Duration = state::CACHE_SPAN;
 /// AppSync's fixed refusal text for a delete of a cache that is not available; the
 /// service's own copy, so the assertion cannot drift from what the handler answers.
 const NOT_DELETABLE: &str = state::CACHE_NOT_DELETABLE_MESSAGE;
-
-/// The text a not-found carries for an API that holds no cache.
-const NO_CACHE: &str = state::CACHE_NOT_FOUND_MESSAGE;
 
 /// `ApiCachingBehavior`'s whole value set, in the order the model declares it.
 /// Source: `smithy_query(query="shape", shape="ApiCachingBehavior")`.
@@ -140,36 +136,26 @@ async fn api_with_cache(
     api_id
 }
 
-/// Which non-available status the instance is in when the row deletes it.
-#[derive(Debug, Clone, Copy)]
-enum NotYet {
-    /// Straight after the create, while the instance is still being provisioned.
-    JustCreated,
-    /// Straight after an update, while the new settings are being applied.
-    JustUpdated,
-}
-
-/// The rule's refusal half: while the instance is in any status other than the
-/// available one the delete is refused, with 400 `BadRequestException` and AppSync's
-/// fixed sentence, and the cache is left in place — so the very next read still reports
-/// it and a later delete, once the clock has made the instance available, is served.
+/// The rule's refusal half: while the create itself has not completed the delete is
+/// refused, with 400 `BadRequestException` and AppSync's fixed sentence, and the cache
+/// is left in place — so the very next read still reports it and a later delete, once
+/// the clock has made the instance available, is served.
 ///
-/// The rows differ along every input the rule generalises over: the status the instance
-/// is in (being created, having new settings applied), the cache's settings (`ttl`,
-/// caching behaviour, instance type, health metrics) and how many times the refused
-/// delete is repeated.
+/// The rows differ along every input the rule generalises over: the cache's settings
+/// (`ttl`, caching behaviour, instance type, health metrics) and how many times the
+/// refused delete is repeated.
 #[tokio::test]
-async fn deleting_a_cache_that_is_not_available_is_refused_and_keeps_the_cache() {
+async fn deleting_a_cache_that_is_still_being_created_is_refused_and_keeps_the_cache() {
     let router = router();
 
-    let rows: &[(&str, i64, NotYet)] = &[
-        ("the published minimum ttl, being created", 1, NotYet::JustCreated),
-        ("a mid-window ttl, being created", 300, NotYet::JustCreated),
-        ("the published maximum ttl, settings being applied", 3_600, NotYet::JustUpdated),
-        ("a mid-window ttl, settings being applied", 42, NotYet::JustUpdated),
+    let rows: &[(&str, i64)] = &[
+        ("the published minimum ttl, being created", 1),
+        ("a mid-window ttl, being created", 300),
+        ("the published maximum ttl, being created", 3_600),
+        ("another mid-window ttl, being created", 42),
     ];
 
-    for (index, (case, ttl, when)) in rows.iter().enumerate() {
+    for (index, (case, ttl)) in rows.iter().enumerate() {
         let cache_type = CACHE_TYPES[index % CACHE_TYPES.len()];
         let behavior = CACHING_BEHAVIORS[index % CACHING_BEHAVIORS.len()];
         let health = HEALTH_METRICS[index % HEALTH_METRICS.len()];
@@ -183,28 +169,6 @@ async fn deleting_a_cache_that_is_not_available_is_refused_and_keeps_the_cache()
             health,
         )
         .await;
-
-        if let NotYet::JustUpdated = when {
-            // The instance has to be available before it accepts new settings, so let
-            // the clock make the create due first; the slack covers the scheduler.
-            tokio::time::sleep(CACHE_SPAN + Duration::from_millis(100)).await;
-            let updated = call(
-                &router,
-                "POST",
-                &format!("/v1/apis/{api_id}/ApiCaches/update"),
-                Some(json!({
-                    "ttl": ttl,
-                    "apiCachingBehavior": behavior,
-                    "type": cache_type,
-                    "healthMetricsConfig": health,
-                })),
-            )
-            .await;
-            assert_eq!(
-                updated.status, 200,
-                "case {case:?}: expected the update to be accepted, got {updated:?}"
-            );
-        }
 
         // Two refusals in a row: the refusal writes nothing, so the second answers
         // exactly as the first did.
@@ -326,15 +290,23 @@ async fn deleting_an_available_cache_removes_it_and_answers_without_members() {
             "case {case:?}: expected a response with no members, got {deleted:?}"
         );
 
-        // The cache is gone, so every operation that resolves one answers not-found
-        // with the absent-cache sentence.
-        for (op, method, path, body) in [
-            ("get", "GET", format!("/v1/apis/{api_id}/ApiCaches"), None),
+        // The cache is gone, so every operation that addresses one answers for an
+        // absence a delete left behind — each naming the call that met it, and the
+        // teardown naming the absent resource it asks for.
+        for (op, method, path, body, expected_message) in [
+            (
+                "get",
+                "GET",
+                format!("/v1/apis/{api_id}/ApiCaches"),
+                None,
+                state::cache_deleted_message(state::CacheCall::Get),
+            ),
             (
                 "flush",
                 "DELETE",
                 format!("/v1/apis/{api_id}/FlushCache"),
                 None,
+                state::cache_deleted_message(state::CacheCall::Flush),
             ),
             (
                 "update",
@@ -345,12 +317,14 @@ async fn deleting_an_available_cache_removes_it_and_answers_without_members() {
                     "apiCachingBehavior": behavior,
                     "type": cache_type,
                 })),
+                state::cache_deleted_message(state::CacheCall::Update),
             ),
             (
                 "delete again",
                 "DELETE",
                 format!("/v1/apis/{api_id}/ApiCaches"),
                 None,
+                state::cache_not_found_message(state::CacheCall::Delete),
             ),
         ] {
             let answer = call(&router, method, &path, body).await;
@@ -364,8 +338,8 @@ async fn deleting_an_available_cache_removes_it_and_answers_without_members() {
                  got {answer:?}"
             );
             assert_eq!(
-                answer.message, NO_CACHE,
-                "case {case:?} {op} after delete: expected the absent-cache sentence, \
+                answer.message, expected_message,
+                "case {case:?} {op} after delete: expected {expected_message:?}, \
                  got {answer:?}"
             );
         }
