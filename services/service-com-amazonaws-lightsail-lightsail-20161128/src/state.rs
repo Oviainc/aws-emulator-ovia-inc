@@ -10550,9 +10550,9 @@ pub fn alarm_metric_names(resource_type: &str) -> String {
 ///
 /// From the modelled `PutAlarmRequest$monitoredResourceName` documentation:
 /// "Instances, load balancers, and relational databases are the only Lightsail
-/// resources that can currently be monitored by alarms." Of those three, this
-/// slice stores instances and relational databases; a load balancer cannot be
-/// created yet, so no name resolves to one.
+/// resources that can currently be monitored by alarms." All three of those
+/// resolve to one of these, each addressed the way its own operations address it
+/// — see [`ComAmazonawsLightsailLightsail20161128State::monitored_resource`].
 #[derive(Debug, Clone)]
 pub struct MonitoredResource {
     pub name: String,
@@ -14634,11 +14634,28 @@ impl ComAmazonawsLightsailLightsail20161128State {
             .remove(&(region.to_string(), protocol.to_string()))
     }
 
-    /// The resource an alarm would monitor under `name`, or `None` when this
-    /// account holds no alarmable resource of that name.
+    /// The resource an alarm would monitor under `name` for a request made in
+    /// `region`, or `None` when this account holds no alarmable resource of that
+    /// name there.
     ///
-    /// See [`MonitoredResource`] for which resource types those are.
-    pub fn monitored_resource(&self, name: &str) -> Option<MonitoredResource> {
+    /// ONE name addresses one resource — the reasoning is spelled out on
+    /// [`Self::with_tagged_record`]: `GetActiveNames` reports the account's
+    /// resources as a single flat list of names with no resource type
+    /// qualifying them, and each kind's own create refuses a name already
+    /// taken — so at most one of the three below holds a given name and the
+    /// order they are searched in is not a tie-break.
+    ///
+    /// Which resource types those are is [`MonitoredResource`]; each is searched
+    /// the way that resource's OWN operations address it, the way
+    /// [`Self::with_tagged_record`] searches them, so an alarm can watch exactly
+    /// what those operations serve and no more. An instance and a relational
+    /// database are held by name alone — `GetInstance` and
+    /// `GetRelationalDatabase` serve them whichever Region the request is made
+    /// from — and a load balancer is held under its Region together with its
+    /// name, because a load balancer is a REGIONAL resource whose own
+    /// documentation caps them "per AWS Region in your account", so the one a
+    /// name addresses is the one in `region`.
+    pub fn monitored_resource(&self, region: &str, name: &str) -> Option<MonitoredResource> {
         if let Some(instance) = self.instances.get(name) {
             return Some(MonitoredResource {
                 name: instance.name.clone(),
@@ -14647,12 +14664,20 @@ impl ComAmazonawsLightsailLightsail20161128State {
                 location: StoredLocation::regional(&instance.location.region_name),
             });
         }
-        let database = self.relational_databases.get(name)?;
+        if let Some(database) = self.relational_databases.get(name) {
+            return Some(MonitoredResource {
+                name: database.name.clone(),
+                arn: database.arn.clone(),
+                resource_type: RESOURCE_TYPE_RELATIONAL_DATABASE,
+                location: StoredLocation::regional(&database.location.region_name),
+            });
+        }
+        let balancer = self.load_balancer(region, name)?;
         Some(MonitoredResource {
-            name: database.name.clone(),
-            arn: database.arn.clone(),
-            resource_type: RESOURCE_TYPE_RELATIONAL_DATABASE,
-            location: StoredLocation::regional(&database.location.region_name),
+            name: balancer.name.clone(),
+            arn: balancer.arn.clone(),
+            resource_type: RESOURCE_TYPE_LOAD_BALANCER,
+            location: StoredLocation::regional(&balancer.location.region_name),
         })
     }
 

@@ -227,11 +227,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only, and nothing this operation stores
-        // comes from it: an alarm watches ONE resource, so the region it lives in
-        // is the region of that resource's own record, not the one the request
-        // signed for.
-        let _ = ctx;
+        // The Region the request is signed for decides WHICH resource a
+        // monitored resource name addresses, for the kinds this store holds
+        // under their Region: a load balancer is a regional resource, so the one
+        // a name names is the one of this Region (an instance and a relational
+        // database are each addressed by name alone). Nothing this operation
+        // STORES comes from it: an alarm watches ONE resource, so the region the
+        // alarm lives in is the region of that resource's own record.
+        let region = crate::state::request_region(ctx.parts());
 
         // `alarmName`, `metricName`, `monitoredResourceName`,
         // `comparisonOperator`, `threshold` and `evaluationPeriods` are modelled
@@ -302,7 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         crate::state::with_state(&*self.engine, |store| {
             let monitored = store
-                .monitored_resource(&input.monitored_resource_name)
+                .monitored_resource(&region, &input.monitored_resource_name)
                 .ok_or_else(|| monitored_resource_does_not_exist(&input.monitored_resource_name))?;
             // Each resource type publishes its own metrics, so a metric the
             // monitored resource does not publish is refused rather than stored

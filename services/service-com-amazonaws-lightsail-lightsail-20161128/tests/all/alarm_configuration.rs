@@ -58,9 +58,10 @@ const INSTANCE_BUNDLE: &str = "micro_3_0";
 ///
 /// From `PutAlarmRequest$monitoredResourceName`: "Instances, load balancers, and
 /// relational databases are the only Lightsail resources that can currently be
-/// monitored by alarms." Of those three, only these two can be created in this
-/// emulator — `CreateLoadBalancer` is still a scaffold with its own issue — so a
-/// load balancer metric is exercised through the refusals instead.
+/// monitored by alarms." These are the two of those three that a name alone
+/// addresses, which is what the cases here are about; the third — a load
+/// balancer, which a name addresses in the Region the request is made in — is
+/// covered by the suite of its own in `alarm_load_balancer.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Monitored {
     Instance,
