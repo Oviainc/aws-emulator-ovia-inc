@@ -866,8 +866,10 @@
 //! [`ComAmazonawsEc2Amazonec2State::route_servers`] holds the account's VPC route servers
 //! as [`RouteServerRecord`]s: the modelled [`RouteServer`] shape every operation that
 //! reports one answers with, plus the instants the clock owes it its `pending` ->
-//! `available` move and, when the create asked for route persistence, its `enabling` ->
-//! `enabled` move. Those two words are facts of the record's age, so
+//! `available` move, its `modifying` -> `available` move once a configuration change has
+//! been asked for, and the move its route persistence is within (`enabling` -> `enabled`,
+//! `disabling` -> `disabled`, or a `resetting` that withdraws the persisted routes and
+//! leaves the configuration as it was). Those two words are facts of the record's age, so
 //! [`RouteServerRecord::view_at`] derives them on read instead of letting two writers
 //! store two different ones. Keyed by `RouteServerId` in a [`BTreeMap`], the same stable
 //! order the VPC and volume stores are kept in, so a pagination token can name the id the
@@ -27701,6 +27703,11 @@ pub const ROUTE_SERVER_STATE_PENDING: &str = "pending";
 /// The state a created route server reaches: `RouteServerState`'s `available`.
 pub const ROUTE_SERVER_STATE_AVAILABLE: &str = "available";
 
+/// The state a route server whose configuration a modification is being applied to sits
+/// in: `RouteServerState`'s `modifying`, the enum's one non-terminal state besides
+/// `pending` and `deleting`.
+pub const ROUTE_SERVER_STATE_MODIFYING: &str = "modifying";
+
 /// Route persistence being turned on: `RouteServerPersistRoutesState`'s `enabling`
 /// (`smithy_query(query="shape",shape="RouteServerPersistRoutesState")`).
 pub const PERSIST_ROUTES_STATE_ENABLING: &str = "enabling";
@@ -27708,13 +27715,31 @@ pub const PERSIST_ROUTES_STATE_ENABLING: &str = "enabling";
 /// Route persistence on: `RouteServerPersistRoutesState`'s `enabled`.
 pub const PERSIST_ROUTES_STATE_ENABLED: &str = "enabled";
 
+/// Route persistence being turned off: `RouteServerPersistRoutesState`'s `disabling`.
+pub const PERSIST_ROUTES_STATE_DISABLING: &str = "disabling";
+
 /// Route persistence off: `RouteServerPersistRoutesState`'s `disabled`.
 pub const PERSIST_ROUTES_STATE_DISABLED: &str = "disabled";
+
+/// Persisted routes being withdrawn: `RouteServerPersistRoutesState`'s `resetting`, the
+/// state a route server whose persisted routes are being cleared is in — "reset will
+/// withdraw all routes and reset route server to an empty FIB and RIB"
+/// (`ModifyRouteServerRequest$PersistRoutes`).
+pub const PERSIST_ROUTES_STATE_RESETTING: &str = "resetting";
 
 /// `RouteServerPersistRoutesAction`'s `enable` — "Indicates whether routes should be
 /// persisted after all BGP sessions are terminated"
 /// (`CreateRouteServerRequest$PersistRoutes`).
 pub const PERSIST_ROUTES_ENABLE: &str = "enable";
+
+/// `RouteServerPersistRoutesAction`'s `disable`: "Routes will not be persisted in FIB and
+/// RIB after all BGP sessions are terminated" (`ModifyRouteServerRequest$PersistRoutes`).
+pub const PERSIST_ROUTES_DISABLE: &str = "disable";
+
+/// `RouteServerPersistRoutesAction`'s `reset`: withdraws the routes a route server has
+/// persisted, leaving whether it persists them at all as it is
+/// (`ModifyRouteServerRequest$PersistRoutes`).
+pub const PERSIST_ROUTES_RESET: &str = "reset";
 
 /// The ASN range the Amazon side of the BGP session accepts: "Valid values are from 1 to
 /// 4294967295" (`CreateRouteServerRequest$AmazonSideAsn`). The model declares no `@range`
@@ -27725,6 +27750,20 @@ pub const AMAZON_SIDE_ASN_RANGE: (i64, i64) = (1, 4_294_967_295);
 /// 1-5" (`CreateRouteServerRequest$PersistRoutesDuration`). The model declares no `@range`
 /// on the member either.
 pub const PERSIST_ROUTES_DURATION_RANGE: (i64, i64) = (1, 5);
+
+/// How the service words a `PersistRoutesDuration` it will not accept, whatever the value
+/// at fault: the duration is a fixed sentence about the parameter rather than a template
+/// quoting what was sent.
+pub const PERSIST_ROUTES_DURATION_INVALID_MESSAGE: &str =
+    "Persist routes time is invalid for this operation.";
+
+/// Refuse a `PersistRoutesDuration` the operation cannot act on — one outside
+/// [`PERSIST_ROUTES_DURATION_RANGE`], or one the request's persistence choice gives nothing
+/// to wait out: HTTP 400 `InvalidParameterValue` with
+/// [`PERSIST_ROUTES_DURATION_INVALID_MESSAGE`].
+pub fn persist_routes_duration_invalid<E>() -> Scaffolded<E> {
+    invalid_parameter_value(PERSIST_ROUTES_DURATION_INVALID_MESSAGE)
+}
 
 /// The one resource type a route server create's `TagSpecifications` can name: "The tags to
 /// apply to the route server during creation"
@@ -27784,6 +27823,18 @@ pub struct RouteServerRecord {
     /// for a route server that asked for persistence. A route server that did not is
     /// `disabled` from the start, so its instant is the create's own.
     pub persist_routes_settled_at: Instant,
+    /// The transient `RouteServerPersistRoutesState` the clock has yet to settle
+    /// ([`PERSIST_ROUTES_STATE_ENABLING`], [`PERSIST_ROUTES_STATE_DISABLING`] or
+    /// [`PERSIST_ROUTES_STATE_RESETTING`]), reported until
+    /// [`Self::persist_routes_settled_at`]; `None` for a route server whose persistence
+    /// nobody has asked to move.
+    pub persist_routes_transition: Option<&'static str>,
+    /// The instant from which this route server's `modifying` -> `available` move is due:
+    /// a configuration change is applied over a span, like every other move this store
+    /// owes. Monotonic for the reason [`Self::available_at`] is, and the CREATE's own
+    /// instant for a route server no modification has been asked for, which is already
+    /// behind every read.
+    pub modify_settled_at: Instant,
 }
 
 impl RouteServerRecord {
@@ -27798,27 +27849,34 @@ impl RouteServerRecord {
         }
     }
 
-    /// The route server's `RouteServerState` at `now`.
+    /// The route server's `RouteServerState` at `now`: `pending` until its create has
+    /// settled, `modifying` while a configuration change is being applied, and `available`
+    /// once the clock has settled both.
     pub fn state_at(&self, now: Instant) -> &'static str {
         if now < self.available_at {
             ROUTE_SERVER_STATE_PENDING
+        } else if now < self.modify_settled_at {
+            ROUTE_SERVER_STATE_MODIFYING
         } else {
             ROUTE_SERVER_STATE_AVAILABLE
         }
     }
 
-    /// The route server's `RouteServerPersistRoutesState` at `now`.
+    /// The route server's `RouteServerPersistRoutesState` at `now`: the transient state a
+    /// persistence move is still within, else the settled state its configuration names.
     ///
-    /// A route server that was not asked to persist routes has nothing to turn off, so it
-    /// is `disabled` with no transient state of its own.
+    /// A route server whose persistence nobody has asked to move carries no transient
+    /// state, so it reports `enabled` or `disabled` from the instant it was written.
     pub fn persist_routes_state_at(&self, now: Instant) -> &'static str {
-        if !self.persist_routes_enabled {
-            return PERSIST_ROUTES_STATE_DISABLED;
-        }
         if now < self.persist_routes_settled_at {
-            PERSIST_ROUTES_STATE_ENABLING
-        } else {
+            if let Some(transition) = self.persist_routes_transition {
+                return transition;
+            }
+        }
+        if self.persist_routes_enabled {
             PERSIST_ROUTES_STATE_ENABLED
+        } else {
+            PERSIST_ROUTES_STATE_DISABLED
         }
     }
 }

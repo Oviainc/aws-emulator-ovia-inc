@@ -149,11 +149,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            idempotent_parameter_mismatch, request_region, require_service_state,
-            route_server_limit_exceeded, route_server_payload_bytes, route_server_sns_topic_arn,
-            same_tags, tags_from_specifications, RouteServerRecord, AMAZON_SIDE_ASN_RANGE,
-            MAX_CLIENT_TOKEN_CHARS, MAX_STORED_BYTES, MAX_STORED_ROUTE_SERVERS,
-            PERSIST_ROUTES_DURATION_RANGE, PERSIST_ROUTES_ENABLE, ROUTE_SERVER_ID_PREFIX,
+            idempotent_parameter_mismatch, persist_routes_duration_invalid, request_region,
+            require_service_state, route_server_limit_exceeded, route_server_payload_bytes,
+            route_server_sns_topic_arn, same_tags, tags_from_specifications, RouteServerRecord,
+            AMAZON_SIDE_ASN_RANGE, MAX_CLIENT_TOKEN_CHARS, MAX_STORED_BYTES,
+            MAX_STORED_ROUTE_SERVERS, PERSIST_ROUTES_DURATION_RANGE, PERSIST_ROUTES_ENABLE,
+            PERSIST_ROUTES_STATE_ENABLING, ROUTE_SERVER_ID_PREFIX,
             ROUTE_SERVER_TAGGABLE_RESOURCE, TRANSITION_DELAY,
         };
 
@@ -187,11 +188,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (duration_min, duration_max) = PERSIST_ROUTES_DURATION_RANGE;
         let persist_routes_duration = match (input.persist_routes_duration, persist_routes_enabled)
         {
+            // Refused with the service's own sentence for a persist-routes time it will not
+            // act on, which names the parameter rather than quoting the value sent
+            // ([`crate::state::persist_routes_duration_invalid`]).
             (Some(duration), _) if duration < duration_min || duration > duration_max => {
-                return Err(Scaffolded::invalid_parameter_value(format!(
-                    "Invalid value '{duration}' for persistRoutesDuration. \
-                     It must be from {duration_min} to {duration_max} minutes"
-                )));
+                return Err(persist_routes_duration_invalid());
             }
             // A duration given with anything other than `enable` (so `disable`, `reset`, or
             // no choice at all) is refused. The documented sentences tie the duration to
@@ -355,6 +356,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             } else {
                 now
             },
+            persist_routes_transition: persist_routes_enabled
+                .then_some(PERSIST_ROUTES_STATE_ENABLING),
+            // Nothing has asked this route server to change yet, so its `modifying` span is
+            // already behind every read.
+            modify_settled_at: now,
         };
         if let Some(token) = input.client_token.clone() {
             store
