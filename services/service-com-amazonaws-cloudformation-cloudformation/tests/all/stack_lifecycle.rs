@@ -126,6 +126,19 @@ pub(crate) async fn sns(
     action: &str,
     params: &[(&str, &str)],
 ) -> (u16, String) {
+    sns_in(router, REGION, action, params).await
+}
+
+/// [`sns`], signed for `region`: a stack deploys its resources in the Region the call that
+/// created it was signed for, and a StackSet's stack instance deploys them in the TARGET
+/// Region it was created for — so a case that reads one of those topics back reaches Amazon
+/// SNS in that Region, which is the Region its topic ARNs carry.
+pub(crate) async fn sns_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
     let mut body = format!("Action={action}&Version=2010-03-31");
     for (name, value) in params {
         body.push('&');
@@ -136,12 +149,12 @@ pub(crate) async fn sns(
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
-        .header("host", format!("sns.{REGION}.amazonaws.com"))
+        .header("host", format!("sns.{region}.amazonaws.com"))
         .header("content-type", "application/x-www-form-urlencoded")
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/sns/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/sns/aws4_request, \
                  SignedHeaders=host, Signature=0123456789abcdef"
             ),
         )

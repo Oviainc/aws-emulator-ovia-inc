@@ -249,6 +249,8 @@ mod stack_set_mutations;
 mod stack_set_operation_refusal_wording;
 #[path = "all/stack_set_refusal_wording.rs"]
 mod stack_set_refusal_wording;
+#[path = "all/stack_set_revision_rollout.rs"]
+mod stack_set_revision_rollout;
 #[path = "all/stack_status_accepts_an_update.rs"]
 mod stack_status_accepts_an_update;
 #[path = "all/stack_tag_propagation.rs"]
