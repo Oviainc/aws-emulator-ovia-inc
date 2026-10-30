@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListActivityTypes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListActivityTypes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListActivityTypes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a pure read of the `ActivityTypeRecord`s stored in the addressed
+//! domain, filtered to the requested `registrationStatus` and, when the request names
+//! one, to that `name`; ordered ascending by name (then version, so the several
+//! versions of one name hold a reproducible position), reversed when `reverseOrder` is
+//! set, and cut into pages of `maximumPageSize` with a `nextPageToken` naming the
+//! position the page ended at. A domain no record is stored under is an
+//! `UnknownResourceFault`; a domain holding no matching type is an empty list, not a
+//! fault.
 //!
 //! ## Shape of an operation
 //!
@@ -172,20 +172,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListActivityTypes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListActivityTypesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListActivityTypes"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListActivityTypesErrorModeled::OperationNotPermittedFault(
+                OperationNotPermittedFault {
+                    message: Some("the SWF domain store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let guard = state.lock();
+        // The listing is scoped to one domain, and the domain's own registration status
+        // does not gate it: deprecating a domain stops new registrations in it, while
+        // the types already registered there stay listable.
+        let domain = guard.domains.get(&input.domain).ok_or_else(|| {
+            ListActivityTypesErrorModeled::UnknownResourceFault(UnknownResourceFault {
+                message: Some(format!("Unknown domain: {}", input.domain)),
+            })
+        })?;
+
+        // `registrationStatus` is required and selects on the record's own stored status
+        // ("Specifies the registration status of the activity types to list"); the
+        // optional `name` narrows further ("If specified, only lists the activity types
+        // that have this name") — every version registered under that name, since the
+        // listing takes no version.
+        let requested_name = crate::state::non_empty(&input.name);
+        let mut matching: Vec<&crate::state::ActivityTypeRecord> = domain
+            .activity_types
+            .values()
+            .filter(|record| {
+                record.status == input.registration_status
+                    && requested_name
+                        .as_ref()
+                        .is_none_or(|name| &record.name == name)
+            })
+            .collect();
+
+        // "By default, the results are returned in ascending alphabetical order by name
+        // of the activity types"; `reverseOrder` returns them descending instead.
+        // Sorting is by the full order key, so the position of two versions registered
+        // under one name is still defined — the store holds them in a map with no order
+        // of its own.
+        matching.sort_by_key(|record| crate::state::type_order_key(&record.name, &record.version));
+        if input.reverse_order {
+            matching.reverse();
+        }
+
+        // `maximumPageSize` defaults to 0 ("not specified"), which means every match up
+        // to the modelled page maximum. The modelled `PageSize` range (0..1000) is
+        // enforced by the boundary validator before this handler runs, so a value above
+        // the maximum never reaches here; the clamp is the internal safety bound that
+        // keeps one response bounded regardless.
+        let page_size = match usize::try_from(input.maximum_page_size) {
+            Ok(size) if size > 0 => size.min(crate::state::MAX_TYPE_PAGE_SIZE),
+            _ => crate::state::MAX_TYPE_PAGE_SIZE,
+        };
+
+        // The token names the position the previous page ended at, so this page starts
+        // at the first match that sorts after it in THIS ordering. `partition_point`
+        // reads that off the sorted ordering, so a type registered, deprecated or
+        // deleted between the two calls shifts nothing the token addresses.
+        let start = match crate::state::non_empty(&input.next_page_token) {
+            Some(token) => {
+                let resume_after =
+                    crate::state::decode_type_page_token(&token, input.reverse_order)
+                        .map_err(crate::scaffolded::Scaffolded::validation)?;
+                matching.partition_point(|record| {
+                    let key = crate::state::type_order_key(&record.name, &record.version);
+                    if input.reverse_order {
+                        key >= resume_after
+                    } else {
+                        key <= resume_after
+                    }
+                })
+            }
+            None => 0,
+        };
+        let total = matching.len();
+        let end = (start + page_size).min(total);
+        let page = &matching[start..end];
+
+        Ok(ListActivityTypesOutput {
+            type_infos: page.iter().map(|record| record.info()).collect(),
+            // The token names the last type of THIS page, so `last()` is what the
+            // cursor is built from, and it is issued only while matches remain.
+            next_page_token: page.last().filter(|_| end < total).map(|last| {
+                crate::state::encode_type_page_token(
+                    input.reverse_order,
+                    &crate::state::type_order_key(&last.name, &last.version),
+                )
+            }),
+        })
     }
 }
+

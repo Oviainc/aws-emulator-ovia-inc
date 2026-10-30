@@ -215,6 +215,12 @@ pub const MAX_HISTORY_PAGE_SIZE: usize = 1_000;
 /// `PageSize` maximum (range 0..1000).
 pub const MAX_EXECUTION_PAGE_SIZE: usize = 1_000;
 
+/// The page size a listing of a domain's registered types uses when the caller passes
+/// no `maximumPageSize` (the member defaults to `0`), so one unparameterised request
+/// cannot materialise a response that grows without bound. It is the modelled
+/// `PageSize` maximum (range 0..1000).
+pub const MAX_TYPE_PAGE_SIZE: usize = 1_000;
+
 /// The `timeoutType` of a decision task that was handed to a decider and not completed
 /// within its `startToCloseTimeout` ("The maximum duration for this decision task. The
 /// task is considered timed out if it doesn't completed within this duration."). One of
@@ -3083,6 +3089,73 @@ fn execution_order_tag(reverse_order: bool, basis: ExecutionTimeBasis) -> &'stat
         (true, ExecutionTimeBasis::StartTime) => "as",
         (false, ExecutionTimeBasis::CloseTime) => "dc",
         (true, ExecutionTimeBasis::CloseTime) => "ac",
+    }
+}
+
+/// The total order a listing of a domain's registered types pages through: the type's
+/// `name`, then its `version`.
+///
+/// The name comes first because that is the order the listings document — "the results
+/// are returned in ascending alphabetical order by name" — and the version is part of
+/// the key because the store holds types in a map with no order of its own: the several
+/// versions registered under one name would otherwise have no defined position, and a
+/// page boundary between them would not be reproducible.
+pub type TypeOrderKey = (String, String);
+
+/// The [`TypeOrderKey`] of one registered type identity.
+pub fn type_order_key(name: &str, version: &str) -> TypeOrderKey {
+    (name.to_string(), version.to_string())
+}
+
+/// A type listing's `nextPageToken` for the next unread type: the ordering the page was
+/// read in, then the [`TypeOrderKey`] the page ended on.
+///
+/// The token names a POSITION IN THE ORDER rather than a stored record, so a type
+/// registered, deprecated or deleted between two pages cannot invalidate it: the next
+/// page is whatever still sorts after that key. The direction is part of the token
+/// because "after this one" means something different in each of them; carrying it lets
+/// a token replayed against the other ordering be refused instead of silently skipping
+/// or repeating types, which is what "Keep all other arguments unchanged" asks of the
+/// caller.
+pub fn encode_type_page_token(reverse_order: bool, key: &TypeOrderKey) -> String {
+    let (name, version) = key;
+    // Hex-encoded for the same reason as [`encode_execution_page_token`]: the token is a
+    // response member with no structure of its own, and a type `name` may hold any
+    // character SWF's naming rule allows.
+    let payload = format!("{name}\u{0}{version}");
+    format!("{}{}", type_order_tag(reverse_order), ::hex::encode(payload))
+}
+
+/// The [`TypeOrderKey`] a `nextPageToken` resumes AFTER, for a listing in
+/// `reverse_order`.
+pub fn decode_type_page_token(token: &str, reverse_order: bool) -> Result<TypeOrderKey, String> {
+    let rejected = || {
+        format!(
+            "nextPageToken {token:?} was not issued for a reverseOrder={reverse_order} listing \
+             of this domain's registered types; pass the token back unchanged, with every \
+             other argument unchanged"
+        )
+    };
+    let payload = token
+        .strip_prefix(type_order_tag(reverse_order))
+        .and_then(|encoded| ::hex::decode(encoded).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(rejected)?;
+    let mut parts = payload.split('\u{0}');
+    let (Some(name), Some(version), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(rejected());
+    };
+    Ok((name.to_string(), version.to_string()))
+}
+
+/// The ordering tag [`encode_type_page_token`] stamps into a page token: the direction
+/// the page was walked in. It differs from every other tag of this module so that two
+/// kinds of token cannot be mistaken for one another.
+fn type_order_tag(reverse_order: bool) -> &'static str {
+    if reverse_order {
+        "tr"
+    } else {
+        "tf"
     }
 }
 

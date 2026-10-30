@@ -37,6 +37,8 @@ mod domain_tagging;
 mod domain_undeprecation;
 #[path = "all/execution_start_to_close_timeout.rs"]
 mod execution_start_to_close_timeout;
+#[path = "all/list_activity_types.rs"]
+mod list_activity_types;
 #[path = "all/list_closed_workflow_executions.rs"]
 mod list_closed_workflow_executions;
 #[path = "all/list_open_workflow_executions.rs"]
