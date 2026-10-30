@@ -639,7 +639,7 @@ async fn a_token_issued_in_another_region_is_refused_with_that_regions_endpoint(
         }))
         .await;
     assert_eq!(status, 200, "StartDeviceAuthorization answered {started}");
-    tokio::time::sleep(Duration::from_millis(750)).await;
+    emulator.approve(&text(&started, "userCode"));
     let (status, foreign) = emulator
         .post(
             "/token",

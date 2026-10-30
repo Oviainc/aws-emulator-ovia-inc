@@ -21,6 +21,8 @@ mod create_token_grant_type;
 mod create_token_with_iam;
 #[path = "all/device_authorization_flow.rs"]
 mod device_authorization_flow;
+#[path = "all/device_code_approval.rs"]
+mod device_code_approval;
 #[path = "all/error_descriptions.rs"]
 mod error_descriptions;
 #[path = "all/state_roundtrip.rs"]

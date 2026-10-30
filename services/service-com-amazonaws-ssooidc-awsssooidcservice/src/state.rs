@@ -178,7 +178,7 @@ pub const DESCRIPTION_INVALID_SCOPE: &str = "Invalid scope provided";
 
 /// A device authorization whose approval has not happened yet
 /// (`authorization_pending`).
-pub const DESCRIPTION_AUTHORIZATION_PENDING: &str = "Authorization is pending";
+pub const DESCRIPTION_AUTHORIZATION_PENDING: &str = "Authorization is still pending";
 
 /// A device authorization that was refused (`access_denied`).
 pub const DESCRIPTION_ACCESS_DENIED: &str = "Access denied";
@@ -225,13 +225,6 @@ pub const ACCESS_TOKEN_EXPIRES_IN: i32 = 3600;
 /// expired can still exchange its refresh token for a new pair, so the refresh
 /// token has its own lifetime rather than the access token's.
 pub const REFRESH_TOKEN_EXPIRES_IN: i32 = 8 * 3600;
-
-/// How long after `StartDeviceAuthorization` the pending authorization becomes
-/// approved. The emulator has no browser to approve it in, so the clock owes the
-/// `Pending -> Approved` transition the way a human would have made it: CHOSEN
-/// at half a second, so a client polling straight away still observes
-/// `AuthorizationPendingException` and its next poll (at `interval`) succeeds.
-pub const APPROVAL_DELAY: Duration = Duration::from_millis(500);
 
 /// How long an expired device authorization is kept before it is reclaimed, so a
 /// client polling a stale device code still gets `ExpiredTokenException` rather
@@ -346,9 +339,6 @@ pub struct DeviceAuthorization {
     pub verification_uri: String,
     pub verification_uri_complete: String,
     pub created_at: SystemTime,
-    /// The instant the clock owes this authorization its `Pending -> Approved`
-    /// transition; see [`APPROVAL_DELAY`].
-    pub approval_due_at: SystemTime,
     pub expires_in: i32,
     pub interval: i32,
     pub status: DeviceAuthStatus,
@@ -363,11 +353,6 @@ impl DeviceAuthorization {
     /// Whether the authorization's lifetime has run out at `now`.
     pub fn is_expired(&self, now: SystemTime) -> bool {
         now >= self.expires_at()
-    }
-
-    /// Whether the clock already owes this authorization its approval at `now`.
-    pub fn approval_is_due(&self, now: SystemTime) -> bool {
-        now >= self.approval_due_at
     }
 }
 
@@ -661,6 +646,31 @@ impl ComAmazonawsSsooidcAwsssooidcserviceState {
         (0..MAX_USER_CODE_ATTEMPTS)
             .map(|_| mint_user_code())
             .find(|candidate| !self.user_codes.contains_key(candidate))
+    }
+
+    /// Records the approval a user makes for `user_code` at the verification
+    /// page, which is what moves a device authorization from `Pending` to
+    /// `Approved` and so is the only thing that makes its device code
+    /// redeemable. The approval is made outside this API — the verification page
+    /// is not an operation of it — so no call and no amount of elapsed time
+    /// moves the status on its own: an authorization nobody approves stays
+    /// pending for the whole life of its device code.
+    ///
+    /// Answers whether a pending authorization still inside its lifetime was
+    /// found under `user_code`; an approved, denied, redeemed or expired one is
+    /// left exactly as it stands.
+    pub fn approve_user_code(&mut self, user_code: &str, now: SystemTime) -> bool {
+        let Some(device_code) = self.user_codes.get(user_code).cloned() else {
+            return false;
+        };
+        let Some(authorization) = self.device_auths.get_mut(&device_code) else {
+            return false;
+        };
+        if authorization.status != DeviceAuthStatus::Pending || authorization.is_expired(now) {
+            return false;
+        }
+        authorization.status = DeviceAuthStatus::Approved;
+        true
     }
 
     /// Persists a device authorization and indexes it by its user code.

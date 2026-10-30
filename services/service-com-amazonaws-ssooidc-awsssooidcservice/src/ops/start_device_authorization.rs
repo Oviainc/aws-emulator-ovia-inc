@@ -281,7 +281,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_id: input.client_id.clone(),
             start_url: input.start_url.clone(),
             created_at: now,
-            approval_due_at: now + st::APPROVAL_DELAY,
             expires_in: st::DEVICE_CODE_EXPIRES_IN,
             interval: st::DEVICE_CODE_INTERVAL,
             status: st::DeviceAuthStatus::Pending,

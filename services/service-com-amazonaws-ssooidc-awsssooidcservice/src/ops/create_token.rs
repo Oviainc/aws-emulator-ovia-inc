@@ -373,7 +373,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The borrow ends with this block, so the token can be minted into
                 // the same store below.
                 {
-                    let Some(authorization) = store.device_auths.get_mut(device_code) else {
+                    let Some(authorization) = store.device_auths.get(device_code) else {
                         return Err(invalid_grant(st::DESCRIPTION_INVALID_DEVICE_CODE));
                     };
                     // A device code issued to another registration is no grant of
@@ -410,24 +410,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         st::DeviceAuthStatus::Consumed => {
                             return Err(invalid_grant(st::DESCRIPTION_INVALID_DEVICE_CODE));
                         }
+                        // Nothing this endpoint serves approves an
+                        // authorization: the approval is a user's, made at the
+                        // verification URI, so a pending authorization stays
+                        // pending for the life of its device code and every
+                        // poll of it is refused — however long the client has
+                        // been polling.
                         st::DeviceAuthStatus::Pending => {
-                            if !authorization.approval_is_due(now) {
-                                return Err(
-                                    CreateTokenErrorModeled::AuthorizationPendingException(
-                                        AuthorizationPendingException {
-                                            error: Some("authorization_pending".to_string()),
-                                            error_description: Some(
-                                                st::DESCRIPTION_AUTHORIZATION_PENDING.to_string(),
-                                            ),
-                                        },
-                                    )
-                                    .into(),
-                                );
-                            }
-                            // The approval the clock owed has come due: record it
-                            // on the stored record, so what is redeemed below is
-                            // an approved authorization.
-                            authorization.status = st::DeviceAuthStatus::Approved;
+                            return Err(CreateTokenErrorModeled::AuthorizationPendingException(
+                                AuthorizationPendingException {
+                                    error: Some("authorization_pending".to_string()),
+                                    error_description: Some(
+                                        st::DESCRIPTION_AUTHORIZATION_PENDING.to_string(),
+                                    ),
+                                },
+                            )
+                            .into());
                         }
                         st::DeviceAuthStatus::Approved => {}
                     }

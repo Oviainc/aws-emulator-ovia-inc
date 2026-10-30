@@ -16,9 +16,9 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_ssoadmin_swbexternalservice as identity_center;
 use service_com_amazonaws_ssooidc_awsssooidcservice as ssooidc;
 use ssooidc::state::{
-    ACCESS_TOKEN_EXPIRES_IN, APPROVAL_DELAY, CLIENT_SECRET_LIFETIME, DEVICE_CODE_EXPIRES_IN,
-    DEVICE_CODE_INTERVAL, GRANT_TYPE_AUTHORIZATION_CODE, GRANT_TYPE_DEVICE_CODE,
-    GRANT_TYPE_REFRESH_TOKEN, REFRESH_TOKEN_EXPIRES_IN, TOKEN_TYPE_BEARER,
+    ACCESS_TOKEN_EXPIRES_IN, CLIENT_SECRET_LIFETIME, DEVICE_CODE_EXPIRES_IN, DEVICE_CODE_INTERVAL,
+    GRANT_TYPE_AUTHORIZATION_CODE, GRANT_TYPE_DEVICE_CODE, GRANT_TYPE_REFRESH_TOKEN,
+    REFRESH_TOKEN_EXPIRES_IN, TOKEN_TYPE_BEARER,
 };
 
 /// The region most cases sign for; the region table below varies it.
@@ -30,8 +30,6 @@ pub(crate) const REGION: &str = "us-west-2";
 pub(crate) fn start_url() -> String {
     ssooidc::state::access_portal_url(identity_center::state::SEED_IDENTITY_STORE_ID)
 }
-/// Long enough for the approval the clock owes a pending authorization to come due.
-pub(crate) const PAST_APPROVAL: Duration = APPROVAL_DELAY.saturating_add(Duration::from_millis(250));
 
 /// One emulator: the shared engine plus the router that serves this service, the
 /// same pair `core/router` builds in production.
@@ -164,6 +162,18 @@ impl Emulator {
     ) -> engine::ServiceState<ssooidc::ComAmazonawsSsooidcAwsssooidcserviceState> {
         ssooidc::state::service_state(&*self.engine).expect("the service state is reachable")
     }
+
+    /// Stand in for the user who approves `user_code` at the verification page:
+    /// the step this API does not serve, and the only thing that makes a device
+    /// code redeemable.
+    pub(crate) fn approve(&self, user_code: &str) {
+        assert!(
+            self.state()
+                .lock()
+                .approve_user_code(user_code, SystemTime::now()),
+            "the pending authorization of user code {user_code:?} must be approvable"
+        );
+    }
 }
 
 /// A string member of a response body, with the body in the failure message.
@@ -198,7 +208,7 @@ pub(crate) fn seconds(expires_in: i32) -> u64 {
 }
 
 /// Run the device flow for an already-registered client and return the token
-/// response: register -> start -> wait for the approval the clock owes -> poll.
+/// response: start -> the user approves the user code -> poll.
 pub(crate) async fn device_flow_token(
     emulator: &Emulator,
     client_id: &str,
@@ -212,7 +222,7 @@ pub(crate) async fn device_flow_token(
         }))
         .await;
     assert_eq!(status, 200, "StartDeviceAuthorization answered {started}");
-    tokio::time::sleep(PAST_APPROVAL).await;
+    emulator.approve(&text(&started, "userCode"));
     let (status, token) = emulator
         .create_token(&json!({
             "clientId": client_id,
@@ -682,7 +692,7 @@ async fn start_device_authorization_computes_the_codes_from_the_region_and_persi
 }
 
 /// RULE: the device flow runs off persisted state — the authorization is pending
-/// until the approval the clock owes comes due, the device code is redeemed exactly
+/// until a user approves its user code, the device code is redeemed exactly
 /// once, and the refresh token rotates into a new access token.
 #[tokio::test]
 async fn the_device_flow_runs_end_to_end_from_persisted_state() {
@@ -700,6 +710,7 @@ async fn the_device_flow_runs_end_to_end_from_persisted_state() {
         .await;
     assert_eq!(status, 200, "StartDeviceAuthorization answered {started}");
     let device_code = text(&started, "deviceCode");
+    let user_code = text(&started, "userCode");
 
     let poll = json!({
         "clientId": client_id,
@@ -708,11 +719,11 @@ async fn the_device_flow_runs_end_to_end_from_persisted_state() {
         "deviceCode": device_code,
     });
 
-    // The first poll comes before the approval is due, so the caller sees the
-    // transient state rather than a token.
+    // No user has approved the user code yet, so the poll is refused rather than
+    // answered with a token.
     let (status, pending) = emulator.create_token(&poll).await;
     assert_failure(
-        "a poll before the approval is due",
+        "a poll before the user approves",
         status,
         &pending,
         400,
@@ -730,8 +741,8 @@ async fn the_device_flow_runs_end_to_end_from_persisted_state() {
         "the record must still be pending after a pending poll"
     );
 
-    // Once it is due, the transition is recorded and the token is minted.
-    tokio::time::sleep(PAST_APPROVAL).await;
+    // Once the user has approved it, the poll is answered with a token.
+    emulator.approve(&user_code);
     let (status, token) = emulator.create_token(&poll).await;
     assert_eq!(status, 200, "the approved poll answered {token}");
     let access_token = text(&token, "accessToken");
@@ -1073,7 +1084,6 @@ async fn a_device_authorization_past_its_lifetime_is_an_expired_token() {
                 .get_mut(&device_code)
                 .expect("the record is persisted");
             record.created_at -= aged;
-            record.approval_due_at -= aged;
         }
 
         let (status, response) = emulator
@@ -1132,7 +1142,7 @@ async fn a_registrations_grant_types_decide_only_whether_a_refresh_token_is_mint
             status, 200,
             "case {case:?}: StartDeviceAuthorization answered {started}"
         );
-        tokio::time::sleep(PAST_APPROVAL).await;
+        emulator.approve(&text(&started, "userCode"));
 
         let (status, token) = emulator
             .create_token(&json!({
@@ -1196,7 +1206,7 @@ async fn spent_records_are_reclaimed_rather_than_held_for_ever() {
     let spent_device_code = text(&started, "deviceCode");
     let spent_user_code = text(&started, "userCode");
 
-    tokio::time::sleep(PAST_APPROVAL).await;
+    emulator.approve(&spent_user_code);
     let (status, token) = emulator
         .create_token(&json!({
             "clientId": client_id,
@@ -1362,7 +1372,7 @@ async fn a_refresh_cannot_widen_the_scope_it_was_granted() {
         }))
         .await;
     assert_eq!(status, 200, "StartDeviceAuthorization answered {started}");
-    tokio::time::sleep(PAST_APPROVAL).await;
+    emulator.approve(&text(&started, "userCode"));
     let (status, token) = emulator
         .create_token(&json!({
             "clientId": client_id,
