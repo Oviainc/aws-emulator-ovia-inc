@@ -209,8 +209,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only; the store is reached through `self.engine`.
-        let _ = ctx;
+        // A hypervisor is REGIONAL — its region is a segment of the ARN it is minted and
+        // keyed under — so this endpoint resolves only the records of the region the
+        // request itself was addressed to
+        // (`crate::state::arn_is_in_request_region`): an ARN of another region names no
+        // hypervisor here, exactly as this region's `ListHypervisors` does not report it,
+        // so it is refused as the missing hypervisor it is and NOTHING is written.
+        let in_request_region =
+            crate::state::arn_is_in_request_region(&input.hypervisor_arn, ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PutHypervisorPropertyMappingsErrorModeled::InternalServerException(
@@ -259,7 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // some OTHER resource still points at cannot change this answer. Nothing is written
         // before either gate passes, so the refusal is the same however often it is
         // repeated.
-        if store.hypervisor(&input.hypervisor_arn).is_none() {
+        if !in_request_region || store.hypervisor(&input.hypervisor_arn).is_none() {
             return Err(hypervisor_not_found(&input.hypervisor_arn));
         }
 

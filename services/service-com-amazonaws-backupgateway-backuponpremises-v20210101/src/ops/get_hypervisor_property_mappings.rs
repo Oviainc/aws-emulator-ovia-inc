@@ -146,8 +146,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only; the store is reached through `self.engine`.
-        let _ = ctx;
+        // A hypervisor is REGIONAL — its region is a segment of the ARN it is minted and
+        // keyed under — so this endpoint resolves only the records of the region the
+        // request itself was addressed to
+        // (`crate::state::arn_is_in_request_region`): an ARN of another region names no
+        // hypervisor here, exactly as this region's `ListHypervisors` does not report it,
+        // so it is refused as the missing hypervisor it is.
+        let in_request_region =
+            crate::state::arn_is_in_request_region(&input.hypervisor_arn, ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetHypervisorPropertyMappingsErrorModeled::InternalServerException(
@@ -167,7 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the STORE — which is what this lookup asks, in that order: a mappings read of an
         // ARN naming no hypervisor is a missing HYPERVISOR, and only a hypervisor the
         // store really holds can be missing its MAPPINGS.
-        let stored = state.hypervisor(&input.hypervisor_arn);
+        let stored = if in_request_region {
+            state.hypervisor(&input.hypervisor_arn)
+        } else {
+            None
+        };
         let missing = match stored {
             None => Some(crate::state::MissingResource::Hypervisor),
             Some(hypervisor) if hypervisor.property_mappings.is_none() => {

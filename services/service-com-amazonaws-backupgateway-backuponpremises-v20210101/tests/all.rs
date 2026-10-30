@@ -83,6 +83,8 @@ mod put_property_mappings_one_answer_for_a_missing_hypervisor;
 mod refusal_names_the_member_one_way;
 #[path = "all/regional_listing_scope.rs"]
 mod regional_listing_scope;
+#[path = "all/regional_single_resource_scope.rs"]
+mod regional_single_resource_scope;
 #[path = "all/resource_tagging_spans_every_resource.rs"]
 mod resource_tagging_spans_every_resource;
 #[path = "all/resource_untagging.rs"]

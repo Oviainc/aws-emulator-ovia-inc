@@ -142,8 +142,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only; the store is reached through `self.engine`.
-        let _ = ctx;
+        // A gateway is REGIONAL — its region is a segment of the ARN it is minted and
+        // keyed under — so this endpoint resolves only the records of the region the
+        // request itself was addressed to
+        // (`crate::state::arn_is_in_request_region`): an ARN of another region names no
+        // gateway here, exactly as this region's `ListGateways` does not report it, so it
+        // is refused as the missing resource it is and NO update is triggered.
+        let in_request_region =
+            crate::state::arn_is_in_request_region(&input.gateway_arn, ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateGatewaySoftwareNowErrorModeled::InternalServerException(
@@ -161,9 +167,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // install takes is recorded: a gateway that was never created, or one already
         // deleted, is simply absent from the store and has no appliance to update — the
         // same answer for both, which is what the real service gives.
-        let Some(gateway) =
+        let triggered = if in_request_region {
             state.update_gateway_software_now(&input.gateway_arn, ::std::time::SystemTime::now())
-        else {
+        } else {
+            None
+        };
+        let Some(gateway) = triggered else {
             // The status, the `ErrorCode` and the sentence come from
             // `crate::state::MissingResource`, the one place this service chooses how it
             // refuses an ARN it holds no record under — not from this handler, so every

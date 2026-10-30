@@ -147,8 +147,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only; the store is reached through `self.engine`.
-        let _ = ctx;
+        // Every resource this service tags is REGIONAL — its region is a segment of the ARN
+        // it is keyed under — so this endpoint resolves only the records of the region the
+        // request itself was addressed to
+        // (`crate::state::arn_is_in_request_region`): an ARN of another region names no
+        // resource here, exactly as this region's listings do not report it, so it is
+        // refused as the missing resource it is and NO tag is removed.
+        let in_request_region =
+            crate::state::arn_is_in_request_region(&input.resource_arn, ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UntagResourceErrorModeled::InternalServerException(InternalServerException {
@@ -171,11 +177,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled `ResourceNotFoundException` shape throughout, but a missing hypervisor
         // is answered 400 with `ErrorCode` `HypervisorNotFound` where every other type
         // takes the shape's own 404 (`crate::state::MissingResource`).
-        let Some(resource_arn) = state.remove_resource_tags(
-            &input.resource_arn,
-            &input.tag_keys,
-            ::std::time::SystemTime::now(),
-        ) else {
+        let removed = if in_request_region {
+            state.remove_resource_tags(
+                &input.resource_arn,
+                &input.tag_keys,
+                ::std::time::SystemTime::now(),
+            )
+        } else {
+            None
+        };
+        let Some(resource_arn) = removed else {
             let missing = crate::state::MissingResource::for_arn(&input.resource_arn);
             let error =
                 UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {

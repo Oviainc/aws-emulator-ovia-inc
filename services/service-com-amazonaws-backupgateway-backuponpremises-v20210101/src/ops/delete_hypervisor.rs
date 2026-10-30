@@ -142,8 +142,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only; the store is reached through `self.engine`.
-        let _ = ctx;
+        // A hypervisor is REGIONAL — its region is a segment of the ARN it is minted and
+        // keyed under — so this endpoint resolves only the records of the region the
+        // request itself was addressed to
+        // (`crate::state::arn_is_in_request_region`): an ARN of another region names no
+        // hypervisor here, exactly as this region's `ListHypervisors` does not report it,
+        // so it is refused as the missing resource it is and NOTHING is removed.
+        let in_request_region =
+            crate::state::arn_is_in_request_region(&input.hypervisor_arn, ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteHypervisorErrorModeled::InternalServerException(InternalServerException {
@@ -159,7 +165,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `HypervisorNotFound` (`crate::state::MissingResource`); @idempotent describes
         // the effect of repeating the call, not a success for a resource that is not
         // there.
-        let Some(removed) = state.lock().remove_hypervisor(&input.hypervisor_arn) else {
+        let removed = if in_request_region {
+            state.lock().remove_hypervisor(&input.hypervisor_arn)
+        } else {
+            None
+        };
+        let Some(removed) = removed else {
             let missing = crate::state::MissingResource::Hypervisor;
             let error = DeleteHypervisorErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

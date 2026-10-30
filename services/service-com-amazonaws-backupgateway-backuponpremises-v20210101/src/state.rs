@@ -99,7 +99,12 @@
 //! region the listing request itself was addressed to ([`arn_is_in_region`], applied
 //! before the page is cut), whichever resource it lists: one store serves every region a
 //! client addresses, and a listing is an account-and-region listing, never a listing of
-//! every region at once.
+//! every region at once. That scope is not the listings' alone: an operation that resolves
+//! ONE ARN reaches only the records of the region ITS request was addressed to
+//! ([`arn_is_in_request_region`]), so an ARN of another region names no resource that
+//! endpoint holds and is refused as the missing resource it is, with nothing read and
+//! nothing written — a region never reports, writes or deletes a record another region's
+//! listing owns.
 //!
 //! A hypervisor also carries its PROPERTY MAPPINGS ([`StoredPropertyMappings`]) — the
 //! VMware-to-Amazon tag mappings and the IAM role they are applied with. They live on
@@ -1923,12 +1928,15 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// `server_arn`, and hand back the gateway as it is now STORED — cloned off the record
     /// in the map after the write, so the ARN a caller gets is the key the store holds.
     ///
-    /// Both ARNs have to name a record this store really holds: an association is a link
-    /// between two existing resources, so one naming a gateway or a server the service
-    /// does not have is refused and NOTHING is written
+    /// Both ARNs have to name a record this store really holds IN `region`, the region the
+    /// request was addressed to: an association is a link between two existing resources of
+    /// one regional endpoint, so an ARN naming a gateway or a server this service does not
+    /// have — or one it holds in ANOTHER region, which this endpoint resolves no more than
+    /// a record it never held ([`arn_is_in_region`]) — is refused and NOTHING is written
     /// ([`AssociationRefusal::NoSuchGateway`], [`AssociationRefusal::NoSuchServer`]). The
     /// gateway is resolved first, so a request that names neither is answered for the
-    /// gateway — one answer, not one that depends on which map was consulted first.
+    /// gateway — one answer, not one that depends on which map was consulted first; the
+    /// region scope is part of resolving each end, so it does not change that order.
     ///
     /// A gateway backs up the machines of ONE hypervisor, so a gateway already associated
     /// with a different server is refused too
@@ -1944,13 +1952,15 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         &mut self,
         gateway_arn: &str,
         server_arn: &str,
+        region: &str,
     ) -> Result<StoredGateway, AssociationRefusal> {
-        if !self.gateways.contains_key(gateway_arn) {
+        if !(arn_is_in_region(gateway_arn, region) && self.gateways.contains_key(gateway_arn)) {
             return Err(AssociationRefusal::NoSuchGateway);
         }
         let server = self
             .hypervisors
             .get(server_arn)
+            .filter(|_| arn_is_in_region(server_arn, region))
             .ok_or(AssociationRefusal::NoSuchServer)?;
         // The link is to the record's own ARN — the key this store holds the hypervisor
         // under — and not to the string the request spelled. Both are read before the
@@ -3086,9 +3096,9 @@ pub fn arn_resource_id(arn: &str) -> Option<&str> {
 /// not have to know which error shapes an operation carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssociationRefusal {
-    /// The `GatewayArn` names no gateway this store holds.
+    /// The `GatewayArn` names no gateway this store holds in the region addressed.
     NoSuchGateway,
-    /// The `ServerArn` names no hypervisor this store holds.
+    /// The `ServerArn` names no hypervisor this store holds in the region addressed.
     NoSuchServer,
     /// The gateway is already associated with a DIFFERENT server, whose ARN this carries.
     AlreadyAssociated(String),
@@ -3214,6 +3224,21 @@ fn is_arn_segment(segment: &str) -> bool {
 /// this service at all is in no region.
 pub fn arn_is_in_region(arn: &str, region: &str) -> bool {
     arn_parts(arn).is_some_and(|parts| parts.region == arn_region(region))
+}
+
+/// Whether the request `parts` describes resolves `arn` AT ALL — the question every
+/// operation of this service that resolves a single ARN answers before it reads or writes
+/// the record it names.
+///
+/// A resource is regional, so the endpoint a request was addressed to
+/// ([`request_region`]) decides which records that request can reach, exactly as it
+/// decides which records a listing reports ([`arn_is_in_region`]): one store serves every
+/// region a client addresses, so an ARN whose region segment names another region names
+/// no resource of this endpoint — no more than one of another account would — and an
+/// operation refuses it as the missing resource it is rather than reading or deleting a
+/// record its own listings do not report.
+pub fn arn_is_in_request_region(arn: &str, parts: &::http::request::Parts) -> bool {
+    arn_is_in_region(arn, &request_region(parts))
 }
 
 /// The region to mint an ARN in, falling back to [`DEFAULT_REGION`] for anything that

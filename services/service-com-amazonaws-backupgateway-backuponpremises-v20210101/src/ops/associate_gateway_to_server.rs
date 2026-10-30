@@ -157,8 +157,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only; the store is reached through `self.engine`.
-        let _ = ctx;
+        // A gateway and a hypervisor are both REGIONAL — the region each is minted in is a
+        // segment of the ARN it is keyed under — so this endpoint resolves only the records
+        // of the region the request itself was addressed to: an ARN of another region names
+        // no record here, exactly as this region's listings do not report it, so an
+        // association is refused for the end that is missing and NOTHING is written. The
+        // region is handed to the store, where both ends are resolved IN ORDER, so the
+        // scope cannot change which end a refusal names.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             AssociateGatewayToServerErrorModeled::InternalServerException(
@@ -179,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // associations of one gateway cannot both pass the already-associated check.
         let mut store = state.lock();
         let associated = store
-            .associate_gateway_to_server(&input.gateway_arn, &input.server_arn)
+            .associate_gateway_to_server(&input.gateway_arn, &input.server_arn, &region)
             .map_err(|refusal| match refusal {
                 crate::state::AssociationRefusal::NoSuchGateway => {
                     // This operation declares no `ResourceNotFoundException`, so the

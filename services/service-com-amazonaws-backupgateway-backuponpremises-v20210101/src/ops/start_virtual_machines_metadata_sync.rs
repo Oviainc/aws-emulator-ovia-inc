@@ -189,8 +189,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only; the store is reached through `self.engine`.
-        let _ = ctx;
+        // A hypervisor is REGIONAL — its region is a segment of the ARN it is minted and
+        // keyed under — so this endpoint reaches only the records of the region the request
+        // itself was addressed to (`crate::state::arn_is_in_request_region`): an ARN of
+        // another region names no hypervisor here, exactly as this region's
+        // `ListHypervisors` does not report it, so no sync of it can be started and no
+        // inventory is materialised.
+        let in_request_region =
+            crate::state::arn_is_in_request_region(&input.hypervisor_arn, ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartVirtualMachinesMetadataSyncErrorModeled::InternalServerException(
@@ -213,9 +219,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The PRECONDITION of a sync: the hypervisor's property mappings — what
         // `PutHypervisorPropertyMappings` writes — have to be configured before its
         // virtual-machine metadata can be synced. The gate is asked BEFORE any
-        // resource-existence lookup, so an ARN naming no record at all and an ARN naming a
-        // record with no mappings take the one refusal and it reveals neither.
-        if !store.property_mappings_configured(&input.hypervisor_arn) {
+        // resource-existence lookup, so an ARN naming no record at all, an ARN naming a
+        // record of another region and an ARN naming a record with no mappings take the one
+        // refusal and it reveals none of them.
+        if !in_request_region || !store.property_mappings_configured(&input.hypervisor_arn) {
             return Err(mappings_not_configured());
         }
 

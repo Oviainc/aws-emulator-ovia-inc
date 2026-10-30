@@ -155,8 +155,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only; the store is reached through `self.engine`.
-        let _ = ctx;
+        // A hypervisor is REGIONAL — its region is a segment of the ARN it is minted and
+        // keyed under — so this endpoint resolves only the records of the region the
+        // request itself was addressed to
+        // (`crate::state::arn_is_in_request_region`): an ARN of another region names no
+        // hypervisor here, exactly as this region's `ListHypervisors` does not report it,
+        // so it is refused as the missing resource it is and NOTHING is written.
+        let in_request_region =
+            crate::state::arn_is_in_request_region(&input.hypervisor_arn, ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateHypervisorErrorModeled::InternalServerException(InternalServerException {
@@ -186,7 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no input member a key and declares no uniqueness constraint, so a `Host`, `Name`
         // or `LogGroupArn` another stored record already carries is written like any
         // other value.
-        let updated = state.lock().update_hypervisor(&input.hypervisor_arn, update);
+        let updated = if in_request_region {
+            state.lock().update_hypervisor(&input.hypervisor_arn, update)
+        } else {
+            None
+        };
 
         let Some(updated) = updated else {
             // This operation resolves exactly one resource type, so an ARN it cannot

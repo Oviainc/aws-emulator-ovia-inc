@@ -141,8 +141,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only; the store is reached through `self.engine`.
-        let _ = ctx;
+        // A virtual machine is REGIONAL — its region is a segment of the ARN minted for it
+        // when the sync that discovered it recorded it — so this endpoint resolves only the
+        // records of the region the request itself was addressed to
+        // (`crate::state::arn_is_in_request_region`): an ARN of another region names no
+        // machine here, exactly as this region's `ListVirtualMachines` does not report it,
+        // so it is refused as the missing resource it is.
+        let in_request_region =
+            crate::state::arn_is_in_request_region(&input.resource_arn, ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetVirtualMachineErrorModeled::InternalServerException(InternalServerException {
@@ -158,9 +164,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is what this lookup asks: a machine is part of its hypervisor's inventory from
         // the instant the sync that discovered it fell due, the same instant the listing
         // that hands a client its ARN starts reporting it.
-        let Some(machine) =
+        let resolved = if in_request_region {
             state.virtual_machine_as_of(&input.resource_arn, ::std::time::SystemTime::now())
-        else {
+        } else {
+            None
+        };
+        let Some(machine) = resolved else {
             // This operation resolves exactly one resource type, so an ARN it cannot
             // resolve is a missing VIRTUAL MACHINE whatever else the ARN spells — and
             // this service answers that with the modelled `ResourceNotFoundException` at

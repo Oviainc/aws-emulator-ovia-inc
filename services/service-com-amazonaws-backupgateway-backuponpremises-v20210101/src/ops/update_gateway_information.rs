@@ -142,8 +142,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only; the store is reached through `self.engine`.
-        let _ = ctx;
+        // A gateway is REGIONAL — its region is a segment of the ARN it is minted and
+        // keyed under — so this endpoint resolves only the records of the region the
+        // request itself was addressed to
+        // (`crate::state::arn_is_in_request_region`): an ARN of another region names no
+        // gateway here, exactly as this region's `ListGateways` does not report it, so it
+        // is refused as the missing resource it is and NOTHING is written.
+        let in_request_region =
+            crate::state::arn_is_in_request_region(&input.gateway_arn, ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateGatewayInformationErrorModeled::InternalServerException(
@@ -157,7 +163,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
-        let Some(gateway) = state.gateway_mut(&input.gateway_arn) else {
+        let resolved = if in_request_region {
+            state.gateway_mut(&input.gateway_arn)
+        } else {
+            None
+        };
+        let Some(gateway) = resolved else {
             // The status, the `ErrorCode` and the sentence come from
             // `crate::state::MissingResource`, the one place this service chooses how it
             // refuses an ARN it holds no record under — not from this handler, so every

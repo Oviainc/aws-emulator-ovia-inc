@@ -164,8 +164,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only; the store is reached through `self.engine`.
-        let _ = ctx;
+        // A gateway and a hypervisor are both REGIONAL — the region each is minted in is a
+        // segment of the ARN it is keyed under — so this endpoint reaches only the records
+        // of the region the request itself was addressed to
+        // (`crate::state::arn_is_in_region`): neither a gateway nor a hypervisor record of
+        // another region is part of what this endpoint holds, exactly as this region's
+        // listings do not report them.
+        let region = crate::state::request_region(ctx.parts());
+        let gateway_in_request_region =
+            crate::state::arn_is_in_region(&input.gateway_arn, &region);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TestHypervisorConfigurationErrorModeled::InternalServerException(
@@ -192,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource type reads — refused the way every other operation of this service
         // refuses an ARN it holds no record under, its status, its `ErrorCode` and its
         // sentence all read off `crate::state::MissingResource` rather than composed here.
-        if store.gateway(&input.gateway_arn).is_none() {
+        if !gateway_in_request_region || store.gateway(&input.gateway_arn).is_none() {
             let missing = crate::state::MissingResource::Other;
             let error = TestHypervisorConfigurationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -208,9 +215,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The hypervisor this test is to reach is named by its HOST and not by an ARN, so
         // it is resolved through the host lookup — a host may name several records, and any
-        // one of them is a configuration this service holds for that host. A host with none
-        // is a resource the action requires and this service does not have.
-        if store.hypervisors_for_host(&input.host).is_empty() {
+        // one of them THIS REGION holds is a configuration this endpoint has for that host.
+        // A host with none is a resource the action requires and this service does not have.
+        if !store
+            .hypervisors_for_host(&input.host)
+            .iter()
+            .any(|record| crate::state::arn_is_in_region(&record.arn, &region))
+        {
             // This service answers a missing hypervisor with the modelled
             // `ResourceNotFoundException` at HTTP 400 carrying `ErrorCode`
             // `HypervisorNotFound` (`crate::state::MissingResource`), the one place that

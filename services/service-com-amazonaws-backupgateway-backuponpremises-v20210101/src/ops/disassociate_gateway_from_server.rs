@@ -150,8 +150,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only; the store is reached through `self.engine`.
-        let _ = ctx;
+        // A gateway is REGIONAL — its region is a segment of the ARN it is minted and
+        // keyed under — so this endpoint resolves only the records of the region the
+        // request itself was addressed to
+        // (`crate::state::arn_is_in_request_region`): an ARN of another region names no
+        // gateway here, exactly as this region's `ListGateways` does not report it, so it
+        // takes the same refusal an ARN with no record takes and NO link is cleared.
+        let in_request_region =
+            crate::state::arn_is_in_request_region(&input.gateway_arn, ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DisassociateGatewayFromServerErrorModeled::InternalServerException(
@@ -172,7 +178,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One guard spans resolving the record and clearing the link, so two concurrent
         // disassociations of one gateway cannot both pass the associated check.
         let mut store = state.lock();
-        let disassociated = match store.disassociate_gateway_from_server(&input.gateway_arn) {
+        let cleared = if in_request_region {
+            store.disassociate_gateway_from_server(&input.gateway_arn)
+        } else {
+            Err(crate::state::DisassociationRefusal::NoSuchGateway)
+        };
+        let disassociated = match cleared {
             Ok(disassociated) => disassociated,
             // A gateway that was never created, or one already deleted, is simply absent
             // from the store — the `ResourceNotFoundException` this operation models,
