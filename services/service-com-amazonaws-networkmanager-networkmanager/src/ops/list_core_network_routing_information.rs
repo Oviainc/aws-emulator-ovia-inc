@@ -303,15 +303,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a request naming a segment that policy does not declare, or a Region it configures
         // no edge in, addresses no route table at all, so it is refused on the member that
         // carried it — the same refusal a create naming an edge the policy does not
-        // configure gives. A core network's policy is in force once the `CREATING` ->
-        // `AVAILABLE` transition the clock owes has fallen due, which is exactly when a read
-        // of the core network reports its segments and edges, so until then it declares no
-        // segment here either.
-        let topology = if core_network.state_at(now) == crate::state::STATE_AVAILABLE {
-            core_network.topology()
-        } else {
-            &crate::state::NO_POLICY_IN_FORCE
-        };
+        // configure gives. The policy in force is the one the LIVE version carries
+        // ([`crate::state::CoreNetworkRecord::topology`]) and nothing else: a reconfiguration
+        // of the core network still outstanding deploys one policy OVER another, so a policy
+        // is in force throughout it and the segments and edges a read of the core network
+        // reports in that same instant are exactly the coordinates a route table is
+        // addressed by here.
+        let topology = core_network.topology();
         if !topology.has_segment(&input.segment_name) {
             return Err(
                 ListCoreNetworkRoutingInformationErrorModeled::ValidationException(

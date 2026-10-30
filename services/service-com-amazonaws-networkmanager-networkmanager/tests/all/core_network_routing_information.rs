@@ -13,7 +13,11 @@
 //! appliance's AS) — reported in one stable order, narrowed by every match the request
 //! carries, and paged by `MaxResults`/`NextToken`. A segment or an edge location the policy
 //! in force does not declare addresses no route table, which is a field failure; an unknown
-//! core network is not found.
+//! core network is not found. The policy in force is the one the LIVE version carries
+//! whatever lifecycle state the core network itself is in: a reconfiguration still
+//! outstanding deploys one policy over another, so the coordinates a route table is
+//! addressed by through that window are the segments and edges a read of the core network
+//! reports in the same instant.
 //!
 //! The tables below span that class: rows differing in the kind of route (a static route to
 //! an attachment, a blackholed static route, a route learned over a BGP peering), in the
@@ -21,7 +25,9 @@
 //! at all), in the edge location, in how many prefixes one action declares and how many
 //! destinations it names, in whether a destination resolves to an attachment of that segment
 //! at that edge, in whether the peering carries a peer ASN, in the address family of the
-//! prefix, and — for the filters — in which attribute is matched, on how many values, and in
+//! prefix, in which reconfiguration of the core network is outstanding while the listing is
+//! read (a deployment that moves a route, one that moves none, an update that touches no
+//! policy), and — for the filters — in which attribute is matched, on how many values, and in
 //! how many filters combine.
 //!
 //! The policy document's own key names (`segment-actions`, `action`, `create-route`,
@@ -296,54 +302,7 @@ async fn subject(emulator: &Emulator) -> Subject {
     )
     .await;
 
-    // The static routes: two prefixes through one attachment, one prefix through an
-    // attachment of another edge AND through nothing (`blackhole`), one prefix of the
-    // western-only segment, one prefix whose destination names no stored attachment, and one
-    // action acting on a segment the document never declares.
-    put_policy_in_force(
-        emulator,
-        &core_network,
-        policy_document(&json!([
-            {
-                "action": "create-route",
-                "segment": SHARED,
-                "destination-cidr-blocks": ["10.0.0.0/16", "10.1.0.0/16"],
-                "destinations": [west_vpc],
-            },
-            {
-                "action": "create-route",
-                "segment": SHARED,
-                "destination-cidr-blocks": ["10.2.0.0/16"],
-                "destinations": [central_vpc, "blackhole"],
-            },
-            {
-                "action": "create-route",
-                "segment": PROD,
-                "destination-cidr-blocks": ["172.16.0.0/16"],
-                "destinations": [prod_vpc],
-            },
-            {
-                "action": "create-route",
-                "segment": SHARED,
-                "destination-cidr-blocks": ["192.168.0.0/24"],
-                "destinations": [ABSENT_ATTACHMENT],
-            },
-            {
-                "action": "create-route",
-                "segment": "undeclared",
-                "destination-cidr-blocks": ["203.0.113.0/24"],
-                "destinations": ["blackhole"],
-            },
-        ])),
-    )
-    .await;
-
-    // Every attachment and every peering owes the clock its `CREATING` -> `AVAILABLE`
-    // transition, and a route is held only through a next hop that is available, so the
-    // listing is read once that transition has fallen due.
-    std::thread::sleep(PAST_SETTLE);
-
-    Subject {
+    let subject = Subject {
         core_network,
         west_vpc,
         west_vpc_arn,
@@ -355,7 +314,60 @@ async fn subject(emulator: &Emulator) -> Subject {
         central_connect,
         west_peer,
         central_peer,
-    }
+    };
+    put_policy_in_force(
+        emulator,
+        &subject.core_network,
+        policy_document(&subject_routes(&subject)),
+    )
+    .await;
+
+    // Every attachment and every peering owes the clock its `CREATING` -> `AVAILABLE`
+    // transition, and a route is held only through a next hop that is available, so the
+    // listing is read once that transition has fallen due.
+    std::thread::sleep(PAST_SETTLE);
+
+    subject
+}
+
+/// The `segment-actions` the subject's policy declares, naming the attachments the subject
+/// holds: two prefixes through one attachment, one prefix through an attachment of another
+/// edge AND through nothing (`blackhole`), one prefix of the western-only segment, one
+/// prefix whose destination names no stored attachment, and one action acting on a segment
+/// the document never declares.
+fn subject_routes(subject: &Subject) -> Value {
+    json!([
+        {
+            "action": "create-route",
+            "segment": SHARED,
+            "destination-cidr-blocks": ["10.0.0.0/16", "10.1.0.0/16"],
+            "destinations": [subject.west_vpc],
+        },
+        {
+            "action": "create-route",
+            "segment": SHARED,
+            "destination-cidr-blocks": ["10.2.0.0/16"],
+            "destinations": [subject.central_vpc, "blackhole"],
+        },
+        {
+            "action": "create-route",
+            "segment": PROD,
+            "destination-cidr-blocks": ["172.16.0.0/16"],
+            "destinations": [subject.prod_vpc],
+        },
+        {
+            "action": "create-route",
+            "segment": SHARED,
+            "destination-cidr-blocks": ["192.168.0.0/24"],
+            "destinations": [ABSENT_ATTACHMENT],
+        },
+        {
+            "action": "create-route",
+            "segment": "undeclared",
+            "destination-cidr-blocks": ["203.0.113.0/24"],
+            "destinations": ["blackhole"],
+        },
+    ])
 }
 
 /// The URI `ListCoreNetworkRoutingInformation` is addressed at, carrying `query` (already
@@ -1038,5 +1050,242 @@ async fn a_match_filter_carrying_more_values_than_the_bound_allows_is_refused_on
             json!(member),
             "case {member:?}: the refusal must name the member that carried the list, got {refused}"
         );
+    }
+}
+
+/// The prefix the deployment of a changed document adds to [`SHARED`]'s route table, reached
+/// through that segment's attachment at [`WEST`]. It sorts between the prefixes the subject
+/// already holds, so reporting it also pins where the stable order puts it.
+const ADDED_PREFIX: &str = "10.3.0.0/16";
+
+/// The description one row below writes, which is a change to the record and to no policy.
+const REDESCRIBED: &str = "read while a reconfiguration is outstanding";
+
+/// How one row leaves the core network with a reconfiguration still outstanding — every way
+/// an operation of this service does: executing a change set, whether or not the document it
+/// puts in force moves a route, and an update of the record's own members.
+#[derive(Clone, Copy)]
+enum Reconfiguration {
+    /// Execute the change set of a document declaring one route more than the one in force.
+    DeployChangedPolicy,
+    /// Execute the change set of the document already in force: a deployment that moves no
+    /// route at all.
+    DeployUnchangedPolicy,
+    /// `UpdateCoreNetwork` changing the description, which touches no policy.
+    UpdateDescription,
+}
+
+/// Start `how` on `subject`'s core network, returning as soon as the call that started it
+/// answered — so the span the clock owes that reconfiguration is still open here.
+async fn start_reconfiguration(emulator: &Emulator, subject: &Subject, how: Reconfiguration) {
+    match how {
+        Reconfiguration::DeployChangedPolicy => {
+            let mut routes = subject_routes(subject);
+            routes
+                .as_array_mut()
+                .expect("the subject's segment actions are a list")
+                .push(json!({
+                    "action": "create-route",
+                    "segment": SHARED,
+                    "destination-cidr-blocks": [ADDED_PREFIX],
+                    "destinations": [subject.west_vpc],
+                }));
+            put_policy_in_force(emulator, &subject.core_network, policy_document(&routes)).await;
+        }
+        Reconfiguration::DeployUnchangedPolicy => {
+            put_policy_in_force(
+                emulator,
+                &subject.core_network,
+                policy_document(&subject_routes(subject)),
+            )
+            .await;
+        }
+        Reconfiguration::UpdateDescription => {
+            let (status, updated) = emulator
+                .patch(
+                    &format!("/core-networks/{}", subject.core_network),
+                    json!({ "Description": REDESCRIBED }),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "UpdateCoreNetwork expected 200, got {status} with {updated}"
+            );
+        }
+    }
+}
+
+/// The routes each coordinate of the subject holds while `how` is outstanding: the route
+/// table of the policy IN FORCE, which a deployment of a document declaring another route
+/// has already moved and the other two reconfigurations leave exactly where it was.
+fn expected_through(subject: &Subject, how: Reconfiguration) -> Vec<ListingCase> {
+    let mut cases = listing_cases(subject);
+    if matches!(how, Reconfiguration::DeployChangedPolicy) {
+        for case in &mut cases {
+            if case.segment == SHARED && case.edge == WEST {
+                // Ahead of the prefixes the peering carries and behind the three the other
+                // actions declare, which is where the prefix text orders it.
+                case.expected.insert(
+                    3,
+                    route(
+                        ADDED_PREFIX,
+                        attachment_hop(&subject.west_vpc, &subject.west_vpc_arn, SHARED, WEST),
+                        &[],
+                    ),
+                );
+            }
+        }
+    }
+    cases
+}
+
+/// The names reported in `member` of the core network `core_network` reports.
+fn names_in(case: &str, core_network: &Value, member: &str, name: &str) -> BTreeSet<String> {
+    core_network[member]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a {member} array in {core_network}"))
+        .iter()
+        .map(|entry| {
+            entry[name]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: no {name} in {entry}"))
+                .to_string()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_core_network_being_reconfigured_reports_the_routing_of_the_policy_in_force() {
+    for (name, how) in [
+        (
+            "a deployment of a document declaring one more route",
+            Reconfiguration::DeployChangedPolicy,
+        ),
+        (
+            "a deployment of the document already in force",
+            Reconfiguration::DeployUnchangedPolicy,
+        ),
+        (
+            "an update of the record alone, which touches no policy",
+            Reconfiguration::UpdateDescription,
+        ),
+    ] {
+        // One subject per row, so the reconfiguration a row reads through is its own.
+        let emulator = Emulator::new();
+        let subject = subject(&emulator).await;
+        start_reconfiguration(&emulator, &subject, how).await;
+
+        // The reconfiguration is still outstanding, which is what the core network reports
+        // of itself — and a policy IS in force throughout it: the segments and edges a read
+        // of the core network reports in this very instant are the coordinates a route table
+        // is addressed by.
+        let (status, body) = emulator
+            .get(&format!("/core-networks/{}", subject.core_network))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: GetCoreNetwork expected 200, got {status} with {body}"
+        );
+        let deploying = &body["CoreNetwork"];
+        assert_eq!(
+            deploying["State"],
+            json!("UPDATING"),
+            "case {name:?}: the reconfiguration must still be outstanding here, got {deploying}"
+        );
+        let segments = names_in(name, deploying, "Segments", "Name");
+        assert_eq!(
+            segments,
+            BTreeSet::from([SHARED.to_string(), PROD.to_string(), QUIET.to_string()]),
+            "case {name:?}: expected the segments the policy in force declares, got {deploying}"
+        );
+        let edges = names_in(name, deploying, "Edges", "EdgeLocation");
+        assert_eq!(
+            edges,
+            BTreeSet::from([WEST.to_string(), CENTRAL.to_string()]),
+            "case {name:?}: expected the edges the policy in force configures, got {deploying}"
+        );
+
+        // Every coordinate of that policy holds exactly the routes it holds when nothing is
+        // outstanding: a reconfiguration takes no segment and no edge away.
+        let expected = expected_through(&subject, how);
+        for case in &expected {
+            let row = format!("{name}: {}", case.name);
+            let page = page(
+                &emulator,
+                &row,
+                &subject.core_network,
+                case.segment,
+                case.edge,
+                &Value::Null,
+                "",
+            )
+            .await;
+            let reported = entries(&row, &page);
+            assert_eq!(
+                reported, case.expected,
+                "case {row:?}: expected {:?}, got {reported:?}",
+                case.expected
+            );
+        }
+
+        // A coordinate the policy in force does NOT configure is still refused on the member
+        // that carried it, in this window as outside it: what is refused follows from the
+        // policy, not from the state the core network is in.
+        for (member, segment, edge) in [
+            (state::FIELD_SEGMENT_NAME, "undeclared", WEST),
+            (state::FIELD_EDGE_LOCATION, SHARED, "ap-southeast-4"),
+        ] {
+            let (status, refused) =
+                list(&emulator, &subject.core_network, segment, edge, &Value::Null, "").await;
+            assert_eq!(
+                status, 400,
+                "case {name:?} / {member}: expected 400, got {status} with {refused}"
+            );
+            assert_eq!(
+                error_code(&refused),
+                "ValidationException",
+                "case {name:?} / {member}: expected ValidationException, got {refused}"
+            );
+            assert_eq!(
+                refused["Fields"][0]["Name"],
+                json!(member),
+                "case {name:?} / {member}: the refusal must name the member that carried it, got {refused}"
+            );
+        }
+
+        // Past the span the clock owes, the same core network reports the same routing: the
+        // window was a window onto the policy in force, not a route table of its own.
+        tokio::time::sleep(PAST_SETTLE).await;
+        let (status, settled) = emulator
+            .get(&format!("/core-networks/{}", subject.core_network))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: GetCoreNetwork expected 200, got {status} with {settled}"
+        );
+        assert_eq!(
+            settled["CoreNetwork"]["State"],
+            json!("AVAILABLE"),
+            "case {name:?}: past the span the reconfiguration has settled, got {settled}"
+        );
+        for case in &expected {
+            let row = format!("{name}: {} once settled", case.name);
+            let page = page(
+                &emulator,
+                &row,
+                &subject.core_network,
+                case.segment,
+                case.edge,
+                &Value::Null,
+                "",
+            )
+            .await;
+            let reported = entries(&row, &page);
+            assert_eq!(
+                reported, case.expected,
+                "case {row:?}: expected {:?}, got {reported:?}",
+                case.expected
+            );
+        }
     }
 }
