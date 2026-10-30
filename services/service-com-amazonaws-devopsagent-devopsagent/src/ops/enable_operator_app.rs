@@ -264,7 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.agent_spaces.contains_key(&input.agent_space_id) {
             return Err(EnableOperatorAppErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("AgentSpace not found: {}", input.agent_space_id),
+                    message: crate::state::agent_space_not_found_message(&input.agent_space_id),
                 },
             )
             .into());

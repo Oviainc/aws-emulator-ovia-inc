@@ -150,7 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // reported as a success.
             return Err(DeleteAgentSpaceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("agent space {} was not found", input.agent_space_id),
+                    message: crate::state::agent_space_not_found_message(&input.agent_space_id),
                 },
             )
             .into());

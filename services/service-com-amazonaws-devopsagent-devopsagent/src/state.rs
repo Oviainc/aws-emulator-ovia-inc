@@ -130,6 +130,31 @@ pub fn region_of(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// The AWS account whose credentials every request this emulator serves is signed
+/// with, which is the account scope an AgentSpace lookup is performed in.
+///
+/// This emulator presents exactly one account, so the lookup scope of every request
+/// is this id.
+pub fn caller_account_id() -> &'static str {
+    ::emulator_server::emulator_account_id()
+}
+
+/// The refusal message a control-plane operation answers with when the
+/// `agentSpaceId` it was given names no AgentSpace in the caller's account.
+///
+/// The not-found refusal of this service's control plane names BOTH the identifier
+/// the request carried and the account the lookup ran in, each double-quoted, so an
+/// operator can tell an AgentSpace that was deleted from a lookup performed against
+/// a different account than they expected. The id is taken verbatim from the
+/// request and the account from the calling identity ([`caller_account_id`]); the
+/// model states no message text, so the wording is the service's own.
+pub fn agent_space_not_found_message(agent_space_id: &str) -> String {
+    let account_id = caller_account_id();
+    format!(
+        "Could not find Agent Space with provided agentSpaceId \"{agent_space_id}\" in accountId \"{account_id}\""
+    )
+}
+
 /// The URL operators use to reach the Operator App of one AgentSpace.
 ///
 /// One host per AgentSpace in the region the enabling request was signed for,
