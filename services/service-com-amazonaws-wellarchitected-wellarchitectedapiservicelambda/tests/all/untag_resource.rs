@@ -40,7 +40,10 @@ use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state
 /// non-greedy `@httpLabel` and the key list is bound to `@httpQuery("tagKeys")`, so "to
 /// specify multiple tags, use separate tagKeys parameters" (the operation's doc) — one
 /// parameter per key, each percent-encoded, exactly as an SDK sends it.
-async fn untag(client: &Client, resource_arn: &str, tag_keys: &[&str]) -> Answer {
+///
+/// `pub(crate)` because `super::tag_family_envelopes` is about the envelopes of the same
+/// requests, and the two suites must not disagree about how one is spelled.
+pub(crate) async fn untag(client: &Client, resource_arn: &str, tag_keys: &[&str]) -> Answer {
     let path = format!("/tags/{}", encode_path_segment(resource_arn));
     let query = tag_keys
         .iter()
@@ -136,8 +139,8 @@ fn tags_without(tags: &BTreeMap<String, String>, keys: &[&str]) -> BTreeMap<Stri
 
 fn assert_untagged(answer: &Answer, case: &str) {
     assert_eq!(
-        answer.status, 200,
-        "case {case:?}: expected UntagResource 200, got {answer:?}"
+        answer.status, 204,
+        "case {case:?}: expected UntagResource 204, got {answer:?}"
     );
 }
 

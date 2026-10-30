@@ -4,7 +4,8 @@
 //! IMPLEMENTED: adds the request's tags to the resource its `WorkloadArn` names — a
 //! workload, a custom lens, a profile, a review template or an agent profile, resolved
 //! through [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::resource_tags_mut`],
-//! the write twin of the lookup `ListTagsForResource` reads through. The tags are MERGED
+//! the write twin of the lookup `ListTagsForResource` reads through — and answers 204 No
+//! Content, the tag family's success status. The tags are MERGED
 //! into the resource's stored tag map — "Adds one or more tags to the specified
 //! resource" — so a key the resource already carries takes the request's value and every
 //! other key it carries survives, which is what [`crate::ops::list_tags_for_resource`]
@@ -131,7 +132,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // The tag family answers with NO content: `TagResourceOutput` carries no member, so
+    // there is nothing for a client to parse and the write is reported by its status
+    // alone. The model leaves the protocol's own 200 on the operation, but the service
+    // answers 204 No Content for a tag write, which is what this status is.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,

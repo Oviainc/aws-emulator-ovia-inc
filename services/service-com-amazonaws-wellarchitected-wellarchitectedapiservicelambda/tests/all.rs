@@ -446,3 +446,8 @@ mod answer_choice_set_changes;
 // here so a new suite does not collide with another insertion.
 #[path = "all/lens_share_token_lens_identity.rs"]
 mod lens_share_token_lens_identity;
+
+// Appended at the end of this list for the reason the notes above give: modules are appended
+// here so a new suite does not collide with another insertion.
+#[path = "all/tag_family_envelopes.rs"]
+mod tag_family_envelopes;

@@ -5,7 +5,7 @@
 //! resolves to — a workload, a custom lens, a profile, a review template or an agent
 //! profile, resolved through the one lookup every tag operation shares
 //! ([`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::resource_tags_mut`])
-//! — and answers an empty 200. Every tag whose key the request does not name is left as
+//! — and answers 204 No Content. Every tag whose key the request does not name is left as
 //! it stands, and a key the resource does not carry removes nothing, so repeating the
 //! request changes nothing further. An ARN naming no resource this store holds is a 404
 //! `ResourceNotFoundException` and writes nothing.
@@ -130,7 +130,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // The tag family answers with NO content: `UntagResourceOutput` carries no member, so
+    // there is nothing for a client to parse and the delete is reported by its status
+    // alone. The model leaves the protocol's own 200 on the operation, but the service
+    // answers 204 No Content for a tag write, which is what this status is.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,

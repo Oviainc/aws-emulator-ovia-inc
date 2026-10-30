@@ -110,8 +110,8 @@ async fn tag_then_read(
 ) -> BTreeMap<String, String> {
     let tagged = tag(client, arn, requested).await;
     assert_eq!(
-        tagged.status, 200,
-        "case {case:?}: expected TagResource 200, got {tagged:?}"
+        tagged.status, 204,
+        "case {case:?}: expected TagResource 204, got {tagged:?}"
     );
     let read = list_tags(client, arn).await;
     assert_eq!(
@@ -520,73 +520,63 @@ async fn an_arn_that_names_no_stored_resource_is_a_not_found_and_records_nothing
         .map(|(_, arn)| arn.clone())
         .unwrap_or_default();
 
-    let rows: Vec<(&str, String, &str, &str)> = vec![
+    let rows: Vec<(&str, String, &str)> = vec![
         (
             "a workload ARN no workload carries",
             format!("arn:aws:wellarchitected:us-west-2:{account}:workload/{absent_id}"),
             "WORKLOAD",
-            "workload",
         ),
         (
             "a review template ARN no template carries",
             format!("arn:aws:wellarchitected:us-west-2:{account}:review-template/{absent_id}"),
             "REVIEW_TEMPLATE",
-            "review template",
         ),
         (
             "a custom lens ARN no lens carries",
             format!("arn:aws:wellarchitected:us-west-2:{account}:lens/{absent_id}"),
             "LENS",
-            "custom lens",
         ),
         (
             "an agent profile ARN no profile carries",
             format!("arn:aws:wellarchitected:us-west-2:{account}:agent-profile/{absent_id}"),
             "AGENT_PROFILE",
-            "agent profile",
         ),
         (
             "a profile ARN no profile carries",
             format!("arn:aws:wellarchitected:us-west-2:{account}:profile/{absent_id}"),
             "PROFILE",
-            "profile",
         ),
         (
             "a stored workload's ARN under another account",
             workload_arn.replace(account, "210987654321"),
             "WORKLOAD",
-            "workload",
         ),
         (
             "a stored workload's ARN in another Region",
             workload_arn.replace("us-west-2", "eu-west-1"),
             "WORKLOAD",
-            "workload",
         ),
         (
             "an Amazon Web Services official lens ARN, which names no account's resource",
             "arn:aws:wellarchitected:us-west-2::lens/serverless".to_string(),
             "LENS",
-            "custom lens",
         ),
         // An ARN whose resource part names no taggable kind of this service is reported
-        // under the resource type of the member that carried it (`WorkloadArn`), naming
-        // the resource in general — there is nothing more specific to say about it.
+        // under the resource type of the member that carried it (`WorkloadArn`) — there is
+        // nothing more specific to say about it.
         (
             "an ARN of another service entirely",
             format!("arn:aws:s3:::a-bucket/{absent_id}"),
             "WORKLOAD",
-            "resource",
         ),
         (
             "a value that is not an ARN at all",
             "not-an-arn".to_string(),
             "WORKLOAD",
-            "resource",
         ),
     ];
 
-    for (shape, arn, resource_type, subject) in rows {
+    for (shape, arn, resource_type) in rows {
         assert!(
             !arn.is_empty() && arn != workload_arn,
             "case {shape:?}: the row must not name the resource that exists, got {arn:?}"
@@ -615,15 +605,11 @@ async fn an_arn_that_names_no_stored_resource_is_a_not_found_and_records_nothing
             );
             assert_eq!(
                 answer.body.get("Message").and_then(Value::as_str),
-                Some(
-                    format!(
-                        "[ResourceNotFound] No {subject} with ARN {arn} was found in \
-                         account {account}."
-                    )
-                    .as_str()
-                ),
-                "case {shape:?}/{operation}: the message names the resource kind, the ARN and \
-                 the account, got {answer:?}"
+                // The fixed text of this failure class on the tag path, as the service
+                // words it: no ARN, no account and no class tag inside the sentence.
+                Some("Resource was not found"),
+                "case {shape:?}/{operation}: the message is the tag family's fixed text, got \
+                 {answer:?}"
             );
         }
     }
@@ -758,7 +744,7 @@ async fn the_tag_write_and_the_tag_read_resolve_the_same_arns() {
         let read = list_tags(&client, &arn).await;
         assert_eq!(
             (written.status, read.status),
-            (200, 200),
+            (204, 200),
             "case {kind:?}: write and read must both resolve {arn:?}, got {written:?} / {read:?}"
         );
         assert_eq!(

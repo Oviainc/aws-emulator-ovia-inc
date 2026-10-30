@@ -1936,7 +1936,7 @@ impl WorkloadProfileRecord {
 }
 
 /// Every resource type of this service a TAG operation can name, as
-/// `(ARN resource prefix, modelled `ResourceType`, the words a message calls it by)`.
+/// `(ARN resource prefix, modelled `ResourceType`)`.
 ///
 /// "The WorkloadArn parameter can be a workload ARN, a custom lens ARN, a profile ARN, or
 /// review template ARN" (`ListTagsForResource` / `TagResource` / `UntagResource` doc) —
@@ -1948,20 +1948,12 @@ impl WorkloadProfileRecord {
 /// The prefixes are matched against the RESOURCE PART of the ARN
 /// (`arn:<partition>:<service>:<region>:<account>:<resource>`), so `profile/` cannot also
 /// match an `agent-profile/` ARN.
-const TAGGABLE_RESOURCE_KINDS: &[(&str, &str, &str)] = &[
-    ("workload/", WORKLOAD_RESOURCE_TYPE, "workload"),
-    ("lens/", LENS_RESOURCE_TYPE, "custom lens"),
-    ("profile/", PROFILE_RESOURCE_TYPE, "profile"),
-    (
-        "review-template/",
-        REVIEW_TEMPLATE_RESOURCE_TYPE,
-        "review template",
-    ),
-    (
-        "agent-profile/",
-        AGENT_PROFILE_RESOURCE_TYPE,
-        "agent profile",
-    ),
+const TAGGABLE_RESOURCE_KINDS: &[(&str, &str)] = &[
+    ("workload/", WORKLOAD_RESOURCE_TYPE),
+    ("lens/", LENS_RESOURCE_TYPE),
+    ("profile/", PROFILE_RESOURCE_TYPE),
+    ("review-template/", REVIEW_TEMPLATE_RESOURCE_TYPE),
+    ("agent-profile/", AGENT_PROFILE_RESOURCE_TYPE),
 ];
 
 /// Where the tags of the resource a tag ARN names LIVE in this store: which map holds the
@@ -9346,33 +9338,42 @@ pub fn profile_not_found(profile_arn: &str) -> ResourceNotFoundException {
     )
 }
 
-/// [`resource_not_found`] for an ARN a TAG operation names that resolves to no resource
-/// this store holds ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::resource_tags`]).
+/// The whole `Message` of the tag family's `ResourceNotFoundException`: the FIXED text of
+/// that failure class on the tag path, with no variable part.
 ///
-/// `ResourceType` is read off the ARN's own resource part
-/// ([`TAGGABLE_RESOURCE_KINDS`]), so a caller is told which KIND of resource was looked
-/// for; an ARN naming no taggable kind at all is reported under the resource type of the
-/// member that carried it (`WorkloadArn`). `ResourceId` is the ARN AS SENT. Shared by
-/// every operation that resolves a resource by tag ARN, so they cannot word it
-/// differently.
+/// The tag operations are served as one family, and their missing-resource refusal reports
+/// the class alone — the ARN the request named travels in `ResourceId` and the resource
+/// type in `ResourceType`, so the sentence interpolates neither it nor the account the
+/// lookup ran in.
+pub const TAGGED_RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The `ResourceNotFoundException` (HTTP 404) for an ARN a TAG operation names that
+/// resolves to no resource this store holds
+/// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::resource_tags`]).
+///
+/// The message is [`TAGGED_RESOURCE_NOT_FOUND_MESSAGE`], the fixed text of this failure
+/// class on the tag path — which is why this does not go through [`resource_not_found`],
+/// whose sentence is built from the request and the owning account. `ResourceType` is read
+/// off the ARN's own resource part ([`TAGGABLE_RESOURCE_KINDS`]), so a caller is still told
+/// which KIND of resource was looked for; an ARN naming no taggable kind at all is reported
+/// under the resource type of the member that carried it (`WorkloadArn`). `ResourceId` is
+/// the ARN AS SENT. Shared by every operation that resolves a resource by tag ARN, so they
+/// cannot word it differently.
 pub fn tagged_resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
     // partition : service : region : account : resource
     let resource_part = resource_arn
         .strip_prefix("arn:")
         .and_then(|rest| rest.splitn(5, ':').nth(4))
         .unwrap_or_default();
-    let (resource_type, subject) = TAGGABLE_RESOURCE_KINDS
+    let resource_type = TAGGABLE_RESOURCE_KINDS
         .iter()
-        .find(|(prefix, _, _)| resource_part.starts_with(prefix))
-        .map_or(
-            (WORKLOAD_RESOURCE_TYPE, "resource"),
-            |(_, resource_type, subject)| (*resource_type, *subject),
-        );
-    resource_not_found(
-        resource_type,
-        resource_arn.to_string(),
-        &format!("{subject} with ARN {resource_arn}"),
-    )
+        .find(|(prefix, _)| resource_part.starts_with(prefix))
+        .map_or(WORKLOAD_RESOURCE_TYPE, |(_, resource_type)| *resource_type);
+    ResourceNotFoundException {
+        message: TAGGED_RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+        resource_id: resource_arn.to_string(),
+        resource_type: resource_type.to_string(),
+    }
 }
 
 /// [`resource_not_found`] for a `ProfileVersion` the profile `profile_arn` names does not

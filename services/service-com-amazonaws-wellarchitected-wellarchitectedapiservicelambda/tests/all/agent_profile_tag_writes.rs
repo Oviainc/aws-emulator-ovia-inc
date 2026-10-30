@@ -208,7 +208,7 @@ async fn a_tag_write_records_only_values_the_resources_own_tag_shape_can_carry()
         let answer = tag(&client, &arn, &requested(&row)).await;
         if row.carried_by_tag_structure {
             assert_eq!(
-                answer.status, 200,
+                answer.status, 204,
                 "case {case:?}: a value the Tag structure carries must be recorded, got \
                  {answer:?}"
             );
@@ -300,7 +300,7 @@ async fn a_resource_reported_only_as_a_tag_map_records_the_values_only_it_carrie
             let answer = tag(&client, &arn, &requested(&row)).await;
             if row.carried_by_tag_map {
                 assert_eq!(
-                    answer.status, 200,
+                    answer.status, 204,
                     "case {case:?}: a value a TagMap carries must be recorded on a resource \
                      reported through one, got {answer:?}"
                 );
@@ -360,8 +360,8 @@ async fn the_create_and_the_tag_write_agree_on_what_an_agent_profile_tag_can_hol
         let tagged_arn = profile_arn_of(&client, &format!("tag-door-written-{index}"), 1).await;
         let answer = tag(&client, &tagged_arn, &expected).await;
         assert_eq!(
-            answer.status, 200,
-            "case {case:?}: expected TagResource 200, got {answer:?}"
+            answer.status, 204,
+            "case {case:?}: expected TagResource 204, got {answer:?}"
         );
         for (reader, read) in [
             ("the created profile", get_profile(&client, &arn).await),

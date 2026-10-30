@@ -593,7 +593,7 @@ async fn a_profile_the_create_tagged_is_taggable_up_to_the_same_ceiling() {
     let below_arn = created_arn(&below, "below the ceiling");
     let tagged = tag(&client, &below_arn, &extra).await;
     assert_eq!(
-        tagged.status, 200,
+        tagged.status, 204,
         "case \"below the ceiling\": one more tag must be recorded, got {tagged:?}"
     );
     let listed = list_tags(&client, &below_arn).await;
@@ -636,7 +636,7 @@ async fn a_profile_the_create_tagged_is_taggable_up_to_the_same_ceiling() {
         .collect();
     let accepted = tag(&client, &at_arn, &overwrite).await;
     assert_eq!(
-        accepted.status, 200,
+        accepted.status, 204,
         "case \"at the ceiling/overwrite\": an overwrite must be recorded, got {accepted:?}"
     );
     let reported = reported_tags(
