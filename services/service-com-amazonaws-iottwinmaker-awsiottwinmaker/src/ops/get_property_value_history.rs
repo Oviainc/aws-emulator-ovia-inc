@@ -22,7 +22,12 @@
 //! bounds are INCLUSIVE ("the date and time of the earliest/latest property
 //! value to return"). `interpolation` asks for the series resampled at a fixed
 //! interval across that window instead of as written. The answer is PAGED:
-//! `maxResults` caps how many values it carries and `nextToken` resumes it.
+//! `maxResults` caps how many values it carries and `nextToken` resumes it. A
+//! value has no key of its own, so a token resumes at an ORDINAL and is bound to
+//! every request member that decides the sequence it was counted in
+//! ([`token_scope`]) — the scope, the selection, the window, the order, the
+//! filters and the interpolation — so a token minted by another query is refused
+//! rather than resumed into values it was never counted in.
 //!
 //! Every pass is BOUNDED: the scope is capped at [`MAX_COMPONENTS_IN_SCOPE`]
 //! components, one request reads at most [`MAX_VALUES_READ`] values out of the
@@ -1048,20 +1053,36 @@ fn page(
 /// elsewhere — for another query, or by hand — is recognisably not one of ours.
 const HISTORY_TOKEN_PREFIX: &str = "iottwinmaker:property-history:1:";
 
-/// What a `nextToken` is bound to besides its workspace: the members that
-/// decide WHICH values of which components the page is of, so a token is only
+/// What a `nextToken` is bound to besides its workspace: EVERY member that
+/// decides which values of which components the page is of, so a token is only
 /// resumed by the query that minted it.
+///
+/// A value has no key of its own, so a page resumes at its ORDINAL in the
+/// sequence the request produced ([`page`]) — and an ordinal only means
+/// something inside the one sequence it was counted in. So the scope carries the
+/// whole address of the components read (`entityId` with `componentName` or
+/// `componentPath`, else `componentTypeId`), the selection, the window's two
+/// bounds, the direction the values are reported in, the `propertyFilters` that
+/// decide which of the window's values are in the sequence at all
+/// ([`crate::state::property_filters_token_scope`]) and the `interpolation` that
+/// replaces each series' values with resampled points
+/// ([`interpolation_scope`]). `maxResults` is NOT in it: the page size decides
+/// how much of the sequence one answer carries, not what the sequence holds, so
+/// a paginator asking for another page size still resumes.
 ///
 /// Last of the token's scope parts, which is the one that may itself contain the
 /// separator ([`crate::state::encode_page_token`]), because the selected
-/// property names are free text. The selection is taken sorted and
-/// de-duplicated, the way the answer is ordered.
+/// property names and the filter values are free text. Rendered as JSON — the
+/// way the sibling latest-value query renders its own scope — so each member is
+/// delimited by the rendering rather than by a separator one of those free-text
+/// values could itself carry. The selection is taken sorted and de-duplicated,
+/// the way the answer is ordered, so re-asking for the same properties in
+/// another order still resumes.
 fn token_scope(input: &GetPropertyValueHistoryInput) -> String {
     let mut selected = input.selected_properties.clone();
     selected.sort();
     selected.dedup();
-    format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}",
+    ::serde_json::json!([
         input.entity_id.as_deref().unwrap_or(""),
         input.component_name.as_deref().unwrap_or(""),
         input.component_path.as_deref().unwrap_or(""),
@@ -1069,8 +1090,32 @@ fn token_scope(input: &GetPropertyValueHistoryInput) -> String {
         input.order_by_time.as_deref().unwrap_or(ORDER_ASCENDING),
         bound_key(input.start_time.as_deref(), input.start_date_time.as_ref()),
         bound_key(input.end_time.as_deref(), input.end_date_time.as_ref()),
-        selected.join(","),
-    )
+        selected,
+        crate::state::property_filters_token_scope(
+            input.property_filters.as_deref().unwrap_or_default()
+        ),
+        interpolation_scope(input.interpolation.as_ref()),
+    ])
+    .to_string()
+}
+
+/// What a `nextToken` binds `interpolation` to: the resampling that decides
+/// which points the page is of.
+///
+/// An interpolated answer reports the RESAMPLED points instead of the values as
+/// written ([`Interpolation::resample`]), so the interpolation type and the
+/// interval are as much part of the sequence an ordinal was counted in as the
+/// window is — a request adding, dropping or re-spacing one asks for another
+/// sequence. A request naming none asks for the series as written, which is a
+/// sequence of its own, so it renders as nothing rather than as some interval.
+fn interpolation_scope(parameters: Option<&InterpolationParameters>) -> ::serde_json::Value {
+    let Some(parameters) = parameters else {
+        return ::serde_json::Value::Null;
+    };
+    ::serde_json::json!([
+        parameters.interpolation_type.as_deref().unwrap_or(""),
+        parameters.interval_in_seconds,
+    ])
 }
 
 /// One window bound as the token's scope carries it: the instant it names, or

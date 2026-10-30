@@ -86,6 +86,9 @@ mod filtered_page_token_scope;
 #[path = "all/harness.rs"]
 mod harness;
 
+#[path = "all/history_page_token_scope.rs"]
+mod history_page_token_scope;
+
 #[path = "all/max_results_zero_page.rs"]
 mod max_results_zero_page;
 
