@@ -238,6 +238,7 @@ version = "0.1.0"
 dependencies = [
  "aws-emulator-emulator-paths",
  "http",
+ "libc",
  "reqwest",
  "rusqlite",
  "serde",
@@ -246,6 +247,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -717,6 +719,8 @@ version = "0.1.0"
 dependencies = [
  "aws-credential-types",
  "aws-emulator-emulator-paths",
+ "aws-emulator-emulator-telemetry",
+ "aws-emulator-smithy-schema-server",
  "aws-lc-rs",
  "aws-sigv4",
  "aws-smithy-runtime-api",
