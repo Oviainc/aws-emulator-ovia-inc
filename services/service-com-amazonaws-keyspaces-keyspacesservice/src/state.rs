@@ -913,9 +913,13 @@ impl Keyspace {
     /// replication Regions is returned" (`KeyspaceSummary$replicationRegions`), and the
     /// member's modelled minimum length is 2 — which a single-Region keyspace's own
     /// region, on its own, could never satisfy.
+    ///
+    /// Which Regions those are is decided in ONE place,
+    /// [`Self::table_replica_regions`]: this is the same list under the same rule, owned
+    /// rather than borrowed, so a report of the keyspace and a report of any table of it
+    /// can never name different Regions.
     pub fn reported_replication_regions(&self) -> Option<Vec<String>> {
-        (self.replication_strategy == MULTI_REGION_STRATEGY)
-            .then(|| self.replication_regions.clone())
+        self.table_replica_regions().map(<[String]>::to_vec)
     }
 
     /// The Amazon Web Services Regions a report of ANY table of this keyspace carries
@@ -932,6 +936,10 @@ impl Keyspace {
     /// `GetTableAutoScalingSettingsResponse$replicaSpecifications` ("the settings for all
     /// Regions the table is replicated in") each report one entry per; a table of a
     /// single-Region keyspace is replicated in one Region only, so it has none.
+    ///
+    /// This is the one place the rule lives: every report of the keyspace or of a table of
+    /// it reaches the Region list through here, directly or through
+    /// [`Self::reported_replication_regions`].
     pub fn table_replica_regions(&self) -> Option<&[String]> {
         (self.replication_strategy == MULTI_REGION_STRATEGY)
             .then_some(self.replication_regions.as_slice())

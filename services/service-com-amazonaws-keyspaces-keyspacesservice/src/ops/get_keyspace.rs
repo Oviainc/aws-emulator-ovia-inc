@@ -190,9 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Which Regions a report of this keyspace carries, decided once on the stored
-        // keyspace itself ([`crate::state::Keyspace::reported_replication_regions`] /
-        // [`crate::state::Keyspace::table_replica_regions`]) rather than restated here, so
-        // this report and every other one answer the same rule.
+        // keyspace itself ([`crate::state::Keyspace::table_replica_regions`], which
+        // [`crate::state::Keyspace::reported_replication_regions`] hands back owned)
+        // rather than restated here, so both members of this report — and every other
+        // report of the same keyspace — answer the one rule.
         let replication_regions = keyspace.reported_replication_regions();
         let replication_group_regions = keyspace.table_replica_regions();
 

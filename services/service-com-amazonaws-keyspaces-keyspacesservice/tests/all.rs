@@ -51,6 +51,8 @@ mod list_types;
 mod multi_region_table_replicas;
 #[path = "all/name_conflict_precedes_type_resolution.rs"]
 mod name_conflict_precedes_type_resolution;
+#[path = "all/one_replication_region_rule.rs"]
+mod one_replication_region_rule;
 #[path = "all/page_token_codec.rs"]
 mod page_token_codec;
 #[path = "all/pagination_window.rs"]
