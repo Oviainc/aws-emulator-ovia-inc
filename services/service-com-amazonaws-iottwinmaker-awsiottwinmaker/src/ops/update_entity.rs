@@ -771,10 +771,18 @@ fn updated_parent_entity_id(
 /// rule that refused the request produced.
 ///
 /// The message is built from the REQUEST — the member and the id, name or path
-/// the service could not resolve — so a caller is told what to change.
+/// the service could not resolve — so a caller is told what to change, and it is
+/// clamped to the modelled maximum of the member it is reported on
+/// ([`crate::state::clamped_message`]): a `componentPath` this operation
+/// addresses a composite component by is bounded as widely as that member
+/// itself, so the rendered reason is brought within the bound instead of
+/// overrunning it.
 fn validation(message: String) -> UpdateEntityError {
     UpdateEntityErrorModeled::ValidationException(ValidationException {
-        message: Some(message),
+        message: Some(crate::state::clamped_message(
+            message,
+            crate::state::ERROR_MESSAGE_MAX_CHARS,
+        )),
     })
     .into()
 }

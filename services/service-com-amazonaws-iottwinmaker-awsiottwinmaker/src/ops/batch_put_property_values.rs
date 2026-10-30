@@ -200,6 +200,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Err(error) => error_entries.push(BatchPutPropertyErrorEntry {
                     errors: vec![BatchPutPropertyError {
                         error_code: error.code.to_string(),
+                        // Already within this member's own `@length` maximum:
+                        // see [`ENTRY_ERROR_MESSAGE_MAX_CHARS`], which every
+                        // reason is clamped to where it is built.
                         error_message: error.message,
                         // The entry itself, so a caller matching errors to what
                         // it sent does not have to count positions.
@@ -221,7 +224,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// rather than the scaffold wrapper's.
 fn not_found(message: String) -> BatchPutPropertyValuesError {
     BatchPutPropertyValuesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(message),
+        message: Some(crate::state::clamped_message(
+            message,
+            crate::state::ERROR_MESSAGE_MAX_CHARS,
+        )),
     })
     .into()
 }
@@ -242,6 +248,15 @@ const ERROR_CODE_VALIDATION: &str = "ValidationException";
 /// entity or a component the workspace does not hold.
 const ERROR_CODE_NOT_FOUND: &str = "ResourceNotFoundException";
 
+/// The greatest number of characters `BatchPutPropertyError$errorMessage`
+/// admits: `@length(1..256)`, from
+/// `smithy_query(query="shape", shape="BatchPutPropertyError")`. It is NARROWER
+/// than the identifiers a per-entry reason names — `EntityPropertyReference`
+/// bounds `propertyName` at 256 characters and `componentPath` at 2048 — so the
+/// reason is clamped to it ([`crate::state::clamped_message`]) as the error is
+/// built, rather than reported past the bound of the member it travels on.
+const ENTRY_ERROR_MESSAGE_MAX_CHARS: usize = 256;
+
 /// Why ONE entry cannot be served: the `errorCode` and `errorMessage` its
 /// reported error carries.
 struct EntryError {
@@ -253,7 +268,7 @@ struct EntryError {
 fn invalid_entry(message: String) -> EntryError {
     EntryError {
         code: ERROR_CODE_VALIDATION,
-        message,
+        message: crate::state::clamped_message(message, ENTRY_ERROR_MESSAGE_MAX_CHARS),
     }
 }
 
@@ -261,7 +276,7 @@ fn invalid_entry(message: String) -> EntryError {
 fn absent_entry(message: String) -> EntryError {
     EntryError {
         code: ERROR_CODE_NOT_FOUND,
-        message,
+        message: crate::state::clamped_message(message, ENTRY_ERROR_MESSAGE_MAX_CHARS),
     }
 }
 

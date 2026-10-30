@@ -226,10 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .flat_map(|tags| tags.keys().map(String::as_str)),
         ) {
-            return Err(CreateEntityErrorModeled::ValidationException(ValidationException {
-                message: Some(message),
-            })
-            .into());
+            return Err(validation(message).into());
         }
 
         // The Region this request is signed for picks the store it writes to,
@@ -245,13 +242,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.region_mut(&region);
 
         let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
-            return Err(CreateEntityErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(crate::state::workspace_not_found_message(
-                        &input.workspace_id,
-                    )),
-                },
-            )
+            return Err(validation(crate::state::workspace_not_found_message(
+                &input.workspace_id,
+            ))
             .into());
         };
 
@@ -299,26 +292,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // graph cyclic, which the tree walks over it must never be asked to
         // handle.
         if parent_entity_id == entity_id {
-            return Err(CreateEntityErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "parentEntityId {parent_entity_id} must not name the entity being created"
-                    )),
-                },
-            )
+            return Err(validation(format!(
+                "parentEntityId {parent_entity_id} must not name the entity being created"
+            ))
             .into());
         }
         if parent_entity_id != crate::state::ROOT_PARENT_ENTITY_ID
             && !workspace.entities.contains_key(&parent_entity_id)
         {
-            return Err(CreateEntityErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "parentEntityId {parent_entity_id} does not name an entity in workspace {}",
-                        input.workspace_id
-                    )),
-                },
-            )
+            return Err(validation(format!(
+                "parentEntityId {parent_entity_id} does not name an entity in workspace {}",
+                input.workspace_id
+            ))
             .into());
         }
 
@@ -379,11 +364,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "compositeComponents",
                 &component_path,
             )
-            .map_err(|message| {
-                CreateEntityErrorModeled::ValidationException(ValidationException {
-                    message: Some(message),
-                })
-            })?;
+            .map_err(validation)?;
             // A composite component instantiates the component type the
             // declaration its path resolved to names, so the same abstractness
             // rule holds for it as for a top-level component.
@@ -576,10 +557,23 @@ fn abstract_component_type_refusal(
     workspace: &crate::state::Workspace,
     component_type_id: Option<&str>,
 ) -> Option<CreateEntityErrorModeled> {
-    crate::state::abstract_component_type_violation(workspace, component_type_id).map(|message| {
-        CreateEntityErrorModeled::ValidationException(ValidationException {
-            message: Some(message),
-        })
+    crate::state::abstract_component_type_violation(workspace, component_type_id).map(validation)
+}
+
+/// This operation's `ValidationException`, carrying the message the rule that
+/// refused the request produced.
+///
+/// The message is clamped to the modelled maximum of the member it is reported
+/// on ([`crate::state::clamped_message`]): a refusal names what the request
+/// named, and this operation's `compositeComponents` is keyed by a
+/// `ComponentPath` the model bounds as widely as that member itself, so the
+/// rendered reason is brought within the bound instead of overrunning it.
+fn validation(message: String) -> CreateEntityErrorModeled {
+    CreateEntityErrorModeled::ValidationException(ValidationException {
+        message: Some(crate::state::clamped_message(
+            message,
+            crate::state::ERROR_MESSAGE_MAX_CHARS,
+        )),
     })
 }
 
@@ -605,13 +599,9 @@ fn require_data_types(
             .as_ref()
             .is_some_and(|definition| definition.data_type.is_none())
         {
-            return Err(CreateEntityErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "{member_path}.properties.{property_name}.definition.dataType is required"
-                    )),
-                },
-            ));
+            return Err(validation(format!(
+                "{member_path}.properties.{property_name}.definition.dataType is required"
+            )));
         }
     }
     Ok(())

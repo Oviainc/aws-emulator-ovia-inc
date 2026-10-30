@@ -332,7 +332,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// rather than the scaffold wrapper's.
 fn invalid(message: String) -> GetPropertyValueHistoryError {
     GetPropertyValueHistoryErrorModeled::ValidationException(ValidationException {
-        message: Some(message),
+        message: Some(crate::state::clamped_message(
+            message,
+            crate::state::ERROR_MESSAGE_MAX_CHARS,
+        )),
     })
     .into()
 }
@@ -340,7 +343,10 @@ fn invalid(message: String) -> GetPropertyValueHistoryError {
 /// Answer that something the request named does not exist.
 fn not_found(message: String) -> GetPropertyValueHistoryError {
     GetPropertyValueHistoryErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(message),
+        message: Some(crate::state::clamped_message(
+            message,
+            crate::state::ERROR_MESSAGE_MAX_CHARS,
+        )),
     })
     .into()
 }

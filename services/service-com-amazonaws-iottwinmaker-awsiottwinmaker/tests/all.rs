@@ -77,6 +77,9 @@ mod entity_external_id_filter;
 #[path = "all/entity_update.rs"]
 mod entity_update;
 
+#[path = "all/error_message_bounds.rs"]
+mod error_message_bounds;
+
 #[path = "all/execute_query.rs"]
 mod execute_query;
 

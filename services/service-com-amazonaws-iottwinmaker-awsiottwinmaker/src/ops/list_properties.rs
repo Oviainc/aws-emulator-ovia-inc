@@ -292,7 +292,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// rather than the scaffold wrapper's.
 fn invalid(message: String) -> ListPropertiesError {
     ListPropertiesErrorModeled::ValidationException(ValidationException {
-        message: Some(message),
+        message: Some(crate::state::clamped_message(
+            message,
+            crate::state::ERROR_MESSAGE_MAX_CHARS,
+        )),
     })
     .into()
 }
@@ -303,7 +306,10 @@ fn invalid(message: String) -> ListPropertiesError {
 /// as the missing resource it is rather than as a bad request.
 fn not_found(message: String) -> ListPropertiesError {
     ListPropertiesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(message),
+        message: Some(crate::state::clamped_message(
+            message,
+            crate::state::ERROR_MESSAGE_MAX_CHARS,
+        )),
     })
     .into()
 }

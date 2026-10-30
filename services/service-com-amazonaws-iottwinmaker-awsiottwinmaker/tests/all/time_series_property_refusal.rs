@@ -110,11 +110,24 @@ fn properties() -> Vec<Property> {
     ]
 }
 
+/// The clause the refusal ends in: the reason it gives, after the property it
+/// names.
+const NOT_A_TIME_SERIES: &str = " is not marked as a time-series property.";
+
+/// The greatest number of characters `BatchPutPropertyError$errorMessage`
+/// admits (`@length(1..256)`, from
+/// `smithy_query(query="shape",shape="BatchPutPropertyError")`), which is
+/// narrower than the `propertyName` the construction names: a reason past it is
+/// reported cut to it, so a row whose property name is long enough is asserted
+/// by its reason rather than by the whole text. `tests/all/error_message_bounds.rs`
+/// is the suite about that bound.
+const ENTRY_ERROR_MESSAGE_MAX: usize = 256;
+
 /// The message a refusal for `property_name` has to carry, written out here
 /// rather than read from the service so the expectation is independent of the
 /// construction under test.
 fn expected_message(property_name: &str) -> String {
-    format!("{property_name} is not marked as a time-series property.")
+    format!("{property_name}{NOT_A_TIME_SERIES}")
 }
 
 /// The `message` an error body carries.
@@ -307,16 +320,29 @@ async fn a_batch_write_names_the_property_that_is_not_marked_as_a_time_series() 
                 "case {case:?}: expected one reported error, got {written:?}"
             );
             assert_eq!(
-                (
-                    errors[0]["errorCode"].as_str().unwrap_or_default(),
-                    errors[0]["errorMessage"].as_str().unwrap_or_default()
-                ),
-                (
-                    "ValidationException",
-                    expected_message(&property.name).as_str()
-                ),
-                "case {case:?}: expected the ValidationException construction, got {written:?}"
+                errors[0]["errorCode"].as_str().unwrap_or_default(),
+                "ValidationException",
+                "case {case:?}: expected the ValidationException code, got {written:?}"
             );
+            let expected = expected_message(&property.name);
+            let reported = errors[0]["errorMessage"].as_str().unwrap_or_default();
+            if expected.chars().count() <= ENTRY_ERROR_MESSAGE_MAX {
+                assert_eq!(
+                    reported, expected,
+                    "case {case:?}: expected the construction {expected:?}, got {written:?}"
+                );
+            } else {
+                assert_eq!(
+                    reported.chars().count(),
+                    ENTRY_ERROR_MESSAGE_MAX,
+                    "case {case:?}: expected a construction too long for the member to be \
+                     reported at its bound, got {written:?}"
+                );
+                assert!(
+                    reported.ends_with(NOT_A_TIME_SERIES),
+                    "case {case:?}: expected the reason to survive the bound, got {reported:?}"
+                );
+            }
         }
     }
 }

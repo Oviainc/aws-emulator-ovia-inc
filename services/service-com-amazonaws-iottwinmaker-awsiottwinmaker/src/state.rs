@@ -4469,6 +4469,52 @@ impl RegionalState {
     }
 }
 
+/// The greatest number of characters the modelled `ErrorMessage` shape — the
+/// member every one of this service's modelled refusals states its reason on —
+/// admits: `@length(0..2048)`, from
+/// `smithy_query(query="shape", shape="ErrorMessage")`.
+pub const ERROR_MESSAGE_MAX_CHARS: usize = 2048;
+
+/// What a message that does not fit the member it is reported on is cut with.
+///
+/// The cut is marked rather than silent, so a caller can tell a message the
+/// service shortened from one it worded that way.
+const MESSAGE_ELISION: &str = "...";
+
+/// `message` rendered so it satisfies the `@length` maximum of the member it is
+/// reported on, which is `max_chars` characters.
+///
+/// A message names what the request named, and an identifier the model bounds
+/// as widely as — or more widely than — the member the message travels on
+/// renders text past that member's own bound: a `ComponentPath` of 2048
+/// characters, or a `Name` of 256, stated on a member capped at 256. The
+/// message that already fits is returned unchanged; a longer one keeps its
+/// leading characters AND its trailing ones around [`MESSAGE_ELISION`], because
+/// these messages name the thing first and give the reason last, so cutting
+/// only the tail would drop the reason. The result is exactly `max_chars`
+/// characters — Smithy measures a string's length in characters, so the cut is
+/// counted and made in characters rather than in bytes.
+pub fn clamped_message(message: String, max_chars: usize) -> String {
+    let characters: Vec<char> = message.chars().collect();
+    if characters.len() <= max_chars {
+        return message;
+    }
+    let elision: Vec<char> = MESSAGE_ELISION.chars().collect();
+    // A member too small to hold the marker itself holds as much of the
+    // message as it admits and nothing else.
+    if max_chars <= elision.len() {
+        return characters[..max_chars].iter().collect();
+    }
+    let kept = max_chars - elision.len();
+    let tail = kept / 2;
+    let head = kept - tail;
+    characters[..head]
+        .iter()
+        .chain(elision.iter())
+        .chain(characters[characters.len() - tail..].iter())
+        .collect()
+}
+
 /// The message for a resource no ARN in this service's index names.
 ///
 /// Built from the request, naming the ARN that was looked for — the same

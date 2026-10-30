@@ -215,7 +215,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let invalid = |message: String| {
             ListComponentsErrorModeled::ValidationException(ValidationException {
-                message: Some(message),
+                message: Some(crate::state::clamped_message(
+                    message,
+                    crate::state::ERROR_MESSAGE_MAX_CHARS,
+                )),
             })
         };
         // Unlike this service's workspace-scoped listings, this operation DOES
@@ -223,7 +226,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reported as the missing resource it is rather than as a bad request.
         let not_found = |message: String| {
             ListComponentsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(message),
+                message: Some(crate::state::clamped_message(
+                    message,
+                    crate::state::ERROR_MESSAGE_MAX_CHARS,
+                )),
             })
         };
 
