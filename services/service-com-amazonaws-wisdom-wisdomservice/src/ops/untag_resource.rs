@@ -144,7 +144,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::scaffolded::NOT_FOUND_CODE`.
         let Some(tags) = state.tags_of_resource_mut(&input.resource_arn) else {
             return Err(crate::scaffolded::Scaffolded::not_found(
-                crate::state::MESSAGE_UNTAG_RESOURCE_NOT_FOUND,
+                crate::state::MESSAGE_TAGGING_RESOURCE_NOT_FOUND,
             ));
         };
         // Untagging is stated as a POSTCONDITION — the named keys are not on the resource

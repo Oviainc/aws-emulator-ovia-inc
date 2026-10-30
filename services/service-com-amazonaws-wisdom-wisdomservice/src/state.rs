@@ -244,16 +244,6 @@ pub fn message_too_many_tags() -> String {
     format!("The resultant tag set must not have more than {MAX_TAGS_PER_RESOURCE} user tags.")
 }
 
-/// The sentence a tagging operation refuses an ARN this account holds no resource
-/// under with.
-///
-/// It is the model's own documentation of `ResourceNotFoundException`
-/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`: "The specified
-/// resource does not exist."), and it carries NOTHING from the request, so a caller
-/// cannot probe the store through the wording. The ARN the caller asked about travels
-/// in the error's own `resourceName` member, which the model provides for naming it.
-pub const MESSAGE_RESOURCE_NOT_FOUND: &str = "The specified resource does not exist.";
-
 /// The only `KnowledgeBaseType` a content upload may be started against.
 ///
 /// `StartContentUpload`'s own documentation states the rule — "You can only upload
@@ -261,6 +251,49 @@ pub const MESSAGE_RESOURCE_NOT_FOUND: &str = "The specified resource does not ex
 /// of any other modelled type is refused instead of being handed a URL that could not
 /// be used.
 pub const KNOWLEDGE_BASE_TYPE_CUSTOM: &str = "CUSTOM";
+
+/// The modelled `KnowledgeBaseType` whose INTERNAL name is not its modelled value
+/// (`smithy_query(query="shape",shape="KnowledgeBaseType")`: `EXTERNAL`, `CUSTOM`,
+/// `QUICK_RESPONSES`), and that internal name.
+///
+/// The recorded wire answer of this endpoint for an upload against a knowledge base of
+/// this type names the type `quick_replies` — the name it carried before the API spelled
+/// it `QUICK_RESPONSES` — so the token travels from the recording rather than from the
+/// modelled value. See [`knowledge_base_type_token`].
+const KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES: &str = "QUICK_RESPONSES";
+const KNOWLEDGE_BASE_TYPE_TOKEN_QUICK_RESPONSES: &str = "quick_replies";
+
+/// The name this service uses for a `KnowledgeBaseType` INTERNALLY, which is what its
+/// refusals name a knowledge base's type with rather than the modelled enum value.
+///
+/// The internal name is the modelled value in lower case
+/// (`QUICK_RESPONSES` -> [`KNOWLEDGE_BASE_TYPE_TOKEN_QUICK_RESPONSES`] being the one that
+/// is not simply that, because the type was renamed in the API and not internally). A
+/// value no modelled enumeration declares cannot reach a stored record — the boundary
+/// refuses it before any handler runs — so this is total over the stored types. The Amazon
+/// Q in Connect view of this same endpoint words it from its own copy
+/// (`services/service-com-amazonaws-qconnect-wisdomservice/src/state.rs`), so a client
+/// cannot get a different sentence depending on which model it addressed.
+pub fn knowledge_base_type_token(knowledge_base_type: &str) -> String {
+    if knowledge_base_type == KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES {
+        return KNOWLEDGE_BASE_TYPE_TOKEN_QUICK_RESPONSES.to_string();
+    }
+    knowledge_base_type.to_ascii_lowercase()
+}
+
+/// The sentence this endpoint refuses an upload against a knowledge base whose type
+/// cannot take content with.
+///
+/// It is the fixed text the recorded wire answer of this endpoint carries for that class,
+/// and its one variable part is the INTERNAL name of the type the request pointed at
+/// ([`knowledge_base_type_token`]), read from the STORED knowledge base — the only thing a
+/// caller learns from it is which type it addressed, which is what the refusal is for.
+pub fn message_unsupported_content_type(knowledge_base_type: &str) -> String {
+    format!(
+        "Unsupported ContentType for KnowledgeBaseType: {}",
+        knowledge_base_type_token(knowledge_base_type)
+    )
+}
 
 /// How long an upload URL stays valid when the caller names no
 /// `presignedUrlTimeToLive`.
@@ -366,10 +399,13 @@ pub const MESSAGE_INVALID_UPLOAD_ID: &str = "Invalid uploadId";
 /// `@idempotencyToken` with different parameters is refused with.
 pub const MESSAGE_IDEMPOTENCY_CONFLICT: &str = "Idempotency conflict";
 
-/// The fixed text the recorded `UntagResource` answer carries for a `resourceArn` that
-/// names no resource of this account. See [`crate::scaffolded::NOT_FOUND_CODE`] for why
-/// that answer's error code is not the modelled shape name.
-pub const MESSAGE_UNTAG_RESOURCE_NOT_FOUND: &str = "Resource was not found";
+/// The fixed text the recorded answers of this service's TAGGING endpoints carry for a
+/// `resourceArn` that names no resource of this account — the one sentence the whole
+/// tagging surface words that class with, whichever of the three operations was called.
+/// See [`crate::scaffolded::NOT_FOUND_CODE`] for why those answers' error code is not the
+/// modelled shape name, and [`MESSAGE_ASSISTANT_NOT_FOUND`] for why the sentence carries
+/// nothing from the request.
+pub const MESSAGE_TAGGING_RESOURCE_NOT_FOUND: &str = "Resource was not found";
 
 /// The sentence a `NotifyRecommendationsReceived` entry carries for a
 /// `recommendationId` the session's feed does not hold.

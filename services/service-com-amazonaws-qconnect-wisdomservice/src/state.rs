@@ -328,6 +328,49 @@ pub const MEMBER_SHORTCUT_KEY: &str = "shortcut key";
 /// be used.
 pub const KNOWLEDGE_BASE_TYPE_CUSTOM: &str = "CUSTOM";
 
+/// The modelled `KnowledgeBaseType` whose INTERNAL name is not its modelled value
+/// (`smithy_query(query="shape",shape="KnowledgeBaseType")`: `EXTERNAL`, `CUSTOM`,
+/// `QUICK_RESPONSES`, `MESSAGE_TEMPLATES`, `MANAGED`), and that internal name.
+///
+/// The recorded wire answer of this endpoint for an upload against a knowledge base of
+/// this type names the type `quick_replies` — the name it carried before the API spelled
+/// it `QUICK_RESPONSES` — so the token travels from the recording rather than from the
+/// modelled value. See [`knowledge_base_type_token`].
+const KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES: &str = "QUICK_RESPONSES";
+const KNOWLEDGE_BASE_TYPE_TOKEN_QUICK_RESPONSES: &str = "quick_replies";
+
+/// The name this service uses for a `KnowledgeBaseType` INTERNALLY, which is what its
+/// refusals name a knowledge base's type with rather than the modelled enum value.
+///
+/// The internal name is the modelled value in lower case
+/// (`QUICK_RESPONSES` -> [`KNOWLEDGE_BASE_TYPE_TOKEN_QUICK_RESPONSES`] being the one that
+/// is not simply that, because the type was renamed in the API and not internally). A
+/// value no modelled enumeration declares cannot reach a stored record — the boundary
+/// refuses it before any handler runs — so this is total over the stored types. The legacy
+/// Amazon Connect Wisdom view of this same endpoint words it from its own copy
+/// (`services/service-com-amazonaws-wisdom-wisdomservice/src/state.rs`), so a client
+/// cannot get a different sentence depending on which model it addressed.
+pub fn knowledge_base_type_token(knowledge_base_type: &str) -> String {
+    if knowledge_base_type == KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES {
+        return KNOWLEDGE_BASE_TYPE_TOKEN_QUICK_RESPONSES.to_string();
+    }
+    knowledge_base_type.to_ascii_lowercase()
+}
+
+/// The sentence this endpoint refuses an upload against a knowledge base whose type
+/// cannot take content with.
+///
+/// It is the fixed text the recorded wire answer of this endpoint carries for that class,
+/// and its one variable part is the INTERNAL name of the type the request pointed at
+/// ([`knowledge_base_type_token`]), read from the STORED knowledge base — the only thing a
+/// caller learns from it is which type it addressed, which is what the refusal is for.
+pub fn message_unsupported_content_type(knowledge_base_type: &str) -> String {
+    format!(
+        "Unsupported ContentType for KnowledgeBaseType: {}",
+        knowledge_base_type_token(knowledge_base_type)
+    )
+}
+
 /// The `KnowledgeBaseType` values whose content comes from a source OUTSIDE this service
 /// (`smithy_query(query="shape",shape="KnowledgeBaseType")` declares `EXTERNAL`, `CUSTOM`,
 /// `QUICK_RESPONSES`, `MESSAGE_TEMPLATES` and `MANAGED`).

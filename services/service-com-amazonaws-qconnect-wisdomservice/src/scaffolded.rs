@@ -183,10 +183,13 @@ impl SerializableStruct for ValidationException {
 ///
 /// It is NOT a modelled error — this model declares no `BadRequestException` shape —
 /// because it belongs to the boundary that reads a request into an input shape, not to
-/// any one operation. This constant is the single owner of the code: `src/service.rs`
-/// words the value-outside-an-enumeration class with it from here, and a handler reaches
-/// the same class through [`Scaffolded::bad_request`].
-pub const BAD_REQUEST_CODE: &str = "BadRequestException";
+/// any one operation. This constant is the single owner of the code WITHIN this crate:
+/// `src/service.rs` words that boundary's classes with it from here, and a handler
+/// reaches the same class through [`Scaffolded::bad_request`]. The code itself is the
+/// workspace's ONE copy of it (`service_common::front_door::BAD_REQUEST_EXCEPTION`), the
+/// code every AWS REST service with such a boundary answers that class with, so it cannot
+/// drift per crate.
+pub const BAD_REQUEST_CODE: &str = ::service_common::front_door::BAD_REQUEST_EXCEPTION;
 
 /// The HTTP status that boundary refusal carries: a client error, as the recorded wire
 /// answers of this endpoint carry it.

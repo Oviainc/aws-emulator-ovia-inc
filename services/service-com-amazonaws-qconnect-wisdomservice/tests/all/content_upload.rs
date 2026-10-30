@@ -28,7 +28,10 @@
 //! * a start against a knowledge base this account does not hold is
 //!   `ResourceNotFoundException` (HTTP 404), and one against a knowledge base whose type
 //!   is not `CUSTOM` is `ValidationException` (HTTP 400) — the operation's own
-//!   documentation: "You can only upload content to a knowledge base of type CUSTOM.";
+//!   documentation: "You can only upload content to a knowledge base of type CUSTOM." —
+//!   stating the type the request pointed at by the name this service uses for it
+//!   internally, read from the STORED knowledge base, for every modelled type that is not
+//!   `CUSTOM` and in both label forms;
 //! * the written bodies this endpoint holds are bounded in AGGREGATE as well as one by
 //!   one, so a caller cannot hold the product of the per-body bound and the number of
 //!   upload slots in the emulator's heap.
@@ -875,47 +878,75 @@ async fn a_start_against_a_knowledge_base_that_cannot_take_content_is_refused() 
         account = engine::EMULATOR_ACCOUNT_ID
     );
 
-    // (case, the knowledgeBaseId sent, the expected status, the expected error code)
-    let mut rows: Vec<(String, String, u16, &str)> = vec![
+    // (case, the knowledgeBaseId sent, the expected status, the expected error code, the
+    // expected message where this endpoint states a fixed one for the class)
+    let mut rows: Vec<(String, String, u16, &str, Option<String>)> = vec![
         (
             "a CUSTOM knowledge base this account holds".to_string(),
             custom_id,
             200,
             "",
+            None,
         ),
         (
             "a knowledge base this account no longer holds".to_string(),
             deleted_id,
             404,
             "ResourceNotFoundException",
+            None,
         ),
         (
             "an id this account holds no knowledge base under".to_string(),
             ABSENT_UUID.to_string(),
             404,
             "ResourceNotFoundException",
+            None,
         ),
         (
             "an ARN of this account that names no knowledge base".to_string(),
             this_account_arn,
             404,
             "ResourceNotFoundException",
+            None,
         ),
         (
             "an ARN of another account".to_string(),
             other_account_arn,
             404,
             "ResourceNotFoundException",
+            None,
         ),
         (
             "a label outside the modelled UuidOrArn pattern".to_string(),
             "not-a-knowledge-base".to_string(),
             400,
             "ValidationException",
+            None,
         ),
     ];
     // Every modelled knowledge-base type content cannot be uploaded to, by id and by
-    // ARN: the type of the STORED record is what the refusal reads, not the label form.
+    // ARN: the type of the STORED record is what the refusal reads, not the label form,
+    // and the refusal names that type the way this service names it internally. The
+    // expected sentence is WRITTEN OUT per type rather than taken from the
+    // implementation, so each row pins the template and the type name the wire carries.
+    let stated_sentences: [(&str, &str); 4] = [
+        (
+            "EXTERNAL",
+            "Unsupported ContentType for KnowledgeBaseType: external",
+        ),
+        (
+            "QUICK_RESPONSES",
+            "Unsupported ContentType for KnowledgeBaseType: quick_replies",
+        ),
+        (
+            "MESSAGE_TEMPLATES",
+            "Unsupported ContentType for KnowledgeBaseType: message_templates",
+        ),
+        (
+            "MANAGED",
+            "Unsupported ContentType for KnowledgeBaseType: managed",
+        ),
+    ];
     for (index, knowledge_base_type) in NON_CUSTOM_KNOWLEDGE_BASE_TYPES.into_iter().enumerate() {
         let (id, arn) = emulator
             .given_knowledge_base(
@@ -925,21 +956,44 @@ async fn a_start_against_a_knowledge_base_that_cannot_take_content_is_refused() 
                 None,
             )
             .await;
+        let stated = stated_sentences
+            .iter()
+            .find(|(declared, _)| *declared == knowledge_base_type)
+            .map(|(_, sentence)| (*sentence).to_string());
+        assert!(
+            stated.is_some(),
+            "case {knowledge_base_type:?}: the table must state the sentence this type is \
+             refused with"
+        );
         rows.push((
             format!("a {knowledge_base_type} knowledge base, by id"),
             id,
             400,
             "ValidationException",
+            stated.clone(),
         ));
         rows.push((
             format!("a {knowledge_base_type} knowledge base, by ARN"),
             arn,
             400,
             "ValidationException",
+            stated,
         ));
     }
+    // The one type whose internal name is not its modelled value, asserted again on its
+    // own row so the renamed token is unmissable.
+    rows.push((
+        "a QUICK_RESPONSES knowledge base states its internal type name".to_string(),
+        emulator
+            .given_knowledge_base("token", "kb-quick-token", "QUICK_RESPONSES", None)
+            .await
+            .0,
+        400,
+        "ValidationException",
+        Some("Unsupported ContentType for KnowledgeBaseType: quick_replies".to_string()),
+    ));
 
-    for (case, knowledge_base_id, expected_status, expected_code) in rows {
+    for (case, knowledge_base_id, expected_status, expected_code, expected_message) in rows {
         let reply = emulator
             .start_upload(&knowledge_base_id, "text/plain", None)
             .await;
@@ -951,6 +1005,13 @@ async fn a_start_against_a_knowledge_base_that_cannot_take_content_is_refused() 
             assert_eq!(
                 reply.error_type, expected_code,
                 "case {case:?}: expected the code {expected_code}, got {reply:?}"
+            );
+        }
+        if let Some(expected_message) = expected_message {
+            assert_eq!(
+                reply.string("/message"),
+                Some(expected_message.clone()),
+                "case {case:?}: expected the message {expected_message:?}, got {reply:?}"
             );
         }
     }

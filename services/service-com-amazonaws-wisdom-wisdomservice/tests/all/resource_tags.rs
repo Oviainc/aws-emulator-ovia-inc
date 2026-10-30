@@ -6,8 +6,9 @@
 //! The rule under test, asserted over a TABLE of inputs rather than the one recorded
 //! request: `ListTagsForResource` REPORTS the tag map persisted on the resource its
 //! `resourceArn` names, for EVERY resource family this service holds tags on, and an ARN
-//! that names no resource this account holds is the modelled `ResourceNotFoundException`
-//! (HTTP 404).
+//! that names no resource this account holds is refused with HTTP 404 under the error code
+//! this endpoint's tagging surface words that class with ([`TAGGING_NOT_FOUND_CODE`]) and
+//! the one sentence it states for it.
 //!
 //! The rows differ along every axis the rule generalises over:
 //!
@@ -66,6 +67,11 @@ const TYPE_KNOWLEDGE_BASE: &str = "KNOWLEDGE_BASE";
 const TAG_KEY_MAX: usize = 128;
 const TAG_VALUE_MIN: usize = 1;
 const TAG_VALUE_MAX: usize = 256;
+
+/// The error code this endpoint's TAGGING surface answers a `resourceArn` naming no
+/// resource of the account with, which is NOT the name of the `ResourceNotFoundException`
+/// shape the operations' `errors` lists declare.
+pub(crate) const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
 
 /// One wire answer, reduced to what a client branches on.
 #[derive(Debug)]
@@ -573,9 +579,9 @@ struct MissCase {
     arn: String,
 }
 
-/// An ARN this account holds no resource under is the modelled
-/// `ResourceNotFoundException` (HTTP 404), whatever makes it miss: the family label, the
-/// id, the region, the account or the partition.
+/// An ARN this account holds no resource under is refused as not found (HTTP 404) with
+/// the code and sentence this endpoint's tagging surface words that class with, whatever
+/// makes it miss: the family label, the id, the region, the account or the partition.
 #[tokio::test]
 async fn an_arn_naming_no_resource_this_account_holds_is_not_found() {
     let emulator = Emulator::new();
@@ -707,20 +713,26 @@ async fn an_arn_naming_no_resource_this_account_holds_is_not_found() {
             case.label, case.arn, reply.status, reply.body
         );
         assert!(
-            reply.error_type.contains("ResourceNotFoundException"),
-            "case {:?}: expected the modelled ResourceNotFoundException for {}, got \
+            reply.error_type.contains(TAGGING_NOT_FOUND_CODE),
+            "case {:?}: expected the tagging surface's {TAGGING_NOT_FOUND_CODE} for {}, got \
              x-amzn-errortype {:?}",
             case.label,
             case.arn,
             reply.error_type
         );
         assert_eq!(
-            reply.string("/resourceName"),
-            case.arn,
-            "case {:?}: expected the refusal to name the ARN asked about in \
-             resourceName, got {:?}",
+            reply.string("/message"),
+            state::MESSAGE_TAGGING_RESOURCE_NOT_FOUND,
+            "case {:?}: expected the sentence this surface words that class with, got {:?}",
             case.label,
-            reply.string("/resourceName")
+            reply.string("/message")
+        );
+        assert_eq!(
+            reply.field("/resourceName"),
+            None,
+            "case {:?}: the refusal must carry nothing from the request, got {}",
+            case.label,
+            reply.body
         );
     }
 }

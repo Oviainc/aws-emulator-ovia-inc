@@ -89,6 +89,29 @@ use std::sync::Arc;
 /// for the same input depending on which key it addressed. Change one and change the other.
 const ENUM_VALUE_REFUSAL_CODE: &str = crate::scaffolded::BAD_REQUEST_CODE;
 
+/// The sentence this endpoint refuses a body the boundary in front of the service will not
+/// read with. It carries NOTHING from the request — no value, member name or value set —
+/// which is what the recorded wire answer of this endpoint for that class carries, and it
+/// is the whole message: the framework's `Value '…' at '…' failed to satisfy constraint:
+/// Member must satisfy enum value set: […]` sentence belongs to a different validation
+/// layer and is not what this endpoint answers.
+///
+/// The sentence itself is the workspace's ONE copy of it
+/// (`service_common::front_door::INVALID_REQUEST_BODY`), which several AWS REST services
+/// answer a body their front door will not read with, so it cannot drift per crate. What
+/// is this service's own is only WHICH class is refused there, below.
+///
+/// The Q Connect view of this SAME endpoint words the enumeration class from the same
+/// shared constant
+/// (`services/service-com-amazonaws-qconnect-wisdomservice/src/service.rs`), so a client
+/// gets the same sentence for that input whichever key it addressed. The two views are
+/// aligned for THAT class only: the Q Connect view also answers a body value outside a
+/// modelled `@length` bound there, from a recording of the shared endpoint identity it
+/// serves, while this view still answers that class with the modelled `ValidationException`
+/// — no recorded answer under THIS registration key covers it, and folding it in belongs
+/// to the issue that owns that class rather than to this one.
+const INVALID_REQUEST_BODY_MESSAGE: &str = ::service_common::front_door::INVALID_REQUEST_BODY;
+
 /// The key THIS service answers under, which is NOT the `wisdom` key its model's
 /// `aws.auth#sigv4` name resolves to.
 ///
@@ -421,15 +444,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the operation's input shape, and this endpoint answers it 400
         // `BadRequestException` — a code neither this model nor the Q Connect view
         // declares as an operation error, because it is the deserialization boundary's,
-        // not a modelled failure. Only the CODE is chosen here; the message stays the
-        // framework's own `Value '…' at '…' failed to satisfy constraint: Member must
-        // satisfy enum value set: […]` sentence, built from the request.
+        // not a modelled failure — with the one fixed sentence
+        // [`INVALID_REQUEST_BODY_MESSAGE`] states. Nothing from the request travels in it:
+        // the refusal is "this body cannot be read", not a report of which member failed
+        // which constraint.
         //
         // `any`, not `all` or "the first": a request that ALSO breaks a constraint this
         // service validates itself could not be read into the input shape either, so the
-        // boundary's refusal is the one the caller gets, and the message still states
-        // every clause the walk found. That keeps the answer independent of the order the
-        // members happen to be walked in.
+        // boundary's refusal is the one the caller gets, whatever else the same request
+        // gets wrong. That keeps the answer independent of the order the members happen to
+        // be walked in.
         // Every other class is stated by the workspace's ONE renderer of an AWS constraint
         // refusal, `service_common::aws_validation_refusal`: it keeps the framework's
         // envelope, its member paths and every other requirement, and restates only the
@@ -446,8 +470,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             {
                 Some(Refused {
                     code: ENUM_VALUE_REFUSAL_CODE.to_string(),
-                    message: ::service_common::aws_validation_refusal(refusal)
-                        .map_or_else(|| "invalid request".to_string(), |stated| stated.message),
+                    message: INVALID_REQUEST_BODY_MESSAGE.to_string(),
                 })
             }
             _ => ::service_common::aws_validation_refusal(refusal),

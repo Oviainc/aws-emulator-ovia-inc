@@ -12,7 +12,11 @@
 //! resource family this store holds a tag map for ([`crate::state::ComAmazonawsWisdomWisdomserviceState::tags_of_resource`]):
 //! an assistant, a knowledge base, a session or an assistant association. An ARN that
 //! names no resource this account holds — including one this emulator never minted — is
-//! the operation's modelled `ResourceNotFoundException` (HTTP 404).
+//! refused with the not-found status the model declares (HTTP 404) under the error code
+//! the recorded answers of this endpoint's TAGGING surface carry for that class
+//! ([`crate::scaffolded::NOT_FOUND_CODE`]), worded with the one sentence that surface
+//! states ([`crate::state::MESSAGE_TAGGING_RESOURCE_NOT_FOUND`]) — the code and text a
+//! client branches on, rather than the modelled shape's name.
 //!
 //! The `tags` member is ALWAYS present, and an empty object for a resource carrying no
 //! tag: that is the rule this crate states once in [`crate::state::wire_tags`], so a
@@ -154,14 +158,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let state = state.lock();
+        // Resolved through the one seam the whole tagging surface shares, and refused with
+        // the code and status that surface's recorded answers carry for an ARN naming no
+        // resource of this account — see `crate::scaffolded::NOT_FOUND_CODE`.
         let Some(tags) = state.tags_of_resource(&input.resource_arn) else {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::MESSAGE_RESOURCE_NOT_FOUND.to_string()),
-                    resource_name: Some(input.resource_arn.clone()),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                crate::state::MESSAGE_TAGGING_RESOURCE_NOT_FOUND,
+            ));
         };
         Ok(ListTagsForResourceOutput {
             tags: crate::state::wire_tags(tags),

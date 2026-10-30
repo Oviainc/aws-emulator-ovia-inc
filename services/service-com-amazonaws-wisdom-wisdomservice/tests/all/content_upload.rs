@@ -26,7 +26,10 @@
 //! * a start against a knowledge base this account does not hold is
 //!   `ResourceNotFoundException` (HTTP 404), and one against a knowledge base whose type
 //!   is not `CUSTOM` is `ValidationException` (HTTP 400) — the operation's own
-//!   documentation: "You can only upload content to a knowledge base of type CUSTOM."
+//!   documentation: "You can only upload content to a knowledge base of type CUSTOM." —
+//!   stating the type the request pointed at by the name this service uses for it
+//!   internally, read from the STORED knowledge base, for every modelled type that is not
+//!   `CUSTOM` and in both label forms;
 //!
 //! This view of the shared `wisdom` endpoint answers under its own registration key (see
 //! `src/service.rs`), which is what every modelled request below is signed for; the
@@ -711,65 +714,79 @@ async fn a_start_against_a_knowledge_base_that_cannot_take_content_is_refused() 
         account = engine::EMULATOR_ACCOUNT_ID
     );
 
-    // (case, the knowledgeBaseId sent, the expected status, the expected error code)
-    let rows: Vec<(&str, String, u16, &str)> = vec![
+    // (case, the knowledgeBaseId sent, the expected status, the expected error code, the
+    // expected message where this endpoint states a fixed one for the class)
+    let rows: Vec<(&str, String, u16, &str, Option<String>)> = vec![
         (
             "a CUSTOM knowledge base this account holds",
             custom_id,
             200,
             "",
+            None,
         ),
         (
             "an EXTERNAL knowledge base, by id",
             external_id,
             400,
             "ValidationException",
+            // The sentence written out rather than taken from the implementation, so the
+            // row pins the template AND the lower-cased type name the wire carries.
+            Some("Unsupported ContentType for KnowledgeBaseType: external".to_string()),
         ),
         (
             "an EXTERNAL knowledge base, by ARN",
             external_arn,
             400,
             "ValidationException",
+            Some("Unsupported ContentType for KnowledgeBaseType: external".to_string()),
         ),
         (
             "a QUICK_RESPONSES knowledge base",
             quick_responses_id,
             400,
             "ValidationException",
+            // The type's INTERNAL name, which is not its modelled value: the refusal
+            // names the type the request pointed at the way this endpoint names it.
+            Some("Unsupported ContentType for KnowledgeBaseType: quick_replies".to_string()),
         ),
         (
             "a knowledge base this account no longer holds",
             deleted_id,
             404,
             "ResourceNotFoundException",
+            None,
         ),
         (
             "an id this account holds no knowledge base under",
             ABSENT_UUID.to_string(),
             404,
             "ResourceNotFoundException",
+            None,
         ),
         (
             "an ARN of this account that names no knowledge base",
             this_account_arn,
             404,
             "ResourceNotFoundException",
+            None,
         ),
         (
             "an ARN of another account",
             other_account_arn,
             404,
             "ResourceNotFoundException",
+            None,
         ),
         (
             "a label outside the modelled UuidOrArn pattern",
             "not-a-knowledge-base".to_string(),
             400,
             "ValidationException",
+            None,
         ),
     ];
 
-    for (case, knowledge_base_id, expected_status, expected_code) in rows {
+    for (case, knowledge_base_id, expected_status, expected_code, expected_message) in rows {
         let reply = emulator
             .start_upload(&knowledge_base_id, "text/plain", None)
             .await;
@@ -781,6 +798,13 @@ async fn a_start_against_a_knowledge_base_that_cannot_take_content_is_refused() 
             assert_eq!(
                 reply.error_type, expected_code,
                 "case {case:?}: expected the code {expected_code}, got {reply:?}"
+            );
+        }
+        if let Some(expected_message) = expected_message {
+            assert_eq!(
+                reply.string("/message"),
+                Some(expected_message.clone()),
+                "case {case:?}: expected the message {expected_message:?}, got {reply:?}"
             );
         }
     }

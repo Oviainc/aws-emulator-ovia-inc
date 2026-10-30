@@ -17,10 +17,11 @@
 //! `wisdom_qconnect_signing_name_routing.rs`; this suite does not restate them. What it
 //! adds is the ONE endpoint-wide property neither that suite nor a service-level suite
 //! asserts, because it needs both registrations mounted at once: a value outside a
-//! modelled enumeration's value set is refused with HTTP 400 and the error code
-//! `BadRequestException` — the deserialization boundary's code — whichever view answers
-//! the request, the shared endpoint name's or the legacy model's own registration key's,
-//! while a constraint a view validates itself keeps the modelled `ValidationException`.
+//! modelled enumeration's value set is refused with HTTP 400, the error code
+//! `BadRequestException` — the deserialization boundary's code — and the one sentence this
+//! endpoint states for a body it will not read, whichever view answers the request, the
+//! shared endpoint name's or the legacy model's own registration key's, while a constraint
+//! a view validates itself keeps the modelled `ValidationException`.
 //!
 //! Rows span the keys a request can resolve to, the enumerations the two models declare
 //! (one shared by both, one only the superset model has), an implemented and a scaffolded
@@ -45,6 +46,12 @@ const LEGACY_REGISTRATION_KEY: &str = "com-amazonaws-wisdom-wisdomservice";
 
 /// An example `UuidOrArn` path label: the form every id label in both models takes.
 const ID: &str = "11111111-1111-1111-1111-111111111111";
+
+/// The error code the boundary that reads a request body answers with, and the one
+/// sentence it words that refusal with — neither of them a modelled operation error,
+/// because the refusal is made before any handler runs.
+const BODY_REFUSAL_CODE: &str = "BadRequestException";
+const INVALID_REQUEST_BODY: &str = "Invalid request body";
 
 type QConnect =
     service_com_amazonaws_qconnect_wisdomservice::EmulatedService<engine::InMemoryEngine>;
@@ -211,5 +218,14 @@ async fn an_undeclared_enum_value_is_refused_the_same_way_by_either_view() {
             "case {case:?}: expected HTTP {expected_status} {expected_code:?}, got {status} \
              {code:?} ({parsed})"
         );
+        if expected_code == BODY_REFUSAL_CODE {
+            // One endpoint, one answer: the sentence is the same whichever view served the
+            // request, and it carries nothing of the request.
+            assert_eq!(
+                parsed.get("message").and_then(Value::as_str),
+                Some(INVALID_REQUEST_BODY),
+                "case {case:?}: expected the one sentence this class states, got {parsed}"
+            );
+        }
     }
 }

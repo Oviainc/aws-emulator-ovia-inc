@@ -15,6 +15,8 @@
 mod assistant_association;
 #[path = "all/assistant_lifecycle.rs"]
 mod assistant_lifecycle;
+#[path = "all/client_error_refusals.rs"]
+mod client_error_refusals;
 #[path = "all/content_upload.rs"]
 mod content_upload;
 #[path = "all/idempotency_contents_and_refusal_fidelity.rs"]

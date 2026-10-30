@@ -81,10 +81,11 @@ use std::sync::Arc;
 /// classes reach it, both recorded for this endpoint:
 ///
 /// * a value outside a modelled enumeration's value set, which the input shape cannot hold
-///   at all — this endpoint's long-standing answer, whose message states the constraint;
-/// * a body value outside a modelled `@length` bound, which this endpoint answers with the
-///   one sentence [`INVALID_REQUEST_BODY_MESSAGE`] states — the recorded wire answer for
-///   exactly that case.
+///   at all;
+/// * a body value outside a modelled `@length` bound.
+///
+/// Both are answered with the one sentence [`INVALID_REQUEST_BODY_MESSAGE`] states — the
+/// recorded wire answer for each of them.
 ///
 /// Every other refusal class keeps the error its model declares: a value outside a
 /// `@pattern`, an absent `@required` member, a value outside a `@range` and a `@length`
@@ -101,10 +102,18 @@ use std::sync::Arc;
 /// boundary catches here carry ONE code rather than drifting apart.
 const BODY_REFUSAL_CODE: &str = crate::scaffolded::BAD_REQUEST_CODE;
 
-/// The sentence this endpoint refuses a body value outside a modelled `@length` bound
-/// with. It carries NOTHING from the request — no value, member name or bound — which is
-/// what the recorded wire answer of this endpoint for that class carries.
-const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
+/// The sentence this endpoint refuses a body the boundary in front of the service will not
+/// read with. It carries NOTHING from the request — no value, member name or bound — which
+/// is what the recorded wire answers of this endpoint for both of that boundary's classes
+/// carry.
+///
+/// The sentence itself is the workspace's ONE copy of it
+/// (`service_common::front_door::INVALID_REQUEST_BODY`), which several AWS REST services
+/// answer a body their front door will not read with, so it cannot drift per crate. What
+/// is this service's own is only WHICH classes are refused there — see
+/// [`refuses_the_request_body`] — and the legacy Amazon Connect Wisdom view of this
+/// endpoint words the enumeration class from the same shared constant.
+const INVALID_REQUEST_BODY_MESSAGE: &str = ::service_common::front_door::INVALID_REQUEST_BODY;
 
 /// The member names this model binds to the request QUERY STRING whose values a modelled
 /// `@length` bound can refuse: the continuation tokens
@@ -125,8 +134,10 @@ const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
 /// keeps the modelled error. See [`refuses_the_request_body`].
 const QUERY_TOKEN_MEMBERS: [&str; 3] = ["nextToken", "nextChunkToken", "nextMessageToken"];
 
-/// Whether these violations include a refusal of a BODY value against a modelled size
-/// bound: a `@length` violation on a member the request did not carry in its query string
+/// Whether these violations include a refusal of the request BODY by the boundary that
+/// reads it against the operation's input schema: a value outside a modelled
+/// enumeration's value set, which the input shape cannot hold at all, or a `@length`
+/// violation on a member the request did not carry in its query string
 /// ([`QUERY_TOKEN_MEMBERS`]).
 ///
 /// `any`, not `all`: the body is checked against the operation's input schema BEFORE the
@@ -144,10 +155,15 @@ fn refuses_the_request_body(violations: &[smithy_server_runtime::Violation]) -> 
             .split('.')
             .next()
             .unwrap_or(violation.path.as_str());
-        matches!(
-            violation.kind,
-            ViolationKind::MinLength(_) | ViolationKind::MaxLength(_)
-        ) && !QUERY_TOKEN_MEMBERS.contains(&member)
+        match violation.kind {
+            // An enumeration's value set is part of the input SHAPE, so the refusal is the
+            // boundary's wherever the value travelled.
+            ViolationKind::EnumValue(_) => true,
+            ViolationKind::MinLength(_) | ViolationKind::MaxLength(_) => {
+                !QUERY_TOKEN_MEMBERS.contains(&member)
+            }
+            _ => false,
+        }
     })
 }
 
@@ -499,12 +515,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // validates itself).
         //
         // Two classes are refused by the boundary in front of the service instead, with
-        // the code [`BODY_REFUSAL_CODE`] names: a body value outside a modelled `@length`
-        // bound, answered with the one sentence [`INVALID_REQUEST_BODY_MESSAGE`] states,
-        // and a value outside a modelled enumeration's value set, which the input shape
-        // cannot hold at all and whose message states the constraint. The size class is
-        // matched FIRST: a body the boundary measures as too long or too short is refused
-        // there, before anything reads a value out of it.
+        // the code [`BODY_REFUSAL_CODE`] names and the one sentence
+        // [`INVALID_REQUEST_BODY_MESSAGE`] states: a value outside a modelled enumeration's
+        // value set, which the input shape cannot hold at all, and a body value outside a
+        // modelled `@length` bound. Neither answer carries anything from the request — the
+        // offending value, the member name and the bound or value set are all absent from
+        // it — which is what the recorded wire answers of this endpoint for those classes
+        // carry.
         //
         // Every other class — a `@pattern`, an absent `@required` member, a `@range`, and
         // a length refusal of a value that travelled in the query string — is stated by
@@ -521,20 +538,6 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 Some(Refused {
                     code: BODY_REFUSAL_CODE.to_string(),
                     message: INVALID_REQUEST_BODY_MESSAGE.to_string(),
-                })
-            }
-            Refusal::Invalid(violations)
-                if violations
-                    .iter()
-                    .any(|violation| matches!(violation.kind, ViolationKind::EnumValue(_))) =>
-            {
-                // Only the CODE is this service's for the enumeration class; the sentence
-                // is the shared renderer's, so a request that ALSO breaks a `@pattern`
-                // states that pattern the one way too.
-                Some(Refused {
-                    code: BODY_REFUSAL_CODE.to_string(),
-                    message: ::service_common::aws_validation_refusal(refusal)
-                        .map_or_else(|| "invalid request".to_string(), |stated| stated.message),
                 })
             }
             _ => ::service_common::aws_validation_refusal(refusal),

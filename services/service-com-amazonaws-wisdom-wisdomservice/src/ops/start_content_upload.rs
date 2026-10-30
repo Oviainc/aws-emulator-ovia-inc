@@ -193,13 +193,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // The operation's own documentation: "You can only upload content to a knowledge
         // base of type CUSTOM." A start against a knowledge base of any other modelled
-        // type is refused here rather than answered with a URL that could not be used.
+        // type is refused here rather than answered with a URL that could not be used,
+        // worded the way this endpoint words that class — naming the type the request
+        // pointed at by its internal name, read from the STORED knowledge base.
         if knowledge_base.knowledge_base_type != crate::state::KNOWLEDGE_BASE_TYPE_CUSTOM {
             return Err(StartContentUploadErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(format!(
-                        "Content can only be uploaded to a knowledge base of type {}.",
-                        crate::state::KNOWLEDGE_BASE_TYPE_CUSTOM
+                    message: Some(crate::state::message_unsupported_content_type(
+                        &knowledge_base.knowledge_base_type,
                     )),
                 },
             )

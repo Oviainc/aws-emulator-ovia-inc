@@ -7,11 +7,11 @@
 //!
 //! * a value a modelled enumeration does not declare — which the operation's input shape
 //!   cannot hold at all — is refused where the request body is read, before any handler
-//!   runs, with HTTP 400 and the error code `BadRequestException`, for every operation and
-//!   every enum member;
+//!   runs, with HTTP 400, the error code `BadRequestException` and the one sentence this
+//!   endpoint states for a body it will not read (`Invalid request body`), which carries
+//!   nothing from the request, for every operation and every enum member;
 //! * a BODY value outside a modelled `@length` bound is refused there too, with the same
-//!   code and the one sentence this endpoint states for it (`Invalid request body`), which
-//!   carries nothing from the request — the recorded wire answer for exactly that case;
+//!   code and the same sentence — the recorded wire answer for each of those cases;
 //! * every other refusal class keeps the error this model declares, with the
 //!   constraint-stating sentence AWS words it with: a value outside a `@pattern`, an absent
 //!   `@required` member, a value outside a `@range`, and a `@length` refusal of a value
@@ -65,8 +65,8 @@ const MAX_RESULTS_MIN: i64 = 1;
 const MAX_RESULTS_MAX: i64 = 100;
 const NEXT_TOKEN_MAX: usize = 4096;
 
-/// The one sentence a BODY value outside a modelled `@length` bound is refused with, which
-/// reports nothing from the request.
+/// The one sentence the boundary in front of the service refuses a body it will not read
+/// with, which reports nothing from the request.
 const INVALID_REQUEST_BODY: &str = "Invalid request body";
 
 /// The error code every class the service validates itself keeps — the one its model
@@ -236,10 +236,9 @@ async fn a_value_outside_a_modelled_enum_is_refused_as_a_bad_request() {
             400,
             BAD_REQUEST,
         ),
-        // The refused value travels into the constraint message, so a value carrying the
-        // error envelope's own metacharacters must still come back as a well-formed JSON
-        // body with the code readable — the row fails if the body cannot be parsed at all,
-        // because the code is then read as empty.
+        // The refused value must NOT travel into the answer: a value carrying the error
+        // envelope's own metacharacters comes back as a well-formed JSON body stating the
+        // one sentence this class states, with nothing of the request in it.
         (
             "CreateAssistant with a type that carries JSON envelope metacharacters",
             "POST",
@@ -266,10 +265,11 @@ async fn a_value_outside_a_modelled_enum_is_refused_as_a_bad_request() {
             "case {case:?}: expected HTTP {expected_status} {expected_code:?}, got {status} \
              {code:?} ({parsed})"
         );
-        assert!(
-            parsed.get("message").and_then(Value::as_str).is_some(),
-            "case {case:?}: the refusal must carry a parsed `message` stating the \
-             constraint, got {parsed}"
+        assert_eq!(
+            parsed.get("message").and_then(Value::as_str),
+            Some(INVALID_REQUEST_BODY),
+            "case {case:?}: the refusal must carry the one sentence this class states, \
+             got {parsed}"
         );
     }
 }
