@@ -847,7 +847,9 @@ pub struct EnabledControl {
     /// The teardown a `DISABLE_CONTROL` still in flight will complete, or `None` while no
     /// disable is running. [`settle`] removes the enablement once the clock makes it due,
     /// so the resource stops existing when the asynchronous teardown completes and not
-    /// when the call that asked for it returned.
+    /// when the call that asked for it returned; it TAKES the teardown at that instant, so
+    /// a teardown the clock has already settled is never in flight any more and its
+    /// outcome is never re-decided.
     ///
     /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
     pub pending_deletion: Option<PendingEnabledControlDeletion>,
@@ -1444,29 +1446,33 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
 
         // A DISABLE_CONTROL the clock has made due has finished tearing its
         // `EnabledControl` down, so the resource is gone whether or not anybody called;
-        // its operation record stays, and still resolves. The due instant is the pending
-        // teardown's OWN, not read back off the operation log, for the same reason a
-        // landing zone's decommissioning carries its own: `enforce_log_bound` evicts the
-        // oldest in-flight record when every record is in flight, and a missing record
-        // must not be read as "due" and remove a resource the clock does not owe yet. A
-        // teardown whose own record FAILED removed nothing, so the enablement stays —
-        // the same reading the pending update below gives a failed operation.
+        // its operation record stays, and still resolves. The parked teardown is TAKEN the
+        // moment it falls due, exactly as a landing zone's decommissioning and an enabled
+        // baseline's are, so the outcome is decided once: the due instant is the parked
+        // teardown's OWN, and the operation's terminal status is read at that one instant
+        // rather than on every later settle against a bounded, self-evicting log. A
+        // teardown whose own record FAILED removed nothing, so the enablement stays and
+        // stops being a teardown in flight — the same reading the parked update below
+        // gives a failed operation.
         let operations = &self.control_operations;
-        let torn_down: Vec<String> = self
-            .enabled_controls
-            .iter()
-            .filter(|(_, control)| {
-                control.pending_deletion.as_ref().is_some_and(|pending| {
-                    now >= pending.due_at
-                        && !operations
-                            .get(&pending.operation_identifier)
-                            .is_some_and(|operation| {
-                                operation.status == ControlOperationStatus::Failed
-                            })
-                })
-            })
-            .map(|(arn, _)| arn.clone())
-            .collect();
+        let mut torn_down: Vec<String> = Vec::new();
+        for (arn, control) in self.enabled_controls.iter_mut() {
+            let due = control
+                .pending_deletion
+                .take_if(|pending| now >= pending.due_at);
+            let Some(pending) = due else {
+                // Not due yet leaves the parked teardown where it is, unchanged.
+                continue;
+            };
+            if operations
+                .get(&pending.operation_identifier)
+                .is_some_and(|operation| operation.status == ControlOperationStatus::Failed)
+            {
+                // A failed teardown removed nothing, so the enablement stays.
+                continue;
+            }
+            torn_down.push(arn.clone());
+        }
         for arn in torn_down {
             self.enabled_controls.remove(&arn);
             // A tag entry never outlives the resource it tags, which is what keeps the tag

@@ -47,6 +47,8 @@ mod enabled_baseline_update;
 mod enabled_baseline_update_validation;
 #[path = "all/enabled_control_lifecycle.rs"]
 mod enabled_control_lifecycle;
+#[path = "all/enabled_control_pending_transitions.rs"]
+mod enabled_control_pending_transitions;
 #[path = "all/enabled_control_reset.rs"]
 mod enabled_control_reset;
 #[path = "all/enabled_control_target_regions.rs"]

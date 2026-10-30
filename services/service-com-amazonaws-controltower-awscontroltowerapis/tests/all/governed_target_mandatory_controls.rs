@@ -128,7 +128,7 @@ pub(crate) async fn list(router: &MultiServiceRouter, body: serde_json::Value) -
 
 /// The `controlIdentifier` of every entry of a listing, sorted, so a case compares SETS
 /// without depending on the order ARNs were minted in.
-fn listed_controls(listed: &Answer) -> Vec<String> {
+pub(crate) fn listed_controls(listed: &Answer) -> Vec<String> {
     let mut identifiers: Vec<String> = entries(listed.get("enabledControls"))
         .iter()
         .map(|entry| {

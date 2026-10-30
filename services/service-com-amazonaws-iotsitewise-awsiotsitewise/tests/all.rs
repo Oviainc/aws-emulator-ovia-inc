@@ -80,6 +80,13 @@ mod workspace_scoped_job_reads;
 #[path = "all/list_workspaces.rs"]
 mod list_workspaces;
 
+// `component_model_definition_propagation` is declared HERE, beside the note
+// above, for the reason it gives: the sorted list and the END of this file are
+// both where every concurrent iotsitewise change puts a declaration of its own.
+// Fold it into the list once the churn settles.
+#[path = "all/component_model_definition_propagation.rs"]
+mod component_model_definition_propagation;
+
 // `delete_dataset` is declared HERE, beside the note above, for the reason it
 // gives: the sorted list and the END of this file are both where every concurrent
 // iotsitewise change puts a declaration of its own. Fold it into the list once the
