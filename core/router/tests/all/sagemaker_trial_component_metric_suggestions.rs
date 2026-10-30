@@ -11,11 +11,13 @@
 //! control plane, then ask the control plane for suggestions.
 //!
 //! The RULE it pins: the property names `GetSearchSuggestions` answers for a resource type
-//! are the members the model binds it to in `SearchRecord` plus the dotted PATH of every
-//! key the account's stored resources of that type carry in a keyed member of that entity
-//! — never the bare key, and never a name no stored resource of that type carries.
+//! are the INDEXED ones — for every key the account's stored resources of that type carry
+//! in a keyed member of that type's `SearchRecord` entity, the dotted PATH that key sits at
+//! with the containing member LOWERCASED (`parameters.<key>`, `tags.<key>`) — never the
+//! bare key, never a FIXED member of the entity (that is schema, not an indexed property),
+//! and never a name no stored resource of that type carries.
 //!
-//! KNOWN GAP, documented on the handler: a trial component's `Metrics.<name>` are not
+//! KNOWN GAP, documented on the handler: a trial component's `metrics.<name>` are not
 //! among those names, because the metric series `BatchPutMetrics` ingests live in the
 //! metrics service's own state and the control plane stores none. This suite therefore
 //! asserts nothing about metric names; it does drive `BatchPutMetrics` so that the
@@ -114,22 +116,23 @@ async fn suggestions(router: &MultiServiceRouter, hint: &str) -> Vec<String> {
         .collect()
 }
 
-/// RULE: through the assembled router, the suggestions for a resource type are the
-/// modelled members of its searchable entity plus the dotted path of every key its stored
-/// resources carry in a keyed member of that entity — never the bare key, and never a name
-/// no stored resource of that type carries.
+/// RULE: through the assembled router, the suggestions for a resource type are the dotted
+/// paths of the keys its stored resources carry in a keyed member of its searchable entity,
+/// the facet segment lowercased — never the bare key, never a fixed member of the entity,
+/// and never a name no stored resource of that type carries.
 #[tokio::test]
 async fn trial_component_property_names_are_answered_through_the_router() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = build_router(&engine);
 
-    // Nothing is stored yet, so only the MODELLED member names can be answered: a stored
-    // key is never invented for a resource the account does not hold.
+    // Nothing is stored yet, so NOTHING can be answered: a suggestion is an indexed
+    // property of a resource the account holds, and the entity's own fixed members are
+    // schema rather than indexed properties.
     let before = suggestions(&router, "Parameters").await;
-    assert_eq!(
-        before,
-        vec!["Parameters".to_string()],
-        "case empty-store: only the modelled member can be suggested, got {before:?}"
+    assert!(
+        before.is_empty(),
+        "case empty-store: an account holding no trial component has no indexed property \
+         to suggest, got {before:?}"
     );
 
     // `BatchPutMetrics.TrialComponentName` is `^[a-z0-9](-*[a-z0-9]){0,119}$`, so the
@@ -187,46 +190,39 @@ async fn trial_component_property_names_are_answered_through_the_router() {
         (
             "parameter-key",
             "learning",
-            &["Parameters.learning_rate"],
+            &["parameters.learning_rate"],
             &["learning_rate"],
         ),
         (
             "parameter-path-prefix",
-            "Parameters.opt",
-            &["Parameters.optimiser"],
-            &["Parameters.learning_rate", "optimiser"],
+            "parameters.opt",
+            &["parameters.optimiser"],
+            &["parameters.learning_rate", "optimiser"],
         ),
         (
             "tag-key-case-folded",
             "PROJ",
-            &["Tags.Project"],
+            &["tags.Project"],
             &["Project"],
         ),
         (
             "input-artifact-key",
             "datas",
-            &["InputArtifacts.dataset"],
+            &["inputartifacts.dataset"],
             &["dataset"],
         ),
         (
-            "container-hint-answers-the-member-and-every-key-under-it",
+            "facet-hint-answers-every-key-under-it-but-not-the-member",
             "Parameters",
-            &[
-                "Parameters",
-                "Parameters.learning_rate",
-                "Parameters.optimiser",
-            ],
-            &["Tags.Project"],
+            &["parameters.learning_rate", "parameters.optimiser"],
+            &["Parameters", "tags.Project"],
         ),
-        (
-            "modelled-member",
-            "TrialComponentA",
-            &["TrialComponentArn"],
-            &[],
-        ),
+        // A fixed member of the entity is schema, not an indexed property, so the hint
+        // that begins it answers nothing.
+        ("fixed-member", "TrialComponentA", &[], &["TrialComponentArn"]),
         // A hint is text that BEGINS a property's name, so text from the middle of one
         // begins nothing.
-        ("substring-not-a-prefix", "rate", &[], &["Parameters.learning_rate"]),
+        ("substring-not-a-prefix", "rate", &[], &["parameters.learning_rate"]),
         ("unmatched", "zzzz-no-such-name", &[], &[]),
     ];
 

@@ -2392,10 +2392,42 @@ impl Cluster {
     }
 
     /// The node of this cluster with instance id `instance_id`, once the node has one.
+    pub fn node_by_instance_id(&self, instance_id: &str) -> Option<&ClusterNode> {
+        self.nodes
+            .values()
+            .find(|node| node.instance_id.as_deref() == Some(instance_id))
+    }
+
+    /// [`Self::node_by_instance_id`], for a caller that changes the node it resolves.
     pub fn node_by_instance_id_mut(&mut self, instance_id: &str) -> Option<&mut ClusterNode> {
         self.nodes
             .values_mut()
             .find(|node| node.instance_id.as_deref() == Some(instance_id))
+    }
+
+    /// The `NodeLogicalId` of the node of this cluster with instance id `instance_id`, so
+    /// a caller holding an instance id reaches the node's own key. Resolved through
+    /// [`Self::node_by_instance_id`], so an instance id resolves ONE way whichever caller
+    /// asks.
+    pub fn logical_id_of_instance(&self, instance_id: &str) -> Option<String> {
+        self.node_by_instance_id(instance_id)
+            .map(|node| node.logical_id.clone())
+    }
+
+    /// Drop the node `logical_id` names from this cluster, lowering by one the target
+    /// count of the instance group it belonged to.
+    ///
+    /// The mirror of what adding a node does (`BatchAddClusterNodes` raises the same
+    /// count), so a group's count and the nodes it holds cannot disagree: a group whose
+    /// node was deleted asks for one instance fewer, and the provisioning the cluster does
+    /// when it reaches `InService` therefore does not mint it again. Answers the node that
+    /// was removed, or `None` when this cluster holds no such node.
+    pub fn remove_node(&mut self, logical_id: &str) -> Option<ClusterNode> {
+        let node = self.nodes.remove(logical_id)?;
+        if let Some(group) = self.instance_group_mut(&node.instance_group_name) {
+            group.instance_count = group.instance_count.saturating_sub(1);
+        }
+        Some(node)
     }
 
     /// Remember `record` under `token`, keeping the token store bounded.
@@ -2454,6 +2486,14 @@ pub struct ClusterNode {
     pub volume_attachments: BTreeMap<String, VolumeAttachment>,
 }
 
+/// How a per-node failure words the condition that another operation is already changing
+/// the node, which is what `BatchReplaceClusterNodes`' `InstanceIdInUse` and
+/// `BatchDeleteClusterNodes`' `NodeIdInUse` both describe ("another operation is already
+/// in progress for this node"). Named ONCE here so the two operations cannot word the one
+/// condition two ways.
+pub const NODE_OPERATION_IN_FLIGHT_MESSAGE: &str = "Another operation is already in \
+     progress for this node. Wait for the operation to complete before retrying.";
+
 impl ClusterNode {
     /// Materialise the transition the clock already owes this node — the
     /// `Pending` -> `Running` one of a node that is coming up, or the
@@ -2479,14 +2519,20 @@ impl ClusterNode {
         false
     }
 
-    /// Whether this node's hardware may be replaced right now: its status is a settled
-    /// one, so nothing the service is already doing to the node is interrupted.
+    /// Whether this node is in a SETTLED status, so an operation that changes or removes
+    /// it interrupts nothing the service is already doing to it.
     ///
     /// `Running` is the one settled status this emulator moves a node to; a node that is
     /// still coming up, shutting down, updating or being health-checked is mid-change,
-    /// which is the condition the per-node `InvalidInstanceStatus` describes.
-    pub fn accepts_replacement(&self) -> bool {
+    /// which is the condition the per-node invalid-status codes describe.
+    pub fn is_settled(&self) -> bool {
         self.status == NODE_STATUS_RUNNING && self.replacement_due_at.is_none()
+    }
+
+    /// Whether this node's hardware may be replaced right now: its status is a settled
+    /// one, so nothing the service is already doing to the node is interrupted.
+    pub fn accepts_replacement(&self) -> bool {
+        self.is_settled()
     }
 
     /// Whether a replacement is already in flight on this node, i.e. another operation is

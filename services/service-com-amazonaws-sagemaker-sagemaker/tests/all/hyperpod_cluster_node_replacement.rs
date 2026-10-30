@@ -32,7 +32,7 @@ use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emul
 /// Longer than `state::TRANSIENT_STATE_SETTLES_AFTER` (300 ms), so the clock owes a
 /// cluster its instances, and a replaced node its fresh hardware, by the time the next
 /// call runs.
-const PAST_SETTLE_DUE: Duration = Duration::from_millis(600);
+pub(crate) const PAST_SETTLE_DUE: Duration = Duration::from_millis(600);
 
 /// The per-node failure messages, as `BatchReplaceClusterNodesErrorCode` accounts for each
 /// code (smithy_query shape=BatchReplaceClusterNodesError,
@@ -40,19 +40,24 @@ const PAST_SETTLE_DUE: Duration = Duration::from_millis(600);
 /// the logical-id list says "node", the terms their own error shapes are documented in.
 const INSTANCE_NOT_FOUND: &str = "The instance does not exist in the specified cluster.";
 /// See [`INSTANCE_NOT_FOUND`].
-const NODE_NOT_FOUND: &str = "The node does not exist in the specified cluster.";
+pub(crate) const NODE_NOT_FOUND: &str = "The node does not exist in the specified cluster.";
 /// See [`INSTANCE_NOT_FOUND`].
 const NODE_INVALID_STATUS: &str = "The node is in a state that does not allow replacement. \
      Wait for the node to finish any ongoing changes before retrying.";
 /// See [`INSTANCE_NOT_FOUND`].
-const IN_USE: &str = "Another operation is already in progress for this node. Wait for the \
-     operation to complete before retrying.";
+pub(crate) const IN_USE: &str = "Another operation is already in progress for this node. Wait \
+     for the operation to complete before retrying.";
+
+/// How SageMaker refuses a request none of whose identifiers names a node of the cluster:
+/// fixed text with no variable part.
+const NONE_EXIST: &str = "All provided nodes do not exist. Please check the input and try \
+     again.";
 
 /// An instance group of a HyperPod cluster. `InstanceCount`, `InstanceGroupName` and
 /// `ExecutionRole` are the group's required members (smithy_query
 /// shape=ClusterInstanceGroupSpecification); the types come from `ClusterInstanceType`
 /// (smithy_query shape=ClusterInstanceType).
-fn instance_group(name: &str, instance_type: &str, instance_count: i64) -> Value {
+pub(crate) fn instance_group(name: &str, instance_type: &str, instance_count: i64) -> Value {
     json!({
         "InstanceGroupName": name,
         "InstanceCount": instance_count,
@@ -64,18 +69,18 @@ fn instance_group(name: &str, instance_type: &str, instance_count: i64) -> Value
 /// One node of a cluster, as the listing reports it: the two identifiers a replacement can
 /// name it by, plus the configuration a replacement must keep.
 #[derive(Clone, Debug, PartialEq)]
-struct Node {
-    logical_id: String,
-    instance_id: String,
-    instance_group: String,
-    instance_type: String,
-    status: String,
-    launch_time: f64,
+pub(crate) struct Node {
+    pub(crate) logical_id: String,
+    pub(crate) instance_id: String,
+    pub(crate) instance_group: String,
+    pub(crate) instance_type: String,
+    pub(crate) status: String,
+    pub(crate) launch_time: f64,
 }
 
 /// Every node of `cluster`, in the order `ListClusterNodes` reports them, read through the
 /// listing that carries `NodeLogicalId` so both identifiers of each node are known.
-async fn nodes_of(emulator: &Emulator, cluster: &str) -> Vec<Node> {
+pub(crate) async fn nodes_of(emulator: &Emulator, cluster: &str) -> Vec<Node> {
     let listed = emulator
         .ok(
             "ListClusterNodes",
@@ -107,7 +112,7 @@ async fn nodes_of(emulator: &Emulator, cluster: &str) -> Vec<Node> {
 
 /// Create `cluster` holding one instance group per `(name, type, count)` row, wait for the
 /// instances its groups asked for, and answer its `ClusterArn` beside its nodes.
-async fn in_service_cluster(
+pub(crate) async fn in_service_cluster(
     emulator: &Emulator,
     cluster: &str,
     groups: &[(&str, &str, i64)],
@@ -151,7 +156,7 @@ async fn describe(emulator: &Emulator, cluster: &str, logical_id: &str) -> Value
 }
 
 /// A string-list member of a response, or `None` when the response does not carry it.
-fn string_list(body: &Value, member: &str) -> Option<Vec<String>> {
+pub(crate) fn string_list(body: &Value, member: &str) -> Option<Vec<String>> {
     let entries = body.get(member)?.as_array()?;
     Some(
         entries
@@ -514,42 +519,6 @@ async fn an_identifier_the_cluster_does_not_hold_is_reported_in_the_failure_list
     // whether a known identifier sits beside it in the same batch.
     let rows: Vec<FailureRow> = vec![
         (
-            "unknown-instance-id",
-            json!({ "ClusterName": cluster, "NodeIds": ["i-0123456789abcdef0"] }),
-            vec![],
-            json!([{
-                "NodeId": "i-0123456789abcdef0",
-                "ErrorCode": "InstanceIdNotFound",
-                "Message": INSTANCE_NOT_FOUND,
-            }]),
-            vec![],
-            Value::Null,
-        ),
-        (
-            "short-unknown-instance-id",
-            json!({ "ClusterName": cluster, "NodeIds": ["i-abcdef01"] }),
-            vec![],
-            json!([{
-                "NodeId": "i-abcdef01",
-                "ErrorCode": "InstanceIdNotFound",
-                "Message": INSTANCE_NOT_FOUND,
-            }]),
-            vec![],
-            Value::Null,
-        ),
-        (
-            "unknown-logical-id",
-            json!({ "ClusterName": cluster, "NodeLogicalIds": ["no-such-node"] }),
-            vec![],
-            Value::Null,
-            vec![],
-            json!([{
-                "NodeLogicalId": "no-such-node",
-                "ErrorCode": "InstanceIdNotFound",
-                "Message": NODE_NOT_FOUND,
-            }]),
-        ),
-        (
             "known-beside-unknown",
             json!({
                 "ClusterName": cluster,
@@ -605,6 +574,88 @@ async fn an_identifier_the_cluster_does_not_hold_is_reported_in_the_failure_list
              {replaced}"
         );
     }
+}
+
+/// RULE: a request NONE of whose identifiers names a node of the cluster is refused
+/// outright with a 400 `ValidationException` — there is no per-entry outcome to report
+/// when the call can replace nothing — and it replaces nothing on the way to that refusal.
+#[tokio::test]
+async fn a_request_naming_only_nodes_the_cluster_does_not_hold_is_refused() {
+    let emulator = Emulator::new();
+    let cluster = "replace-only-unknown-identifiers";
+    let (_, nodes) = in_service_cluster(&emulator, cluster, &[("pool", "ml.c5.large", 2)]).await;
+    // A node that existed and was then DELETED: the stale reference a client works from
+    // after reading the node list, and the one the refusal is about.
+    let removed = nodes[1].logical_id.clone();
+    emulator
+        .ok(
+            "BatchDeleteClusterNodes",
+            &json!({ "ClusterName": cluster, "NodeLogicalIds": [removed.clone()] }),
+        )
+        .await;
+    let surviving = nodes_of(&emulator, cluster).await;
+
+    // Rows differ along what the rule generalises over: which identifier kind names the
+    // missing nodes, how many of them one request names, the shape of the identifier (a
+    // long and a short instance id, a minted logical id, a made-up one), and whether the
+    // node never existed or was deleted after being listed.
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "one-unknown-instance-id",
+            json!({ "ClusterName": cluster, "NodeIds": ["i-0123456789abcdef0"] }),
+        ),
+        (
+            "short-unknown-instance-id",
+            json!({ "ClusterName": cluster, "NodeIds": ["i-abcdef01"] }),
+        ),
+        (
+            "several-unknown-instance-ids",
+            json!({
+                "ClusterName": cluster,
+                "NodeIds": ["i-0123456789abcdef0", "i-abcdef01", "i-00000000000000001"],
+            }),
+        ),
+        (
+            "one-unknown-logical-id",
+            json!({ "ClusterName": cluster, "NodeLogicalIds": ["no-such-node"] }),
+        ),
+        (
+            "stale-logical-id-of-a-deleted-node",
+            json!({ "ClusterName": cluster, "NodeLogicalIds": [removed.clone()] }),
+        ),
+        (
+            "both-kinds-unknown",
+            json!({
+                "ClusterName": cluster,
+                "NodeIds": ["i-0123456789abcdef0"],
+                "NodeLogicalIds": [removed.clone(), "no-such-node"],
+            }),
+        ),
+    ];
+    for (case, request) in rows {
+        let (status, body) = emulator.call("BatchReplaceClusterNodes", &request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected a ValidationException, got {body}"
+        );
+        assert_eq!(
+            message(&body),
+            NONE_EXIST,
+            "case {case:?}: expected the all-missing refusal, got {body}"
+        );
+    }
+
+    // None of the refusals touched the cluster: the surviving node is still the one it was.
+    let after = nodes_of(&emulator, cluster).await;
+    assert_eq!(
+        after, surviving,
+        "case refusals: a refused request replaces nothing, got {after:?}"
+    );
 }
 
 /// RULE: a node the service is already changing cannot take a replacement — a node whose

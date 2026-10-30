@@ -1,22 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSearchSuggestions
-//! IMPLEMENTED: answers the property names of the requested resource that the caller's
-//! `PropertyNameHint` begins — the members the model binds that resource type to in
-//! `SearchRecord`, plus the dotted path of every key the resources stored in
-//! `crate::state` carry in a keyed member of that entity (`Tags.<key>`,
-//! `hyperparameters.<key>`, `Environment.<key>`, `Parameters.<key>`,
-//! `InputArtifacts.<key>`, `OutputArtifacts.<key>`, `CustomerMetadataProperties.<key>`).
+//! IMPLEMENTED: answers the INDEXED property names of the requested resource that the
+//! caller's `PropertyNameHint` begins — for every key the resources stored in
+//! `crate::state` carry in a keyed (map) member of that resource's searchable entity, the
+//! dotted path that key sits at with the containing member's name LOWERCASED
+//! (`tags.<key>`, `hyperparameters.<key>`, `environment.<key>`, `parameters.<key>`,
+//! `inputartifacts.<key>`, `outputartifacts.<key>`,
+//! `customermetadataproperties.<key>`). A FIXED member of the
+//! entity is never suggested: the operation is the autocomplete for the search index, and
+//! what is indexed per resource is the caller-named entries, not the entity's own schema.
 //! This is the ONLY file to touch for this operation.
 //!
-//! KNOWN GAP: a trial component's `Metrics.<name>` are NOT suggested. The metric series
-//! a trial component carries are written by the SageMaker METRICS service's
-//! `BatchPutMetrics` and live in THAT service's
-//! state; this service stores none, and a suggestion is only ever made for a name some
-//! stored resource actually carries — never for work nothing reported. Whichever change
-//! brings those series within reach of this service's state (a store here, or a shared
-//! crate under `services/` both services depend on) adds the `Metrics` arm to
-//! [`stored_property_names`] beside the others.
+//! KNOWN GAP: a trial component's `metrics.<name>` are NOT suggested. The metric series a
+//! trial component carries are written by the SageMaker METRICS service's
+//! `BatchPutMetrics` and live in THAT service's state; this service stores none, and a
+//! suggestion is only ever made for a name some stored resource actually carries — never
+//! for work nothing reported. Whichever change brings those series within reach of this
+//! service's state (a store here, or a shared crate under `services/` both services
+//! depend on) adds the `Metrics` arm to [`stored_property_names`] beside the others.
 //!
 //! Reporting only: this operation WRITES NOTHING — it reads the model's schemas and the
 //! service's stores, so nothing it answers changes what a later caller sees.
@@ -181,9 +183,10 @@ impl<'hint> Suggestions<'hint> {
 ///
 /// `Filter`'s `Name` documents a resource's valid property names as the members of its
 /// `SearchRecord` entry ("For valid property names, see SearchRecord"), so the entity
-/// `SearchRecord` binds a resource type to is what names that resource's properties — and
-/// a suggestion is a "possible match for the property name to use in Search queries"
-/// (this operation's own doc), i.e. one of exactly those names.
+/// `SearchRecord` binds a resource type to is what says WHICH members a resource has — and
+/// therefore which keyed member a stored key may be offered under. The entity's own member
+/// names are not themselves suggested (see the module header); the entity is consulted so
+/// that no key is ever offered under a member its resource does not carry.
 ///
 /// A `ResourceType` value names its `SearchRecord` member directly, except the two
 /// `Experiment`-prefixed ones (`ExperimentTrial` / `ExperimentTrialComponent`), whose
@@ -217,30 +220,18 @@ fn search_entity(resource: &str) -> Option<&'static ::aws_smithy_schema::Schema>
     })
 }
 
-/// The facet segment the keys of a training job's `HyperParameters` map are suggested
-/// under.
+/// The facet segment a suggested path carries for an entity member whose keys the caller
+/// names.
 ///
 /// A caller-named key is suggested as the PATH a `Search` filter accepts for it, and that
-/// path's facet segment is the name the search index publishes for the facet rather than
-/// always the modelled member's own casing: recorded SageMaker answers
-/// `hyperparameters.<key>` — this lowercase facet, then the key verbatim as the request
-/// spelled it — for a key supplied on `CreateTrainingJob`. The modelled member name
-/// `HyperParameters` is still suggested on its own, like every other member of the entity.
-const HYPER_PARAMETERS_FACET: &str = "hyperparameters";
-
-/// The segment a suggested path carries for the entity member `member`: the name
-/// SageMaker publishes for that facet, which is the member's own name except for the
-/// hyperparameters facet, published lowercased (see [`HYPER_PARAMETERS_FACET`]).
-///
-/// A member not named here keeps its modelled name, which is the only name the model
-/// gives it — the form every other facet of this operation has always been answered with
-/// and the one `Search`'s `Filter.Name` documents ("For valid property names, see
-/// SearchRecord"). A facet the service turns out to publish differently is one line here.
-fn published_facet(member: &str) -> &str {
-    match member {
-        "HyperParameters" => HYPER_PARAMETERS_FACET,
-        other => other,
-    }
+/// path's facet segment is the name the search INDEX publishes for the facet rather than
+/// the modelled member's own casing: recorded SageMaker answers `hyperparameters.<key>`
+/// for a key supplied on `CreateTrainingJob` and `parameters.<key>` for one supplied on
+/// `CreateTrialComponent` — the member's name lowercased, then the key verbatim as the
+/// request spelled it. The same rule covers every facet, so a member needs no entry
+/// anywhere: ONE lowercasing is what the index does to all of them.
+fn published_facet(member: &str) -> String {
+    member.to_ascii_lowercase()
 }
 
 /// Whether `schema` declares a member called `member`.
@@ -275,21 +266,26 @@ fn hint_begins(name: &str, hint: &str) -> bool {
         })
 }
 
-/// The property names the account's stored resources of type `resource` contribute: the
-/// dotted path of every caller-named entry a stored resource carries in a member of
-/// `entity`, its searchable entity.
+/// The property names the account's stored resources of type `resource` contribute, which
+/// are the WHOLE answer: the indexed path of every caller-named entry a stored resource
+/// carries in a keyed member of `entity`, its searchable entity.
 ///
 /// ONE rule decides which members those are, and it is the operation's own doc: it
 /// "provides suggestions for `HyperParameters`, `Tags`, and `Metrics`". Those three, plus
 /// the entity's other MAP members (`Environment`, `Parameters`, `InputArtifacts`,
 /// `OutputArtifacts`, `CustomerMetadataProperties`), are the members whose entries the
 /// CALLER names and which `Search` addresses BY that name, so the path of a key under one
-/// of them is a property name and the stored resources are the only place those names can
-/// come from. A member that is a list of MODELLED structures is not one of them —
+/// of them is an indexed property name and the stored resources are the only place those
+/// names can come from. A member that is a list of MODELLED structures is not one of them —
 /// `PipelineParameters` and `FeatureMetadata`'s
 /// `Parameters` are addressed through their structure's own members (`.Name`, `.Value`),
-/// which the entity already declares, not through the value a caller put in them — so no
-/// caller-chosen name is emitted under those.
+/// not through the value a caller put in them — so no caller-chosen name is emitted under
+/// those.
+///
+/// The containing member's name is rendered LOWERCASED (`tags.<key>`,
+/// `hyperparameters.<key>`) — the form the index names a facet by, and the one a caller
+/// pastes straight into a `Search` filter — while the KEY keeps the case it was stored
+/// under, because the key is the caller's own and only the facet prefix is the service's.
 ///
 /// `Metrics` is the one member of the operation's three this emulator cannot contribute a
 /// name for: a trial component's metric series are written by another service
@@ -300,18 +296,18 @@ fn hint_begins(name: &str, hint: &str) -> bool {
 /// property name to use in Search queries", and the path is the form `Filter`'s `Name`
 /// accepts for an entry inside a member. A caller part-way through typing the key still
 /// reaches it — [`hint_begins`] matches the hint against each segment of the path, so
-/// typing a tag's key offers `Tags.<key>`.
+/// typing a tag's key offers `tags.<key>`.
 ///
 /// The path's facet segment carries the name the search index publishes for the facet,
-/// which is the modelled member name except where the index lowercases it (see
-/// [`HYPER_PARAMETERS_FACET`]); the key after the dot is always the caller's own, verbatim.
+/// which is the modelled member name lowercased (see [`published_facet`]); the key after
+/// the dot is always the caller's own, verbatim.
 ///
 /// A name is emitted only when `entity` declares the member the path's first segment
 /// names, so no entry is ever offered under a member the resource does not have.
 ///
 /// A resource type this emulator stores nothing for contributes nothing, and so does a
-/// stored record whose entity declares no such member: the modelled names from `entity`
-/// are then the whole answer.
+/// stored record whose entity declares no such member: the answer is then empty, since
+/// the entity's fixed members are not property names this operation suggests.
 ///
 /// Names are offered into `names`, which filters them by the hint and caps how many are
 /// kept, so walking a store never accumulates more than the answer carries.
@@ -325,6 +321,8 @@ fn stored_property_names(
     // the guard below asks the model for them; the path the caller is answered carries the
     // name the service publishes for each of those facets ([`published_facet`]).
     let mut push = |container: &str, key: &str| {
+        // `container` is spelled as the MODEL spells the member, so the entity can be
+        // asked whether it declares it; the suggestion renders it lowercased.
         let first = container.split('.').next().unwrap_or(container);
         if !key.is_empty() && entity.is_some_and(|schema| declares(schema, first)) {
             let mut path = String::new();
@@ -332,7 +330,7 @@ fn stored_property_names(
                 if !path.is_empty() {
                     path.push('.');
                 }
-                path.push_str(published_facet(member));
+                path.push_str(&published_facet(member));
             }
             path.push('.');
             path.push_str(key);
@@ -461,13 +459,13 @@ fn stored_property_names(
         // store for the resource: there is no project, feature-metadata, pipeline-version
         // or unified-`Job` map on `ComAmazonawsSagemakerSagemakerState`. (2) The store
         // exists but its records carry no caller-named entry: this emulator's hub-content
-        // record keeps no tags. (3) The store exists and the records
-        // carry caller-named values, but not in a member `Search` addresses by that name:
-        // a pipeline execution's parameters are the entity's `PipelineParameters`, a list
-        // of modelled `Parameter` structures addressed through `.Name`/`.Value`, which the
-        // entity already declares. `Image` and `ImageVersion` have stores but no
-        // `SearchRecord` member at all, so the model names no property for them. The
-        // stores for resource kinds `ResourceType` does not name (`transform_jobs`,
+        // record keeps no tags. (3) The store exists and the records carry caller-named
+        // values, but not in a member `Search` addresses by that name: a pipeline
+        // execution's parameters are the entity's `PipelineParameters`, a list of modelled
+        // `Parameter` structures addressed through `.Name`/`.Value`, not by the value a
+        // caller put in them. `Image` and `ImageVersion` have stores but no `SearchRecord`
+        // member at all, so the model binds no searchable member to them. The stores for
+        // resource kinds `ResourceType` does not name (`transform_jobs`,
         // `processing_jobs`, `algorithms`, `ai_benchmark_jobs`, `contexts`, `artifacts`,
         // `actions`, `clusters`, `apps`, …) are not reachable here either: a transform or
         // processing job appears in the model only INSIDE a trial component's
@@ -532,17 +530,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // iterated — the model leaves the list's order unspecified, and a caller reading
         // twice must get the same list.
         let mut names = Suggestions::new(hint);
-        // The names the MODEL gives this resource: the members of its `SearchRecord`
-        // entity.
-        for member in entity
-            .into_iter()
-            .flat_map(|schema| schema.members().iter().filter_map(|m| m.member_name()))
-        {
-            names.offer(member.to_owned());
-        }
 
         // A pure read: the store is locked for reading only, so asking for suggestions
-        // changes nothing a later caller sees.
+        // changes nothing a later caller sees. The account's stored resources are the ONE
+        // source of a suggestion — the entity's own fixed members are schema, not indexed
+        // properties, so none of them is offered.
         let store = state.lock();
         stored_property_names(&input.resource, &store, entity, &mut names);
         drop(store);

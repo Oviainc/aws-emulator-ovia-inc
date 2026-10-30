@@ -28,6 +28,32 @@ Issue-Commit: 066b7cda09b446bd4bd9be1c3ecfcbe16940769e
 
 > _Note: this issue was identified against the code base at commit `066b7cda09b446bd4bd9be1c3ecfcbe16940769e`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Fix status, per numbered cause
+
+This report bundles ten unrelated causes and is filed here because its search-index
+causes are fixed. Not every cause below is:
+
+- **Cause 9 (GetSearchSuggestions does not index a created resource) — FIXED.** The
+  operation now answers only the indexed facet paths of the account's stored resources,
+  with the facet segment lowercased (`tags.<key>`, `hyperparameters.<key>`,
+  `parameters.<key>`, …) and the caller's key verbatim.
+- **Cause 10, first half (fixed schema fields were suggested) — FIXED.** A fixed member
+  of a resource's `SearchRecord` entity is schema, not an indexed property, and is no
+  longer suggested.
+- **Cause 8 (HyperPod cluster nodes) — PARTIALLY FIXED.** `BatchDeleteClusterNodes` was a
+  501 stub and is now implemented, and `BatchReplaceClusterNodes` now refuses a request
+  none of whose identifiers names a node of the cluster. The replay check for this cause
+  still times out earlier than either of those calls, so the cause is not closed.
+- **Causes 1-7 (training, processing, tuning, AutoML and inference-recommendation jobs,
+  and the notebook-instance lifecycle hook) — NOT FIXED, platform-blocked.** Each one's
+  work is a container image or a shell script the emulator has no runtime for, so the
+  affected operations still report the modelled failure state with a reason naming what
+  is unsupported. Reporting `Completed`, a duration or an artifact would be a status for
+  work nothing ran.
+- **Cause 10, second half (a CloudFormation-declared `AWS::SageMaker::Endpoint` /
+  `AWS::SageMaker::InferenceComponent` is never provisioned) — NOT FIXED.** It needs a
+  resource provisioner in the CloudFormation service, not a SageMaker handler.
+
 ## Operation
 CreateTrainingJob
 

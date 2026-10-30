@@ -6,7 +6,10 @@
 //! a replacement on each node the request names — reporting the identifiers it accepted
 //! in `Successful`/`SuccessfulNodeLogicalIds` IN THE ORDER THE REQUEST LISTED THEM, and a
 //! node it cannot replace in `Failed`/`FailedNodeLogicalIds` with the modelled per-node
-//! error code rather than failing the whole batch. A replaced node keeps its
+//! error code rather than failing the whole batch. A request NONE of whose identifiers
+//! names a node of the cluster is refused with a 400 `ValidationException`
+//! ([`MESSAGE_NONE_EXIST`]) rather than answered with an all-failure batch. A replaced
+//! node keeps its
 //! `NodeLogicalId` and its configuration while its instance is terminated and fresh
 //! hardware comes up ([`crate::state::ClusterNode::begin_replacement`]). This is the ONLY
 //! file to touch for this operation.
@@ -176,9 +179,18 @@ const MESSAGE_INSTANCE_INVALID_STATUS: &str = "The instance is in a state that d
 /// See [`MESSAGE_INSTANCE_NOT_FOUND`].
 const MESSAGE_NODE_INVALID_STATUS: &str = "The node is in a state that does not allow \
      replacement. Wait for the node to finish any ongoing changes before retrying.";
-/// See [`MESSAGE_INSTANCE_NOT_FOUND`].
-const MESSAGE_IN_USE: &str = "Another operation is already in progress for this node. Wait \
-     for the operation to complete before retrying.";
+/// See [`MESSAGE_INSTANCE_NOT_FOUND`]: the one condition both batch node operations
+/// describe, worded from `crate::state` so neither words it on its own.
+const MESSAGE_IN_USE: &str = crate::state::NODE_OPERATION_IN_FLIGHT_MESSAGE;
+
+/// How SageMaker refuses a request NONE of whose identifiers names a node of the cluster.
+///
+/// The per-node failure lists report the nodes a call could not replace ALONGSIDE the ones
+/// it could; a request that names no node the cluster holds asked for nothing this call
+/// can do, so it is refused outright instead of answering a 200 whose every entry is a
+/// failure. Fixed text with no variable part: the request named nothing to report about.
+const MESSAGE_NONE_EXIST: &str =
+    "All provided nodes do not exist. Please check the input and try again.";
 
 /// What this call did with the node one identifier named.
 enum Outcome {
@@ -293,6 +305,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // up against the answer without re-sorting it.
         let mut successful: Vec<String> = Vec::new();
         let mut failed: Vec<BatchReplaceClusterNodesError2> = Vec::new();
+        // How many of the request's identifiers named no node of this cluster at all,
+        // which decides the all-or-nothing refusal below.
+        let mut missing = 0usize;
         for node_id in &node_ids {
             // An `InstanceId` names the node that RUNS on that instance, which is the only
             // node this identifier can replace.
@@ -302,7 +317,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     successful.push(node_id.clone());
                     continue;
                 }
-                Outcome::NotFound => (ERROR_INSTANCE_ID_NOT_FOUND, MESSAGE_INSTANCE_NOT_FOUND),
+                Outcome::NotFound => {
+                    missing += 1;
+                    (ERROR_INSTANCE_ID_NOT_FOUND, MESSAGE_INSTANCE_NOT_FOUND)
+                }
                 Outcome::InUse => (ERROR_INSTANCE_ID_IN_USE, MESSAGE_IN_USE),
                 Outcome::InvalidStatus => {
                     (ERROR_INVALID_INSTANCE_STATUS, MESSAGE_INSTANCE_INVALID_STATUS)
@@ -326,7 +344,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     successful_logical.push(logical_id.clone());
                     continue;
                 }
-                Outcome::NotFound => (ERROR_INSTANCE_ID_NOT_FOUND, MESSAGE_NODE_NOT_FOUND),
+                Outcome::NotFound => {
+                    missing += 1;
+                    (ERROR_INSTANCE_ID_NOT_FOUND, MESSAGE_NODE_NOT_FOUND)
+                }
                 Outcome::InUse => (ERROR_INSTANCE_ID_IN_USE, MESSAGE_IN_USE),
                 Outcome::InvalidStatus => {
                     (ERROR_INVALID_INSTANCE_STATUS, MESSAGE_NODE_INVALID_STATUS)
@@ -337,6 +358,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 error_code: error_code.to_string(),
                 message: message.to_string(),
             });
+        }
+
+        // A request EVERY identifier of which names no node of the cluster — a client
+        // working from a stale node list, say — asked for nothing this call can do, so it
+        // is refused rather than answered with a 200 whose every entry is a failure. The
+        // per-node failure lists report the nodes a call could not replace beside the ones
+        // it could; with nothing to replace there is no such answer to give. Nothing was
+        // mutated on the way here, since every identifier resolved to no node.
+        if missing == node_ids.len() + logical_ids.len() {
+            return Err(crate::scaffolded::Scaffolded::validation(MESSAGE_NONE_EXIST));
         }
 
         // Whether this call changed the cluster at all: a batch whose every identifier

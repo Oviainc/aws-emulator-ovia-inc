@@ -210,3 +210,5 @@ mod hyperpod_cluster_node_listing;
 mod hyperpod_cluster_deletion;
 #[path = "all/hyperpod_cluster_node_replacement.rs"]
 mod hyperpod_cluster_node_replacement;
+#[path = "all/hyperpod_cluster_node_deletion.rs"]
+mod hyperpod_cluster_node_deletion;

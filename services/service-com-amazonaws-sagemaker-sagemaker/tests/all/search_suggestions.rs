@@ -9,19 +9,18 @@
 //! `inference_deployment_lifecycle` declares, not a second copy of it.
 //!
 //! The RULE under test: for the requested `ResourceType`, the operation answers the
-//! property names of that resource that the `PropertyNameHint` begins — the whole name or
-//! one of its dot-separated segments ("Text that begins a property's name") — and nothing
-//! else. A resource's property names are the members the model binds that resource type
-//! to in `SearchRecord` (`Filter`'s `Name` doc: "For valid property names, see
-//! SearchRecord") plus, for every key the account's stored resources of that type carry
-//! in a keyed member of that entity, the dotted PATH that key sits at (the operation's
-//! doc: "Provides suggestions for HyperParameters, Tags, and Metrics"), whose facet
-//! segment carries the name SageMaker publishes for that facet — lowercase
-//! `hyperparameters` for a training job's hyperparameters — and the caller's key verbatim.
-//! A key is never offered bare: the path is the form `Filter`'s `Name` accepts. The tests
-//! assert that rule over a TABLE of resource types, hints and stored keys, and sweep every
-//! property name of every `ResourceType` value for the prefix invariant rather than
-//! trusting one row.
+//! INDEXED property names of that resource that the `PropertyNameHint` begins — the whole
+//! name or one of its dot-separated segments ("Text that begins a property's name") — and
+//! nothing else. A resource's indexed property names are, for every key the account's
+//! stored resources of that type carry in a KEYED member of that resource's searchable
+//! entity, the dotted path that key sits at with the containing member LOWERCASED
+//! (`tags.<key>`, `hyperparameters.<key>`, `environment.<key>`, `parameters.<key>`) — the
+//! operation's own doc: "Provides suggestions for HyperParameters, Tags, and Metrics" —
+//! and the caller's key verbatim. A key is never offered
+//! bare, and a FIXED member of the entity (`ExperimentName`, `TrainingJobStatus`, …) is
+//! never offered at all: it is schema, not an indexed property. The tests assert that rule
+//! over a TABLE of resource types, hints and stored keys, and sweep every property name of
+//! every `ResourceType` value for the prefix invariant rather than trusting one row.
 
 use std::collections::BTreeSet;
 
@@ -66,14 +65,9 @@ const RESOURCE_TYPES: [&str; 20] = [
     "HubContent",
 ];
 
-/// The two `ResourceType` values `SearchRecord` declares NO member for
-/// (smithy_query query="shape" shape="SearchRecord" lists every other one), so the model
-/// names no searchable property for them at all.
-const WITHOUT_A_SEARCH_RECORD_MEMBER: [&str; 2] = ["Image", "ImageVersion"];
-
 /// Every caller-chosen key [`seeded`] stores, spelled bare. None of them is a property
 /// name a `Search` filter accepts — `Filter`'s `Name` takes the path the key sits at
-/// (`Tags.Project`, not `Project`) — so none may be suggested on its own.
+/// (`tags.Project`, not `Project`) — so none may be suggested on its own.
 const BARE_KEYS: [&str; 19] = [
     "momentum",
     "VERBOSITY",
@@ -94,6 +88,40 @@ const BARE_KEYS: [&str; 19] = [
     "domain",
     "phase",
     "cohort",
+];
+
+/// One FIXED member of a resource's searchable entity, per resource type the model binds
+/// one to: the resource type and the member's name as the model spells it
+/// (smithy_query query="shape" shape="<entity>"). None of them is an indexed property, so
+/// none may be suggested — not even when the hint is the member's own name.
+///
+/// The rows cover every kind of fixed member the entity declares: a scalar, a list, a
+/// nested structure, and the two keyed members whose ENTRIES are indexed (`Tags`,
+/// `HyperParameters`) — the container itself is still schema.
+const FIXED_MEMBERS: [(&str, &str); 23] = [
+    ("TrainingJob", "TrainingJobName"),
+    ("TrainingJob", "TrainingJobStatus"),
+    ("TrainingJob", "HyperParameters"),
+    ("TrainingJob", "Environment"),
+    ("Experiment", "ExperimentName"),
+    ("Experiment", "DisplayName"),
+    ("Experiment", "Tags"),
+    ("ExperimentTrial", "TrialName"),
+    ("ExperimentTrialComponent", "TrialComponentName"),
+    ("ExperimentTrialComponent", "Parameters"),
+    ("Endpoint", "EndpointName"),
+    ("Endpoint", "CreationTime"),
+    ("Model", "MonitoringSchedules"),
+    ("ModelPackage", "CustomerMetadataProperties"),
+    ("ModelPackageGroup", "ModelPackageGroupStatus"),
+    ("Pipeline", "PipelineDisplayName"),
+    ("PipelineExecution", "PipelineExecutionStatus"),
+    ("PipelineVersion", "PipelineVersionId"),
+    ("FeatureGroup", "FeatureDefinitions"),
+    ("FeatureMetadata", "FeatureType"),
+    ("Project", "ProjectId"),
+    ("HyperParameterTuningJob", "BestTrainingJob"),
+    ("HubContent", "HubContentSearchKeywords"),
 ];
 
 /// A `CreateHyperParameterTuningJob` request body this suite's seed is accepted with: the
@@ -320,295 +348,210 @@ async fn seeded() -> Emulator {
     emulator
 }
 
-/// RULE: a suggestion for a resource type is one of the members the model binds that
-/// type to in `SearchRecord`, whatever the hint's case.
-#[tokio::test]
-async fn modelled_member_names_are_suggested_for_every_resource_type() {
-    let emulator = Emulator::new();
-
-    // Rows differ along what the rule generalises over: the resource type (including the
-    // two whose `SearchRecord` member is not named after it, `ExperimentTrial` and
-    // `ExperimentTrialComponent`, and `Model`, whose entity is `ModelDashboardModel`),
-    // the hint's case and length, and the kind of member the hint lands on (a scalar, a
-    // map, a list, a nested structure). Every expected name below is a member of that
-    // entity in the model (smithy_query query="shape" shape="<entity>").
-    let cases: Vec<(&str, &str, &str, &[&str])> = vec![
-        (
-            "training-job-hyper-parameters",
-            "TrainingJob",
-            "Hyper",
-            &["HyperParameters"],
-        ),
-        (
-            "training-job-lowercase-hint",
-            "TrainingJob",
-            "training",
-            &["TrainingJobName", "TrainingJobArn", "TrainingJobStatus"],
-        ),
-        (
-            "experiment-display-name",
-            "Experiment",
-            "Display",
-            &["DisplayName"],
-        ),
-        (
-            "experiment-trial-is-the-trial-entity",
-            "ExperimentTrial",
-            "TrialName",
-            &["TrialName"],
-        ),
-        (
-            "experiment-trial-component-entity",
-            "ExperimentTrialComponent",
-            "trial",
-            &["TrialComponentName", "TrialComponentArn"],
-        ),
-        (
-            "endpoint-entity",
-            "Endpoint",
-            "ENDPOINT",
-            &[
-                "EndpointName",
-                "EndpointArn",
-                "EndpointConfigName",
-                "EndpointStatus",
-            ],
-        ),
-        (
-            "model-is-the-dashboard-entity",
-            "Model",
-            "Monitoring",
-            &["MonitoringSchedules"],
-        ),
-        (
-            "model-package-customer-metadata",
-            "ModelPackage",
-            "Customer",
-            &["CustomerMetadataProperties"],
-        ),
-        (
-            "model-package-group-entity",
-            "ModelPackageGroup",
-            "ModelPackageGroup",
-            &[
-                "ModelPackageGroupName",
-                "ModelPackageGroupArn",
-                "ModelPackageGroupStatus",
-            ],
-        ),
-        (
-            "pipeline-entity",
-            "Pipeline",
-            "pipelined",
-            &["PipelineDisplayName", "PipelineDescription"],
-        ),
-        (
-            "pipeline-execution-entity",
-            "PipelineExecution",
-            "PipelineExecutionS",
-            &["PipelineExecutionStatus"],
-        ),
-        (
-            "pipeline-version-entity",
-            "PipelineVersion",
-            "PipelineVersionI",
-            &["PipelineVersionId"],
-        ),
-        (
-            "feature-group-entity",
-            "FeatureGroup",
-            "feature",
-            &["FeatureGroupName", "FeatureDefinitions"],
-        ),
-        (
-            "feature-metadata-entity",
-            "FeatureMetadata",
-            "FeatureT",
-            &["FeatureType"],
-        ),
-        ("project-entity", "Project", "ProjectI", &["ProjectId"]),
-        (
-            "tuning-job-search-entity",
-            "HyperParameterTuningJob",
-            "BestT",
-            &["BestTrainingJob"],
-        ),
-        (
-            "model-card-entity",
-            "ModelCard",
-            "Risk",
-            &["RiskRating"],
-        ),
-        ("job-entity", "Job", "JobCat", &["JobCategory"]),
-        (
-            "hub-content-entity",
-            "HubContent",
-            "HubContentSearch",
-            &["HubContentSearchKeywords"],
-        ),
-        // The whole name is a prefix of itself, so the exact name is always suggested.
-        ("exact-name", "Endpoint", "CreationTime", &["CreationTime"]),
-    ];
-
-    for (case, resource, hint, expected) in &cases {
-        let answered = suggestions(&emulator, resource, Some(hint)).await;
-        for name in *expected {
-            assert!(
-                answered.iter().any(|suggested| suggested == name),
-                "case {case}: expected {name} among the suggestions for {resource} \
-                 hinted {hint:?}, got {answered:?}"
-            );
-        }
-        for suggested in &answered {
-            assert!(
-                begins(suggested, hint),
-                "case {case}: the hint {hint:?} begins neither {suggested:?} nor any of \
-                 its segments, got {answered:?}"
-            );
-        }
-    }
+/// Every indexed property name [`seeded`] stores, per resource type: the facet path
+/// LOWERCASED with the key in the case it was sent. A resource type the seed stores no
+/// caller-named key for has none at all.
+fn seeded_property_names(resource: &str) -> BTreeSet<String> {
+    let names: &[&str] = match resource {
+        "TrainingJob" => &[
+            "hyperparameters.momentum",
+            "environment.VERBOSITY",
+            "tags.unit",
+        ],
+        "Experiment" => &["tags.squad"],
+        "ExperimentTrial" => &["tags.phase"],
+        "ExperimentTrialComponent" => &[
+            "parameters.learning_rate",
+            "parameters.batch_size",
+            "parameters.optimiser",
+            "parameters.größe",
+            "inputartifacts.dataset",
+            "outputartifacts.metrics_file",
+            "tags.Project",
+            "tags.team",
+        ],
+        "Endpoint" => &["tags.env"],
+        // `SearchRecord`'s `Model` member targets `ModelDashboardModel`, which carries the
+        // model itself under its own `Model` member — so a model's tags sit one level
+        // deeper, and the whole path is lowercased.
+        "Model" => &["model.tags.dept"],
+        "ModelPackageGroup" => &["tags.owner"],
+        "HyperParameterTuningJob" => &["tags.cohort"],
+        "FeatureGroup" => &["tags.domain"],
+        _ => &[],
+    };
+    names.iter().map(|name| (*name).to_string()).collect()
 }
 
-/// RULE: a key a stored resource carries in a keyed member of its searchable entity is a
-/// property name of that resource at the dotted PATH it sits at — never bare, since the
-/// path is the form `Filter`'s `Name` accepts — for the resource type that holds it and
-/// for no other.
+/// RULE: a key a stored resource carries in a keyed member of its searchable entity is an
+/// indexed property name of that resource at the dotted PATH it sits at, with the facet
+/// LOWERCASED and the key in the case it was stored — never bare, since the path is the
+/// form `Filter`'s `Name` accepts — for the resource type that holds it and for no other.
 #[tokio::test]
-async fn keys_stored_on_a_resource_are_suggested_at_the_path_they_sit_at() {
+async fn keys_stored_on_a_resource_are_suggested_at_the_lowercased_path_they_sit_at() {
     let emulator = seeded().await;
 
     // Rows differ along what the rule generalises over: which keyed member the key sits
-    // in (`Tags`, `Parameters`, `InputArtifacts`, `OutputArtifacts`), the depth of the
-    // path (`Tags` on the entity itself versus `Model.Tags`, since `SearchRecord`'s
-    // `Model` member targets `ModelDashboardModel`, which nests the model), the hint's
-    // case, the hint's shape (a key, a dotted path prefix, a whole container) and the
-    // key's character set (ASCII, non-ASCII). The answer is the PATH in every row — the
-    // form `Filter`'s `Name` accepts — whether the hint begins the path or the key.
+    // in (`Tags`, `HyperParameters`, `Parameters`, `InputArtifacts`, `OutputArtifacts`),
+    // the depth of the path (`tags` on the entity itself versus `model.tags`), the hint's
+    // case, the hint's shape (a key, a dotted path prefix, a whole facet) and the key's
+    // character set (ASCII, non-ASCII). The answer is the lowercased PATH in every row,
+    // whether the hint begins the path or the key.
     let cases: Vec<(&str, &str, &str, &[&str])> = vec![
+        (
+            "hyperparameter-key",
+            "TrainingJob",
+            "moment",
+            &["hyperparameters.momentum"],
+        ),
+        (
+            "hyperparameter-lowercase-facet-path",
+            "TrainingJob",
+            "hyperparameters.m",
+            &["hyperparameters.momentum"],
+        ),
+        (
+            "facet-hint-in-model-casing",
+            "TrainingJob",
+            "HyperParameters",
+            &["hyperparameters.momentum"],
+        ),
+        (
+            "environment-key",
+            "TrainingJob",
+            "VERBOS",
+            &["environment.VERBOSITY"],
+        ),
+        (
+            "training-job-tag-key",
+            "TrainingJob",
+            "unit",
+            &["tags.unit"],
+        ),
         (
             "parameter-key",
             "ExperimentTrialComponent",
             "learning",
-            &["Parameters.learning_rate"],
+            &["parameters.learning_rate"],
         ),
         (
             "parameter-path",
             "ExperimentTrialComponent",
-            "Parameters.learn",
-            &["Parameters.learning_rate"],
+            "parameters.learn",
+            &["parameters.learning_rate"],
         ),
         (
             "second-parameter-key",
             "ExperimentTrialComponent",
             "batch",
-            &["Parameters.batch_size"],
+            &["parameters.batch_size"],
         ),
         (
             "parameter-key-case-folded",
             "ExperimentTrialComponent",
             "OPTIMIS",
-            &["Parameters.optimiser"],
+            &["parameters.optimiser"],
         ),
         (
             "non-ascii-parameter-key",
             "ExperimentTrialComponent",
             "größ",
-            &["Parameters.größe"],
+            &["parameters.größe"],
         ),
         (
             "input-artifact-key",
             "ExperimentTrialComponent",
             "datas",
-            &["InputArtifacts.dataset"],
+            &["inputartifacts.dataset"],
         ),
         (
             "input-artifact-path",
             "ExperimentTrialComponent",
             "InputArtifacts.data",
-            &["InputArtifacts.dataset"],
+            &["inputartifacts.dataset"],
         ),
         (
             "output-artifact-key",
             "ExperimentTrialComponent",
             "metrics_",
-            &["OutputArtifacts.metrics_file"],
+            &["outputartifacts.metrics_file"],
         ),
         (
             "tag-key",
             "ExperimentTrialComponent",
             "Project",
-            &["Tags.Project"],
+            &["tags.Project"],
         ),
         (
             "tag-path-prefix",
             "ExperimentTrialComponent",
-            "Tags.Pro",
-            &["Tags.Project"],
+            "tags.Pro",
+            &["tags.Project"],
         ),
         (
             "tag-key-case-folded",
             "ExperimentTrialComponent",
             "TEAM",
-            &["Tags.team"],
+            &["tags.team"],
         ),
         (
-            "container-hint-answers-the-member-and-every-key-under-it",
+            "facet-hint-answers-every-key-under-it",
             "ExperimentTrialComponent",
             "Tags",
-            &["Tags", "Tags.Project", "Tags.team"],
+            &["tags.Project", "tags.team"],
         ),
-        ("model-tag-key", "Model", "dept", &["Model.Tags.dept"]),
+        ("model-tag-key", "Model", "dept", &["model.tags.dept"]),
         (
             "model-nested-tag-path",
             "Model",
             "Model.Tags",
-            &["Model.Tags.dept"],
+            &["model.tags.dept"],
         ),
-        ("endpoint-tag-key", "Endpoint", "env", &["Tags.env"]),
-        ("endpoint-tag-path", "Endpoint", "Tags.e", &["Tags.env"]),
+        ("endpoint-tag-key", "Endpoint", "env", &["tags.env"]),
+        ("endpoint-tag-path", "Endpoint", "tags.e", &["tags.env"]),
         (
             "model-package-group-tag-key",
             "ModelPackageGroup",
             "owner",
-            &["Tags.owner"],
+            &["tags.owner"],
         ),
-        ("experiment-tag-key", "Experiment", "squad", &["Tags.squad"]),
+        ("experiment-tag-key", "Experiment", "squad", &["tags.squad"]),
         (
             "experiment-tag-path",
             "Experiment",
-            "Tags.s",
-            &["Tags.squad"],
+            "tags.s",
+            &["tags.squad"],
         ),
-        ("trial-tag-key", "ExperimentTrial", "phase", &["Tags.phase"]),
+        ("trial-tag-key", "ExperimentTrial", "phase", &["tags.phase"]),
         (
             "trial-tag-path",
             "ExperimentTrial",
             "Tags.ph",
-            &["Tags.phase"],
+            &["tags.phase"],
         ),
         (
             "tuning-job-tag-key",
             "HyperParameterTuningJob",
             "cohort",
-            &["Tags.cohort"],
+            &["tags.cohort"],
         ),
         (
             "tuning-job-tag-path",
             "HyperParameterTuningJob",
-            "Tags.c",
-            &["Tags.cohort"],
+            "tags.c",
+            &["tags.cohort"],
         ),
         (
             "feature-group-tag-key",
             "FeatureGroup",
             "domain",
-            &["Tags.domain"],
+            &["tags.domain"],
         ),
         (
             "feature-group-tag-path",
             "FeatureGroup",
-            "Tags.d",
-            &["Tags.domain"],
+            "tags.d",
+            &["tags.domain"],
         ),
     ];
 
@@ -636,18 +579,18 @@ async fn keys_stored_on_a_resource_are_suggested_at_the_path_they_sit_at() {
     // The hint is the name itself, which begins it.
     let stored: [(&str, &str); 13] = [
         ("TrainingJob", "hyperparameters.momentum"),
-        ("TrainingJob", "Environment.VERBOSITY"),
-        ("TrainingJob", "Tags.unit"),
-        ("ExperimentTrialComponent", "Parameters.learning_rate"),
-        ("ExperimentTrialComponent", "InputArtifacts.dataset"),
-        ("ExperimentTrialComponent", "Tags.Project"),
-        ("Model", "Model.Tags.dept"),
-        ("Endpoint", "Tags.env"),
-        ("ModelPackageGroup", "Tags.owner"),
-        ("Experiment", "Tags.squad"),
-        ("ExperimentTrial", "Tags.phase"),
-        ("HyperParameterTuningJob", "Tags.cohort"),
-        ("FeatureGroup", "Tags.domain"),
+        ("TrainingJob", "environment.VERBOSITY"),
+        ("TrainingJob", "tags.unit"),
+        ("ExperimentTrialComponent", "parameters.learning_rate"),
+        ("ExperimentTrialComponent", "inputartifacts.dataset"),
+        ("ExperimentTrialComponent", "tags.Project"),
+        ("Model", "model.tags.dept"),
+        ("Endpoint", "tags.env"),
+        ("ModelPackageGroup", "tags.owner"),
+        ("Experiment", "tags.squad"),
+        ("ExperimentTrial", "tags.phase"),
+        ("HyperParameterTuningJob", "tags.cohort"),
+        ("FeatureGroup", "tags.domain"),
     ];
     for (owner, name) in stored {
         for other in RESOURCE_TYPES.iter().filter(|other| **other != owner) {
@@ -661,20 +604,50 @@ async fn keys_stored_on_a_resource_are_suggested_at_the_path_they_sit_at() {
     }
 }
 
-/// RULE: a suggestion is a member of the resource's searchable entity, or the dotted path
-/// of a key a stored resource carries under one of those members. Nothing else is a
-/// property name of that resource — in particular a key is never offered bare — and a
-/// resource type the model binds no `SearchRecord` member to has no property name at all.
+/// RULE: a FIXED member of a resource's searchable entity is not an indexed property, so
+/// it is never suggested — not even when the hint is that member's own name — and an
+/// account that has stored nothing therefore gets no suggestion for any resource type.
 #[tokio::test]
-async fn every_suggestion_is_a_modelled_member_or_a_path_under_one() {
-    let emulator = seeded().await;
-    // A second emulator with an EMPTY store: what it answers is the modelled surface
-    // alone, since no stored resource can contribute a key to it.
+async fn no_fixed_member_of_the_searchable_entity_is_suggested() {
+    let seeded_emulator = seeded().await;
     let empty = Emulator::new();
+
+    for (resource, member) in FIXED_MEMBERS {
+        for (store, emulator) in [("seeded", &seeded_emulator), ("empty", &empty)] {
+            let answered = suggestions(emulator, resource, Some(member)).await;
+            assert!(
+                !answered.iter().any(|suggested| suggested == member),
+                "case {store}/{resource}/{member}: {member} is a fixed member of the \
+                 searchable entity, not an indexed property, got {answered:?}"
+            );
+        }
+    }
+
+    // Nothing stored, nothing indexed: the entity's schema contributes no name of its own.
+    for resource in RESOURCE_TYPES {
+        let answered = suggestions(&empty, resource, None).await;
+        assert!(
+            answered.is_empty(),
+            "case {resource}: an empty account has no indexed property to suggest, \
+             got {answered:?}"
+        );
+    }
+}
+
+/// RULE: the whole answer for a resource type is the indexed paths its stored resources
+/// contribute — deduplicated, in one stable order — and nothing else.
+#[tokio::test]
+async fn the_answer_is_exactly_the_indexed_paths_the_stored_resources_contribute() {
+    let emulator = seeded().await;
 
     for resource in RESOURCE_TYPES {
         let all = suggestions(&emulator, resource, None).await;
-        let modelled = suggestions(&empty, resource, None).await;
+        let expected: Vec<String> = seeded_property_names(resource).into_iter().collect();
+        assert_eq!(
+            all, expected,
+            "case {resource}: the answer must be the indexed paths the seed stored, \
+             got {all:?}"
+        );
 
         // An absent `SuggestionQuery` and the empty hint both limit nothing, so they
         // answer the same list.
@@ -685,56 +658,13 @@ async fn every_suggestion_is_a_modelled_member_or_a_path_under_one() {
              SuggestionQuery does, got {empty_hint:?} and {all:?}"
         );
 
-        // The list is deduplicated and in one stable order, so two reads agree.
-        let mut sorted = all.clone();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(
-            all, sorted,
-            "case {resource}: suggestions must be deduplicated and ordered, got {all:?}"
-        );
-
-        if WITHOUT_A_SEARCH_RECORD_MEMBER.contains(&resource) {
-            assert!(
-                all.is_empty() && modelled.is_empty(),
-                "case {resource}: SearchRecord declares no member for it, so the model \
-                 names no property to suggest, got {all:?}"
-            );
-            continue;
-        }
-        assert!(
-            !modelled.is_empty(),
-            "case {resource}: SearchRecord binds it to an entity, so its members must be \
-             suggested, got {modelled:?}"
-        );
-        // Storing resources only ADDS property names; it never takes a modelled one away.
-        for name in &modelled {
-            assert!(
-                all.contains(name),
-                "case {resource}: the modelled member {name} must still be suggested, \
-                 got {all:?}"
-            );
-        }
-
+        // Every name is a facet PATH: a lowercase facet head, at least one dot, and a key
+        // that is not offered bare.
         for name in &all {
-            if modelled.contains(name) {
-                continue;
-            }
-            // Every name the stored resources added is a PATH under a modelled member:
-            // the key's own spelling is never a suggestion on its own, because it is not
-            // the name a `Search` filter accepts.
-            // The facet segment carries the name SageMaker publishes for that member,
-            // which is the member's own name for every facet but the hyperparameters one
-            // — published lowercase — so an otherwise mis-cased segment is still a failure.
             let head = name.split('.').next().unwrap_or(name.as_str());
             assert!(
-                name.contains('.')
-                    && modelled.iter().any(|member| {
-                        member == head
-                            || (head == HYPER_PARAMETERS_FACET && member == "HyperParameters")
-                    }),
-                "case {resource}: {name} is neither a modelled member nor a path under \
-                 one: {modelled:?}"
+                name.contains('.') && head == head.to_ascii_lowercase(),
+                "case {resource}: {name} is not a lowercased facet path, got {all:?}"
             );
         }
     }
@@ -800,7 +730,7 @@ async fn one_answer_is_capped_and_still_deterministic() {
         let tags: Vec<Value> = (0..50u32)
             .map(|index| {
                 let key = format!("key-{group:02}-{index:02}");
-                stored.insert(format!("Tags.{key}"));
+                stored.insert(format!("tags.{key}"));
                 json!({ "Key": key, "Value": "seeded" })
             })
             .collect();
@@ -820,7 +750,7 @@ async fn one_answer_is_capped_and_still_deterministic() {
         stored.len()
     );
 
-    let answered = suggestions(&emulator, "Experiment", Some("Tags.key-")).await;
+    let answered = suggestions(&emulator, "Experiment", Some("tags.key-")).await;
     assert_eq!(
         answered.len(),
         CAP,
@@ -833,7 +763,7 @@ async fn one_answer_is_capped_and_still_deterministic() {
         "case cap: the answer must be the first {CAP} names of the order it answers in"
     );
     // Capping does not make the answer unstable: the same call answers the same list.
-    let again = suggestions(&emulator, "Experiment", Some("Tags.key-")).await;
+    let again = suggestions(&emulator, "Experiment", Some("tags.key-")).await;
     assert_eq!(
         answered, again,
         "case cap-repeated: two identical calls must answer the same capped list"
@@ -860,12 +790,12 @@ async fn an_unmatched_hint_answers_an_empty_list_and_no_read_changes_the_state()
     let emulator = seeded().await;
 
     // Rows differ along what the rule generalises over: the resource type, and why the
-    // hint begins nothing (a name no entity carries, a stored key of ANOTHER resource
+    // hint begins nothing (a name no resource carries, a stored key of ANOTHER resource
     // type, a path's segments in the wrong order, text that only occurs INSIDE a name,
-    // text longer than any name).
+    // text longer than any name, a fixed member of the entity).
     let unmatched: Vec<(&str, &str, &str)> = vec![
         ("nonsense", "ExperimentTrialComponent", "zzzz-no-such-name"),
-        ("other-types-key", "TrainingJob", "learning_rate"),
+        ("other-types-key", "Endpoint", "learning_rate"),
         ("other-types-tag", "Endpoint", "Project"),
         (
             "segment-out-of-order",
@@ -875,7 +805,12 @@ async fn an_unmatched_hint_answers_an_empty_list_and_no_read_changes_the_state()
         // A hint is text that BEGINS a property's name, so a substring of one in any
         // other position begins nothing: `learning_rate` is suggested, `rate` is not.
         ("substring-not-a-prefix", "ExperimentTrialComponent", "rate"),
-        ("longer-than-any-name", "Job", "JobCategoryAndThenSome"),
+        (
+            "longer-than-any-name",
+            "ExperimentTrialComponent",
+            "tags.Projective",
+        ),
+        ("fixed-member-of-an-unseeded-type", "Job", "JobCategory"),
     ];
     for (case, resource, hint) in &unmatched {
         let answered = suggestions(&emulator, resource, Some(hint)).await;
@@ -1069,7 +1004,8 @@ async fn a_training_jobs_hyperparameter_keys_are_suggested_under_the_lowercase_f
 
 /// RULE (the same one, over the OTHER caller-named members a training job's entity
 /// declares): a key stored in the job's `Environment` or `Tags` is answered at the path it
-/// sits at, so the facet a key is offered under is the one the request put it in.
+/// sits at, with the facet lowercased, so the facet a key is offered under is the one the
+/// request put it in.
 #[tokio::test]
 async fn a_training_jobs_environment_and_tag_keys_are_suggested_at_their_own_paths() {
     let emulator = Emulator::new();
@@ -1094,11 +1030,11 @@ async fn a_training_jobs_environment_and_tag_keys_are_suggested_at_their_own_pat
     // with the full path and with a prefix of it.
     let rows: Vec<(&str, &str)> = vec![
         ("hyperparameter", "hyperparameters.eta"),
-        ("environment-upper", "Environment.VERBOSITY"),
-        ("environment-leading-underscore", "Environment._private"),
-        ("environment-mixed-case", "Environment.mixedCase"),
-        ("tag", "Tags.unit"),
-        ("tag-with-a-dot-in-the-key", "Tags.Owner.Team"),
+        ("environment-upper", "environment.VERBOSITY"),
+        ("environment-leading-underscore", "environment._private"),
+        ("environment-mixed-case", "environment.mixedCase"),
+        ("tag", "tags.unit"),
+        ("tag-with-a-dot-in-the-key", "tags.Owner.Team"),
     ];
     for (case, expected) in &rows {
         // The whole path, and the path one CHARACTER short of it (char-wise, so a row

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDeleteClusterNodes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDeleteClusterNodes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDeleteClusterNodes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves the `ClusterName` (name or ARN) in `crate::state`, refuses a
+//! cluster that does not exist with the modelled `ResourceNotFound`, and otherwise drops
+//! each node the request names from the cluster — lowering the target count of the
+//! instance group it belonged to, reporting the identifiers it deleted in
+//! `Successful`/`SuccessfulNodeLogicalIds` IN THE ORDER THE REQUEST LISTED THEM, and a
+//! node it cannot delete in `Failed`/`FailedNodeLogicalIds` with the modelled per-node
+//! error code rather than failing the whole batch. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +123,72 @@ impl From<BatchDeleteClusterNodesErrorModeled> for BatchDeleteClusterNodesError 
     }
 }
 
+/// `BatchDeleteClusterNodesErrorCode`'s members this operation can report, from the
+/// model's enum of the same name
+/// (smithy_query query="shape" shape="BatchDeleteClusterNodesErrorCode").
+///
+/// The logical-id failure shape documents its own codes in prose
+/// (`NodeLogicalIdNotFound`, `InternalError`), but both failure lists target THIS enum, so
+/// a value outside it would be off the wire contract: a missing node is `NodeIdNotFound`
+/// whichever identifier named it. Nothing here faults, so no internal-error code is
+/// reported.
+const ERROR_NODE_ID_NOT_FOUND: &str = "NodeIdNotFound";
+/// See [`ERROR_NODE_ID_NOT_FOUND`].
+const ERROR_INVALID_NODE_STATUS: &str = "InvalidNodeStatus";
+/// See [`ERROR_NODE_ID_NOT_FOUND`].
+const ERROR_NODE_ID_IN_USE: &str = "NodeIdInUse";
+
+/// The most nodes one call may delete: "You must specify either NodeLogicalIds,
+/// InstanceIds, or both, with a combined maximum of 50 identifiers"
+/// (`NodeLogicalIds`'s own doc).
+///
+/// The bound is on the nodes the request NAMES, so the two identifier lists count
+/// together — the model bounds them at 3000 and 99 separately, which a request naming both
+/// can satisfy while naming far more than fifty nodes.
+const DELETE_BATCH_MAX: usize = 50;
+
+/// How a per-node failure is worded, in the terms each failure shape documents its subject
+/// in — a "node" for both lists, which is what `BatchDeleteClusterNodes` deletes.
+const MESSAGE_NOT_FOUND: &str = "The node does not exist in the specified cluster.";
+/// See [`MESSAGE_NOT_FOUND`].
+const MESSAGE_INVALID_STATUS: &str = "The node is in a state that does not allow deletion. \
+     Wait for the node to finish any ongoing changes before retrying.";
+/// See [`MESSAGE_NOT_FOUND`]: the one condition both batch node operations describe,
+/// worded from `crate::state` so neither words it on its own.
+const MESSAGE_IN_USE: &str = crate::state::NODE_OPERATION_IN_FLIGHT_MESSAGE;
+
+/// What this call did with the node one identifier named.
+enum Outcome {
+    /// The node was dropped from the cluster, so the identifier is reported as successful.
+    Deleted,
+    /// No node of the cluster answers to the identifier.
+    NotFound,
+    /// Another operation is already in flight on the node.
+    InUse,
+    /// The node is mid-change, so it cannot be deleted right now.
+    InvalidStatus,
+}
+
+/// Delete the node `logical_id` names, when its state admits it, and answer what this call
+/// reports for that identifier.
+///
+/// The ONE decision both identifier lists are classified by, so the same node named by its
+/// instance id and by its logical id is never judged two different ways.
+fn delete(cluster: &mut crate::state::Cluster, logical_id: Option<String>) -> Outcome {
+    let Some(logical_id) = logical_id else {
+        return Outcome::NotFound;
+    };
+    match cluster.nodes.get(&logical_id) {
+        None => Outcome::NotFound,
+        Some(node) if node.is_replacing() => Outcome::InUse,
+        Some(node) if !node.is_settled() => Outcome::InvalidStatus,
+        Some(_) => {
+            cluster.remove_node(&logical_id);
+            Outcome::Deleted
+        }
+    }
+}
+
 /// The `BatchDeleteClusterNodes` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -160,18 +225,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDeleteClusterNodes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeleteClusterNodesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // "You must specify either NodeLogicalIds, InstanceIds, or both, with a combined
+        // maximum of 50 identifiers" (`NodeLogicalIds`'s doc). A request naming neither
+        // names no node to delete — a combination the model cannot express, so the service
+        // is what refuses it.
+        let BatchDeleteClusterNodesInput {
+            cluster_name,
+            node_ids,
+            node_logical_ids,
+        } = input;
+        let node_ids = node_ids.unwrap_or_default();
+        let logical_ids = node_logical_ids.unwrap_or_default();
+        if node_ids.is_empty() && logical_ids.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Either NodeIds or NodeLogicalIds must be provided.",
+            ));
+        }
+        if node_ids.len() + logical_ids.len() > DELETE_BATCH_MAX {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "You can specify up to {DELETE_BATCH_MAX} identifiers in a single request."
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The cluster is this call's subject, so a name or ARN this account holds no
+        // cluster for is the modelled `ResourceNotFound` and no node is deleted.
+        let Some(cluster) = store.cluster_by_name_or_arn_mut(&cluster_name) else {
+            return Err(BatchDeleteClusterNodesErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(crate::state::cluster_not_found(&cluster_name)),
+            })
+            .into());
+        };
+        // Transitions the clock already owes this cluster and its nodes, so the state this
+        // call decides against is the one a describe would report at the same instant: a
+        // node whose provisioning or replacement is already due is deletable.
+        cluster.settle_status(now);
+        for node in cluster.nodes.values_mut() {
+            node.settle_status(now);
+        }
+
+        // Both lists are walked IN REQUEST ORDER and answered in that order: the response
+        // lists carry the identifiers the request listed, so a caller can line its request
+        // up against the answer without re-sorting it.
+        let mut successful: Vec<String> = Vec::new();
+        let mut failed: Vec<BatchDeleteClusterNodesError2> = Vec::new();
+        for node_id in &node_ids {
+            // An `InstanceId` names the node that RUNS on that instance, which is the only
+            // node this identifier can delete.
+            let resolved = cluster.logical_id_of_instance(node_id);
+            let (code, message) = match delete(cluster, resolved) {
+                Outcome::Deleted => {
+                    successful.push(node_id.clone());
+                    continue;
+                }
+                Outcome::NotFound => (ERROR_NODE_ID_NOT_FOUND, MESSAGE_NOT_FOUND),
+                Outcome::InUse => (ERROR_NODE_ID_IN_USE, MESSAGE_IN_USE),
+                Outcome::InvalidStatus => (ERROR_INVALID_NODE_STATUS, MESSAGE_INVALID_STATUS),
+            };
+            failed.push(BatchDeleteClusterNodesError2 {
+                node_id: node_id.clone(),
+                code: code.to_string(),
+                message: message.to_string(),
+            });
+        }
+
+        let mut successful_logical: Vec<String> = Vec::new();
+        let mut failed_logical: Vec<BatchDeleteClusterNodeLogicalIdsError> = Vec::new();
+        for logical_id in &logical_ids {
+            // A `NodeLogicalId` is the node's own key, so it resolves a node that has no
+            // instance id yet.
+            let (code, message) = match delete(cluster, Some(logical_id.clone())) {
+                Outcome::Deleted => {
+                    successful_logical.push(logical_id.clone());
+                    continue;
+                }
+                Outcome::NotFound => (ERROR_NODE_ID_NOT_FOUND, MESSAGE_NOT_FOUND),
+                Outcome::InUse => (ERROR_NODE_ID_IN_USE, MESSAGE_IN_USE),
+                Outcome::InvalidStatus => (ERROR_INVALID_NODE_STATUS, MESSAGE_INVALID_STATUS),
+            };
+            failed_logical.push(BatchDeleteClusterNodeLogicalIdsError {
+                node_logical_id: logical_id.clone(),
+                code: code.to_string(),
+                message: message.to_string(),
+            });
+        }
+
+        // Whether this call changed the cluster at all: a batch whose every identifier
+        // landed in a failure list deleted nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDeleteClusterNodes"))
+        // Such a batch is still a 200 with per-entry failures, not a refusal: this
+        // operation models a `Failed`/`FailedNodeLogicalIds` entry for every node it
+        // could not delete, and nothing recorded shows it refusing a request whose
+        // identifiers all name missing nodes. (Its sibling `BatchReplaceClusterNodes`
+        // DOES refuse that shape, on the recorded refusal quoted in its own handler; the
+        // two are worded as each operation's own evidence words them rather than made
+        // uniform on a guess.)
+        let deleted = !successful.is_empty() || !successful_logical.is_empty();
+        let answer = BatchDeleteClusterNodesOutput {
+            // Every one of the four lists is modelled from a minimum length of one, so a
+            // call that has nothing of that kind to report carries no list rather than an
+            // empty one.
+            successful: (!successful.is_empty()).then_some(successful),
+            successful_node_logical_ids: (!successful_logical.is_empty())
+                .then_some(successful_logical),
+            failed: (!failed.is_empty()).then_some(failed),
+            failed_node_logical_ids: (!failed_logical.is_empty()).then_some(failed_logical),
+        };
+        let arn = cluster.arn.clone();
+        drop(store);
+
+        if deleted {
+            crate::state::record_state_change(Self::NAME, &arn, ctx);
+        }
+        Ok(answer)
     }
 }
