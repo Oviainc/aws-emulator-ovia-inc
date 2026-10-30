@@ -948,19 +948,30 @@ pub fn paginate<T: Clone>(
     Ok((page, token))
 }
 
-/// This service's opaque pagination cursor: the list it belongs to and the key of the
-/// element the page that minted it reported last.
+/// This service's opaque pagination cursor: the identity of the list it belongs to and the
+/// key of the element the page that minted it reported last.
 ///
 /// Hex over a JSON pair rather than a hand-rolled framing, so the DECODE below is
 /// `serde_json`'s — a cursor is caller-supplied input, and the typed shape it has to parse
 /// into is what decides whether it is one. Hex is an encoding, not a secret: a client can
-/// decode one. What makes a cursor trustworthy here is the `kind` check in
+/// decode one. What makes a cursor trustworthy here is the list-identity check in
 /// [`decode_page_token`] — a token is only honoured by the list that minted it, so a forged
 /// or stale one is refused rather than applied to a different list.
+///
+/// The identity bound into the token is [`list_identity`]'s FIXED-SIZE digest of `kind`,
+/// never `kind` itself, so the token a page mints stays the same size however large the
+/// request that selected the list was.
 fn encode_page_token(kind: &str, key: &[String]) -> String {
-    ::hex::encode(
-        ::serde_json::to_vec(&(kind, key)).expect("a list identity and a cursor key serialize"),
-    )
+    let token = ::hex::encode(
+        ::serde_json::to_vec(&(list_identity(kind), key))
+            .expect("a list identity and a cursor key serialize"),
+    );
+    debug_assert!(
+        token.len() <= MAX_NEXT_TOKEN,
+        "a minted cursor must fit the modelled NextToken maximum of {MAX_NEXT_TOKEN}, got {}",
+        token.len()
+    );
+    token
 }
 
 /// Decode a cursor minted by [`encode_page_token`] for the same list, into the key of the
@@ -968,13 +979,39 @@ fn encode_page_token(kind: &str, key: &[String]) -> String {
 fn decode_page_token(kind: &str, token: &str) -> Result<Vec<String>, StateError> {
     let invalid = || StateError::Validation("NextToken is not a valid pagination token".to_string());
     let decoded = ::hex::decode(token).map_err(|_| invalid())?;
-    let (token_kind, key): (String, Vec<String>) =
+    let (token_identity, key): (String, Vec<String>) =
         ::serde_json::from_slice(&decoded).map_err(|_| invalid())?;
-    if token_kind != kind {
+    if token_identity != list_identity(kind) {
         return Err(invalid());
     }
     Ok(key)
 }
+
+/// The identity of the list a cursor belongs to: a fixed-size digest of `kind`, the list's
+/// full description (the operation plus whatever selected it).
+///
+/// A cursor is minted by the service and SENT BACK by the client, so its length is bounded
+/// by the model — `NextToken` is `@length 1..16384` on the `Filters`-driven lists — while
+/// `kind` renders the whole selection that produced the list, which a selection the model
+/// allows (`FilterList` carries no `@length`, over `StringList` values of up to 100 entries
+/// of up to 100 characters) can make arbitrarily long. Binding the list into the token as
+/// SHA-256 over that description makes the minted cursor's size independent of the request's
+/// size, so a walk the service started can always be continued, and still binds the cursor
+/// to ONE list: two different descriptions share a digest only on a hash collision, so a
+/// cursor minted for another selection is refused exactly as before.
+///
+/// SHA-256 comes from the `sha2` crate rather than being hand-rolled.
+fn list_identity(kind: &str) -> String {
+    use ::sha2::Digest as _;
+    ::hex::encode(::sha2::Sha256::digest(kind.as_bytes()))
+}
+
+/// The longest `NextToken` a client may send back to this service, from the model:
+/// `ListLinuxSubscriptionsRequest$NextToken` and
+/// `ListLinuxSubscriptionInstancesRequest$NextToken` are `@length 1..16384` (the cursor
+/// `ListRegisteredSubscriptionProviders` takes carries no bound of its own, so this is the
+/// tightest one every minted cursor of this service has to satisfy).
+pub const MAX_NEXT_TOKEN: usize = 16384;
 
 /// A deterministic rendering of the `SubscriptionProviderSources` selection, for the
 /// list identity a pagination cursor is minted against: a cursor names an element of ONE

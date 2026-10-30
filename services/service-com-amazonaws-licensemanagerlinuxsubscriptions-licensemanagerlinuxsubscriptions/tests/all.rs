@@ -23,6 +23,8 @@ mod error_taxonomy;
 mod harness;
 #[path = "all/linux_subscriptions.rs"]
 mod linux_subscriptions;
+#[path = "all/page_token_length_bound.rs"]
+mod page_token_length_bound;
 #[path = "all/paged_walk_under_writes.rs"]
 mod paged_walk_under_writes;
 #[path = "all/provider_credential_validation.rs"]

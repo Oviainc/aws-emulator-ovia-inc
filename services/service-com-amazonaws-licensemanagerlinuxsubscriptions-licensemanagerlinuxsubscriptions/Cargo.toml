@@ -23,6 +23,9 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Encodes/decodes this service's opaque pagination cursors.
 hex = { workspace = true }
+# SHA-256 over the description of the list a pagination cursor belongs to, so the cursor
+# binds to that list at a fixed size instead of carrying the request's whole selection.
+sha2 = { workspace = true }
 # The Secrets Manager client `RegisterSubscriptionProvider` reads the subscription
 # provider's access token through, over the in-process callback into this same emulator (no
 # network client feature is enabled: the transport is the emulator's own).
@@ -42,7 +45,6 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
 # The registration suites mount Secrets Manager beside this service on one engine, because
 # `RegisterSubscriptionProvider` reads the secret its `SecretArn` names by calling it.
 service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
