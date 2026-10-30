@@ -9,18 +9,18 @@
 //! Two things a request can ask for, and the model documents that it must ask for at
 //! least one: reserve a `MinimumLoadBalancerCapacity`, or `ResetCapacityReservation`.
 //!
-//! A reservation is read against the published capacity-units quota of one load balancer
-//! FIRST: asking to reserve more than that quota allows is the modelled
-//! `CapacityUnitsLimitExceededException`, whatever account the request is signed for,
-//! because the figure is outside the range the API accepts at all.
+//! Reserving minimum capacity is an entitlement of the ACCOUNT, and that entitlement is
+//! settled BEFORE anything the request asks to reserve is read: the account this emulator
+//! serves is not entitled, so every request that names `MinimumLoadBalancerCapacity` is
+//! the modelled `OperationNotPermittedException`, identically whatever capacity units it
+//! names — the refusal that tells a caller to ask AWS Support to enable the feature,
+//! rather than a number to correct. The per-load-balancer capacity-units quota
+//! (`CapacityUnitsLimitExceededException`) and the per-reservation configuration rules
+//! only decide a request an entitled account makes, so they are never reached here.
 //!
-//! Within that quota, reserving minimum capacity is a capability of the ACCOUNT, and the
-//! account this emulator serves does not have it, so a request that names
-//! `MinimumLoadBalancerCapacity` is the modelled `OperationNotPermittedException` — the
-//! refusal that tells a caller to ask AWS Support to enable it, rather than a reservation
-//! nothing in this emulator would honour. Resetting is still served: it clears what a
-//! reservation would have reserved and records the instant it did, which
-//! `DescribeCapacityReservation` then reports as `LastModifiedTime`.
+//! Resetting is still served: it clears what a reservation would have reserved and records
+//! the instant it did, which `DescribeCapacityReservation` then reports as
+//! `LastModifiedTime`.
 //!
 //! A request that asks for neither, or for both at once, is the modelled
 //! `InvalidConfigurationRequestException`; an ARN this store holds no load balancer for is
@@ -192,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "When modifying capacity reservation, you must include at least one
         // MinimumLoadBalancerCapacity or ResetCapacityReservation." Read from the request
         // alone, so both are decided before anything is looked up — and so is the account
-        // capability below, which is why a request to reserve capacity is refused for the
+        // entitlement below, which is why a request to reserve capacity is refused for the
         // account whether or not the load balancer it names exists.
         let reserving = input.minimum_load_balancer_capacity.is_some();
         let resetting = input.reset_capacity_reservation.unwrap_or(false);
@@ -209,26 +209,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         if reserving {
-            // The capacity asked for, read against the range the API accepts before the
-            // account capability below: a figure outside it is refused for the figure, and
-            // a caller who corrects it then learns what its account can configure.
-            // `MinimumLoadBalancerCapacity` carries the one member `CapacityUnits`, so a
-            // structure that names no capacity asks for no capacity at all.
-            let units = input
-                .minimum_load_balancer_capacity
-                .as_ref()
-                .and_then(|capacity| capacity.capacity_units);
-            if let Some(units) = units {
-                if units < 0 {
-                    return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                        "The capacity units to reserve in MinimumLoadBalancerCapacity cannot be \
-                         negative, got {units}"
-                    )));
-                }
-                if units > crate::state::CAPACITY_UNITS_PER_LOAD_BALANCER {
-                    return Err(capacity_units_limit_exceeded(units));
-                }
-            }
+            // The account entitlement, settled before the capacity the request names is
+            // read at all: this account cannot configure minimum load balancer capacity, so
+            // there is no number it could name that would be accepted, and no range or
+            // quota verdict to give it instead. The refusal is therefore the same code and
+            // the same account-level sentence for every requested figure, and it carries no
+            // value from the request.
             return Err(
                 ModifyCapacityReservationErrorModeled::OperationNotPermittedException(
                     OperationNotPermittedException {
@@ -277,23 +263,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 const MINIMUM_CAPACITY_NOT_SUPPORTED: &str = "This AWS account does not support configuring \
      minimum load balancer capacity reservation. For more information, please contact AWS \
      Support.";
-
-/// The modelled "you've exceeded the capacity units limit" refusal, for a reservation of
-/// more capacity units than the published quota of one load balancer allows. The message
-/// carries the quota the request passed and the figure it asked for, so the caller can
-/// correct it.
-fn capacity_units_limit_exceeded(requested: i32) -> ModifyCapacityReservationError {
-    ModifyCapacityReservationErrorModeled::CapacityUnitsLimitExceededException(
-        CapacityUnitsLimitExceededException {
-            message: Some(format!(
-                "You've exceeded the capacity units limit. At most {} capacity units can be \
-                 reserved for a load balancer, and {requested} were requested",
-                crate::state::CAPACITY_UNITS_PER_LOAD_BALANCER
-            )),
-        },
-    )
-    .into()
-}
 
 /// The modelled "the requested configuration is not valid" refusal, for a request that
 /// asks for neither of the two changes this operation makes, or for both at once. The

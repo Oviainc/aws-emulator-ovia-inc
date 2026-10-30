@@ -11,13 +11,12 @@
 //!   reserves no minimum capacity, no capacity and no zone holding any. It is a reporting
 //!   operation, so two reads of one load balancer answer alike, a read changes nothing a
 //!   later read sees, and a write to one load balancer is invisible to every other.
-//! * `ModifyCapacityReservation` reads the capacity a request asks to reserve against the
-//!   published capacity-units quota of one load balancer FIRST: past that quota the
-//!   request is the modelled `CapacityUnitsLimitExceeded`, naming the quota and the figure
-//!   asked for, and a negative figure is no capacity to reserve at all. Within the quota
-//!   the account capability decides it, and this account cannot configure minimum
-//!   capacity, so it is the modelled `OperationNotPermitted` in the words AWS words that
-//!   refusal.
+//! * `ModifyCapacityReservation` settles the ACCOUNT entitlement to configure minimum load
+//!   balancer capacity FIRST, before the capacity a request asks for is read and before the
+//!   load balancer is looked up: this account is not entitled, so every request that names
+//!   `MinimumLoadBalancerCapacity` is the modelled `OperationNotPermitted` with the one
+//!   account-level sentence AWS words that refusal in, byte-identical whatever figure the
+//!   request carries, interpolating no value from it and persisting nothing.
 //! * A reset is served, recorded, and reported by a later read as the instant it happened.
 //!
 //! The wire harness (`emulator`, `call`, `action`, `p`, `members`, `first_text`) comes
@@ -33,19 +32,12 @@ use crate::provisioning_loop::{emulator, first_text, members, Reply, REGION};
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::CAPACITY_UNITS_PER_LOAD_BALANCER;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The awsQuery error code of `CapacityUnitsLimitExceededException`
+/// The awsQuery error code of `OperationNotPermittedException`
 /// (`smithy_query(query="operation",operation="ModifyCapacityReservation")`).
-const CAPACITY_UNITS_LIMIT_EXCEEDED: &str = "CapacityUnitsLimitExceeded";
-
-/// The awsQuery error code of `OperationNotPermittedException`.
 const OPERATION_NOT_PERMITTED: &str = "OperationNotPermitted";
 
 /// The awsQuery error code of `LoadBalancerNotFoundException`.
 const LOAD_BALANCER_NOT_FOUND: &str = "LoadBalancerNotFound";
-
-/// The error code this service answers a value it cannot accept with, for a rule its model
-/// states in prose rather than as an error shape.
-const VALIDATION_ERROR: &str = "ValidationError";
 
 /// The refusal AWS answers a request to configure minimum load balancer capacity with for
 /// an account that does not have that capability, in the words it words it.
@@ -275,67 +267,81 @@ async fn a_read_reports_the_instant_the_last_write_recorded() {
 // The capacity a reservation asks for.
 // ---------------------------------------------------------------------------
 
-/// The capacity units a request asks to reserve are read against the published
-/// capacity-units quota of one load balancer before anything else: past the quota the
-/// request is the modelled `CapacityUnitsLimitExceeded` naming the quota and the figure
-/// asked for, a negative figure is refused for being no capacity at all, and a figure
-/// inside the quota reaches the account capability — which this account does not have, so
-/// it is the modelled `OperationNotPermitted` in AWS's own words.
-///
-/// The rows walk the published bound: zero, one, well inside it, one unit inside it, the
-/// bound itself, one unit past it, far past it, and two values below the bottom of the
-/// range. Nothing is persisted for any of them.
-#[tokio::test]
-async fn the_capacity_a_reservation_asks_for_is_read_against_the_published_quota() {
-    let (router, _engine) = emulator();
-    let arn = create_load_balancer(&router, "lb-reservation-bound", &[]).await;
+/// The figures a request can ask to reserve, walked across the published per-load-balancer
+/// capacity-units quota (`crate::state::CAPACITY_UNITS_PER_LOAD_BALANCER`, the figure
+/// `DescribeAccountLimits` publishes as `application-load-balancer-capacity-units`) and
+/// across the range the modelled `CapacityUnits` integer carries: both sides of zero, one
+/// unit, the documented application floor, each side of the quota and the quota itself, far
+/// past it, and the two extremes of the integer.
+fn capacity_figures() -> Vec<(&'static str, i32)> {
     let quota = CAPACITY_UNITS_PER_LOAD_BALANCER;
+    vec![
+        ("the smallest figure the modelled integer carries", i32::MIN),
+        ("a far negative capacity", -quota),
+        ("a negative capacity", -5),
+        ("no capacity units", 0),
+        ("one capacity unit", 1),
+        ("the documented application floor", 100),
+        ("one unit inside the published quota", quota - 1),
+        ("the published quota itself", quota),
+        ("one unit past the published quota", quota + 1),
+        ("far past the published quota", quota * 100),
+        ("the largest figure the modelled integer carries", i32::MAX),
+    ]
+}
 
-    // (case, the capacity units asked for, the awsQuery error code expected)
-    let cases: Vec<(&str, i32, &str)> = vec![
-        ("no capacity units", 0, OPERATION_NOT_PERMITTED),
-        ("one capacity unit", 1, OPERATION_NOT_PERMITTED),
-        ("a capacity well inside the quota", 100, OPERATION_NOT_PERMITTED),
-        ("one unit inside the quota", quota - 1, OPERATION_NOT_PERMITTED),
-        ("the published quota itself", quota, OPERATION_NOT_PERMITTED),
-        (
-            "one unit past the published quota",
-            quota + 1,
-            CAPACITY_UNITS_LIMIT_EXCEEDED,
-        ),
-        (
-            "far past the published quota",
-            quota * 100,
-            CAPACITY_UNITS_LIMIT_EXCEEDED,
-        ),
-        ("a negative capacity", -1, VALIDATION_ERROR),
-        ("a far negative capacity", -quota, VALIDATION_ERROR),
-    ];
+/// Assert that `reply` is the account-level refusal: the modelled `OperationNotPermitted`
+/// with the one sentence AWS words it in, carrying no figure from the request.
+fn assert_not_entitled(case: &str, reply: &Reply) {
+    assert_refused(case, reply, OPERATION_NOT_PERMITTED, "");
+    let message = reply.text("Message").unwrap_or_default();
+    assert_eq!(
+        message, MINIMUM_CAPACITY_NOT_SUPPORTED,
+        "case {case:?}: expected the account-level sentence, got body {}",
+        reply.body
+    );
+    // Account-level fixed text: no unit count, no quota ceiling, no other request value.
+    assert!(
+        !message.chars().any(|character| character.is_ascii_digit()),
+        "case {case:?}: the refusal must interpolate no request value, got {message:?}"
+    );
+}
 
-    for (case, units, code) in &cases {
-        let reply = reserve(&router, &arn, *units).await;
-        assert_refused(case, &reply, code, "");
-        let message = reply.text("Message").unwrap_or_default();
-        match *code {
-            // The refusal names the quota the request passed and the figure it asked for,
-            // both taken from the request and this service's own published limit.
-            CAPACITY_UNITS_LIMIT_EXCEEDED => assert!(
-                message.contains(&quota.to_string()) && message.contains(&units.to_string()),
-                "case {case:?}: expected a message naming the quota and the figure asked for, \
-                 got {message:?}"
-            ),
-            // The account capability is refused in the words AWS words it, with the
-            // remediation it points a caller at.
-            OPERATION_NOT_PERMITTED => assert_eq!(
-                message, MINIMUM_CAPACITY_NOT_SUPPORTED,
-                "case {case:?}: unexpected message in {}",
-                reply.body
-            ),
-            _ => assert!(
-                message.contains(&units.to_string()),
-                "case {case:?}: expected a message naming the value refused, got {message:?}"
+/// Configuring minimum load balancer capacity is settled by the ACCOUNT entitlement before
+/// the capacity the request asks for is read: this account is not entitled, so every figure
+/// is refused with the modelled `OperationNotPermitted` and the one account-level sentence,
+/// byte-identical in code and message across figures, and nothing is persisted for any of
+/// them.
+///
+/// The rows are every figure in `capacity_figures()` — in particular both sides of the
+/// published quota, which a value-dependent quota check would separate.
+#[tokio::test]
+async fn the_account_entitlement_refuses_every_capacity_a_reservation_asks_for() {
+    let (router, _engine) = emulator();
+    let arn = create_load_balancer(&router, "lb-reservation-entitlement", &[]).await;
+
+    // What the first row answered: every later row must answer exactly the same refusal.
+    let mut first: Option<(String, String, &str)> = None;
+
+    for (case, units) in capacity_figures() {
+        let reply = reserve(&router, &arn, units).await;
+        assert_not_entitled(case, &reply);
+
+        let answered = (
+            reply.error_code(),
+            reply.text("Message").unwrap_or_default(),
+            case,
+        );
+        match &first {
+            None => first = Some(answered),
+            Some((code, message, first_case)) => assert_eq!(
+                (&answered.0, &answered.1),
+                (code, message),
+                "case {case:?}: every refusal on one load balancer must be identical to \
+                 {first_case:?} in code and message"
             ),
         }
+
         assert_eq!(
             read_reservation(&router, case, &arn).await,
             nothing_reserved(None),
@@ -344,19 +350,42 @@ async fn the_capacity_a_reservation_asks_for_is_read_against_the_published_quota
     }
 }
 
-/// The figure is read before the load balancer is looked up, so a reservation past the
-/// published quota is refused for the figure even when the ARN names no load balancer this
-/// store holds — while a reset of one that is not there is the modelled
+/// The entitlement is the ACCOUNT's, so it is settled before the load balancer is looked up
+/// and whatever load balancer the request names: a reservation is the same
+/// `OperationNotPermitted` for every load balancer this store holds and for an ARN it holds
+/// none for — while a reset reaches the lookup, so an absent one is the modelled
 /// `LoadBalancerNotFound`.
 ///
-/// The rows span the shapes of an ARN that names no load balancer: one of each type code
-/// and one of another Region.
+/// The rows span the load balancers a reservation can name — each family, both schemes,
+/// and the shapes of an ARN that names none: one of each type code and one of another
+/// Region — crossed with every figure in `capacity_figures()`.
 #[tokio::test]
-async fn an_absent_load_balancer_is_refused_for_the_figure_before_the_lookup() {
+async fn the_entitlement_is_settled_before_the_load_balancer_is_looked_up() {
     let (router, _engine) = emulator();
-    let quota = CAPACITY_UNITS_PER_LOAD_BALANCER;
 
-    let absent: Vec<(&str, String)> = vec![
+    // (case, the fields the load balancer is created with)
+    let families: Vec<(&str, Vec<(&str, &str)>)> = vec![
+        ("an application load balancer", vec![]),
+        (
+            "an internal application load balancer",
+            vec![("Scheme", "internal")],
+        ),
+        (
+            "a network load balancer",
+            vec![("Type", "network"), ("Subnets.member.1", "subnet-11111111")],
+        ),
+        (
+            "a gateway load balancer",
+            vec![("Type", "gateway"), ("IpAddressType", "ipv4")],
+        ),
+    ];
+
+    let mut targets: Vec<(String, String, bool)> = Vec::new();
+    for (index, (case, fields)) in families.iter().enumerate() {
+        let arn = create_load_balancer(&router, &format!("lb-entitlement-{index}"), fields).await;
+        targets.push(((*case).to_string(), arn, true));
+    }
+    for (case, arn) in [
         (
             "an application load balancer ARN nothing carries",
             absent_load_balancer_arn(REGION, "app", "absent-capacity", "0000000000000000"),
@@ -369,15 +398,19 @@ async fn an_absent_load_balancer_is_refused_for_the_figure_before_the_lookup() {
             "a well-formed ARN of another Region",
             absent_load_balancer_arn("eu-west-1", "app", "elsewhere", "2222222222222222"),
         ),
-    ];
+    ] {
+        targets.push((case.to_string(), arn, false));
+    }
 
-    for (case, arn) in &absent {
-        let past_the_quota = reserve(&router, arn, quota + 1).await;
-        assert_refused(case, &past_the_quota, CAPACITY_UNITS_LIMIT_EXCEEDED, "");
+    for (target, arn, in_store) in &targets {
+        for (figure, units) in capacity_figures() {
+            let case = format!("{target} reserving {figure}");
+            let reply = reserve(&router, arn, units).await;
+            assert_not_entitled(&case, &reply);
+        }
 
-        let inside_the_quota = reserve(&router, arn, 1).await;
-        assert_refused(case, &inside_the_quota, OPERATION_NOT_PERMITTED, "");
-
+        // The reset is served for a load balancer this store holds and reaches the lookup
+        // for one it does not: the entitlement gate covers reservations only.
         let cleared = call_on(
             &router,
             "ModifyCapacityReservation",
@@ -385,6 +418,22 @@ async fn an_absent_load_balancer_is_refused_for_the_figure_before_the_lookup() {
             &[("ResetCapacityReservation", "true")],
         )
         .await;
-        assert_refused(case, &cleared, LOAD_BALANCER_NOT_FOUND, arn);
+        if *in_store {
+            assert_eq!(
+                cleared.status, 200,
+                "case {target:?}: a reset is served, got {} body {}",
+                cleared.status, cleared.body
+            );
+            // And the reset left nothing reserved, with the instant it happened recorded.
+            let reported = read_reservation(&router, target, arn).await;
+            assert!(
+                reported.modified_at.is_some()
+                    && reported == nothing_reserved(reported.modified_at.clone()),
+                "case {target:?}: a served reset leaves nothing reserved and records when it \
+                 happened, got {reported:?}"
+            );
+        } else {
+            assert_refused(target, &cleared, LOAD_BALANCER_NOT_FOUND, arn);
+        }
     }
 }
