@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEnvironment
-//! IMPLEMENTED: takes an environment, and the deployments made into it, out of its
-//! application, so every later reader and writer of that id misses on it.
+//! IMPLEMENTED: takes an environment out of its application, so every later reader and
+//! writer of that id misses on it, while the deployments made into it stay records the
+//! application holds.
 //!
 //! ## Shape of an operation
 //!
@@ -206,22 +207,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The delete IS the removal of the stored record, and an environment owns its
-        // deployments, so they go with it: once this answers 204, `GetEnvironment`,
-        // `UpdateEnvironment`, `ListEnvironments`, `GetDeployment` and the tagging
-        // operations all miss on this environment, because each of them reads the map
-        // this took it out of.
+        // The delete IS the removal of the stored environment record: once this answers
+        // 204, `GetEnvironment`, `UpdateEnvironment`, `ListEnvironments`, `GetDeployment`,
+        // `ListDeployments` and the tagging operations all miss on this environment,
+        // because each of them reads the map this took it out of.
         //
         // A deployment IN FLIGHT into the environment does not hold this delete up: the
         // gate AppConfig puts on a delete is the existence of the resources the container
         // OWNS (`DeleteApplication`'s environments, `DeleteConfigurationProfile`'s hosted
         // versions), and a deployment is work on the environment rather than a resource
-        // under it.
-        if application
-            .environments
-            .remove(&input.environment_id)
-            .is_none()
-        {
+        // under it. For the same reason the deployment RECORDS are not destroyed with the
+        // environment: `Application::delete_environment` keeps them, so a caller settling
+        // such a deployment with `StopDeployment` still reaches it.
+        let Some(removed) = application.delete_environment(&input.environment_id) else {
             return Err(DeleteEnvironmentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::environment_not_found(
@@ -232,7 +230,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        }
+        };
+
+        // An attribution record for the removal, so the call that takes a stored resource
+        // out of this service's state is observable at the level a default subscriber
+        // keeps, the way `DeleteApplication` records its own.
+        tracing::info!(
+            operation = "DeleteEnvironment",
+            outcome = "deleted",
+            application_id = input.application_id.as_str(),
+            environment_id = removed.id.as_str(),
+            state = removed.state.as_str(),
+            "deleted an environment"
+        );
 
         Ok(DeleteEnvironmentOutput)
     }

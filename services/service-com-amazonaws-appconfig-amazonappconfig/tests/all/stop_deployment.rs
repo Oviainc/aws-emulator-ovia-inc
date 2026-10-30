@@ -42,7 +42,9 @@ use crate::deployment_wire_fidelity::{
 };
 
 /// `StartDeployment` of version 1 of `profile` into `environment`.
-async fn start(
+///
+/// `pub(crate)` because more than one suite starts a deployment this way.
+pub(crate) async fn start(
     router: &MultiServiceRouter,
     application: &str,
     environment: &str,
@@ -68,7 +70,9 @@ async fn start(
 /// `AllowRevert` is bound to the `Allow-Revert` HEADER rather than to a body member
 /// (`smithy_query(query="operation", operation="StopDeployment")`), so `None` here is a
 /// request that carries no such header at all.
-async fn stop(
+///
+/// `pub(crate)` because more than one suite stops a deployment this way.
+pub(crate) async fn stop(
     router: &MultiServiceRouter,
     application: &str,
     environment: &str,
@@ -90,8 +94,9 @@ async fn stop(
     .await
 }
 
-/// `GetDeployment`, the implemented reader a stop is read back through.
-async fn get_deployment(
+/// `GetDeployment`, the implemented reader a stop is read back through. `pub(crate)`
+/// because more than one suite reads a stopped deployment back.
+pub(crate) async fn get_deployment(
     router: &MultiServiceRouter,
     application: &str,
     environment: &str,
@@ -201,7 +206,8 @@ fn assert_not_found(case: &str, answer: &Answer) {
 
 /// The members of a Deployment document that describe WHICH deployment it is, rather than
 /// how far along it is: a stop must answer the same deployment `StartDeployment` minted.
-const IDENTITY_MEMBERS: &[&str] = &[
+/// `pub(crate)` because every suite that stops a deployment asserts them.
+pub(crate) const IDENTITY_MEMBERS: &[&str] = &[
     "ApplicationId",
     "EnvironmentId",
     "DeploymentStrategyId",

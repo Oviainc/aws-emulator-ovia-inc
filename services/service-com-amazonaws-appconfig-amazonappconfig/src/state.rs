@@ -19,6 +19,11 @@
 //! instant it started plus the strategy's documented durations, and
 //! [`Deployment::materialize`] brings the record up to whatever the clock already
 //! made due. Reporting it never invents a transition that was not owed.
+//!
+//! That lifetime is also independent of the environment's: deleting an environment takes
+//! the environment out of the tree, so every lookup scoped through it misses, but the
+//! deployments started into it stay records the application holds
+//! ([`Application::delete_environment`]) and `StopDeployment` still settles one.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
@@ -257,6 +262,19 @@ pub const CONTENT_SIZE_LIMIT_EXCEEDED_MESSAGE: &str = "Content size limit exceed
 /// environment deployed into in a loop cannot grow without limit. The bound is the
 /// emulator's, not an AppConfig quota.
 pub const MAX_RETAINED_DEPLOYMENTS_PER_ENVIRONMENT: usize = 200;
+
+/// How many deployment records whose environment has been deleted one application keeps.
+///
+/// A deployment record outlives the environment it was started into
+/// ([`Application::delete_environment`]), so the same emulator bound as
+/// [`MAX_RETAINED_DEPLOYMENTS_PER_ENVIRONMENT`] applies to the records an application
+/// still holds for environments it no longer has: the most recently started are kept and
+/// the earliest dropped — the ones the service has finished with first, and once every
+/// retained record is still active the earliest of those — so creating and deleting
+/// environments in a loop cannot grow without limit. The bound is the emulator's, not an
+/// AppConfig quota.
+pub const MAX_RETAINED_DEPLOYMENTS_WITHOUT_ENVIRONMENT: usize =
+    MAX_RETAINED_DEPLOYMENTS_PER_ENVIRONMENT;
 
 /// How many experiment-run records one experiment definition keeps.
 ///
@@ -1076,6 +1094,17 @@ impl From<&PredefinedStrategy> for DeploymentStrategy {
     }
 }
 
+/// Whether a retention scan may choose a record the service is still working on; see
+/// [`Application::prune_deployments_without_environment`], which prefers a finished record
+/// and falls back to any of them rather than letting the map grow past its bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveRecords {
+    /// Consider only records the service has finished with.
+    Keep,
+    /// Consider every record, active ones included.
+    Evictable,
+}
+
 /// An AppConfig application: the organisational root that owns environments,
 /// configuration profiles and the experiment definitions written under it.
 #[derive(Debug, Clone)]
@@ -1097,6 +1126,17 @@ pub struct Application {
     /// through [`Application::try_insert_experiment_definition`], which bounds it at
     /// [`MAX_EXPERIMENT_DEFINITIONS_PER_APPLICATION`].
     pub experiment_definitions: HashMap<String, ExperimentDefinition>,
+    /// The deployment records of environments this application no longer holds, by the id
+    /// of the environment they were started into and their deployment number.
+    ///
+    /// A deployment record has a lifetime of its own: deleting an environment removes the
+    /// ENVIRONMENT, so everything addressed through it misses, but the deployments started
+    /// into it are still records this application holds, and `StopDeployment` still
+    /// resolves one by the ids and number its own path carries. Written only by
+    /// [`Application::delete_environment`], which bounds the map at
+    /// [`MAX_RETAINED_DEPLOYMENTS_WITHOUT_ENVIRONMENT`], and read back through
+    /// [`Application::deployment_without_environment_mut`].
+    pub deployments_without_environment: HashMap<(String, i32), Deployment>,
 }
 
 impl Application {
@@ -1114,7 +1154,94 @@ impl Application {
             environments: HashMap::new(),
             profiles: HashMap::new(),
             experiment_definitions: HashMap::new(),
+            // Nothing has been deleted out from under a deployment yet.
+            deployments_without_environment: HashMap::new(),
         }
+    }
+
+    /// Take the environment `environment_id` out of this application and answer the record
+    /// that was removed, or `None` when it held no such environment.
+    ///
+    /// The ENVIRONMENT is gone the moment this answers, so every operation addressed
+    /// through its id — `GetEnvironment`, `UpdateEnvironment`, `ListEnvironments`,
+    /// `GetDeployment`, `ListDeployments` and the tagging operations — misses on it. The
+    /// deployments it held are NOT destroyed with it: they move to
+    /// [`Self::deployments_without_environment`], where `StopDeployment` still resolves
+    /// one, because the record of a deployment is not a child resource of the environment
+    /// the way a hosted configuration version is of its profile — it is the history of work
+    /// done on the application, and it is still addressable after the environment it names
+    /// has been removed. The returned record therefore carries no deployments: they are the
+    /// application's now.
+    pub fn delete_environment(&mut self, environment_id: &str) -> Option<Environment> {
+        let mut environment = self.environments.remove(environment_id)?;
+        // MOVED rather than copied, so one deployment's history is never held twice.
+        for (number, deployment) in std::mem::take(&mut environment.deployments) {
+            self.deployments_without_environment
+                .insert((environment.id.clone(), number), deployment);
+        }
+        self.prune_deployments_without_environment();
+        Some(environment)
+    }
+
+    /// Bring the records this application holds for environments it no longer has down to
+    /// [`MAX_RETAINED_DEPLOYMENTS_WITHOUT_ENVIRONMENT`] of them.
+    ///
+    /// The bound binds UNCONDITIONALLY, because this map grows by one record per delete
+    /// request and nothing else caps it: the live environments a deployment is normally held
+    /// under are themselves capped ([`MAX_ENVIRONMENTS_PER_APPLICATION`]), and the delete
+    /// that moves a record in here frees that slot again, so a caller tearing environments
+    /// down in a loop would otherwise grow the store without limit.
+    ///
+    /// Which record goes is a preference, not a reprieve: a record the service has FINISHED
+    /// with is dropped before one it is still working on, since the active one is what a
+    /// caller is about to settle — but once every retained record is active the
+    /// earliest-started of those is dropped anyway, rather than letting the map grow.
+    fn prune_deployments_without_environment(&mut self) {
+        while self.deployments_without_environment.len()
+            > MAX_RETAINED_DEPLOYMENTS_WITHOUT_ENVIRONMENT
+        {
+            let Some(evicted) = self
+                .earliest_deployment_without_environment(ActiveRecords::Keep)
+                .or_else(|| self.earliest_deployment_without_environment(ActiveRecords::Evictable))
+            else {
+                // Unreachable while the map is over the bound, and so non-empty: the
+                // fallback above considers every record it holds.
+                break;
+            };
+            self.deployments_without_environment.remove(&evicted);
+        }
+    }
+
+    /// The key of the earliest-started record this application holds for an environment it
+    /// no longer has, among the ones `active` admits.
+    fn earliest_deployment_without_environment(
+        &self,
+        active: ActiveRecords,
+    ) -> Option<(String, i32)> {
+        self.deployments_without_environment
+            .iter()
+            .filter(|(_, deployment)| {
+                active == ActiveRecords::Evictable || !deployment.is_active()
+            })
+            // The key breaks a tie between two records started at the same instant, so the
+            // choice is a total order rather than whichever the map iterated first.
+            .min_by(|(left_key, left), (right_key, right)| {
+                (left.started_at, *left_key).cmp(&(right.started_at, *right_key))
+            })
+            .map(|(key, _)| key.clone())
+    }
+
+    /// The deployment `deployment_number` of the deleted environment `environment_id`, for
+    /// a caller that goes on to write to it. `None` when this application never held such a
+    /// deployment, or still holds the environment that issued it — a live environment's
+    /// deployments are read out of the environment itself.
+    pub fn deployment_without_environment_mut(
+        &mut self,
+        environment_id: &str,
+        deployment_number: i32,
+    ) -> Option<&mut Deployment> {
+        self.deployments_without_environment
+            .get_mut(&(environment_id.to_string(), deployment_number))
     }
 
     /// Whether this application already holds every environment
@@ -2365,6 +2492,62 @@ impl Deployment {
             now,
         ));
         Ok(())
+    }
+
+    /// Stop this deployment at `now` once the environment it was rolling into has been
+    /// deleted.
+    ///
+    /// The same acceptance rule as [`Self::stop`] — a deployment the service was still
+    /// working on is rolled back, a completed one is reverted only when the caller allows
+    /// it and only inside [`REVERT_WINDOW`], anything else is refused and left as it was —
+    /// with one difference: the rollback is already FINISHED when this answers, so the
+    /// deployment is `ROLLED_BACK` rather than `ROLLING_BACK`. A rollback walks the
+    /// configuration back out of the environment the deployment was rolling into, and that
+    /// environment no longer exists, so there is no interval of work left for the clock to
+    /// owe and both of the rollback's events fall at this instant.
+    pub fn stop_without_environment(
+        &mut self,
+        allow_revert: bool,
+        now: SystemTime,
+    ) -> Result<(), StopRefusal> {
+        if !self.is_in_flight() {
+            // Every other state is judged exactly as it is for a deployment whose
+            // environment is still there.
+            return self.stop(allow_revert, now);
+        }
+        self.state = DEPLOYMENT_ROLLED_BACK.to_string();
+        // Nothing is due: the rollback is over, so no reader is owed a transition.
+        self.rollback_completion_due = None;
+        self.completed_at = Some(now);
+        self.next_tick_due = None;
+        self.event_log.push(deployment_event(
+            EVENT_ROLLBACK_STARTED,
+            TRIGGERED_BY_USER,
+            DESCRIPTION_ROLLBACK_STARTED.to_string(),
+            now,
+        ));
+        self.event_log.push(deployment_event(
+            EVENT_ROLLBACK_COMPLETED,
+            TRIGGERED_BY_APPCONFIG,
+            DESCRIPTION_ROLLBACK_COMPLETED.to_string(),
+            now,
+        ));
+        Ok(())
+    }
+
+    /// Bring a deployment whose environment has been deleted up to what the clock still
+    /// owes it at `now`.
+    ///
+    /// Only a rollback a caller had already started is still due: it was owed at an instant
+    /// that has passed whether or not any environment still held the deployment. The
+    /// strategy's remaining growth steps, its bake time and the completion they lead to are
+    /// NOT owed any more — they are the rollout of a configuration into an environment that
+    /// no longer exists — so such a record keeps the state it had when its environment was
+    /// removed.
+    pub fn materialize_without_environment(&mut self, now: SystemTime) {
+        if self.is_rolling_back() {
+            self.materialize(now);
+        }
     }
 
     /// How long the rollout itself lasts: the strategy's deployment duration.

@@ -566,7 +566,8 @@ async fn a_deleted_environment_is_gone_with_its_deployments() {
         );
         assert_not_found(case, "a second DeleteEnvironment", &delete(&router, &uri, &[]).await);
 
-        // The deployment history went with the environment that owned it.
+        // The deployment history is read THROUGH the environment that issued it, so with
+        // the environment gone the report misses.
         if row.deploy {
             assert_not_found(
                 case,

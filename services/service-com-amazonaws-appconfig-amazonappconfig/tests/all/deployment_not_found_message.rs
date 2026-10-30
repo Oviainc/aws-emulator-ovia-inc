@@ -224,6 +224,13 @@ async fn a_deployment_lookup_that_misses_names_its_number_by_the_wire_member_spe
 /// environment that was deleted after it had issued the deployment, an environment that
 /// never existed, and — the one level that keeps its own template — an application that
 /// never existed.
+///
+/// `GetDeployment` reads a deployment THROUGH the environment that holds it, so it misses
+/// on every row. `StopDeployment` resolves the deployment RECORD, whose lifetime is not the
+/// environment's, so a record written before the environment was deleted is still there for
+/// it to settle — what it answers for that record is asserted in
+/// `crate::stop_deployment_without_its_environment` — and it misses only where no record of
+/// that deployment was ever written.
 #[tokio::test]
 async fn a_deployment_report_names_the_deployment_whichever_level_of_the_path_is_missing() {
     let router = router();
@@ -275,34 +282,39 @@ async fn a_deployment_report_names_the_deployment_whichever_level_of_the_path_is
         String::from_utf8_lossy(&deleted.body)
     );
 
-    let rows: Vec<(&str, &str, &str)> = vec![
+    // The last column is whether a deployment RECORD was ever written under this path, so
+    // `StopDeployment` has one to settle rather than a miss to report.
+    let rows: Vec<(&str, &str, &str, bool)> = vec![
         (
             "the environment that issued it has been deleted",
             &application,
             &environment,
+            true,
         ),
         (
             "an environment that never existed",
             &application,
             "nosuchenv",
+            false,
         ),
     ];
 
-    for (case, application_id, environment_id) in rows {
+    for (case, application_id, environment_id, record_written) in rows {
         let expected = format!(
             "Deployment with Application Id {application_id}, Environment Id {environment_id}, \
              and deploymentNumber 1 could not be found for account {account}."
         );
-        for (operation, answer) in [
-            (
-                "GetDeployment",
-                get_deployment(&router, application_id, environment_id, 1).await,
-            ),
-            (
+        let mut answers = vec![(
+            "GetDeployment",
+            get_deployment(&router, application_id, environment_id, 1).await,
+        )];
+        if !record_written {
+            answers.push((
                 "StopDeployment",
                 stop_deployment(&router, application_id, environment_id, 1).await,
-            ),
-        ] {
+            ));
+        }
+        for (operation, answer) in answers {
             assert_eq!(
                 answer.status,
                 404,

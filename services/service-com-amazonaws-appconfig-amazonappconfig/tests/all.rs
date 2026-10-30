@@ -115,6 +115,8 @@ mod start_experiment_run;
 mod state_roundtrip;
 #[path = "all/stop_deployment.rs"]
 mod stop_deployment;
+#[path = "all/stop_deployment_without_its_environment.rs"]
+mod stop_deployment_without_its_environment;
 #[path = "all/stop_experiment_run.rs"]
 mod stop_experiment_run;
 #[path = "all/update_application.rs"]
