@@ -69,6 +69,8 @@ mod durable_execution_bound;
 mod durable_execution_history;
 #[path = "all/durable_execution_listing.rs"]
 mod durable_execution_listing;
+#[path = "all/durable_execution_refusals.rs"]
+mod durable_execution_refusals;
 #[path = "all/durable_execution_start.rs"]
 mod durable_execution_start;
 #[path = "all/durable_execution_stop.rs"]

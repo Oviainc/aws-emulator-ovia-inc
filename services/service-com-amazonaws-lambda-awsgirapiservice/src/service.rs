@@ -99,6 +99,11 @@ use std::sync::Arc;
 /// Applied to every response [`StatedPerOperation`] answers; see the module's own header.
 pub mod fault_class;
 
+/// The members of this model whose broken constraint is stated as AWS's own fixed sentence
+/// rather than as the constraint envelope, because AWS keeps the value opaque; see the
+/// module's own header.
+mod opaque_members;
+
 /// The largest single value ONE clause of this service's validation refusal quotes back.
 ///
 /// An AWS constraint message always quotes the value it refused in full, and the shared
@@ -420,9 +425,17 @@ fn stated_refusal<O: Operation>(
 /// The ONE renderer both refusal paths go through — [`StatedPerOperation`] for a request a
 /// wrapped operation refuses, and [`Service::override_refusal`] for one the centralized
 /// walk refuses — so a caller cannot be told the same broken constraint two ways.
+///
+/// A member this service refuses OPAQUELY is answered first, with the whole fixed sentence
+/// AWS gives it instead of the envelope over its clause (see [`opaque_members`]): the
+/// envelope would quote back a token the caller cannot compose and the form a minted one
+/// has, neither of which AWS discloses.
 fn stated_violations(violations: &[Violation]) -> Option<Refused> {
     if violations.is_empty() {
         return None;
+    }
+    if let Some(opaque) = opaque_members::opaque_refusal(violations) {
+        return Some(opaque);
     }
     let restated: Vec<Violation> = violations
         .iter()
@@ -454,10 +467,18 @@ where
             // below would make this future non-`Send`.
             let refused = stated_refusal::<O>(svc.definition().protocol(), req);
             if let Some((violations, stated)) = refused {
-                return fault_class::with_fault_class(
-                    svc.definition()
-                        .refusal_response(ProtocolError::Invalid(violations), Some(stated)),
-                );
+                // An OPAQUE refusal is answered as the message alone: the body AWS
+                // records for it carries no other member, so it does not name the
+                // class of its fault either (see [`opaque_members`]).
+                let names_no_fault_class = opaque_members::names_no_fault_class(&violations);
+                let response = svc
+                    .definition()
+                    .refusal_response(ProtocolError::Invalid(violations), Some(stated));
+                return if names_no_fault_class {
+                    response
+                } else {
+                    fault_class::with_fault_class(response)
+                };
             }
             fault_class::with_fault_class(self.operation.run(svc, req, ctx).await)
         })

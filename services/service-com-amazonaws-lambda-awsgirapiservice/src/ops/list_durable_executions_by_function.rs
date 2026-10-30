@@ -17,6 +17,10 @@
 //! transition the CLOCK already made due (see
 //! [`crate::state::DurableExecutionRecord::materialize`]).
 //!
+//! A `FunctionName` that resolves to no function — or to no such version or alias of one —
+//! is refused with this operation's OWN fixed sentence ([`FUNCTION_NOT_FOUND`]), which
+//! names nothing of the request.
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -225,7 +229,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(|failure| match failure {
             crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
-            crate::state::ResolveFailure::NotFound(message) => not_found(message),
+            // The resolver's own sentence NAMES the function it resolved the request's
+            // reference to; this operation's does not (see [`FUNCTION_NOT_FOUND`]), so the
+            // 404 is re-worded here rather than carried through.
+            crate::state::ResolveFailure::NotFound(_) => not_found(),
         })?;
         let record = &*record;
         // An alias names the version it invokes, so filtering by an alias filters by
@@ -356,12 +363,26 @@ fn invalid_parameter(message: String) -> ListDurableExecutionsByFunctionError {
     .into()
 }
 
-/// The modelled 404 for a function this emulator does not hold.
-fn not_found(message: String) -> ListDurableExecutionsByFunctionError {
+/// This operation's WHOLE sentence for a function it cannot resolve the request's
+/// `FunctionName` (and the `Qualifier` it may be paired with) to.
+///
+/// It names the resource that is missing and nothing of the request: not the name the
+/// caller sent, and not the ARN this service resolved it to — unlike the sentence the
+/// function operations of the earlier Lambda API dates carry, which appends that ARN
+/// (`crate::state::resolve_function`'s `Function not found: <arn>`). Recorded behaviour:
+/// corpus `simparity-wire-aws-v1`, fixture
+/// `lambda-durable-execution-list-and-callback-errors`, step `task#1`, where this
+/// operation on a function nobody created is answered `404 ResourceNotFoundException` with
+/// `Message` exactly this.
+const FUNCTION_NOT_FOUND: &str = "Function not found";
+
+/// The modelled 404 for a function this emulator does not hold, or for a version or alias
+/// of one it does not have: one resolution failure, one sentence.
+fn not_found() -> ListDurableExecutionsByFunctionError {
     ListDurableExecutionsByFunctionErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
             r#type: None,
-            message: Some(message),
+            message: Some(FUNCTION_NOT_FOUND.to_string()),
         },
     )
     .into()

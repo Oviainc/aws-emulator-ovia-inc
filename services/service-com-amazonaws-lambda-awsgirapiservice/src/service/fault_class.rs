@@ -63,6 +63,10 @@
 //! * the routing-error and framework-error paths, which answer a request that named no
 //!   modelled operation or failed at the transport, so no error shape of this model is
 //!   what they render.
+//!
+//! And one answer inside that surface is held back from it deliberately: the OPAQUE
+//! refusal of a service-minted token (`crate::service::opaque_members`), whose recorded
+//! body is its fixed sentence and no other member at all.
 
 use aws_smithy_runtime_api::http::Response as RtResponse;
 use aws_smithy_types::body::SdkBody;
