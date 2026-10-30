@@ -96,21 +96,33 @@ pub const DEFAULT_DEOBFUSCATION_STATUS: &str = "DISABLED";
 /// [`crate::ops::types::DEOBFUSCATION_STATUS_VALUES`].
 pub const ENABLED_DEOBFUSCATION_STATUS: &str = "ENABLED";
 
-/// `CustomEvents$Status` of an app monitor whose create request named no `CustomEvents`.
+/// `CustomEvents$Status` of an app monitor whose request left the member unset — the
+/// request that named no `CustomEvents` at all and the one that carried the structure
+/// without a `Status` alike ([`settled_custom_events`]).
 ///
-/// From the model: `CreateAppMonitorRequest$CustomEvents` documents "If you omit this
+/// From the model: `CustomEvents$Status` documents "The default is for custom events to be
+/// `DISABLED`", and `CreateAppMonitorRequest$CustomEvents` documents "If you omit this
 /// parameter, custom events are DISABLED." A member of
 /// [`crate::ops::types::CUSTOM_EVENTS_STATUS_VALUES`].
 pub const DEFAULT_CUSTOM_EVENTS_STATUS: &str = "DISABLED";
 
-/// `SessionSampleRate` of an app monitor whose create request named no
-/// `AppMonitorConfiguration`.
+/// `SessionSampleRate` of an app monitor whose request left the member unset — the request
+/// that named no `AppMonitorConfiguration` at all and the one that carried the structure
+/// without a rate alike ([`settled_app_monitor_configuration`]).
 ///
-/// From the model: `CreateAppMonitorRequest$AppMonitorConfiguration` documents "If you
-/// omit this argument, the sample rate used for RUM is set to 10% of the user sessions."
-/// (The member's own `@default` is `0`, which applies when the request DOES carry a
-/// configuration but leaves the rate out.)
+/// From the model: `AppMonitorConfiguration$SessionSampleRate` documents "If you omit this
+/// parameter, the default of 0.1 is used, and 10% of sessions will be sampled", and
+/// `CreateAppMonitorRequest$AppMonitorConfiguration` documents "If you omit this argument,
+/// the sample rate used for RUM is set to 10% of the user sessions."
 pub const DEFAULT_SESSION_SAMPLE_RATE: f64 = 0.1;
+
+/// The value an UNSET `SessionSampleRate` arrives as: the member's modelled `@default` of
+/// `0`, which the deserializer fills in for a configuration that leaves the member out.
+///
+/// The member is also the bottom of its own modelled `@range` (`0` to `1` inclusive), so
+/// this is the lowest value that can reach a handler at all, and a rate at or below it is
+/// the unset one ([`settled_app_monitor_configuration`]).
+pub const UNSET_SESSION_SAMPLE_RATE: f64 = 0.0;
 
 /// Prefix of the CloudWatch Logs group an app monitor copies telemetry into when
 /// `CwLogEnabled` is set: RUM is a vended-logs service, so the group lives under
@@ -1552,20 +1564,40 @@ pub fn current_iso_timestamp() -> String {
     iso_timestamp(SystemTime::now())
 }
 
-/// The configuration an app monitor gets when its create request carried none: every
-/// member unset except the documented 10% session sample rate.
-pub fn default_app_monitor_configuration() -> AppMonitorConfiguration {
-    AppMonitorConfiguration {
-        session_sample_rate: DEFAULT_SESSION_SAMPLE_RATE,
-        ..AppMonitorConfiguration::default()
+/// `configuration` with every member it left unset settled onto the value the model
+/// documents for that member when it is omitted.
+///
+/// The ONE conversion a configuration goes through before it is stored — the create path
+/// and the update path share it — so a structure a request carried only part of is stored
+/// with the same values as one it omitted entirely, and no read reports a monitor
+/// configured with a value the service would never have chosen. Pass
+/// `AppMonitorConfiguration::default()` for the request that named no configuration at
+/// all: it leaves every member unset, so it settles to exactly the documented defaults.
+///
+/// `SessionSampleRate` is the one member of the structure the model documents a value for
+/// when it is omitted ("If you omit this parameter, the default of 0.1 is used"): the rest
+/// document none, so one a request left out stays absent. An omitted rate arrives as the
+/// member's modelled `@default` ([`UNSET_SESSION_SAMPLE_RATE`]), which is also the bottom
+/// of its modelled `@range`, so that is what "unset" is readable as here.
+pub fn settled_app_monitor_configuration(
+    mut configuration: AppMonitorConfiguration,
+) -> AppMonitorConfiguration {
+    if configuration.session_sample_rate <= UNSET_SESSION_SAMPLE_RATE {
+        configuration.session_sample_rate = DEFAULT_SESSION_SAMPLE_RATE;
     }
+    configuration
 }
 
-/// The custom-events setting an app monitor gets when its create request carried none.
-pub fn default_custom_events() -> CustomEvents {
-    CustomEvents {
-        status: Some(DEFAULT_CUSTOM_EVENTS_STATUS.to_string()),
+/// `custom_events` with its `Status` settled onto the documented default when the request
+/// left the member unset — the same conversion for the request that named no
+/// `CustomEvents` at all (pass `CustomEvents::default()`) and for the one that carried the
+/// structure without a status, since "the default is for custom events to be `DISABLED`"
+/// either way.
+pub fn settled_custom_events(mut custom_events: CustomEvents) -> CustomEvents {
+    if custom_events.status.is_none() {
+        custom_events.status = Some(DEFAULT_CUSTOM_EVENTS_STATUS.to_string());
     }
+    custom_events
 }
 
 /// The deobfuscation configuration an app monitor gets when its create request carried
@@ -1578,6 +1610,12 @@ pub fn default_custom_events() -> CustomEvents {
 /// with deobfuscation DISABLED, and recorded behaviour reports exactly that structure
 /// rather than omitting the member. Which is also why a read never has to decide: the
 /// record always holds one ([`AppMonitorRecord::deobfuscation_configuration`]).
+///
+/// There is nothing for a configuration the request DID carry to settle: the one member of
+/// the structure documents no value for an omitted parameter, and the status inside it is
+/// `@required`, so a request that names source maps always names their status
+/// (`settled_app_monitor_configuration` and `settled_custom_events` cover the two members
+/// that DO document one).
 pub fn default_deobfuscation_configuration() -> DeobfuscationConfiguration {
     DeobfuscationConfiguration {
         java_script_source_maps: Some(JavaScriptSourceMaps {

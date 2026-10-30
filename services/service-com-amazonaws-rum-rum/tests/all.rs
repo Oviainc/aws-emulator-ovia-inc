@@ -69,6 +69,8 @@ mod metrics_destination_pass_role;
 mod metrics_destination_removal;
 #[path = "all/metrics_destinations.rs"]
 mod metrics_destinations;
+#[path = "all/nested_configuration_defaults.rs"]
+mod nested_configuration_defaults;
 #[path = "all/not_found_and_conflict_bodies.rs"]
 mod not_found_and_conflict_bodies;
 #[path = "all/pagination_token_check_precedence.rs"]

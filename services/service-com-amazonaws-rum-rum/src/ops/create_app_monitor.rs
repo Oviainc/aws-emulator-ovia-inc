@@ -446,12 +446,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state: crate::state::CREATED_STATE.to_string(),
             platform,
             cw_log_enabled: input.cw_log_enabled.unwrap_or(false),
-            app_monitor_configuration: input
-                .app_monitor_configuration
-                .unwrap_or_else(crate::state::default_app_monitor_configuration),
-            custom_events: input
-                .custom_events
-                .unwrap_or_else(crate::state::default_custom_events),
+            // Each structure is SETTLED before it is stored: a member this request left
+            // unset takes the value the model documents for it when omitted (a session
+            // sample rate of 10%, custom events DISABLED), whether the request named the
+            // structure without that member or named no structure at all. The same two
+            // conversions the update path goes through, so a monitor cannot be stored
+            // with a value no request asked for and no read reports one.
+            app_monitor_configuration: crate::state::settled_app_monitor_configuration(
+                input.app_monitor_configuration.unwrap_or_default(),
+            ),
+            custom_events: crate::state::settled_custom_events(
+                input.custom_events.unwrap_or_default(),
+            ),
+            // The deobfuscation configuration has no such member to settle — its one
+            // member documents no value for an omitted parameter and the status inside it
+            // is `@required` — so only the request that named NO configuration takes a
+            // default here.
             deobfuscation_configuration: input
                 .deobfuscation_configuration
                 .unwrap_or_else(crate::state::default_deobfuscation_configuration),

@@ -346,8 +346,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.domain = None;
             changed = true;
         }
+        // A structure this request DOES carry replaces the stored one whole — these are
+        // request parameters, and "for any parameters that you omit, the existing values
+        // are kept" is about the parameter, not about the members inside it — and is
+        // settled on the way in, so a member the request left unset lands on the value
+        // the model documents for it when omitted rather than on the raw wire default
+        // (`crate::state::settled_app_monitor_configuration` and
+        // `crate::state::settled_custom_events`, which the create path shares). A
+        // configuration that names no session sample rate is therefore stored sampling the
+        // documented 10%, never nothing. The deobfuscation configuration has no such
+        // member: its one member documents no value for an omitted parameter and the
+        // status inside it is `@required`.
         if let Some(configuration) = input.app_monitor_configuration {
-            record.app_monitor_configuration = configuration;
+            record.app_monitor_configuration =
+                crate::state::settled_app_monitor_configuration(configuration);
             changed = true;
         }
         if let Some(cw_log_enabled) = input.cw_log_enabled {
@@ -355,7 +367,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             changed = true;
         }
         if let Some(custom_events) = input.custom_events {
-            record.custom_events = custom_events;
+            record.custom_events = crate::state::settled_custom_events(custom_events);
             changed = true;
         }
         if let Some(deobfuscation) = input.deobfuscation_configuration {
