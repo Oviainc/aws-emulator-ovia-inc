@@ -133,6 +133,20 @@ impl<Eng> AddNotificationChannels<Eng> {
     }
 }
 
+/// One requested channel, resolved and validated but NOT yet given an id the request did
+/// not name.
+///
+/// What this operation holds between validating the request and applying the write: a
+/// channel whose `id` is `None` is one the store mints an id for, and that mint is a WRITE
+/// to the store, so it happens only after every check that can still refuse the add — the
+/// ordering `crate::state::remove_permission` keeps for the revision it mints.
+struct PendingChannel {
+    /// The id the request named for this channel, or `None` when it named none.
+    id: Option<String>,
+    uri: String,
+    event_publishers: Vec<String>,
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for AddNotificationChannels<Eng>
 {
@@ -177,9 +191,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Resolve every requested channel BEFORE writing any of them, so a request this
-        // operation refuses leaves the stored configuration exactly as it was.
-        let mut requested: Vec<crate::state::NotificationChannel> =
-            Vec::with_capacity(input.channels.len());
+        // operation refuses leaves the store exactly as it was — the stored configuration
+        // and the store's own channel-id mint count alike. An id the caller did not name
+        // is therefore NOT minted here: the checks below run first, under a shared
+        // borrow, and the mint happens only once the write is going to be applied, which
+        // is the order `crate::state::remove_permission` keeps for the revision it mints.
+        let mut requested: Vec<PendingChannel> = Vec::with_capacity(input.channels.len());
         for (index, channel) in input.channels.iter().enumerate() {
             // `ChannelUri` is an `@arnReference` whose doc says "Currently we only
             // support SNS channels and thus required to be an ARN" — a constraint the
@@ -217,60 +234,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
 
-            let id = match channel.id.clone() {
-                Some(named) => named,
-                // `Channel$id`: "A random UUID for channelId is used when adding a
-                // channel to the notification configuration if not specified in the
-                // request." Minted by the STORE, the way every UUID-shaped id this
-                // crate hands out is minted (`state::mint_channel_id`), so no second
-                // way of making one is introduced here.
-                None => guard.mint_channel_id(&input.profiling_group_name),
-            };
-            if requested.iter().any(|earlier| earlier.id == id) {
-                return Err(AddNotificationChannelsErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "channels[{index}] repeats channel id {id}; one request cannot add \
-                             the same channel twice"
-                        ),
-                    },
-                )
-                .into());
+            // An id the REQUEST names is the caller's, so a repeat of one an earlier
+            // channel of the same request carries is a conflict already. A channel the
+            // request names no id for repeats nothing: the id it gets is minted below,
+            // from a mint count no other id this store handed out was derived from.
+            if let Some(named) = channel.id.as_deref() {
+                if requested
+                    .iter()
+                    .any(|earlier| earlier.id.as_deref() == Some(named))
+                {
+                    return Err(AddNotificationChannelsErrorModeled::ConflictException(
+                        ConflictException {
+                            message: format!(
+                                "channels[{index}] repeats channel id {named}; one request \
+                                 cannot add the same channel twice"
+                            ),
+                        },
+                    )
+                    .into());
+                }
             }
-            requested.push(crate::state::NotificationChannel {
-                id,
+            requested.push(PendingChannel {
+                id: channel.id.clone(),
                 uri: channel.uri.clone(),
                 event_publishers: channel.event_publishers.clone(),
             });
         }
 
-        // The group the existence check above found, now borrowed for the write: the
-        // store lock was never released, so this is the same record and the
-        // `ok_or_else` is that same 404 rather than a second refusal.
-        let group = guard
-            .groups
-            .get_mut(&input.profiling_group_name)
-            .ok_or_else(|| {
-                AddNotificationChannelsErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::group_not_found_message(
-                            &input.profiling_group_name,
-                        ),
-                    },
-                )
-            })?;
+        // The group the existence check above found, read back under a SHARED borrow for
+        // the two checks that refuse the add: the store lock was never released, so this
+        // is the same record and the `ok_or_else` is that same 404 rather than a second
+        // refusal.
+        let group = guard.groups.get(&input.profiling_group_name).ok_or_else(|| {
+            AddNotificationChannelsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::group_not_found_message(&input.profiling_group_name),
+                },
+            )
+        })?;
 
         // A channel id already in the configuration names a channel that exists: adding
-        // it again would conflict with the stored state rather than add anything.
+        // it again would conflict with the stored state rather than add anything. Only an
+        // id the request named can name a stored channel; the ids this operation mints
+        // are minted after this check and name none.
         if let Some(duplicate) = requested
             .iter()
-            .find(|channel| group.has_notification_channel(&channel.id))
+            .filter_map(|channel| channel.id.as_deref())
+            .find(|id| group.has_notification_channel(id))
         {
             return Err(AddNotificationChannelsErrorModeled::ConflictException(
                 ConflictException {
                     message: format!(
-                        "profiling group {} already has a notification channel {}",
-                        input.profiling_group_name, duplicate.id
+                        "profiling group {} already has a notification channel {duplicate}",
+                        input.profiling_group_name
                     ),
                 },
             )
@@ -301,11 +317,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The whole batch is stored in one step, so a refusal is never a partial write.
+        // The write is applied from here on, so this is where the ids it carries are
+        // minted: a channel the request named no id for gets one from the STORE, the way
+        // every UUID-shaped id this crate hands out is minted
+        // (`state::mint_channel_id`), so no second way of making one is introduced here
+        // and no refused request moves the store's mint count.
+        //
+        // `Channel$id`: "A random UUID for channelId is used when adding a channel to the
+        // notification configuration if not specified in the request."
+        let channels: Vec<crate::state::NotificationChannel> = requested
+            .into_iter()
+            .map(|pending| crate::state::NotificationChannel {
+                id: pending
+                    .id
+                    .unwrap_or_else(|| guard.mint_channel_id(&input.profiling_group_name)),
+                uri: pending.uri,
+                event_publishers: pending.event_publishers,
+            })
+            .collect();
+
+        // The group once more, now borrowed for the write — still the same record under
+        // the same unreleased lock, so the `ok_or_else` is that same 404.
+        let group = guard
+            .groups
+            .get_mut(&input.profiling_group_name)
+            .ok_or_else(|| {
+                AddNotificationChannelsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::group_not_found_message(
+                            &input.profiling_group_name,
+                        ),
+                    },
+                )
+            })?;
+
         // `false` is unreachable while the two checks above hold — they are exactly the
-        // setter's own two refusals (a repeated id, the channel bound) — and answering
-        // the modelled server error for it keeps a dropped write from ever being
-        // reported as a stored one.
-        if !group.add_notification_channels(requested) {
+        // setter's own two refusals (a repeated id, the channel bound), and the ids
+        // minted after them repeat nothing — and answering the modelled server error for
+        // it keeps a dropped write from ever being reported as a stored one.
+        if !group.add_notification_channels(channels) {
             return Err(
                 AddNotificationChannelsErrorModeled::InternalServerException(
                     InternalServerException {

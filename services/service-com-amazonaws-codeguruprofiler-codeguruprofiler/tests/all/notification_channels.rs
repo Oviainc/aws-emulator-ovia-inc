@@ -44,7 +44,7 @@ const UNUSED_ID: &str = "cccccccc-1111-2222-3333-444444444444";
 /// One channel as a request body member; `id: None` leaves the id to the service, which
 /// `Channel$id` documents as "A random UUID for channelId is used when adding a channel
 /// to the notification configuration if not specified in the request".
-fn channel_body(id: Option<&str>, uri: &str) -> serde_json::Value {
+pub(crate) fn channel_body(id: Option<&str>, uri: &str) -> serde_json::Value {
     let mut channel = serde_json::Map::new();
     if let Some(id) = id {
         channel.insert("id".to_string(), serde_json::Value::from(id));
@@ -57,7 +57,10 @@ fn channel_body(id: Option<&str>, uri: &str) -> serde_json::Value {
     serde_json::Value::Object(channel)
 }
 
-async fn create_group(harness: &Harness, name: &str) {
+/// `CreateProfilingGroup`: `POST /profilingGroups?clientToken=..`, answered 201.
+/// `pub(crate)` so a sibling suite about this service's notification writes drives the
+/// same senders rather than forking them.
+pub(crate) async fn create_group(harness: &Harness, name: &str) {
     let answer = harness
         .send(
             "POST",
@@ -88,7 +91,9 @@ async fn delete_group(harness: &Harness, name: &str) -> Answer {
         .await
 }
 
-async fn add(harness: &Harness, group: &str, channels: &[serde_json::Value]) -> Answer {
+/// `AddNotificationChannels`:
+/// `POST /profilingGroups/{profilingGroupName}/notificationConfiguration`.
+pub(crate) async fn add(harness: &Harness, group: &str, channels: &[serde_json::Value]) -> Answer {
     harness
         .send(
             "POST",
@@ -100,7 +105,9 @@ async fn add(harness: &Harness, group: &str, channels: &[serde_json::Value]) -> 
         .await
 }
 
-async fn get(harness: &Harness, group: &str) -> Answer {
+/// `GetNotificationConfiguration`:
+/// `GET /profilingGroups/{profilingGroupName}/notificationConfiguration`.
+pub(crate) async fn get(harness: &Harness, group: &str) -> Answer {
     harness
         .send(
             "GET",
@@ -125,7 +132,7 @@ async fn remove(harness: &Harness, group: &str, channel_id: &str) -> Answer {
 /// The channel ids a response's `notificationConfiguration` reports, in order. Panics
 /// (naming the case) when the response carries no channel list at all: a configured or
 /// unconfigured group reports a list either way, an empty one included.
-fn reported_ids(case: &str, answer: &Answer) -> Vec<String> {
+pub(crate) fn reported_ids(case: &str, answer: &Answer) -> Vec<String> {
     let body = answer.json();
     let channels = body
         .get("notificationConfiguration")
@@ -152,7 +159,7 @@ fn reported_ids(case: &str, answer: &Answer) -> Vec<String> {
 /// Whether `value` has the shape the model's `ChannelId` pattern describes,
 /// `[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}` — what a MINTED id
 /// must look like.
-fn is_channel_id(value: &str) -> bool {
+pub(crate) fn is_channel_id(value: &str) -> bool {
     let widths = [8usize, 4, 4, 4, 12];
     let parts: Vec<&str> = value.split('-').collect();
     parts.len() == widths.len()

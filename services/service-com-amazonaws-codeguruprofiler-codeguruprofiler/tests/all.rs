@@ -55,6 +55,8 @@ mod latest_aggregated_profile;
 mod list_pagination;
 #[path = "all/message_timestamp_rendering.rs"]
 mod message_timestamp_rendering;
+#[path = "all/minted_ids_follow_applied_writes.rs"]
+mod minted_ids_follow_applied_writes;
 #[path = "all/not_found_surfaces.rs"]
 mod not_found_surfaces;
 #[path = "all/notification_channels.rs"]
