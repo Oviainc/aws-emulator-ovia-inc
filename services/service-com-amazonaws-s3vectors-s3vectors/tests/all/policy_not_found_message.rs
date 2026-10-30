@@ -14,9 +14,10 @@
 //!
 //! Every row states the case it covers and every assertion reports the actual
 //! value. The rows differ in the bucket name (its length and its characters), in
-//! which input form names the bucket (`vectorBucketName`, `vectorBucketArn`, or
-//! both), and in how the policy came to be absent (never put, put then deleted,
-//! deleted again).
+//! which input form names the bucket (`vectorBucketName` or `vectorBucketArn` — the
+//! two accepted forms are mutually exclusive, so naming both is a refusal of its
+//! own, covered in `selector_validation.rs`), and in how the policy came to be
+//! absent (never put, put then deleted, deleted again).
 
 use serde_json::{json, Value};
 use service_com_amazonaws_s3vectors_s3vectors::state::{BUCKET_NOT_FOUND, POLICY_NOT_FOUND};
@@ -32,15 +33,14 @@ fn message_of(body: &Value) -> String {
         .to_string()
 }
 
-/// How one row names the bucket a policy operation acts on.
+/// How one row names the bucket a policy operation acts on: one of the two
+/// mutually exclusive selector forms.
 #[derive(Debug, Clone, Copy)]
 enum Target {
     /// Only `vectorBucketName`.
     Name,
     /// Only `vectorBucketArn`.
     Arn,
-    /// Both members, naming the same bucket.
-    Both,
 }
 
 impl Target {
@@ -49,10 +49,6 @@ impl Target {
         match self {
             Self::Name => json!({ "vectorBucketName": bucket }),
             Self::Arn => json!({ "vectorBucketArn": expected_bucket_arn(bucket) }),
-            Self::Both => json!({
-                "vectorBucketName": bucket,
-                "vectorBucketArn": expected_bucket_arn(bucket),
-            }),
         }
     }
 }
@@ -128,7 +124,7 @@ async fn assert_policy_absent(
 #[tokio::test]
 async fn an_absent_policy_reports_one_fixed_sentence_whatever_the_request_names() {
     for (name_case, bucket) in bucket_names() {
-        for target in [Target::Name, Target::Arn, Target::Both] {
+        for target in [Target::Name, Target::Arn] {
             let router = router();
             ok(
                 &router,

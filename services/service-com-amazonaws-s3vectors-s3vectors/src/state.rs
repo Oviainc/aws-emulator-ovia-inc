@@ -534,30 +534,42 @@ pub fn validate_bucket_policy(member: &str, policy: &str) -> Result<(), LookupEr
     Ok(())
 }
 
+/// The `ValidationException` message for a bucket selector that is not EXACTLY one
+/// of the two accepted forms, as the service words it: ONE fixed sentence covering
+/// the whole selector rule — naming neither form, or naming both — carrying no value
+/// from the request, so a client that branches on the text matches one constant
+/// string. The "but not both" half is operative: the two forms are mutually
+/// exclusive, so a request carrying both is refused even when they agree. This is the
+/// sentence the real service answered in the recorded response; the status (400) and
+/// the error code (`ValidationException`) are the requirements either way.
+pub const BUCKET_SELECTOR_REFUSED: &str =
+    "Must specify either vectorBucketName or vectorBucketArn but not both";
+
+/// See [`BUCKET_SELECTOR_REFUSED`]: the one fixed sentence for the other selector —
+/// the index pair `vectorBucketName` + `indexName` against `indexArn` — which the
+/// service words in terms of the ARN first. Every selector that is not exactly one
+/// complete form takes it: neither form, half of the name pair, or the ARN alongside
+/// either name.
+pub const INDEX_SELECTOR_REFUSED: &str =
+    "Must specify either indexArn or both vectorBucketName and indexName";
+
 /// Resolve the bucket a request names by `vectorBucketName` or `vectorBucketArn`.
 ///
 /// The operations that take both document "you must use either the vector bucket
-/// name or the vector bucket ARN", so naming neither is refused, and naming both
-/// is accepted only when they agree.
+/// name or the vector bucket ARN": the two forms are MUTUALLY EXCLUSIVE, so a
+/// request names exactly one of them. Naming neither, and naming both — even two
+/// that agree — are the same refusal ([`BUCKET_SELECTOR_REFUSED`]); only the form
+/// that was named is then parsed.
 pub fn resolve_bucket_name(
     name: Option<&str>,
     arn: Option<&str>,
 ) -> Result<String, LookupError> {
-    let from_arn = match arn {
-        Some(arn) => Some(bucket_from_arn("vectorBucketArn", arn)?),
-        None => None,
-    };
-    match (name, from_arn) {
+    match (name, arn) {
         (Some(name), None) => Ok(name.to_string()),
-        (None, Some(from_arn)) => Ok(from_arn),
-        (Some(name), Some(from_arn)) if name == from_arn => Ok(from_arn),
-        (Some(name), Some(from_arn)) => Err(LookupError::invalid_request(format!(
-            "`vectorBucketName` ({name}) and `vectorBucketArn` (bucket {from_arn}) \
-             name different vector buckets"
-        ))),
-        (None, None) => Err(LookupError::invalid_request(
-            "either `vectorBucketName` or `vectorBucketArn` is required",
-        )),
+        (None, Some(arn)) => bucket_from_arn("vectorBucketArn", arn),
+        (Some(_), Some(_)) | (None, None) => {
+            Err(LookupError::invalid_request(BUCKET_SELECTOR_REFUSED))
+        }
     }
 }
 
@@ -565,36 +577,19 @@ pub fn resolve_bucket_name(
 /// `indexArn`.
 ///
 /// The operations that take both document "you can either use both the vector
-/// bucket name and the vector index name, or use the vector index ARN", so a
-/// request must carry one of the two forms, and a request carrying both is
-/// accepted only when they agree.
+/// bucket name and the vector index name, or use the vector index ARN": as with the
+/// bucket selector the two forms are MUTUALLY EXCLUSIVE, so a request carries
+/// exactly one COMPLETE form. Neither form, half of the name pair, and the ARN
+/// alongside either name are the same refusal ([`INDEX_SELECTOR_REFUSED`]).
 pub fn resolve_index_name(
     bucket_name: Option<&str>,
     index_name: Option<&str>,
     index_arn: Option<&str>,
 ) -> Result<(String, String), LookupError> {
-    let from_arn = match index_arn {
-        Some(arn) => Some(index_from_arn("indexArn", arn)?),
-        None => None,
-    };
-    match (bucket_name, index_name, from_arn) {
+    match (bucket_name, index_name, index_arn) {
         (Some(bucket), Some(index), None) => Ok((bucket.to_string(), index.to_string())),
-        (None, None, Some(from_arn)) => Ok(from_arn),
-        (bucket, index, Some((arn_bucket, arn_index))) => {
-            let bucket_ok = bucket.is_none_or(|bucket| bucket == arn_bucket);
-            let index_ok = index.is_none_or(|index| index == arn_index);
-            if bucket_ok && index_ok {
-                Ok((arn_bucket, arn_index))
-            } else {
-                Err(LookupError::invalid_request(format!(
-                    "`indexArn` names index {arn_index} in vector bucket {arn_bucket}, \
-                     which is not the index `vectorBucketName`/`indexName` name"
-                )))
-            }
-        }
-        (_, _, None) => Err(LookupError::invalid_request(
-            "either both `vectorBucketName` and `indexName`, or `indexArn`, is required",
-        )),
+        (None, None, Some(arn)) => index_from_arn("indexArn", arn),
+        _ => Err(LookupError::invalid_request(INDEX_SELECTOR_REFUSED)),
     }
 }
 

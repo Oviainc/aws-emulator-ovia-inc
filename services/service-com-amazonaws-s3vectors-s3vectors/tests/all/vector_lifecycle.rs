@@ -1700,8 +1700,9 @@ async fn list_vector_buckets_and_indexes_page_by_prefix_and_cursor() {
     );
 }
 
-/// A request that names neither accepted form of its target, or two forms that
-/// disagree, is refused; an ARN that is not an ARN of the right resource is too.
+/// A request that names neither accepted form of its target, or BOTH of them
+/// (whether or not they agree), is refused; an ARN that is not an ARN of the right
+/// resource is too.
 #[tokio::test]
 async fn a_target_must_be_named_by_exactly_one_accepted_form() {
     let router = with_index("target-bucket", "target-index", 2, "cosine").await;
@@ -1715,6 +1716,18 @@ async fn a_target_must_be_named_by_exactly_one_accepted_form() {
             "GetVectorBucket",
             json!({ "vectorBucketName": "target-bucket",
                     "vectorBucketArn": expected_bucket_arn("other-bucket") }),
+        ),
+        (
+            "bucket name and ARN agree",
+            "GetVectorBucket",
+            json!({ "vectorBucketName": "target-bucket",
+                    "vectorBucketArn": expected_bucket_arn("target-bucket") }),
+        ),
+        (
+            "index name pair and ARN agree",
+            "GetIndex",
+            json!({ "vectorBucketName": "target-bucket", "indexName": "target-index",
+                    "indexArn": other }),
         ),
         (
             "an index ARN where a bucket ARN belongs",
@@ -1756,21 +1769,23 @@ async fn a_target_must_be_named_by_exactly_one_accepted_form() {
         );
     }
 
-    // Naming the same target twice, consistently, is accepted.
+    // Exactly one complete form resolves the target.
+    let got = ok(&router, "GetIndex", &json!({ "indexArn": other })).await;
+    assert_eq!(
+        got["index"]["indexArn"].as_str(),
+        Some(other.as_str()),
+        "an ARN-only request must resolve, got {got}"
+    );
     let got = ok(
         &router,
         "GetIndex",
-        &json!({
-            "vectorBucketName": "target-bucket",
-            "indexName": "target-index",
-            "indexArn": other,
-        }),
+        &json!({ "vectorBucketName": "target-bucket", "indexName": "target-index" }),
     )
     .await;
     assert_eq!(
         got["index"]["indexArn"].as_str(),
         Some(other.as_str()),
-        "a consistent name-and-ARN request must resolve, got {got}"
+        "a name-pair request must resolve to the same index, got {got}"
     );
 }
 

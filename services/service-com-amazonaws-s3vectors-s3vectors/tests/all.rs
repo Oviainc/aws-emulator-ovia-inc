@@ -27,6 +27,8 @@ mod reserved_tag_keys;
 mod resource_tagging;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/selector_validation.rs"]
+mod selector_validation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_write_conflict.rs"]
