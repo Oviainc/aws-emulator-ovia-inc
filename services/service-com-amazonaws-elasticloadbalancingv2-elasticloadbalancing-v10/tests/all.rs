@@ -47,6 +47,8 @@ mod rule_deletion_and_condition_value_spellings;
 mod rule_modification;
 #[path = "all/rule_priorities.rs"]
 mod rule_priorities;
+#[path = "all/rule_transforms_and_fixed_response_content_type.rs"]
+mod rule_transforms_and_fixed_response_content_type;
 #[path = "all/shared_endpoint_routing.rs"]
 mod shared_endpoint_routing;
 #[path = "all/ssl_policies.rs"]

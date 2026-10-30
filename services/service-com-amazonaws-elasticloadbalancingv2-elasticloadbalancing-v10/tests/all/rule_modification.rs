@@ -25,7 +25,8 @@
 //! forwards to, and which clause a refused request broke.
 
 use crate::listener_rules::{
-    add_rule, create_listener, create_load_balancer, forward_to, host_header, rules_of, Form,
+    add_rule, create_listener, create_load_balancer, forward_to, host_header, host_header_rewrite,
+    rules_of, url_rewrite, Form,
 };
 use crate::provisioning_loop::{
     action, call, create_http_target_group, emulator, first_text, members, p, Reply,
@@ -65,7 +66,9 @@ struct ModifyRow {
     reports: Vec<String>,
     /// Values the rule must NOT report after it.
     omits: Vec<String>,
-    /// Whether the rule still carries any transform.
+    /// Whether the rule still carries any transform. `Rule$Transforms` is reported on
+    /// every rule, so what a modification changes is whether that list has anything in
+    /// it, never whether the member is there.
     transforms: bool,
 }
 
@@ -110,38 +113,6 @@ async fn stored_rule(router: &MultiServiceRouter, case: &str, arn: &str) -> Stri
     single_rule(case, &reply)
 }
 
-/// A host header rewrite transform, which is one of the two types `TransformTypeEnum`
-/// declares (`smithy_query(query="shape",shape="TransformTypeEnum")`:
-/// `host-header-rewrite`, `url-rewrite`).
-fn host_header_rewrite(regex: &str, replace: &str) -> Form {
-    vec![
-        p("Transforms.member.1.Type", "host-header-rewrite"),
-        p(
-            "Transforms.member.1.HostHeaderRewriteConfig.Rewrites.member.1.Regex",
-            regex,
-        ),
-        p(
-            "Transforms.member.1.HostHeaderRewriteConfig.Rewrites.member.1.Replace",
-            replace,
-        ),
-    ]
-}
-
-/// A URL rewrite transform, the other type `TransformTypeEnum` declares.
-fn url_rewrite(regex: &str, replace: &str) -> Form {
-    vec![
-        p("Transforms.member.1.Type", "url-rewrite"),
-        p(
-            "Transforms.member.1.UrlRewriteConfig.Rewrites.member.1.Regex",
-            regex,
-        ),
-        p(
-            "Transforms.member.1.UrlRewriteConfig.Rewrites.member.1.Replace",
-            replace,
-        ),
-    ]
-}
-
 /// The fields every rule under test is created with: one host header condition, one
 /// forwarding action and one transform — so a modification naming any one of the three
 /// can be checked against the two it left alone.
@@ -149,7 +120,7 @@ fn base_rule(target_group: &str) -> Form {
     [
         host_header(BASE_HOST),
         forward_to(target_group),
-        host_header_rewrite("^(.*)\\.example\\.com$", "$1.internal"),
+        host_header_rewrite(1, "^(.*)\\.example\\.com$", "$1.internal"),
     ]
     .concat()
 }
@@ -231,7 +202,7 @@ fn modify_table(group_a: &str, group_b: &str) -> Vec<ModifyRow> {
         ModifyRow {
             case: "the transforms alone are replaced, by a transform of the other type",
             priority: 5,
-            fields: url_rewrite("^/old/(.*)$", "/new/$1"),
+            fields: url_rewrite(1, "^/old/(.*)$", "/new/$1"),
             reports: vec![
                 BASE_HOST.to_string(),
                 group_a.to_string(),
@@ -356,8 +327,14 @@ async fn modifying_a_rule_replaces_only_the_properties_the_request_names() {
                 row.case
             );
         }
+        assert!(
+            stored.contains("<Transforms") && answered.contains("<Transforms"),
+            "case {}: every reported rule carries the Transforms member, got {stored} (the \
+             write answered {answered})",
+            row.case
+        );
         assert_eq!(
-            stored.contains("<Transforms"),
+            first_text(&stored, "Transforms").is_some(),
             row.transforms,
             "case {}: expected transforms reported: {}, got {stored}",
             row.case,
@@ -434,7 +411,7 @@ fn refusal_table(rule_arn: &str, default_arn: &str, unknown_arn: &str, absent_gr
             case: "the transforms to apply named together with the reset",
             fields: [
                 vec![p("RuleArn", rule_arn), p("ResetTransforms", "true")],
-                url_rewrite("^/a$", "/b"),
+                url_rewrite(1, "^/a$", "/b"),
             ]
             .concat(),
             status: 400,
@@ -442,27 +419,12 @@ fn refusal_table(rule_arn: &str, default_arn: &str, unknown_arn: &str, absent_gr
         },
         RefusalRow {
             case: "two transforms of one type",
-            fields: vec![
-                p("RuleArn", rule_arn),
-                p("Transforms.member.1.Type", "url-rewrite"),
-                p(
-                    "Transforms.member.1.UrlRewriteConfig.Rewrites.member.1.Regex",
-                    "^/a$",
-                ),
-                p(
-                    "Transforms.member.1.UrlRewriteConfig.Rewrites.member.1.Replace",
-                    "/b",
-                ),
-                p("Transforms.member.2.Type", "url-rewrite"),
-                p(
-                    "Transforms.member.2.UrlRewriteConfig.Rewrites.member.1.Regex",
-                    "^/c$",
-                ),
-                p(
-                    "Transforms.member.2.UrlRewriteConfig.Rewrites.member.1.Replace",
-                    "/d",
-                ),
-            ],
+            fields: [
+                vec![p("RuleArn", rule_arn)],
+                url_rewrite(1, "^/a$", "/b"),
+                url_rewrite(2, "^/c$", "/d"),
+            ]
+            .concat(),
             status: 400,
             code: VALIDATION_ERROR,
         },

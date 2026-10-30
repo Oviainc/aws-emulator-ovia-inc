@@ -91,7 +91,7 @@ use smithy_server_runtime::http;
 use crate::ops::types::{Action, RuleCondition};
 use crate::state::{
     service_state, ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State as ElbState,
-    ListenerRecord, LoadBalancerFamily, LoadBalancerRecord,
+    ListenerRecord, LoadBalancerFamily, LoadBalancerRecord, DEFAULT_FIXED_RESPONSE_CONTENT_TYPE,
 };
 // How a client ADDRESSES a data plane, from the one reading of it in the tree: the
 // reserved path namespace, the first path segment, the host without its port, the port a
@@ -122,10 +122,6 @@ const SOURCE_IP_FIELD: &str = "source-ip";
 const FIXED_RESPONSE_ACTION: &str = "fixed-response";
 const REDIRECT_ACTION: &str = "redirect";
 const FORWARD_ACTION: &str = "forward";
-
-/// The default `FixedResponseActionConfig$ContentType`: "The content type. Maximum size
-/// is 32 KB. If the value is not specified, the default value is `text/plain`."
-const DEFAULT_FIXED_RESPONSE_CONTENT_TYPE: &str = "text/plain";
 
 /// The status a load balancer answers while it is still coming up: it is publishing a
 /// name, and its listeners are not yet serving traffic on it.

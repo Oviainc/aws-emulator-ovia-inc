@@ -153,12 +153,82 @@ pub(crate) fn forward_to(tg_arn: &str) -> Form {
     ]
 }
 
-/// A fixed-response action answering `status`.
-pub(crate) fn fixed_response(status: &str) -> Form {
-    vec![
+/// A fixed-response action answering `status`, naming the content type and the message
+/// body only where the caller gives them: the two members
+/// `smithy_query(query="shape",shape="FixedResponseActionConfig")` declares beside the
+/// required `StatusCode`.
+///
+/// One builder for the crate, so no suite drifts on how a fixed response is spelled.
+pub(crate) fn fixed_response_configured(
+    status: &str,
+    content_type: Option<&str>,
+    message_body: Option<&str>,
+) -> Form {
+    let mut form = vec![
         p("Actions.member.1.Type", "fixed-response"),
         p("Actions.member.1.FixedResponseConfig.StatusCode", status),
-        p("Actions.member.1.FixedResponseConfig.ContentType", "text/plain"),
+    ];
+    if let Some(content_type) = content_type {
+        form.push(p(
+            "Actions.member.1.FixedResponseConfig.ContentType",
+            content_type,
+        ));
+    }
+    if let Some(message_body) = message_body {
+        form.push(p(
+            "Actions.member.1.FixedResponseConfig.MessageBody",
+            message_body,
+        ));
+    }
+    form
+}
+
+/// A fixed-response action answering `status` with the content type spelled out.
+pub(crate) fn fixed_response(status: &str) -> Form {
+    fixed_response_configured(status, Some("text/plain"), None)
+}
+
+/// The `Transforms.member.<index>` fields of a host header rewrite transform, which is one
+/// of the two types `TransformTypeEnum` declares
+/// (`smithy_query(query="shape",shape="TransformTypeEnum")`: `host-header-rewrite`,
+/// `url-rewrite`).
+///
+/// The index is a parameter so a rule carrying one transform of each type is built from the
+/// same two builders as a rule carrying one.
+pub(crate) fn host_header_rewrite(index: usize, regex: &str, replace: &str) -> Form {
+    vec![
+        p(
+            &format!("Transforms.member.{index}.Type"),
+            "host-header-rewrite",
+        ),
+        p(
+            &format!(
+                "Transforms.member.{index}.HostHeaderRewriteConfig.Rewrites.member.1.Regex"
+            ),
+            regex,
+        ),
+        p(
+            &format!(
+                "Transforms.member.{index}.HostHeaderRewriteConfig.Rewrites.member.1.Replace"
+            ),
+            replace,
+        ),
+    ]
+}
+
+/// The `Transforms.member.<index>` fields of a URL rewrite transform, the other type
+/// `TransformTypeEnum` declares.
+pub(crate) fn url_rewrite(index: usize, regex: &str, replace: &str) -> Form {
+    vec![
+        p(&format!("Transforms.member.{index}.Type"), "url-rewrite"),
+        p(
+            &format!("Transforms.member.{index}.UrlRewriteConfig.Rewrites.member.1.Regex"),
+            regex,
+        ),
+        p(
+            &format!("Transforms.member.{index}.UrlRewriteConfig.Rewrites.member.1.Replace"),
+            replace,
+        ),
     ]
 }
 

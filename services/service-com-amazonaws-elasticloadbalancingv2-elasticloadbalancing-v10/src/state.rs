@@ -2621,8 +2621,8 @@ pub struct RuleRecord {
     pub priority: i32,
     pub conditions: Vec<RuleCondition>,
     pub actions: Vec<Action>,
-    /// The transforms applied to a request this rule matches. Empty is reported as
-    /// nothing rather than as an empty list, which is what a rule carrying none answers.
+    /// The transforms applied to a request this rule matches. A rule carrying none is
+    /// reported with the member PRESENT and empty, never with the member left out.
     pub transforms: Vec<RuleTransform>,
     /// The tags this rule was created with, which `DescribeTags` reports: a listener
     /// rule is a taggable Elastic Load Balancing resource.
@@ -2642,7 +2642,10 @@ impl RuleRecord {
             actions: Some(reported_actions(&self.actions)),
             // Only the rule a listener mints with itself is the default one.
             is_default: Some(false),
-            transforms: (!self.transforms.is_empty()).then(|| self.transforms.clone()),
+            // `Rule$Transforms` is a list member every reported rule carries: a rule with
+            // no transform answers the empty list, which is a different answer from an
+            // absent member.
+            transforms: Some(self.transforms.clone()),
         }
     }
 }
@@ -2953,7 +2956,9 @@ impl ListenerRecord {
             conditions: Some(Vec::new()),
             actions: Some(reported_actions(&self.default_actions)),
             is_default: Some(true),
-            transforms: None,
+            // A default rule carries no transform, and reports that as the empty list
+            // exactly as every other rule does ([`RuleRecord::to_shape`]).
+            transforms: Some(Vec::new()),
         }
     }
 
@@ -3055,9 +3060,16 @@ const KEEP_PORT: &str = "#{port}";
 const KEEP_PATH: &str = "/#{path}";
 const KEEP_QUERY: &str = "#{query}";
 
+/// The value `FixedResponseActionConfig$ContentType` takes when a fixed-response action
+/// names none: "The content type. … If the value is not specified, the default value is
+/// `text/plain`." One of that member's own documented valid values, so an action created
+/// without it is reported — and served — carrying it.
+pub const DEFAULT_FIXED_RESPONSE_CONTENT_TYPE: &str = "text/plain";
+
 /// One action as a read reports it: a redirect's unmodified components answered as the
-/// keywords that retain them ([`KEEP_PROTOCOL`] and the rest), every other action exactly
-/// as it was given.
+/// keywords that retain them ([`KEEP_PROTOCOL`] and the rest), a fixed response's content
+/// type answered as the one the service defaults when the action named none
+/// ([`DEFAULT_FIXED_RESPONSE_CONTENT_TYPE`]), every other action exactly as it was given.
 ///
 /// The ONE normalisation of an action, so a rule's actions, a listener's default actions
 /// and the default rule carrying them all report the same configuration — the stored
@@ -3065,6 +3077,11 @@ const KEEP_QUERY: &str = "#{query}";
 /// [`reported_condition`] does for a condition's two spellings.
 fn reported_action(action: &Action) -> Action {
     let mut reported = action.clone();
+    if let Some(config) = reported.fixed_response_config.as_mut() {
+        if config.content_type.is_none() {
+            config.content_type = Some(DEFAULT_FIXED_RESPONSE_CONTENT_TYPE.to_string());
+        }
+    }
     if let Some(config) = reported.redirect_config.as_mut() {
         let kept = |value: &mut Option<String>, keyword: &str| {
             if value.is_none() {
