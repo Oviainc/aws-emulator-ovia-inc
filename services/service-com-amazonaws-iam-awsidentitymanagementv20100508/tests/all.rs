@@ -37,6 +37,8 @@ mod aws_managed_policy_attachability;
 mod aws_managed_policy_catalog;
 #[path = "all/boundary_and_provider_writes.rs"]
 mod boundary_and_provider_writes;
+#[path = "all/boundary_refusal_message_wording.rs"]
+mod boundary_refusal_message_wording;
 #[path = "all/change_password.rs"]
 mod change_password;
 #[path = "all/composed_condition_context.rs"]

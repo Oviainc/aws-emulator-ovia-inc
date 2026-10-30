@@ -40,7 +40,11 @@ use crate::user_lifecycle::{
 /// order written — the several-statement spelling of
 /// [`crate::identity_policy_enforcement::statement`], which every row needing a single
 /// statement takes instead.
-fn statements(parts: &[(&str, &str, &str)]) -> String {
+///
+/// `pub(crate)` because every suite that layers a grant, a ceiling and a deny in one
+/// document builds it this one way
+/// (`tests/all/boundary_refusal_message_wording.rs`).
+pub(crate) fn statements(parts: &[(&str, &str, &str)]) -> String {
     let written: Vec<String> = parts
         .iter()
         .map(|(effect, action, resource)| {
@@ -122,7 +126,11 @@ async fn put_user_policy(
 
 /// Create the managed policy `policy_name` carrying `document` and set it as
 /// `user_name`'s permissions boundary, answering its ARN.
-async fn attach_boundary(
+///
+/// `pub(crate)` because every suite that puts a caller under a ceiling of its own writing
+/// builds that fixture this one way
+/// (`tests/all/boundary_refusal_message_wording.rs`).
+pub(crate) async fn attach_boundary(
     router: &MultiServiceRouter,
     case: &str,
     user_name: &str,
