@@ -34,7 +34,7 @@ const PAST_TRANSITION: Duration = Duration::from_millis(900);
 /// Cluster ids no cluster carries: the shape a real id has, a shorter and a longer
 /// body, a prefix with nothing after it, and the empty string (`ClusterId` is
 /// `len 0..256`, so the boundary validator passes it on to the handler).
-const UNKNOWN_CLUSTER_IDS: &[&str] = &[
+pub(crate) const UNKNOWN_CLUSTER_IDS: &[&str] = &[
     "j-ZZZZZZZZZZZZZ",
     "j-1",
     "j-000000000000000000000000",
@@ -55,9 +55,10 @@ const MAX_SESSION_MAPPINGS_PER_STUDIO: usize = 500;
 const MAX_INSTANCE_FLEETS_PER_CLUSTER: usize = 50;
 
 /// The bound a batch of job flow ids is capped at: EMR publishes "The maximum number of
-/// clusters allowed is 10" for `TerminateJobFlows` and nothing for
-/// `SetUnhealthyNodeReplacement`, so the emulator takes the same number for both.
-const MAX_JOB_FLOW_IDS_PER_REQUEST: usize = 10;
+/// clusters allowed is 10" for `TerminateJobFlows` and nothing for the `Set*` operations
+/// carrying the same `JobFlowIds` member, so the emulator takes the same number for all
+/// of them.
+pub(crate) const MAX_JOB_FLOW_IDS_PER_REQUEST: usize = 10;
 
 /// A request body for each cluster-id mutation, with `<cluster>` standing in for the
 /// cluster id under test.

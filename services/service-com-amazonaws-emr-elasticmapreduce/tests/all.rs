@@ -69,3 +69,5 @@ mod studio_session_mapping_listing;
 mod supported_instance_types;
 #[path = "all/tag_character_class.rs"]
 mod tag_character_class;
+#[path = "all/termination_protection.rs"]
+mod termination_protection;
