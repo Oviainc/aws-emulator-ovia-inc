@@ -1,0 +1,40 @@
+Issue-Severity: LOW
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: opensearch.disabled-operation-gating-across-readonly-apis
+Issue-Shape-Id: com.amazonaws.opensearch#AmazonOpenSearchService
+Issue-Key: opensearch.disabled-operation-gating-across-readonly-apis|_wait_domain_active#24|Timeout|time.sleep(interval_s)
+Issue-Commit: 7c99236ae825318ea39609d7816a78954799ef34
+
+# opensearch: a CreateDomain + UpdateDomainConfig sequence never reaches an idle domain in time — DescribeDomain still reports Processing=true on the read that immediately follows each call, so a poll-based wait-for-active stalls the check
+
+> _Note: this issue was identified against the code base at commit `7c99236ae825318ea39609d7816a78954799ef34`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+DescribeDomain
+
+## Description
+Cause 1 of 1: a check that creates a domain, waits for it to go idle, then calls UpdateDomainConfig and waits for it to go idle a second time never gets a response for its later assertions — it is killed by the suite's 60 s per-check budget before StartDomainMaintenance eligibility is ever exercised. Failing check: opensearch.disabled-operation-gating-across-readonly-apis.
+
+AWS: Smithy: DescribeDomain -> DomainStatus.Processing — "The status of the domain configuration. True if OpenSearch Service is processing configuration changes. False if the configuration is active." DomainStatus.DomainProcessingStatus carries Creating / Modifying / Active. AWS therefore does report Processing=true while a create or a configuration change is in flight; nothing in the model states how long the transient window lasts (recorded behavior only — the recording shows the domain eventually settling to Processing=false, DomainProcessingStatus=Active, with Endpoint published).
+
+Emulator: the emulator reproduces the transient state but on a window of its own choosing: services/service-com-amazonaws-opensearch-amazonopensearchservice/src/state.rs declares PROVISIONING = Duration::from_millis(500) and sets processing/processing_status=Creating on CreateDomain and Modifying on an UpdateDomainConfig that changes something, materialising the settle only when a later call reads the record. The first DescribeDomain after each call therefore always answers Processing=true (observed directly in this suite: a just-created domain reads Processing: True, DomainProcessingStatus: 'Creating', ChangeProgressDetails.ConfigChangeStatus: 'ApplyingChanges'). A client that polls on a 30 s interval — as this check does — consumes one whole interval per transition, so two transitions (create, then update) consume the entire 60 s budget and the check is terminated with "Check timed out after 60.0s" before any of its control-plane assertions run. No assertion failure is reported: nothing after the second wait was exercised, so StartDomainMaintenance RESTART_SEARCH_PROCESS eligibility at 3 data nodes, GetDomainMaintenanceStatus and ListDomainMaintenances visibility on this path remain unverified.
+
+Why: a client that waits for an idle domain between two control-plane calls — the documented way to sequence CreateDomain and UpdateDomainConfig — gets no usable progress signal from the first read it makes: Processing is always true on it, and the domain only settles when polled again. Anything that drives two configuration transitions back to back (scale-out then maintenance, create then update) therefore spends its whole deadline in waits against an emulator whose work actually completed in half a second, and callers see the operations that follow as unreachable rather than as served.
+
+Hypothesis: the emulator can close this without discarding the transient state by letting the settle fall due on the SAME read that materialises it once the owed work is complete (i.e. publishing Processing=false/DomainProcessingStatus=Active as soon as the 500 ms window has elapsed at read time rather than only on the following poll), or by making the provisioning window short enough relative to a conventional poll interval that a single wait does not cost a full interval.
+
+Fix: the domain state machine's settle/materialise path and the PROVISIONING window in the service's state module, together with the DescribeDomain projection that reports Processing / DomainProcessingStatus / ChangeProgressDetails from it. File and line citations: services/service-com-amazonaws-opensearch-amazonopensearchservice/src/state.rs:431 (PROVISIONING = 500 ms), :4789-4793 and :5036-5043 (settle on a later read), :5329-5333 (DomainStatus.DomainProcessingStatus projection).
+
+Traces: opensearch.disabled-operation-gating-across-readonly-apis (the only surviving failure in this suite run that is not already owned by an open issue or blocked by a filed unimplemented-operation issue).
+
+## Evidence
+Expected: the check completes its sequence — CreateDomain, wait for an idle domain, StartDomainMaintenance(RESTART_SEARCH_PROCESS) refused with ResourceNotFoundException on a 1-data-node domain with no maintenance record written, the fabricated-id reads refused rather than fabricated, ListVpcEndpointsForDomain = [], then UpdateDomainConfig to 3 data nodes, wait for an idle domain, and the same StartDomainMaintenance accepted and visible in ListDomainMaintenances.
+
+Actual: suite verdict [mismatch] opensearch.disabled-operation-gating-across-readonly-apis, detail "Error: Check timed out after 60.0s". No response assertion failed; the check never returned. Each wait-for-active loop reads DescribeDomain and, because DomainStatus.Processing is true on the read taken immediately after CreateDomain and again immediately after UpdateDomainConfig, sleeps its 30 s poll interval — two intervals exhaust the 60 s budget. Emulator state backing this: PROVISIONING = Duration::from_millis(500) with processing_status Creating/Modifying until a later read materialises the settle (state.rs:431, :4789-4793, :5036-5043). A just-created domain in this same suite run reads: 'Processing': True, 'DomainProcessingStatus': 'Creating', 'ChangeProgressDetails': {'ConfigChangeStatus': 'ApplyingChanges', ...} (domain name, ARN, endpoint host and timestamps in that payload are per-run values, not part of the requirement).
+
+## Steps to Reproduce
+1. CreateDomain with DomainName=<any valid name>, EngineVersion=OpenSearch_2.11, ClusterConfig={InstanceType: t3.small.search, InstanceCount: 1, DedicatedMasterEnabled: false, ZoneAwarenessEnabled: false}, EBSOptions={EBSEnabled: true, VolumeType: gp3, VolumeSize: 10}.
+2. Immediately call DescribeDomain on that name: DomainStatus.Processing is true and DomainProcessingStatus is 'Creating'. Poll on a 30 s interval until Created=true, Processing=false and Endpoint is present — the settle only appears on the second poll, i.e. ~30 s after a create the emulator completed in 500 ms.
+3. Call UpdateDomainConfig(DomainName=<name>, ClusterConfig={InstanceCount: 3}), then immediately DescribeDomain again: Processing is true (DomainProcessingStatus 'Modifying'), so the same 30 s-interval wait costs another full interval.
+4. With a 60 s per-check deadline the sequence is killed here, before StartDomainMaintenance(Action=RESTART_SEARCH_PROCESS, NodeId=<a DescribeDomainNodes data NodeId>) and the ListDomainMaintenances read that follow it are ever issued. Replay: opensearch.disabled-operation-gating-across-readonly-apis.
