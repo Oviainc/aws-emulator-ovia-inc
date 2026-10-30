@@ -3126,6 +3126,44 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
             .any(|record| record.request_id == request_id)
     }
 
+    /// Drop the permission set `permission_set_arn` names under `instance_arn`, and every
+    /// row the store holds FOR it: the copies its provisionings delivered, the
+    /// provisionings themselves, the assignments made from it and the status records
+    /// reporting on those assignments.
+    ///
+    /// The provisionings go because one of them can still be IN FLIGHT: an unapplied
+    /// record is a write the clock owes, and [`Self::materialize_due_provisionings`]
+    /// applies what is owed whether or not anybody called, so a record left behind would
+    /// deliver a copy of a permission set no reader can see — the very copies
+    /// [`Self::forget_provisioned_copies`] had just forgotten. Dropping the owed write
+    /// with the resource it reports on is what [`Self::remove_instance`] already does one
+    /// level up, and it is the same rule: a resource that no longer exists holds no rows
+    /// and owes no work, so nothing can be written for it after it has gone.
+    pub fn remove_permission_set(&mut self, instance_arn: &str, permission_set_arn: &str) {
+        self.permission_sets.remove(permission_set_arn);
+        self.forget_provisioned_copies(instance_arn, permission_set_arn);
+        self.permission_set_provisionings.retain(|record| {
+            record.instance_arn != instance_arn || record.permission_set_arn != permission_set_arn
+        });
+        let withdrawn: Vec<String> = self
+            .account_assignments
+            .iter()
+            .filter(|row| {
+                row.instance_arn == instance_arn && row.permission_set_arn == permission_set_arn
+            })
+            .map(|row| row.request_id.clone())
+            .collect();
+        self.account_assignments.retain(|row| {
+            row.instance_arn != instance_arn || row.permission_set_arn != permission_set_arn
+        });
+        for request_id in &withdrawn {
+            self.assignment_operations.remove(request_id);
+        }
+        self.assignment_deletions.retain(|record| {
+            record.instance_arn != instance_arn || record.permission_set_arn != permission_set_arn
+        });
+    }
+
     /// Drop the instance `instance_arn` names and everything held INSIDE it.
     ///
     /// A permission set, an account assignment, a trusted token issuer and an

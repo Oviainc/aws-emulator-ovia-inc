@@ -7,7 +7,9 @@
 //! The removal is observable to the next reader: `DescribePermissionSet` answers
 //! `ResourceNotFoundException` and `ListPermissionSets` no longer carries the ARN. The
 //! assignments go with it because an assignment names the permission set it grants —
-//! leaving the rows behind would keep a grant of a permission set that no longer exists.
+//! leaving the rows behind would keep a grant of a permission set that no longer exists —
+//! and so does the WORK still owed on it: a provisioning the clock has not applied yet is
+//! dropped rather than left to deliver a copy of a permission set nothing holds.
 //!
 //! ## Shape of an operation
 //!
@@ -191,30 +193,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             })?;
 
-        store.permission_sets.remove(&input.permission_set_arn);
-        // A permission set that no longer exists is provisioned nowhere, so the copies
-        // its provisionings delivered go with it.
-        store.forget_provisioned_copies(&input.instance_arn, &input.permission_set_arn);
-        // The assignments that referenced the deleted permission set go with it, and so
-        // do their creation-status records: a status record exists to report on one
-        // assignment, so keeping it after that assignment is gone would both report
-        // work on a resource no reader can see and hold store capacity for it forever.
-        let removed: Vec<String> = store
-            .account_assignments
-            .iter()
-            .filter(|row| {
-                row.instance_arn == input.instance_arn
-                    && row.permission_set_arn == input.permission_set_arn
-            })
-            .map(|row| row.request_id.clone())
-            .collect();
-        store.account_assignments.retain(|row| {
-            row.instance_arn != input.instance_arn
-                || row.permission_set_arn != input.permission_set_arn
-        });
-        for request_id in removed {
-            store.assignment_operations.remove(&request_id);
-        }
+        // A permission set that no longer exists holds no rows and owes no work: the
+        // copies its provisionings delivered, the provisionings themselves (including one
+        // the clock has not applied yet, which would otherwise re-deliver a copy of a
+        // permission set no reader can see), the assignments made from it and the status
+        // records reporting on those assignments all go with it — keeping any of them
+        // would report work on, or store state for, a resource nothing holds. That
+        // removal is ONE rule over the whole store, so it lives in `crate::state` beside
+        // the instance-level sibling that keeps it for everything held under an instance.
+        store.remove_permission_set(&input.instance_arn, &input.permission_set_arn);
         Ok(DeletePermissionSetOutput {})
     }
 }
