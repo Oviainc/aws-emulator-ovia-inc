@@ -3,7 +3,8 @@
 //! Engine state for the com-amazonaws-codestarconnections-codestar-connections-20191201 service.
 //!
 //! This module owns the service's persisted resources (connections, repository links,
-//! hosts, sync blockers, the sync state recorded per resource, and their tags) plus the few request-derived helpers every handler needs: the ARN namespace, the
+//! hosts, sync blockers, the sync state recorded per resource and per linked repository
+//! branch, and their tags) plus the few request-derived helpers every handler needs: the ARN namespace, the
 //! region the caller signed for, and the `NextToken` codec the paginated list
 //! operations share. `src/lib.rs` is generated, so a helper several handlers reach
 //! lives here rather than in a module of its own.
@@ -15,8 +16,8 @@ use std::hash::BuildHasher;
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    Connection, Host, RepositoryLinkInfo, ResourceSyncAttempt, Revision, SyncBlocker,
-    SyncBlockerContext, SyncBlockerSummary, Tag, VpcConfiguration,
+    Connection, Host, RepositoryLinkInfo, RepositorySyncAttempt, ResourceSyncAttempt, Revision,
+    SyncBlocker, SyncBlockerContext, SyncBlockerSummary, Tag, VpcConfiguration,
 };
 
 /// This service's ARN namespace (`awsService.arnNamespace` in the Smithy model), used
@@ -396,6 +397,25 @@ pub fn resource_sync_key(sync_type: &str, resource_name: &str) -> (String, Strin
     (sync_type.to_string(), resource_name.to_string())
 }
 
+/// The key a REPOSITORY's sync attempt is stored under: the
+/// `(SyncType, RepositoryLinkId, Branch)` triple `GetRepositorySyncStatus` addresses one
+/// by (`smithy_query(query="operation", operation="GetRepositorySyncStatus")` — all three
+/// members are `@required`), so a sync of one branch of a linked repository is a record of
+/// its own and never answers for another branch, another link or another sync type.
+///
+/// One function, so a writer and a reader can never disagree about the field order.
+pub fn repository_sync_key(
+    sync_type: &str,
+    repository_link_id: &str,
+    branch: &str,
+) -> (String, String, String) {
+    (
+        sync_type.to_string(),
+        repository_link_id.to_string(),
+        branch.to_string(),
+    )
+}
+
 /// Per-service state for com-amazonaws-codestarconnections-codestar-connections-20191201. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
@@ -425,6 +445,17 @@ pub struct ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
     ///
     /// Only a sync the service performed writes here; see [`StoredResourceSyncState`].
     pub resource_sync_states: BTreeMap<(String, String), StoredResourceSyncState>,
+    /// The latest repository sync attempt recorded against each
+    /// `(SyncType, RepositoryLinkId, Branch)` triple, keyed by [`repository_sync_key`] —
+    /// the same triple `GetRepositorySyncStatus` addresses.
+    ///
+    /// A repository sync is performed by the service's Git-sync component (it pushes and
+    /// pulls a remote repository's commits), which this emulator does not run, so — like
+    /// [`resource_sync_states`](Self::resource_sync_states) and
+    /// [`sync_blockers`](Self::sync_blockers) — this map holds whatever that side of the
+    /// service has put there and nothing is synthesised for work nothing ran: a triple
+    /// holding no attempt has no sync history, which is an ABSENT resource.
+    pub repository_sync_attempts: BTreeMap<(String, String, String), RepositorySyncAttempt>,
     /// Tags by resource ARN, shared by `TagResource` / `UntagResource` /
     /// `ListTagsForResource` and populated from `CreateConnection.Tags` /
     /// `CreateHost.Tags`.
@@ -983,6 +1014,21 @@ pub fn repository_link_not_found_message(repository_link_id: &str) -> String {
         ),
         TAIL_RESOURCE_NOT_FOUND,
     )
+}
+
+/// What the repository-sync surface answers for a `(RepositoryLinkId, Branch, SyncType)`
+/// triple it holds no sync attempt for: the link whose sync status was asked for and could
+/// not be found.
+///
+/// The template is the one the live service answers this call with (corpus
+/// `simparity-behavioral-aws-v1`, unit
+/// `codestar-connections.get-repository-sync-status-without-history-rejected`, which
+/// asserts the whole message): the FIXED sentence below with the requested
+/// `RepositoryLinkId` in it. Unlike the refusals this front raises out of its Git-sync
+/// component ([`with_framework_tail`]) this one carries no tail, and it names the link
+/// rather than the branch.
+pub fn repository_sync_status_not_found_message(repository_link_id: &str) -> String {
+    format!("Could not find a sync status for repository link: {repository_link_id}")
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRepositorySyncStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRepositorySyncStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the repository sync attempt [`crate::state`] has recorded against
+//! the requested `(SyncType, RepositoryLinkId, Branch)` triple, and refuses a triple it
+//! holds none for with the modelled `ResourceNotFoundException`. A pure report — nothing
+//! is written. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRepositorySyncStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A triple with no recorded attempt is a REFUSAL here, unlike `GetResourceSyncStatus`'s
+//! empty success: this operation's output carries the single `@required` member
+//! `LatestSync`, so there is no success that reports "this branch has never synced" — the
+//! sync status of a branch that has none is an absent resource. The link itself resolving
+//! to nothing is the same absence, worded as every other reader of a `RepositoryLinkId`
+//! words it ([`crate::state::repository_link_not_found_message`]).
+//!
+//! A repository sync attempt is recorded by the service's Git-sync component, which this
+//! emulator does not run (nothing here pushes to or pulls from a remote repository), so no
+//! attempt, status or event is ever synthesised here for work nothing ran: this reader
+//! reports whatever is recorded for the triple, however it got there, out of the one
+//! `RepositorySyncAttempt` the store holds under [`crate::state::repository_sync_key`].
+//!
+//! The modelled `AccessDeniedException` is deliberately never returned: the emulator
+//! verifies every request signature up front and models no per-principal policy for a
+//! sync-status read, so there is no authorization decision this handler could make.
 //!
 //! ## Shape of an operation
 //!
@@ -152,20 +164,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // Unused: the sync status is addressed entirely by the request body's
+        // `(SyncType, RepositoryLinkId, Branch)` triple, so no request metadata enters
+        // the answer.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRepositorySyncStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRepositorySyncStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRepositorySyncStatus"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetRepositorySyncStatusErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "CodeStar connections state is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `SyncType` is a modeled enum, and `RepositoryLinkId` and `Branch` carry modeled
+        // constraints, so a value outside any of them is refused before this handler runs:
+        // the triple below is well-formed, and the only question left is whether it
+        // resolves.
+        let store = state.lock();
+
+        // An id this service holds no link under names a resource that is ABSENT, so the
+        // read is refused exactly as the link's own readers refuse it rather than as "this
+        // branch has no sync history".
+        if !store
+            .repository_links
+            .contains_key(&input.repository_link_id)
+        {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                GetRepositorySyncStatusErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::repository_link_not_found_message(
+                            &input.repository_link_id,
+                        )),
+                    },
+                ),
+                crate::state::REPOSITORY_LINK_NOT_FOUND_STATUS,
+            ));
+        }
+
+        // A pure read: the report is the attempt this service has RECORDED for the
+        // addressed triple and nothing else. A triple it holds no attempt for has no sync
+        // status to report — the output's one member is `@required` — so it is refused as
+        // an absence instead of being answered with a synthesised attempt.
+        let key = crate::state::repository_sync_key(
+            &input.sync_type,
+            &input.repository_link_id,
+            &input.branch,
+        );
+        let Some(latest_sync) = store.repository_sync_attempts.get(&key).cloned() else {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                GetRepositorySyncStatusErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::repository_sync_status_not_found_message(
+                            &input.repository_link_id,
+                        )),
+                    },
+                ),
+                crate::state::RESOURCE_NOT_FOUND_STATUS,
+            ));
+        };
+
+        Ok(GetRepositorySyncStatusOutput { latest_sync })
     }
 }
