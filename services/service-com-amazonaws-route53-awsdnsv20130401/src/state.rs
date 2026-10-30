@@ -231,6 +231,16 @@ pub const ENDPOINT_HEALTH_CHECK_TYPES: &[&str] =
 /// (`HealthCheckType` enum).
 pub const STRING_MATCH_HEALTH_CHECK_TYPES: &[&str] = &["HTTP_STR_MATCH", "HTTPS_STR_MATCH"];
 
+/// The `HealthCheckType` values whose probe negotiates TLS with the endpoint
+/// (`HealthCheckType` enum).
+///
+/// `HealthCheckType`'s own documentation: an `HTTPS` check "submits an HTTPS
+/// request" and an `HTTPS_STR_MATCH` check "submits an HTTPS request and
+/// searches ... the response body" — and "if you specify HTTPS for the value of
+/// Type, the endpoint must support TLS". These are therefore the types a
+/// `client_hello` is sent for at all, which is what `EnableSNI` is about.
+pub const TLS_HEALTH_CHECK_TYPES: &[&str] = &["HTTPS", "HTTPS_STR_MATCH"];
+
 /// The `HealthCheckType` that checks a TCP connection to the endpoint, rather
 /// than a response to a request (`HealthCheckType` enum).
 pub const HEALTH_CHECK_TYPE_TCP: &str = "TCP";
@@ -261,6 +271,30 @@ pub const DEFAULT_REQUEST_INTERVAL: i32 = 30;
 /// specify a value for FailureThreshold, the default value is three health
 /// checks."
 pub const DEFAULT_FAILURE_THRESHOLD: i32 = 3;
+
+/// Whether Route 53 measures the latency to the endpoint of a health check that
+/// asks for nothing either way.
+///
+/// `HealthCheckConfig$MeasureLatency` asks the service to "measure the latency
+/// between health checkers in multiple Amazon Web Services regions and your
+/// endpoint, and to display CloudWatch latency graphs" — extra work on the
+/// check, so it is done only for a check that asks for it.
+pub const DEFAULT_MEASURE_LATENCY: bool = false;
+
+/// Whether the status of a health check that asks for nothing either way is
+/// inverted.
+///
+/// `HealthCheckConfig$Inverted` asks the service "to invert the status of a
+/// health check, for example, to consider a health check unhealthy when it
+/// otherwise would be considered healthy", so a check that asks for nothing
+/// reports the status it was assessed to have.
+pub const DEFAULT_INVERTED: bool = false;
+
+/// Whether a health check that asks for nothing either way is stopped.
+///
+/// `HealthCheckConfig$Disabled` "stops Route 53 from performing health checks",
+/// and a check the account just asked for is one Route 53 performs.
+pub const DEFAULT_DISABLED: bool = false;
 
 /// The version a newly created health check carries.
 ///
@@ -1328,18 +1362,56 @@ fn first_address_in(cidr: &str) -> Option<String> {
 /// `config` with the values the service fills in for a member the caller left
 /// out, so what the store holds is what the service would report.
 ///
-/// Only the endpoint-based types take these two members —
-/// `HealthCheckConfig$RequestInterval` and `$FailureThreshold` both state that
-/// they are "not supported when you specify a value for Type of
-/// RECOVERY_CONTROL", and the other two types read a CloudWatch alarm or combine
-/// child health checks rather than probing an endpoint — so a check of another
-/// type keeps exactly the configuration it was created with.
+/// A `HealthCheckConfig` member the service decides the behaviour of is
+/// MATERIALISED here, with the value that behaviour amounts to, and every member
+/// a check's `Type` has no behaviour for is left absent:
+///
+/// * `RequestInterval` and `FailureThreshold` carry the intervals their own
+///   documentation names ("If you don't specify a value for RequestInterval, the
+///   default value is 30 seconds", "if you don't specify a value for
+///   FailureThreshold, the default value is three health checks"), and both are
+///   "not supported when you specify a value for Type of RECOVERY_CONTROL" —
+///   so they belong to the types that probe an endpoint
+///   ([`ENDPOINT_HEALTH_CHECK_TYPES`]).
+/// * `MeasureLatency` ("whether you want Amazon Route 53 to measure the latency
+///   between health checkers ... and your endpoint") describes a probe of an
+///   endpoint, is likewise "not supported ... for Type of RECOVERY_CONTROL", and
+///   a check that measures nothing by itself is one that does not measure
+///   latency.
+/// * `EnableSNI` ("whether you want Amazon Route 53 to send the value of
+///   FullyQualifiedDomainName to the endpoint in the client_hello message during
+///   TLS negotiation") belongs to the same probing types, and the behaviour it
+///   describes is what a probe that negotiates TLS does unless it is turned off
+///   ([`TLS_HEALTH_CHECK_TYPES`]); a probe that negotiates none sends no
+///   `client_hello` at all.
+/// * `Inverted` ("whether you want Amazon Route 53 to invert the status of a
+///   health check") and `Disabled` ("stops Route 53 from performing health
+///   checks") are about the check's own status, which every type has, and a
+///   check neither inverted nor stopped is one whose status is reported as
+///   assessed.
+/// * `ChildHealthChecks` is "(CALCULATED Health Checks Only) ... one
+///   ChildHealthCheck element for each health check that you want to associate
+///   with a CALCULATED health check", so the check whose health is a function of
+///   that list carries the list — empty when it names none, which is a different
+///   answer from a type that has no child list at all.
 pub fn health_check_config_with_defaults(config: &HealthCheckConfig) -> HealthCheckConfig {
     let mut filled = config.clone();
-    if ENDPOINT_HEALTH_CHECK_TYPES.contains(&filled.r#type.as_str()) {
+    let kind = filled.r#type.clone();
+    if ENDPOINT_HEALTH_CHECK_TYPES.contains(&kind.as_str()) {
         filled.request_interval = Some(filled.request_interval.unwrap_or(DEFAULT_REQUEST_INTERVAL));
         filled.failure_threshold =
             Some(filled.failure_threshold.unwrap_or(DEFAULT_FAILURE_THRESHOLD));
+        filled.measure_latency = Some(filled.measure_latency.unwrap_or(DEFAULT_MEASURE_LATENCY));
+        filled.enable_sni = Some(
+            filled
+                .enable_sni
+                .unwrap_or_else(|| TLS_HEALTH_CHECK_TYPES.contains(&kind.as_str())),
+        );
+    }
+    filled.inverted = Some(filled.inverted.unwrap_or(DEFAULT_INVERTED));
+    filled.disabled = Some(filled.disabled.unwrap_or(DEFAULT_DISABLED));
+    if kind == HEALTH_CHECK_TYPE_CALCULATED && filled.child_health_checks.is_none() {
+        filled.child_health_checks = Some(Vec::new());
     }
     filled
 }

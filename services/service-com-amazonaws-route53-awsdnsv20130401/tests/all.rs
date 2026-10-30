@@ -37,6 +37,10 @@ mod error_envelope;
 mod geo_locations;
 #[path = "all/geolocation_routing.rs"]
 mod geolocation_routing;
+// Declared beside the other health-check suites: this one is the members of a
+// `HealthCheckConfig` the service decides for a request that leaves them out.
+#[path = "all/health_check_config_defaults.rs"]
+mod health_check_config_defaults;
 #[path = "all/health_check_creation.rs"]
 mod health_check_creation;
 // Declared beside the other health-check suites: this one is the `ChildHealthChecks`
