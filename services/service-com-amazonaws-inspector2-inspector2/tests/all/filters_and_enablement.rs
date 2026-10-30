@@ -36,7 +36,7 @@ fn resource_member(resource_type: &str) -> &'static str {
 
 /// A router holding only this service, over its own engine, so each test starts from
 /// empty state.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -48,7 +48,7 @@ fn router() -> MultiServiceRouter {
 
 /// POST a restJson1 request, signed for `region` so the service claims it and can read
 /// the region out of the SigV4 credential scope.
-async fn post_in(
+pub(crate) async fn post_in(
     router: &MultiServiceRouter,
     region: &str,
     uri: &str,

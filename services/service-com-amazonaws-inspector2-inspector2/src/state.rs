@@ -167,6 +167,26 @@ impl ComAmazonawsInspector2Inspector2State {
             &format!("owner/{owner_id}/filter/{id}"),
         )
     }
+
+    /// The aggregation rows the findings this service has recorded roll up to, for one
+    /// `AggregationType` token.
+    ///
+    /// Amazon Inspector counts an aggregation over the findings its own scans produced:
+    /// one row per key of the requested aggregation — an account, a repository, an image
+    /// layer — and a key no finding falls under is left OUT of the answer rather than
+    /// reported with zero counts. This store records account enablement and suppression
+    /// filters, and no finding: Inspector mints a finding from a scan it runs itself and
+    /// no operation of this API submits one, so nothing has recorded a finding for any
+    /// account the store knows. The roll-up of that finding set is no rows at all — for
+    /// every aggregation type, and whatever `accountIds` or aggregation-request filter a
+    /// call carries, since an empty set has nothing for a filter to keep or drop. Rows
+    /// appear here as soon as there are recorded findings to count.
+    pub fn finding_aggregation(
+        &self,
+        _aggregation_type: &str,
+    ) -> Vec<crate::ops::types::AggregationResponse> {
+        Vec::new()
+    }
 }
 
 /// The region this request is signed for, or [`DEFAULT_REGION`] when it is unsigned.

@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/filters_and_enablement.rs"]
 mod filters_and_enablement;
+#[path = "all/finding_aggregations.rs"]
+mod finding_aggregations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

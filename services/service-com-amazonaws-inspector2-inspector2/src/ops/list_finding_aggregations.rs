@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFindingAggregations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFindingAggregations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: answers the roll-up of the findings this service has recorded, for the
+//! aggregation type the request names, and refuses an `aggregationRequest` that is not
+//! the aggregation that type names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFindingAggregations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `aggregationType` and `aggregationRequest` describe the SAME aggregation — the first
+//! names it, the second carries that aggregation's filters — so a request pairing a type
+//! with another aggregation's filters is refused with the operation's modelled
+//! `ValidationException` rather than answered. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +130,77 @@ impl From<ListFindingAggregationsErrorModeled> for ListFindingAggregationsError 
     }
 }
 
+/// The `AggregationRequest` union member that carries the filters of one
+/// `AggregationType` token, or `None` for a token this model does not declare.
+///
+/// `aggregationType` names the aggregation and `aggregationRequest` carries that same
+/// aggregation's filters, so exactly one union member goes with each token; the pairing
+/// below is the model's own, member for token.
+///
+/// Source: `smithy_query(query="shape", shape="AggregationType,AggregationRequest")`.
+fn aggregation_member_for(aggregation_type: &str) -> Option<&'static str> {
+    Some(match aggregation_type {
+        "ACCOUNT" => "accountAggregation",
+        "AMI" => "amiAggregation",
+        "AWS_EC2_INSTANCE" => "ec2InstanceAggregation",
+        "AWS_ECR_CONTAINER" => "awsEcrContainerAggregation",
+        "AWS_LAMBDA_FUNCTION" => "lambdaFunctionAggregation",
+        "CODE_REPOSITORY" => "codeRepositoryAggregation",
+        "CONTAINER_IMAGE" => "containerImageAggregation",
+        "FINDING_TYPE" => "findingTypeAggregation",
+        "IMAGE_LAYER" => "imageLayerAggregation",
+        "LAMBDA_LAYER" => "lambdaLayerAggregation",
+        "PACKAGE" => "packageAggregation",
+        "REPOSITORY" => "repositoryAggregation",
+        "SERVERLESS_FUNCTION" => "serverlessFunctionAggregation",
+        "TITLE" => "titleAggregation",
+        "VM_INSTANCE" => "vmInstanceAggregation",
+        _ => return None,
+    })
+}
+
+/// The union member the request's `aggregationRequest` carries, under the name the wire
+/// gives it.
+fn carried_member(request: &AggregationRequest) -> &'static str {
+    match request {
+        AggregationRequest::accountAggregation(_) => "accountAggregation",
+        AggregationRequest::amiAggregation(_) => "amiAggregation",
+        AggregationRequest::awsEcrContainerAggregation(_) => "awsEcrContainerAggregation",
+        AggregationRequest::ec2InstanceAggregation(_) => "ec2InstanceAggregation",
+        AggregationRequest::findingTypeAggregation(_) => "findingTypeAggregation",
+        AggregationRequest::imageLayerAggregation(_) => "imageLayerAggregation",
+        AggregationRequest::packageAggregation(_) => "packageAggregation",
+        AggregationRequest::repositoryAggregation(_) => "repositoryAggregation",
+        AggregationRequest::titleAggregation(_) => "titleAggregation",
+        AggregationRequest::lambdaLayerAggregation(_) => "lambdaLayerAggregation",
+        AggregationRequest::lambdaFunctionAggregation(_) => "lambdaFunctionAggregation",
+        AggregationRequest::codeRepositoryAggregation(_) => "codeRepositoryAggregation",
+        AggregationRequest::vmInstanceAggregation(_) => "vmInstanceAggregation",
+        AggregationRequest::containerImageAggregation(_) => "containerImageAggregation",
+        AggregationRequest::serverlessFunctionAggregation(_) => "serverlessFunctionAggregation",
+    }
+}
+
+/// Refuse the request with this operation's modelled `ValidationException`: HTTP 400, a
+/// `ValidationExceptionReason` token for why the value could not be used, and the member
+/// that carried it.
+fn refuse(
+    reason: &str,
+    member: &str,
+    message: String,
+    member_message: String,
+) -> ListFindingAggregationsError {
+    ListFindingAggregationsErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: reason.to_string(),
+        fields: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: member_message,
+        }]),
+    })
+    .into()
+}
+
 /// The `ListFindingAggregations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -166,18 +237,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFindingAggregations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFindingAggregationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFindingAggregations"))
+        let _ = ctx;
+        // An aggregation reports recorded state, so a call that cannot reach this
+        // service's store has to fail rather than report a roll-up it never read.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListFindingAggregationsErrorModeled::InternalServerException(InternalServerException {
+                message: "Amazon Inspector finding state is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        // `aggregationType` is modelled as an enum, so the boundary validator has
+        // already refused a token outside `AggregationType` by the time this runs; a
+        // token that pairs with no union member is still refused as a bad value rather
+        // than answered with some other aggregation's roll-up.
+        let expected_member = aggregation_member_for(&input.aggregation_type).ok_or_else(|| {
+            refuse(
+                "FIELD_VALIDATION_FAILED",
+                "aggregationType",
+                format!(
+                    "The aggregation type {} is not a supported aggregation type.",
+                    input.aggregation_type
+                ),
+                "must be a supported aggregation type".to_string(),
+            )
+        })?;
+
+        // The filters belong to the aggregation the type names, so a request carrying
+        // another aggregation's member asks for two different aggregations at once and
+        // cannot be answered.
+        if let Some(carried) = input.aggregation_request.as_ref().map(carried_member) {
+            if carried != expected_member {
+                return Err(refuse(
+                    "FIELD_VALIDATION_FAILED",
+                    "aggregationRequest",
+                    format!(
+                        "The aggregation request does not match the aggregation type. \
+                         aggregationType {} takes the {expected_member} aggregation request, \
+                         but the request carried {carried}.",
+                        input.aggregation_type
+                    ),
+                    format!(
+                        "must be the {expected_member} aggregation request when aggregationType \
+                         is {}",
+                        input.aggregation_type
+                    ),
+                ));
+            }
+        }
+
+        // Every answer this operation gives carries its whole roll-up, so no call hands
+        // out a `nextToken`; a token no answer handed out names no position in the
+        // roll-up and is refused rather than read as the start of the list.
+        if input.next_token.is_some() {
+            return Err(refuse(
+                "CANNOT_PARSE",
+                "nextToken",
+                "nextToken is not a token returned by a previous ListFindingAggregations call."
+                    .to_string(),
+                "must be a nextToken returned by ListFindingAggregations".to_string(),
+            ));
+        }
+
+        // The roll-up itself, counted over the findings this service has recorded. It
+        // never exceeds one page, so `maxResults` — the cap on the rows ONE answer
+        // carries — leaves it whole, and no cursor follows it.
+        let responses = state.lock().finding_aggregation(&input.aggregation_type);
+
+        Ok(ListFindingAggregationsOutput {
+            // The required echo of the type the roll-up was computed for.
+            aggregation_type: input.aggregation_type,
+            responses: Some(responses),
+            next_token: None,
+        })
     }
 }
