@@ -166,15 +166,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that stored record, through the one place that knows which resource kinds
         // this store holds tags for. Any other kind is a resource this store cannot
         // hold, which is the not-found error this operation models; its body is the
-        // identifier echo the ARN-addressed paths of this service word one by.
+        // fixed sentence the tagging paths word that refusal with, which renders no
+        // part of the ARN the request supplied.
         let tags = store
             .tags_mut(&region, &resource_type, &resource_id)
             .ok_or_else(|| {
                 UntagResourceErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::identifier_not_found(
-                        crate::state::RESOURCE_ARN_MEMBER,
-                        &input.resource_arn,
-                    )),
+                    message: Some(crate::state::resource_not_found()),
                 })
             })?;
 

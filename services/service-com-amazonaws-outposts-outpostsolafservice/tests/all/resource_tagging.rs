@@ -13,8 +13,8 @@
 //!    and that is what every later reader of the resource answers, whichever
 //!    taggable resource kind the ARN names.
 //! 2. A `ResourceArn` that is readable but names no resource this store holds is
-//!    the modelled `NotFoundException` (HTTP 404), worded by this service's
-//!    identifier-echo rule, and nothing is created to satisfy it.
+//!    the modelled `NotFoundException` (HTTP 404), worded by the tagging API's fixed
+//!    not-found sentence, and nothing is created to satisfy it.
 //! 3. A resource's tag map is reported as the modelled `TagMap`
 //!    (`@length(min: 1, max: 50)`), so a change that would take the resource past
 //!    that maximum is the modelled `ValidationException` (HTTP 400) and writes
@@ -240,8 +240,8 @@ async fn tag_resource_merges_its_map_into_the_stored_tags_for_every_reader() {
 /// absent site, an absent Outpost, and a resource kind this service does not hold at
 /// all.
 ///
-/// Each refusal is the modelled 404 and its body is the identifier echo
-/// `resourceArn=<the value as supplied>`, and the ARN still names nothing afterwards
+/// Each refusal is the modelled 404 and its body is the tagging API's fixed sentence
+/// (`crate::tagging_not_found_wording`), and the ARN still names nothing afterwards
 /// — a refused tagging call that had created a record would show up on the read-back.
 #[tokio::test]
 async fn tagging_an_arn_that_names_no_resource_is_not_found_and_writes_nothing() {
@@ -286,9 +286,8 @@ async fn tagging_an_arn_that_names_no_resource_is_not_found_and_writes_nothing()
         );
         assert_eq!(
             text(&refused.body, "Message"),
-            format!("resourceArn={arn}"),
-            "case {case:?}: the refusal echoes the identifier member and the value as \
-             supplied, got {:?}",
+            crate::tagging_not_found_wording::RESOURCE_NOT_FOUND,
+            "case {case:?}: the refusal states the tagging API's fixed sentence, got {:?}",
             refused.body
         );
 

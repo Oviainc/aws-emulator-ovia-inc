@@ -14,12 +14,14 @@
 //! cut, so the refusal's own fixed wording survives for any value that reaches a
 //! handler.
 //!
-//! That matters because several members a refusal echoes are modelled LONGER than
+//! That matters because several members a refusal renders are modelled LONGER than
 //! the message reporting them: `GetConnection$ConnectionId` is `length(1..1024)`
 //! and the `Arn` every tagging operation binds is `length(0..1011)`
 //! (`smithy_query(query="operation",operation="GetConnection,ListTagsForResource")`),
 //! while `CreateOutpost$AvailabilityZone` is `length(1..1000)` — so a value the
-//! boundary validator accepts can be longer than the body that refuses it.
+//! boundary validator accepts can be longer than the body that refuses it. A refusal
+//! whose wording renders NO caller value — the tagging not-found sentence — keeps the
+//! bound whatever arrived, because there is nothing in it to grow.
 //!
 //! What the body SAYS for an identifier that already fits is
 //! [`crate::error_message_rules`]' rule A, which these rows leave exactly as it is:
@@ -144,14 +146,21 @@ fn assert_within_model(case: &str, message: &str) {
     );
 }
 
-/// One row: a call that names a resource no store holds, and the input member plus
-/// the value it named it with.
+/// The wholly fixed sentence the tagging paths word a not-found with, stated once in
+/// [`crate::tagging_not_found_wording`]: it renders no part of the `ResourceArn` the
+/// caller supplied, so no value can grow it.
+const RESOURCE_NOT_FOUND: &str = crate::tagging_not_found_wording::RESOURCE_NOT_FOUND;
+
+/// One row: a call that names a resource no store holds, and — for a refusal worded
+/// as the identifier echo — the input member plus the value it named it with.
 struct Echo {
     case: String,
     method: &'static str,
     path: String,
     body: Option<Value>,
-    member: &'static str,
+    /// The member the echo names, or `None` for a row whose refusal is worded by a
+    /// fixed sentence that renders no caller value.
+    member: Option<&'static str>,
     supplied: String,
 }
 
@@ -161,7 +170,7 @@ fn echo(
     method: &'static str,
     collection: &str,
     query: &str,
-    member: &'static str,
+    member: Option<&'static str>,
     supplied: String,
     body: Option<Value>,
 ) -> Echo {
@@ -186,8 +195,10 @@ fn echo(
 #[tokio::test]
 async fn a_not_found_echo_is_cut_to_the_modelled_message_bound() {
     let outposts = Outposts::new();
-    // The room `connectionId=` / `resourceArn=` leave the value inside the bound:
-    // the longest echo that is still the whole value.
+    // The room `connectionId=` leaves the value inside the bound: the longest echo
+    // that is still the whole value. The same measure sets the ARN lengths the
+    // tagging rows send, so they straddle the point an echo of that member WOULD
+    // have been cut at.
     let connection_room = ERROR_MESSAGE_MAX - CONNECTION_ID_MEMBER.len() - 1;
     let arn_room = ERROR_MESSAGE_MAX - RESOURCE_ARN_MEMBER.len() - 1;
     let tags = json!({ "Tags": { "bound": "case" } });
@@ -199,7 +210,7 @@ async fn a_not_found_echo_is_cut_to_the_modelled_message_bound() {
         "GET",
         "sites",
         "",
-        SITE_ID_MEMBER,
+        Some(SITE_ID_MEMBER),
         ABSENT_SITE_ID.to_string(),
         None,
     )];
@@ -218,14 +229,17 @@ async fn a_not_found_echo_is_cut_to_the_modelled_message_bound() {
             "GET",
             "connections",
             "",
-            CONNECTION_ID_MEMBER,
+            Some(CONNECTION_ID_MEMBER),
             connection_id(filler, length),
             None,
         ));
     }
 
     // The three tagging operations bind the SAME `ResourceArn`, so every ARN row
-    // goes to all of them: one rule, worded once, whatever the method.
+    // goes to all of them: one rule, worded once, whatever the method. Their
+    // not-found renders no part of the value, so however long the ARN is the body
+    // is the same fixed sentence — which is what keeps it inside the bound for a
+    // member modelled longer than the message.
     for arn in [
         short_arn(),
         padded_arn(arn_room - 1),
@@ -246,7 +260,7 @@ async fn a_not_found_echo_is_cut_to_the_modelled_message_bound() {
                 method,
                 "tags",
                 query,
-                RESOURCE_ARN_MEMBER,
+                None,
                 arn.clone(),
                 body,
             ));
@@ -265,25 +279,36 @@ async fn a_not_found_echo_is_cut_to_the_modelled_message_bound() {
             reply.body
         );
         let actual = message(&reply.body);
-        let expected = expected_echo(row.member, &row.supplied);
+        let expected = match row.member {
+            Some(member) => expected_echo(member, &row.supplied),
+            None => RESOURCE_NOT_FOUND.to_string(),
+        };
         assert_eq!(
             actual, expected,
-            "case {case:?}: expected $.Message of {} characters, got {} characters",
-            expected.len(),
-            actual.len()
+            "case {case:?}: expected $.Message {expected:?}, got {actual:?}"
         );
         assert_within_model(case, &actual);
-        // Whatever was cut, what the body carries is the value AS SUPPLIED as far as
-        // it fits — never a normalised or re-spelled identifier.
-        let echoed = actual
-            .split_once('=')
-            .map_or(String::new(), |(_, echoed)| echoed.to_string());
-        assert!(
-            !echoed.is_empty() && row.supplied.starts_with(&echoed),
-            "case {case:?}: the echo must be the supplied value as far as it fits, got {} \
-             characters",
-            echoed.len()
-        );
+        // Whatever was cut, what an ECHOED body carries is the value AS SUPPLIED as
+        // far as it fits — never a normalised or re-spelled identifier. A body worded
+        // by a fixed sentence carries none of the value at all.
+        match row.member {
+            Some(_) => {
+                let echoed = actual
+                    .split_once('=')
+                    .map_or(String::new(), |(_, echoed)| echoed.to_string());
+                assert!(
+                    !echoed.is_empty() && row.supplied.starts_with(&echoed),
+                    "case {case:?}: the echo must be the supplied value as far as it fits, \
+                     got {} characters",
+                    echoed.len()
+                );
+            }
+            None => assert!(
+                !actual.contains(&row.supplied[..row.supplied.len().min(32)]),
+                "case {case:?}: a fixed sentence must render no part of the supplied value, \
+                 got {actual:?}"
+            ),
+        }
     }
 }
 

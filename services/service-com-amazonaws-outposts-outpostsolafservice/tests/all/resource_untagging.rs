@@ -14,8 +14,8 @@
 //!    resource kind the ARN names. The call states which keys must be GONE, so sending
 //!    it again changes nothing further.
 //! 2. A `ResourceArn` that is readable but names no resource this store holds is the
-//!    modelled `NotFoundException` (HTTP 404), worded by this service's identifier-echo
-//!    rule, and nothing is created or changed to satisfy it.
+//!    modelled `NotFoundException` (HTTP 404), worded by the tagging API's fixed
+//!    not-found sentence, and nothing is created or changed to satisfy it.
 //! 3. A removal can only shrink the tag map, so it is never refused for the modelled
 //!    `TagMap` maximum: a request at the modelled `TagKeyList` maximum of 50 keys is
 //!    accepted, and a resource every one of whose keys is removed is left carrying no
@@ -242,9 +242,9 @@ async fn untag_resource_removes_exactly_the_named_keys_for_every_reader() {
 /// of another partition, region and account, and — the regional half of the rule — the
 /// ARN of a resource that DOES exist, on a request addressed to another region.
 ///
-/// Each refusal is the modelled 404 with the identifier echo `resourceArn=<the value as
-/// supplied>`, nothing is created to satisfy it, and the resource that does exist still
-/// carries every tag it had.
+/// Each refusal is the modelled 404 with the tagging API's fixed not-found sentence
+/// (`crate::tagging_not_found_wording`), nothing is created to satisfy it, and the
+/// resource that does exist still carries every tag it had.
 #[tokio::test]
 async fn untagging_an_arn_that_names_no_resource_is_not_found_and_changes_nothing() {
     let outposts = Outposts::new();
@@ -298,9 +298,8 @@ async fn untagging_an_arn_that_names_no_resource_is_not_found_and_changes_nothin
         );
         assert_eq!(
             text(&refused.body, "Message"),
-            format!("resourceArn={arn}"),
-            "case {case:?}: the refusal echoes the identifier member and the value as \
-             supplied, got {:?}",
+            crate::tagging_not_found_wording::RESOURCE_NOT_FOUND,
+            "case {case:?}: the refusal states the tagging API's fixed sentence, got {:?}",
             refused.body
         );
 

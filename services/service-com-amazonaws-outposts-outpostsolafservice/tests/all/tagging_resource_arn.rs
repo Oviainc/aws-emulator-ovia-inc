@@ -216,9 +216,9 @@ async fn every_tagging_operation_reads_one_resource_arn_the_same_way() {
         );
 
         // A refusal of the ARN's SYNTAX names the member and the requirement and
-        // renders none of the value it refused. (A 404 is the other rule: it echoes
-        // the identifier the request supplied, which is asserted in
-        // `crate::error_message_rules`.)
+        // renders none of the value it refused. (A 404 is the other rule: the tagging
+        // API's fixed not-found sentence, which renders none of the value either and
+        // is asserted in `crate::tagging_not_found_wording`.)
         if row.status == 400 {
             assert!(
                 !list_message.contains(&row.arn),

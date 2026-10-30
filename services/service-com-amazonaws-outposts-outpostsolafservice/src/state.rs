@@ -5661,9 +5661,10 @@ pub fn apply<T>(stored: &mut Option<T>, update: Option<T>) {
 //   text per kind of resource, whose only variable part is the identifier taken
 //   from the request. The texts are [`order_not_found`], [`quote_not_found`],
 //   [`asset_not_found`], [`outpost_not_found`] and [`outpost_arn_not_found`] for
-//   the kinds that are worded as a sentence or by the resolved ARN, and the
-//   identifier ECHO `<member>=<value as supplied>` on the site and Outpost
-//   registry paths that answer it ([`identifier_not_found`]).
+//   the kinds that are worded as a sentence or by the resolved ARN,
+//   [`resource_not_found`] for the tagging paths, whose sentence has no variable
+//   part at all, and the identifier ECHO `<member>=<value as supplied>` on the
+//   site and Outpost registry paths that answer it ([`identifier_not_found`]).
 // * `ValidationException` — the body is the standard AWS validation report, and
 //   it never renders the offending value. See [`validation_report`].
 //
@@ -5713,7 +5714,7 @@ fn echoes<const N: usize>(fixed: usize, parts: [&str; N]) -> [String; N] {
 /// resource that could not be resolved is what fixes a not-found text, and the
 /// order, quote, asset and capacity paths word theirs differently
 /// ([`order_not_found`], [`quote_not_found`], [`asset_not_found`],
-/// [`outpost_not_found`], [`outpost_arn_not_found`]).
+/// [`outpost_not_found`], [`outpost_arn_not_found`], [`resource_not_found`]).
 ///
 /// The one thing it does to the value is FIT it: the echo is cut to the room
 /// `<member>=` leaves inside [`ERROR_MESSAGE_MAX`] ([`echoes`]), so an identifier
@@ -5752,6 +5753,21 @@ pub fn quote_not_found(supplied: &str) -> String {
     const FIXED: &str = "Could not find Quote with identifier ";
     let [supplied] = echoes(FIXED.len(), [supplied]);
     format!("{FIXED}{supplied}")
+}
+
+/// How the TAGGING paths of this service state that the `ResourceArn` a request
+/// named resolves to no resource they hold: `Resource was not found`.
+///
+/// The text is WHOLLY fixed — this is the one not-found wording of this API with no
+/// variable part at all, so the ARN the caller supplied is not rendered and the body
+/// is the same sentence whichever resource kind, partition, Region or account the
+/// value named. Nothing is echoed, so nothing can be cut: the body is inside
+/// [`ERROR_MESSAGE_MAX`] for every value that reaches a handler.
+///
+/// Shared by every operation that binds the tagging `ResourceArn` member
+/// ([`RESOURCE_ARN_MEMBER`]), so they cannot drift apart on it.
+pub fn resource_not_found() -> String {
+    "Resource was not found".to_string()
 }
 
 /// How a refusal states that no installed ASSET carries the id a request named:

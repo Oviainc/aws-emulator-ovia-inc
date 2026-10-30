@@ -143,6 +143,8 @@ mod site_rack_properties_order_hold;
 mod state_roundtrip;
 #[path = "all/supported_instance_types.rs"]
 mod supported_instance_types;
+#[path = "all/tagging_not_found_wording.rs"]
+mod tagging_not_found_wording;
 #[path = "all/tagging_resource_arn.rs"]
 mod tagging_resource_arn;
 #[path = "all/update_persistence.rs"]
