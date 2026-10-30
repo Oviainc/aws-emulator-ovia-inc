@@ -33,7 +33,7 @@ use service_com_amazonaws_codecommit_codecommit_20150413::state::ComAmazonawsCod
 
 use crate::compared_commit_comments::{refused, reported_location};
 use crate::repository_lifecycle::{base64, emulator_with_engine, is_comment_id, ok, string_at};
-use crate::wire::{caller_arn, DEFAULT_ACCESS_KEY_ID};
+use crate::wire::{caller_arn, fresh_client_request_token, DEFAULT_ACCESS_KEY_ID};
 
 /// The file the pull request changes, and the two versions of it the destination
 /// and the source branch carry. The line counts (2 and 3) are what a comment's
@@ -123,6 +123,7 @@ pub(crate) async fn pull_request_on(router: &MultiServiceRouter, repository: &st
                 "sourceReference": "feature",
                 "destinationReference": "main",
             }],
+            "clientRequestToken": fresh_client_request_token(),
         }),
     )
     .await;

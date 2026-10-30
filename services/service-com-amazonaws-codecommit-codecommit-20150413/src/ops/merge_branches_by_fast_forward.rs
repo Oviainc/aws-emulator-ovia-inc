@@ -396,17 +396,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             crate::state::merge::FastForward::Diverged => {
                 // Each history holds commits the other does not, so honouring both
-                // sides needs a merge commit, which no reference move can make.
-                // The sentence is built from what this request asked about: the two
-                // specifiers it named and why they cannot be fast-forwarded, which
-                // says more for a branch merge than the modelled shape's own
-                // pull-request wording.
+                // sides needs a merge commit, which no reference move can make —
+                // which is exactly what the modelled refusal says, in the one
+                // sentence the service answers that code with for every merge path.
                 return Err(
                     MergeBranchesByFastForwardErrorModeled::ManualMergeRequiredException(
                         ManualMergeRequiredException {
-                            message: Some(format!(
-                                "the merge of {source_specifier} into {destination_specifier} cannot be performed by fast-forward because neither commit is an ancestor of the other. You must manually merge the branches and resolve any conflicts."
-                            )),
+                            message: Some(
+                                crate::state::MANUAL_MERGE_REQUIRED_MESSAGE.to_string(),
+                            ),
                         },
                     )
                     .into(),

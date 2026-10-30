@@ -345,7 +345,7 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         ),
         ("clientRequestToken", _) if missing => (
             "ClientRequestTokenRequiredException",
-            "A client request token is required.",
+            crate::state::CLIENT_REQUEST_TOKEN_REQUIRED_MESSAGE,
         ),
         ("clientRequestToken", _) => (
             "InvalidClientRequestTokenException",
@@ -431,10 +431,29 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
             "InvalidApprovalRuleTemplateNameException",
             "The name of the approval rule template is not valid. Template names must be between 1 and 100 valid characters in length.",
         ),
-        // `newRuleContent` is deliberately NOT listed: UpdatePullRequestApprovalRuleContent
-        // spells its member that way too, and that operation models
-        // `ApprovalRuleContentRequiredException` / `InvalidApprovalRuleContentException`
-        // instead, so one name-keyed row cannot speak for both.
+        // `newRuleContent` is deliberately NOT listed: UpdateApprovalRuleTemplateContent
+        // and UpdatePullRequestApprovalRuleContent both spell their content member that
+        // way while modelling different error classes for it (the template's and the
+        // rule's), so one name-keyed row cannot speak for both.
+        //
+        // `approvalRuleContent` names only a pull request's OWN approval rule
+        // (`CreatePullRequestApprovalRule`), which models the rule's classes. Content
+        // that carries no document at all — the member left out, or present and empty
+        // against its `@length min 1` — is the same failure stated by one sentence
+        // covering both, and the service answers it with the rule's "not valid" code
+        // rather than a protocol-level refusal.
+        ("approvalRuleContent", _) if missing => (
+            "InvalidApprovalRuleContentException",
+            crate::state::APPROVAL_RULE_CONTENT_REQUIRED_MESSAGE,
+        ),
+        ("approvalRuleContent", ViolationKind::MinLength(_)) => (
+            "InvalidApprovalRuleContentException",
+            crate::state::APPROVAL_RULE_CONTENT_REQUIRED_MESSAGE,
+        ),
+        ("approvalRuleContent", _) => (
+            "InvalidApprovalRuleContentException",
+            crate::state::INVALID_APPROVAL_RULE_CONTENT_MESSAGE,
+        ),
         ("approvalRuleTemplateContent", _) if missing => (
             "ApprovalRuleTemplateContentRequiredException",
             "The content for the approval rule template is empty. You must provide some content for an approval rule template. The content cannot be null.",

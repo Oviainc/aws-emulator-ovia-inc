@@ -28,6 +28,19 @@ use crate::repository_lifecycle::{emulator, error, is_uuid, ok, string_at, REGIO
 /// catalog a trigger's `events` is drawn from.
 const EVERY_EVENT: &[&str] = &["all", "updateReference", "createReference", "deleteReference"];
 
+/// The sentence `InvalidRepositoryTriggerEventsException` carries for a list that
+/// names `all` beside another event type — fixed text, ending without a period, as
+/// the service writes it.
+const ALL_COMBINED_MESSAGE: &str =
+    "Repository trigger events cannot contain 'all' and additional event types simultaneously";
+
+/// The sentence the same code carries for an event name the service does not
+/// recognise: the other reason a list is refused, worded for the NAME rather than for
+/// the combination.
+const UNRECOGNISED_EVENT_MESSAGE: &str =
+    "One or more events specified for the trigger is not valid. Check to make sure that all \
+     events specified match the requirements for allowed events.";
+
 /// The ARN of an Amazon SNS topic in `region` — a destination a repository trigger
 /// may target.
 fn topic_arn(region: &str, topic: &str) -> String {
@@ -234,7 +247,9 @@ async fn every_modelled_event_is_accepted_and_all_stands_alone() {
         "every modelled event other than all must combine, got {read_triggers}"
     );
 
-    // "The valid value \"all\" cannot be used with any other values."
+    // "The valid value \"all\" cannot be used with any other values." The refusal is
+    // worded for the COMBINATION rather than for an event the service does not
+    // recognise, which is the sentence the sibling test below pins.
     for other in &combined {
         let (code, message) = error_with_message(
             &router,
@@ -250,12 +265,127 @@ async fn every_modelled_event_is_accepted_and_all_stands_alone() {
             code, "InvalidRepositoryTriggerEventsException",
             "case {other:?}: all beside another event must be refused, got {code}: {message}"
         );
+        assert_eq!(
+            message, ALL_COMBINED_MESSAGE,
+            "case {other:?}: expected the combination sentence, got {message:?}"
+        );
     }
 
     // And the configuration that was already stored is still the one it holds.
     let (_, read_triggers) = read(&router, "trigger-events").await;
     assert_eq!(
         read_triggers, sent,
+        "a refused put must leave the stored configuration alone, got {read_triggers}"
+    );
+}
+
+/// The two reasons an `events` list is refused carry the SAME modelled code and
+/// DIFFERENT sentences, so a caller can tell an illegal combination from an event
+/// name the service does not recognise.
+///
+/// The rows below span what that rule generalises over: where `all` sits in the list
+/// and how many other events stand beside it (before, after, among two others, among
+/// every other value) for the combination sentence, and why a name is not an event
+/// (a value outside the enum, one differing only in case, one differing only in
+/// spacing, and the same value named twice) for the generic one. The accepted rows
+/// are `all` alone and each other value alone, which is what makes these refusals
+/// about the list rather than about the trigger.
+#[tokio::test]
+async fn the_two_reasons_an_events_list_is_refused_are_worded_apart() {
+    let router = emulator();
+    seed(&router, "trigger-event-wording").await;
+    // The configuration a refusal must leave in place.
+    let stored = json!([trigger(
+        "already-stored",
+        &topic_arn(REGION, "events"),
+        &["all"]
+    )]);
+    put(&router, "trigger-event-wording", &stored).await;
+
+    let combination: Vec<(&str, Vec<&str>)> = vec![
+        ("all before another event", vec!["all", "updateReference"]),
+        ("all after another event", vec!["createReference", "all"]),
+        (
+            "all among two other events",
+            vec!["createReference", "all", "deleteReference"],
+        ),
+        ("all among every other event", EVERY_EVENT.to_vec()),
+    ];
+    let unrecognised: Vec<(&str, Vec<&str>)> = vec![
+        ("an event outside the enum", vec!["pushReference"]),
+        (
+            "an event differing only in case",
+            vec!["UpdateReference"],
+        ),
+        (
+            "an event differing only in spacing",
+            vec![" updateReference"],
+        ),
+        (
+            "a recognised event named twice",
+            vec!["createReference", "createReference"],
+        ),
+        (
+            "an unrecognised event beside a recognised one",
+            vec!["createReference", "pushReference"],
+        ),
+        (
+            "all beside the same event twice: a list naming one event twice names\
+             nothing new, which is refused for the name rather than for the\
+             combination",
+            vec!["all", "updateReference", "updateReference"],
+        ),
+    ];
+
+    for (rows, expected, label) in [
+        (combination, ALL_COMBINED_MESSAGE, "the combination"),
+        (unrecognised, UNRECOGNISED_EVENT_MESSAGE, "the event name"),
+    ] {
+        for (case, events) in rows {
+            let (code, message) = error_with_message(
+                &router,
+                "PutRepositoryTriggers",
+                &json!({
+                    "repositoryName": "trigger-event-wording",
+                    "triggers": [trigger("bad-trigger", &topic_arn(REGION, "events"), &events)],
+                }),
+                400,
+            )
+            .await;
+            assert_eq!(
+                code, "InvalidRepositoryTriggerEventsException",
+                "case {case:?}: expected the modelled events error, got {code}: {message}"
+            );
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected the sentence for {label}, got {message:?}"
+            );
+            // Neither sentence interpolates anything: not the trigger, not the
+            // repository, not the offending value.
+            for named in events
+                .iter()
+                .copied()
+                .chain(["bad-trigger", "trigger-event-wording"])
+            {
+                let named = named.trim();
+                if named == "all" {
+                    // The combination sentence names the one value that cannot be
+                    // combined, which is part of its fixed text.
+                    continue;
+                }
+                assert!(
+                    !message.contains(named),
+                    "case {case:?}: the message must not carry {named:?}, got {message:?}"
+                );
+            }
+        }
+    }
+
+    // Every refused put left the stored configuration alone, and the list it holds is
+    // still accepted on its own.
+    let (_, read_triggers) = read(&router, "trigger-event-wording").await;
+    assert_eq!(
+        read_triggers, stored,
         "a refused put must leave the stored configuration alone, got {read_triggers}"
     );
 }

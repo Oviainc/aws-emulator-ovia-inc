@@ -2,28 +2,30 @@
 
 //! The TEXT CodeCommit puts on `FileDoesNotExistException`, over the wire.
 //!
-//! The rule under test: whenever a request is refused because a file path it named
-//! is absent from the tree that path is resolved against, the message is ONE
+//! The rule under test: the message a refusal carries is the one the OPERATION that
+//! raised it answers that error class with — no operation borrows another's
+//! template. For a path a tree does not hold, the reading operations (`GetFile`, and
+//! `CreateCommit` naming a path through each of its three entry kinds) answer ONE
 //! template — the fixed words "Could not find path " followed by that path — and
 //! nothing else of the request or of the stored state reaches it: not the commit the
 //! path was resolved against, not the branch, not the repository. It is the path
 //! sibling of the `CommitDoesNotExistException` text ("Could not find commit
-//! <specifier>") the neighbouring suites pin, and it holds for every operation that
-//! raises the code for an absent path, not only for the read.
+//! <specifier>") the neighbouring suites pin. `DeleteFile` answers the same code with
+//! its OWN fixed sentence, which names no path at all.
 //!
-//! So the table below varies what the rule generalises over — where the path sits
+//! So the tables below vary what the rule generalises over — where the path sits
 //! (repository root, one folder, four folders deep), how it is spelled (bare, with a
 //! leading separator, with a space, dotted, non-ASCII, without an extension), WHICH
-//! operation raises the code (`GetFile`, `DeleteFile`, and `CreateCommit` through
-//! each of its three entry kinds) and, for the read, which commit specifier form
-//! resolved the tree (absent, a branch name, an explicit commit id) — and asserts the
-//! same template with the request's path in its slot on every row, plus that no row's
+//! operation raises the code, and, for the read, which commit specifier form
+//! resolved the tree (absent, a branch name, an explicit commit id) — and assert the
+//! template that operation words the refusal with on every row, plus that no row's
 //! text carries the repository, the branch or any commit id.
 //!
 //! The error's status and code come from the model
 //! (`smithy_query(query="shape",shape="FileDoesNotExistException")`: `errorKind`
 //! client, `httpError` 400); a path with a leading separator addresses the same tree
-//! entry as one without it, so the slot carries the path in that canonical form.
+//! entry as one without it, so the read template's slot carries the path in that
+//! canonical form.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -45,10 +47,15 @@ const CODE: &str = "FileDoesNotExistException";
 /// The branch every case's repository holds.
 const BRANCH: &str = "main";
 
-/// The message the rule requires for a path: the fixed words, then the path.
+/// The message the rule requires for a path on the READ paths: the fixed words, then
+/// the path.
 fn expected_message(addressed_path: &str) -> String {
     format!("Could not find path {addressed_path}")
 }
+
+/// The message `DeleteFile` answers the same code with: FIXED text that names no
+/// path, which is the whole of that operation's template.
+const DELETE_MESSAGE: &str = "Cannot find the specified file.";
 
 /// One row: a path no repository under test holds, as SENT and as it ADDRESSES a
 /// tree entry (leading separators removed — `"/a.txt"` and `"a.txt"` name the same
@@ -219,7 +226,7 @@ async fn get_file_words_an_absent_path_with_the_path_template() {
 }
 
 #[tokio::test]
-async fn delete_file_words_an_absent_path_with_the_path_template() {
+async fn delete_file_words_an_absent_path_with_its_own_fixed_sentence() {
     let router = emulator();
     let repository = "absent-path-delete";
     let (first, tip) = seed(&router, repository).await;
@@ -237,13 +244,27 @@ async fn delete_file_words_an_absent_path_with_the_path_template() {
             CLIENT_ERROR_STATUS,
         )
         .await;
-        assert_refusal(
-            absent.label,
-            &code,
-            &message,
-            absent.addressed,
-            &[repository, BRANCH, first.as_str(), tip.as_str()],
+        assert_eq!(
+            code, CODE,
+            "case {:?}: expected the modelled {CODE}, got {code:?} with message {message:?}",
+            absent.label
         );
+        assert_eq!(
+            message, DELETE_MESSAGE,
+            "case {:?}: expected the exact sentence AWS words a deletion's absent path with, \
+             got {message:?}",
+            absent.label
+        );
+        // The delete path's sentence is opaque: it names neither the path the request
+        // carried nor anything else about the repository it was made against.
+        for named in [absent.sent, absent.addressed, repository, BRANCH, &first, &tip] {
+            assert!(
+                !message.contains(named),
+                "case {:?}: the message must name nothing of the request, but {message:?} \
+                 carries {named:?}",
+                absent.label
+            );
+        }
     }
 
     // A refused deletion writes nothing, so the branch still points at the tip the

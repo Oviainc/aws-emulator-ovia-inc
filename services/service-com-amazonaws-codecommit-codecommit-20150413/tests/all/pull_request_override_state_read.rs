@@ -35,7 +35,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::repository_lifecycle::{base64, ok, string_at};
-use crate::wire::{caller_arn, emulator_with_callers, ok_as};
+use crate::wire::{caller_arn, emulator_with_callers, fresh_client_request_token, ok_as};
 
 /// The operation under test, the one that records what it reports, and the reader
 /// the pull request itself is read back through.
@@ -177,6 +177,7 @@ async fn fixture() -> Fixture {
                     "sourceReference": source,
                     "destinationReference": DESTINATION,
                 }],
+                "clientRequestToken": fresh_client_request_token(),
             }),
         )
         .await;

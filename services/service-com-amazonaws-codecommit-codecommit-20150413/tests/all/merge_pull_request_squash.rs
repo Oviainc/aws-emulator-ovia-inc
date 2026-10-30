@@ -57,7 +57,7 @@ use crate::repository_lifecycle::{
 use crate::unreferenced_merge_commits::{
     commit, commit_of, parents_of, tree_of, Change, EXECUTABLE, GITKEEP, NORMAL,
 };
-use crate::wire::{caller_arn, DEFAULT_ACCESS_KEY_ID};
+use crate::wire::{caller_arn, fresh_client_request_token, DEFAULT_ACCESS_KEY_ID};
 
 /// The two branches every pull request below is between: `main` is the repository's
 /// default branch (it took the first commit) and the destination, `feature` is the
@@ -465,6 +465,7 @@ async fn open_pull_request(
                 "sourceReference": SOURCE,
                 "destinationReference": DESTINATION,
             }],
+            "clientRequestToken": fresh_client_request_token(),
         }),
     )
     .await;
@@ -906,6 +907,7 @@ async fn a_squash_merge_that_names_no_mergeable_pull_request_is_refused_and_writ
                     "sourceReference": SOURCE,
                     "destinationReference": DESTINATION,
                 }],
+                "clientRequestToken": fresh_client_request_token(),
             }),
         )
         .await;

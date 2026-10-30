@@ -207,7 +207,7 @@ fn refusal(problem: crate::state::TriggerProblem) -> PutRepositoryTriggersError 
                 RepositoryTriggerEventsListRequiredException { message },
             )
         }
-        TriggerProblem::EventsInvalid => {
+        TriggerProblem::EventsInvalid | TriggerProblem::EventsAllCombined => {
             PutRepositoryTriggersErrorModeled::InvalidRepositoryTriggerEventsException(
                 InvalidRepositoryTriggerEventsException { message },
             )

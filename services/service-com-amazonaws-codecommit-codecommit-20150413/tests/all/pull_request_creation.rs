@@ -33,7 +33,10 @@ use service_com_amazonaws_codecommit_codecommit_20150413::ComAmazonawsCodecommit
 use crate::repository_lifecycle::{
     base64, emulator_with_engine, error, ok, string_at, REGION,
 };
-use crate::wire::{caller_arn, emulator_with_callers, error_as, ok_as, DEFAULT_ACCESS_KEY_ID};
+use crate::wire::{
+    caller_arn, emulator_with_callers, error_as, fresh_client_request_token, ok_as,
+    DEFAULT_ACCESS_KEY_ID,
+};
 
 /// The principals the author rows below call as, and a principal that only reads:
 /// each one is a user of the account holding its own long-term access key, so the
@@ -140,6 +143,11 @@ async fn commit_on(
 }
 
 /// A `CreatePullRequest` body naming one target.
+///
+/// The `clientRequestToken` is one the operation requires on the wire, fresh for
+/// each body so each is its own request rather than a replay of the last one
+/// (`crate::wire::fresh_client_request_token`); the suite's own token rows name
+/// their value instead.
 fn create_body(
     repository: &str,
     title: &str,
@@ -151,7 +159,11 @@ fn create_body(
     if let Some(destination) = destination {
         target["destinationReference"] = json!(destination);
     }
-    let mut body = json!({ "title": title, "targets": [target] });
+    let mut body = json!({
+        "title": title,
+        "targets": [target],
+        "clientRequestToken": fresh_client_request_token(),
+    });
     if let Some(description) = description {
         body["description"] = json!(description);
     }
@@ -429,7 +441,11 @@ async fn a_request_naming_no_pair_of_stored_branches_is_refused_and_persists_not
         },
         Refusal {
             label: "no targets at all",
-            body: json!({ "title": "t", "targets": [] }),
+            body: json!({
+                "title": "t",
+                "targets": [],
+                "clientRequestToken": fresh_client_request_token(),
+            }),
             code: "TargetsRequiredException",
         },
         Refusal {
@@ -440,6 +456,7 @@ async fn a_request_naming_no_pair_of_stored_branches_is_refused_and_persists_not
                     { "repositoryName": REPOSITORY, "sourceReference": "feature" },
                     { "repositoryName": "other", "sourceReference": "feature" },
                 ],
+                "clientRequestToken": fresh_client_request_token(),
             }),
             code: "MultipleRepositoriesInPullRequestException",
         },
@@ -451,6 +468,7 @@ async fn a_request_naming_no_pair_of_stored_branches_is_refused_and_persists_not
                     { "repositoryName": REPOSITORY, "sourceReference": "feature" },
                     { "repositoryName": REPOSITORY, "sourceReference": "main" },
                 ],
+                "clientRequestToken": fresh_client_request_token(),
             }),
             code: "InvalidTargetsException",
         },

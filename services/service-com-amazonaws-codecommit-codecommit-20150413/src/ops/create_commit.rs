@@ -338,15 +338,13 @@ fn normalized_entries(input: &CreateCommitInput) -> Result<Entries, CreateCommit
         .into());
     }
     // The entry lists are caller-sized and each entry is hashed into the new
-    // tree, so this is what bounds the per-request work.
+    // tree, and the bound they count against is the one CodeCommit publishes for
+    // the operation: `putFiles`, `deleteFiles` and `setFileModes` TOGETHER, each
+    // entry being one file the commit changes.
     if entry_count > crate::state::MAX_FILE_ENTRIES_PER_COMMIT {
         return Err(CreateCommitErrorModeled::MaximumFileEntriesExceededException(
             MaximumFileEntriesExceededException {
-                message: Some(format!(
-                    "the commit specifies {entry_count} file entries, more than the \
-                     maximum of {} that can be changed in a single commit",
-                    crate::state::MAX_FILE_ENTRIES_PER_COMMIT
-                )),
+                message: Some(crate::state::MAXIMUM_FILE_ENTRIES_EXCEEDED_MESSAGE.to_string()),
             },
         )
         .into());

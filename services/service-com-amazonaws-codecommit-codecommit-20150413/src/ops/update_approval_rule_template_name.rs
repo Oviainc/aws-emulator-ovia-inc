@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApprovalRuleTemplateName
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApprovalRuleTemplateName`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApprovalRuleTemplateName::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Renaming a stored approval rule template: the template the old name addresses is
+//! re-keyed under the new one, keeping its id, its content, its content digest and
+//! its creation date, and keeping every repository association that was made under
+//! the old name. Template names are unique per account, so a request for a name the
+//! account already holds is refused with the modelled
+//! `ApprovalRuleTemplateNameAlreadyExistsException` and NOTHING moves.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +151,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApprovalRuleTemplateName` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApprovalRuleTemplateNameErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApprovalRuleTemplateName"))
+        // Both members are required and both lengths are modelled
+        // (`ApprovalRuleTemplateName` 1..100), so the boundary validator already
+        // refused anything outside them — as
+        // `ApprovalRuleTemplateNameRequiredException` and
+        // `InvalidApprovalRuleTemplateNameException` respectively
+        // (`crate::service::refusal_for`). What is left is the part of the name rule
+        // the model cannot express, the templates' existence and occupancy, and the
+        // move itself.
+
+        // "Template names must be between 1 and 100 valid characters in length." A
+        // name of nothing but whitespace names no template, and neither does one
+        // carrying a control character — decided for every operation that takes a
+        // template name in `crate::state::is_approval_rule_template_name`, so the
+        // name a rename moves a template TO is held to what a create would accept.
+        for name in [
+            &input.old_approval_rule_template_name,
+            &input.new_approval_rule_template_name,
+        ] {
+            if !crate::state::is_approval_rule_template_name(name) {
+                return Err(
+                    UpdateApprovalRuleTemplateNameErrorModeled::InvalidApprovalRuleTemplateNameException(
+                        InvalidApprovalRuleTemplateNameException {
+                            message: Some(
+                                crate::state::invalid_approval_rule_template_name_message(name),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+
+        // The old name has to address a template: there is nothing to rename
+        // otherwise, and nothing is written.
+        if !store
+            .approval_rule_templates
+            .contains_key(&input.old_approval_rule_template_name)
+        {
+            return Err(
+                UpdateApprovalRuleTemplateNameErrorModeled::ApprovalRuleTemplateDoesNotExistException(
+                    ApprovalRuleTemplateDoesNotExistException {
+                        message: Some(
+                            crate::state::approval_rule_template_does_not_exist_message(
+                                &input.old_approval_rule_template_name,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Approval rule template names must be unique." A name the account already
+        // holds cannot be taken by another template, whichever template holds it —
+        // including the one being renamed, which already holds its own name — and
+        // the refusal leaves BOTH templates exactly as they were.
+        if store
+            .approval_rule_templates
+            .contains_key(&input.new_approval_rule_template_name)
+        {
+            return Err(
+                UpdateApprovalRuleTemplateNameErrorModeled::ApprovalRuleTemplateNameAlreadyExistsException(
+                    ApprovalRuleTemplateNameAlreadyExistsException {
+                        // A CONSTANT for this class, shared with
+                        // `CreateApprovalRuleTemplate`: template names are unique per
+                        // ACCOUNT, and the message names neither template.
+                        message: Some(
+                            crate::state::APPROVAL_RULE_TEMPLATE_NAME_ALREADY_EXISTS_MESSAGE
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The move: the stored template is re-keyed under the new name, taking its
+        // repository associations with it, and the change is attributed to this
+        // caller at this instant. Everything else about the template carries over.
+        let modified_by = crate::state::caller_identity_arn(&*self.engine, ctx);
+        let renamed = store
+            .rename_approval_rule_template(
+                &input.old_approval_rule_template_name,
+                &input.new_approval_rule_template_name,
+                modified_by,
+                std::time::SystemTime::now(),
+            )
+            .ok_or_else(|| {
+                // The template was found under this same guard just above, so it is
+                // still there; answering the modelled failure rather than panicking
+                // keeps the handler total.
+                UpdateApprovalRuleTemplateNameErrorModeled::ApprovalRuleTemplateDoesNotExistException(
+                    ApprovalRuleTemplateDoesNotExistException {
+                        message: Some(
+                            crate::state::approval_rule_template_does_not_exist_message(
+                                &input.old_approval_rule_template_name,
+                            ),
+                        ),
+                    },
+                )
+            })?;
+
+        Ok(UpdateApprovalRuleTemplateNameOutput {
+            approval_rule_template: renamed.to_modeled(),
+        })
     }
 }

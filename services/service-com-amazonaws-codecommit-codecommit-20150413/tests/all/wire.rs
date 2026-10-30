@@ -11,6 +11,7 @@
 //! tested by calling as two different principals. That default harness builds its
 //! requests through [`call_as`] too, so there is exactly one request builder.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -104,6 +105,24 @@ pub(crate) fn emulator_with_callers(
         hold_long_term_key(&engine, access_key_id);
     }
     (router, engine)
+}
+
+/// A `clientRequestToken` no other call in this test target has used.
+///
+/// `CreatePullRequest` REQUIRES the member on the wire: an AWS SDK fills it in from
+/// the model's `@idempotencyToken` before the request is sent, and a suite that
+/// drives the wire itself fills it in itself. The token is also the idempotency key,
+/// so two calls that are meant to create two pull requests carry two tokens — which
+/// is what this counter guarantees, without any suite having to invent one.
+///
+/// A suite whose SUBJECT is the token (its bounds, its deduplication, or the refusal
+/// of a request carrying none) names its own value instead.
+pub(crate) fn fresh_client_request_token() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!(
+        "idempotency-token-{}",
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Send one awsJson1_1 request: `POST /` with `X-Amz-Target:

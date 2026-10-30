@@ -236,19 +236,34 @@ fn created(record: &crate::state::PullRequestRecord) -> CreatePullRequestOutput 
     }
 }
 
-/// The idempotency token this request names, or the refusal for a token that is
-/// present but is not one CodeCommit accepts.
+/// The idempotency token this request names, or the refusal for one that is absent
+/// or is not a token CodeCommit accepts.
+///
+/// `CreatePullRequest` REQUIRES the token on the wire: the model leaves the member
+/// optional (the SDKs fill it in client-side from `@idempotencyToken`), but the
+/// service refuses a body that carries none at all with the
+/// `ClientRequestTokenRequiredException` it models for exactly that, before a pull
+/// request id is allocated — so a caller that signs its own request cannot create
+/// pull requests no token can deduplicate.
 ///
 /// Which tokens are acceptable is `crate::state`'s rule
 /// ([`crate::state::is_client_request_token`]), so every operation carrying the
-/// member agrees about it; a request that leaves the member out names no earlier
-/// request, while a present token that names none (an empty one, one past the
-/// length bound) is MALFORMED rather than absent and is refused before anything
-/// is written.
+/// member agrees about it; a present token that names none (an empty one, one past
+/// the length bound) is MALFORMED rather than absent and takes the other code.
 fn client_request_token(
     input: &CreatePullRequestInput,
-) -> Result<Option<&str>, CreatePullRequestError> {
+) -> Result<&str, CreatePullRequestError> {
     match input.client_request_token.as_deref() {
+        None => Err(
+            CreatePullRequestErrorModeled::ClientRequestTokenRequiredException(
+                ClientRequestTokenRequiredException {
+                    message: Some(
+                        crate::state::CLIENT_REQUEST_TOKEN_REQUIRED_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into(),
+        ),
         Some(token) if !crate::state::is_client_request_token(token) => Err(
             CreatePullRequestErrorModeled::InvalidClientRequestTokenException(
                 InvalidClientRequestTokenException {
@@ -257,7 +272,7 @@ fn client_request_token(
             )
             .into(),
         ),
-        token => Ok(token),
+        Some(token) => Ok(token),
     }
 }
 
@@ -317,9 +332,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The idempotency token the request names, judged BEFORE anything else:
-        // a present token that is not a token CodeCommit accepts is a malformed
-        // request, so no pull request is created for it.
+        // The idempotency token the request REQUIRES, judged BEFORE anything else:
+        // a body carrying none, and one carrying a token CodeCommit does not accept,
+        // are both refused here, so no pull request id is allocated for either.
         let client_request_token = client_request_token(&input)?;
 
         // "A pull request title is required. It cannot be empty or null."
@@ -525,34 +540,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // accepted for, so a later edit of the pull request does not turn a
             // replay of that request into a mismatch.
             let mut existing_token_answer = None;
-            if let Some(token) = client_request_token {
-                if let Some(existing) = repository
-                    .pull_request_tokens
-                    .get(token)
-                    .and_then(|id| repository.pull_requests.get(id))
-                {
-                    if unchanged_request(
-                        existing,
-                        &input.title,
-                        description.as_deref(),
-                        &target.repository_name,
-                        &source_reference,
-                        &destination_reference,
-                    ) {
-                        existing_token_answer = Some(created(existing));
-                    } else {
-                        return Err(
-                            CreatePullRequestErrorModeled::IdempotencyParameterMismatchException(
-                                IdempotencyParameterMismatchException {
-                                    message: Some(format!(
-                                        "the client request token {token} was used in a previous \
-                                         request with different parameters"
-                                    )),
-                                },
-                            )
-                            .into(),
-                        );
-                    }
+            if let Some(existing) = repository
+                .pull_request_tokens
+                .get(client_request_token)
+                .and_then(|id| repository.pull_requests.get(id))
+            {
+                if unchanged_request(
+                    existing,
+                    &input.title,
+                    description.as_deref(),
+                    &target.repository_name,
+                    &source_reference,
+                    &destination_reference,
+                ) {
+                    existing_token_answer = Some(created(existing));
+                } else {
+                    return Err(
+                        CreatePullRequestErrorModeled::IdempotencyParameterMismatchException(
+                            IdempotencyParameterMismatchException {
+                                message: Some(format!(
+                                    "the client request token {client_request_token} was used in \
+                                     a previous request with different parameters"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
                 }
             }
 
@@ -684,7 +697,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_activity_date: now,
             status: crate::state::PULL_REQUEST_STATUS_OPEN.to_string(),
             author_arn,
-            client_request_token: client_request_token.map(str::to_string),
+            client_request_token: Some(client_request_token.to_string()),
             targets: vec![crate::state::PullRequestTargetRecord {
                 repository_name: target.repository_name.clone(),
                 source_reference: crate::state::qualified_reference(&source_branch),

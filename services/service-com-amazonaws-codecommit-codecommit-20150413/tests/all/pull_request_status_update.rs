@@ -25,7 +25,9 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{error_with_message, PULL_REQUEST_DOES_NOT_EXIST};
 use crate::repository_lifecycle::{base64, ok, string_at};
-use crate::wire::{caller_arn, emulator_with_callers, ok_as, refusal_as};
+use crate::wire::{
+    caller_arn, emulator_with_callers, fresh_client_request_token, ok_as, refusal_as,
+};
 
 /// Every value of `PullRequestStatusEnum`
 /// (`smithy_query(query="shape",shape="PullRequestStatusEnum")`), which is the
@@ -53,9 +55,12 @@ const AUTHOR: &str = "AKIDAUTHOR";
 const CLOSER: &str = "AKIDCLOSER";
 
 /// The message `InvalidPullRequestStatusUpdateException` carries: the sentence pair
-/// the model documents for that shape.
+/// the SERVICE answers that class with, which names the transition in prose casing
+/// rather than in the enum's own spellings (`src/state.rs`'s
+/// `INVALID_PULL_REQUEST_STATUS_UPDATE_MESSAGE`).
 const INVALID_UPDATE_MESSAGE: &str =
-    "The pull request status update is not valid. The only valid update is from OPEN to CLOSED.";
+    "The pull request status update is not valid. The only valid value change is from Open to \
+     Closed.";
 
 /// The message `InvalidPullRequestStatusException` carries, likewise the shape's own
 /// documented sentence pair.
@@ -149,6 +154,7 @@ async fn opened(repository: &str) -> Opened {
                 "sourceReference": SOURCE,
                 "destinationReference": DESTINATION,
             }],
+            "clientRequestToken": fresh_client_request_token(),
         }),
     )
     .await;

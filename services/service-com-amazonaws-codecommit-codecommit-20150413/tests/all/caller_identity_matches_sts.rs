@@ -36,7 +36,7 @@ use service_com_amazonaws_sts_awssecuritytokenservicev20110615 as sts_service;
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts;
 
 use crate::repository_lifecycle::{base64, string_at};
-use crate::wire::{hold_long_term_key_for, ok_as};
+use crate::wire::{fresh_client_request_token, hold_long_term_key_for, ok_as};
 
 /// The operations the caller's identity is read back through.
 const OVERRIDE_OPERATION: &str = "OverridePullRequestApprovalRules";
@@ -345,6 +345,7 @@ async fn the_identity_this_service_records_is_the_one_sts_resolves_for_the_crede
                     "sourceReference": SOURCE,
                     "destinationReference": DESTINATION,
                 }],
+                "clientRequestToken": fresh_client_request_token(),
             }),
         )
         .await;

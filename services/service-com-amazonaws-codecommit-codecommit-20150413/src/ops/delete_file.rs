@@ -374,10 +374,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Deletes a specified file from a specified branch": the entry leaves the
         // tree, and the blob it named is what the response reports. A path the tree
         // does not hold is refused, so nothing is committed for a deletion that
-        // deletes nothing.
+        // deletes nothing — in the words the service answers the delete path with,
+        // which name no path (the READ path's wording is the one that does).
         let removed = files.remove(&file_path).ok_or_else(|| {
             DeleteFileErrorModeled::FileDoesNotExistException(FileDoesNotExistException {
-                message: Some(crate::state::file_does_not_exist_message(&file_path)),
+                message: Some(crate::state::DELETED_FILE_DOES_NOT_EXIST_MESSAGE.to_string()),
             })
         })?;
 

@@ -537,12 +537,20 @@ pub const INVALID_PULL_REQUEST_EVENT_TYPE_MESSAGE: &str = "The pull request even
 pub const INVALID_PULL_REQUEST_STATUS_MESSAGE: &str =
     "The pull request status is not valid. The only valid values are OPEN and CLOSED.";
 
-/// `InvalidPullRequestStatusUpdateException`'s message: likewise the shape's own
-/// documented sentence pair, stating the failure and then the ONE transition the
-/// status admits — what an attempt to move a pull request's status any other way
-/// is refused with.
+/// `InvalidPullRequestStatusUpdateException`'s message: the sentence pair the
+/// service answers that class with, stating the failure and then the ONE change of
+/// value the status admits — what an attempt to move a pull request's status any
+/// other way is refused with.
+///
+/// It is not the error shape's documented sentence: that one is prose about the
+/// error class for a reader of the API reference, which spells the two states as the
+/// enum's own `OPEN`/`CLOSED` values. The service's sentence names the transition in
+/// PROSE casing instead — the status VALUES a response carries stay upper-case
+/// ([`PULL_REQUEST_STATUS_OPEN`], [`PULL_REQUEST_STATUS_CLOSED`]), the message does
+/// not — and a client branching on the text matches this one.
 pub const INVALID_PULL_REQUEST_STATUS_UPDATE_MESSAGE: &str =
-    "The pull request status update is not valid. The only valid update is from OPEN to CLOSED.";
+    "The pull request status update is not valid. The only valid value change is from Open to \
+     Closed.";
 
 /// `PullRequestStatusRequiredException`'s message: a FIXED sentence, worded here
 /// once for every operation that requires a `pullRequestStatus`.
@@ -657,6 +665,24 @@ pub const INVALID_APPROVAL_RULE_CONTENT_MESSAGE: &str =
     "The JSON in the approval rule is not valid. Review the JSON and make sure it is valid, and \
      then try again.";
 
+/// `InvalidApprovalRuleContentException`'s message for content that carries NO
+/// document at all — a member that is absent, empty, or nothing but whitespace.
+///
+/// A document is the thing `ApprovalRuleContent` carries, so a value holding none of
+/// one is not a document this service failed to parse: it is content that was never
+/// provided, and the service says so in one sentence that covers both forms the
+/// absence takes (an empty value and a null one) and carries nothing from the
+/// request. The code is the same `InvalidApprovalRuleContentException` a malformed
+/// document takes ([`INVALID_APPROVAL_RULE_CONTENT_MESSAGE`]); only the sentence
+/// differs, so a client catching that one modelled exception sees both.
+///
+/// Worded here once for the request boundary (`crate::service::refusal_for`, which
+/// refuses the member's `@length min 1`) and for the handler that reaches the
+/// whitespace-only case past it.
+pub const APPROVAL_RULE_CONTENT_REQUIRED_MESSAGE: &str =
+    "Content for an approval rule is required, but the content of the approval rule was either \
+     empty or null.";
+
 /// `InvalidResourceArnException`'s message: a FIXED sentence that echoes no ARN.
 ///
 /// The tagging operations (`TagResource`, `UntagResource`,
@@ -734,6 +760,17 @@ pub fn commit_does_not_exist_message(specifier: &str) -> String {
 pub fn file_does_not_exist_message(path: &str) -> String {
     format!("Could not find path {path}")
 }
+
+/// `FileDoesNotExistException`'s message on the path that DELETES a file: a FIXED
+/// sentence naming no path at all.
+///
+/// CodeCommit words this code per the call that raises it rather than once for the
+/// code, and the deletion path is deliberately opaque: it states that the file named
+/// is not there and nothing else — not the path, not the parent commit, not the
+/// branch, not the repository. The READ path words the same code with the path it
+/// looked for ([`file_does_not_exist_message`]), which is why the two cannot share
+/// one template.
+pub const DELETED_FILE_DOES_NOT_EXIST_MESSAGE: &str = "Cannot find the specified file.";
 
 /// `ParentCommitIdOutdatedException`'s message: a FIXED sentence group carrying
 /// nothing from the request — neither the stale id nor the branch.
@@ -844,10 +881,26 @@ pub const MAX_TEMPLATES_PER_REPOSITORY: usize = 100;
 /// How many file entries one `CreateCommit` may carry before it refuses with the
 /// modelled `MaximumFileEntriesExceededException`.
 ///
-/// The emulator's OWN bound, not a published AWS quota: the entry lists are
-/// caller-sized and each one is hashed into the commit's tree, so this is what
-/// bounds the per-request work.
+/// The bound CodeCommit publishes for the operation, and states in the refusal
+/// itself ([`MAXIMUM_FILE_ENTRIES_EXCEEDED_MESSAGE`]: "The maximum limit for the
+/// number of files is 100 in the AWS CodeCommit console and in the CreateCommit
+/// API"). The `putFiles`, `deleteFiles` and `setFileModes` entries of one request
+/// count TOGETHER against it, because each is one file the commit changes.
 pub const MAX_FILE_ENTRIES_PER_COMMIT: usize = 100;
+
+/// `MaximumFileEntriesExceededException`'s message: the FIXED sentence group
+/// CodeCommit answers that code with, carrying nothing from the request — in
+/// particular not how many entries the refused request held.
+///
+/// It is not the error shape's documented sentence, which is prose about the error
+/// class; the service's own text states the bound, where it applies, and the two
+/// ways out (several commits, or a git client). The bound it names is
+/// [`MAX_FILE_ENTRIES_PER_COMMIT`].
+pub const MAXIMUM_FILE_ENTRIES_EXCEEDED_MESSAGE: &str =
+    "The commit cannot be created because it exceeds the maximum number of changed files allowed \
+     in a commit. The maximum limit for the number of files is 100 in the AWS CodeCommit console \
+     and in the CreateCommit API. Either create multiple commits to push these file changes, or \
+     use a Git client.";
 
 /// The smallest `maxResults` a paginated CodeCommit list operation accepts; one
 /// below it is refused with `InvalidMaxResultsException`. CodeCommit documents the
@@ -936,6 +989,13 @@ pub fn is_client_request_token(candidate: &str) -> bool {
     let characters = candidate.chars().count();
     (1..=CLIENT_REQUEST_TOKEN_MAX_LENGTH).contains(&characters)
 }
+
+/// `ClientRequestTokenRequiredException`'s message: a FIXED sentence naming nothing
+/// from the request, for a request that carries no `clientRequestToken` AT ALL where
+/// the operation requires one. Worded here once for the request boundary
+/// (`crate::service`) and for the handler that requires the member the model leaves
+/// optional.
+pub const CLIENT_REQUEST_TOKEN_REQUIRED_MESSAGE: &str = "A client request token is required.";
 
 /// `InvalidClientRequestTokenException`'s message: the sentence pair the service
 /// words that code with — the failure, then the rule — naming nothing from the
@@ -1236,6 +1296,41 @@ impl ComAmazonawsCodecommitCodecommit20150413State {
         self.repositories
             .values()
             .any(|repository| repository.associated_templates.contains(template_name))
+    }
+
+    /// Re-key the approval rule template stored under `old_name` to `new_name`,
+    /// answering the stored template under its new name.
+    ///
+    /// The template map is keyed by the name, and an association is held by that
+    /// same name on each repository, so a rename moves BOTH: the repositories
+    /// associated with the template stay associated with it, because it is the same
+    /// template. Nothing else about it changes — its id (the identity a rename does
+    /// not alter), its content, its content digest and its creation date all carry
+    /// over, while the change moves `lastModifiedDate` and `lastModifiedUser` onto
+    /// this call, exactly as the other two template updates do.
+    ///
+    /// Answers `None` when no template is stored under `old_name`. The CALLER
+    /// decides whether `new_name` may be taken: this is the mechanics of the move,
+    /// so it would overwrite a template already stored under `new_name`.
+    pub fn rename_approval_rule_template(
+        &mut self,
+        old_name: &str,
+        new_name: &str,
+        modified_by: String,
+        modified: SystemTime,
+    ) -> Option<&ApprovalRuleTemplateRecord> {
+        let mut template = self.approval_rule_templates.remove(old_name)?;
+        template.rename(new_name, modified_by, modified);
+        for repository in self.repositories.values_mut() {
+            if repository.associated_templates.remove(old_name) {
+                repository
+                    .associated_templates
+                    .insert(new_name.to_string());
+            }
+        }
+        self.approval_rule_templates
+            .insert(new_name.to_string(), template);
+        self.approval_rule_templates.get(new_name)
     }
 }
 
@@ -2725,6 +2820,20 @@ impl ApprovalRuleTemplateRecord {
         self.last_modified_user = by;
         self.last_modified_date = at;
     }
+
+    /// Give this template another name, recording who changed it and when.
+    ///
+    /// The name is the only thing that moves: the template's id is its identity and
+    /// is NOT re-derived from the new name, and its description, content, content
+    /// digest and creation date carry over — so the template a caller renames is the
+    /// same template, reachable under the new name. Which name the map keys it under
+    /// is the store's part of the move
+    /// ([`ComAmazonawsCodecommitCodecommit20150413State::rename_approval_rule_template`]).
+    pub fn rename(&mut self, name: &str, by: String, at: SystemTime) {
+        self.name = name.to_string();
+        self.last_modified_user = by;
+        self.last_modified_date = at;
+    }
 }
 
 /// One pull request and everything CodeCommit reports about it.
@@ -3375,6 +3484,17 @@ pub const CANNOT_DELETE_APPROVAL_RULE_FROM_TEMPLATE_MESSAGE: &str =
 pub const PULL_REQUEST_ALREADY_CLOSED_MESSAGE: &str =
     "The pull request status cannot be updated because it is already closed.";
 
+/// `PullRequestAlreadyClosedException`'s message for an attempt to MERGE a pull
+/// request that is no longer open.
+///
+/// CodeCommit words that code differently there too: it states the state the pull
+/// request is in and then that such a pull request is not merged — a caller
+/// attempting a merge is not told a status update failed. FIXED text naming nothing
+/// from the request, worded here once for the three operations that merge a pull
+/// request.
+pub const PULL_REQUEST_CLOSED_CANNOT_BE_MERGED_MESSAGE: &str =
+    "The specified pull request is marked as Closed. A closed pull request cannot be merged.";
+
 /// `PullRequestAlreadyClosedException`'s message for an update of a pull
 /// request's TEXT — its title or its description.
 ///
@@ -3412,6 +3532,19 @@ pub const TIP_OF_SOURCE_REFERENCE_IS_DIFFERENT_MESSAGE: &str =
     "The tip of the source branch in the destination repository does not match the tip of the \
      source branch specified in your request. The pull request might have been updated. Make sure \
      that you have the latest changes.";
+
+/// `ManualMergeRequiredException`'s message: the FIXED sentence CodeCommit answers
+/// that code with, carrying nothing from the request — no repository, no branch, no
+/// commit id and no conflicting path.
+///
+/// It is not the error shape's documented sentence, which is prose about the error
+/// class and speaks of a pull request even where the merge was between two branches.
+/// The service answers this one sentence on every path that raises the code — a
+/// merge whose conflicts no strategy and no resolution settled, and a fast-forward
+/// between two tips neither of which contains the other — so it is worded here once
+/// for all of them.
+pub const MANUAL_MERGE_REQUIRED_MESSAGE: &str =
+    "Current branches cannot be merged, please try to merge using a Git client locally.";
 
 /// `ConcurrentReferenceUpdateException`'s message: the sentences the model
 /// documents for the shape, echoing nothing from the request — what a merge
@@ -5068,9 +5201,14 @@ pub enum TriggerProblem {
     /// A trigger names no event, so nothing would ever run it:
     /// `RepositoryTriggerEventsListRequiredException`.
     EventsMissing,
-    /// An event outside `RepositoryTriggerEventEnum`, or `all` beside another
-    /// value: `InvalidRepositoryTriggerEventsException`.
+    /// An event outside `RepositoryTriggerEventEnum`, or one named twice:
+    /// `InvalidRepositoryTriggerEventsException`.
     EventsInvalid,
+    /// [`REPOSITORY_TRIGGER_EVENT_ALL`] named beside another event type, which the
+    /// one value standing for every event cannot be: the same
+    /// `InvalidRepositoryTriggerEventsException`, worded for the combination
+    /// rather than for an event name the service does not recognise.
+    EventsAllCombined,
     /// A trigger names more branches than one trigger may:
     /// `MaximumBranchesExceededException`.
     TooManyBranches,
@@ -5127,6 +5265,14 @@ impl TriggerProblem {
                                     Check to make sure that all events specified match the \
                                     requirements for allowed events."
                 .to_string(),
+            // The two reasons an events list is refused are distinguishable only by
+            // this text, so the combination has the service's own sentence for it
+            // rather than the one that reports an unrecognised event name. It ends
+            // without a period, as the service writes it.
+            Self::EventsAllCombined => format!(
+                "Repository trigger events cannot contain '{REPOSITORY_TRIGGER_EVENT_ALL}' and \
+                 additional event types simultaneously"
+            ),
             Self::TooManyBranches => format!(
                 "The number of branches for the trigger was exceeded. The maximum number of \
                  branches for a trigger is {MAX_BRANCHES_PER_TRIGGER}."
@@ -5225,9 +5371,14 @@ pub fn trigger_configuration_problem(
         if trigger.events.iter().any(|event| {
             !crate::ops::types::REPOSITORY_TRIGGER_EVENT_ENUM_VALUES.contains(&event.as_str())
                 || !distinct.insert(event.as_str())
-        }) || (names_all && trigger.events.len() > 1)
-        {
+        }) {
             return Some(TriggerProblem::EventsInvalid);
+        }
+        // "The valid value \"all\" cannot be used with any other values": a list
+        // naming it beside another event type is refused for the COMBINATION, which
+        // the service words differently from an event it does not recognise.
+        if names_all && trigger.events.len() > 1 {
+            return Some(TriggerProblem::EventsAllCombined);
         }
         let branches = trigger.branches.as_deref().unwrap_or_default();
         if branches.len() > MAX_BRANCHES_PER_TRIGGER {

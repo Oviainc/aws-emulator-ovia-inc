@@ -29,7 +29,9 @@ use crate::harness::{
     PULL_REQUEST_DOES_NOT_EXIST,
 };
 use crate::repository_lifecycle::{base64, ok, string_at};
-use crate::wire::{caller_arn, emulator_with_callers, ok_as, refusal_as};
+use crate::wire::{
+    caller_arn, emulator_with_callers, fresh_client_request_token, ok_as, refusal_as,
+};
 
 /// The operation under test, and the writer whose records it reads back.
 const OPERATION: &str = "GetPullRequestApprovalStates";
@@ -136,6 +138,7 @@ async fn fixture() -> Fixture {
                 "sourceReference": SOURCE,
                 "destinationReference": DESTINATION,
             }],
+            "clientRequestToken": fresh_client_request_token(),
         }),
     )
     .await;
@@ -271,6 +274,7 @@ impl Fixture {
                     "sourceReference": SECOND_SOURCE,
                     "destinationReference": DESTINATION,
                 }],
+                "clientRequestToken": fresh_client_request_token(),
             }),
         )
         .await;

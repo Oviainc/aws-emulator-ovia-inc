@@ -219,13 +219,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // "The content for the approval rule is empty. You must provide some content
-        // for an approval rule." Likewise reached by whitespace-only content.
+        // Content that carries no document at all is refused as content that is not
+        // valid, in the one sentence the service answers for both forms the absence
+        // takes. The modelled minimum length is 1, so the request boundary already
+        // refused an empty value with this same code and sentence
+        // (`crate::service::refusal_for`); what reaches here is content of nothing
+        // but whitespace, which carries a document no more than an empty value does.
         if input.approval_rule_content.trim().is_empty() {
             return Err(
-                CreatePullRequestApprovalRuleErrorModeled::ApprovalRuleContentRequiredException(
-                    ApprovalRuleContentRequiredException {
-                        message: Some("the content for the approval rule is empty".to_string()),
+                CreatePullRequestApprovalRuleErrorModeled::InvalidApprovalRuleContentException(
+                    InvalidApprovalRuleContentException {
+                        message: Some(
+                            crate::state::APPROVAL_RULE_CONTENT_REQUIRED_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

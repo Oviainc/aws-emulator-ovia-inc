@@ -32,7 +32,10 @@ use crate::harness::{
     PULL_REQUEST_DOES_NOT_EXIST,
 };
 use crate::repository_lifecycle::{base64, ok, string_at};
-use crate::wire::{caller_arn, emulator_with_callers, hold_long_term_key, ok_as, refusal_as};
+use crate::wire::{
+    caller_arn, emulator_with_callers, fresh_client_request_token, hold_long_term_key, ok_as,
+    refusal_as,
+};
 
 /// The operation under test, and the readers a recorded approval is read back
 /// through.
@@ -191,6 +194,7 @@ async fn fixture(rule: Option<&str>) -> Fixture {
                 "sourceReference": SOURCE,
                 "destinationReference": DESTINATION,
             }],
+            "clientRequestToken": fresh_client_request_token(),
         }),
     )
     .await;
@@ -339,6 +343,7 @@ impl Fixture {
                     "sourceReference": source,
                     "destinationReference": DESTINATION,
                 }],
+                "clientRequestToken": fresh_client_request_token(),
             }),
         )
         .await;

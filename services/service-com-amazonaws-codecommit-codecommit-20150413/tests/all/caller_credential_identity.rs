@@ -43,7 +43,9 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts;
 
 use crate::repository_lifecycle::{base64, ok, string_at};
-use crate::wire::{emulator_with_callers, hold_long_term_key_for, ok_as, refusal_as};
+use crate::wire::{
+    emulator_with_callers, fresh_client_request_token, hold_long_term_key_for, ok_as, refusal_as,
+};
 
 /// The operations driven here: the approval, the merge the approval gates, and the
 /// readers the recorded identity and the merge's effect are read back through.
@@ -329,6 +331,7 @@ async fn fixture(rule: &str) -> Fixture {
                 "sourceReference": SOURCE,
                 "destinationReference": DESTINATION,
             }],
+            "clientRequestToken": fresh_client_request_token(),
         }),
     )
     .await;

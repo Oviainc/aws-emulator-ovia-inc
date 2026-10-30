@@ -23,6 +23,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::error_with_message;
 use crate::repository_lifecycle::{base64, emulator, is_object_id, ok, string_at};
+use crate::wire::fresh_client_request_token;
 
 /// The three merge operations a pull request can be merged by, and the `mergeOption`
 /// each records (`smithy_query(query="shape",shape="MergeOptionTypeEnum")`).
@@ -55,11 +56,12 @@ const STATUS_CLOSED: &str = "CLOSED";
 /// The status every error asserted here models (`errorKind: client`, `httpError: 400`).
 const CLIENT_ERROR_STATUS: u16 = 400;
 
-/// The sentence `PullRequestAlreadyClosedException` carries, written out here rather than
-/// read from the service, so the refusal is checked against the words CodeCommit answers
-/// this error class with.
+/// The sentence `PullRequestAlreadyClosedException` carries on a MERGE, written out
+/// here rather than read from the service, so the refusal is checked against the
+/// words CodeCommit answers a merge of a closed pull request with — which are not
+/// the ones it answers an attempt to update its status with.
 const ALREADY_CLOSED: &str =
-    "The pull request status cannot be updated because it is already closed.";
+    "The specified pull request is marked as Closed. A closed pull request cannot be merged.";
 
 const DESTINATION: &str = "main";
 const SOURCE: &str = "feature";
@@ -150,6 +152,7 @@ async fn open_pull_request(repository: &str, diverged: bool) -> Opened {
                 "sourceReference": SOURCE,
                 "destinationReference": DESTINATION,
             }],
+            "clientRequestToken": fresh_client_request_token(),
         }),
     )
     .await;

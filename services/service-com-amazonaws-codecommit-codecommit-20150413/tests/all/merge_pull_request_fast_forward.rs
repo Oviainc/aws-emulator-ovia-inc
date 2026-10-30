@@ -38,7 +38,7 @@ use service_com_amazonaws_codecommit_codecommit_20150413::state::ComAmazonawsCod
 use crate::harness::error_with_message;
 use crate::repository_lifecycle::{emulator, emulator_with_engine, error, git_blob_id, ok, string_at};
 use crate::unreferenced_merge_commits::{commit, commit_of, parents_of, tree_of, Change, EXECUTABLE, NORMAL};
-use crate::wire::{caller_arn, DEFAULT_ACCESS_KEY_ID};
+use crate::wire::{caller_arn, fresh_client_request_token, DEFAULT_ACCESS_KEY_ID};
 
 /// The two branches every pull request below is between: `main` is the destination
 /// and `feature` the source.
@@ -58,11 +58,12 @@ const STATUS_CLOSED: &str = "CLOSED";
 /// 400` on each of these error shapes).
 const CLIENT_ERROR_STATUS: u16 = 400;
 
-/// The sentence pair `ManualMergeRequiredException` carries, as the model documents
-/// the shape.
+/// The one sentence `ManualMergeRequiredException` carries — the words the SERVICE
+/// answers that class with on every merge path, which name no branch, no commit and
+/// no repository (`src/state.rs`'s `MANUAL_MERGE_REQUIRED_MESSAGE`), rather than the
+/// prose the model documents on the shape.
 const MANUAL_MERGE_MESSAGE: &str =
-    "The pull request cannot be merged automatically into the destination branch. You must \
-     manually merge the branches and resolve any conflicts.";
+    "Current branches cannot be merged, please try to merge using a Git client locally.";
 
 /// The one sentence pair `PullRequestApprovalRulesNotSatisfiedException` carries,
 /// whichever rule went unmet.
@@ -357,6 +358,7 @@ async fn open_pull_request(
                 "sourceReference": SOURCE,
                 "destinationReference": DESTINATION,
             }],
+            "clientRequestToken": fresh_client_request_token(),
         }),
     )
     .await;
@@ -774,6 +776,7 @@ async fn a_fast_forward_merge_that_names_no_mergeable_pull_request_is_refused_an
                     "sourceReference": SOURCE,
                     "destinationReference": DESTINATION,
                 }],
+                "clientRequestToken": fresh_client_request_token(),
             }),
         )
         .await;

@@ -626,7 +626,7 @@ async fn a_request_naming_no_rule_the_pull_request_can_take_is_refused() {
                 "approvalRuleName": "another",
                 "approvalRuleContent": "   ",
             }),
-            code: "ApprovalRuleContentRequiredException",
+            code: "InvalidApprovalRuleContentException",
         },
         Refusal {
             label: "content that is not JSON at all",

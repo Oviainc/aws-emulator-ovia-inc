@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/approval_rule_content_required.rs"]
+mod approval_rule_content_required;
 #[path = "all/approval_rule_template_content_canonicalization.rs"]
 mod approval_rule_template_content_canonicalization;
 #[path = "all/approval_rule_template_content_update.rs"]
@@ -21,6 +23,8 @@ mod approval_rule_template_deletion;
 mod approval_rule_template_description;
 #[path = "all/approval_rule_template_disassociation.rs"]
 mod approval_rule_template_disassociation;
+#[path = "all/approval_rule_template_rename.rs"]
+mod approval_rule_template_rename;
 #[path = "all/approval_rule_templates.rs"]
 mod approval_rule_templates;
 #[path = "all/approval_rules_and_commits.rs"]
@@ -75,6 +79,8 @@ mod comment_reactions_read;
 mod comment_replies;
 #[path = "all/comment_thread_traversal.rs"]
 mod comment_thread_traversal;
+#[path = "all/commit_file_entry_bound.rs"]
+mod commit_file_entry_bound;
 #[path = "all/commit_folder_and_diff_members.rs"]
 mod commit_folder_and_diff_members;
 #[path = "all/commit_reads.rs"]
@@ -105,6 +111,8 @@ mod git_transport;
 mod git_transport_body_bound;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/manual_merge_required_message.rs"]
+mod manual_merge_required_message;
 #[path = "all/merge_branches_fast_forward.rs"]
 mod merge_branches_fast_forward;
 #[path = "all/merge_branches_squash.rs"]
@@ -159,6 +167,8 @@ mod pull_request_status_update;
 mod pull_request_text_update;
 #[path = "all/pull_request_title_update.rs"]
 mod pull_request_title_update;
+#[path = "all/pull_request_token_required.rs"]
+mod pull_request_token_required;
 #[path = "all/refusal_message_shape.rs"]
 mod refusal_message_shape;
 #[path = "all/repositories_for_approval_rule_template.rs"]

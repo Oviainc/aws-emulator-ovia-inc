@@ -36,7 +36,7 @@ use crate::harness::{
     INVALID_REVISION_ID, PULL_REQUEST_DOES_NOT_EXIST,
 };
 use crate::repository_lifecycle::{base64, ok, string_at};
-use crate::wire::{caller_arn, emulator_with_callers, ok_as};
+use crate::wire::{caller_arn, emulator_with_callers, fresh_client_request_token, ok_as};
 
 /// The operation under test.
 const OPERATION: &str = "EvaluatePullRequestApprovalRules";
@@ -191,6 +191,7 @@ async fn fixture() -> Fixture {
                 "sourceReference": SOURCE,
                 "destinationReference": DESTINATION,
             }],
+            "clientRequestToken": fresh_client_request_token(),
         }),
     )
     .await;

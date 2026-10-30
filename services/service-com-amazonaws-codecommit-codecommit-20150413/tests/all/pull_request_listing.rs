@@ -24,7 +24,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::error_with_message;
 use crate::repository_lifecycle::{base64, ok, string_at};
-use crate::wire::{caller_arn, emulator_with_callers, ok_as};
+use crate::wire::{caller_arn, emulator_with_callers, fresh_client_request_token, ok_as};
 
 /// The status every error asserted here models (`errorKind: client`, `httpError:
 /// 400` on each of these error shapes).
@@ -254,6 +254,7 @@ async fn listing() -> Listing {
                     "sourceReference": plan.branch,
                     "destinationReference": DESTINATION,
                 }],
+                "clientRequestToken": fresh_client_request_token(),
             }),
         )
         .await;

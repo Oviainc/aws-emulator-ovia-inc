@@ -9,9 +9,11 @@
 //! shape. Setting approval rule requirements aside says the pull request is already
 //! merged or closed and that its approval status is not overridden; replacing the
 //! pull request's text names the state the pull request is in and which text a
-//! closed pull request no longer takes; every other operation carries the sentence
-//! the model documents for the shape. None of the three depends on how the pull
-//! request stopped being open, on the caller, or on anything else the request said.
+//! closed pull request no longer takes; MERGING it says the pull request is marked
+//! as Closed and that a closed pull request is not merged; every other operation
+//! carries the sentence the model documents for the shape. None of the four depends
+//! on how the pull request stopped being open, on the caller, or on anything else the
+//! request said.
 //!
 //! The table below spans what that rule generalises over: the operation refused
 //! (the override path, both text paths, the approval-rule and approval-state paths,
@@ -32,7 +34,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::repository_lifecycle::{base64, ok, string_at};
-use crate::wire::{emulator_with_callers, ok_as, refusal_as};
+use crate::wire::{emulator_with_callers, fresh_client_request_token, ok_as, refusal_as};
 
 /// The error every row asserts, and the status the model binds it with
 /// (`errorKind: client`, `httpError: 400`).
@@ -78,6 +80,13 @@ const OVERRIDE_REFUSAL: &str = "This pull request is already merged or closed. Y
 const DOCUMENTED_REFUSAL: &str =
     "The pull request status cannot be updated because it is already closed.";
 
+/// The sentence a MERGE of a closed pull request is refused with: the same code, in
+/// the words that operation answers it with — a caller attempting a merge is not told
+/// a status update failed. Names nothing from the request or the stored record
+/// either.
+const MERGE_REFUSAL: &str =
+    "The specified pull request is marked as Closed. A closed pull request cannot be merged.";
+
 fn text_refusal(status: &str) -> String {
     format!(
         "The change cannot be made because the state of the pull request is {status}. You cannot \
@@ -91,6 +100,10 @@ fn override_refusal(_status: &str) -> String {
 
 fn documented_refusal(_status: &str) -> String {
     DOCUMENTED_REFUSAL.to_string()
+}
+
+fn merge_refusal(_status: &str) -> String {
+    MERGE_REFUSAL.to_string()
 }
 
 /// An approval rule document asking for `approvals` approvals, as compact JSON text.
@@ -181,6 +194,7 @@ async fn closed_pull_request(repository: &str, by_merging: bool) -> ClosedPullRe
                 "sourceReference": SOURCE,
                 "destinationReference": DESTINATION,
             }],
+            "clientRequestToken": fresh_client_request_token(),
         }),
     )
     .await;
@@ -381,7 +395,7 @@ fn rows() -> Vec<Row> {
                     "pullRequestId": closed.pull_request_id,
                 })
             },
-            expected: documented_refusal,
+            expected: merge_refusal,
             refused_after_a_merge: false,
         },
         Row {
@@ -393,7 +407,7 @@ fn rows() -> Vec<Row> {
                     "pullRequestId": closed.pull_request_id,
                 })
             },
-            expected: documented_refusal,
+            expected: merge_refusal,
             refused_after_a_merge: false,
         },
         Row {
@@ -405,7 +419,7 @@ fn rows() -> Vec<Row> {
                     "pullRequestId": closed.pull_request_id,
                 })
             },
-            expected: documented_refusal,
+            expected: merge_refusal,
             refused_after_a_merge: false,
         },
     ]
@@ -449,10 +463,10 @@ async fn a_closed_pull_request_refuses_each_change_in_that_operations_own_words(
 }
 
 #[tokio::test]
-async fn the_three_closed_pull_request_refusals_are_worded_apart() {
-    // The point of the rule: the override refusal, the text refusal and the
-    // documented sentence are three DIFFERENT strings, so a client reading the
-    // message of one code can still tell which change was refused.
+async fn the_four_closed_pull_request_refusals_are_worded_apart() {
+    // The point of the rule: the override refusal, the text refusal, the documented
+    // sentence and the merge refusal are four DIFFERENT strings, so a client reading
+    // the message of one code can still tell which change was refused.
     let closed = closed_pull_request("closed-refusals-differ", false).await;
     let mut seen: Vec<String> = Vec::new();
     for row in rows() {
@@ -472,6 +486,7 @@ async fn the_three_closed_pull_request_refusals_are_worded_apart() {
         OVERRIDE_REFUSAL.to_string(),
         text_refusal(STATUS_CLOSED),
         DOCUMENTED_REFUSAL.to_string(),
+        MERGE_REFUSAL.to_string(),
     ];
     assert_eq!(
         seen, expected,

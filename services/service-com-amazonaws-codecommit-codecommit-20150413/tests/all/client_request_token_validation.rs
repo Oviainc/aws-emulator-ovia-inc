@@ -14,6 +14,12 @@
 //! so repeating the same request under it answers the first call's resource instead
 //! of creating a second one.
 //!
+//! Whether the member may be left out AT ALL is the operation's own requirement, not
+//! this rule's: `CreatePullRequest` requires it on the wire (its refusal is pinned by
+//! `tests/all/modeled_refusal_messages.rs`), while the comment-posting operations
+//! take a request that carries none and simply have no earlier request to answer
+//! with — which is the last table below.
+//!
 //! The tables below span what that rule generalises over: the operation carrying the
 //! member (every implemented one), and the token's size and character kind — the
 //! empty string, one character, the 256-character bound, one character past it
@@ -104,6 +110,7 @@ async fn fixture() -> Fixture {
                 "sourceReference": "feature",
                 "destinationReference": "main",
             }],
+            "clientRequestToken": crate::wire::fresh_client_request_token(),
         }),
     )
     .await;
@@ -118,8 +125,8 @@ async fn fixture() -> Fixture {
 
 impl Fixture {
     /// Every implemented operation carrying a `clientRequestToken`: the operation
-    /// name, a body that succeeds without a token, and where its answer carries the
-    /// id of the resource the call creates.
+    /// name, a body WITHOUT a token, and where its answer carries the id of the
+    /// resource the call creates. The token rows below add the member to each body.
     fn carriers(&self) -> Vec<(&'static str, Value, &'static str)> {
         vec![
             (
@@ -284,9 +291,16 @@ async fn a_present_token_inside_the_bound_is_accepted_and_deduplicates_a_repeat(
 async fn a_request_leaving_the_token_out_creates_a_resource_of_its_own() {
     let fixture = fixture().await;
 
-    // The member is optional: leaving it out names no earlier request, so two such
-    // calls are two resources — the behaviour an empty token must NOT be read as.
-    for (operation, body, id_pointer) in fixture.carriers() {
+    // The comment-posting operations take a request that carries no token: leaving
+    // the member out names no earlier request, so two such calls are two comments —
+    // the behaviour an empty token must NOT be read as. `CreatePullRequest` is not
+    // among them: it REQUIRES the member, which is its own rule rather than this
+    // one, so it is left to the suite that pins that refusal.
+    for (operation, body, id_pointer) in fixture
+        .carriers()
+        .into_iter()
+        .filter(|(operation, _, _)| *operation != "CreatePullRequest")
+    {
         let first = string_at(&ok(&fixture.router, operation, &body).await, id_pointer);
         let second = string_at(&ok(&fixture.router, operation, &body).await, id_pointer);
         assert_ne!(

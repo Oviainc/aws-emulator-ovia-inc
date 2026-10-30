@@ -710,12 +710,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 MergeBranchesBySquashErrorModeled::ManualMergeRequiredException(
                     ManualMergeRequiredException {
-                        message: Some(
-                            "The pull request cannot be merged automatically into the destination \
-                             branch. You must manually merge the branches and resolve any \
-                             conflicts."
-                                .to_string(),
-                        ),
+                        message: Some(crate::state::MANUAL_MERGE_REQUIRED_MESSAGE.to_string()),
                     },
                 )
                 .into(),
