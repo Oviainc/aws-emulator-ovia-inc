@@ -1492,21 +1492,29 @@ impl StoredCampaign {
     /// value naming no block removes nothing.
     ///
     /// Only the named block goes: `instanceLimitsHandling` is not a config type any
-    /// request can name, so a campaign that set it keeps it. An override left carrying
-    /// no member at all carries nothing, so the record holds no override rather than an
-    /// empty one — a campaign with no override to begin with is left exactly as it was,
+    /// request can name, so a campaign that set it keeps it. An override a REMOVAL left
+    /// carrying no member at all carries nothing, so the record holds no override rather
+    /// than an empty one. A campaign with no override to begin with, and one whose
+    /// override holds no block for the named config, are left exactly as they were —
     /// which is what makes the operation idempotent, as the model declares.
     pub fn clear_communication_limits(&mut self, config_type: &str) {
         let Some(config) = self.communication_limits_override.as_mut() else {
             return;
         };
-        match config_type {
-            "ALL_CHANNEL_SUBTYPES" => config.all_channel_subtypes = None,
+        let removed = match config_type {
+            "ALL_CHANNEL_SUBTYPES" => config.all_channel_subtypes.take().is_some(),
             // A catalog value with no block on `CommunicationLimitsConfig` is a config
             // this emulator cannot be configured for, so it holds nothing to remove.
-            _ => return,
-        }
-        if config.all_channel_subtypes.is_none() && config.instance_limits_handling.is_none() {
+            _ => false,
+        };
+        // Only a removal collapses the override: a call that removed nothing writes
+        // nothing at all, so a campaign carrying an override with no block in it keeps
+        // that override rather than losing it to a deletion that found nothing — the
+        // same guard the sibling `clear_channel_subtype_config` collapses behind.
+        if removed
+            && config.all_channel_subtypes.is_none()
+            && config.instance_limits_handling.is_none()
+        {
             self.communication_limits_override = None;
         }
     }

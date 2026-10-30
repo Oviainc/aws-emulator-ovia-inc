@@ -11,7 +11,9 @@
 //! nothing else: it keeps no copy of its own.
 //!
 //! Idempotent, as the model declares: a config whose block is not set, and a campaign
-//! carrying no communication-limits override at all, are a 200 that removes nothing.
+//! carrying no communication-limits override at all, are a 200 that removes nothing —
+//! and a call that removes nothing writes nothing, so such a record is left exactly as
+//! it was, an override holding no block for the named config included.
 //!
 //! ## Shape of an operation
 //!

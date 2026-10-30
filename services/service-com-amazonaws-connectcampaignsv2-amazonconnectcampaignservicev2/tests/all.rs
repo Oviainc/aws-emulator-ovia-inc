@@ -63,6 +63,8 @@ mod common;
 mod communication_limits_refusal_wording;
 #[path = "all/communication_time_window_constraints.rs"]
 mod communication_time_window_constraints;
+#[path = "all/configuration_deletion_writes_only_a_removal.rs"]
+mod configuration_deletion_writes_only_a_removal;
 #[path = "all/connect_instance_config_deletion.rs"]
 mod connect_instance_config_deletion;
 #[path = "all/connect_instance_integration_deletion.rs"]

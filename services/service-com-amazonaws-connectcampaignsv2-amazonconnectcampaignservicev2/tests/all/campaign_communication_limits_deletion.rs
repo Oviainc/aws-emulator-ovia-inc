@@ -10,11 +10,12 @@
 //!   holds in its stored `communicationLimitsOverride` for the ONE config `config`
 //!   names, and nothing else: every other member of that override — and every other
 //!   member of the campaign — stays as it was, which is what every later read
-//!   (`DescribeCampaign`) projects. An override left with no member at all is absent
-//!   rather than empty;
+//!   (`DescribeCampaign`) projects. An override a REMOVAL left with no member at all is
+//!   absent rather than empty;
 //! * the operation is idempotent (`@idempotent` in the model, "This API is idempotent"
 //!   in its documentation): a config whose block is not set, and a campaign carrying no
-//!   override at all, are a 200 that removes nothing;
+//!   override at all, are a 200 that removes nothing — and a call that removed nothing
+//!   writes nothing, so the record is left exactly as it was;
 //! * an id the store does not hold is HTTP 404 `ResourceNotFoundException` and removes
 //!   nothing;
 //! * a `config` outside the model's `CommunicationLimitsConfigType` catalog is HTTP 400
@@ -153,20 +154,25 @@ async fn describe(router: &MultiServiceRouter, region: &str, id: &str, case: &st
 
 /// The override the store should hold after deleting `config_type` from `created`:
 /// `created` minus that config's own member, and absent (`Value::Null`, the shape the
-/// projection carries for a member it does not hold) once no member is left.
+/// projection carries for a member it does not hold) once a REMOVAL left no member
+/// behind. A delete that found no block for `config_type` removed nothing, so it writes
+/// nothing and `created` stays exactly as it was — an override carrying no block at all
+/// included.
 fn expected_override(created: Option<&Value>, config_type: &str) -> Value {
     let Some(created) = created else {
         return Value::Null;
     };
     let mut expected = created.clone();
-    expected
+    let removed = expected
         .as_object_mut()
         .expect("a communication limits config is an object")
-        .remove(member_of(config_type));
-    if expected
-        .as_object()
-        .expect("a communication limits config is an object")
-        .is_empty()
+        .remove(member_of(config_type))
+        .is_some();
+    if removed
+        && expected
+            .as_object()
+            .expect("a communication limits config is an object")
+            .is_empty()
     {
         return Value::Null;
     }
