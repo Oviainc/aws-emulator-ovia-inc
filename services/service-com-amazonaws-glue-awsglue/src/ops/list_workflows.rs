@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkflows
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkflows`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkflows::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the names of the workflows this account holds
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::workflows`]): one `MaxResults`-sized
+//! page at a time in workflow-name order, with a `NextToken` that resumes the walk where
+//! the previous page stopped. Reporting only — nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +67,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest page `MaxResults` accepts, from the member's own range
+/// (`ListWorkflowsRequest$MaxResults`, `OrchestrationPageSize25` range 1..25) — and so
+/// the page size for a request that names none.
+const MAX_PAGE_SIZE: i32 = 25;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -142,18 +143,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWorkflows` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkflowsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkflows"))
+        // A workflow lives in one per-account namespace — every operation that addresses
+        // one names it by `Name` alone, with no `CatalogId` and no Region member — so
+        // nothing here depends on the request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on — the same way
+            // the other workflow readers report it.
+            return Err(ListWorkflowsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue workflow store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "The maximum size of a list to return" (`MaxResults`, range 1..25). Absent, the
+        // page is the largest the model accepts for it; the clamp re-states that range
+        // here so the page size is never 0 even if the boundary validator ever stops
+        // enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        // Reporting only: the stored names are projected out and nothing is written — not
+        // even the statuses a workflow's runs are owed, because no member of this answer
+        // reports one.
+        let store = state.lock();
+        // The namespace is keyed by workflow name and iterated in key order, so one page
+        // follows another deterministically.
+        let names: Vec<&str> = store
+            .workflows
+            .values()
+            .map(|entry| entry.name.as_str())
+            .collect();
+
+        // "A continuation token, if this is a continuation request": it is the last name
+        // of the previous page, so this page resumes at the first stored name strictly
+        // after it — which stays correct across workflows created or deleted between two
+        // calls. A token this service never issued names a position in that order rather
+        // than a refusal, for the same reason: the cursor is a key in the listing's own
+        // order, so every string names one, exactly as the sibling name listings of this
+        // crate resolve a cursor.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => names.partition_point(|name| *name <= cursor),
+            None => 0,
+        };
+        // Taken with `skip`/`take` rather than by slicing, so a cursor the request chose
+        // can never index outside the set.
+        let page: Vec<String> = names
+            .iter()
+            .skip(start)
+            .take(page_size)
+            .map(|name| (*name).to_string())
+            .collect();
+        let end = start.saturating_add(page.len());
+        // "A continuation token, if not all workflow names have been returned": it names
+        // the last entry of the page, taken from the page itself so there is no index
+        // arithmetic to underflow on an empty page.
+        let next_token = if end < names.len() {
+            page.last().cloned()
+        } else {
+            None
+        };
+
+        Ok(ListWorkflowsOutput {
+            // `Workflows` is `WorkflowNames`, "len 1..25", so the model admits no empty
+            // list: an account holding no workflow, and a page past the end of the
+            // listing, report no `Workflows` member at all rather than an empty one.
+            workflows: (!page.is_empty()).then_some(page),
+            next_token,
+        })
     }
 }
