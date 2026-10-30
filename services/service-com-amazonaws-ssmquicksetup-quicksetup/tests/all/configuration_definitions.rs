@@ -7,8 +7,10 @@
 //! asserted is what a signed AWS SDK request observes.
 //!
 //! The rule under test: an update replaces, in the ONE stored configuration definition
-//! the `{ManagerArn}/{Id}` pair names, exactly the members the request carries, leaves
-//! every member it omits and every other definition as they were stored, and carries
+//! the `{ManagerArn}/{Id}` pair names, exactly the members the request carries — and,
+//! inside `Parameters`, exactly the entries it names — leaves
+//! every member and every parameter entry it omits, and every other definition, as they
+//! were stored, and carries
 //! the new values into the configuration the service deploys from that definition — so
 //! a later `GetConfigurationManager` and `ListConfigurations` report them. A pair that
 //! names no stored definition is the modelled 404, and an input the model or the
@@ -221,6 +223,36 @@ fn latest_version_of(type_: &str) -> &'static str {
         .latest_version()
 }
 
+/// The parameter map the FIRST definition of [`baseline`] is created with: the map every
+/// update below writes its entries into.
+fn baseline_parameters() -> Value {
+    json!({
+        "TargetOrganizationalUnits": TARGET_OU,
+        "TargetRegions": TARGET_REGIONS,
+        "TargetType": "*",
+        "UpdateSSMAgent": "true",
+    })
+}
+
+/// The `Parameters` the updated definition HOLDS once an update whose `Parameters`
+/// carries `entries` has been served: an update writes the entries it names into the
+/// stored map and leaves every other stored entry alone.
+fn parameters_after(entries: &Value) -> Value {
+    merged(&baseline_parameters(), entries)
+}
+
+/// One row of the table below for an update carrying nothing but `entries` in its
+/// `Parameters`: the body to send, and the members the named definition must then
+/// report.
+fn parameter_case(case: &'static str, entries: Value) -> (&'static str, Value, Value) {
+    let held = parameters_after(&entries);
+    (
+        case,
+        json!({ "Parameters": entries }),
+        json!({ "Parameters": held }),
+    )
+}
+
 /// The two definitions every case below starts from: both carry a `TypeVersion` the
 /// catalog publishes for their type and a parameter set naming somewhere to deploy to
 /// and the Region to deploy into (which every accepted definition must), the first also
@@ -233,12 +265,7 @@ fn baseline() -> Value {
         "ConfigurationDefinitions": [
             {
                 "Type": BASELINE_TYPE,
-                "Parameters": {
-                    "TargetOrganizationalUnits": TARGET_OU,
-                    "TargetRegions": TARGET_REGIONS,
-                    "TargetType": "*",
-                    "UpdateSSMAgent": "true",
-                },
+                "Parameters": baseline_parameters(),
                 "TypeVersion": "1.0",
                 "LocalDeploymentExecutionRoleName": "QuickSetupExecution",
                 "LocalDeploymentAdministrationRoleArn":
@@ -385,33 +412,33 @@ async fn an_update_replaces_only_the_members_it_carries_in_the_definition_it_nam
             json!({ "TypeVersion": "2" }),
             json!({ "TypeVersion": "2.0" }),
         ),
-        (
-            "parameters are replaced, not merged into",
-            json!({ "Parameters": {
+        parameter_case(
+            // A parameter the update names is written over the stored one; a parameter
+            // it does not name keeps the value the definition holds for it.
+            "one parameter written over the stored map",
+            json!({
                 "TargetOrganizationalUnits": TARGET_OU,
                 "TargetRegions": TARGET_REGIONS,
                 "TargetType": "instance",
-            } }),
-            json!({ "Parameters": {
-                "TargetOrganizationalUnits": TARGET_OU,
-                "TargetRegions": TARGET_REGIONS,
-                "TargetType": "instance",
-            } }),
+            }),
         ),
-        (
-            "a parameter set holding nothing but the deployment target and its Regions",
-            json!({ "Parameters": parameters(2) }),
-            json!({ "Parameters": parameters(2) }),
+        parameter_case(
+            // Every entry it names already holds that value, so this update stores
+            // nothing at all.
+            "a parameter set naming only entries the definition already holds",
+            parameters(2),
         ),
-        (
+        parameter_case(
             "a parameter set larger than the stored one",
-            json!({ "Parameters": parameters(5) }),
-            json!({ "Parameters": parameters(5) }),
+            parameters(5),
         ),
-        (
-            "a parameter set at the bound one definition may hold",
-            json!({ "Parameters": parameters(MAX_PARAMETERS) }),
-            json!({ "Parameters": parameters(MAX_PARAMETERS) }),
+        parameter_case(
+            // The stored map holds two entries this one does not name
+            // (`baseline_parameters`), which it leaves in place, so a set of
+            // `MAX_PARAMETERS - 2` entries leaves the definition holding exactly the
+            // bound.
+            "a parameter set leaving the definition at the bound it may hold",
+            parameters(MAX_PARAMETERS - 2),
         ),
         (
             "the local deployment execution role only",
@@ -452,12 +479,12 @@ async fn an_update_replaces_only_the_members_it_carries_in_the_definition_it_nam
             }),
             json!({
                 "TypeVersion": latest,
-                "Parameters": {
+                "Parameters": parameters_after(&json!({
                     "TargetOrganizationalUnits": TARGET_OU,
                     "TargetRegions": TARGET_REGIONS,
                     "TargetType": "tag-key",
                     "TargetTagKey": "Env",
-                },
+                })),
                 "LocalDeploymentExecutionRoleName": "AllAtOnceExecution",
                 "LocalDeploymentAdministrationRoleArn":
                     "arn:aws:iam::000000000000:role/AllAtOnceAdministration",
@@ -624,13 +651,13 @@ async fn the_deployed_configuration_reports_what_the_update_wrote() {
     );
     assert_eq!(
         deployed.get("Parameters"),
-        Some(&json!({
+        Some(&parameters_after(&json!({
             "TargetOrganizationalUnits": TARGET_OU,
             "TargetRegions": TARGET_REGIONS,
             "TargetType": "instance",
-        })),
-        "case {case}: the deployed configuration must carry every updated parameter, got \
-         {deployed:?}"
+        }))),
+        "case {case}: the deployed configuration must carry every parameter the definition \
+         now holds, got {deployed:?}"
     );
     assert_eq!(
         target_after.get("Type"),
@@ -766,19 +793,21 @@ async fn an_update_the_service_cannot_accept_is_refused_and_writes_nothing() {
     let cases: Vec<(&str, String, Value)> = vec![
         (
             // `ConfigurationParametersMap` bounds each key and value but not the map's
-            // size, so the service's own bound is what refuses this one past it.
-            "one parameter past the bound a definition may hold",
+            // size, so the service's own bound is what refuses a set that would leave
+            // the definition past it — the two stored entries the update does not name
+            // included.
+            "a parameter set leaving the definition one entry past the bound",
             target.clone(),
-            json!({ "Parameters": parameters(MAX_PARAMETERS + 1) }),
+            json!({ "Parameters": parameters(MAX_PARAMETERS - 1) }),
         ),
         (
             // A definition is deployed where its parameters say, so a parameter set
             // naming neither the accounts nor the organizational units to deploy to
-            // names nowhere — including when the update would be STRIPPING the target
-            // the stored definition has.
-            "a parameter set naming no deployment target",
+            // names nowhere — including when the update is STRIPPING the target the
+            // stored definition has by writing its key with no value.
+            "a parameter set stripping the stored deployment target",
             target.clone(),
-            json!({ "Parameters": { "UpdateSSMAgent": "true" } }),
+            json!({ "Parameters": { "TargetOrganizationalUnits": "" } }),
         ),
         (
             "a parameter set whose only target keys are written empty",

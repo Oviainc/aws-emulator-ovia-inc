@@ -9,8 +9,9 @@
 //!
 //! The rule under test: a Quick Setup configuration definition is deployed into the
 //! Regions its parameters name and into no others, so every request that writes a
-//! definition's parameter map — the create that stores one and the update that replaces
-//! one — is accepted only when that map provides a value for `TargetRegions`, and is
+//! definition's parameter map — the create that stores one and the update that writes
+//! entries into one — is accepted only when the map the definition then HOLDS provides a
+//! value for `TargetRegions`, and is
 //! otherwise refused with a 400 `ValidationException` having written nothing; nothing
 //! stands in for the Regions a definition did not name, least of all the Region the
 //! request was signed for. The model's documentation for the member is where the rule is
@@ -43,6 +44,21 @@ fn local_account() -> String {
 /// the one that left it alone.
 fn baseline_parameters() -> Value {
     json!({ "TargetOrganizationalUnits": "ou-1", "TargetRegions": "us-east-1" })
+}
+
+/// [`baseline_parameters`] with every entry `entries` names written over it: the
+/// parameter map a definition HOLDS once an update carrying `entries` has been served,
+/// since an update writes the entries it names and leaves the rest of the stored map
+/// alone.
+fn parameters_after(entries: &Value) -> Value {
+    let mut map = baseline_parameters()
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    for (key, value) in entries.as_object().cloned().unwrap_or_default() {
+        map.insert(key, value);
+    }
+    Value::Object(map)
 }
 
 /// One emulator with an empty store, mounted exactly as the router mounts it.
@@ -475,17 +491,136 @@ async fn a_create_stores_a_definition_only_when_its_parameters_name_the_target_r
     }
 }
 
-/// An update replaces a definition's whole parameter map, so it is accepted only when
-/// the map it writes still names the Regions to deploy into — and a refused one leaves
-/// the stored definition, deployments and all, exactly as it was.
+/// One row of the update table: the case, the configuration type the definition deploys,
+/// the entries the update writes, and — when the map the definition then holds may be
+/// stored — the Regions it must be deployed into. `None` is a row the service must
+/// refuse.
+type RegionUpdateCase = (&'static str, &'static str, Value, Option<Vec<&'static str>>);
+
+/// The table for an update, every row written into a stored map that names one Region to
+/// deploy into ([`baseline_parameters`]). The rows differ along what decides the merged
+/// map's Regions — whether the update names `TargetRegions` at all, how many Regions it
+/// names, how that comma-separated value is written (padding, empty entries, repeats),
+/// whether it writes the stored key with no value (the way the stored Regions are
+/// dropped), the spelling of the key, which configuration type the definition deploys
+/// (one per published table, including types the reported case did not name), and which
+/// other parameters it names beside it.
+///
+/// The configuration types are entries of the catalog `ListQuickSetupTypes` publishes
+/// (`crate::state::QUICK_SETUP_TYPE_CATALOG`), so no row is refused for naming a type
+/// the service does not offer.
+fn update_cases() -> Vec<RegionUpdateCase> {
+    vec![
+        (
+            // The update names no Region key at all, so the definition keeps the Region
+            // it was stored with.
+            "the deployment target rewritten and no Regions named",
+            "AWSQuickSetupType-DHMC",
+            json!({ "TargetOrganizationalUnits": "ou-2", "TargetType": "*" }),
+            Some(vec!["us-east-1"]),
+        ),
+        (
+            "type-specific options and a target, no Regions named",
+            "AWSQuickSetupType-Scheduler",
+            json!({
+                "TargetOrganizationalUnits": "ou-1",
+                "TargetTagKey": "Environment",
+                "TargetTagValue": "production",
+                "ICalendarString": "BEGIN:VCALENDAR",
+            }),
+            Some(vec!["us-east-1"]),
+        ),
+        (
+            // Writing the stored key with no value leaves the definition naming no
+            // Region at all.
+            "the stored Regions written empty",
+            "AWSQuickSetupType-CFGRecording",
+            json!({ "TargetRegions": "" }),
+            None,
+        ),
+        (
+            "the stored Regions written as blanks",
+            "AWSQuickSetupType-CFGCPacks",
+            json!({ "TargetRegions": "   " }),
+            None,
+        ),
+        (
+            "the stored Regions written as separators only",
+            "AWSQuickSetupType-DevOpsGuru",
+            json!({ "TargetAccounts": "111122223333", "TargetRegions": " , ," }),
+            None,
+        ),
+        (
+            // Parameter keys are matched as the model writes them, so a differently
+            // cased key is a different parameter: it names no Region, and the stored key
+            // written empty is what leaves the definition with none.
+            "the stored Regions dropped for a lower-cased Regions key",
+            "AWSQuickSetupType-SSMOpsCenter",
+            json!({ "TargetRegions": "", "targetregions": "eu-west-1" }),
+            None,
+        ),
+        (
+            // Singular: a key of this definition's own template, not the common one.
+            "the stored Regions dropped for a key that only resembles them",
+            "AWSQuickSetupType-PatchPolicy",
+            json!({ "TargetRegions": "", "TargetRegion": "eu-west-1" }),
+            None,
+        ),
+        (
+            "one Region written over the stored one",
+            "AWSQuickSetupType-DHMC",
+            json!({ "TargetRegions": "eu-west-1" }),
+            Some(vec!["eu-west-1"]),
+        ),
+        (
+            // A type whose own parameter table the model does not itemise: the common
+            // parameters are common to every definition.
+            "one Region on the default configuration type",
+            "AWSQuickSetupType-SSM",
+            json!({ "TargetRegions": "ap-south-1" }),
+            Some(vec!["ap-south-1"]),
+        ),
+        (
+            "three Regions",
+            "AWSQuickSetupType-ResourceExplorer",
+            json!({
+                "TargetRegions": "eu-west-1,eu-central-1,ap-southeast-2",
+                "SelectedAggregatorRegion": "eu-west-1",
+                "ReplaceExistingAggregator": "false",
+            }),
+            Some(vec!["eu-west-1", "eu-central-1", "ap-southeast-2"]),
+        ),
+        (
+            "a Region list with padding, an empty entry and a repeat",
+            "AWSQuickSetupType-SSMChangeMgr",
+            json!({
+                "TargetRegions": " eu-west-1 , ,eu-west-1, ap-south-1 ",
+                "DelegatedAccountId": "111122223333",
+                "JobFunction": "operators",
+            }),
+            Some(vec!["eu-west-1", "ap-south-1"]),
+        ),
+        (
+            "the Region the request itself was signed for",
+            "AWSQuickSetupType-Distributor",
+            json!({ "TargetRegions": REGION }),
+            Some(vec![REGION]),
+        ),
+    ]
+}
+
+/// An update writes the entries its `Parameters` names into the map the definition
+/// holds, so it is accepted only when the map it leaves behind still names the Regions
+/// to deploy into — it then redeploys into exactly those Regions, and a refused one
+/// leaves the stored definition, deployments and all, exactly as it was.
 #[tokio::test]
-async fn an_update_replaces_a_parameter_map_only_when_it_still_names_the_target_regions() {
+async fn an_update_writes_parameter_entries_only_when_the_definition_still_names_the_regions() {
     let local = local_account();
     let baseline_pairs: BTreeSet<(String, String)> = [(local.clone(), "us-east-1".to_string())]
         .into_iter()
         .collect();
 
-    for (case, type_, parameters, deployed) in cases() {
+    for (case, type_, entries, deployed) in update_cases() {
         // One manager per row, so no row observes another row's writes.
         let router = emulator();
         let manager_arn = create_ok(&router, case, type_, &baseline_parameters()).await;
@@ -496,20 +631,21 @@ async fn an_update_replaces_a_parameter_map_only_when_it_still_names_the_target_
             "case {case:?}: the baseline create must store the baseline parameters, got {before:?}"
         );
 
-        let (status, answer) = update_parameters(&router, &manager_arn, &id, &parameters).await;
+        let (status, answer) = update_parameters(&router, &manager_arn, &id, &entries).await;
         let (_, after) = stored_definition(&router, case, &manager_arn).await;
         let pairs = deployed_pairs(&router, case, &manager_arn).await;
         match &deployed {
             Some(regions) => {
                 assert_eq!(
                     status, 200,
-                    "case {case:?}: UpdateConfigurationDefinition must accept {parameters:?}, \
+                    "case {case:?}: UpdateConfigurationDefinition must accept {entries:?}, \
                      got {status} / {answer:?}"
                 );
+                let want_parameters = parameters_after(&entries);
                 assert_eq!(
-                    after, parameters,
-                    "case {case:?}: the stored definition must carry the parameters the update \
-                     wrote, got {after:?}"
+                    after, want_parameters,
+                    "case {case:?}: the stored definition must hold {want_parameters:?}, \
+                     got {after:?}"
                 );
                 let want: BTreeSet<(String, String)> = regions
                     .iter()
@@ -517,14 +653,14 @@ async fn an_update_replaces_a_parameter_map_only_when_it_still_names_the_target_
                     .collect();
                 assert_eq!(
                     pairs, want,
-                    "case {case:?}: the update must redeploy into exactly the Regions it names, \
-                     expected {want:?}, got {pairs:?}"
+                    "case {case:?}: the update must redeploy into exactly the Regions the \
+                     definition now names, expected {want:?}, got {pairs:?}"
                 );
             }
             None => {
                 assert_eq!(
                     status, 400,
-                    "case {case:?}: UpdateConfigurationDefinition must refuse {parameters:?}, \
+                    "case {case:?}: UpdateConfigurationDefinition must refuse {entries:?}, \
                      got {status} / {answer:?}"
                 );
                 assert_eq!(

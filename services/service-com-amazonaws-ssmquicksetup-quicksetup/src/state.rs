@@ -959,13 +959,38 @@ pub fn start_teardown(summaries: &mut Vec<StatusSummaryRecord>, now: SystemTime)
 /// [`MAX_PARAMETERS`] values of up to the 40960 characters
 /// `ConfigurationParametersMap` allows: sharing one map keeps what a request stores
 /// proportional to what it sent instead of multiplying it by the fan-out. The map is
-/// never edited in place — an update replaces a definition's parameters wholesale with
-/// a new one — so no record observes another's write.
+/// never edited in place — an update stores a NEW map
+/// ([`merged_parameters`]) over the shared one — so no record observes another's write.
 pub type SharedParameters = ::std::sync::Arc<BTreeMap<String, String>>;
 
 /// A wire parameter map as the store shares it. The one place this conversion lives.
 pub fn to_shared_parameters(map: Option<HashMap<String, String>>) -> SharedParameters {
     ::std::sync::Arc::new(to_btree_map(map))
+}
+
+/// The parameter set a configuration definition HOLDS once the entries an update
+/// carries are applied to the set it already holds: every entry `update` names written
+/// over the stored one of the same key, and every other stored entry kept.
+///
+/// `ConfigurationParametersMap` is a map of INDEPENDENTLY named parameters, and an
+/// update that names one of them states that parameter and says nothing about the ones
+/// it leaves out, so a parameter the request does not name keeps the value the
+/// definition holds for it. What a request names with an EMPTY value the definition goes
+/// on holding as an empty entry, and that entry provides nothing — no deployment target,
+/// no Region — exactly as an absent key provides nothing, which is how a stored target
+/// is dropped. The one place that application lives, so the rules a stored
+/// parameter set must satisfy and the set actually written are read off the same map.
+pub fn merged_parameters(
+    stored: &BTreeMap<String, String>,
+    update: &HashMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut merged = stored.clone();
+    merged.extend(
+        update
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    merged
 }
 
 /// One configuration definition of a stored manager, with the `Id` the service

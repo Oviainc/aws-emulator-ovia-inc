@@ -287,6 +287,28 @@ fn product(accounts: &[String], regions: &[String]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The `Parameters` an update sends to put a definition on exactly the deployment
+/// targets `parameters` names: the row's own entries, plus an EMPTY value for every
+/// target key the row leaves out.
+///
+/// An update writes the entries its `Parameters` names into the map the definition holds
+/// and leaves every other stored entry alone, so a stored target key the row does not
+/// name is dropped by naming it with no value: a key that provides no value names no
+/// target, exactly as a key left out of a create's parameter map does. That is what
+/// makes the two operations comparable row by row — both end up with a definition whose
+/// parameters name the row's targets and nothing else.
+fn update_entries(parameters: &Value) -> Value {
+    let mut entries = parameters.as_object().cloned().unwrap_or_default();
+    for key in [
+        "TargetAccounts",
+        "TargetOrganizationalUnits",
+        "TargetRegions",
+    ] {
+        entries.entry(key.to_string()).or_insert_with(|| json!(""));
+    }
+    Value::Object(entries)
+}
+
 /// One row: the case, the definition's `Parameters`, and what both operations must do
 /// with them.
 type ParameterCase = (&'static str, Value, Expected);
@@ -436,7 +458,8 @@ async fn a_create_and_an_update_read_the_same_targets_from_one_parameter_map() {
             "case {case}: the baseline create must deploy the baseline targets"
         );
         let (update_status, updated) =
-            update_parameters(&router, &manager_arn, &definition, &parameters).await;
+            update_parameters(&router, &manager_arn, &definition, &update_entries(&parameters))
+                .await;
 
         match expected {
             Expected::Targets(want) => {

@@ -3,7 +3,9 @@
 //! @op UpdateConfigurationDefinition
 //! Mutates the ONE stored configuration definition the `{ManagerArn}/{Id}` pair names:
 //! every member the request carries replaces the stored one, every member it omits is
-//! left exactly as it was stored, and the configurations the service deploys from that
+//! left exactly as it was stored, `Parameters` naming the entries of the parameter map
+//! to write and leaving the entries it does not name as they were stored, and the
+//! configurations the service deploys from that
 //! definition are re-deployed with the new values — one per account and Region the
 //! definition's parameters now target — so a later `GetConfigurationManager` and
 //! `ListConfigurations` report them. `@idempotent`: a request that stores no new value
@@ -91,56 +93,60 @@ use super::types::*;
 /// a 400 `ValidationException` before the handler body runs. What is checked here is
 /// what the model cannot say:
 ///
-/// * `ConfigurationParametersMap` bounds each key and value but not the map's size, so
-///   a parameter set past [`crate::state::MAX_PARAMETERS`] is refused rather than
-///   stored — the same bound `CreateConfigurationManager` applies to the definitions it
-///   stores, so an update can never put a definition past what a create may hold;
-/// * a definition is deployed where its parameters say, so the parameter set this
-///   request writes must name somewhere to deploy to, must name the Regions to deploy
-///   into and must name no more deployments than may be served;
-///   [`crate::state::deployment_targets_rejection`] is the one place
-///   that rule lives, shared with the create that stores a definition, and it counts the
-///   very deployments the fan-out below performs — hence the `local_account`
-///   default, which it needs to count them;
 /// * `LocalDeploymentAdministrationRoleArn` is an `IAMRoleArn`, whose
 ///   `@arnReference` to `AWS::IAM::Role` the model states with no `@pattern` to enforce
 ///   it; [`crate::state::iam_role_arn_rejection`] is the one place that rule lives,
 ///   shared with every other `IAMRoleArn` member of this service.
 ///
-/// `TypeVersion` is not checked here: the versions a configuration version may name
-/// are the ones the catalog publishes for the definition's own `Type`, which is known
-/// only once the `{ManagerArn}/{Id}` pair has been resolved to a stored definition, so
-/// that check lives in the handler beside the lookup
-/// ([`crate::state::resolve_type_version`]).
-fn update_rejection(
-    input: &UpdateConfigurationDefinitionInput,
-    local_account: &str,
-) -> Option<String> {
-    let parameters = input
-        .parameters
-        .as_ref()
-        .map_or(0, std::collections::HashMap::len);
-    if parameters > crate::state::MAX_PARAMETERS {
-        return Some(format!(
-            "Parameters carries {parameters} entries, more than the {} one configuration \
-             definition may hold",
-            crate::state::MAX_PARAMETERS
-        ));
-    }
-    // A parameter set the request replaces also names where the definition is
-    // deployed, so the targets it names are checked the way a create's are —
-    // `crate::state` is the one place that rule lives.
-    if let Some(why) = input.parameters.as_ref().and_then(|parameters| {
-        crate::state::deployment_targets_rejection("Parameters", parameters, local_account)
-    }) {
-        return Some(why);
-    }
+/// `TypeVersion` and `Parameters` are not checked here: both are judged against what
+/// the STORED definition holds — the versions a configuration version may name are the
+/// ones the catalog publishes for the definition's own `Type`, and the parameter set a
+/// request's entries are applied to is the one the definition already holds — which is
+/// known only once the `{ManagerArn}/{Id}` pair has been resolved, so those checks live
+/// in the handler beside the lookup ([`crate::state::resolve_type_version`],
+/// [`held_parameters_rejection`]).
+fn update_rejection(input: &UpdateConfigurationDefinitionInput) -> Option<String> {
     input
         .local_deployment_administration_role_arn
         .as_deref()
         .and_then(|arn| {
             crate::state::iam_role_arn_rejection("LocalDeploymentAdministrationRoleArn", arn)
         })
+}
+
+/// Why the parameter set this update leaves the definition HOLDING cannot be served, or
+/// `None` when it can.
+///
+/// What a request writes into a definition's parameter map is judged by the map the
+/// definition ends up holding, never by the entries the request happens to carry on
+/// their own: a rule about a definition's parameters is a rule about the whole set, and
+/// an update names only the entries it changes ([`crate::state::merged_parameters`]). So
+/// the checks below read the merged set:
+///
+/// * `ConfigurationParametersMap` bounds each key and value but not the map's size, so
+///   a parameter set past [`crate::state::MAX_PARAMETERS`] is refused rather than
+///   stored — the same bound `CreateConfigurationManager` applies to the definitions it
+///   stores, so an update can never put a definition past what a create may hold;
+/// * a definition is deployed where its parameters say, so the parameter set it holds
+///   must name somewhere to deploy to, must name the Regions to deploy
+///   into and must name no more deployments than may be served;
+///   [`crate::state::deployment_targets_rejection`] is the one place
+///   that rule lives, shared with the create that stores a definition, and it counts the
+///   very deployments the fan-out below performs — hence the `local_account`
+///   default, which it needs to count them.
+fn held_parameters_rejection(
+    held: &::std::collections::BTreeMap<String, String>,
+    local_account: &str,
+) -> Option<String> {
+    let parameters = held.len();
+    if parameters > crate::state::MAX_PARAMETERS {
+        return Some(format!(
+            "Parameters leaves the configuration definition holding {parameters} entries, \
+             more than the {} one configuration definition may hold",
+            crate::state::MAX_PARAMETERS
+        ));
+    }
+    crate::state::deployment_targets_rejection("Parameters", held, local_account)
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -252,7 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        if let Some(why) = update_rejection(&input, ::engine::emulator_account_id()) {
+        if let Some(why) = update_rejection(&input) {
             return Err(
                 UpdateConfigurationDefinitionErrorModeled::ValidationException(
                     ValidationException { message: Some(why) },
@@ -325,14 +331,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // An update replaces a definition's whole parameter set, and those parameters
-        // name where it is deployed, so only an update CARRYING parameters can change
-        // the deployments this definition fans out to — one that carries none redeploys
-        // the same set. The store's bound on configurations is read once the manager and
+        // The parameter set this update leaves the definition holding: the stored one
+        // with the request's entries applied, or the stored one itself when the request
+        // carries no `Parameters` at all. Every rule about a definition's parameters,
+        // and the deployments they name, is read off THIS map — so an update naming one
+        // parameter of a live definition is judged by what the definition will hold and
+        // not by what one request happened to carry.
+        let held_parameters = input
+            .parameters
+            .as_ref()
+            .map(|requested| crate::state::merged_parameters(&definition.parameters, requested));
+
+        // Those parameters name where the definition is deployed, so only an update
+        // CARRYING parameters can change the deployments this definition fans out to —
+        // one that carries none redeploys the same set, which the stored map was already
+        // accepted for. The store's bound on configurations is read once the manager and
         // the definition are known to exist, and before anything is written, so an
         // update the store cannot take changes nothing. The Region is the manager's own:
         // only the endpoint that created a manager serves it.
-        if let Some(parameters) = input.parameters.as_ref() {
+        if let Some(parameters) = held_parameters.as_ref() {
+            if let Some(why) =
+                held_parameters_rejection(parameters, ::engine::emulator_account_id())
+            {
+                return Err(
+                    UpdateConfigurationDefinitionErrorModeled::ValidationException(
+                        ValidationException { message: Some(why) },
+                    )
+                    .into(),
+                );
+            }
             let planned =
                 crate::state::deployment_targets(parameters, ::engine::emulator_account_id())
                     .len();
@@ -378,10 +405,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every member but the two labels is optional, and only what the request
         // carries is replaced, so an update naming one member leaves the others as they
-        // were stored. `Parameters` is the definition's whole parameter set — the model
-        // names no per-entry update — so a request carrying it replaces that set rather
-        // than merging into it, which is also what keeps the operation `@idempotent`:
-        // replaying one request leaves exactly the same definition.
+        // were stored. `Parameters` is a map of independently named parameters, so the
+        // same holds INSIDE it: a request carrying it writes the entries it names and
+        // leaves every other stored entry alone, which is how one parameter of a live
+        // definition is adjusted on its own. It keeps the operation `@idempotent` either
+        // way: replaying one request leaves exactly the same definition.
         //
         // What a member carrying the value already stored leaves behind is nothing at
         // all, so each write reports whether it changed the record
@@ -394,10 +422,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(type_version),
             );
         }
-        if let Some(parameters) = input.parameters {
+        if let Some(parameters) = held_parameters {
             changed |= crate::state::store_if_changed(
                 &mut definition.parameters,
-                crate::state::to_shared_parameters(Some(parameters)),
+                ::std::sync::Arc::new(parameters),
             );
         }
         if let Some(role_name) = input.local_deployment_execution_role_name {

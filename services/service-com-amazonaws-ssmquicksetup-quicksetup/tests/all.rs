@@ -39,6 +39,8 @@ mod manager_not_found_message;
 mod manager_region_scope;
 #[path = "all/pagination_tokens.rs"]
 mod pagination_tokens;
+#[path = "all/partial_parameter_updates.rs"]
+mod partial_parameter_updates;
 #[path = "all/quick_setup_type_versions.rs"]
 mod quick_setup_type_versions;
 #[path = "all/region_scoping.rs"]

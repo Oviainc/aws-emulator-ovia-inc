@@ -485,8 +485,16 @@ async fn an_update_redeploys_the_definition_to_exactly_the_targets_it_now_names(
             ],
         ),
         (
+            // The accounts the step before named are cleared by writing the key EMPTY:
+            // an update writes the entries it names, so a stored target key is dropped
+            // by naming it with no value, which names no account exactly as leaving it
+            // out of a create does.
             "back to one region, in the Region the manager lives in",
-            json!({ "TargetOrganizationalUnits": "ou-1", "TargetRegions": REGION }),
+            json!({
+                "TargetAccounts": "",
+                "TargetOrganizationalUnits": "ou-1",
+                "TargetRegions": REGION,
+            }),
             vec![(local.clone(), REGION.to_string())],
         ),
     ];

@@ -9,9 +9,10 @@
 //!
 //! The rule under test: a Quick Setup configuration definition is deployed where its
 //! parameters say, so every request that writes a definition's parameter map — the
-//! create that stores one and the update that replaces one — is accepted only when that
-//! map provides a value for either `TargetAccounts` or `TargetOrganizationalUnits`, and
-//! is otherwise refused with a 400 `ValidationException` having written nothing. The
+//! create that stores one and the update that writes entries into one — is accepted only
+//! when the map the definition then HOLDS provides a value for either `TargetAccounts`
+//! or `TargetOrganizationalUnits`, and is otherwise refused with a 400
+//! `ValidationException` having written nothing. The
 //! model's documentation for the member is where the rule is stated: a value must be
 //! provided for either of the two
 //! (`smithy_query(query="doc", shape="ConfigurationDefinitionInput",
@@ -38,6 +39,21 @@ const NO_TARGET_MESSAGE: &str =
 /// one that left it alone.
 fn baseline_parameters() -> Value {
     json!({ "TargetOrganizationalUnits": "ou-1", "TargetRegions": "us-east-1" })
+}
+
+/// [`baseline_parameters`] with every entry `entries` names written over it: the
+/// parameter map a definition HOLDS once an update carrying `entries` has been served,
+/// since an update writes the entries it names and leaves the rest of the stored map
+/// alone.
+fn parameters_after(entries: &Value) -> Value {
+    let mut map = baseline_parameters()
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    for (key, value) in entries.as_object().cloned().unwrap_or_default() {
+        map.insert(key, value);
+    }
+    Value::Object(map)
 }
 
 /// One emulator with an empty store, mounted exactly as the router mounts it.
@@ -392,12 +408,87 @@ async fn a_create_stores_a_definition_only_when_its_parameters_name_a_deployment
     }
 }
 
-/// An update replaces a definition's whole parameter map, so it is accepted only when
-/// the map it writes still names somewhere to deploy to — and a refused one leaves the
-/// stored definition, targets and all, exactly as it was.
+/// One row of the update table: the case, the entries the update writes, and whether the
+/// map the definition then HOLDS still names somewhere to deploy to.
+type UpdateCase = (&'static str, Value, bool);
+
+/// The table for an update, every row written into a stored map that names an
+/// organizational unit to deploy to and the Region to deploy into
+/// ([`baseline_parameters`]). The rows differ along what decides the merged map's
+/// targets — whether the update names a target key at all, which of the two it names,
+/// how many entries it names, whether it writes a stored target key with no value (the
+/// way a stored target is dropped), how that empty value is written, and the spelling of
+/// the key, since a parameter key is matched as the model writes it. No row touches the
+/// stored `TargetRegions`, which a definition must name whatever it targets, so a row is
+/// refused only for the reason under test.
+fn update_cases() -> Vec<UpdateCase> {
+    vec![
+        (
+            // The update names no target key at all, so the definition keeps the one it
+            // was stored with.
+            "a parameter that names no target",
+            json!({ "UpdateSSMAgent": "true" }),
+            true,
+        ),
+        (
+            "one targeted account added beside the stored units",
+            json!({ "TargetAccounts": "111122223333" }),
+            true,
+        ),
+        (
+            "three targeted accounts added beside the stored units",
+            json!({ "TargetAccounts": "111122223333,444455556666,777788889999" }),
+            true,
+        ),
+        (
+            "the stored organizational units replaced by others",
+            json!({ "TargetOrganizationalUnits": "ou-1234-56789012,r-abcd" }),
+            true,
+        ),
+        (
+            // Writing the only target key the definition holds with no value leaves it
+            // naming nowhere to deploy to.
+            "the stored organizational units written empty",
+            json!({ "TargetOrganizationalUnits": "" }),
+            false,
+        ),
+        (
+            "the stored organizational units written as blanks",
+            json!({ "TargetOrganizationalUnits": "   " }),
+            false,
+        ),
+        (
+            "the stored organizational units written as separators only",
+            json!({ "TargetOrganizationalUnits": " , " }),
+            false,
+        ),
+        (
+            "the stored organizational units dropped while an account is named",
+            json!({ "TargetOrganizationalUnits": "", "TargetAccounts": "111122223333" }),
+            true,
+        ),
+        (
+            "both target keys written empty",
+            json!({ "TargetAccounts": "", "TargetOrganizationalUnits": " , " }),
+            false,
+        ),
+        (
+            // Parameter keys are matched as the model writes them, so a differently
+            // cased key is a different parameter and names no target.
+            "the stored organizational units dropped for a lower-cased account key",
+            json!({ "TargetOrganizationalUnits": "", "targetaccounts": "111122223333" }),
+            false,
+        ),
+    ]
+}
+
+/// An update writes the entries its `Parameters` names into the map the definition
+/// holds, so it is accepted only when the map it leaves behind still names somewhere to
+/// deploy to — and a refused one leaves the stored definition, targets and all, exactly
+/// as it was.
 #[tokio::test]
-async fn an_update_replaces_a_parameter_map_only_when_it_still_names_a_deployment_target() {
-    for (case, parameters, acceptable) in cases() {
+async fn an_update_writes_parameter_entries_only_when_the_definition_still_names_a_target() {
+    for (case, entries, acceptable) in update_cases() {
         // One manager per row, so no row observes another row's writes.
         let router = emulator();
         let manager_arn = create_ok(&router, case, &baseline_parameters()).await;
@@ -408,23 +499,23 @@ async fn an_update_replaces_a_parameter_map_only_when_it_still_names_a_deploymen
             "case {case:?}: the baseline create must store the baseline parameters, got {before:?}"
         );
 
-        let (status, answer) = update_parameters(&router, &manager_arn, &id, &parameters).await;
+        let (status, answer) = update_parameters(&router, &manager_arn, &id, &entries).await;
         let (_, after) = stored_definition(&router, case, &manager_arn).await;
         if acceptable {
             assert_eq!(
                 status, 200,
-                "case {case:?}: UpdateConfigurationDefinition must accept {parameters:?}, \
+                "case {case:?}: UpdateConfigurationDefinition must accept {entries:?}, \
                  got {status} / {answer:?}"
             );
+            let want = parameters_after(&entries);
             assert_eq!(
-                after, parameters,
-                "case {case:?}: the stored definition must carry the parameters the update \
-                 wrote, got {after:?}"
+                after, want,
+                "case {case:?}: the stored definition must hold {want:?}, got {after:?}"
             );
         } else {
             assert_eq!(
                 status, 400,
-                "case {case:?}: UpdateConfigurationDefinition must refuse {parameters:?}, \
+                "case {case:?}: UpdateConfigurationDefinition must refuse {entries:?}, \
                  got {status} / {answer:?}"
             );
             assert_eq!(
