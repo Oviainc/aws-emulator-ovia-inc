@@ -41,6 +41,8 @@ mod identity_key_separators;
 mod mutating_plan_admission;
 #[path = "all/next_token_authenticity.rs"]
 mod next_token_authenticity;
+#[path = "all/off_enum_member_refusals.rs"]
+mod off_enum_member_refusals;
 #[path = "all/plan_version_member_validation.rs"]
 mod plan_version_member_validation;
 #[path = "all/policy_name_identity.rs"]
