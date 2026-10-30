@@ -574,10 +574,9 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
         environment_name: &str,
         id: &str,
     ) -> bool {
-        self.components
-            .iter()
-            .filter(|((app, environment), _)| app != app_id || environment != environment_name)
-            .any(|(_, components)| components.iter().any(|component| component.id == id))
+        id_in_other_scope(&self.components, app_id, environment_name, id, |component| {
+            &component.id
+        })
     }
 
     /// The live component called `name` in one app environment, if there is one.
@@ -785,10 +784,7 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
     /// form at all, which is simply absent. The component counterpart is
     /// [`Self::component_in_other_scope`].
     pub fn form_in_other_scope(&self, app_id: &str, environment_name: &str, id: &str) -> bool {
-        self.forms
-            .iter()
-            .filter(|((app, environment), _)| app != app_id || environment != environment_name)
-            .any(|(_, forms)| forms.iter().any(|form| form.id == id))
+        id_in_other_scope(&self.forms, app_id, environment_name, id, |form| &form.id)
     }
 
     /// Remove the form `id` names from the app environment the request addressed,
@@ -861,6 +857,25 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
         self.codegen_jobs_in(app_id, environment_name)
             .iter()
             .find(|job| job.id == id)
+    }
+
+    /// Whether `id` names a codegen job some OTHER app environment owns.
+    ///
+    /// A codegen job is addressed by (appId, environmentName, id) exactly as a
+    /// component and a form are, so an id that resolves outside the app
+    /// environment the request named is a request made in the wrong scope — told
+    /// apart here from an id that names no job at all, which is simply absent.
+    /// The counterparts are [`Self::component_in_other_scope`] and
+    /// [`Self::form_in_other_scope`].
+    pub fn codegen_job_in_other_scope(
+        &self,
+        app_id: &str,
+        environment_name: &str,
+        id: &str,
+    ) -> bool {
+        id_in_other_scope(&self.codegen_jobs, app_id, environment_name, id, |job| {
+            &job.id
+        })
     }
 
     /// Store a codegen job at the end of its environment's start order.
@@ -1061,6 +1076,27 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
             &hex[20..]
         )
     }
+}
+
+/// Whether `id` names a record some OTHER app environment owns, in one of this
+/// store's (appId, environmentName)-keyed collections.
+///
+/// The one place the wrong-scope test lives: every resource of this service that
+/// is addressed by (appId, environmentName, id) classifies a miss the same way,
+/// so the per-kind methods above ([`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::component_in_other_scope`]
+/// and its counterparts) differ only in which collection they search and where
+/// the record carries its id.
+fn id_in_other_scope<T>(
+    collections: &HashMap<EnvironmentKey, Vec<T>>,
+    app_id: &str,
+    environment_name: &str,
+    id: &str,
+    record_id: impl Fn(&T) -> &str,
+) -> bool {
+    collections
+        .iter()
+        .filter(|((app, environment), _)| app != app_id || environment != environment_name)
+        .any(|(_, records)| records.iter().any(|record| record_id(record) == id))
 }
 
 /// A seed from the operating system, for the ids one store mints.

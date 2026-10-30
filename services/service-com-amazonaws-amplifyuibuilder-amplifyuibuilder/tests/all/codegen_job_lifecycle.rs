@@ -15,8 +15,10 @@
 //!    published; this emulator performs no code generation run, so the status it owes is
 //!    the modelled `failed` with a reason and no asset.
 //! 3. `clientToken` is an `@idempotencyToken`: one token names one job.
-//! 4. An id naming no job in the app environment addressed is the modelled
-//!    `ResourceNotFoundException` (HTTP 404), not an empty success.
+//! 4. An id naming no job ANYWHERE is the modelled `ResourceNotFoundException`
+//!    (HTTP 404), not an empty success. An id that resolves under another app
+//!    environment is the wrong-scope refusal instead — its own suite,
+//!    `codegen_job_scope.rs`.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -667,10 +669,14 @@ async fn one_client_token_starts_one_codegen_job() {
          job, got {:?}",
         other.id()
     );
+    // Reading that environment's job from this one is a wrong-scope request, not an
+    // absent one: the id resolves, under another app environment (400, see
+    // `codegen_job_scope.rs`). What matters here is that it is not THIS environment's
+    // job.
     assert_eq!(
         get_in(&router, APP_ID, ENVIRONMENT, &other.id()).await.status,
-        404,
-        "a job started in another environment is not readable from {ENVIRONMENT:?}"
+        400,
+        "a job started in another environment is not a job of {ENVIRONMENT:?}"
     );
 
     // With no token every start mints a new job.
@@ -687,9 +693,10 @@ async fn one_client_token_starts_one_codegen_job() {
     );
 }
 
-/// An id that names no stored job in the app environment addressed is reported as missing:
-/// `GetCodegenJob` answers the modelled `ResourceNotFoundException` (HTTP 404), never an
-/// empty success.
+/// An id that names no stored job at all is reported as missing: `GetCodegenJob` answers
+/// the modelled `ResourceNotFoundException` (HTTP 404), never an empty success. An id that
+/// DOES name a job, read under another app environment, is a different class — see
+/// `codegen_job_scope.rs`.
 #[tokio::test]
 async fn an_id_naming_no_codegen_job_is_reported_as_missing() {
     let router = emulator();
@@ -710,16 +717,16 @@ async fn an_id_naming_no_codegen_job_is_reported_as_missing() {
             "not-a-job".to_string(),
         ),
         (
-            "a real id read from another environment",
+            "a UUID nothing started, in another environment",
             APP_ID.to_string(),
             "production".to_string(),
-            id.clone(),
+            "22222222-2222-4222-8222-222222222222".to_string(),
         ),
         (
-            "a real id read from another app",
+            "a UUID nothing started, in another app",
             "d9999zzzz".to_string(),
             ENVIRONMENT.to_string(),
-            id.clone(),
+            "33333333-3333-4333-8333-333333333333".to_string(),
         ),
     ];
 

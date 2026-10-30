@@ -161,6 +161,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_codegen_jobs(::std::time::SystemTime::now());
 
         let Some(job) = store.codegen_job(&input.app_id, &input.environment_name, &input.id) else {
+            // Two different failures, told apart by where the id resolves — the same
+            // two `GetComponent` and `GetForm` tell apart, because a codegen job is
+            // addressed by (appId, environmentName, id) exactly as they are: an id a
+            // DIFFERENT app environment owns is a request made in the wrong scope
+            // (the modelled `InvalidParameterException`, 400), while an id that names
+            // no job anywhere is absent (the modelled `ResourceNotFoundException`,
+            // 404).
+            if store.codegen_job_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
+                return Err(GetCodegenJobErrorModeled::InvalidParameterException(
+                    crate::state::item_wrong_scope(),
+                )
+                .into());
+            }
             return Err(GetCodegenJobErrorModeled::ResourceNotFoundException(
                 crate::state::item_not_found(),
             )
