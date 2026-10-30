@@ -377,7 +377,7 @@ async fn every_connection_refusal_names_the_call_that_failed() {
             }),
             "create",
             "ResourceAlreadyExistsException",
-            format!("Connection {taken} already exists."),
+            format!("A connection with name '{taken}' already exists."),
         ),
         (
             // The framework's own boundary validator refuses a value outside a

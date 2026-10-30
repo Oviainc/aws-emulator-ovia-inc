@@ -243,9 +243,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.connection(&input.name).is_some() {
                 return Err(CreateConnectionErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
-                        message: Some(refused(&format!(
-                            "Connection {} already exists.",
-                            input.name
+                        message: Some(refused(&crate::state::connection_already_exists(
+                            &input.name,
                         ))),
                     },
                 )
@@ -254,10 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.connections.len() >= crate::state::MAX_CONNECTIONS {
                 return Err(CreateConnectionErrorModeled::LimitExceededException(
                     LimitExceededException {
-                        message: Some(refused(&format!(
-                            "The account already holds the maximum of {} connections.",
-                            crate::state::MAX_CONNECTIONS
-                        ))),
+                        message: Some(crate::state::QUOTA_EXCEEDED.to_string()),
                     },
                 )
                 .into());

@@ -280,10 +280,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.replays.len() >= crate::state::MAX_REPLAYS {
                 return Err(StartReplayErrorModeled::LimitExceededException(
                     LimitExceededException {
-                        message: Some(format!(
-                            "The account already holds the maximum of {} replays.",
-                            crate::state::MAX_REPLAYS
-                        )),
+                        message: Some(crate::state::QUOTA_EXCEEDED.to_string()),
                     },
                 )
                 .into());

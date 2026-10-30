@@ -521,7 +521,7 @@ fn events<Eng: Send + Sync + 'static>(
     let Some(stored) = state.tags_of_mut(&resource) else {
         return absent(
             "ResourceNotFoundException",
-            owner_events::state::no_such_tagged_resource(&resource),
+            state.missing_tagged_resource(&resource),
         );
     };
     let mut pairs = plain_tag_pairs(stored);

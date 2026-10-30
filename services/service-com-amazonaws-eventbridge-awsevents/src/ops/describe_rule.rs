@@ -150,14 +150,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pure read: nothing is created or moved by describing a rule, so the
         // store is left exactly as it was found.
         let store = state.lock();
-        let Some(rule) = store.rule(&region, &bus_name, &input.name) else {
-            return Err(DescribeRuleErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::no_such_rule(&bus_name, &input.name)),
-                },
-            )
-            .into());
-        };
+        // `EventBusName` names the SCOPE the rule is sought in, so the bus is
+        // resolved before the rule and a bus that is gone is the missing
+        // resource this call reports — `crate::state` owns that precedence, and
+        // the refusal it composes, for every operation that resolves a rule.
+        let rule = store
+            .resolve_rule(&region, &bus_name, &input.name)
+            .map_err(|missing| {
+                DescribeRuleErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(missing),
+                })
+            })?;
 
         Ok(DescribeRuleOutput {
             name: Some(rule.name.clone()),

@@ -207,14 +207,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if replication_state == crate::state::REPLICATION_STATE_ENABLED && input.role_arn.is_none()
         {
             return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::parameter_violation(
-                    "RoleArn",
-                    &format!(
-                        "RoleArn is required when event replication is {}.",
-                        crate::state::REPLICATION_STATE_ENABLED
-                    ),
-                ),
+                crate::state::REPLICATION_NEEDS_A_ROLE,
             ));
+        }
+
+        // The Region the create is signed for is the endpoint's PRIMARY Region,
+        // so it is resolved before the failover policy is judged against it.
+        let region = crate::state::request_region(ctx.parts());
+
+        // The failover policy's secondary Region is the OTHER Region of the
+        // pair, which the model cannot express and the boundary validator
+        // therefore passes. Judged BEFORE the bus pair: both members describe the
+        // same two Regions, so a request that gets both wrong reads the refusal
+        // about the Region it named itself.
+        if let Some(reason) = crate::state::routing_config_violation(&input.routing_config, &region)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(reason));
         }
 
         // The pair of buses has to be ONE bus name in TWO Regions, which the
@@ -223,7 +231,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(reason));
         }
 
-        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // An endpoint whose clock has already moved it on is settled first, so
@@ -242,10 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.endpoints.len() >= crate::state::MAX_ENDPOINTS {
             return Err(CreateEndpointErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "The account already holds the maximum of {} global endpoints.",
-                        crate::state::MAX_ENDPOINTS
-                    )),
+                    message: Some(crate::state::QUOTA_EXCEEDED.to_string()),
                 },
             )
             .into());

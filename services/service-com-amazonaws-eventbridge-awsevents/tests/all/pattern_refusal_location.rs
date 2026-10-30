@@ -272,13 +272,21 @@ fn location_rows() -> Vec<Row> {
             reason: "Consecutive wildcard characters at pos 2",
             read: r#"{"detail": {"k": [{"wildcard": "a**b""#,
         },
-        // A numeric comparison the operator set does not hold, read out of the
-        // token itself; a bound of the wrong type, shown by its opening token.
+        // A numeric comparison the operator set does not hold, reported once the
+        // operator and the bound it compares against have both been read — the
+        // list is read pair by pair; a bound of the wrong type, shown by its
+        // opening token.
         Row {
             case: "a numeric comparison the operator set does not hold",
             pattern: r#"{"detail": {"n": [{"numeric": ["!=", 1]}]}}"#,
             reason: "Unrecognized numeric range operator: !=",
-            read: r#"{"detail": {"n": [{"numeric": ["!=""#,
+            read: r#"{"detail": {"n": [{"numeric": ["!=", 1"#,
+        },
+        Row {
+            case: "a numeric comparison the operator set does not hold, with no bound after it",
+            pattern: r#"{"detail": {"n": [{"numeric": ["!="]}]}}"#,
+            reason: "Unrecognized numeric range operator: !=",
+            read: r#"{"detail": {"n": [{"numeric": ["!="]"#,
         },
         Row {
             case: "a numeric bound that is text",

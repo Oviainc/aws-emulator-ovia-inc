@@ -127,6 +127,24 @@ pub const STORE_UNAVAILABLE: &str = "the eventbridge state store is unavailable"
 /// id is in the request the caller sent.
 pub const NO_SUCH_POLICY_STATEMENT: &str = "Statement with the provided id does not exist.";
 
+/// What EventBridge reports for a request that would take a resource COUNT past
+/// the quota that bounds it.
+///
+/// `LimitExceededException` is "the request failed because it attempted to
+/// create resource beyond the allowed service quota", and the message the
+/// service answers it with is this FIXED sentence: it names neither the resource
+/// the request was about nor the number that bounds it, so a quota a caller
+/// cannot raise from the API is not disclosed in the refusal. Stated once, so
+/// every count quota of this service — targets on a rule, rules on a bus, buses,
+/// connections, archives, replays, api destinations, global endpoints, partner
+/// event sources — is refused in the same words.
+///
+/// A refusal about one submitted VALUE being outside a bound is NOT this: that
+/// is a parameter diagnostic naming the member and the value
+/// ([`parameter_violation`]), which is a different class of refusal even where it
+/// travels on the same modelled error.
+pub const QUOTA_EXCEEDED: &str = "The requested resource exceeds the maximum number allowed.";
+
 /// Largest page a list operation returns, and the page size it uses when the
 /// request names no `Limit`.
 ///
@@ -2165,6 +2183,18 @@ pub const REPLICATION_STATE_DISABLED: &str = "DISABLED";
 /// endpoint reports the replication actually in force rather than nothing.
 pub const DEFAULT_REPLICATION_STATE: &str = REPLICATION_STATE_ENABLED;
 
+/// What a writer of a global endpoint reports for a configuration that would
+/// leave event replication on with no role to replicate as.
+///
+/// "The default state is ENABLED which means you must supply a RoleArn. If you
+/// don't have a RoleArn or you don't want event replication enabled, set the
+/// state to DISABLED" (`CreateEndpoint$ReplicationConfig`): replication runs AS
+/// that role, so a configuration that names none is refused. The sentence
+/// EventBridge answers it with is entirely FIXED — it names neither the member
+/// nor the state, so nothing of the request appears in it — and it is stated
+/// once here, for both writers of an endpoint's replication configuration.
+pub const REPLICATION_NEEDS_A_ROLE: &str = "When replication is enabled, role cannot be empty.";
+
 /// The domain a global endpoint's URL is published under.
 ///
 /// "The URL subdomain of the endpoint. For example, if the URL for Endpoint is
@@ -2280,6 +2310,34 @@ pub fn arn_region(arn: &str) -> Option<&str> {
     let (_partition, _service) = (fields.next()?, fields.next()?);
     let region = fields.next()?;
     (!region.is_empty()).then_some(region)
+}
+
+/// Why an endpoint request's `RoutingConfig` is not a failover policy
+/// EventBridge accepts for an endpoint whose primary Region is
+/// `primary_region`, or `None` when it is one.
+///
+/// "The secondary Region that processes events when failover is triggered or
+/// replication is enabled" (`Secondary`) — the secondary Region is the OTHER
+/// Region of the pair, so a `Route` naming the endpoint's own primary Region
+/// describes a failover that fails over to where it already is, and is refused
+/// rather than stored. The route's own form is modelled (`Route` is len 9..20
+/// with pattern `^[\-a-z0-9]+$`), so what is left to decide here is only which
+/// Region it names relative to the endpoint's primary one.
+///
+/// This is the first thing an endpoint write is judged on, before the bus pair
+/// ([`endpoint_event_bus_violation`]): the two members describe the SAME pair of
+/// Regions, so where both are wrong the caller reads the refusal about the
+/// Region it stated itself.
+///
+/// The message is built from the request and names the member that was rejected,
+/// the way this service's other parameter refusals do ([`parameter_violation`]).
+pub fn routing_config_violation(routing: &RoutingConfig, primary_region: &str) -> Option<String> {
+    (routing.failover_config.secondary.route == primary_region).then(|| {
+        parameter_violation(
+            "Route",
+            "Provided route for the secondary region cannot be the same as the primary region.",
+        )
+    })
 }
 
 /// Why an endpoint request's `EventBuses` name no pair of buses an endpoint can
@@ -2686,6 +2744,92 @@ impl ComAmazonawsEventbridgeAwseventsState {
         name: &str,
     ) -> Option<&mut RuleRecord> {
         self.bus_mut(region, bus_name)?.rules.get_mut(name)
+    }
+
+    /// The rule `name` on the bus `bus_name` in `region`, or WHY this store
+    /// cannot resolve it.
+    ///
+    /// `EventBusName` is "the name or ARN of the event bus associated with the
+    /// rule" (`DisableRule`'s member, and every other rule-scoped operation's), so
+    /// it names the SCOPE the rule is looked up in rather than a property of the
+    /// rule: the scope is resolved FIRST, and a bus this store holds no record of
+    /// is the missing resource whatever rule name arrived with it
+    /// ([`no_such_event_bus`]). Only on a bus that EXISTS can the rule name be the
+    /// thing that is missing ([`no_such_rule`]). The two call for different
+    /// remedies — a caller told to create a rule on a bus that is gone acts on the
+    /// wrong resource — so the order is part of the answer and not an accident of
+    /// how a handler happens to look things up.
+    ///
+    /// The ONE composer of both refusals, so a lookup and the message it fails
+    /// with cannot drift apart: every operation that resolves a rule reaches a
+    /// rule and a refusal through this ([`Self::resolve_rule_mut`] for a writer,
+    /// [`Self::missing_rule`] for a caller that has to judge the scope before it
+    /// judges the request's own members, and [`Self::missing_tagged_resource`] for
+    /// one that reached the rule through an ARN).
+    pub fn resolve_rule(
+        &self,
+        region: &str,
+        bus_name: &str,
+        name: &str,
+    ) -> Result<&RuleRecord, String> {
+        let Some(bus) = self.bus(region, bus_name) else {
+            return Err(no_such_event_bus(bus_name));
+        };
+        bus.rules
+            .get(name)
+            .ok_or_else(|| no_such_rule(bus_name, name))
+    }
+
+    /// [`Self::resolve_rule`] for a WRITER: the same resolution, in the same
+    /// order, answering the stored rule mutably.
+    pub fn resolve_rule_mut(
+        &mut self,
+        region: &str,
+        bus_name: &str,
+        name: &str,
+    ) -> Result<&mut RuleRecord, String> {
+        let Some(bus) = self.bus_mut(region, bus_name) else {
+            return Err(no_such_event_bus(bus_name));
+        };
+        bus.rules
+            .get_mut(name)
+            .ok_or_else(|| no_such_rule(bus_name, name))
+    }
+
+    /// Why this store cannot resolve the rule `name` on the bus `bus_name` in
+    /// `region`, or `None` when it holds that rule.
+    ///
+    /// [`Self::resolve_rule`]'s answer without the rule, for a caller that has to
+    /// resolve the resource BEFORE it judges the request's own members (so the
+    /// rule it then writes to is fetched after those checks) and for one that
+    /// reports on a rule it does not read.
+    pub fn missing_rule(&self, region: &str, bus_name: &str, name: &str) -> Option<String> {
+        self.resolve_rule(region, bus_name, name).err()
+    }
+
+    /// What a tagging path reports for a well-formed ARN naming a resource this
+    /// store holds no record of.
+    ///
+    /// The message is built from the request through the resource the ARN NAMED
+    /// ([`parse_tagged_resource`]), so a missing resource is identified by its
+    /// kind and its own name — a rule by name and by the bus it was sought on, a
+    /// bus by name — in exactly the words every other reader of that kind uses,
+    /// rather than by echoing the ARN text back at the caller. The tag paths
+    /// therefore report the same refusal for a missing rule as `DescribeRule`
+    /// does, the precedence between the rule and its bus included
+    /// ([`Self::missing_rule`]), whether the caller reached them through this
+    /// service or through the tagging API that resolves an `events` ARN here.
+    pub fn missing_tagged_resource(&self, resource: &TaggedResource) -> String {
+        match resource {
+            TaggedResource::EventBus { name, .. } => no_such_event_bus(name),
+            TaggedResource::Rule {
+                region,
+                event_bus_name,
+                name,
+            } => self
+                .missing_rule(region, event_bus_name, name)
+                .unwrap_or_else(|| no_such_rule(event_bus_name, name)),
+        }
     }
 
     /// The tag set of the resource an ARN named ([`parse_tagged_resource`]), for
@@ -4264,6 +4408,18 @@ pub fn connection_does_not_exist(name: &str) -> String {
     format!("Connection '{name}' does not exist.")
 }
 
+/// What a create reports for a name this store already holds a connection under:
+/// the connection the request NAMED, quoted, and that one exists already.
+///
+/// The counterpart of [`connection_does_not_exist`], worded the way this
+/// resource's refusals word an identity that is taken: the clause describes the
+/// connection by the `Name` the request carried and states what is true of it.
+/// It carries no verb of its own, because the failing call is stated before it
+/// ([`connection_refusal`]).
+pub fn connection_already_exists(name: &str) -> String {
+    format!("A connection with name '{name}' already exists.")
+}
+
 /// What any operation on the connection resource reports for a name this store
 /// holds no connection for: the failing call and then the missing connection.
 ///
@@ -4347,28 +4503,6 @@ pub fn replay_not_cancellable(replay_name: &str) -> String {
     format!("Replay {replay_name} is not in a valid state for this operation.")
 }
 
-/// What a tagging path reports for a well-formed ARN naming a resource this
-/// store holds no record of.
-///
-/// The message is built from the request through the resource the ARN NAMED
-/// ([`parse_tagged_resource`]), so a missing resource is identified by its kind
-/// and its own name — a rule by name and by the bus it was sought on, a bus by
-/// name — in exactly the words every other reader of that kind uses, rather
-/// than by echoing the ARN text back at the caller. The tag paths therefore
-/// report the same refusal for a missing rule as `DescribeRule` does, whether
-/// the caller reached them through this service or through the tagging API that
-/// resolves an `events` ARN here.
-pub fn no_such_tagged_resource(resource: &TaggedResource) -> String {
-    match resource {
-        TaggedResource::EventBus { name, .. } => no_such_event_bus(name),
-        TaggedResource::Rule {
-            event_bus_name,
-            name,
-            ..
-        } => no_such_rule(event_bus_name, name),
-    }
-}
-
 /// Why a `LogConfig` is not one EventBridge accepts, or `None` when it is.
 ///
 /// A submitted log configuration has to name BOTH of `LogConfig`'s members:
@@ -4415,6 +4549,12 @@ pub fn log_config_violation(config: &LogConfig) -> Option<String> {
 /// expression. For example, `cron(0 20 * * ? *)` or `rate(5 minutes)`"
 /// (`PutRule`'s `ScheduleExpression`) — so anything that is not one of those two
 /// forms is refused rather than stored and silently never fired.
+///
+/// The refusal names the PARAMETER and stops there: EventBridge discloses
+/// nothing about what is wrong with a schedule expression it will not take — not
+/// the text submitted, not which of the two forms was expected — so the message
+/// is the subject clause alone, with no reason after it
+/// ([`parameter_not_valid`]).
 pub fn schedule_expression_violation(expression: &str) -> Option<String> {
     let trimmed = expression.trim();
     let body = trimmed
@@ -4423,10 +4563,7 @@ pub fn schedule_expression_violation(expression: &str) -> Option<String> {
         .and_then(|rest| rest.strip_suffix(')'));
     match body {
         Some(body) if !body.trim().is_empty() => None,
-        _ => Some(format!(
-            "Parameter ScheduleExpression is not valid. Reason: \
-             {expression:?} is neither a rate(<value> <unit>) nor a cron(<fields>) expression."
-        )),
+        _ => Some(parameter_not_valid("ScheduleExpression")),
     }
 }
 
@@ -4552,7 +4689,19 @@ pub fn missing_entry_member(
 /// leaves as a top-level error or on a batch entry's own row, so a caller reads
 /// the same shape for every rejected member.
 pub fn parameter_violation(member: &str, reason: &str) -> String {
-    format!("Parameter {member} is not valid. Reason: {reason}")
+    format!("{} Reason: {reason}", parameter_not_valid(member))
+}
+
+/// The subject half of that refusal on its own: the member is not valid, and
+/// nothing about why.
+///
+/// Some refusals of this service state only this — the member the request got
+/// wrong, with no reason clause — because the service itself discloses no reason
+/// for them ([`schedule_expression_violation`]). The two forms share their
+/// opening, so a caller that looks for the member it has to change finds it in
+/// the same place either way.
+pub fn parameter_not_valid(member: &str) -> String {
+    format!("Parameter {member} is not valid.")
 }
 
 /// What a refusal states for an entry member the entry does not provide.
@@ -6344,13 +6493,21 @@ pub mod event_pattern {
                         .as_str()
                         .filter(|operator| NUMERIC_OPERATORS.contains(operator))
                     else {
-                        return Err(at.index(spelled_at).refuse(
-                            Read::Whole,
-                            format!(
-                                "Unrecognized numeric range operator: {}",
-                                spelled_out(spelled)
-                            ),
-                        ));
+                        // The list is read PAIR by pair — an operator and the
+                        // bound it compares against — so the reader has taken
+                        // in the whole pair by the time it can say that the
+                        // operator names no comparison, and the position it
+                        // reports is just past the pair's last member. A pair
+                        // the list stops short of a bound for ends at the list
+                        // itself, which is as far as the reader got.
+                        let reason = format!(
+                            "Unrecognized numeric range operator: {}",
+                            spelled_out(spelled)
+                        );
+                        return Err(match pair.len() {
+                            1 => at.refuse(Read::Whole, reason),
+                            _ => at.index(spelled_at + 1).refuse(Read::Whole, reason),
+                        });
                     };
                     match pair.get(1) {
                         Some(bound) if bound.is_number() => {}

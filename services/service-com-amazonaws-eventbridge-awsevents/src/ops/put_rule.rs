@@ -300,10 +300,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(PutRuleErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "Event bus {bus_name} already holds the maximum of {} rules.",
-                        crate::state::MAX_RULES_PER_BUS
-                    )),
+                    message: Some(crate::state::QUOTA_EXCEEDED.to_string()),
                 },
             )
             .into());

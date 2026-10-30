@@ -100,7 +100,10 @@
 //!
 //! * which value a clause echoes — the one the caller submitted ([`with_submitted_values`]),
 //!   and, for a clause stated at a collection member, the collection itself
-//!   ([`submitted_lists`]);
+//!   ([`submitted_lists`]), rendered over the members a structure is printed with: the ones
+//!   the request SET, every one the shape DECLARES, or the ones the SERVICE states for a
+//!   layer that prints members no model declares
+//!   ([`refusing_violations_with_printed_echoes_over`]);
 //! * a `@pattern` printed as the expression a value has to satisfy, without the `^`/`$`
 //!   anchors a model writes to demand a whole-string match ([`unanchored`], and
 //!   [`unanchored_grouping_alternation`] for the services whose recordings show the pair
@@ -342,6 +345,49 @@ pub fn refusing_violations_with_declared_echoes_over<O: Operation>(
         .collect()
 }
 
+/// As [`refusing_violations_with_declared_echoes_over`], with the members a structure is
+/// printed over stated by the CALLER for the shapes `printed` names, instead of read off
+/// the model.
+///
+/// What it is for: the object the validation layer in front of a service prints is that
+/// layer's own, and for some services it carries members the public model does not declare
+/// — a member of an internal request type, which no caller can set and which therefore
+/// always prints unset. The member list and its ORDER are fixed text of that message rather
+/// than anything derived from one request, so they are stated by the service whose refusal
+/// is being reproduced ([`StructureForm::MembersPrinted`]): one entry per shape, naming the
+/// members in the order the layer prints them, each spelled as a clause spells a member.
+///
+/// A shape `printed` does not name renders exactly as
+/// [`refusing_violations_with_declared_echoes_over`] renders it, so a service states only
+/// the shapes whose printed form it knows. Everything else is that function's: the same
+/// collecting walk, the same violations, the same per-value and per-message echo bounds.
+#[must_use]
+pub fn refusing_violations_with_printed_echoes_over<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+    max_positions: usize,
+    printed: PrintedMembers,
+) -> Vec<(Violation, SubmittedEcho)> {
+    let refusing = violations_in::<O>(
+        protocol,
+        req,
+        Echoes::PrintedRenderingsOver(max_positions, printed),
+    );
+    refusing
+        .violations
+        .into_iter()
+        .zip(refusing.echoes)
+        .collect()
+}
+
+/// The members one or more SHAPES are printed with inside a clause, in the order they are
+/// printed: one entry per shape, naming the shape and its printed member list.
+///
+/// Stated by the service whose refusal is being reproduced — see
+/// [`refusing_violations_with_printed_echoes_over`] — and `'static` because it is a
+/// property of that service's recorded wording rather than of any request.
+pub type PrintedMembers = &'static [(&'static str, &'static [&'static str])];
+
 /// Whether a collected violation's value echo is restored to the bytes the caller sent.
 ///
 /// A service whose refusal QUOTES the value needs it restored; one whose refusal reports
@@ -368,6 +414,10 @@ pub(crate) enum Echoes {
     /// As [`Self::RenderingsOver`], with a structure rendered over every member its shape
     /// declares ([`refusing_violations_with_declared_echoes_over`]).
     DeclaredRenderingsOver(usize),
+    /// As [`Self::DeclaredRenderingsOver`], with the members a structure is printed over
+    /// stated by the caller for the shapes it names
+    /// ([`refusing_violations_with_printed_echoes_over`]).
+    PrintedRenderingsOver(usize, PrintedMembers),
 }
 
 /// Which members a STRUCTURE is rendered over inside a clause.
@@ -384,6 +434,12 @@ pub(crate) enum StructureForm {
     /// Every member the shape DECLARES, in declaration order, with one the request left
     /// unset rendered as `null`.
     EveryMemberDeclared,
+    /// Every member the shapes this names are PRINTED with, in the order it states them,
+    /// with one the request left unset rendered as `null` — the form for a layer whose
+    /// printed object carries members the model does not declare
+    /// ([`refusing_violations_with_printed_echoes_over`]). A shape it does not name renders
+    /// as [`Self::EveryMemberDeclared`] renders it.
+    MembersPrinted(PrintedMembers),
 }
 
 /// The ONE collecting walk this crate performs: every violation that refuses `req` before
@@ -461,6 +517,22 @@ pub(crate) fn violations_in<O: Operation>(
                         O::INPUT_SCHEMA,
                         max_positions,
                         StructureForm::EveryMemberDeclared,
+                    )
+                    .into_iter()
+                    .unzip();
+                    Refusing {
+                        violations,
+                        lists: HashMap::new(),
+                        echoes,
+                    }
+                }
+                Echoes::PrintedRenderingsOver(max_positions, printed) => {
+                    let (violations, echoes) = echoed_over(
+                        violations,
+                        &input,
+                        O::INPUT_SCHEMA,
+                        max_positions,
+                        StructureForm::MembersPrinted(printed),
                     )
                     .into_iter()
                     .unzip();
@@ -1312,6 +1384,16 @@ fn rendered_declared_structure(
     Some(format!("{name}({})", members.join(", ")))
 }
 
+/// The members the shape `name` is PRINTED with, as the caller stated them
+/// ([`PrintedMembers`]), or `None` when it named no such shape — which renders that shape
+/// over the members its own schema declares instead.
+fn printed_members(printed: PrintedMembers, name: &str) -> Option<Vec<String>> {
+    printed
+        .iter()
+        .find(|(shape, _)| *shape == name)
+        .map(|(_, members)| members.iter().map(|member| (*member).to_string()).collect())
+}
+
 /// The members `schema` DECLARES, in declaration order, spelled as a clause spells a
 /// member — empty for a schema that declares none, and for a member schema, which carries
 /// the member's own name rather than its target shape's members.
@@ -1535,10 +1617,12 @@ impl SubmittedValues {
         if let Some(open) = self.open.last_mut() {
             open.take(RenderedChild {
                 name: Self::segment_for(schema),
-                // Read only by the form that needs it, so the other form pays no
-                // allocation for a shape name nothing will state.
+                // Read only by the forms that need it, so a form that states no
+                // shape name pays no allocation for one.
                 declared_by: match self.structures {
-                    StructureForm::EveryMemberDeclared => declaring_shape(schema),
+                    StructureForm::EveryMemberDeclared | StructureForm::MembersPrinted(_) => {
+                        declaring_shape(schema)
+                    }
                     StructureForm::MembersSet => None,
                 },
                 rendering,
@@ -1664,26 +1748,45 @@ impl SubmittedValues {
     /// (`&Inner::SCHEMA`, from the generated `serialize_members`), while a struct reached
     /// as a MEMBER carries the member schema, whose name is the member's. Rendering that
     /// one would state `<member>(…)`, a form AWS never emits — so under
-    /// [`StructureForm::MembersSet`] such a structure renders as nothing, and under
-    /// [`StructureForm::EveryMemberDeclared`] it is named by the shape its own members
-    /// declare ([`declaring_shape`]), which is the one fact about it the member schema
-    /// does not carry. The members that shape DECLARES are not reachable that way, so a
-    /// structure reached as a member renders over the members it wrote even in that form.
+    /// [`StructureForm::MembersSet`] such a structure renders as nothing, and under the two
+    /// forms that name every member it is named by the shape its own members declare
+    /// ([`declaring_shape`]), which is the one fact about it the member schema does not
+    /// carry. The members that shape DECLARES are not reachable that way, so a structure
+    /// reached as a member renders over the members it wrote — unless the caller STATED
+    /// that shape's printed members ([`StructureForm::MembersPrinted`]), which is a fact
+    /// about the service's wording rather than about the schema and so is available at
+    /// either position.
     fn rendered_struct(&self, schema: &Schema, children: &[RenderedChild]) -> Option<String> {
-        match (self.structures, schema.member_name()) {
-            (StructureForm::MembersSet, None) => {
-                rendered_structure(schema.shape_id().shape_name(), children)
+        let printed = |name: &str| match self.structures {
+            StructureForm::MembersPrinted(printed) => printed_members(printed, name),
+            _ => None,
+        };
+        match schema.member_name() {
+            // Written against the structure's OWN schema: that schema names the shape and
+            // carries the members it declares.
+            None => {
+                let name = schema.shape_id().shape_name();
+                match self.structures {
+                    StructureForm::MembersSet => rendered_structure(name, children),
+                    _ => rendered_declared_structure(
+                        name,
+                        &printed(name).unwrap_or_else(|| declared_members(schema)),
+                        children,
+                    ),
+                }
             }
-            (StructureForm::MembersSet, Some(_)) => None,
-            (StructureForm::EveryMemberDeclared, None) => rendered_declared_structure(
-                schema.shape_id().shape_name(),
-                &declared_members(schema),
-                children,
-            ),
-            (StructureForm::EveryMemberDeclared, Some(_)) => {
-                let name = children.iter().find_map(|child| child.declared_by.as_deref())?;
-                rendered_structure(name, children)
-            }
+            // Reached as a struct MEMBER, so the shape is recovered from the members the
+            // structure wrote and its declared members are out of reach.
+            Some(_) => match self.structures {
+                StructureForm::MembersSet => None,
+                _ => {
+                    let name = children.iter().find_map(|child| child.declared_by.as_deref())?;
+                    match printed(name) {
+                        Some(members) => rendered_declared_structure(name, &members, children),
+                        None => rendered_structure(name, children),
+                    }
+                }
+            },
         }
     }
 }

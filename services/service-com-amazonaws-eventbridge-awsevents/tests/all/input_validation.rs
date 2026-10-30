@@ -1116,20 +1116,24 @@ async fn a_pattern_refusal_reports_the_expression_without_the_models_anchors() {
             ),
         ),
         (
-            // `TargetList` is modelled `@length(min: 1, max: 100)`.
+            // `TargetList` is modelled `@length(min: 1, max: 100)`. A clause on a
+            // LIST member states the list as submitted, which for an empty one is
+            // the empty list it was.
             "PutTargets with an empty Targets list",
             "PutTargets",
             json!({ "Rule": "ok-rule", "Targets": [] }),
-            "1 validation error detected: Value '0 items' at 'targets' failed to satisfy \
+            "1 validation error detected: Value '[]' at 'targets' failed to satisfy \
              constraint: Member must have length greater than or equal to 1"
                 .to_string(),
         ),
         (
             // `PutEventsRequestEntryList` is modelled `@length(min: 1, max: 10)`.
+            // A clause on a LIST member states the list as submitted, which for an
+            // empty one is the empty list it was.
             "PutEvents with an empty Entries list",
             "PutEvents",
             json!({ "Entries": [] }),
-            "1 validation error detected: Value '0 items' at 'entries' failed to satisfy \
+            "1 validation error detected: Value '[]' at 'entries' failed to satisfy \
              constraint: Member must have length greater than or equal to 1"
                 .to_string(),
         ),

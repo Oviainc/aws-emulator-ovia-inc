@@ -159,14 +159,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is therefore NOT found by a call that names no bus.
         let bus_name = crate::state::effective_bus_name(input.event_bus_name.as_deref());
         let mut store = state.lock();
-        let Some(rule) = store.rule_mut(&region, &bus_name, &input.name) else {
-            return Err(DisableRuleErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::no_such_rule(&bus_name, &input.name)),
-                },
-            )
-            .into());
-        };
+        // `EventBusName` names the SCOPE the rule is sought in, so the bus is
+        // resolved before the rule and a bus that is gone is the missing
+        // resource this call reports — `crate::state` owns that precedence, and
+        // the refusal it composes, for every operation that resolves a rule.
+        let rule = store
+            .resolve_rule_mut(&region, &bus_name, &input.name)
+            .map_err(|missing| {
+                DisableRuleErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(missing),
+                })
+            })?;
 
         // "You cannot modify these managed rules by using DisableRule, EnableRule,
         // PutTargets, PutRule, TagResource, or UntagResource"

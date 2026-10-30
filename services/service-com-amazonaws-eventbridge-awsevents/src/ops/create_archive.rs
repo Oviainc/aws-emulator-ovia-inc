@@ -230,10 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.archives.len() >= crate::state::MAX_ARCHIVES {
             return Err(CreateArchiveErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "The account already holds the maximum of {} archives.",
-                        crate::state::MAX_ARCHIVES
-                    )),
+                    message: Some(crate::state::QUOTA_EXCEEDED.to_string()),
                 },
             )
             .into());

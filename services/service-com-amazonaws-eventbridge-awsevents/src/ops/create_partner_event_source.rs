@@ -199,10 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreatePartnerEventSourceErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "The account already holds the maximum of {} partner event sources.",
-                        crate::state::MAX_PARTNER_EVENT_SOURCES
-                    )),
+                    message: Some(crate::state::QUOTA_EXCEEDED.to_string()),
                 },
             )
             .into());

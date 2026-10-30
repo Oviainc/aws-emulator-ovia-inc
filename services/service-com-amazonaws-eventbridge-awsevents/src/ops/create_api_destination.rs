@@ -178,16 +178,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // connection whose deletion fell due no longer backs a new destination.
         store.settle_connections(now);
         if store.connection_by_arn(&input.connection_arn).is_none() {
-            // Named the way every other reader of the connection slice names a
-            // missing connection: by its NAME, which is the part of the ARN that
-            // identifies it.
-            let named = crate::state::connection_name_in_arn(&input.connection_arn)
-                .unwrap_or(input.connection_arn.as_str());
+            // Named by the `ConnectionArn` the request SENT: that value is the
+            // caller's own identification of the connection, and the one it can
+            // correlate the refusal with, so it is echoed rather than reduced to
+            // the name inside it.
             return Err(CreateApiDestinationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::api_destination_refusal(
                         VERB,
-                        &crate::state::connection_does_not_exist(named),
+                        &crate::state::connection_does_not_exist(&input.connection_arn),
                     )),
                 },
             )
@@ -208,10 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.api_destinations.len() >= crate::state::MAX_API_DESTINATIONS {
             return Err(CreateApiDestinationErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "The account already holds the maximum of {} api destinations.",
-                        crate::state::MAX_API_DESTINATIONS
-                    )),
+                    message: Some(crate::state::QUOTA_EXCEEDED.to_string()),
                 },
             )
             .into());

@@ -529,23 +529,32 @@ async fn an_absent_eventbridge_rule_fails_with_eventbridges_own_wording() {
     .await;
     assert_eq!(status, 200, "PutRule: body {body}");
 
-    let rows: &[(&str, &str, &str)] = &[
-        ("the default bus", "default", "ghost-rule"),
-        ("the default bus, a dotted name", "default", "ghost.rule.v2"),
-        ("a custom bus that exists", "orders-bus", "ghost_rule"),
-        ("a custom bus that does not exist", "ghost-bus", "ghost-rule"),
+    // (case, the bus the ARN names, whether that bus EXISTS, the rule name)
+    let rows: &[(&str, &str, bool, &str)] = &[
+        ("the default bus", "default", true, "ghost-rule"),
+        ("the default bus, a dotted name", "default", true, "ghost.rule.v2"),
+        ("a custom bus that exists", "orders-bus", true, "ghost_rule"),
+        ("a custom bus that does not exist", "ghost-bus", false, "ghost-rule"),
         (
             "a stored rule's name under another bus",
             "orders-bus",
+            true,
             "live-rule",
         ),
     ];
 
-    for (case, bus, rule) in rows {
+    for (case, bus, bus_exists, rule) in rows {
         let ghost = events_rule_arn(bus, rule);
         // The wording this test holds the emulator to, composed here from the
-        // row's own rule and bus.
-        let expected = format!("Rule {rule} does not exist on EventBus {bus}.");
+        // row's own rule and bus. `EventBusName` names the SCOPE a rule is sought
+        // in, so a row whose bus does not exist reads that the BUS is missing:
+        // the hosting service resolves the bus first, and this API carries
+        // whichever of the two refusals it composed.
+        let expected = if *bus_exists {
+            format!("Rule {rule} does not exist on EventBus {bus}.")
+        } else {
+            format!("Event bus {bus} does not exist.")
+        };
 
         for (operation, request) in [
             (

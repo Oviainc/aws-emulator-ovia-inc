@@ -262,10 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.bus_count_in(&region) >= crate::state::MAX_EVENT_BUSES {
             return Err(CreateEventBusErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "The account already holds the maximum of {} event buses.",
-                        crate::state::MAX_EVENT_BUSES
-                    )),
+                    message: Some(crate::state::QUOTA_EXCEEDED.to_string()),
                 },
             )
             .into());
@@ -277,10 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.may_hold_bus_in(&region) {
             return Err(CreateEventBusErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "The account already holds event buses in the maximum of {} regions.",
-                        crate::state::MAX_BUS_REGIONS
-                    )),
+                    message: Some(crate::state::QUOTA_EXCEEDED.to_string()),
                 },
             )
             .into());

@@ -224,6 +224,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A failover policy this write names has to put its secondary Region
+        // somewhere other than the endpoint's primary one, which the model cannot
+        // express either. Judged BEFORE the bus pair, for the reason
+        // `crate::state::routing_config_violation` gives, and against the stored
+        // endpoint's own primary Region — a write never moves it. A write naming
+        // no policy leaves the stored one alone, so there is nothing to check.
+        if let Some(reason) = input.routing_config.as_ref().and_then(|routing| {
+            crate::state::routing_config_violation(routing, &endpoint.home_region)
+        }) {
+            return Err(crate::scaffolded::Scaffolded::validation(reason));
+        }
+
         // What the write would leave in force: a member it carries, and
         // otherwise the one the stored record already holds.
         let replication_state = named_state
@@ -240,13 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // replicate for.
         if replication_state == crate::state::REPLICATION_STATE_ENABLED && role_arn.is_none() {
             return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::parameter_violation(
-                    "RoleArn",
-                    &format!(
-                        "RoleArn is required when event replication is {}.",
-                        crate::state::REPLICATION_STATE_ENABLED
-                    ),
-                ),
+                crate::state::REPLICATION_NEEDS_A_ROLE,
             ));
         }
 

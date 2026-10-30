@@ -154,14 +154,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let bus_name = crate::state::effective_bus_name(input.event_bus_name.as_deref());
         let store = state.lock();
-        let Some(rule) = store.rule(&region, &bus_name, &input.rule) else {
-            return Err(ListTargetsByRuleErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::no_such_rule(&bus_name, &input.rule)),
-                },
-            )
-            .into());
-        };
+        // `EventBusName` names the SCOPE the rule is sought in, so the bus is
+        // resolved before the rule and a bus that is gone is the missing
+        // resource this call reports — `crate::state` owns that precedence, and
+        // the refusal it composes, for every operation that resolves a rule.
+        let rule = store
+            .resolve_rule(&region, &bus_name, &input.rule)
+            .map_err(|missing| {
+                ListTargetsByRuleErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(missing),
+                    },
+                )
+            })?;
 
         // The token names a POSITION in the stored order: everything strictly
         // after that target id. A well-formed token whose target has since been

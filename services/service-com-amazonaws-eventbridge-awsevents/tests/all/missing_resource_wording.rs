@@ -10,7 +10,10 @@
 //! without the bus a caller cannot tell "no such rule anywhere" from "that rule
 //! lives on another bus"), an event bus by its NAME — never by echoing back the
 //! ARN or any other text the caller sent. One wording per missing-resource kind,
-//! whatever operation ran into it.
+//! whatever operation ran into it. `EventBusName` names the SCOPE a rule is
+//! sought in, so the bus is resolved FIRST: a request naming a bus this account
+//! does not hold reads that the BUS is missing, whatever rule name came with it,
+//! and only on a bus that exists is the rule the missing resource.
 //!
 //! Each table spans the class the rule generalises over rather than one recorded
 //! request: the OPERATION that ran the lookup (a read, a target write, a target
@@ -140,7 +143,8 @@ fn expected_bus_wording(bus: &str) -> String {
 /// Every operation that resolves a rule by name refuses a missing one with the
 /// rule NAMED and the event bus it was sought on named too, whichever way the
 /// caller addressed it (members, or an ARN) — and with no ARN text in the
-/// message.
+/// message. A rule sought on a bus that does not exist reports THE BUS: the bus
+/// is the scope the lookup runs in, so it is resolved first.
 #[tokio::test]
 async fn a_missing_rule_is_named_with_its_event_bus_by_every_operation() {
     let emulator = emulator();
@@ -158,48 +162,54 @@ async fn a_missing_rule_is_named_with_its_event_bus_by_every_operation() {
     assert_eq!(status, 200, "PutRule answered {status} {body}");
 
     // (case, the `EventBusName` member the request carries, the bus the lookup
-    // runs on, the rule name). The rows differ along the bus the rule is sought
-    // on and the form of both names.
-    let rows: Vec<(&str, Option<&str>, &str, &str)> = vec![
+    // runs on, whether that bus EXISTS, the rule name). The rows differ along the
+    // bus the rule is sought on and the form of both names.
+    let rows: Vec<(&str, Option<&str>, &str, bool, &str)> = vec![
         (
             "a rule on the implicit default bus",
             None,
             DEFAULT_BUS,
+            true,
             "absent-rule",
         ),
         (
             "a rule on the default bus, named explicitly",
             Some(DEFAULT_BUS),
             DEFAULT_BUS,
+            true,
             "absent.rule.dotted",
         ),
         (
             "a rule on a custom bus that exists",
             Some("orders-bus"),
             "orders-bus",
+            true,
             "absent_rule_underscored",
         ),
         (
             "a rule on a bus that does not exist either",
             Some("ghost-bus"),
             "ghost-bus",
+            false,
             "absent-rule",
         ),
         (
             "a rule on a bus whose name carries a slash (the partner-bus form)",
             Some("team/orders"),
             "team/orders",
+            false,
             "absent-rule",
         ),
         (
             "a stored rule's name under another bus",
             Some("orders-bus"),
             "orders-bus",
+            true,
             "on-default",
         ),
     ];
 
-    for (case, bus_member, bus, rule) in rows {
+    for (case, bus_member, bus, bus_exists, rule) in rows {
         let arn = rule_arn(bus, rule);
         let with_bus = |mut body: Value| {
             if let Some(name) = bus_member {
@@ -232,7 +242,14 @@ async fn a_missing_rule_is_named_with_its_event_bus_by_every_operation() {
             ("ListTagsForResource", json!({ "ResourceARN": arn })),
         ];
 
-        let expected = expected_rule_wording(bus, rule);
+        // The missing resource is the BUS where the request named one this
+        // account does not hold, and the rule only where the bus is there to
+        // hold it.
+        let expected = if bus_exists {
+            expected_rule_wording(bus, rule)
+        } else {
+            expected_bus_wording(bus)
+        };
         for (operation, body) in requests {
             let (status, answered) = call(&emulator, operation, &body).await;
             assert_eq!(

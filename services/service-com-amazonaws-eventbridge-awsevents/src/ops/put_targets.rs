@@ -181,11 +181,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The RULE is resolved before the request's own members are judged: a
         // caller naming a rule that does not exist has to read that, not a
         // verdict on its target list, because the two call for different
-        // remedies.
-        if store.rule(&region, &bus_name, &input.rule).is_none() {
+        // remedies. `EventBusName` names the SCOPE that lookup runs in, so the
+        // bus is resolved before the rule and a bus that is gone is the missing
+        // resource reported — `crate::state::missing_rule` owns that precedence
+        // for every operation that resolves a rule.
+        if let Some(missing) = store.missing_rule(&region, &bus_name, &input.rule) {
             return Err(PutTargetsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::no_such_rule(&bus_name, &input.rule)),
+                    message: Some(missing),
                 },
             )
             .into());
@@ -215,14 +218,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(violation));
         }
 
-        let Some(rule) = store.rule_mut(&region, &bus_name, &input.rule) else {
-            return Err(PutTargetsErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::no_such_rule(&bus_name, &input.rule)),
-                },
-            )
-            .into());
-        };
+        // The rule is resolved AGAIN for the write, now that the request's own
+        // members have been judged — through the one resolver, so the refusal is
+        // the same one the check above would have stated.
+        let rule = store
+            .resolve_rule_mut(&region, &bus_name, &input.rule)
+            .map_err(|missing| {
+                PutTargetsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(missing),
+                })
+            })?;
 
         // "You cannot modify these managed rules by using DisableRule, EnableRule,
         // PutTargets, PutRule, TagResource, or UntagResource"
@@ -245,11 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if rule.targets.len() + incoming > crate::state::MAX_TARGETS_PER_RULE {
             return Err(PutTargetsErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "Rule {} cannot hold more than {} targets.",
-                        input.rule,
-                        crate::state::MAX_TARGETS_PER_RULE
-                    )),
+                    message: Some(crate::state::QUOTA_EXCEEDED.to_string()),
                 },
             )
             .into());

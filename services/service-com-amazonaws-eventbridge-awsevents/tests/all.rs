@@ -25,6 +25,8 @@ mod archive_replay;
 mod archive_state_is_settled;
 #[path = "all/bus_forward_authorization.rs"]
 mod bus_forward_authorization;
+#[path = "all/client_error_wording.rs"]
+mod client_error_wording;
 #[path = "all/connection_authorization.rs"]
 mod connection_authorization;
 #[path = "all/connection_lifecycle.rs"]

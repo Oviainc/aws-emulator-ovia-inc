@@ -549,6 +549,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The member path a constraint clause about this operation's `Entries` list
+/// names, in the spelling the framework's validating walk reports a member at
+/// (lowerCamel, see `aws_smithy_schema_server::constraints::path`).
+pub const ENTRIES_MEMBER_PATH: &str = "entries";
+
+/// The members a refused `PutEventsRequestEntry` is PRINTED with, in the order
+/// the validation layer in front of EventBridge prints them.
+///
+/// That layer echoes a rejected value by printing the request object it refused,
+/// so the member list and its order are FIXED TEXT of the message rather than
+/// anything derived from one request. Seven of them are this model's own —
+/// `smithy_query(query="shape", shape="com.amazonaws.eventbridge#PutEventsRequestEntry")`
+/// gives `Time Source Resources DetailType Detail EventBusName TraceHeader` — and
+/// the three the model does not declare (`eventGroupId` between `detailType` and
+/// `detail`, then `kmsKeyIdentifier` and `internalMetadata` last) are members of
+/// the object that layer prints, which nothing in a request to this service can
+/// set and which therefore always print unset.
+///
+/// This is the one fact about the wording that is this service's; the rendering
+/// itself — the structure, the list around it, each member's value taken from the
+/// entry as submitted and an unset one printed as `null` — is the tree's shared
+/// echo walk's (`service_common::validation`), which `crate::service` drives.
+pub const PRINTED_ENTRY_MEMBERS: ::service_common::validation::PrintedMembers = &[(
+    "PutEventsRequestEntry",
+    &[
+        "time",
+        "source",
+        "resources",
+        "detailType",
+        "eventGroupId",
+        "detail",
+        "eventBusName",
+        "traceHeader",
+        "kmsKeyIdentifier",
+        "internalMetadata",
+    ],
+)];
+
 /// "A specified parameter is not valid" (`PutEventsResultEntry$ErrorCode`).
 const INVALID_ARGUMENT: &str = "InvalidArgument";
 /// "You do not have permissions to publish events with this source onto this
