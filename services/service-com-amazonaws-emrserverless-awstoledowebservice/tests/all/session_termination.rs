@@ -13,11 +13,11 @@
 //!    straight away and the clock owes it `TERMINATED` after the transition span, with
 //!    the end instant that state implies; the termination REPLACES whatever change the
 //!    clock still owed the session, and the session stays readable afterwards.
-//! 2. Whether a terminate is accepted is decided by the session's `SessionState` alone:
-//!    it moves every state that names a live session, it is the idempotent no-op that
-//!    writes nothing for a session already terminating, and it is refused with the
-//!    modelled `ValidationException` (HTTP 400) for a session that has reached a state it
-//!    never leaves — leaving the state and its details exactly as they were.
+//! 2. What a terminate does is decided by the session's `SessionState` alone: it moves
+//!    every state that names a live session, and for every state that leaves it no live
+//!    work to end — the `TERMINATING` one it leads to, and the ones a session never
+//!    leaves — it is the idempotent no-op that answers the modelled 200 with the stored
+//!    ids while leaving the state and its details exactly as they were.
 //! 3. Both ids a terminate names have to name something, in the scope the route gives
 //!    them: an application the account does not hold, or a session that application does
 //!    not hold, is the modelled `ResourceNotFoundException` (HTTP 404), and the session
@@ -41,18 +41,17 @@ use super::session_lifecycle::{get_session, minimal_session, session_application
 /// `smithy_query(query="shape",shape="SessionState")` lists exactly `SUBMITTED`,
 /// `STARTING`, `STARTED`, `IDLE`, `BUSY`, `FAILED`, `TERMINATING`, `TERMINATED`. A
 /// terminate ends the states that name a live session; `TERMINATING` already has the
-/// termination in flight, so an `@idempotent` retry reports it and writes nothing; and
-/// `FAILED` and `TERMINATED` name a session that is over, so there is nothing left to
-/// end.
+/// termination in flight and `FAILED` and `TERMINATED` name a session that is over, so
+/// for all three the `@idempotent` operation reports the stored ids and writes nothing.
 const SESSION_STATES: &[(&str, Outcome)] = &[
     ("SUBMITTED", Outcome::Terminates),
     ("STARTING", Outcome::Terminates),
     ("STARTED", Outcome::Terminates),
     ("IDLE", Outcome::Terminates),
     ("BUSY", Outcome::Terminates),
-    ("FAILED", Outcome::Refused),
+    ("FAILED", Outcome::Unchanged),
     ("TERMINATING", Outcome::Unchanged),
-    ("TERMINATED", Outcome::Refused),
+    ("TERMINATED", Outcome::Unchanged),
 ];
 
 /// What a terminate does to a session in a given `SessionState`.
@@ -62,8 +61,6 @@ enum Outcome {
     Terminates,
     /// It answers the modelled success and leaves the record exactly as it is.
     Unchanged,
-    /// It is refused with the modelled `ValidationException` and writes nothing.
-    Refused,
 }
 
 /// What a not-found refusal says, by resource class: EMR Serverless states the class that
@@ -71,9 +68,9 @@ enum Outcome {
 /// `crate::state`. Source: the recorded refusals this service's other handlers already
 /// answer with (`application_lifecycle::an_id_that_names_nothing_is_refused`).
 const APPLICATION_NOT_FOUND: &str = "Application does not exist";
-const SESSION_NOT_FOUND: &str = "Session does not exist";
+const SESSION_NOT_FOUND: &str = "Session with given ID doesn't exist";
 
-async fn terminate_session(
+pub(crate) async fn terminate_session(
     router: &MultiServiceRouter,
     application_id: &str,
     session_id: &str,
@@ -99,7 +96,7 @@ fn is_state_details(value: &Value) -> bool {
 /// `SessionState` catalog can be asserted — the states a client cannot drive a session
 /// into over HTTP included — and clear whatever the clock owed it, so the state under
 /// test is the one the terminate sees.
-fn force_session_state(
+pub(crate) fn force_session_state(
     engine: &engine::InMemoryEngine,
     application_id: &str,
     session_id: &str,
@@ -180,7 +177,7 @@ fn terminate_cases() -> Vec<TerminateCase> {
 
 /// Rule 1: a terminate moves a live session to `TERMINATING`, the clock owes it
 /// `TERMINATED`, and the session it ended is still readable in that state — and rule 2's
-/// refusal, asserted here on the retry that follows a terminate.
+/// no-op, asserted here on the retries that follow a terminate.
 #[tokio::test]
 async fn terminate_session_moves_a_live_session_through_terminating_to_terminated() {
     let router = emulator();
@@ -339,55 +336,53 @@ async fn terminate_session_moves_a_live_session_through_terminating_to_terminate
             ended.at("/session/arn")
         );
 
-        // Rule 2 on the retry: the session is over, so there is nothing left to
-        // terminate and the refusal writes nothing.
+        // Rule 2 on the retry after the session is over: the termination this call asks
+        // for has already happened, so the `@idempotent` operation reports the stored
+        // ids with the modelled 200 and writes nothing.
         let retried = terminate_session(&router, &application_id, &session_id).await;
         assert_eq!(
-            retried.status, 400,
-            "case {label:?}: terminating a terminated session expected 400, got {} with {:?}",
+            retried.status, 200,
+            "case {label:?}: terminating a terminated session expected 200, got {} with {:?}",
             retried.status, retried.body
         );
         assert_eq!(
-            retried.error_code(),
-            "ValidationException",
-            "case {label:?}: expected ValidationException, got {:?}",
-            retried.body
+            retried.at("/applicationId").as_str(),
+            Some(application_id.as_str()),
+            "case {label:?}: the repeat reports the stored application id, got {:?}",
+            retried.at("/applicationId")
         );
         assert_eq!(
-            retried.resolved_error_shape(),
-            Some("ValidationException"),
-            "case {label:?}: a restJson1 client resolves the shape from x-amzn-errortype, \
-             got {:?}",
-            retried.resolved_error_shape()
-        );
-        assert!(
-            retried
-                .at("/message")
-                .as_str()
-                .is_some_and(|message| message.trim() != ""),
-            "case {label:?}: a refusal states its condition, got {:?}",
-            retried.at("/message")
+            retried.at("/sessionId").as_str(),
+            Some(session_id.as_str()),
+            "case {label:?}: the repeat reports the stored session id, got {:?}",
+            retried.at("/sessionId")
         );
 
-        let after_refusal = get_session(&router, &application_id, &session_id).await;
+        let after_repeat = get_session(&router, &application_id, &session_id).await;
         assert_eq!(
-            after_refusal.at("/session/state").as_str(),
+            after_repeat.at("/session/state").as_str(),
             Some("TERMINATED"),
-            "case {label:?}: a refused terminate leaves the state alone, got {:?}",
-            after_refusal.at("/session/state")
+            "case {label:?}: a repeated terminate leaves the state alone, got {:?}",
+            after_repeat.at("/session/state")
         );
         assert_eq!(
-            after_refusal.at("/session/updatedAt").as_f64(),
+            after_repeat.at("/session/updatedAt").as_f64(),
             ended_at,
-            "case {label:?}: a refused terminate writes nothing, got {:?}",
-            after_refusal.at("/session/updatedAt")
+            "case {label:?}: a repeated terminate writes nothing, got {:?}",
+            after_repeat.at("/session/updatedAt")
+        );
+        assert_eq!(
+            after_repeat.at("/session/endedAt").as_f64(),
+            ended_at,
+            "case {label:?}: a repeated terminate does not move the end instant, got {:?}",
+            after_repeat.at("/session/endedAt")
         );
     }
 }
 
 /// Rule 2 over the WHOLE `SessionState` catalog: a terminate ends exactly the states that
-/// name a live session, reports the in-flight one without writing, and is refused on the
-/// ones that are over — with the record unchanged either way it does not act.
+/// name a live session, and reports the stored ids without writing for every state that
+/// leaves it nothing to end — with the record unchanged wherever it does not act.
 #[tokio::test]
 async fn a_terminate_is_accepted_exactly_for_the_states_that_name_a_live_session() {
     let (router, engine) = emulator_with_engine();
@@ -444,9 +439,15 @@ async fn a_terminate_is_accepted_exactly_for_the_states_that_name_a_live_session
             Outcome::Unchanged => {
                 assert_eq!(
                     answer.status, 200,
-                    "case {state:?}: a termination already in flight is reported, got {} \
+                    "case {state:?}: a session with nothing left to end is reported, got {} \
                      with {:?}",
                     answer.status, answer.body
+                );
+                assert_eq!(
+                    answer.at("/applicationId").as_str(),
+                    Some(application_id.as_str()),
+                    "case {state:?}: it reports the stored application id, got {:?}",
+                    answer.at("/applicationId")
                 );
                 assert_eq!(
                     answer.at("/sessionId").as_str(),
@@ -455,24 +456,10 @@ async fn a_terminate_is_accepted_exactly_for_the_states_that_name_a_live_session
                     answer.at("/sessionId")
                 );
             }
-            Outcome::Refused => {
-                assert_eq!(
-                    answer.status, 400,
-                    "case {state:?}: a session that is over has nothing left to terminate, \
-                     got {} with {:?}",
-                    answer.status, answer.body
-                );
-                assert_eq!(
-                    answer.error_code(),
-                    "ValidationException",
-                    "case {state:?}: expected ValidationException, got {:?}",
-                    answer.body
-                );
-            }
         }
 
-        // Neither the reported in-flight termination nor the refusal writes anything: the
-        // record is exactly what it was before the call.
+        // The reported no-op writes nothing: the record is exactly what it was before
+        // the call.
         if *outcome != Outcome::Terminates {
             let read = get_session(&router, &application_id, &session_id).await;
             assert_eq!(

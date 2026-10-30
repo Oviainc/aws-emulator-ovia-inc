@@ -167,30 +167,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
-            // `@idempotent`: a session that is ALREADY terminating has exactly the
-            // termination this call asks for in flight, so the retry reports the same ids
-            // and writes NOTHING — the termination is neither restarted nor its due
-            // instant pushed out.
-            if session.session.state == crate::state::SESSION_TERMINATING_STATE {
+            // `@idempotent`: a session with no live work left for this call to end
+            // already has the outcome the terminate asks for, so the call REPORTS the
+            // stored ids and writes NOTHING. Two kinds of state are like that: the
+            // `TERMINATING` one, where exactly this termination is in flight (neither
+            // restarted nor its due instant pushed out), and the states a session never
+            // leaves (`TERMINATED`, `FAILED`), where the work is already done and the
+            // terminal state must not be overwritten. An `@idempotent` DELETE does not
+            // fail because what it asks for has already happened.
+            if !crate::state::is_terminable_session_state(&session.session.state) {
                 return Ok(TerminateSessionOutput {
                     application_id: session.session.application_id.clone(),
                     session_id: session.session.session_id.clone(),
                 });
-            }
-
-            // A session that has reached a `SessionState` it never leaves (`TERMINATED`,
-            // `FAILED`) has no live session left for this call to end, and its terminal
-            // state must not be overwritten, so it is refused with the only 400 the
-            // operation models. Recorded evidence for the refusal rather than an
-            // idempotent success: the corpus unit
-            // `emr-serverless.terminate-already-terminated-session-rejected`.
-            if !crate::state::is_terminable_session_state(&session.session.state) {
-                return Err(TerminateSessionErrorModeled::ValidationException(
-                    ValidationException {
-                        message: crate::state::SESSION_NOT_TERMINABLE_MESSAGE.to_string(),
-                    },
-                )
-                .into());
             }
 
             // "After you terminate a session, it enters the TERMINATING state and then

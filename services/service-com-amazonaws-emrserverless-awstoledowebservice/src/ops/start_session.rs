@@ -219,9 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !record.session_enabled() {
             return Err(StartSessionErrorModeled::ValidationException(
                 ValidationException {
-                    message: "Interactive sessions are not enabled on this application: \
-                              set interactiveConfiguration.sessionEnabled"
-                        .to_string(),
+                    message: crate::state::SESSIONS_NOT_ENABLED_MESSAGE.to_string(),
                 },
             )
             .into());

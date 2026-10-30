@@ -326,14 +326,15 @@ pub fn is_terminal_session_state(state: &str) -> bool {
     TERMINAL_SESSION_STATES.contains(&state)
 }
 
-/// The `SessionState` values a `TerminateSession` can act on: the ones naming a session
+/// The `SessionState` values a `TerminateSession` ACTS on: the ones naming a session
 /// that is still live, so a terminate has a session left to end.
 ///
 /// Derived from the generated `SessionState` value list rather than re-listed, so a value
 /// the enum gains is classified in one place: a state is terminable when the enum holds
 /// it, it is not terminal ([`TERMINAL_SESSION_STATES`]) and it is not
 /// [`SESSION_TERMINATING_STATE`], which already names the termination a terminate asks
-/// for.
+/// for. A session in any OTHER state has no live work left for a terminate to end, which
+/// the `@idempotent` operation REPORTS rather than refuses.
 pub fn is_terminable_session_state(state: &str) -> bool {
     crate::ops::types::SESSION_STATE_VALUES.contains(&state)
         && !is_terminal_session_state(state)
@@ -1697,15 +1698,21 @@ pub const JOB_RUN_NOT_CANCELLABLE_MESSAGE: &str = "Job run is not in a cancellab
 
 /// The same, for the session a request names: one phrase for the resource class, naming
 /// no identifier, as this service's other not-found refusals do.
-pub const SESSION_NOT_FOUND_MESSAGE: &str = "Session does not exist";
-
-/// What a `ValidationException` says when a session cannot be terminated, because it has
-/// already reached a `SessionState` it never leaves.
 ///
-/// State-agnostic on purpose, the way [`JOB_RUN_NOT_CANCELLABLE_MESSAGE`] is: it states
-/// the condition the operation refuses on, not the state the session happens to be in,
-/// so a caller reads the state from `GetSession` rather than out of an error body.
-pub const SESSION_NOT_TERMINABLE_MESSAGE: &str = "Session is not in a state that can be terminated";
+/// A session is addressed by an ID INSIDE the application the route names, so the phrase
+/// is the one this service uses for a child resource whose id resolved to nothing — the
+/// same sentence [`JOB_RUN_NOT_FOUND_MESSAGE`] states for the other child of an
+/// application, with the resource class as its only difference.
+pub const SESSION_NOT_FOUND_MESSAGE: &str = "Session with given ID doesn't exist";
+
+/// What a `ValidationException` says when `StartSession` is asked for on an application
+/// that does not enable interactive sessions.
+///
+/// `StartSession` documents the precondition it refuses on — the application must "have
+/// interactive sessions enabled" — and the refusal states that condition as fixed text,
+/// carrying no part of the request and no remedy call: the member that enables them is
+/// the application's, not the session request's.
+pub const SESSIONS_NOT_ENABLED_MESSAGE: &str = "Sessions are not enabled on this application";
 
 /// The `ResourceNotFoundException` payload for an application id that names none.
 ///

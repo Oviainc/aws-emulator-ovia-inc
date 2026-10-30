@@ -56,7 +56,7 @@ const EXECUTION_ROLE: &str = "arn:aws:iam::000000000000:role/EMRServerlessSessio
 /// cannot make this test pass. Source: `StartSession`'s documentation — "This operation
 /// is supported for EMR release 7.13.0 and later"
 /// (`smithy_query(query="doc",shape="StartSession")`).
-const EARLIEST_SESSION_RELEASE: &str = "emr-7.13.0";
+pub(crate) const EARLIEST_SESSION_RELEASE: &str = "emr-7.13.0";
 const BEFORE_EARLIEST_SESSION_RELEASE: &str = "emr-7.12.0";
 
 /// `SessionArn`'s modelled `@pattern`
@@ -91,7 +91,7 @@ fn is_state_details(value: &Value) -> bool {
 /// Source: `InteractiveConfiguration$sessionEnabled` — "Enables interactive sessions on
 /// the application. When set to `true`, you can start interactive sessions using the
 /// `StartSession` operation."
-fn sessions_enabled() -> Value {
+pub(crate) fn sessions_enabled() -> Value {
     json!({ "sessionEnabled": true })
 }
 
@@ -110,7 +110,7 @@ fn create_application_body(token: &str, release_label: &str, interactive: Option
 
 /// Create an application and return `(applicationId, applicationArn)`, waiting out the
 /// create transition so the application has settled on `CREATED`.
-async fn application(
+pub(crate) async fn application(
     router: &MultiServiceRouter,
     token: &str,
     release_label: &str,
