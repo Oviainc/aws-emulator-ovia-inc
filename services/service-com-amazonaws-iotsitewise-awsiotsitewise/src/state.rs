@@ -7534,15 +7534,13 @@ pub fn encode_timestamp_token(resume: (i64, i32), scope: &str) -> String {
 /// or `None` for text this service never issued as a token OF THAT enumeration —
 /// which its caller answers as the modelled refusal for an invalid `nextToken`.
 pub fn decode_timestamp_token(token: &str, scope: &str) -> Option<(i64, i32)> {
-    let decoded = ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())?;
+    let decoded = decode_token_text(token)?;
     let (resume, carried) = decoded.rsplit_once(TOKEN_SCOPE_SEPARATOR)?;
     if carried != scope {
         return None;
     }
     let (seconds, nanos) = resume.split_once(TIMESTAMP_TOKEN_SEPARATOR)?;
-    Some((seconds.parse().ok()?, nanos.parse().ok()?))
+    Some((token_number(seconds)?, token_number(nanos)?))
 }
 
 /// What joins the two halves of the resume point in a token
@@ -7615,13 +7613,11 @@ impl BatchCursor {
     /// one — which its caller answers as the modelled refusal for an invalid
     /// `nextToken`.
     pub fn decode(token: &str) -> Option<Self> {
-        let decoded = ::hex::decode(token)
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok())?;
+        let decoded = decode_token_text(token)?;
         let (entry, value) = decoded.split_once(BATCH_CURSOR_SEPARATOR)?;
         Some(Self {
-            entry: entry.parse().ok()?,
-            value: value.parse().ok()?,
+            entry: token_number(entry)?,
+            value: token_number(value)?,
         })
     }
 }
@@ -7657,7 +7653,8 @@ pub struct Page {
 /// this service carry.
 ///
 /// `None` for a `next_token` this service never issued — text that is not the hex
-/// of a resume key, or a key no entry of this enumeration carries. Its caller
+/// of a resume key, hex in a spelling [`encode_page_token`] does not write, or a
+/// key no entry of this enumeration carries. Its caller
 /// answers that with the modelled refusal for an invalid `nextToken`, rather than
 /// with an empty page, which would report absence as success.
 pub fn page_of<T, K, S>(
@@ -7701,9 +7698,42 @@ pub fn encode_page_token(resume: &str) -> String {
 /// The resume key `token` encodes, or `None` for text this service never issued
 /// as a token.
 pub fn decode_page_token(token: &str) -> Option<String> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
+    decode_token_text(token)
+}
+
+/// The bytes `token` spells, or `None` unless `token` is the ONE spelling this
+/// service writes for them.
+///
+/// Every token of this service is the hex of its resume payload, and hex writes a
+/// byte exactly one way, so text is a token this service issued only when
+/// re-encoding what it decodes gives back the very text that arrived. Decoding hex
+/// alone would also read back every other spelling of the same bytes — the
+/// uppercase and mixed-case ones, which no encoder here mints — and serve a page
+/// for text the service never issued; the callers below lift the `None` into the
+/// modelled refusal for an invalid `nextToken` instead.
+pub fn decode_token_bytes(token: &str) -> Option<Vec<u8>> {
+    let bytes = ::hex::decode(token).ok()?;
+    (::hex::encode(&bytes) == token).then_some(bytes)
+}
+
+/// The text `token` spells, under the rule [`decode_token_bytes`] states.
+pub fn decode_token_text(token: &str) -> Option<String> {
+    String::from_utf8(decode_token_bytes(token)?).ok()
+}
+
+/// The number one field of a decoded token holds, or `None` unless `field` is the
+/// one spelling this service writes for that number.
+///
+/// The same rule [`decode_token_bytes`] applies to a token's hex, applied to the
+/// numbers inside it: a signed zero, a zero-padded or `+`-prefixed ordinal parses
+/// as the same number, but is text no encoder of this service writes, so it is text
+/// it never issued as a token.
+pub fn token_number<T>(field: &str) -> Option<T>
+where
+    T: ::std::str::FromStr + ::std::fmt::Display,
+{
+    let value: T = field.parse().ok()?;
+    (value.to_string() == field).then_some(value)
 }
 
 /// The `Quality` a TQV that names none carries.

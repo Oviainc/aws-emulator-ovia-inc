@@ -59,6 +59,13 @@ mod component_model_definition_reach;
 #[path = "all/pagination_token_binding.rs"]
 mod pagination_token_binding;
 
+// `pagination_token_spelling` is declared HERE, beside the suite it belongs with,
+// for the reason that suite's note gives: the sorted list and the END of this file
+// are both where every concurrent iotsitewise change puts a declaration of its own.
+// Fold it into the list once the churn settles.
+#[path = "all/pagination_token_spelling.rs"]
+mod pagination_token_spelling;
+
 // Declared here beside the suite above, for the reason its note gives.
 #[path = "all/asset_model_precondition_wording.rs"]
 mod asset_model_precondition_wording;

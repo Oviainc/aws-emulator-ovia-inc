@@ -244,9 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // answered with an empty page, which would report absence as success.
         let start = match input.next_token.as_deref() {
             Some(token) => {
-                let resume = ::hex::decode(token)
-                    .ok()
-                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                let resume = crate::state::decode_token_text(token)
                     .ok_or_else(invalid_token)?;
                 execution
                     .compute_nodes

@@ -2110,10 +2110,10 @@ pub(crate) fn encode_row_offset(offset: usize, scope: &RowPageScope) -> String {
 /// it belongs to, and the operation lifts a `None`, or an offset outside its result,
 /// into its own modelled refusal.
 pub(crate) fn decode_row_offset(token: &str, scope: &RowPageScope) -> Option<usize> {
-    let decoded = ::hex::decode(token).ok()?;
+    let decoded = crate::state::decode_token_bytes(token)?;
     let (offset, fingerprint) = ::std::str::from_utf8(&decoded).ok()?.split_once('|')?;
     (fingerprint == scope.0).then_some(())?;
-    offset.parse().ok()
+    crate::state::token_number(offset)
 }
 
 /// Decode a `nextToken` back into the row offset it resumes from in `scope`.

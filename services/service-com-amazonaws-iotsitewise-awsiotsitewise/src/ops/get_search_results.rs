@@ -528,10 +528,8 @@ fn encode_token(resume: usize) -> String {
 
 /// Decode a `nextToken` back into the index it resumes from.
 fn decode_token(token: &str) -> Result<usize, GetSearchResultsError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|resume| resume.parse().ok())
+    crate::state::decode_token_text(token)
+        .and_then(|resume| crate::state::token_number(&resume))
         .ok_or_else(invalid_token)
 }
 

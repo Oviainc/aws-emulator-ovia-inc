@@ -393,10 +393,10 @@ fn encode_page_token(at: usize, entries: &[BatchGetAssetPropertyValueEntry]) -> 
 /// The entry index a `nextToken` resumes `entries` at, or `None` when it is not a
 /// token this service issued for this entry list.
 fn decode_page_token(token: &str, entries: &[BatchGetAssetPropertyValueEntry]) -> Option<usize> {
-    let decoded = ::hex::decode(token).ok()?;
+    let decoded = crate::state::decode_token_bytes(token)?;
     let (at, fingerprint) = ::std::str::from_utf8(&decoded).ok()?.split_once('|')?;
     (fingerprint == entries_fingerprint(entries)).then_some(())?;
-    at.parse().ok()
+    crate::state::token_number(at)
 }
 
 /// A short digest of what the entries of one request identify, in order: the value

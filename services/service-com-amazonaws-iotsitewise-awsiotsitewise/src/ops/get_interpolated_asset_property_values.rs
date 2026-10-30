@@ -728,22 +728,16 @@ fn decode_token(
     token: &str,
     scope: &GridScope,
 ) -> Result<u64, GetInterpolatedAssetPropertyValuesError> {
-    let decoded = ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)?;
+    // Only the spelling [`encode_token`] writes is one of this operation's tokens:
+    // hex in another case, or a signed or zero-padded ordinal, reads back as the same
+    // resume point but is text this operation never issued, which the shared decoders
+    // refuse for every paginated operation of this service alike.
+    let decoded = crate::state::decode_token_text(token).ok_or_else(invalid_token)?;
     let (resume, fingerprint) = decoded.split_once('|').ok_or_else(invalid_token)?;
     if fingerprint != scope.0 {
         return Err(invalid_token());
     }
-    let ordinal: u64 = resume.parse().map_err(|_| invalid_token())?;
-    // Only the spelling [`encode_token`] writes is one of this operation's tokens:
-    // a signed or zero-padded ordinal reads as the same number but is text this
-    // operation never issued.
-    if ordinal.to_string() != resume {
-        return Err(invalid_token());
-    }
-    Ok(ordinal)
+    crate::state::token_number(resume).ok_or_else(invalid_token)
 }
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued
