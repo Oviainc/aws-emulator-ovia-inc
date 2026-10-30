@@ -222,6 +222,9 @@ pub const TAG_OPEN_ID_CONNECT_PROVIDER: &str = "iam:TagOpenIDConnectProvider";
 /// `iam:UntagOpenIDConnectProvider`.
 pub const UNTAG_OPEN_ID_CONNECT_PROVIDER: &str = "iam:UntagOpenIDConnectProvider";
 
+/// `iam:TagServerCertificate`.
+pub const TAG_SERVER_CERTIFICATE: &str = "iam:TagServerCertificate";
+
 /// `iam:TagSAMLProvider`.
 pub const TAG_SAML_PROVIDER: &str = "iam:TagSAMLProvider";
 

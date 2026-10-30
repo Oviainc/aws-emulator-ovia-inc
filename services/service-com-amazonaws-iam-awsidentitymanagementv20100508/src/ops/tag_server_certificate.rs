@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagServerCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagServerCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagServerCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds or overwrites the tags of the server certificate the request names, so the merged
+//! set is what `GetServerCertificate` and `ListServerCertificateTags` report afterwards.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +184,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagServerCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagServerCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; what this operation reads out of it is the
+        // signing key id of the caller the request is authorized as. The certificate is
+        // named in the request — IAM is global, so no region is read.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagServerCertificateErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
+        // "invalid … value … for an input parameter". Checked through the one definition of
+        // that rule in `crate::state`, the same one `UploadServerCertificate` uses, and
+        // checked before anything is written: "if any one of the tags is invalid … then the
+        // entire request fails".
+        if let Some(reserved) =
+            crate::state::reserved_tag_key(input.tags.iter().map(|tag| tag.key.as_str()))
+        {
+            return Err(TagServerCertificateErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Tag key {reserved} is reserved: keys must not begin with {}",
+                        crate::state::RESERVED_TAG_KEY_PREFIX
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A mutation: it "adds one or more tags to an IAM server certificate", so the lock
+        // is held for write across the lookup and the merge.
+        let mut store = state.lock();
+
+        // IAM entity names are unique within the account and "are not distinguished by
+        // case", so the certificate is found under the case-folded name whatever case the
+        // request spells it in — the key `UploadServerCertificate` stored it under.
+        let key = crate::state::name_key(&input.server_certificate_name);
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any tag is stored, and before the STORE's answer about the
+        // certificate is given away — so a caller that may not change a certificate's tags
+        // learns that it may not, never whether the account holds that certificate. The
+        // decision is made on the ARN the held certificate carries, or, for a name the
+        // account holds none under, on the ARN that name would carry at the default path,
+        // since there is no other path to attribute it to. The tags this call WRITES are
+        // handed to the gate, because they are part of the request a statement may be
+        // conditioned on (`aws:RequestTag/<key>`, `aws:TagKeys`); the refusal names the
+        // certificate as the request named it. Nothing is written when it refuses.
+        let resource = store.server_certificates.get(&key).map_or_else(
+            || {
+                crate::state::server_certificate_arn(
+                    crate::state::DEFAULT_PATH,
+                    &input.server_certificate_name,
+                )
+            },
+            |certificate| certificate.metadata.arn.clone(),
+        );
+        crate::state::authorization::authorize_written(
+            &store,
+            ctx,
+            crate::state::authorization::TAG_SERVER_CERTIFICATE,
+            &resource,
+            &format!("server certificate {}", input.server_certificate_name),
+            crate::state::authorization::WrittenTags::Pairs(&input.tags),
+        )?;
+
+        // Only a certificate the account holds can be tagged: a name it holds none under
+        // "referenced a resource entity that does not exist" (`NoSuchEntityException`),
+        // worded as every operation naming a server certificate by name words that absence.
+        let Some(certificate) = store.server_certificates.get_mut(&key) else {
+            return Err(TagServerCertificateErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The Server Certificate with name {} cannot be found.",
+                        input.server_certificate_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "If a tag with the same key name already exists, then that tag is overwritten
+        // with the new value" — the merge, and the per-resource tag bound it is taken
+        // against, are the one shared rule in `crate::state`. Nothing is stored when the
+        // bound is passed: "if you exceed the allowed maximum number of tags, then the
+        // entire request fails".
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagServerCertificate"))
+        // The keys the request named are taken for the audit record below before the list is
+        // consumed by the merge: a tag's VALUE is what the caller chose to store, so only
+        // the keys are recorded.
+        let supplied_keys: Vec<String> = input.tags.iter().map(|tag| tag.key.clone()).collect();
+        let Some(mut merged) = crate::state::merge_tags(certificate.tags.as_ref(), input.tags)
+        else {
+            return Err(TagServerCertificateErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot assign more than {} tags to IAM server certificate {}",
+                        crate::state::MAX_TAGS_PER_ENTITY,
+                        certificate.metadata.server_certificate_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // A certificate holds its tags sorted by key, the order `UploadServerCertificate`
+        // stores them in, because "the returned list of tags is sorted by tag key"
+        // (`UploadServerCertificate$Tags`) and `GetServerCertificate` reports the held
+        // order verbatim.
+        merged.sort_by(|left, right| left.key.cmp(&right.key));
+        // An empty tag set is the same as no tags, which is how `UploadServerCertificate`
+        // stores one: the member is reported only when the certificate carries a tag.
+        certificate.tags = (!merged.is_empty()).then_some(merged);
+        let server_certificate_name = certificate.metadata.server_certificate_name.clone();
+
+        // Audit record for the change: the acting principal, the operation and the keys it
+        // wrote to which certificate, so a state-changing call leaves a local record — the
+        // same shape `UpdateServerCertificate` and `TagPolicy` emit. The tag VALUES are not
+        // recorded, only the keys the request named.
+        ::tracing::info!(
+            audit = true,
+            operation = "TagServerCertificate",
+            outcome = "tagged",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            server_certificate_name = %server_certificate_name,
+            tag_keys = ?supplied_keys,
+            "tags were added to a server certificate"
+        );
+
+        // The output shape is `Unit`: the operation reports nothing, and the merged set is
+        // read back through `GetServerCertificate` and `ListServerCertificateTags`.
+        Ok(TagServerCertificateOutput)
     }
 }
