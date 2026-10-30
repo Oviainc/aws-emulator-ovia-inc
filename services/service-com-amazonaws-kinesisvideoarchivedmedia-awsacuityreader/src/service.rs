@@ -45,6 +45,27 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Every INPUT shape of this service, as the generated schema statics.
+///
+/// What they are read for: a constraint broken by the ELEMENTS of a collection member is
+/// stated at that member with the element shape's WHOLE declared constraint set, and that
+/// set is a property of the model rather than of the request — the refusal carries only
+/// the constraints a value actually broke. Codegen attaches a collection member's element
+/// constraints to that member's schema, so the sets are read off these shapes.
+///
+/// ALL of them, not the ones one refusal happens to name: the rule holds for every
+/// constrained collection of every operation. `grep -h 'const INPUT_SCHEMA' src/ops/*.rs`
+/// names exactly these statics; one missing from this list is not a wrong clause, only a
+/// clause stating the constraints that failed rather than the element shape's whole set.
+const INPUT_SCHEMAS: &[&::aws_smithy_schema::Schema] = &[
+    crate::ops::types::GET_CLIP_INPUT_SCHEMA,
+    crate::ops::types::GET_DASH_STREAMING_SESSION_URL_INPUT_SCHEMA,
+    crate::ops::types::GET_HLS_STREAMING_SESSION_URL_INPUT_SCHEMA,
+    crate::ops::types::GET_IMAGES_INPUT_SCHEMA,
+    crate::ops::types::GET_MEDIA_FOR_FRAGMENT_LIST_INPUT_SCHEMA,
+    crate::ops::types::LIST_FRAGMENTS_INPUT_SCHEMA,
+];
+
 /// Whether this service serves the request these `parts` came from.
 ///
 /// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable
@@ -136,16 +157,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it.
+        //
+        // This endpoint reports a constraint its MODEL declares on the ELEMENTS of a
+        // collection member against that MEMBER: no element position, no `member` step
+        // and no element value, with every requirement the element shape declares nested
+        // inside `Member must satisfy constraint: [ … ]` — so a caller is told what every
+        // element of that member has to satisfy, rather than which one element offended.
+        // The framework reports it at the offending element instead, which is the only
+        // difference; every other clause, the envelope, the member paths and the error
+        // code stay the framework's, which is also the code this `restJson1` service
+        // already answers a constraint refusal with.
+        //
+        // An authentication refusal is a different failure with its own code and status,
+        // and nothing about it is this service's to word.
+        service_common::validation_message::aws_validation_refusal_over_elements(
+            refusal,
+            INPUT_SCHEMAS,
+            // This endpoint quotes a `@pattern` requirement as the MODEL declares it,
+            // anchors and all — the framework's own rendering of the expression.
+            str::to_string,
+        )
     }
 
     fn override_routing_error(

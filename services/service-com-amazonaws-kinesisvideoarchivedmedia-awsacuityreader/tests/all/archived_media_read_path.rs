@@ -28,7 +28,7 @@ const REGION: &str = "us-east-1";
 /// loopback. A session URL must come back here, never to a real AWS host.
 const EMULATOR_ENDPOINT: &str = "127.0.0.1:9297";
 /// The seeded stream with an archive and 24 hours of retention.
-const STREAM: &str = "demo-stream";
+pub(crate) const STREAM: &str = "demo-stream";
 /// A seeded stream with `DataRetentionInHours` of 0.
 const NO_RETENTION_STREAM: &str = "no-retention-stream";
 /// A seeded stream whose fragments were ingested just now.
@@ -44,7 +44,7 @@ const LIVE_FRAGMENTS: u64 = 7;
 const FRAGMENT_BASE: u64 = 9_134_385_233_318_143_200;
 
 /// The fragment number of the `index`-th seeded fragment.
-fn fragment_number(index: u64) -> String {
+pub(crate) fn fragment_number(index: u64) -> String {
     (FRAGMENT_BASE + index).to_string()
 }
 
@@ -69,17 +69,21 @@ fn server_secs(index: u64) -> i64 {
 }
 
 /// A seeded emulator: the router, the shared engine, and the seeded stream's ARN.
-struct Harness {
+pub(crate) struct Harness {
     router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
-    arn: String,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
+    pub(crate) arn: String,
 }
 
 impl Harness {
     /// POST `body` to `path` through the router, signed for `REGION` so the
     /// request routes by its SigV4 credential scope, and addressed at a
     /// loopback endpoint — the emulator's own, never a real AWS host.
-    async fn post(&self, path: &str, body: &serde_json::Value) -> http::Response<Bytes> {
+    pub(crate) async fn post(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> http::Response<Bytes> {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("https://{EMULATOR_ENDPOINT}{path}"))
@@ -99,7 +103,7 @@ impl Harness {
 }
 
 /// The JSON body of a response.
-fn body_json(response: &http::Response<Bytes>) -> serde_json::Value {
+pub(crate) fn body_json(response: &http::Response<Bytes>) -> serde_json::Value {
     serde_json::from_slice(response.body()).unwrap_or(serde_json::Value::Null)
 }
 
@@ -116,7 +120,7 @@ fn content_type(response: &http::Response<Bytes>) -> String {
 /// A router serving this service alone over an engine seeded with three
 /// streams: an archive in the past, one with no retention, and one ingested
 /// just now.
-fn seeded() -> Harness {
+pub(crate) fn seeded() -> Harness {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let arn = {
         let state = service_state(&*engine).expect("the service store");
@@ -187,7 +191,10 @@ fn seeded() -> Harness {
 }
 
 /// `base` with every member of `extra` added.
-fn with_members(base: &serde_json::Value, extra: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn with_members(
+    base: &serde_json::Value,
+    extra: &serde_json::Value,
+) -> serde_json::Value {
     let mut object = base.as_object().cloned().unwrap_or_default();
     for (key, value) in extra.as_object().expect("an object of members") {
         object.insert(key.clone(), value.clone());
@@ -197,7 +204,7 @@ fn with_members(base: &serde_json::Value, extra: &serde_json::Value) -> serde_js
 
 /// Every operation of the read loop, with a request body that succeeds for the
 /// seeded stream once the stream-naming members are added.
-fn read_loop_operations() -> Vec<(&'static str, serde_json::Value)> {
+pub(crate) fn read_loop_operations() -> Vec<(&'static str, serde_json::Value)> {
     vec![
         (
             "/listFragments",

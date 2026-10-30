@@ -58,11 +58,27 @@
 //! the HANDLER applies the key shape's own constraints. [`map_key_refusal`] is the message
 //! it states — the framework's envelope and clause, over the map member, listing what a key
 //! has to satisfy — so a request refused for its key reads like one refused for its value.
+//!
+//! The last difference this module owns is WHERE a constraint broken by a collection's
+//! ELEMENTS is stated. The framework reports such a violation at the offending element —
+//! `<collection>.<1-based position>.member`, echoing that element and naming only the
+//! constraint it broke — while AWS states it once at the COLLECTION MEMBER, with the
+//! element shape's WHOLE declared constraint set nested inside
+//! `Member must satisfy constraint: [ … ]` and no value at all.
+//! [`aws_validation_refusal_over_elements`] is that rendering, for a service whose
+//! recordings show it; the set is read off the MODEL (the schemas the caller hands over),
+//! because the refusal carries only the constraints that failed.
 
+use std::collections::HashSet;
+
+use aws_smithy_schema::{Schema, ShapeId, TraitMap};
+use aws_smithy_schema_server::constraints::{
+    self, ElementConstraintsTrait, EnumTrait, LengthTrait, PatternTrait, RangeTrait,
+};
 use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 use smithy_server_runtime::{Refusal, Refused};
 
-use crate::validation::unanchored;
+use crate::validation::{list_of_element, unanchored};
 
 /// The two suffixes the validating walk renders a COLLECTION's size with when it
 /// length-checks one: a list as `<n> items`, a map as `<n> entries`
@@ -441,6 +457,11 @@ pub fn aws_validation_refusal_with(
 /// framework's clauses, with the two renderings this module owns applied — the `@pattern`
 /// quoting the caller chose, and the value half dropped from a clause that states none (a
 /// collection's `@length`, or a member the caller withholds the value of).
+///
+/// LINEAR in the number of violations: each clause is decided BEFORE the envelope is
+/// rendered, so no clause is rewritten inside an already-rendered message (which would
+/// rescan and reallocate the whole message once per violation), and the count the envelope
+/// states is bounded by [`restated_violations`].
 fn stated_refusal(
     refusal: &Refusal,
     quote_pattern: impl Fn(&str) -> String,
@@ -449,47 +470,271 @@ fn stated_refusal(
     let Refusal::Invalid(violations) = refusal else {
         return None;
     };
-    let restated: Vec<Violation> = violations
-        .iter()
-        .map(|violation| match &violation.kind {
-            ViolationKind::Pattern(pattern) => Violation {
-                path: violation.path.clone(),
-                kind: ViolationKind::Pattern(quote_pattern(pattern)),
-                value: violation.value.clone(),
-            },
-            _ => violation.clone(),
-        })
-        .collect();
     // The envelope and every clause are the framework's; a COLLECTION's length clause
     // then drops its value half, which the framework has no way to leave out (a clause
     // carrying no value reads `Value null at …`, which is how an ABSENT member is stated).
-    let mut message = envelope(&restated)?;
-    for violation in &restated {
-        let stated = if withholds_value(&violation.path) {
-            valueless_clause(violation)
-        } else {
-            collection_length_clause(violation)
-        };
-        if let Some(valueless) = stated {
-            message = message.replace(&violation.message(), &valueless);
+    let clauses: Vec<String> = restated_violations(violations, &quote_pattern)
+        .iter()
+        .map(|violation| {
+            let stated = if withholds_value(&violation.path) {
+                valueless_clause(violation)
+            } else {
+                collection_length_clause(violation)
+            };
+            stated.unwrap_or_else(|| violation.message())
+        })
+        .collect();
+    Some(Refused {
+        code: VALIDATION_EXCEPTION.to_owned(),
+        message: envelope_over(&clauses)?,
+    })
+}
+
+/// The violations one message restates, each with its `@pattern` requoted.
+///
+/// BOUNDED by the same ceiling the framework's own walk collects under
+/// ([`crate::validation::MAX_VIOLATIONS`]), so the clause count — and with it the length of
+/// the message and the work of rendering it — is a constant of this crate rather than
+/// something one request chooses. The walk never hands over more than that many, so the
+/// bound only states locally what is already true of every caller.
+fn restated_violations(
+    violations: &[Violation],
+    quote_pattern: &dyn Fn(&str) -> String,
+) -> Vec<Violation> {
+    violations
+        .iter()
+        .take(crate::validation::MAX_VIOLATIONS)
+        .map(|violation| requoted(violation, quote_pattern))
+        .collect()
+}
+
+/// What a clause opens the element shape's constraint set with, when the set is stated at
+/// the collection member the elements belong to.
+const ELEMENT_SET_OPEN: &str = "Member must satisfy constraint: [";
+
+/// State `refusal` as AWS states it for a service that reports a constraint broken by a
+/// collection's ELEMENTS at the COLLECTION MEMBER, or `None` to keep the framework's own
+/// wording.
+///
+/// This is [`aws_validation_refusal_with`] plus one grouping rule:
+///
+/// * a violation at a list ELEMENT (`<collection>.<position>.member`,
+///   [`crate::validation::list_of_element`]) is stated at `<collection>` — no position and
+///   no `member` step — with every requirement the ELEMENT shape declares nested inside
+///   `Member must satisfy constraint: [ \u2026 ]`, and with no value: a collection has no scalar
+///   rendering to quote, which is the same half a collection's own `@length` clause drops.
+///   The set is the element shape's whole set, not just the constraint that happened to
+///   fail, so one request breaking two of an element's constraints is ONE validation error
+///   about one member; two offending elements of one collection are one clause too.
+/// * a violation on the collection ITSELF (its `@length`, its `@uniqueItems`), or on a
+///   member inside a structure element, keeps its own clause and its own path.
+///
+/// `input_schemas` are the operation input shapes of the calling service, which the element
+/// sets are read off: codegen attaches a collection member's element constraints to that
+/// member's schema as an [`ElementConstraintsTrait`], and the refusal carries only the
+/// constraints that FAILED, so a set read off the violations would be missing the ones the
+/// value satisfied. Only the TOP-LEVEL members of those shapes are looked up, and a member
+/// path two of them declare with DIFFERENT element sets keeps the framework's own clause:
+/// the refusal does not say which operation it came from, and a guessed set would not be
+/// known to be true of the request.
+///
+/// `quote_pattern` chooses the `@pattern` rendering exactly as it does for
+/// [`aws_validation_refusal_with`] — `str::to_string` for a service whose refusals quote
+/// the expression the model declares, [`crate::validation::unanchored`] for one whose
+/// recordings drop the anchors. The CHECK always used the model's pattern as written.
+///
+/// THE HOME for this grouping, under the same rule as [`pattern_mismatch`] and
+/// [`enum_value_not_found`]: the service crates below each carry their own inlined copy of
+/// it, written before this module had one, and are to be MIGRATED onto this entry point
+/// rather than copied again (`grep -rln 'Member must satisfy constraint:' services/*/src`
+/// lists them): opensearch-amazonopensearchservice,
+/// bedrock-amazonbedrockcontrolplaneservice,
+/// bedrockagentcorecontrol-amazonbedrockagentcorecontrol,
+/// lambdacore-lambdacoreapiservice, rum-rum, identitystore-awsidentitystore,
+/// acm-certificatemanager, codeguruprofiler-codeguruprofiler,
+/// billingconductor-awsbillingconductor,
+/// licensemanagerlinuxsubscriptions-licensemanagerlinuxsubscriptions, ssmsap-ssmsap and
+/// workspacesinstances-eucmifrontendapiservice. Each migration is that service's own
+/// change, because each has to be re-checked against its own recordings: they do not agree
+/// on the value half of the clause or on how the `@pattern` is quoted.
+pub fn aws_validation_refusal_over_elements(
+    refusal: &Refusal,
+    input_schemas: &[&'static Schema],
+    quote_pattern: impl Fn(&str) -> String,
+) -> Option<Refused> {
+    let Refusal::Invalid(violations) = refusal else {
+        return None;
+    };
+    let quote = &quote_pattern as &dyn Fn(&str) -> String;
+    let mut clauses: Vec<String> = Vec::new();
+    // Dedupe through a set rather than by scanning what is already collected, so the cost
+    // stays linear in the clause count.
+    let mut stated: HashSet<String> = HashSet::new();
+    for violation in &restated_violations(violations, quote) {
+        let clause = list_of_element(&violation.path)
+            .and_then(|collection| element_set_clause(collection, input_schemas, quote))
+            .or_else(|| collection_length_clause(violation))
+            .unwrap_or_else(|| violation.message());
+        // An identical clause is stated once: the member is named once however many of
+        // its elements the walk reported.
+        if stated.insert(clause.clone()) {
+            clauses.push(clause);
         }
     }
     Some(Refused {
         code: VALIDATION_EXCEPTION.to_owned(),
-        message,
+        message: envelope_over(&clauses)?,
     })
+}
+
+/// `violation` with its `@pattern` requirement quoted the way the caller chose, and
+/// everything else untouched.
+///
+/// The ONE place that mapping is made, so the two entry points cannot drift in how an
+/// expression is quoted back.
+fn requoted(violation: &Violation, quote_pattern: &dyn Fn(&str) -> String) -> Violation {
+    match &violation.kind {
+        ViolationKind::Pattern(pattern) => Violation {
+            path: violation.path.clone(),
+            kind: ViolationKind::Pattern(quote_pattern(pattern)),
+            value: violation.value.clone(),
+        },
+        _ => violation.clone(),
+    }
+}
+
+/// The clause stated at `collection` for a constraint its elements broke, or `None` when
+/// the handed-over schemas declare no single element constraint set for that member.
+fn element_set_clause(
+    collection: &str,
+    input_schemas: &[&'static Schema],
+    quote_pattern: &dyn Fn(&str) -> String,
+) -> Option<String> {
+    let mut declared = input_schemas
+        .iter()
+        .filter_map(|schema| element_requirements(schema, collection, quote_pattern));
+    let set = declared.next()?;
+    if declared.any(|other| other != set) {
+        return None;
+    }
+    Some(format!(
+        "Value at '{collection}' failed to satisfy constraint: {ELEMENT_SET_OPEN}{}]",
+        set.join(", ")
+    ))
+}
+
+/// Every requirement the ELEMENT shape of `input_schema`'s `collection` member declares, in
+/// the order a clause states them, or `None` when that member is not a collection of
+/// constrained scalars.
+///
+/// The ORDER is the one AWS's element-constraint clauses state: the `@length` maximum, then
+/// its minimum, then the numeric bounds the same way, then the `@pattern`, then an
+/// enumerated value set. A `@length` with no declared minimum states `0`, the smallest
+/// length a Smithy `@length` can bound.
+///
+/// Every sentence is the framework's own ([`requirement`]), so a requirement nested into a
+/// collection clause reads exactly like one a reported member gets.
+fn element_requirements(
+    input_schema: &Schema,
+    collection: &str,
+    quote_pattern: &dyn Fn(&str) -> String,
+) -> Option<Vec<String>> {
+    let member = input_schema.members().iter().find(|member| {
+        member
+            .member_name()
+            .is_some_and(|name| constraints::path::member(name) == collection)
+    })?;
+    let traits = constraint_trait::<ElementConstraintsTrait>(
+        member.traits()?,
+        &ElementConstraintsTrait::TRAIT_ID,
+    )?
+    .inner();
+
+    let mut requirements: Vec<String> = Vec::new();
+    if let Some(length) = constraint_trait::<LengthTrait>(traits, &LengthTrait::TRAIT_ID) {
+        if let Some(max) = length.max {
+            requirements.push(requirement(ViolationKind::MaxLength(max)));
+        }
+        requirements.push(requirement(ViolationKind::MinLength(
+            length.min.unwrap_or(0),
+        )));
+    }
+    if let Some(range) = constraint_trait::<RangeTrait>(traits, &RangeTrait::TRAIT_ID) {
+        if let Some(max) = range.max {
+            requirements.push(requirement(ViolationKind::MaxValue(rendered_bound(max))));
+        }
+        if let Some(min) = range.min {
+            requirements.push(requirement(ViolationKind::MinValue(rendered_bound(min))));
+        }
+    }
+    if let Some(pattern) = constraint_trait::<PatternTrait>(traits, &PatternTrait::TRAIT_ID) {
+        requirements.push(requirement(ViolationKind::Pattern(quote_pattern(
+            pattern.regex,
+        ))));
+    }
+    if let Some(allowed) = constraint_trait::<EnumTrait>(traits, &EnumTrait::TRAIT_ID) {
+        let values: Vec<String> = allowed.values.iter().map(|value| (*value).to_owned()).collect();
+        requirements.push(requirement(ViolationKind::EnumValue(values)));
+    }
+    (!requirements.is_empty()).then_some(requirements)
+}
+
+/// One constraint trait off a trait map, downcast to the type carrying its bounds.
+fn constraint_trait<'map, T: 'static>(traits: &'map TraitMap, id: &ShapeId) -> Option<&'map T> {
+    traits.get(id)?.as_any().downcast_ref::<T>()
+}
+
+/// A `@range` bound as a requirement displays it: an integral bound without a trailing
+/// `.0`, a fractional one with its decimals — the rendering the framework's own clause
+/// carries, so a bound read off the model and one read off a violation agree.
+///
+/// `{bound:.0}` rather than a cast through `i64`, which SATURATES: a bound past `i64`'s
+/// magnitude would otherwise advertise `i64::MAX` instead of what the model declares.
+fn rendered_bound(bound: f64) -> String {
+    if bound.fract() == 0.0 && bound.is_finite() {
+        format!("{bound:.0}")
+    } else {
+        format!("{bound}")
+    }
+}
+
+/// The framework's envelope over clauses this module stated rather than over violations.
+///
+/// The count word and the separator are the framework's: they are read back out of
+/// [`envelope`]'s own rendering over as many placeholder violations as there are clauses,
+/// so neither is spelled here and a grouped refusal cannot drift from an ungrouped one.
+/// `None` for no clause at all, exactly as [`envelope`] answers for no violation.
+fn envelope_over(clauses: &[String]) -> Option<String> {
+    let placeholder = Violation {
+        path: String::new(),
+        kind: ViolationKind::MissingRequiredMember,
+        value: None,
+    };
+    let rendered = envelope(&vec![placeholder.clone(); clauses.len()])?;
+    let stated = placeholder.message();
+    let (prefix, rest) = rendered.split_once(&stated)?;
+    // With every placeholder identical, whatever sits between the first two is the
+    // separator; one clause needs none.
+    let separator = rest.split_once(&stated).map_or("", |(between, _)| between);
+    Some(format!("{prefix}{}", clauses.join(separator)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        aws_validation_refusal, aws_validation_refusal_with, aws_validation_refusal_withholding,
-        aws_validation_refusal_withholding_with, enum_value_not_found, map_key_refusal,
+        aws_validation_refusal, aws_validation_refusal_over_elements, aws_validation_refusal_with,
+        aws_validation_refusal_withholding, aws_validation_refusal_withholding_with,
+        enum_value_not_found, envelope_over, map_key_refusal,
         pattern_mismatch, property_count_refusal, string_too_long, string_too_short,
     };
     use crate::validation::unanchored_grouping_alternation;
-    use aws_smithy_schema_server::{Violation, ViolationKind};
+    use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
+    use aws_smithy_schema_server::constraints::{
+        ElementConstraintsTrait, LengthTrait, PatternTrait,
+    };
+    use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
     use smithy_server_runtime::Refusal;
+    use std::sync::LazyLock;
 
     /// One violation of `kind` at `path`, for the value a request sent.
     fn violation(path: &str, kind: ViolationKind, value: &str) -> Violation {
@@ -1251,6 +1496,220 @@ mod tests {
         assert!(
             property_count_refusal(&Refusal::Invalid(Vec::new())).is_none(),
             "expected no violations to state nothing"
+        );
+    }
+
+    // A collection member carrying its element shape's own constraints, written the way
+    // codegen writes one: the element's `@length`/`@pattern` live in an
+    // `ElementConstraintsTrait` wrapper on the COLLECTION member's schema, which also
+    // carries the collection's own `@length` over the element count.
+    static ELEMENT_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+        let mut traits = TraitMap::new();
+        traits.insert(Box::new(LengthTrait::new(Some(1), Some(128))));
+        traits.insert(Box::new(PatternTrait::new(r"^[0-9]+$")));
+        traits
+    });
+    static MEMBER_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+        let mut traits = TraitMap::new();
+        traits.insert(Box::new(LengthTrait::new(Some(1), Some(1000))));
+        traits.insert(Box::new(ElementConstraintsTrait::new(&ELEMENT_TRAITS)));
+        traits
+    });
+    static COLLECTION_MEMBER: Schema = Schema::new_member(
+        ShapeId::from_static("test#Input$Numbers", "test", "Numbers"),
+        ShapeType::List,
+        "Numbers",
+        0,
+    )
+    .with_traits(&MEMBER_TRAITS);
+    static SCALAR_MEMBER: Schema = Schema::new_member(
+        ShapeId::from_static("test#Input$Name", "test", "Name"),
+        ShapeType::String,
+        "Name",
+        1,
+    );
+    static INPUT: Schema = Schema::new_struct(
+        ShapeId::from_static("test#Input", "test", "Input"),
+        ShapeType::Structure,
+        &[&COLLECTION_MEMBER, &SCALAR_MEMBER],
+    );
+
+    /// The element shape's whole set, as the clause nests it.
+    const ELEMENT_SET: &str = "Member must satisfy constraint: [Member must have length less \
+                               than or equal to 128, Member must have length greater than or \
+                               equal to 1, Member must satisfy regular expression pattern: \
+                               ^[0-9]+$]";
+
+    /// RULE: a constraint broken by a collection's ELEMENTS is stated once at the
+    /// collection member — no element position, no `member` step and no value — with the
+    /// element shape's whole declared set nested inside `Member must satisfy constraint:
+    /// [ … ]`, whichever of those constraints the request actually broke and however many
+    /// elements broke them.
+    #[test]
+    fn an_element_constraint_is_stated_at_the_collection_member() {
+        // (case, the violations one request produced, the message expected)
+        let rows: Vec<(&str, Vec<Violation>, String)> = vec![
+            (
+                "one element outside the element shape's pattern",
+                vec![violation(
+                    "numbers.1.member",
+                    ViolationKind::Pattern(r"^[0-9]+$".to_owned()),
+                    "not-a-number",
+                )],
+                format!(
+                    "1 validation error detected: Value at 'numbers' failed to satisfy \
+                     constraint: {ELEMENT_SET}"
+                ),
+            ),
+            (
+                "one element breaking a bound the set also declares",
+                vec![violation(
+                    "numbers.3.member",
+                    ViolationKind::MinLength(1),
+                    "",
+                )],
+                format!(
+                    "1 validation error detected: Value at 'numbers' failed to satisfy \
+                     constraint: {ELEMENT_SET}"
+                ),
+            ),
+            (
+                "two elements, each breaking a different one",
+                vec![
+                    violation(
+                        "numbers.1.member",
+                        ViolationKind::Pattern(r"^[0-9]+$".to_owned()),
+                        "x",
+                    ),
+                    violation("numbers.2.member", ViolationKind::MaxLength(128), "9999"),
+                ],
+                format!(
+                    "1 validation error detected: Value at 'numbers' failed to satisfy \
+                     constraint: {ELEMENT_SET}"
+                ),
+            ),
+            (
+                // The collection's OWN `@length` is not an element constraint: it keeps
+                // its own clause, with the value half a collection has no rendering for
+                // dropped.
+                "the collection's own length, beside an element's",
+                vec![
+                    violation("numbers", ViolationKind::MaxLength(1000), "1001 items"),
+                    violation(
+                        "numbers.9.member",
+                        ViolationKind::Pattern(r"^[0-9]+$".to_owned()),
+                        "x",
+                    ),
+                ],
+                format!(
+                    "2 validation errors detected: Value at 'numbers' failed to satisfy \
+                     constraint: Member must have length less than or equal to 1000; Value at \
+                     'numbers' failed to satisfy constraint: {ELEMENT_SET}"
+                ),
+            ),
+            (
+                // A member the schemas declare no element constraints for keeps the
+                // framework's own clause, path and echo.
+                "a scalar member of the same request",
+                vec![violation(
+                    "name",
+                    ViolationKind::Pattern(r"^[a-z]+$".to_owned()),
+                    "NOPE",
+                )],
+                "1 validation error detected: Value 'NOPE' at 'name' failed to satisfy \
+                 constraint: Member must satisfy regular expression pattern: ^[a-z]+$"
+                    .to_owned(),
+            ),
+        ];
+
+        for (case, violations, expected) in rows {
+            let stated = aws_validation_refusal_over_elements(
+                &Refusal::Invalid(violations),
+                &[&INPUT],
+                str::to_string,
+            )
+            .unwrap_or_else(|| panic!("case {case:?}: expected {expected:?}, got none"));
+            assert_eq!(
+                stated.code, "ValidationException",
+                "case {case:?}: expected the JSON protocols' refusal code, got {:?}",
+                stated.code
+            );
+            assert_eq!(
+                stated.message, expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                stated.message
+            );
+        }
+    }
+
+    /// RULE: with no element set to read, nothing is grouped — the refusal is the one
+    /// [`aws_validation_refusal_with`] states, clause for clause.
+    #[test]
+    fn an_element_whose_set_is_unknown_keeps_the_ungrouped_refusal() {
+        let refusal = Refusal::Invalid(vec![
+            violation(
+                "numbers.1.member",
+                ViolationKind::Pattern(r"^[0-9]+$".to_owned()),
+                "x",
+            ),
+            violation("name", ViolationKind::MinLength(3), "ab"),
+        ]);
+        let grouped = aws_validation_refusal_over_elements(&refusal, &[], str::to_string)
+            .expect("a constraint refusal is stated");
+        let ungrouped = aws_validation_refusal_with(&refusal, str::to_string)
+            .expect("a constraint refusal is stated");
+        assert_eq!(
+            grouped, ungrouped,
+            "expected the ungrouped refusal, got {grouped:?}"
+        );
+        assert!(
+            aws_validation_refusal_over_elements(&Refusal::Unauthenticated, &[], str::to_string)
+                .is_none(),
+            "expected an unauthenticated caller to keep the framework's 403 wording"
+        );
+        assert!(
+            aws_validation_refusal_over_elements(
+                &Refusal::Invalid(Vec::new()),
+                &[&INPUT],
+                str::to_string
+            )
+            .is_none(),
+            "expected no violations to state nothing"
+        );
+    }
+
+    /// RULE: the envelope a grouped refusal is stated in is the framework's own — the same
+    /// count word and the same separator it renders over the same number of violations.
+    #[test]
+    fn the_envelope_is_the_frameworks_own() {
+        for count in 1..=4usize {
+            let clauses: Vec<String> = (0..count)
+                .map(|index| format!("Value at 'member{index}' failed to satisfy constraint: X"))
+                .collect();
+            let violations: Vec<Violation> = clauses
+                .iter()
+                .enumerate()
+                .map(|(index, _)| Violation {
+                    path: format!("member{index}"),
+                    kind: ViolationKind::MissingRequiredMember,
+                    value: None,
+                })
+                .collect();
+            // The framework's envelope over the same number of clauses, with its own
+            // clause text swapped for the stated one so only the envelope is compared.
+            let mut expected = envelope(&violations).expect("a violation renders");
+            for (index, clause) in clauses.iter().enumerate() {
+                expected = expected.replace(&violations[index].message(), clause);
+            }
+            let actual = envelope_over(&clauses).expect("a clause renders");
+            assert_eq!(
+                actual, expected,
+                "case {count} clauses: expected {expected:?}, got {actual:?}"
+            );
+        }
+        assert!(
+            envelope_over(&[]).is_none(),
+            "expected no clause to state nothing"
         );
     }
 }

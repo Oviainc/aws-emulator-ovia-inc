@@ -15,6 +15,10 @@
 mod archived_media_read_path;
 #[path = "all/control_plane_stream_resolution.rs"]
 mod control_plane_stream_resolution;
+#[path = "all/refusal_message_wording.rs"]
+mod refusal_message_wording;
+#[path = "all/registered_stream_reads.rs"]
+mod registered_stream_reads;
 #[path = "all/route_claims.rs"]
 mod route_claims;
 #[path = "all/state_roundtrip.rs"]

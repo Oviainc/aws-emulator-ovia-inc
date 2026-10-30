@@ -130,6 +130,10 @@ const CASES: &[Case] = &[
         },
     },
     Case {
+        // The archived-media reader refuses a request naming the stream BOTH ways in
+        // wording only it produces: the control plane words the same refusal "Either
+        // StreamName or StreamARN must be specified." / "refer to different streams",
+        // and the media service "Only one of StreamName and StreamARN".
         name: "Archived Media ListFragments reaches the reader service",
         host: "127.0.0.1:9297",
         path: "/listFragments",

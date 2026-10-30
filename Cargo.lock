@@ -10913,6 +10913,7 @@ dependencies = [
  "http",
  "serde_json",
  "service-com-amazonaws-kinesisvideo-kinesisvideo-20170930",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",

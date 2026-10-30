@@ -196,6 +196,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
+        // Which stream the request names is resolved through the control plane,
+        // whose store this service's own resolver reads.
         let Some(state) = service_state(&*self.engine) else {
             // See the note in `list_fragments`: unreachable in the assembled
             // emulator, and reported as a modelled failure rather than as an

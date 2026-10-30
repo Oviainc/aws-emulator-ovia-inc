@@ -8,6 +8,11 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# `validation_message`: the shared wording of a framework-level constraint refusal —
+# AWS's envelope, its clauses, and the element constraint set a collection member's
+# clause states — so this service's `override_refusal` chooses the rendering rather
+# than re-implementing it.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

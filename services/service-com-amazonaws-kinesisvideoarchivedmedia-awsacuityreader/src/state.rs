@@ -54,14 +54,25 @@ pub fn date_time_millis(value: &::aws_smithy_types::DateTime) -> i64 {
         .saturating_add(i64::from(value.subsec_nanos() / 1_000_000))
 }
 
-/// The instant `millis` milliseconds from the Unix epoch names.
+/// The instant `millis` milliseconds from the Unix epoch names, and the epoch
+/// itself for an offset the platform's clock cannot represent.
+///
+/// TOTAL, through the checked arithmetic: `millis` spans the whole `i64` range
+/// (`date_time_millis` saturates a wire timestamp into it rather than rejecting
+/// one), and near either end the offset is some nine quadrillion seconds, which
+/// the plain `Add`/`Sub` impls PANIC on wherever the clock cannot hold it. The
+/// epoch is the answer for such a value because it names no instant a fragment
+/// can be stamped at, and the only alternative is a panicking conversion of a
+/// number a caller chose.
 #[must_use]
 pub fn from_epoch_millis(millis: i64) -> SystemTime {
-    if millis >= 0 {
-        UNIX_EPOCH + Duration::from_millis(millis.unsigned_abs())
+    let offset = Duration::from_millis(millis.unsigned_abs());
+    let shifted = if millis >= 0 {
+        UNIX_EPOCH.checked_add(offset)
     } else {
-        UNIX_EPOCH - Duration::from_millis(millis.unsigned_abs())
-    }
+        UNIX_EPOCH.checked_sub(offset)
+    };
+    shifted.unwrap_or(UNIX_EPOCH)
 }
 
 /// `t` as the wire timestamp a response member carries, at the millisecond
@@ -462,10 +473,12 @@ pub const TIMESTAMP_RANGE_ORDER_MESSAGE: &str = "StartTimestamp must be before E
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamLookupError {
     /// The request did not name exactly one stream: a client error the
-    /// archived-media operations report as `InvalidArgumentException` (400).
+    /// archived-media operations report as `InvalidArgumentException` (400),
+    /// stated with [`ONE_STREAM_IDENTIFIER_MESSAGE`].
     InvalidArgument(String),
     /// Exactly one of the two was given, and no stream answers to it: reported
-    /// as `ResourceNotFoundException` (404).
+    /// as `ResourceNotFoundException` (404), stated with
+    /// [`STREAM_NOT_FOUND_MESSAGE`].
     NotFound(String),
 }
 
@@ -769,4 +782,59 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{epoch_millis, from_epoch_millis};
+    use std::time::UNIX_EPOCH;
+
+    /// RULE: the epoch-millisecond conversion is TOTAL over the whole `i64`
+    /// range — every offset the platform's clock can represent round-trips, and
+    /// one it cannot answers the epoch instead of panicking.
+    ///
+    /// The rows span what the conversion generalises over: the sign and the
+    /// magnitude (zero, a millisecond, a realistic archive instant, a thousand
+    /// years).
+    #[test]
+    fn the_epoch_conversion_round_trips_every_representable_offset() {
+        // (case, the millisecond offset)
+        let rows: [(&str, i64); 6] = [
+            ("the epoch itself", 0),
+            ("one millisecond after", 1),
+            ("one millisecond before", -1),
+            ("an archived fragment's instant", 1_761_000_000_000),
+            ("an instant before the epoch", -1_761_000_000_000),
+            ("a thousand years on", 31_556_952_000_000),
+        ];
+        for (case, millis) in rows {
+            let actual = epoch_millis(from_epoch_millis(millis));
+            assert_eq!(
+                actual, millis,
+                "case {case:?}: expected {millis} ms from the epoch, got {actual}"
+            );
+        }
+    }
+
+    /// RULE (the other half): at either end of the `i64` range the conversion
+    /// ANSWERS — the offset there is some nine quadrillion seconds, which the
+    /// plain `Add`/`Sub` impls panic on. A platform whose clock represents it
+    /// reads the same number back; one whose clock does not answers the epoch.
+    #[test]
+    fn the_epoch_conversion_answers_at_both_ends_of_the_range() {
+        for (case, millis) in [
+            ("the largest i64", i64::MAX),
+            ("one short of the largest", i64::MAX - 1),
+            ("the smallest i64", i64::MIN),
+            ("one past the smallest", i64::MIN + 1),
+        ] {
+            let instant = from_epoch_millis(millis);
+            let actual = epoch_millis(instant);
+            assert!(
+                actual == millis || instant == UNIX_EPOCH,
+                "case {case:?}: expected {millis} ms from the epoch or the epoch itself, got \
+                 {actual}"
+            );
+        }
+    }
 }
