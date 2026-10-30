@@ -522,11 +522,14 @@ async fn a_provided_data_access_role_arn_outside_its_shape_is_tagged() {
         "case an absent role ARN: expected the absent-member clause, got {answer}"
     );
 
-    // A well-formed ARN is not refused: the implemented family starts the job, and a
+    // A well-formed ARN is not refused: an implemented job family starts the job, and a
     // family that is still a scaffold answers its own 501.
     for (operation, expected) in [
         ("StartEntitiesDetectionV2Job", 200_u16),
-        ("StartPHIDetectionJob", 501),
+        ("StartPHIDetectionJob", 200),
+        ("StartICD10CMInferenceJob", 501),
+        ("StartRxNormInferenceJob", 501),
+        ("StartSNOMEDCTInferenceJob", 501),
     ] {
         let (status, answer) = call(&router, operation, &start_body(vec![])).await;
         assert_eq!(

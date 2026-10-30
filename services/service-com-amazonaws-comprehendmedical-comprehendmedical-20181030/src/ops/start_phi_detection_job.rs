@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartPHIDetectionJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartPHIDetectionJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartPHIDetectionJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. The call records one PHI-detection job in this service's own PHI job
+//! store and answers with the `JobId` it minted; `ClientRequestToken` is the model's
+//! idempotency key, so repeating a start with a token that already created a job names
+//! that job instead of starting a second. The stored record is
+//! [`crate::state::AsyncJob`], the same record every job family keeps, so
+//! `ListPHIDetectionJobs` reports exactly what this call was given.
+//!
+//! The role-resolution refusal AWS gives a well-formed `DataAccessRoleArn` that names
+//! no role that trusts the service is NOT made here; it is the subject of its own open
+//! issue, which also covers `DescribePHIDetectionJob`.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +168,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartPHIDetectionJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartPHIDetectionJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartPHIDetectionJob"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(StartPHIDetectionJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("The service's job store is unavailable.".to_string()),
+                },
+            )
+            .into());
+        };
+        let now = crate::state::now_epoch_secs();
+        let mut state = store.lock();
+        state.expire_jobs(now);
+
+        // `ClientRequestToken` is the model's @idempotencyToken: the same token must
+        // name the job the first call created, never start a second one.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if let Some(job_id) = state.phi_detection_jobs.job_for_token(token) {
+                return Ok(StartPHIDetectionJobOutput {
+                    job_id: Some(job_id.to_string()),
+                });
+            }
+        }
+
+        let job_id = state.mint_job_id(now);
+        let job = crate::state::AsyncJob::submitted(
+            job_id.clone(),
+            now,
+            crate::state::JobSubmission {
+                job_name: input.job_name,
+                input_data_config: input.input_data_config,
+                output_data_config: input.output_data_config,
+                language_code: input.language_code,
+                data_access_role_arn: input.data_access_role_arn,
+                kms_key: input.kms_key,
+                client_request_token: input.client_request_token,
+            },
+        );
+        state.phi_detection_jobs.record(job);
+
+        Ok(StartPHIDetectionJobOutput {
+            job_id: Some(job_id),
+        })
     }
 }

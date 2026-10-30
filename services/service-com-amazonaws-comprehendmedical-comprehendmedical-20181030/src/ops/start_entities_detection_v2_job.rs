@@ -183,43 +183,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ClientRequestToken` is the model's @idempotencyToken: the same token must
         // name the job the first call created, never start a second one.
         if let Some(token) = input.client_request_token.as_deref() {
-            if let Some(job_id) = state.idempotency_tokens.get(token) {
+            if let Some(job_id) = state.entities_detection_v2_jobs.job_for_token(token) {
                 return Ok(StartEntitiesDetectionV2JobOutput {
-                    job_id: Some(job_id.clone()),
+                    job_id: Some(job_id.to_string()),
                 });
             }
         }
 
         let job_id = state.mint_job_id(now);
-        let job = crate::state::AsyncJob {
-            job_id: job_id.clone(),
-            job_name: input.job_name.clone(),
-            // A job AWS has accepted but not finished is reported in a non-terminal
-            // status; `crate::state::AsyncJob::advance` owns every move out of it.
-            job_status: crate::state::JobStatus::Submitted,
-            message: None,
-            submit_time: crate::state::date_time(now),
-            end_time: None,
-            expiration_time: Some(crate::state::date_time(
-                now + crate::state::JOB_METADATA_RETENTION_SECS,
-            )),
-            input_data_config: input.input_data_config.clone(),
-            output_data_config: input.output_data_config.clone(),
-            language_code: input.language_code.clone(),
-            data_access_role_arn: input.data_access_role_arn.clone(),
-            // `ManifestFilePath` is "the path to the file that describes the results of
-            // a batch job": there are no results until a run writes some, so none is
-            // reported here.
-            manifest_file_path: None,
-            kms_key: input.kms_key.clone(),
-            model_version: crate::state::ENTITIES_MODEL_VERSION.to_string(),
-            client_request_token: input.client_request_token.clone(),
-            stop_requested_time: None,
-        };
-        state.entities_detection_v2_jobs.insert(job_id.clone(), job);
-        if let Some(token) = input.client_request_token {
-            state.idempotency_tokens.insert(token, job_id.clone());
-        }
+        let job = crate::state::AsyncJob::submitted(
+            job_id.clone(),
+            now,
+            crate::state::JobSubmission {
+                job_name: input.job_name,
+                input_data_config: input.input_data_config,
+                output_data_config: input.output_data_config,
+                language_code: input.language_code,
+                data_access_role_arn: input.data_access_role_arn,
+                kms_key: input.kms_key,
+                client_request_token: input.client_request_token,
+            },
+        );
+        state.entities_detection_v2_jobs.record(job);
 
         Ok(StartEntitiesDetectionV2JobOutput {
             job_id: Some(job_id),

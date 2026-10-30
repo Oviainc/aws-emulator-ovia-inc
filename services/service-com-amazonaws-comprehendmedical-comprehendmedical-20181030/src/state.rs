@@ -3,9 +3,10 @@
 //! Engine state for the com-amazonaws-comprehendmedical-comprehendmedical-20181030 service.
 //!
 //! The asynchronous detection/inference operations of Amazon Comprehend Medical all
-//! share one record shape ([`AsyncJob`]) and one status machine ([`JobStatus`]), so both
-//! live here rather than in any one operation's file: the entities-detection family is
-//! implemented today and the ICD-10-CM / RxNorm / SNOMED CT / PHI families reuse these
+//! share one record shape ([`AsyncJob`]), one status machine ([`JobStatus`]) and one
+//! per-family store ([`JobFamilyStore`]), so all of them live here rather than in any
+//! one operation's file: the entities-detection and PHI-detection families are
+//! implemented today and the ICD-10-CM / RxNorm / SNOMED CT families reuse these
 //! structures when they are implemented.
 
 use std::collections::{BTreeMap, HashMap};
@@ -13,13 +14,15 @@ use std::collections::{BTreeMap, HashMap};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    ComprehendMedicalAsyncJobProperties, InputDataConfig, OutputDataConfig,
+    ComprehendMedicalAsyncJobFilter, ComprehendMedicalAsyncJobProperties, InputDataConfig,
+    OutputDataConfig,
 };
 
-/// The version this emulator reports for the model behind an entities-detection job.
+/// The version this emulator reports for the model behind an asynchronous job.
 /// The model documents the shape of the value ("The version number looks like X.X.X"),
-/// not a particular version, so one constant is the single source for every job record.
-pub const ENTITIES_MODEL_VERSION: &str = "2.0.0";
+/// not a particular version, so one constant is the single source for every job record
+/// of every job family.
+pub const ASYNC_JOB_MODEL_VERSION: &str = "2.0.0";
 
 /// How long after `StartEntitiesDetectionV2Job` a job leaves `SUBMITTED`.
 ///
@@ -156,7 +159,52 @@ pub struct AsyncJob {
     pub stop_requested_time: Option<DateTime>,
 }
 
+/// What a start call was given, carried into the stored record.
+///
+/// Every asynchronous job family's start operation takes the same members (each one's
+/// generated input shape repeats them), so one struct carries them from any of those
+/// handlers into [`AsyncJob::submitted`] and no handler repeats the record literal.
+#[derive(Debug, Clone)]
+pub struct JobSubmission {
+    pub job_name: Option<String>,
+    pub input_data_config: InputDataConfig,
+    pub output_data_config: OutputDataConfig,
+    pub language_code: String,
+    pub data_access_role_arn: String,
+    pub kms_key: Option<String>,
+    pub client_request_token: Option<String>,
+}
+
 impl AsyncJob {
+    /// The record a start call creates for `job_id`: exactly what the caller asked for,
+    /// in the non-terminal status a job AWS has accepted but not finished is reported
+    /// in, with the instant its metadata expires already fixed.
+    pub fn submitted(job_id: String, now: f64, request: JobSubmission) -> Self {
+        Self {
+            job_id,
+            job_name: request.job_name,
+            // A job AWS has accepted but not finished is reported in a non-terminal
+            // status; [`AsyncJob::advance`] owns every move out of it.
+            job_status: JobStatus::Submitted,
+            message: None,
+            submit_time: date_time(now),
+            end_time: None,
+            expiration_time: Some(date_time(now + JOB_METADATA_RETENTION_SECS)),
+            input_data_config: request.input_data_config,
+            output_data_config: request.output_data_config,
+            language_code: request.language_code,
+            data_access_role_arn: request.data_access_role_arn,
+            // `ManifestFilePath` is "the path to the file that describes the results of
+            // a batch job": there are no results until a run writes some, so none is
+            // reported here.
+            manifest_file_path: None,
+            kms_key: request.kms_key,
+            model_version: ASYNC_JOB_MODEL_VERSION.to_string(),
+            client_request_token: request.client_request_token,
+            stop_requested_time: None,
+        }
+    }
+
     /// Materialise every status change the clock already owes at `now`.
     ///
     /// This is called by the reporting operations (describe, list) and before a stop
@@ -263,16 +311,192 @@ impl AsyncJob {
     }
 }
 
-/// Per-service state for com-amazonaws-comprehendmedical-comprehendmedical-20181030. A handler reaches it through [`service_state`].
+/// One family of asynchronous jobs: the jobs it holds, and the request tokens that
+/// created them.
+///
+/// Each family (entities detection, PHI detection, …) keeps its own store, so a `JobId`
+/// or a `ClientRequestToken` resolves only within the family whose operations issued
+/// it: a PHI job never answers a describe, stop or list of another family.
 #[derive(Debug, Default)]
-pub struct ComAmazonawsComprehendmedicalComprehendmedical20181030State {
-    /// The entities-detection (V2) jobs, keyed by `JobId`. A minted id begins with the
-    /// submit time (see [`Self::mint_job_id`]), so the map's key order IS submit order,
-    /// which is the order `ListEntitiesDetectionV2Jobs` pages through.
-    pub entities_detection_v2_jobs: BTreeMap<String, AsyncJob>,
+pub struct JobFamilyStore {
+    /// This family's jobs, keyed by `JobId`. A minted id begins with the submit time
+    /// (see
+    /// [`ComAmazonawsComprehendmedicalComprehendmedical20181030State::mint_job_id`]), so
+    /// the map's key order IS submit order, which is the order a list operation pages
+    /// through.
+    pub jobs: BTreeMap<String, AsyncJob>,
     /// `ClientRequestToken` -> the `JobId` it created, so repeating a start call with
     /// one token returns the first job instead of creating a second.
     pub idempotency_tokens: HashMap<String, String>,
+}
+
+impl JobFamilyStore {
+    /// The job a `ClientRequestToken` already created, if it created one.
+    pub fn job_for_token(&self, token: &str) -> Option<&str> {
+        self.idempotency_tokens.get(token).map(String::as_str)
+    }
+
+    /// Store a started job, remembering the request token that created it.
+    pub fn record(&mut self, job: AsyncJob) {
+        if let Some(token) = job.client_request_token.clone() {
+            self.idempotency_tokens.insert(token, job.job_id.clone());
+        }
+        self.jobs.insert(job.job_id.clone(), job);
+    }
+
+    /// Materialise everything the clock already owes this family at `now`: metadata kept
+    /// past its `ExpirationTime` is dropped and every remaining job's status progression
+    /// is applied. Both were due at instants fixed when the jobs were started, so
+    /// applying them while reporting shows a later caller nothing it would not otherwise
+    /// have seen.
+    pub fn settle(&mut self, now: f64) {
+        self.expire(now);
+        for job in self.jobs.values_mut() {
+            job.advance(now);
+        }
+    }
+
+    /// Drop the jobs whose metadata has been kept past its `ExpirationTime`, which the
+    /// model says stops them appearing in a list, along with the request tokens that
+    /// named them.
+    fn expire(&mut self, now: f64) {
+        let dropped_tokens: Vec<String> = self
+            .jobs
+            .values()
+            .filter(|job| job.is_expired(now))
+            .filter_map(|job| job.client_request_token.clone())
+            .collect();
+        for token in dropped_tokens {
+            self.idempotency_tokens.remove(&token);
+        }
+        self.jobs.retain(|_, job| !job.is_expired(now));
+    }
+}
+
+/// The page size a list operation uses when the caller names none: "The maximum number
+/// of results to return in each page. The default is 100." (the model's own `MaxResults`
+/// documentation).
+pub const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// Whether `job` satisfies every member the caller set on the filter. An absent member
+/// filters nothing; a member that is set must match.
+///
+/// The model documents the two time members as "Returns only jobs submitted
+/// before/after the specified time" without saying what a job submitted AT the bound
+/// does, so both bounds are inclusive here: a job on the boundary instant is returned
+/// by either filter rather than lost by both.
+fn matches_filter(job: &AsyncJob, filter: Option<&ComprehendMedicalAsyncJobFilter>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let submitted_at = epoch_secs(&job.submit_time);
+    let name_matches = filter
+        .job_name
+        .as_ref()
+        .is_none_or(|wanted| job.job_name.as_deref() == Some(wanted.as_str()));
+    // The filter's `JobStatus` is a modelled enum, so the boundary validator has
+    // already refused a value outside it; parsing it back into the stored status keeps
+    // the comparison on one representation.
+    let status_matches = filter.job_status.as_ref().is_none_or(|wanted| {
+        JobStatus::from_wire(wanted).is_some_and(|status| status == job.job_status)
+    });
+    let before_matches = filter
+        .submit_time_before
+        .as_ref()
+        .is_none_or(|before| submitted_at <= epoch_secs(before));
+    let after_matches = filter
+        .submit_time_after
+        .as_ref()
+        .is_none_or(|after| submitted_at >= epoch_secs(after));
+    name_matches && status_matches && before_matches && after_matches
+}
+
+/// The page token that resumes after `job_id`: the resume key, hex-encoded so a client
+/// treats it as the opaque string the model describes rather than something to build.
+pub fn page_token(job_id: &str) -> String {
+    hex::encode(job_id)
+}
+
+/// The resume key a page token carries, or `None` when it is not a token this service
+/// issued.
+///
+/// A token must decode to something shaped like a minted `JobId` (32 lowercase hex
+/// characters, see
+/// [`ComAmazonawsComprehendmedicalComprehendmedical20181030State::mint_job_id`]);
+/// anything else is refused rather than silently restarting at the first page. A
+/// well-formed cursor that names no stored job is NOT an error — it is a position, so it
+/// resumes after that position, which is what an opaque cursor means.
+pub fn resume_key(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    let minted_shape = decoded.len() == 32
+        && decoded
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch));
+    minted_shape.then_some(decoded)
+}
+
+/// One page of a family's jobs: those that satisfy every member the caller set on the
+/// filter, in the order the filter documents, cut at `page_size`, together with the
+/// token that resumes after the page — `None` when nothing follows it.
+///
+/// The order comes from the model's own filter documentation: `SubmitTimeBefore`
+/// returns jobs "in ascending order, oldest to newest" and `SubmitTimeAfter` "in
+/// descending order, newest to oldest", so a list bounded only from below is
+/// newest-first and every other list keeps the ascending submit order the family's keys
+/// already sort in.
+pub fn page_of_jobs(
+    family: &JobFamilyStore,
+    filter: Option<&ComprehendMedicalAsyncJobFilter>,
+    resume_after: Option<&str>,
+    page_size: usize,
+) -> (Vec<ComprehendMedicalAsyncJobProperties>, Option<String>) {
+    let newest_first = filter.is_some_and(|filter| {
+        filter.submit_time_after.is_some() && filter.submit_time_before.is_none()
+    });
+    let mut matching: Vec<&AsyncJob> = family
+        .jobs
+        .values()
+        .filter(|job| matches_filter(job, filter))
+        .collect();
+    if newest_first {
+        matching.reverse();
+    }
+
+    // A resume key is a position in THIS order, so the comparison follows the order:
+    // the page continues at the first job past the key in whichever direction the jobs
+    // are being returned.
+    let start = match resume_after {
+        Some(key) => matching
+            .iter()
+            .position(|job| {
+                if newest_first {
+                    job.job_id.as_str() < key
+                } else {
+                    job.job_id.as_str() > key
+                }
+            })
+            .unwrap_or(matching.len()),
+        None => 0,
+    };
+    let page = &matching[start..matching.len().min(start + page_size)];
+    let next_token = matching
+        .get(start + page.len())
+        .and(page.last())
+        .map(|last| page_token(&last.job_id));
+
+    (
+        page.iter().map(|job| job.to_properties()).collect(),
+        next_token,
+    )
+}
+
+/// Per-service state for com-amazonaws-comprehendmedical-comprehendmedical-20181030. A handler reaches it through [`service_state`].
+#[derive(Debug, Default)]
+pub struct ComAmazonawsComprehendmedicalComprehendmedical20181030State {
+    /// The entities-detection (V2) jobs.
+    pub entities_detection_v2_jobs: JobFamilyStore,
+    /// The protected-health-information detection jobs.
+    pub phi_detection_jobs: JobFamilyStore,
     /// Distinguishes two jobs minted within the same microsecond.
     pub next_job_seq: u64,
 }
@@ -301,22 +525,13 @@ impl ComAmazonawsComprehendmedicalComprehendmedical20181030State {
         format!("{micros:016x}{seq:016x}")
     }
 
-    /// Drop the jobs whose metadata has been kept past its `ExpirationTime`, which the
-    /// model says stops them appearing in a list, along with the request tokens that
-    /// named them. Expiry is due at an instant fixed when the job was created, so
-    /// materialising it on a read is not a mutation.
+    /// Drop the jobs of every family whose metadata has been kept past its
+    /// `ExpirationTime`, which the model says stops them appearing in a list, along with
+    /// the request tokens that named them. Expiry is due at an instant fixed when the job
+    /// was created, so materialising it on a read is not a mutation.
     pub fn expire_jobs(&mut self, now: f64) {
-        let dropped_tokens: Vec<String> = self
-            .entities_detection_v2_jobs
-            .values()
-            .filter(|job| job.is_expired(now))
-            .filter_map(|job| job.client_request_token.clone())
-            .collect();
-        for token in dropped_tokens {
-            self.idempotency_tokens.remove(&token);
-        }
-        self.entities_detection_v2_jobs
-            .retain(|_, job| !job.is_expired(now));
+        self.entities_detection_v2_jobs.expire(now);
+        self.phi_detection_jobs.expire(now);
     }
 }
 

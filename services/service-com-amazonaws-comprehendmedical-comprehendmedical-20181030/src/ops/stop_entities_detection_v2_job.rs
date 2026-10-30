@@ -155,7 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_epoch_secs();
         let mut state = store.lock();
         state.expire_jobs(now);
-        let Some(job) = state.entities_detection_v2_jobs.get_mut(&input.job_id) else {
+        let Some(job) = state.entities_detection_v2_jobs.jobs.get_mut(&input.job_id) else {
             return Err(
                 StopEntitiesDetectionV2JobErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

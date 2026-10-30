@@ -3,8 +3,11 @@
 //! @op ListEntitiesDetectionV2Jobs
 //!
 //! IMPLEMENTED. The answer is the jobs `StartEntitiesDetectionV2Job` actually created,
-//! in submit order, narrowed by every member the caller set on the filter, truncated at
-//! `MaxResults` and resumable with the opaque `NextToken` the previous page returned.
+//! narrowed by every member the caller set on the filter, in the order the filter
+//! documents (oldest first, and newest first when the caller bounds the submit time only
+//! from below), truncated at `MaxResults` and resumable with the opaque `NextToken` the
+//! previous page returned. The filtering, ordering and paging themselves live in
+//! [`crate::state::page_of_jobs`], which every job family's list operation shares.
 //!
 //! ## Shape of an operation
 //!
@@ -111,69 +114,6 @@ impl From<ListEntitiesDetectionV2JobsErrorModeled> for ListEntitiesDetectionV2Jo
     }
 }
 
-/// The page size when the caller names none: "The maximum number of results to return
-/// in each page. The default is 100." (the model's own `MaxResults` documentation).
-const DEFAULT_MAX_RESULTS: usize = 100;
-
-/// Whether `job` satisfies every member the caller set on the filter. An absent member
-/// filters nothing; a member that is set must match.
-///
-/// The model documents the two time members as "Returns only jobs submitted
-/// before/after the specified time" without saying what a job submitted AT the bound
-/// does, so both bounds are inclusive here: a job on the boundary instant is returned
-/// by either filter rather than lost by both.
-fn matches_filter(
-    job: &crate::state::AsyncJob,
-    filter: Option<&ComprehendMedicalAsyncJobFilter>,
-) -> bool {
-    let Some(filter) = filter else {
-        return true;
-    };
-    let submitted_at = crate::state::epoch_secs(&job.submit_time);
-    let name_matches = filter
-        .job_name
-        .as_ref()
-        .is_none_or(|wanted| job.job_name.as_deref() == Some(wanted.as_str()));
-    // The filter's `JobStatus` is a modelled enum, so the boundary validator has
-    // already refused a value outside it; parsing it back into the stored status keeps
-    // the comparison on one representation.
-    let status_matches = filter.job_status.as_ref().is_none_or(|wanted| {
-        crate::state::JobStatus::from_wire(wanted).is_some_and(|status| status == job.job_status)
-    });
-    let before_matches = filter
-        .submit_time_before
-        .as_ref()
-        .is_none_or(|before| submitted_at <= crate::state::epoch_secs(before));
-    let after_matches = filter
-        .submit_time_after
-        .as_ref()
-        .is_none_or(|after| submitted_at >= crate::state::epoch_secs(after));
-    name_matches && status_matches && before_matches && after_matches
-}
-
-/// The page token that resumes after `job_id`: the resume key, hex-encoded so a client
-/// treats it as the opaque string the model describes rather than something to build.
-fn page_token(job_id: &str) -> String {
-    hex::encode(job_id)
-}
-
-/// The resume key a page token carries, or `None` when it is not a token this service
-/// issued.
-///
-/// A token must decode to something shaped like a minted `JobId` (32 lowercase hex
-/// characters, see `crate::state::…::mint_job_id`); anything else is refused rather
-/// than silently restarting at the first page. A well-formed cursor that names no
-/// stored job is NOT an error — it is a position, so it resumes after that position,
-/// which is what an opaque cursor means.
-fn resume_key(token: &str) -> Option<String> {
-    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    let minted_shape = decoded.len() == 32
-        && decoded
-            .chars()
-            .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch));
-    minted_shape.then_some(decoded)
-}
-
 /// The `ListEntitiesDetectionV2Jobs` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -225,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `NextToken` this service did not issue cannot name a page.
         let resume = match input.next_token.as_deref() {
-            Some(token) => match resume_key(token) {
+            Some(token) => match crate::state::resume_key(token) {
                 Some(key) => Some(key),
                 None => {
                     return Err(
@@ -251,42 +191,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Metadata expiry and each job's status progression were both due at an instant
         // fixed when the job was started, so materialising them while reporting shows a
         // later caller nothing it would not otherwise have seen.
-        state.expire_jobs(now);
-        for job in state.entities_detection_v2_jobs.values_mut() {
-            job.advance(now);
-        }
+        state.entities_detection_v2_jobs.settle(now);
 
         // `MaxResults`' range (1..500) is modelled, so anything outside it was already
         // refused before this handler ran.
         let page_size = input
             .max_results
             .and_then(|max| usize::try_from(max).ok())
-            .unwrap_or(DEFAULT_MAX_RESULTS);
+            .unwrap_or(crate::state::DEFAULT_MAX_RESULTS);
 
-        // Jobs are listed in submit order; a `JobId` begins with its submit time, so
-        // the store's key order IS that order and a resume key is a position in it.
-        let matching: Vec<&crate::state::AsyncJob> = state
-            .entities_detection_v2_jobs
-            .values()
-            .filter(|job| matches_filter(job, input.filter.as_ref()))
-            .collect();
-        let start = match resume.as_deref() {
-            Some(key) => matching
-                .iter()
-                .position(|job| job.job_id.as_str() > key)
-                .unwrap_or(matching.len()),
-            None => 0,
-        };
-        let page = &matching[start..matching.len().min(start + page_size)];
-        let next_token = matching
-            .get(start + page.len())
-            .and(page.last())
-            .map(|last| page_token(&last.job_id));
+        let (page, next_token) = crate::state::page_of_jobs(
+            &state.entities_detection_v2_jobs,
+            input.filter.as_ref(),
+            resume.as_deref(),
+            page_size,
+        );
 
         Ok(ListEntitiesDetectionV2JobsOutput {
-            comprehend_medical_async_job_properties_list: Some(
-                page.iter().map(|job| job.to_properties()).collect(),
-            ),
+            comprehend_medical_async_job_properties_list: Some(page),
             next_token,
         })
     }

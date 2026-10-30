@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // progression — so materialising them while reporting shows a later caller
         // nothing it would not otherwise have seen.
         state.expire_jobs(now);
-        let Some(job) = state.entities_detection_v2_jobs.get_mut(&input.job_id) else {
+        let Some(job) = state.entities_detection_v2_jobs.jobs.get_mut(&input.job_id) else {
             return Err(
                 DescribeEntitiesDetectionV2JobErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPHIDetectionJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPHIDetectionJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPHIDetectionJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. The answer is the jobs `StartPHIDetectionJob` actually created, narrowed
+//! by every member the caller set on the filter, in the order the filter documents
+//! (oldest first, and newest first when the caller bounds the submit time only from
+//! below), truncated at `MaxResults` and resumable with the opaque `NextToken` the
+//! previous page returned. The filtering, ordering and paging themselves live in
+//! [`crate::state::page_of_jobs`], which every job family's list operation shares, and
+//! the jobs come from this family's own store — a job of another family is never listed
+//! here.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +152,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPHIDetectionJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPHIDetectionJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPHIDetectionJobs"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPHIDetectionJobsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("The service's job store is unavailable.".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A `NextToken` this service did not issue cannot name a page.
+        let resume = match input.next_token.as_deref() {
+            Some(token) => match crate::state::resume_key(token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListPHIDetectionJobsErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(
+                                "The NextToken is not valid. Pass back the NextToken from \
+                                 the previous page unchanged, or omit it to start at the \
+                                 first page."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+            None => None,
+        };
+
+        let now = crate::state::now_epoch_secs();
+        let mut state = store.lock();
+        // Metadata expiry and each job's status progression were both due at an instant
+        // fixed when the job was started, so materialising them while reporting shows a
+        // later caller nothing it would not otherwise have seen.
+        state.phi_detection_jobs.settle(now);
+
+        // `MaxResults`' range (1..500) is modelled, so anything outside it was already
+        // refused before this handler ran.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::DEFAULT_MAX_RESULTS);
+
+        let (page, next_token) = crate::state::page_of_jobs(
+            &state.phi_detection_jobs,
+            input.filter.as_ref(),
+            resume.as_deref(),
+            page_size,
+        );
+
+        Ok(ListPHIDetectionJobsOutput {
+            comprehend_medical_async_job_properties_list: Some(page),
+            next_token,
+        })
     }
 }
+
