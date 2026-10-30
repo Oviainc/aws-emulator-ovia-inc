@@ -211,7 +211,15 @@ fn reset_to_defaults() -> Vec<(&'static str, Value)> {
     vec![
         ("LambdaConfig", Value::Null),
         ("DeviceConfiguration", Value::Null),
-        ("AccountRecoverySetting", Value::Null),
+        // An omitted `AccountRecoverySetting` goes back to the service default,
+        // which is the configuration the pool then applies.
+        (
+            "AccountRecoverySetting.RecoveryMechanisms",
+            json!([
+                { "Priority": 1, "Name": "verified_email" },
+                { "Priority": 2, "Name": "verified_phone_number" },
+            ]),
+        ),
         ("SmsAuthenticationMessage", Value::Null),
         ("AutoVerifiedAttributes", Value::Null),
         ("UserPoolTags", json!({})),

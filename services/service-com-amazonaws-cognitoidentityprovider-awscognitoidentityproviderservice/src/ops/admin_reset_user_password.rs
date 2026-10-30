@@ -219,6 +219,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !user.enabled {
             return Err(not_authorized("User is disabled."));
         }
+        // A password reset applies to the password the user owns, so a user that
+        // owns none — one that has never confirmed its sign-up, and one still
+        // holding the temporary password an administrator created it with — is
+        // refused rather than moved to `RESET_REQUIRED`
+        // ([`crate::state::UserStatus::holds_own_password`]).
+        if !user.status.holds_own_password() {
+            return Err(not_authorized(
+                crate::state::PASSWORD_NOT_RESETTABLE_MESSAGE,
+            ));
+        }
         // The STORED username, which is the key the code is recorded under: the request
         // may have named the user by its `sub`, or in another case for a pool whose
         // usernames are case-insensitive.
@@ -258,10 +268,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Sets the requested user's account into a RESET_REQUIRED status, and sends
         // them a password-reset code" (this operation in this service's model), so the
         // user owes a new password before it signs in again and holds the code that
-        // authorises setting one. The model documents no precondition on the status the
-        // user is in — the only states this operation names are the pool's recovery
-        // configuration, checked above — so the status it sets is set whatever the user
-        // held before.
+        // authorises setting one. The user's registration is complete (checked above),
+        // so the status it sets is set whatever else the user held before.
         user.status = crate::state::UserStatus::ResetRequired;
         user.issue_code(crate::state::CodePurpose::PasswordReset, code);
         user.user_last_modified_date = now;

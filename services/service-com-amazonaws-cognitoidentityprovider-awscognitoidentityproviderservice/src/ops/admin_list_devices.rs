@@ -198,6 +198,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request named it, so a token stays valid across an alias and the `sub`,
         // and names no page of another user's listing.
         let scope = format!("{}|{}|{}", Self::NAME, pool.id, user.sub);
+        // Every device REGISTERED to this user: the admin surface reports one
+        // whatever its remembered status, exactly as `AdminGetDevice` does.
         let keys = user.confirmed_device_keys();
         let page = crate::state::page_of(
             &scope,

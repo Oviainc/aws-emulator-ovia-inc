@@ -8,10 +8,11 @@
 //! stored group named by `GroupName`, leaving that user's other memberships, the
 //! group itself and every other user's membership of it untouched; membership is
 //! a SET, so removing one the user does not hold (a repeat, or one never added)
-//! drops nothing and still succeeds. The drop is PERSISTED: a later
-//! `AdminListGroupsForUser` no longer lists the group and a later sign-in's
-//! tokens no longer carry it in their `cognito:groups` claim. An absent pool or
-//! group is a 400 `ResourceNotFoundException` and an absent user a 400
+//! drops nothing and still succeeds. The group itself is NOT looked up, so a
+//! `GroupName` the pool does not hold is the same no-op. The drop is PERSISTED: a
+//! later `AdminListGroupsForUser` no longer lists the group and a later sign-in's
+//! tokens no longer carry it in their `cognito:groups` claim. An absent pool is a
+//! 400 `ResourceNotFoundException` and an absent user a 400
 //! `UserNotFoundException`, and a refused removal persists nothing.
 //!
 //! Each table row names the case it asserts.
@@ -423,7 +424,7 @@ async fn a_user_is_resolved_by_username_or_by_sub() {
 }
 
 #[tokio::test]
-async fn an_absent_pool_group_or_user_is_refused_and_persists_nothing() {
+async fn an_absent_pool_or_user_is_refused_while_an_unknown_group_is_a_no_op() {
     let router = router();
     let user_pool_id = pool(&router, "refusal-pool").await;
     group(&router, &user_pool_id, "admins").await;
@@ -437,24 +438,6 @@ async fn an_absent_pool_group_or_user_is_refused_and_persists_nothing() {
                 "UserPoolId": "us-east-1_absent",
                 "Username": "dave",
                 "GroupName": "admins",
-            }),
-            (400, "ResourceNotFoundException"),
-        ),
-        (
-            "a group the pool does not hold",
-            json!({
-                "UserPoolId": user_pool_id,
-                "Username": "dave",
-                "GroupName": "absent-group",
-            }),
-            (400, "ResourceNotFoundException"),
-        ),
-        (
-            "a group name differing only in case, which is a different group",
-            json!({
-                "UserPoolId": user_pool_id,
-                "Username": "dave",
-                "GroupName": "Admins",
             }),
             (400, "ResourceNotFoundException"),
         ),
@@ -473,6 +456,22 @@ async fn an_absent_pool_group_or_user_is_refused_and_persists_nothing() {
             (status, error_code(&payload)),
             expected,
             "case {label:?}: expected {expected:?}, got {status} with {payload}"
+        );
+    }
+
+    // A `GroupName` the pool does not hold is a membership the user does not
+    // hold either, so there is nothing to remove and the call succeeds with the
+    // empty output it models — including for a name differing from a stored one
+    // only in case, which is a different group.
+    for (label, group_name) in [
+        ("a group the pool does not hold", "absent-group"),
+        ("a group name differing only in case", "Admins"),
+    ] {
+        let (status, payload) = remove(&router, &user_pool_id, "dave", group_name).await;
+        assert_eq!(
+            (status, payload.clone()),
+            (200, json!({})),
+            "case {label:?}: expected an empty 200, got {status} with {payload}"
         );
     }
 

@@ -5,7 +5,10 @@
 //! signed-in user the presented access token names is marked confirmed, which is
 //! what makes the user pool report it, and remembered unless the pool's
 //! `DeviceOnlyRememberedOnUserPrompt` asks for the user's own answer first —
-//! which is exactly what `UserConfirmationNecessary` reports back.
+//! which is exactly what `UserConfirmationNecessary` reports back. A `DeviceKey`
+//! this signed-in user holds no unconfirmed device for — one no sign-in minted,
+//! one another user or pool holds, or one already confirmed — is an invalid
+//! parameter of this request.
 //!
 //! ## Shape of an operation
 //!
@@ -232,17 +235,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .pool_mut(&user_pool_id)
             .ok_or_else(|| user_pool_not_found(&user_pool_id))?;
         let user = pool.user_mut(&username).ok_or_else(user_not_found)?;
-        // Only a device a sign-in of THIS user minted a key for can be confirmed:
-        // the key is "an identifier used in generating the
-        // `DEVICE_PASSWORD_VERIFIER`" that the sign-in handed out, not something a
-        // caller chooses.
+        // Only an UNCONFIRMED device key a sign-in of THIS user minted can be
+        // confirmed: the key is "an identifier used in generating the
+        // `DEVICE_PASSWORD_VERIFIER`" that the sign-in handed out, not something
+        // a caller chooses. So every other key — one no sign-in minted, one a
+        // sign-in of another user or another pool minted, and one this user has
+        // already confirmed — is a `DeviceKey` that is not valid for this
+        // request, which `InvalidParameterException` is the refusal for.
         let device = user
             .devices
             .get_mut(&input.device_key)
-            .ok_or_else(device_not_found)?;
-        if device.confirmed {
-            return Err(device_key_exists());
-        }
+            .filter(|device| !device.confirmed)
+            .ok_or_else(invalid_device_key)?;
         device.confirmed = true;
         device.remembered = !user_confirmation_necessary;
         // The device's own metadata, as this request registered it.
@@ -332,21 +336,19 @@ fn device_remembering_not_configured() -> ConfirmDeviceError {
     .into()
 }
 
-/// This operation's `ResourceNotFoundException` for a `DeviceKey` no sign-in of
-/// this user minted.
-fn device_not_found() -> ConfirmDeviceError {
-    ConfirmDeviceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(crate::state::DEVICE_NOT_FOUND_MESSAGE.to_string()),
-    })
-    .into()
-}
-
-/// The refusal for a device this user already confirmed: `DeviceKeyExistsException`
-/// is "thrown when a user attempts to confirm a device with a device key that
-/// already exists" (this service's model).
-fn device_key_exists() -> ConfirmDeviceError {
-    ConfirmDeviceErrorModeled::DeviceKeyExistsException(DeviceKeyExistsException {
-        message: Some("Device key already exists.".to_string()),
+/// The refusal for a `DeviceKey` this request cannot confirm: one no sign-in of
+/// the signed-in user minted, one another user or pool holds, or one the user
+/// has already confirmed. `InvalidParameterException` "is thrown when the Amazon
+/// Cognito service encounters an invalid parameter" (this service's model), and
+/// the sentence names the member at fault and no stored value, so every rejected
+/// key is reported the same way.
+fn invalid_device_key() -> ConfirmDeviceError {
+    ConfirmDeviceErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(crate::state::INVALID_DEVICE_KEY_MESSAGE.to_string()),
+        // "The reason code of the exception" (this service's model) names a
+        // further classification Amazon Cognito reports only for some refusals;
+        // none applies to a device key, so none is invented.
+        reason_code: None,
     })
     .into()
 }

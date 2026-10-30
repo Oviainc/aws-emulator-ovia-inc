@@ -31,6 +31,7 @@ use crate::ops::types::{
     LogConfigurationType, LogDeliveryConfigurationType,
     MFAOptionType, NewDeviceMetadataType,
     NumberAttributeConstraintsType, PasswordPolicyType, ProviderUserIdentifierType,
+    RecoveryOptionType,
     RefreshTokenRotationType,
     ResourceServerScopeType, ResourceServerType, RiskConfigurationType,
     RiskExceptionConfigurationType, RoutingType,
@@ -263,6 +264,12 @@ pub const USERNAME_CLIENT_NOT_FOUND_MESSAGE: &str = "Username/client id combinat
 /// refusal is the same sentence for every key.
 pub const DEVICE_NOT_FOUND_MESSAGE: &str = "Device does not exist.";
 
+/// The message `ConfirmDevice`'s `InvalidParameterException` carries for a
+/// `DeviceKey` the signed-in user holds no unconfirmed device for. Like
+/// [`DEVICE_NOT_FOUND_MESSAGE`] it names nothing the request asked for, so a key
+/// another user or pool holds is reported exactly as one that was never minted.
+pub const INVALID_DEVICE_KEY_MESSAGE: &str = "Invalid device key given.";
+
 /// The message the refusal of a sign-in by a user Amazon Cognito is waiting on a
 /// new password from carries ([`UserStatus::ResetRequired`]).
 ///
@@ -271,6 +278,12 @@ pub const DEVICE_NOT_FOUND_MESSAGE: &str = "Device does not exist.";
 /// self-service operations a signed-in user's access token authorizes — reports
 /// it the same way.
 pub const PASSWORD_RESET_REQUIRED_MESSAGE: &str = "Password reset required for the user";
+
+/// The message the refusal of a password reset for a user whose registration is
+/// not complete carries: the account has no password for a reset to apply to,
+/// so the state the user is in is what the refusal reports, naming no username.
+pub const PASSWORD_NOT_RESETTABLE_MESSAGE: &str =
+    "User password cannot be reset in the current state.";
 
 /// The message a passkey operation's `ResourceNotFoundException` carries for a
 /// `CredentialId` the signed-in user holds no registered passkey for. Like
@@ -644,6 +657,41 @@ pub fn echoed_value(value: &str) -> String {
         value.get(..end).unwrap_or_default(),
         value.len()
     )
+}
+
+/// `submitted` as this service STORES an optional text member: a value the
+/// request left out and one it sent empty are stored the same way — as no value
+/// at all.
+///
+/// Amazon Cognito materialises no empty string: a member whose modelled length
+/// starts at 0 accepts `""` on input (`DescriptionType` is length 0..2048,
+/// `smithy_query(query="shape",shape="DescriptionType")`), and the stored
+/// resource then carries no such member, so a later read omits it rather than
+/// rendering an empty value. The ONE place that normalization is decided, so
+/// every writer of an optional text member agrees.
+#[must_use]
+pub fn stored_text(submitted: Option<String>) -> Option<String> {
+    submitted.filter(|value| !value.is_empty())
+}
+
+/// The attribute values `requested` writes onto a user, as this service stores
+/// them: one entry per named attribute, with every empty value dropped.
+///
+/// "To delete an attribute from your user, submit the attribute in your API
+/// request with a blank value" (`AdminUpdateUserAttributes.UserAttributes` in
+/// this service's model) — an empty value is not a value of the attribute, so an
+/// attribute submitted with one is stored for no user and a read lists it for
+/// none. The ONE place a submitted attribute list becomes stored attribute
+/// values, so a create normalizes exactly as an update does
+/// ([`plan_attribute_update`]).
+#[must_use]
+pub fn stored_attribute_values(requested: &[AttributeType]) -> BTreeMap<String, String> {
+    requested
+        .iter()
+        .filter_map(|attribute| {
+            stored_text(attribute.value.clone()).map(|value| (attribute.name.clone(), value))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1899,24 +1947,135 @@ impl UserPool {
         }
     }
 
-    /// The stored user `username` names, by username or by `sub`.
+    /// The stored user `username` names, by username, by `sub` or by a sign-in
+    /// name of this pool ([`UserPool::sign_in_name_holder_key`]).
     pub fn user(&self, username: &str) -> Option<&User> {
-        self.users
-            .get(&self.user_key(username))
-            .or_else(|| self.users.values().find(|user| user.sub == username))
+        let key = self.user_storage_key(username)?;
+        self.users.get(&key)
     }
 
     /// The key the stored user `username` names is held under, or `None` when no
-    /// such user exists. Resolves a `sub` the same way [`UserPool::user`] does.
+    /// such user exists.
+    ///
+    /// Every way a request may name one user of this pool, in the order a
+    /// stored name beats a derived one: the username itself, the user's own
+    /// `sub`, then any sign-in name of the pool the value is. A `Username` "is
+    /// typically your user's username, but it can be any of their alias
+    /// attributes. If username isn't an alias attribute in your user pool, this
+    /// value must be the sub of a local user" (`AdminGetUser.Username` in this
+    /// service's model), so all three resolve the same stored user.
     pub fn user_storage_key(&self, username: &str) -> Option<String> {
         let key = self.user_key(username);
         if self.users.contains_key(&key) {
             return Some(key);
         }
-        self.users
+        if let Some(stored_key) = self
+            .users
             .iter()
             .find(|(_, user)| user.sub == username)
             .map(|(stored_key, _)| stored_key.clone())
+        {
+            return Some(stored_key);
+        }
+        if let Some(stored_key) = self.federated_user_key(username) {
+            return Some(stored_key);
+        }
+        self.sign_in_name_holder_key(username)
+    }
+
+    /// The key of the user this pool holds the THIRD-PARTY IdP username
+    /// `username`'s link on, or `None` when no user of this pool holds one.
+    ///
+    /// A `Username` "must be the sub of a local user or the username of a user
+    /// from a third-party IdP" (`AdminGetUser.Username` in this service's
+    /// model), and a third-party user's username is that of its provider and
+    /// its id with that provider ([`federated_username`]). An external identity
+    /// `AdminLinkProviderForUser` linked belongs to the local profile it was
+    /// linked to — "Amazon Cognito returns this user when the new user (with the
+    /// linked IdP attribute) signs in" (`AdminLinkProviderForUser.DestinationUser`)
+    /// — so that profile is the user the federated username names. The name is
+    /// compared the way this pool compares usernames
+    /// ([`UserPool::user_key`]), so a case-insensitive pool resolves it in any
+    /// case and a case-sensitive one only as the link stored it. The
+    /// lowest-ordered key answers, so the lookup is stable whatever order the
+    /// users are held in.
+    pub fn federated_user_key(&self, username: &str) -> Option<String> {
+        let asked_for = self.user_key(username);
+        self.users
+            .iter()
+            .filter(|(_, user)| {
+                user.provider_links.keys().any(|identity| {
+                    self.user_key(&federated_username(
+                        &identity.provider_name,
+                        &identity.provider_attribute_value,
+                    )) == asked_for
+                })
+            })
+            .map(|(key, _)| key.clone())
+            .min()
+    }
+
+    /// The key of the user whose SIGN-IN NAME `value` is, or `None` when no user
+    /// of this pool answers to it.
+    ///
+    /// `UsernameAttributes` "specifies whether a user can use an email address
+    /// or phone number as a username when they sign up", while `AliasAttributes`
+    /// are "attributes supported as an alias for this user pool" (this service's
+    /// model). A username attribute's value IS the name the user signs in with,
+    /// so it resolves whatever its verified flag says; an alias attribute's
+    /// value resolves only while it is the user's ACTIVE alias
+    /// ([`User::alias_is_active`]), since an unconfirmed alias names no user
+    /// yet. At most one user holds a given sign-in value, and the lowest-ordered
+    /// key answers, so the lookup is stable whatever order the users are held
+    /// in. The work is bounded by the attributes the POOL configures, not by
+    /// anything the caller sends.
+    pub fn sign_in_name_holder_key(&self, value: &str) -> Option<String> {
+        let username_names = self
+            .username_attributes
+            .iter()
+            .map(|name| (name.as_str(), false));
+        let alias_names = self
+            .alias_attributes
+            .iter()
+            .map(|name| (name.as_str(), true));
+        for (name, only_while_active) in username_names.chain(alias_names) {
+            let holder = self
+                .users
+                .iter()
+                .filter(|(_, user)| {
+                    user.attributes
+                        .get(name)
+                        .is_some_and(|stored| stored == value)
+                        && (!only_while_active || user.alias_is_active(name))
+                })
+                .map(|(key, _)| key.clone())
+                .min();
+            if holder.is_some() {
+                return holder;
+            }
+        }
+        None
+    }
+
+    /// The attribute a pool whose sign-in name IS an attribute value stores
+    /// `submitted` under, or `None` for a pool whose users sign in with a
+    /// username of their own.
+    ///
+    /// "If your user pool only supports phone numbers or email addresses as
+    /// sign-in attributes, Amazon Cognito automatically generates a username
+    /// value" (`AdminCreateUser.Username` in this service's model), so in such a
+    /// pool the submitted value is not a username at all: it is the value of the
+    /// sign-in attribute it has the shape of — an address for `email`, a number
+    /// for `phone_number` ([`attribute_shape_of`] judges which). A value of no
+    /// configured sign-in attribute's shape is no sign-in value of this pool, so
+    /// none is reported and nothing is stored under an attribute the value does
+    /// not belong to.
+    pub fn sign_in_attribute(&self, submitted: &str) -> Option<&str> {
+        let shape = attribute_shape_of(submitted)?;
+        self.username_attributes
+            .iter()
+            .map(String::as_str)
+            .find(|name| *name == shape)
     }
 
     /// Whether this pool remembers devices at all: `DeviceConfigurationType` is
@@ -2034,6 +2193,32 @@ impl UserPool {
     pub fn user_mut(&mut self, username: &str) -> Option<&mut User> {
         let key = self.user_storage_key(username)?;
         self.users.get_mut(&key)
+    }
+
+    /// Write `plan` ([`plan_attribute_update`]) onto this pool as of `now` and
+    /// return the delivery of each verification message it sent, or `None` when
+    /// the user it applies to is no longer stored.
+    ///
+    /// The plan's own user takes its attributes
+    /// ([`User::apply_attribute_update`]), and every OTHER holder of an alias
+    /// value the plan moves loses the verified flag that made that value
+    /// theirs: an alias names ONE user of the pool, so the write that gives the
+    /// value to this user is the write that takes it from them.
+    pub fn apply_attribute_update(
+        &mut self,
+        plan: &AttributeUpdatePlan,
+        now: SystemTime,
+    ) -> Option<Vec<CodeDeliveryDetailsType>> {
+        for (key, flag) in &plan.demotions {
+            if let Some(holder) = self.users.get_mut(key) {
+                holder
+                    .attributes
+                    .insert((*flag).to_string(), FLAG_UNCONFIRMED.to_string());
+                holder.user_last_modified_date = now;
+            }
+        }
+        let user = self.user_mut(&plan.username)?;
+        Some(user.apply_attribute_update(plan, now))
     }
 
     /// The effective password policy: the pool's own, with the documented
@@ -2362,15 +2547,33 @@ impl UserPool {
     /// confirmed, and an alias attribute with no such flag counts whatever its
     /// value (see [`User::alias_is_active`]).
     pub fn alias_taken(&self, name: &str, value: &str, except_username: &str) -> bool {
+        !self.alias_holder_keys(name, value, except_username).is_empty()
+    }
+
+    /// The keys of the users of this pool OTHER than `except_username` that hold
+    /// `value` as their active alias value of `name`, in ascending key order.
+    ///
+    /// These are the users an update that gives `value` to another user takes
+    /// the alias away from ([`AttributeUpdatePlan::demotions`]).
+    pub fn alias_holder_keys(
+        &self,
+        name: &str,
+        value: &str,
+        except_username: &str,
+    ) -> Vec<String> {
         let except = self.user_key(except_username);
-        self.users.iter().any(|(key, user)| {
-            key != &except
-                && user
-                    .attributes
-                    .get(name)
-                    .is_some_and(|stored| stored == value)
-                && user.alias_is_active(name)
-        })
+        self.users
+            .iter()
+            .filter(|(key, user)| {
+                *key != &except
+                    && user
+                        .attributes
+                        .get(name)
+                        .is_some_and(|stored| stored == value)
+                    && user.alias_is_active(name)
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
     }
 
     /// The names of the attributes this pool's schema marks required that `user`
@@ -3417,6 +3620,19 @@ pub enum UserStatus {
 }
 
 impl UserStatus {
+    /// Whether a user in this status holds a password of its OWN, which is what
+    /// a password reset applies to.
+    ///
+    /// A user that has not confirmed its sign-up (`UNCONFIRMED`) has not
+    /// finished registering, and one an administrator created holds a temporary
+    /// password it must replace at its first sign-in
+    /// (`FORCE_CHANGE_PASSWORD`) — "the user must change their password to
+    /// complete sign-in" — so neither owns a password yet. Every other status
+    /// names a user whose registration is complete.
+    pub fn holds_own_password(self) -> bool {
+        !matches!(self, Self::Unconfirmed | Self::ForceChangePassword)
+    }
+
     /// The wire value of this status.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -3596,15 +3812,38 @@ impl User {
         }
     }
 
-    /// The keys of this user's CONFIRMED devices in ascending order — the stable
-    /// order a paginated device listing indexes into.
+    /// The keys of the devices this user's OWN device surface reports, in
+    /// ascending order — the stable order a paginated self-service listing
+    /// indexes into.
     ///
-    /// `ListDevices` lists "the devices that Amazon Cognito has registered to the
-    /// currently signed-in user" and `ConfirmDevice` "confirms a device that a
-    /// user wants to remember" (this service's model), so a device a sign-in only
-    /// minted a key for is not one a listing reports until it is confirmed.
+    /// `ListDevices` lists "the devices that Amazon Cognito has registered to
+    /// the currently signed-in user", `ConfirmDevice` "confirms a device that a
+    /// user wants to remember" and `UpdateDeviceStatus` marks a device "as
+    /// remembered or not remembered" (this service's model), so the
+    /// self-service surface answers for the devices the user still REMEMBERS:
+    /// a device a sign-in only minted a key for is not reported until it is
+    /// confirmed, and one whose remembered status was cleared leaves the
+    /// listing. The admin surface is wider — `AdminGetDevice` "returns details
+    /// for a user's device" and reports a registered device whatever its
+    /// remembered status ([`User::confirmed_device_keys`]) — exactly as
+    /// [`User::remembered_device`] is narrower than [`User::confirmed_device`].
     pub fn device_keys(&self) -> Vec<String> {
-        self.confirmed_device_keys()
+        self.devices
+            .iter()
+            .filter(|(_, device)| device.confirmed && device.remembered)
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// The keys of every device REGISTERED to this user, in ascending order:
+    /// what the admin device surface reports, whether or not the user still
+    /// remembers each ([`User::device_keys`]).
+    pub fn confirmed_device_keys(&self) -> Vec<String> {
+        self.devices
+            .iter()
+            .filter(|(_, device)| device.confirmed)
+            .map(|(key, _)| key.clone())
+            .collect()
     }
 
     /// Store `options` as this user's SMS MFA configuration, as of `now`.
@@ -3834,16 +4073,6 @@ impl User {
             .filter(|device| device.remembered)
     }
 
-    /// The keys of this user's confirmed devices, in ascending key order: the
-    /// stable order a listing of them pages over.
-    pub fn confirmed_device_keys(&self) -> Vec<String> {
-        self.devices
-            .iter()
-            .filter(|(_, device)| device.confirmed)
-            .map(|(key, _)| key.clone())
-            .collect()
-    }
-
     /// The stored value of `attribute` a message can be addressed to, or `None`
     /// when this user holds no value for it: a code is a message, so it needs an
     /// address to be sent to.
@@ -4016,6 +4245,17 @@ pub struct LinkedProvider {
 /// `identities` attribute name, so a profile nothing is linked to reports no
 /// such attribute.
 pub const IDENTITIES_ATTRIBUTE: &str = "identities";
+
+/// The username a user of a third-party IdP signs in under: the provider's name
+/// and the user's id with that provider, joined by `_` — the form a `Username`
+/// naming "the username of a user from a third-party IdP" (`AdminGetUser.Username`
+/// in this service's model) carries. The ONE place the two parts are joined, so
+/// every lookup of a federated username agrees
+/// ([`UserPool::federated_user_key`]).
+#[must_use]
+pub fn federated_username(provider_name: &str, provider_user_id: &str) -> String {
+    format!("{provider_name}_{provider_user_id}")
+}
 
 /// One provider identity: the (`ProviderName`, `ProviderAttributeName`,
 /// `ProviderAttributeValue`) triple a `ProviderUserIdentifierType` names.
@@ -5557,6 +5797,25 @@ pub fn verified_flag(attribute: &str) -> Option<&'static str> {
     }
 }
 
+/// The attribute `value` has the SHAPE of a value of: an `email` holds an
+/// address, a `phone_number` holds a number in E.164 form ("A phone number must
+/// be in E.164 format", `AdminCreateUser.UserAttributes` in this service's
+/// model, which is a `+` and digits), and a value that is neither belongs to no
+/// addressing attribute.
+///
+/// Used to tell which sign-in attribute a submitted sign-in name is a value of
+/// ([`UserPool::sign_in_attribute`]); it judges the shape only, never whether a
+/// value is deliverable.
+pub fn attribute_shape_of(value: &str) -> Option<&'static str> {
+    if value.starts_with('+') {
+        return Some("phone_number");
+    }
+    if value.contains('@') {
+        return Some("email");
+    }
+    None
+}
+
 /// The value a verified flag carries once the attribute's value is confirmed.
 /// `email_verified` and `phone_number_verified` are `Boolean` schema
 /// attributes, whose values are carried as the strings every attribute value
@@ -5693,6 +5952,11 @@ pub struct AttributeUpdatePlan {
     /// attribute the message is addressed to and the value it goes to, which is
     /// what the code issued for it is recorded against.
     pub verifications: Vec<(String, String)>,
+    /// The OTHER users of the pool this update takes an alias value away from,
+    /// as `(storage key, verified flag)`: the alias each held is now this
+    /// user's, so the flag that made it theirs no longer vouches for anything
+    /// ([`UserPool::apply_attribute_update`]).
+    pub demotions: Vec<(String, &'static str)>,
 }
 
 /// Why a submitted attribute list is no update to make
@@ -5704,7 +5968,9 @@ pub enum AttributeUpdateRefusal {
     /// breaks, for a client to fix the request from, and names no stored value.
     Invalid(String),
     /// The submitted value of the named attribute is one another user of the
-    /// pool already holds as its active alias ([`UserPool::alias_taken`]).
+    /// pool already holds as its alias ([`UserPool::alias_taken`]) and which no
+    /// verified flag can take away from that user, so the two would both answer
+    /// to it.
     AliasTaken(String),
 }
 
@@ -5758,8 +6024,10 @@ pub enum VerifiedFlagAuthority {
 ///   message, and the second holds the new value pending until the user
 ///   confirms it — unless the caller's own flag asserts it is already verified
 ///   ([`VerifiedFlagAuthority`]).
-/// * An alias value names ONE user of the pool, so a value another user
-///   already holds as an active alias is not one this user may take.
+/// * An alias value names ONE user of the pool, so a value another user holds
+///   as an active alias moves to this user and the other holder's verified flag
+///   is demoted with it; an alias attribute that carries no such flag cannot be
+///   moved that way, so taking its value is refused.
 ///
 /// Every step below is bounded by the POOL's schema rather than by the length
 /// of the submitted list: the count is capped and repeated names are refused
@@ -5809,6 +6077,7 @@ pub fn plan_attribute_update(
 
     let mut updates = Vec::new();
     let mut verifications = Vec::new();
+    let mut demotions: Vec<(String, &'static str)> = Vec::new();
     for (name, value) in &submitted {
         let name = (*name).to_string();
         // A verified flag whose attribute this same request DELETES has
@@ -5877,19 +6146,31 @@ pub fn plan_attribute_update(
         let stale_verified_flag = verified_flag
             .filter(|flag| !deferred && !unchanged && !submitted.contains_key(*flag));
 
-        // The value the user would hold may not be one another user already
-        // holds as an active alias, since an alias names ONE user of the pool.
-        // Only an alias attribute of the pool is looked up, and each is looked
-        // up once, so the pool's users are walked at most once per alias
-        // attribute the pool configures.
+        // An alias value names ONE user of the pool, so this user taking
+        // `value` is the other holders losing it. An `email` or a
+        // `phone_number` is an alias only while its verified flag vouches for
+        // it ([`verified_flag`]), so the holder's flag is what the write takes
+        // away: the update is accepted and the previous holder's copy is
+        // demoted out of verified status. An alias attribute that carries no
+        // such flag cannot be demoted, so there the value stays the holder's
+        // and this update is refused. Only an alias attribute of the pool is
+        // looked up, and each is looked up once, so the pool's users are walked
+        // at most once per alias attribute the pool configures.
         let becomes_active_alias = !deferred
             && verified_flag
                 .is_none_or(|flag| flag_after_update(&submitted, user, flag, &stale_verified_flag));
-        if becomes_active_alias
-            && pool.is_alias_attribute(&name)
-            && pool.alias_taken(&name, &value, &user.username)
-        {
-            return Err(AttributeUpdateRefusal::AliasTaken(name));
+        if becomes_active_alias && pool.is_alias_attribute(&name) {
+            match verified_flag {
+                Some(flag) => demotions.extend(
+                    pool.alias_holder_keys(&name, &value, &user.username)
+                        .into_iter()
+                        .map(|key| (key, flag)),
+                ),
+                None if pool.alias_taken(&name, &value, &user.username) => {
+                    return Err(AttributeUpdateRefusal::AliasTaken(name));
+                }
+                None => {}
+            }
         }
 
         // A verification message goes to a NEW email address or phone number
@@ -5917,6 +6198,7 @@ pub fn plan_attribute_update(
         username: user.username.clone(),
         updates,
         verifications,
+        demotions,
     })
 }
 
@@ -6288,6 +6570,37 @@ pub const NO_RECOVERY_DESTINATION_MESSAGE: &str =
 /// falling back to the verified phone number (the two attribute-bearing
 /// `RecoveryOptionNameType` values).
 const DEFAULT_RECOVERY_MECHANISMS: [&str; 2] = ["verified_email", "verified_phone_number"];
+
+/// The `AccountRecoverySetting` a pool is STORED with, which is the one a
+/// request carried or Amazon Cognito's own default.
+///
+/// A pool always has an effective account-recovery configuration — it is what
+/// decides where a self-service reset message goes
+/// ([`UserPool::recovery_destination`]) — so a request that configures none is
+/// stored with the service default rather than with nothing, and
+/// `DescribeUserPool` reports the configuration the pool actually applies.
+/// The default is [`DEFAULT_RECOVERY_MECHANISMS`] in that order, each
+/// mechanism's `Priority` being its rank from 1, since "groups ... take
+/// precedence" by ascending priority ("if `verified_email` has a priority of 1
+/// and `verified_phone_number` has a priority of 2, your user pool sends
+/// account-recovery messages to a verified email address but falls back to an
+/// SMS message", `RecoveryOptionType` in this service's model).
+pub fn effective_account_recovery_setting(
+    requested: Option<AccountRecoverySettingType>,
+) -> AccountRecoverySettingType {
+    requested.unwrap_or_else(|| AccountRecoverySettingType {
+        recovery_mechanisms: Some(
+            DEFAULT_RECOVERY_MECHANISMS
+                .iter()
+                .enumerate()
+                .map(|(index, name)| RecoveryOptionType {
+                    priority: i32::try_from(index).unwrap_or_default() + 1,
+                    name: (*name).to_string(),
+                })
+                .collect(),
+        ),
+    })
+}
 
 /// The user attribute a `RecoveryOptionNameType` recovers through, or `None` for
 /// a mechanism that names no attribute (`admin_only`).

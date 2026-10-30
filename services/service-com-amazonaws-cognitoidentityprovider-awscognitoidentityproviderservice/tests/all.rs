@@ -157,6 +157,8 @@ mod set_user_settings;
 mod sign_up_client_secret;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stored_state_normalization.rs"]
+mod stored_state_normalization;
 #[path = "all/terms_documents.rs"]
 mod terms_documents;
 #[path = "all/terms_not_found_message.rs"]

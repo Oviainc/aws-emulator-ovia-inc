@@ -588,24 +588,26 @@ async fn a_case_insensitive_pool_searches_its_usernames_without_case() {
 
     for (label, filter, expected) in [
         (
-            "the username as stored",
+            // The pool lower-cased the name on the way in, so that is the
+            // stored name a match reports whatever case the filter names.
+            "the username as created",
             "username = \"Alice\"",
-            vec!["Alice"],
+            vec!["alice"],
         ),
         (
             "the username in another case",
             "username = \"ALICE\"",
-            vec!["Alice"],
+            vec!["alice"],
         ),
         (
             "a prefix of the username in another case",
             "username ^= \"al\"",
-            vec!["Alice"],
+            vec!["alice"],
         ),
         (
             "preferred_username in another case, which this pool aliases without case",
             "preferred_username = \"ali\"",
-            vec!["Alice"],
+            vec!["alice"],
         ),
         (
             "an attribute that is no alias, which this setting does not reach",

@@ -333,6 +333,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         pool.mfa_configuration = crate::state::effective_mfa_configuration(input.mfa_configuration);
         pool.deletion_protection =
             crate::state::effective_deletion_protection(input.deletion_protection);
+        // A pool always applies an account-recovery configuration, so an update
+        // that carries none restores the service default rather than leaving the
+        // pool with nothing ([`crate::state::effective_account_recovery_setting`]).
+        pool.account_recovery_setting = Some(crate::state::effective_account_recovery_setting(
+            input.account_recovery_setting,
+        ));
 
         // Everything else is optional with no default but "absent", so an omitted
         // member clears what the pool held.
@@ -342,7 +348,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         pool.email_configuration = input.email_configuration;
         pool.sms_configuration = input.sms_configuration;
         pool.verification_message_template = input.verification_message_template;
-        pool.account_recovery_setting = input.account_recovery_setting;
         pool.user_attribute_update_settings = input.user_attribute_update_settings;
         pool.user_pool_add_ons = input.user_pool_add_ons;
         pool.key_configuration = input.key_configuration;

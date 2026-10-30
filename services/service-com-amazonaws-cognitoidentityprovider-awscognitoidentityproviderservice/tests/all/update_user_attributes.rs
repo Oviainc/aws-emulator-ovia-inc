@@ -16,9 +16,11 @@
 //! the new value pending and keeps the confirmed one. An attribute the schema
 //! does not declare, one it declares immutable and blanking one it marks
 //! required are all refused with 400 `InvalidParameterException`, a value
-//! another user already holds as an active alias with 400
-//! `AliasExistsException`, and a token that names no signed-in user with 400
-//! `NotAuthorizedException` — and a refused request writes nothing.
+//! another user already holds as an alias no verified flag can take away from it
+//! with 400 `AliasExistsException` — while one a verified flag CAN moves to the
+//! taker and demotes the previous holder — and a token that names no signed-in
+//! user with 400 `NotAuthorizedException` — and a refused request writes
+//! nothing.
 //!
 //! The pools, app clients, users and access tokens are all real: they come from
 //! `CreateUserPool`, `CreateUserPoolClient`, `AdminCreateUser`,
@@ -959,7 +961,7 @@ async fn a_token_that_names_no_signed_in_user_is_refused() {
 }
 
 #[tokio::test]
-async fn an_alias_value_another_user_holds_is_refused_only_while_it_is_that_users_alias() {
+async fn an_alias_value_another_user_holds_moves_to_the_taker_or_is_refused() {
     let router = emulator();
     // A pool that resolves a sign-in name through `preferred_username` and
     // `email`, so a value of either names one user of the pool.
@@ -1028,8 +1030,9 @@ async fn an_alias_value_another_user_holds_is_refused_only_while_it_is_that_user
         "an email another user holds verified, taken unverified"
     );
 
-    // Asking for that same address AS VERIFIED is asking for the other user's
-    // alias, which is refused.
+    // Asking for that same address AS VERIFIED takes the alias: an alias names
+    // ONE user of the pool, so the write is accepted and the previous holder's
+    // copy is demoted out of verified status.
     let (status, payload) = update(
         &router,
         &other,
@@ -1037,9 +1040,25 @@ async fn an_alias_value_another_user_holds_is_refused_only_while_it_is_that_user
     )
     .await;
     assert_eq!(
-        (status, error_code(&payload)),
-        (400, "AliasExistsException"),
-        "case {:?}: expected 400 AliasExistsException, got {status} with {payload}",
+        status, 200,
+        "case {:?}: taking a verified alias must succeed, got {status} with {payload}",
+        "an email another user holds verified, taken verified"
+    );
+    let taker = stored_attributes(&router, &holder.user_pool_id, "grace").await;
+    assert_eq!(
+        taker.get("email_verified").map(String::as_str),
+        Some("true"),
+        "case {:?}: the taker holds the alias verified, got {taker:?}",
+        "an email another user holds verified, taken verified"
+    );
+    let demoted = stored_attributes(&router, &holder.user_pool_id, "ada").await;
+    assert_eq!(
+        (
+            demoted.get("email").map(String::as_str),
+            demoted.get("email_verified").map(String::as_str),
+        ),
+        (Some("ada@alias.example"), Some("false")),
+        "case {:?}: the previous holder keeps the value but loses the verified flag, got {demoted:?}",
         "an email another user holds verified, taken verified"
     );
 }

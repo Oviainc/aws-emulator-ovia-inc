@@ -312,10 +312,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "Invalid attributes given, {unknown} is not a valid attribute of this user pool"
             )));
         }
-        let mut attributes: ::std::collections::BTreeMap<String, String> = requested_attributes
-            .into_iter()
-            .filter_map(|attribute| attribute.value.map(|value| (attribute.name, value)))
-            .collect();
+        // An attribute submitted with an empty value is stored for no user
+        // (`crate::state::stored_attribute_values`).
+        let mut attributes = crate::state::stored_attribute_values(&requested_attributes);
         let missing = pool.unset_required_attributes(&attributes);
         if let Some(name) = missing.first() {
             return Err(invalid_parameter(format!(
@@ -323,8 +322,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let key = pool.user_key(&input.username);
-        if pool.users.contains_key(&key) {
+        // "The username of the user that you want to sign up. The value of this
+        // parameter is typically a username, but can be any alias attribute in
+        // your user pool" (`SignUp.Username`), and `UsernameAttributes`
+        // "specifies whether a user can use an email address or phone number as a
+        // username when they sign up" (this service's model): in such a pool the
+        // submitted value is the value of that sign-in attribute and Amazon
+        // Cognito mints the username itself, which is the user's own id.
+        // Everywhere else the submitted name IS the username, normalized the way
+        // this pool compares usernames — a case-insensitive pool lower-cases it
+        // on the way in.
+        let sub = crate::state::new_uuid();
+        let sign_in_attribute = pool.sign_in_attribute(&input.username).map(str::to_string);
+        let (username, key) = match &sign_in_attribute {
+            Some(_) => (sub.clone(), sub.clone()),
+            None => {
+                let username = pool.user_key(&input.username);
+                (username.clone(), username)
+            }
+        };
+        // A second user under a name the pool already holds is refused: the
+        // username itself where that is the sign-in name, and the sign-in value
+        // where an attribute is ([`UserPool::sign_in_name_holder_key`]).
+        let taken = pool.users.contains_key(&key)
+            || sign_in_attribute
+                .as_deref()
+                .is_some_and(|_| pool.sign_in_name_holder_key(&input.username).is_some());
+        if taken {
             return Err(username_exists(&input.username));
         }
         // This emulator holds a pool's users in memory, so the store is bounded; the
@@ -337,11 +361,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let sub = crate::state::new_uuid();
         // `sub` is the user's own id, not something the caller may set.
         attributes.insert("sub".to_string(), sub.clone());
+        // The sign-in name of a pool that mints its usernames is the value of the
+        // attribute its users sign in with, so that is where the submitted value
+        // is held — unless the request submitted a value for it itself.
+        if let Some(attribute) = sign_in_attribute {
+            attributes
+                .entry(attribute)
+                .or_insert_with(|| input.username.clone());
+        }
         let user = crate::state::User {
-            username: input.username.clone(),
+            username,
             sub: sub.clone(),
             attributes,
             // Nothing is pending for a user that has just registered: the

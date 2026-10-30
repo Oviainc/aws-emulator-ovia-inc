@@ -311,9 +311,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // says which medium carries the message when the request names none; it is
         // not a request for one, so a create that asks for no medium is not refused
         // for the address it does not carry.
-        let key = pool.user_key(&input.username);
         if let Some(mediums) = input.desired_delivery_mediums.as_deref() {
-            let stored = pool.users.get(&key);
+            let stored = pool.user(&input.username);
             // Which attributes hold an address is decided ONCE, per addressing
             // attribute — there are two of them, whatever the request's size — so the
             // submitted attribute list is walked a fixed number of times and each
@@ -344,11 +343,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "The username can't be a duplicate of another username in the same user
+        // pool ... You can only provide a value if usernames are a valid sign-in
+        // attribute for your user pool. If your user pool only supports phone
+        // numbers or email addresses as sign-in attributes, Amazon Cognito
+        // automatically generates a username value" (`AdminCreateUser.Username`).
+        // So in a pool whose sign-in name IS an attribute value the submitted
+        // value is not a username at all: it is stored as that attribute's value
+        // and the pool mints the opaque username, which is the user's own id.
+        // Everywhere else the submitted name is the username, normalized the way
+        // this pool compares usernames — a pool whose
+        // `UsernameConfiguration.CaseSensitive` is false lower-cases it on the
+        // way in, so every later read reports the lower-cased form.
+        let sub = crate::state::new_uuid();
+        let sign_in_attribute = pool
+            .sign_in_attribute(&input.username)
+            .map(str::to_string);
+        let (username, key) = match &sign_in_attribute {
+            Some(_) => (sub.clone(), sub.clone()),
+            None => {
+                let username = pool.user_key(&input.username);
+                (username.clone(), username)
+            }
+        };
         // "Set to RESEND to resend the invitation message to a user that already
         // exists, and to reset the temporary-password duration with a new
-        // temporary password" (`AdminCreateUser.MessageAction`).
+        // temporary password" (`AdminCreateUser.MessageAction`). The user a resend
+        // names is the one the submitted sign-in name resolves to, which in a pool
+        // that minted the username is reached through that name.
         let resend = input.message_action.as_deref() == Some("RESEND");
-        if let Some(existing) = pool.users.get_mut(&key) {
+        let existing_key = sign_in_attribute
+            .as_deref()
+            .and_then(|_| pool.sign_in_name_holder_key(&input.username))
+            .unwrap_or_else(|| key.clone());
+        if let Some(existing) = pool.users.get_mut(&existing_key) {
             if !resend {
                 return Err(username_exists());
             }
@@ -374,15 +402,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let mut attributes: ::std::collections::BTreeMap<String, String> = requested_attributes
-            .into_iter()
-            .filter_map(|attribute| attribute.value.map(|value| (attribute.name, value)))
-            .collect();
-        let sub = crate::state::new_uuid();
+        // An attribute submitted with an empty value is stored for no user
+        // (`crate::state::stored_attribute_values`).
+        let mut attributes = crate::state::stored_attribute_values(&requested_attributes);
         // `sub` is the user's own id, not something the caller may set.
         attributes.insert("sub".to_string(), sub.clone());
+        // The sign-in name of a pool that mints its usernames is the value of the
+        // attribute it signs in with, so that is where the submitted value is
+        // held — unless the request submitted a value for it itself.
+        if let Some(attribute) = sign_in_attribute {
+            attributes
+                .entry(attribute)
+                .or_insert_with(|| input.username.clone());
+        }
         let user = crate::state::User {
-            username: input.username.clone(),
+            username,
             sub,
             attributes,
             // Nothing is pending for a user an administrator just created: the

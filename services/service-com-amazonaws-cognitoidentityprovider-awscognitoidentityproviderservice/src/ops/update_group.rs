@@ -192,12 +192,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // description" of the named group (`UpdateGroup`), so a member the request
         // carries replaces what the group held and a member it leaves out keeps its
         // stored value: an update of one property never discards another. A
-        // `Description` can still be emptied by sending the empty string, which its
-        // modelled length 0..2048 admits. The group's identity (its name and its pool)
-        // and its creation instant are not members of this input, so they stay exactly
-        // as `CreateGroup` stored them.
+        // `Description` is still EMPTIED by sending the empty string, which its
+        // modelled length 0..2048 admits: Amazon Cognito materialises no empty
+        // string, so the group is left holding no description at all
+        // (`crate::state::stored_text`). The group's identity (its name and its
+        // pool) and its creation instant are not members of this input, so they
+        // stay exactly as `CreateGroup` stored them.
         if input.description.is_some() {
-            group.description = input.description;
+            group.description = crate::state::stored_text(input.description);
         }
         if input.role_arn.is_some() {
             group.role_arn = input.role_arn;

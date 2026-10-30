@@ -160,7 +160,9 @@ impl Members {
     /// Assert a rendered `GroupType` carries exactly these members: a value this
     /// case expects, and NO member at all for one it expects to be absent.
     fn assert_rendered(&self, label: &str, where_: &str, group: &Value) {
-        match &self.description {
+        // An empty `Description` is accepted on input and materialised as no
+        // description at all, so the rendered group omits the member.
+        match self.description.as_deref().filter(|value| !value.is_empty()) {
             Some(description) => assert_eq!(
                 group["Description"],
                 json!(description),
@@ -168,7 +170,7 @@ impl Members {
             ),
             None => assert!(
                 group.get("Description").is_none(),
-                "case {label:?}: {where_} renders no description when nothing ever set one, got {group}"
+                "case {label:?}: {where_} renders no description when none is stored, got {group}"
             ),
         }
         match &self.role_arn {

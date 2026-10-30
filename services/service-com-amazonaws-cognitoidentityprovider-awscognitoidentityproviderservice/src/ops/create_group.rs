@@ -208,7 +208,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let group = crate::state::Group {
             group_name: input.group_name.clone(),
             user_pool_id: pool.id.clone(),
-            description: input.description.clone(),
+            // An empty `Description` is no description: Amazon Cognito
+            // materialises no empty string, so a group created with one holds
+            // none and a later read omits the member
+            // ([`crate::state::stored_text`]).
+            description: crate::state::stored_text(input.description.clone()),
             role_arn: input.role_arn.clone(),
             precedence: input.precedence,
             creation_date: now,

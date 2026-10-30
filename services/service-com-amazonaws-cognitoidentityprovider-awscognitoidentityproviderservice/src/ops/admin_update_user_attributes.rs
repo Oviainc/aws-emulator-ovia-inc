@@ -16,9 +16,10 @@
 //!   attribute write: an attribute the pool's schema does not declare, one it
 //!   declares immutable, a blank value for one it marks required, a repeated
 //!   name and a list longer than the schema are all refused with
-//!   `InvalidParameterException`; a blank value DELETES the attribute; and a
-//!   value another user of the pool holds as an active alias is refused with
-//!   `AliasExistsException`.
+//!   `InvalidParameterException`; a blank value DELETES the attribute; and an
+//!   alias value another user of the pool holds MOVES to this user, demoting
+//!   that user's verified flag, except where the alias attribute carries no such
+//!   flag, which is refused with `AliasExistsException`.
 //! * An administrator may assert a new value verified: "to skip the
 //!   verification message and update the value of an attribute that requires
 //!   verification in the same API request, include the `email_verified` or
@@ -255,15 +256,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(refused)?
         };
 
-        let user = guard
+        // The write moves an alias value this update takes from another user of
+        // the pool, so it is applied to the POOL rather than to the one user. A
+        // code of a message this update sent is recorded against the attribute
+        // it was sent for, for `VerifyUserAttribute` to accept; this response
+        // models no member to report its destination in, so the deliveries the
+        // write hands back are not reported anywhere.
+        guard
             .pool_mut(&plan.user_pool_id)
-            .and_then(|pool| pool.user_mut(&plan.username))
+            .and_then(|pool| pool.apply_attribute_update(&plan, now))
             .ok_or_else(internal_error)?;
-        // A code of a message this update sent is recorded against the
-        // attribute it was sent for, for `VerifyUserAttribute` to accept; this
-        // response models no member to report its destination in, so the
-        // deliveries the write hands back are not reported anywhere.
-        user.apply_attribute_update(&plan, now);
 
         Ok(AdminUpdateUserAttributesOutput {})
     }

@@ -418,7 +418,7 @@ const RENDER_CASES: &[RenderCase] = &[
         sms_mfa: false,
     },
     RenderCase {
-        case: "a case-insensitive pool renders the STORED casing, not the sign-in's",
+        case: "a case-insensitive pool stores the lower-cased name, whatever case created it",
         case_sensitive: false,
         custom_attributes: &[],
         username: "Barbara",
@@ -474,11 +474,18 @@ async fn get_user_renders_the_stored_user_its_access_token_was_issued_to() {
             );
         }
 
+        // A pool whose usernames are case-insensitive lower-cases the name on
+        // the way in, so the stored username is the lower-cased one whatever
+        // case the create submitted; a case-sensitive pool stores it as sent.
+        let stored_username = if row.case_sensitive {
+            row.username.to_string()
+        } else {
+            row.username.to_lowercase()
+        };
         assert_eq!(
             payload["Username"],
-            json!(row.username),
-            "case {case:?}: expected the stored username {:?}, got {payload}",
-            row.username
+            json!(stored_username),
+            "case {case:?}: expected the stored username {stored_username:?}, got {payload}"
         );
 
         // The attribute list is the STORED one: exactly what the user holds,

@@ -2,12 +2,13 @@
 
 //! @op AdminRemoveUserFromGroup
 //!
-//! Drops membership of a stored group from a stored user of a stored user pool. The
+//! Drops membership of a group from a stored user of a stored user pool. The
 //! membership is held on the stored user (`crate::state::User::groups`), so once it is
 //! gone `AdminListGroupsForUser` no longer lists the group and a later sign-in's
 //! tokens no longer carry it in their `cognito:groups` claim. Removing a membership
-//! the user does not hold drops nothing and succeeds; the group itself and the user's
-//! other memberships are untouched.
+//! the user does not hold — including one of a group the pool does not have at all —
+//! drops nothing and succeeds; the group itself and the user's other memberships are
+//! untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -193,15 +194,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .pool_mut(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
 
-        // The group must be one the pool holds. `GroupNameType` carries no
-        // case-insensitivity trait, so the name is matched exactly as
-        // `CreateGroup` stored it. Which of an absent group and an absent user
-        // is reported first is not something AWS documents; each is reported on
-        // its own.
-        if !pool.groups.contains_key(&input.group_name) {
-            return Err(group_not_found());
-        }
-
+        // The group is NOT looked up: this operation removes a membership held
+        // on the user, and a user holds no membership of a group the pool does
+        // not have, so there is nothing to remove either way and the call
+        // succeeds. Its modelled output binds no member
+        // (`smithy_query(query="operation",operation="AdminRemoveUserFromGroup")`),
+        // so a request naming an unknown group is answered the same way as one
+        // naming a group the user never joined.
+        //
         // `Username` "can be any of their alias attributes" or "the sub of a
         // local user" (`AdminRemoveUserFromGroup.Username`), which is how
         // `UserPool::user_mut` resolves a user.
@@ -221,16 +221,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn user_pool_not_found(user_pool_id: &str) -> AdminRemoveUserFromGroupError {
     AdminRemoveUserFromGroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(format!("User pool {user_pool_id} does not exist.")),
-    })
-    .into()
-}
-
-/// This operation's `ResourceNotFoundException` for a group the pool does not
-/// hold. Carries the fixed message of
-/// [`crate::state::GROUP_NOT_FOUND_MESSAGE`], which names no group.
-fn group_not_found() -> AdminRemoveUserFromGroupError {
-    AdminRemoveUserFromGroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(crate::state::GROUP_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

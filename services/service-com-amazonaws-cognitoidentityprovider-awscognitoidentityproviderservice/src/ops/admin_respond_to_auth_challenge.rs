@@ -428,7 +428,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 continue;
             }
-            attributes.insert(name, value);
+            // An empty value is no value of the attribute, so it is stored for
+            // nobody and takes a held value away
+            // (`crate::state::stored_text`); a required attribute left without
+            // one then leaves the challenge unanswered below.
+            match crate::state::stored_text(Some(value)) {
+                Some(value) => attributes.insert(name, value),
+                None => attributes.remove(&name),
+            };
         }
         // The challenge asks for every required attribute the user has no value
         // for, so one still unset leaves it unanswered.

@@ -701,14 +701,16 @@ async fn confirm_device_registers_the_device_a_sign_in_minted() {
             );
         }
 
-        // Confirming the same device twice is the one case the model has an error for.
+        // Confirming the same device twice presents a `DeviceKey` that is no
+        // longer an unconfirmed key of this user, which is an invalid parameter
+        // of the request.
         refused(
             &router,
             row.case,
             "ConfirmDevice",
             &Value::Object(confirm),
             400,
-            "DeviceKeyExistsException",
+            "InvalidParameterException",
         )
         .await;
     }
@@ -787,7 +789,7 @@ async fn the_device_surface_refuses_what_it_cannot_serve() {
             operation: "ConfirmDevice",
             body: |_, token| json!({ "AccessToken": token, "DeviceKey": UNKNOWN_DEVICE_KEY }),
             status: 400,
-            code: "ResourceNotFoundException",
+            code: "InvalidParameterException",
         },
         RefusalRow {
             case: "UpdateDeviceStatus with a device key nothing minted",
@@ -1159,8 +1161,9 @@ struct StatusRow {
 
 /// `UpdateDeviceStatus` and `AdminUpdateDeviceStatus` record the answer the user gave
 /// the "Remember me on this device" prompt, and a request that names no status changes
-/// nothing. The answer is observable where it belongs: the self-service reader serves
-/// only a remembered device, while the device stays registered to the user either way.
+/// nothing. The answer is observable where it belongs: the self-service reader and the
+/// device listing serve only a remembered device, while the admin reader reports the
+/// device as registered to the user either way.
 #[tokio::test]
 async fn updating_a_devices_status_persists_the_remembered_answer() {
     // The modelled `DeviceRememberedStatusType` values, and the optional member left
@@ -1272,10 +1275,16 @@ async fn updating_a_devices_status_persists_the_remembered_answer() {
                  remembered status, got {admin_read}"
             );
             let listed = listed_device_keys(&router, &case, access_token, None).await;
+            let expected_listing = if row.remembered {
+                vec![device_key.clone()]
+            } else {
+                // A device the user no longer remembers leaves the listing:
+                // `ListDevices` reports the devices this user remembers.
+                Vec::new()
+            };
             assert_eq!(
-                listed,
-                vec![device_key.clone()],
-                "case {case:?}: the device stays registered to the user, got {listed:?}"
+                listed, expected_listing,
+                "case {case:?}: expected the listing {expected_listing:?}, got {listed:?}"
             );
 
             let service_state = state::service_state(&*engine).expect("this service's state");

@@ -185,12 +185,15 @@ async fn a_created_group_round_trips_through_stored_state() {
             json!(user_pool_id),
             "case {label:?}: the group must name the pool it was created in, got {group}"
         );
-        match &case.description {
+        match case.description.as_deref().filter(|value| !value.is_empty()) {
             Some(description) => assert_eq!(
                 group["Description"],
                 json!(description),
                 "case {label:?}: the stored description must be the created one, got {group}"
             ),
+            // An empty `Description` is accepted (its modelled length starts at
+            // 0) and materialised as no description at all, exactly like one the
+            // request left out.
             None => assert!(
                 group.get("Description").is_none(),
                 "case {label:?}: a group created without a description renders none, got {group}"

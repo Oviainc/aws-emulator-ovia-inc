@@ -256,7 +256,14 @@ async fn fixture(
     let result = &payload["AuthenticationResult"];
     Fixture {
         user_pool_id,
-        username: username.to_string(),
+        // The STORED username: a pool whose usernames are case-insensitive
+        // lower-cases the name on the way in, so that is the name every read
+        // reports.
+        username: if case_sensitive {
+            username.to_string()
+        } else {
+            username.to_lowercase()
+        },
         access_token: result["AccessToken"]
             .as_str()
             .expect("an access token")

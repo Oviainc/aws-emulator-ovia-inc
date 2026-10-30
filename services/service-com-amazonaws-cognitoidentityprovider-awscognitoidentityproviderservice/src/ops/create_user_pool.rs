@@ -332,7 +332,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         pool.email_configuration = input.email_configuration;
         pool.sms_configuration = input.sms_configuration;
         pool.verification_message_template = input.verification_message_template;
-        pool.account_recovery_setting = input.account_recovery_setting;
+        pool.account_recovery_setting = Some(crate::state::effective_account_recovery_setting(
+            input.account_recovery_setting,
+        ));
         pool.user_attribute_update_settings = input.user_attribute_update_settings;
         pool.user_pool_add_ons = input.user_pool_add_ons;
         pool.key_configuration = input.key_configuration;
