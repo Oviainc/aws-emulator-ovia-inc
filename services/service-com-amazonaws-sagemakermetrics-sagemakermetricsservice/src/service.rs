@@ -41,9 +41,28 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+use crate::ops::batch_get_metrics::{
+    INVALID_RESOURCE_ARN_CODE, INVALID_RESOURCE_ARN_MESSAGE, SAGEMAKER_RESOURCE_ARN_PATTERN,
+};
+
+/// Whether a boundary refusal is ABOUT a SageMaker resource reference: one of its
+/// violations is a `@pattern` violation of the expression every SageMaker resource ARN
+/// member is constrained with ([`SAGEMAKER_RESOURCE_ARN_PATTERN`]).
+///
+/// Keyed to that EXPRESSION rather than to a member path, so the rule holds for whichever
+/// member of whichever operation carried the value, at whatever position in whatever
+/// collection. A refusal that ALSO carries other violations is still answered as the
+/// resource-reference fault: the reference is what this service resolves a call against
+/// before it reads anything else, so that is the fault it reports.
+fn refused_resource_arn(violations: &[Violation]) -> bool {
+    violations.iter().any(|violation| {
+        matches!(&violation.kind, ViolationKind::Pattern(pattern) if pattern == SAGEMAKER_RESOURCE_ARN_PATTERN)
+    })
+}
 
 /// The `com-amazonaws-sagemakermetrics-sagemakermetricsservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -116,7 +135,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // WITHOUT the `^`/`$` anchors the Smithy pattern carries. That wording is shared
         // by every service on a JSON protocol, so it lives in `service-common`; the
         // check itself still uses the model's pattern as written.
-        service_common::aws_validation_refusal(refusal)
+        //
+        // A SageMaker resource reference is the exception: this service validates it
+        // itself, ahead of the rest of the request, and states only that the reference is
+        // not a SageMaker ARN — one constant sentence, with no member path, collection
+        // position, submitted value or expression quoted back. So a value the member's
+        // modelled `@pattern` rejects is answered with that sentence under the same
+        // `ValidationException` code, and the whole call is still refused rather than
+        // resolving to a per-query status.
+        match refusal {
+            Refusal::Invalid(violations) if refused_resource_arn(violations) => Some(Refused {
+                code: INVALID_RESOURCE_ARN_CODE.to_string(),
+                message: INVALID_RESOURCE_ARN_MESSAGE.to_string(),
+            }),
+            _ => service_common::aws_validation_refusal(refusal),
+        }
     }
 
     fn override_routing_error(

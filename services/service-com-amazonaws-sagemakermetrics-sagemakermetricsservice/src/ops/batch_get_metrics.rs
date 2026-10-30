@@ -31,6 +31,14 @@
 //!   `Message` naming the member.
 //! * `InternalError` — the shared store is unreachable.
 //!
+//! A `ResourceArn` outside the modelled `SageMakerResourceArn` `@pattern` is NOT one of
+//! those per-query statuses, and no handler code below sees it: the framework's
+//! constraint walk refuses such a request BEFORE this handler runs, and
+//! [`crate::service::EmulatedService::override_refusal`] — the one consumer of
+//! [`SAGEMAKER_RESOURCE_ARN_PATTERN`], [`INVALID_RESOURCE_ARN_CODE`] and
+//! [`INVALID_RESOURCE_ARN_MESSAGE`] — words that refusal, so the whole call is refused
+//! and no query is evaluated.
+//!
 //! This operation only READS state: polling it changes nothing a later caller sees.
 //!
 //! ## Reaching this service's state
@@ -87,6 +95,26 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-sagemakermetrics-sagema
 /// AWS publishes no number for this, so the cap is chosen by this emulator; it exists
 /// because the modelled `MetricQueryResultStatus::Truncated` has to be reachable at all.
 pub const MAX_RESULT_POINTS_PER_QUERY: usize = 1_000;
+
+/// The expression the model constrains a SageMaker resource reference with:
+/// `SageMakerResourceArn`'s `@pattern`, as
+/// `smithy_query(query="shape",shape="SageMakerResourceArn")` reports it, copied
+/// character for character so a violation of that member can be recognised by the
+/// requirement it broke.
+pub const SAGEMAKER_RESOURCE_ARN_PATTERN: &str =
+    r"^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:[a-z\-].*/";
+
+/// The error code a value outside [`SAGEMAKER_RESOURCE_ARN_PATTERN`] is refused under —
+/// the same code every other boundary refusal of this restJson1 service carries, so a
+/// client keeps branching on one code.
+pub const INVALID_RESOURCE_ARN_CODE: &str = "ValidationException";
+
+/// The WHOLE message that refusal states: this service validates a SageMaker resource
+/// reference itself, ahead of anything else in the request, and says only that the
+/// reference is not one. All fixed text — no member path, list position, submitted value
+/// or expression is quoted back, so the sentence is the same for every malformed
+/// reference.
+pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid SageMaker ARN";
 
 /// `MetricQueryResultStatus` members, as `types::METRIC_QUERY_RESULT_STATUS_VALUES`
 /// lists them.
