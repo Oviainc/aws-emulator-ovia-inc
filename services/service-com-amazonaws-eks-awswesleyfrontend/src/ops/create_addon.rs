@@ -17,7 +17,10 @@
 //! 2. that cluster must be `ACTIVE` — otherwise `InvalidRequestException` (400), the
 //!    modelled error for "the request is invalid given the state of the cluster";
 //! 3. the body's own members must hold up — otherwise `InvalidParameterException`
-//!    (400), naming the member and what it must be;
+//!    (400), naming the member and what it must be. The add-on and the build asked
+//!    for are held to the CATALOG the same `DescribeAddonVersions` serves: a name
+//!    the catalog publishes no build of for the cluster's Kubernetes version, and a
+//!    build whose compatibilities do not carry that version, are both refused;
 //! 4. the add-on must not already be installed — otherwise `ResourceInUseException`
 //!    (409), unless the request replays the `clientRequestToken` that created it, in
 //!    which case that add-on is returned again. This layer runs BEFORE the checks on
@@ -299,25 +302,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .version
             .clone()
             .unwrap_or_else(|| DEFAULT_KUBERNETES_VERSION.to_string());
-        // The version this add-on is installed at when the request names none: the
-        // one the add-on catalog publishes as the default for that Kubernetes version
-        // (`DescribeAddonVersions`), so an installed add-on reports a version the
-        // catalog offers. The catalog publishes the Amazon EKS-managed add-ons for
-        // the Kubernetes versions the calendar carries, and this handler accepts any
-        // well-formed add-on name (see LAYER 4 below), so a name or a cluster version
-        // the catalog does not cover falls back to the derived form.
-        let default_addon_version = guard
-            .default_addon_version(&input.addon_name, &cluster_version, now)
-            .unwrap_or_else(|| state::derive_default_addon_version(&cluster_version));
-        // The build this install runs: the caller's version when it named one,
-        // else the default version resolved just above. It is the build whose
-        // configuration schema the document below is validated against, and the
-        // version the stored record reports.
-        let addon_version = input
-            .addon_version
-            .clone()
-            .filter(|version| !version.trim().is_empty())
-            .unwrap_or(default_addon_version);
 
         // LAYER 4 — the body's own members. Each is a rule the model cannot express,
         // so the boundary validator passed the request and this is where it is caught.
@@ -328,6 +312,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.addon_name
             )));
         }
+        // "The name of the add-on. The name must match one of the names returned by
+        // DescribeAddonVersions" — and that listing is per Kubernetes version, so the
+        // name has to be one the catalog publishes a build of FOR THE CLUSTER'S OWN
+        // Kubernetes version. An add-on this cluster could not run is refused here,
+        // before any version is resolved and before anything is written, rather than
+        // installed at a version nothing published.
+        if !guard.publishes_addon_for(&input.addon_name, &cluster_version, now) {
+            return Err(invalid_parameter(state::addon_not_supported_message(
+                &input.addon_name,
+                &cluster_version,
+            )));
+        }
+        // "The version of the add-on. The version must match one of the versions
+        // returned by DescribeAddonVersions" — the same listing, narrowed the same
+        // way: a build the catalog does not publish, and a published build whose
+        // `compatibilities` do not carry this cluster's Kubernetes version, are both
+        // builds this cluster is not offered. A blank value names no build at all and
+        // is read as a request that names none (see below).
+        let requested_version = input
+            .addon_version
+            .clone()
+            .filter(|version| !version.trim().is_empty());
+        if let Some(requested) = requested_version.as_deref() {
+            if !guard.publishes_addon_build_for(
+                &input.addon_name,
+                requested,
+                &cluster_version,
+                now,
+            ) {
+                return Err(invalid_parameter(
+                    state::ADDON_VERSION_NOT_SUPPORTED_MESSAGE.to_string(),
+                ));
+            }
+        }
+        // The build this install runs: the caller's version when it named one, else
+        // the one the catalog publishes as the DEFAULT for the cluster's Kubernetes
+        // version (`DescribeAddonVersions`), so an installed add-on reports a version
+        // the catalog offers. The catalog publishes a default build for every
+        // Kubernetes version it publishes a build for at all, which the check above
+        // has already established; the derived form stands in only for a record that
+        // somehow reports a Kubernetes version the calendar does not carry.
+        let addon_version = requested_version.unwrap_or_else(|| {
+            guard
+                .default_addon_version(&input.addon_name, &cluster_version, now)
+                .unwrap_or_else(|| state::derive_default_addon_version(&cluster_version))
+        });
         if let Some(role_arn) = input
             .service_account_role_arn
             .as_deref()
@@ -348,8 +378,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Before any of that, a document which opens like JSON must BE JSON: an add-on
         // configuration is JSON or YAML, and a JSON document that does not parse can
         // never satisfy any schema. A YAML document is not validated here — the schema
-        // is a JSON Schema — and neither is a build this catalog does not publish,
-        // which publishes no schema to validate against.
+        // is a JSON Schema. The build is one the catalog offers this cluster by the
+        // time this runs (see above), so the schema it is held to is the one
+        // `DescribeAddonConfiguration` publishes for that same build.
         if let Some(values) = input
             .configuration_values
             .as_deref()
@@ -469,8 +500,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // add-on is the one the catalog publishes for it
         // (`AddonInfo$defaultNamespace`, `DescribeAddonVersions`), so a request that
         // names no namespace installs the add-on where the catalog says it goes.
-        // [`ADDON_DEFAULT_NAMESPACE`] stands in only for a name the catalog does not
-        // publish, which this handler still accepts (see LAYER 4 above).
+        // Every add-on this far into the handler is one the catalog publishes (see
+        // LAYER 4 above), so [`ADDON_DEFAULT_NAMESPACE`] stands in only for a catalog
+        // entry that somehow publishes no namespace of its own.
         let namespace = input
             .namespace_config
             .as_ref()
@@ -687,7 +719,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `resolveConflicts` decides what happens to a SELF-MANAGED copy of the
             // add-on already running on the cluster; this emulator runs no Kubernetes,
             // so there is never a self-managed copy to resolve against, and the member
-            // is not part of what an `Addon` reports.
+            // is not part of what an `Addon` reports. A value outside the modelled
+            // enum never reaches here: it is refused before dispatch, in this
+            // service's own wording (`crate::service::resolve_conflicts_contract`).
         };
 
         let addon = record.to_addon();

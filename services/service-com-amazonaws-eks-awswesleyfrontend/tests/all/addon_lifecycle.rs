@@ -172,6 +172,14 @@ async fn a_created_addon_reads_back_exactly_as_stored() {
     let router = emulator();
     active_cluster(&router, "read-back").await;
 
+    // The explicit-version row names a build out of the catalog itself, narrowed to
+    // the Kubernetes version the cluster runs: the builds a cluster is offered are
+    // the ones `DescribeAddonVersions` reports for it.
+    let cluster_version = default_cluster_version(&router).await;
+    let coredns_build = catalog_default_version(&router, "coredns", &cluster_version)
+        .await
+        .unwrap_or_else(|| panic!("setup: the catalog publishes coredns for {cluster_version}"));
+
     let cases: Vec<(&str, serde_json::Value)> = vec![
         (
             "only the required members",
@@ -179,7 +187,7 @@ async fn a_created_addon_reads_back_exactly_as_stored() {
         ),
         (
             "an explicit version",
-            serde_json::json!({ "addonName": "coredns", "addonVersion": "v1.11.4-eksbuild.2" }),
+            serde_json::json!({ "addonName": "coredns", "addonVersion": coredns_build }),
         ),
         (
             "a service account role and tags",
@@ -643,20 +651,22 @@ async fn members_the_model_cannot_constrain_are_refused_as_invalid_parameters() 
         }
     }
 
-    // The accepted side of the same members: every form the service does take.
+    // The accepted side of the same members: every form the service does take. Each
+    // row names a DIFFERENT add-on the catalog publishes, because one add-on installs
+    // at most once per cluster, and the rows differ along the member whose form they
+    // exercise. `priorityClassName` is one of the keys every published add-on's
+    // configuration schema declares (source: the common properties
+    // `DescribeAddonConfiguration` publishes, read in this crate's `addon_versions`
+    // suite).
     let accepted: Vec<(&str, serde_json::Value)> = vec![
         (
-            "an add-on name with dots and underscores (a Marketplace add-on name)",
-            serde_json::json!({ "addonName": "vendor_product.v2" }),
-        ),
-        (
-            "an addonName at the length ceiling",
-            serde_json::json!({ "addonName": "a".repeat(MAX_KUBERNETES_NAME_LEN) }),
+            "an add-on name with an underscore (a Marketplace add-on name)",
+            serde_json::json!({ "addonName": "dynatrace_dynatrace-operator" }),
         ),
         (
             "a role ARN with a path",
             serde_json::json!({
-                "addonName": "with-role-path",
+                "addonName": "aws-ebs-csi-driver",
                 "serviceAccountRoleArn":
                     "arn:aws:iam::000000000000:role/aws-service-role/eks.amazonaws.com/Role",
             }),
@@ -664,27 +674,27 @@ async fn members_the_model_cannot_constrain_are_refused_as_invalid_parameters() 
         (
             "a role ARN in another partition",
             serde_json::json!({
-                "addonName": "other-partition",
+                "addonName": "aws-efs-csi-driver",
                 "serviceAccountRoleArn": "arn:aws-us-gov:iam::000000000000:role/AddonRole",
             }),
         ),
         (
             "configurationValues that are a JSON object",
             serde_json::json!({
-                "addonName": "json-config",
-                "configurationValues": "{\"env\":{\"LOG_LEVEL\":\"debug\"}}",
+                "addonName": "metrics-server",
+                "configurationValues": "{\"priorityClassName\":\"system-cluster-critical\"}",
             }),
         ),
         (
             "configurationValues that are not JSON at all",
             serde_json::json!({
-                "addonName": "yaml-config",
+                "addonName": "kube-state-metrics",
                 "configurationValues": "env:\n  LOG_LEVEL: debug\n",
             }),
         ),
         (
             "an empty configurationValues document",
-            serde_json::json!({ "addonName": "empty-config", "configurationValues": "" }),
+            serde_json::json!({ "addonName": "snapshot-controller", "configurationValues": "" }),
         ),
     ];
 
@@ -698,21 +708,20 @@ async fn members_the_model_cannot_constrain_are_refused_as_invalid_parameters() 
 }
 
 // ---------------------------------------------------------------------------
-// RULE: the version an add-on reports is the one the caller named; with none
-// named it is the version the add-on catalog publishes as the default for the
-// cluster's own Kubernetes version, and where the catalog publishes no build for
-// that pair, one in the `vX.Y.Z-eksbuild.N` form every EKS add-on version takes.
+// RULE: the version an add-on reports is the build the caller named out of the
+// ones the catalog offers that cluster; with none named it is the build the
+// catalog publishes as the DEFAULT for the cluster's own Kubernetes version.
 // ---------------------------------------------------------------------------
 
-/// The version the catalog publishes as the default build of one add-on for one
-/// Kubernetes version, read through `DescribeAddonVersions` — so this suite
-/// checks `CreateAddon` against the catalog a caller reads, not against a
-/// repeated constant. `None` when the catalog publishes no build for the pair.
-async fn catalog_default_version(
+/// Every build the catalog offers one add-on on one Kubernetes version, newest
+/// first — the builds `DescribeAddonVersions` reports when it is narrowed to that
+/// version, so this suite checks `CreateAddon` against the catalog a caller reads
+/// rather than against a repeated constant.
+pub(crate) async fn catalog_builds(
     router: &MultiServiceRouter,
     addon_name: &str,
     kubernetes_version: &str,
-) -> Option<String> {
+) -> Vec<serde_json::Value> {
     let answer = call(
         router,
         REGION,
@@ -730,47 +739,141 @@ async fn catalog_default_version(
         "setup DescribeAddonVersions {addon_name}/{kubernetes_version}: got {answer:?}"
     );
     answer.body["addons"]
-        .as_array()?
-        .first()?
-        .get("addonVersions")?
-        .as_array()?
+        .as_array()
+        .and_then(|addons| addons.first())
+        .and_then(|addon| addon.get("addonVersions"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The `addonVersion` of one reported build.
+fn build_version(build: &serde_json::Value) -> String {
+    build["addonVersion"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected an addonVersion, got {build:?}"))
+        .to_owned()
+}
+
+/// The build the catalog publishes as the default one of an add-on for one
+/// Kubernetes version — the one `CreateAddon` installs when the caller names none.
+pub(crate) async fn catalog_default_version(
+    router: &MultiServiceRouter,
+    addon_name: &str,
+    kubernetes_version: &str,
+) -> Option<String> {
+    catalog_builds(router, addon_name, kubernetes_version)
+        .await
         .iter()
         .find(|build| {
             build["compatibilities"]
                 .as_array()
                 .is_some_and(|compatibilities| {
-                    compatibilities.iter().any(|compatibility| {
-                        compatibility["defaultVersion"].as_bool() == Some(true)
-                    })
+                    compatibilities
+                        .iter()
+                        .any(|compatibility| compatibility["defaultVersion"].as_bool() == Some(true))
                 })
-        })?
-        .get("addonVersion")?
-        .as_str()
-        .map(str::to_owned)
+        })
+        .map(build_version)
+}
+
+/// The Kubernetes versions `DescribeClusterVersions` publishes for a cluster to be
+/// created on, newest first.
+pub(crate) async fn published_cluster_versions(router: &MultiServiceRouter) -> Vec<String> {
+    let answer = call(router, REGION, "GET", "/cluster-versions?maxResults=100", "").await;
+    assert_eq!(
+        answer.status, 200,
+        "setup DescribeClusterVersions: got {answer:?}"
+    );
+    answer.body["clusterVersions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a clusterVersions list, got {:?}", answer.body))
+        .iter()
+        .map(|row| {
+            row["clusterVersion"]
+                .as_str()
+                .unwrap_or_else(|| panic!("expected a clusterVersion, got {row:?}"))
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Every add-on name the catalog publishes, in the order it publishes them — the
+/// names `CreateAddon` installs, read out of the catalog itself so a suite that
+/// needs several distinct add-ons names no constant.
+pub(crate) async fn published_addon_names(router: &MultiServiceRouter) -> Vec<String> {
+    let answer = call(
+        router,
+        REGION,
+        "GET",
+        "/addons/supported-versions?maxResults=100",
+        "",
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "setup DescribeAddonVersions: got {answer:?}"
+    );
+    answer.body["addons"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected an addons list, got {:?}", answer.body))
+        .iter()
+        .map(|addon| {
+            addon["addonName"]
+                .as_str()
+                .unwrap_or_else(|| panic!("expected an addonName, got {addon:?}"))
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The Kubernetes version a cluster created without one lands on — the version
+/// `DescribeClusterVersions` reports as the default, and so the version whose
+/// default add-on builds a cluster in this suite is offered.
+pub(crate) async fn default_cluster_version(router: &MultiServiceRouter) -> String {
+    let answer = call(router, REGION, "GET", "/cluster-versions?defaultOnly=true", "").await;
+    assert_eq!(
+        answer.status, 200,
+        "setup DescribeClusterVersions(defaultOnly): got {answer:?}"
+    );
+    answer.body["clusterVersions"]
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row["clusterVersion"].as_str())
+        .unwrap_or_else(|| panic!("expected one default cluster version, got {:?}", answer.body))
+        .to_owned()
 }
 
 #[tokio::test]
 async fn the_addon_version_is_the_one_named_or_the_cluster_default() {
     let router = emulator();
-    // Rows differ along the cluster's Kubernetes version, which is what the default
-    // is taken from: two the published calendar does not carry (so the catalog has
-    // no build for them) and one it does.
-    let versions = ["1.28", "1.29", "1.31"];
-    for version in versions {
+    // Rows differ along the cluster's Kubernetes version — which is what both the
+    // default build and the set of builds the cluster is offered are taken from —
+    // taking the newest version the published calendar carries and the oldest, so a
+    // version a newer build exists for and one none does are both covered.
+    let calendar = published_cluster_versions(&router).await;
+    let versions = [
+        calendar
+            .first()
+            .expect("the calendar publishes a version")
+            .clone(),
+        calendar
+            .last()
+            .expect("the calendar publishes a version")
+            .clone(),
+    ];
+    for version in &versions {
         let mut request = cluster_request(&format!("k8s-{}", version.replace('.', "-")));
         request["version"] = serde_json::json!(version);
         create_cluster_in(&router, REGION, &request).await;
     }
     wait_for_cluster_active().await;
 
-    for version in versions {
+    for version in &versions {
         let cluster = format!("k8s-{}", version.replace('.', "-"));
-        let expected = match catalog_default_version(&router, "vpc-cni", version).await {
-            Some(published) => published,
-            // No build is published for that Kubernetes version, so the version has
-            // to come from the cluster's own Kubernetes version.
-            None => format!("v{version}.0-eksbuild.1"),
-        };
+        let expected = catalog_default_version(&router, "vpc-cni", version)
+            .await
+            .unwrap_or_else(|| panic!("setup {version}: the catalog publishes a default build"));
         let defaulted = create_addon(
             &router,
             &cluster,
@@ -789,18 +892,32 @@ async fn the_addon_version_is_the_one_named_or_the_cluster_default() {
             defaulted.addon()["addonVersion"]
         );
 
-        // A named version is kept verbatim, whatever it is.
-        for named in ["v1.11.4-eksbuild.2", "v2.0.0-eksbuild.11"] {
+        // A named build is kept verbatim, for every add-on the request can name it
+        // for: the rows differ along the add-on (each carries its own version line)
+        // and along which of the builds offered for this Kubernetes version is named
+        // — the newest offered one, which for a version a newer build exists for is
+        // NOT the default, and the default one.
+        for addon in ["coredns", "kube-proxy", "metrics-server"] {
+            let offered = catalog_builds(&router, addon, version).await;
+            assert!(
+                !offered.is_empty(),
+                "setup {addon}/{version}: the catalog must offer a build"
+            );
+            let named = build_version(&offered[0]);
             let answer = create_addon(
                 &router,
                 &cluster,
-                &serde_json::json!({ "addonName": named, "addonVersion": named }),
+                &serde_json::json!({ "addonName": addon, "addonVersion": named }),
             )
             .await;
             assert_eq!(
+                answer.status, 200,
+                "case {version:?}/{addon}/{named:?}: expected 200, got {answer:?}"
+            );
+            assert_eq!(
                 answer.addon()["addonVersion"],
                 serde_json::json!(named),
-                "case {version:?}/{named:?}: a named version is kept, got {:?}",
+                "case {version:?}/{addon}/{named:?}: a named build is kept, got {:?}",
                 answer.addon()["addonVersion"]
             );
         }
@@ -855,11 +972,21 @@ async fn a_retry_with_the_same_idempotency_token_is_absorbed() {
         })
         .collect();
 
+    // One add-on name installs at most once per cluster, so each row drives a
+    // DIFFERENT add-on of the published catalog.
+    let published = published_addon_names(&router).await;
+    assert!(
+        published.len() >= expanded.len(),
+        "setup: the catalog must publish at least {} add-ons, got {}",
+        expanded.len(),
+        published.len()
+    );
+
     for (index, (case, first_token, second_token, expected, with_associations)) in
         expanded.iter().enumerate()
     {
         let with_associations = *with_associations;
-        let name = format!("addon-{index}");
+        let name = published[index].clone();
         let request = |token: &Option<&str>| {
             let mut body = serde_json::json!({ "addonName": name });
             if let Some(token) = token {
@@ -1076,31 +1203,41 @@ async fn a_new_addon_reports_creating_until_the_clock_owes_it_active() {
 }
 
 // ---------------------------------------------------------------------------
-// RULE: the store is bounded — a cluster that already holds its maximum number of
-// add-ons refuses another, and the refusal writes nothing.
+// RULE: the add-ons one cluster can hold are the ones the catalog publishes for
+// its Kubernetes version — every one of them installs, a name outside that set
+// never does, and a refused create writes nothing.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_per_cluster_addon_ceiling_is_enforced() {
+async fn a_cluster_holds_exactly_the_addons_the_catalog_publishes_for_it() {
     let router = emulator();
     active_cluster(&router, "saturated").await;
 
-    for index in 0..MAX_ADDONS_PER_CLUSTER {
+    // What bounds this part of the store: the catalog, which is a fixed table, so
+    // one cluster can hold no more add-ons than it publishes — well inside the
+    // ceiling `CreateAddon` keeps as its backstop.
+    let published = published_addon_names(&router).await;
+    assert!(
+        !published.is_empty() && published.len() <= MAX_ADDONS_PER_CLUSTER,
+        "setup: the catalog must publish between one and {MAX_ADDONS_PER_CLUSTER} add-ons, \
+         got {}",
+        published.len()
+    );
+    for name in &published {
         let answer = create_addon(
             &router,
             "saturated",
-            &serde_json::json!({ "addonName": format!("addon-{index:04}") }),
+            &serde_json::json!({ "addonName": name }),
         )
         .await;
         assert_eq!(
             answer.status, 200,
-            "case {index} of {MAX_ADDONS_PER_CLUSTER} within the ceiling: expected 200, \
-             got {answer:?}"
+            "case {name:?}: every add-on the catalog publishes installs, got {answer:?}"
         );
     }
 
-    // Rows differ only in the name, which is the point: at the ceiling no name is
-    // accepted.
+    // Rows differ only in the name, which is the point: with the catalog exhausted
+    // no further name is accepted, whatever it is.
     for case in ["one-more", "another", "yet-another"] {
         let answer = create_addon(
             &router,
@@ -1110,12 +1247,13 @@ async fn the_per_cluster_addon_ceiling_is_enforced() {
         .await;
         assert_eq!(
             answer.status, 400,
-            "case {case:?}: expected 400 at the ceiling, got {answer:?}"
+            "case {case:?}: expected 400 for a name the catalog does not publish, got \
+             {answer:?}"
         );
         assert_eq!(
             answer.error_type.as_deref(),
-            Some("InvalidRequestException"),
-            "case {case:?}: expected InvalidRequestException, got {answer:?}"
+            Some("InvalidParameterException"),
+            "case {case:?}: expected InvalidParameterException, got {answer:?}"
         );
         let described = describe_addon(&router, "saturated", case).await;
         assert_eq!(
@@ -1124,17 +1262,17 @@ async fn the_per_cluster_addon_ceiling_is_enforced() {
         );
     }
 
-    // Another cluster has its own ceiling.
+    // The set is per cluster, so another cluster takes the same add-ons again.
     active_cluster(&router, "roomy").await;
     let answer = create_addon(
         &router,
         "roomy",
-        &serde_json::json!({ "addonName": "one-more" }),
+        &serde_json::json!({ "addonName": published[0] }),
     )
     .await;
     assert_eq!(
         answer.status, 200,
-        "the ceiling is per cluster, so another cluster still accepts an add-on, \
+        "the add-ons a cluster holds are its own, so another cluster still accepts one, \
          got {answer:?}"
     );
 }
@@ -1174,7 +1312,7 @@ async fn the_associations_an_addon_creates_obey_the_cluster_association_rules() 
             &router,
             "associated",
             &serde_json::json!({
-                "addonName": "too-many",
+                "addonName": "vpc-cni",
                 "podIdentityAssociations": association_list(over),
             }),
         )
@@ -1188,7 +1326,7 @@ async fn the_associations_an_addon_creates_obey_the_cluster_association_rules() 
             Some("InvalidRequestException"),
             "case {over} associations: expected InvalidRequestException, got {answer:?}"
         );
-        let described = describe_addon(&router, "associated", "too-many").await;
+        let described = describe_addon(&router, "associated", "vpc-cni").await;
         assert_eq!(
             described.status, 404,
             "case {over} associations: the refused create must store nothing, got \
@@ -1241,7 +1379,7 @@ async fn the_associations_an_addon_creates_obey_the_cluster_association_rules() 
             &router,
             "associated",
             &serde_json::json!({
-                "addonName": "conflicting",
+                "addonName": "coredns",
                 "podIdentityAssociations": associations,
             }),
         )
@@ -1258,7 +1396,7 @@ async fn the_associations_an_addon_creates_obey_the_cluster_association_rules() 
         );
         // Neither the add-on nor the association that WOULD have been created is
         // written: a request that cannot be carried out in full writes nothing.
-        let described = describe_addon(&router, "associated", "conflicting").await;
+        let described = describe_addon(&router, "associated", "coredns").await;
         assert_eq!(
             described.status, 404,
             "case {case:?}: the refused create must store no add-on, got {described:?}"
@@ -1281,7 +1419,7 @@ async fn the_associations_an_addon_creates_obey_the_cluster_association_rules() 
         &router,
         "associated",
         &serde_json::json!({
-            "addonName": "other",
+            "addonName": "kube-proxy",
             "podIdentityAssociations": [{ "serviceAccount": "other-sa", "roleArn": ROLE_ARN }],
         }),
     )
@@ -1296,7 +1434,7 @@ async fn the_associations_an_addon_creates_obey_the_cluster_association_rules() 
         &router,
         "associated",
         &serde_json::json!({
-            "addonName": "disjoint",
+            "addonName": "metrics-server",
             "podIdentityAssociations": [{ "serviceAccount": "own-sa", "roleArn": ROLE_ARN }],
         }),
     )

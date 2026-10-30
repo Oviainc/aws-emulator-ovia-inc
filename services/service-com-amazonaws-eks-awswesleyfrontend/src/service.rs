@@ -23,8 +23,10 @@
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. EDITED HERE: it claims a tag request the model's own tag contract
 //!   refuses, so that refusal is stated in the error code the called operation
-//!   declares (see [`tag_contract`]). Every other request resolves through the
-//!   generated routing table.
+//!   declares (see [`tag_contract`]), and an add-on request whose `resolveConflicts`
+//!   is outside the modelled enum, so that refusal names the operation it was sent
+//!   to (see [`resolve_conflicts_contract`]). Every other request resolves through
+//!   the generated routing table.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -42,6 +44,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+pub mod resolve_conflicts_contract;
 pub mod tag_contract;
 
 use smithy_server_runtime::{
@@ -62,6 +65,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// [`Service::override_operation`] hands back a borrow of one of its own
     /// operations.
     refused_tag_request: tag_contract::RefusedTagRequest,
+    /// Answers a `CreateAddon` / `UpdateAddon` request whose `resolveConflicts`
+    /// is outside the modelled enum, in this service's own sentence for that
+    /// value (see [`resolve_conflicts_contract`]). Held on the service for the
+    /// same reason the refused tag request is.
+    refused_addon_request: resolve_conflicts_contract::RefusedAddonRequest,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -72,6 +80,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(engine),
             refused_tag_request: tag_contract::RefusedTagRequest::new(),
+            refused_addon_request: resolve_conflicts_contract::RefusedAddonRequest::new(),
         }
     }
 }
@@ -113,10 +122,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Every other request keeps the generated routing table as its only source.
         // See [`tag_contract`] for the whole argument and for the refusal this
         // answers instead.
+        //
+        // ALSO EDITED HERE, for the same reason: an add-on request whose
+        // `resolveConflicts` is outside the modelled enum is refused in a sentence
+        // that names the OPERATION it was sent to, which a per-service refusal seam
+        // cannot word because no operation is named by the time it is reached. See
+        // [`resolve_conflicts_contract`].
         let protocol = self.entry.protocol();
         let key = protocol.routing_key(req).ok()?;
-        tag_contract::refusal_for(key, protocol, req)
-            .map(|_| &self.refused_tag_request as &dyn ErasedOperation)
+        if tag_contract::refusal_for(key, protocol, req).is_some() {
+            return Some(&self.refused_tag_request as &dyn ErasedOperation);
+        }
+        if resolve_conflicts_contract::refusal_for(key, protocol, req).is_some() {
+            return Some(&self.refused_addon_request as &dyn ErasedOperation);
+        }
+        None
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

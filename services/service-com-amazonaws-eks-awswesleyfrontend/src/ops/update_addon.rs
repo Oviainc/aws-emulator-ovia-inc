@@ -116,7 +116,8 @@
 use super::types::*;
 use crate::state::{
     self, PendingAddonUpdate, UpdateRecord, UpdateScope, ADDON_STATUSES_AN_UPDATE_STARTS_FROM,
-    ADDON_STATUS_UPDATING, MAX_POD_IDENTITY_ASSOCIATIONS_PER_CLUSTER, STATUS_ACTIVE,
+    ADDON_STATUS_UPDATING, DEFAULT_KUBERNETES_VERSION,
+    MAX_POD_IDENTITY_ASSOCIATIONS_PER_CLUSTER, STATUS_ACTIVE,
     UPDATE_COMPLETION_DELAY, UPDATE_IN_PROGRESS, UPDATE_PARAM_ADDON_VERSION,
     UPDATE_PARAM_CONFIGURATION_VALUES, UPDATE_PARAM_POD_IDENTITY_ASSOCIATIONS,
     UPDATE_PARAM_RESOLVE_CONFLICTS, UPDATE_PARAM_SERVICE_ACCOUNT_ROLE_ARN, UPDATE_TYPE_ADDON,
@@ -295,6 +296,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let addon_status = addon.status.clone();
         let installed_version = addon.addon_version.clone();
         let cluster_status = cluster.status.clone();
+        // The cluster's own Kubernetes version, which the builds offered for this
+        // add-on are the ones compatible with. Every cluster this far into the handler
+        // is an Amazon EKS cluster and reports one; the service's default Kubernetes
+        // version stands in for a record that somehow carries none.
+        let cluster_version = cluster
+            .version
+            .clone()
+            .unwrap_or_else(|| DEFAULT_KUBERNETES_VERSION.to_string());
         // An update of an add-on is an update OF THAT ADD-ON: it is what selects the
         // update in a listing (`ListUpdates$addonName`) and what makes a second update
         // of the same add-on a conflict while the first is still running.
@@ -364,6 +373,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .map(|version| version.trim().to_string())
             .filter(|version| !version.is_empty());
+        // "The version of the add-on. The version must match one of the versions
+        // returned by DescribeAddonVersions" — the same rule `CreateAddon` holds a
+        // pinned build to, against the same catalog narrowed to the cluster's own
+        // Kubernetes version: an add-on cannot be updated TO a build that cluster is
+        // not offered, whether the catalog publishes no such build at all or publishes
+        // it without that Kubernetes version among its compatibilities.
+        if let Some(requested) = requested_version.as_deref() {
+            if !guard.publishes_addon_build_for(
+                &input.addon_name,
+                requested,
+                &cluster_version,
+                now,
+            ) {
+                return Err(invalid_parameter(
+                    state::ADDON_VERSION_NOT_SUPPORTED_MESSAGE.to_string(),
+                ));
+            }
+        }
         if let Some(role_arn) = input
             .service_account_role_arn
             .as_deref()

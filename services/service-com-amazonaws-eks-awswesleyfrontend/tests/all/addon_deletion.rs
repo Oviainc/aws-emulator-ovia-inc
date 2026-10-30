@@ -23,7 +23,9 @@ use service_com_amazonaws_eks_awswesleyfrontend::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::addon_lifecycle::{create_addon, describe_addon, describe_association};
+use crate::addon_lifecycle::{
+    create_addon, describe_addon, describe_association, published_addon_names,
+};
 use crate::cluster_lifecycle::{create as create_cluster, minimal_request, REGION};
 use crate::wire::{call, emulator, encode_label, error_code, Answer};
 
@@ -313,10 +315,22 @@ async fn preserve_decides_whether_the_associations_the_addon_owns_go_with_it() {
         ("preserve=true", Some(true), true),
     ];
 
+    // One add-on name installs at most once per cluster, so each row drives a
+    // DIFFERENT add-on of the published catalog.
+    let published = published_addon_names(&router).await;
+    assert!(
+        published.len() >= preserve_cases.len() * 2,
+        "setup: the catalog must publish at least {} add-ons, got {}",
+        preserve_cases.len() * 2,
+        published.len()
+    );
+    let mut next_addon = 0_usize;
+
     for (index, (case, preserve, kept)) in preserve_cases.iter().enumerate() {
         for count in [1_usize, 3] {
             let case = format!("{case} with {count} association(s)");
-            let addon_name = format!("addon-{index}-{count}");
+            let addon_name = published[next_addon].clone();
+            next_addon += 1;
             let associations: Vec<serde_json::Value> = (0..count)
                 .map(|slot| {
                     serde_json::json!({
@@ -585,15 +599,20 @@ async fn an_update_in_flight_when_the_addon_is_deleted_does_not_succeed() {
     active_cluster(&router, "interrupted").await;
 
     // Rows differ along what the in-flight update asked to change: a member of the
-    // add-on itself, and a member plus the set of child associations it owns.
-    let cases: Vec<(&str, serde_json::Value, Option<bool>)> = vec![
+    // add-on itself, and a member plus the set of child associations it owns. Each row
+    // installs a DIFFERENT add-on the catalog publishes, and one whose install settles
+    // ACTIVE on a cluster with no compute (a per-node workload with no prerequisite
+    // add-on), because only a settled add-on takes an update.
+    let cases: Vec<(&str, &str, serde_json::Value, Option<bool>)> = vec![
         (
             "a new service account role",
+            "vpc-cni",
             serde_json::json!({ "serviceAccountRoleArn": OTHER_ROLE_ARN }),
             None,
         ),
         (
             "a new service account role and a new association set",
+            "kube-proxy",
             serde_json::json!({
                 "serviceAccountRoleArn": OTHER_ROLE_ARN,
                 "podIdentityAssociations": [
@@ -604,8 +623,8 @@ async fn an_update_in_flight_when_the_addon_is_deleted_does_not_succeed() {
         ),
     ];
 
-    for (index, (case, change, preserve)) in cases.iter().enumerate() {
-        let addon_name = format!("interrupted-{index}");
+    for (case, addon, change, preserve) in cases.iter() {
+        let addon_name = (*addon).to_string();
         active_addon(
             &router,
             "interrupted",

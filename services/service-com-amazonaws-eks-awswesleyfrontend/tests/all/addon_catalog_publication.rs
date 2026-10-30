@@ -394,8 +394,9 @@ async fn create_addon_holds_configuration_values_to_the_published_schema() {
     // The rows differ along the JSON type of the key the document sets, and the
     // way the document meets or fails the schema: a legal value, a key of the
     // wrong type, a key the schema does not declare, a document that is not an
-    // object at all, a required property left out, a YAML document (which no
-    // JSON Schema judges) and an add-on this catalog publishes no schema for.
+    // object at all, a required property left out, and a YAML document (which no
+    // JSON Schema judges). Every row names an add-on the catalog publishes, since
+    // that is the only kind an install can name at all.
     let rows: Vec<(&str, &str, &str, Expected)> = vec![
         (
             "a boolean key the add-on declares",
@@ -503,12 +504,6 @@ async fn create_addon_holds_configuration_values_to_the_published_schema() {
             "a YAML document, which this service does not judge (known gap)",
             "eks-pod-identity-agent",
             "agent:\n  logLevel: debug\n",
-            Expected::Installed,
-        ),
-        (
-            "any document for an add-on this catalog publishes no schema for",
-            "vendor_private.operator",
-            "{\"anythingAtAll\": [1, 2, 3]}",
             Expected::Installed,
         ),
     ];

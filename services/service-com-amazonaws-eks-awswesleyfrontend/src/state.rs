@@ -562,6 +562,30 @@ pub fn tag_ceiling_message(limit: usize) -> String {
     format!("The resultant tag set must not have more than {limit} user tags.")
 }
 
+/// How much of a caller-supplied value a refusal this service words may echo.
+///
+/// A refusal interpolates the value that was refused, so the caller can see what it
+/// sent, and the caller chooses that value's length — so an unbounded echo would
+/// amplify one request into an arbitrarily long response. The framework bounds its
+/// own echo of a refused value at the same length.
+pub const MAX_ECHOED_VALUE: usize = 256;
+
+/// `value` elided at `limit` CHARACTERS, on a character boundary, with the elision
+/// marked.
+///
+/// The one form every refusal this service words echoes a caller-supplied value in,
+/// so two of them cannot elide the same value differently. RENDERING ONLY: each
+/// caller judges the ORIGINAL value and uses this solely to interpolate, since
+/// eliding before the check would judge text the caller never sent.
+#[must_use]
+pub fn elided_value(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+    let kept: String = value.chars().take(limit).collect();
+    format!("{kept}…")
+}
+
 /// The `CancellationStatus` member a cancellation this emulator performed
 /// carries. The model's enum is `InProgress | Failed | Successful`
 /// (`smithy_query query="shape" shape="CancellationStatus"`); the other two
@@ -2840,11 +2864,14 @@ pub const ADDON_DEFAULT_NAMESPACE: &str = "kube-system";
 
 /// The number of add-ons one cluster holds before `CreateAddon` refuses another.
 ///
-/// AWS publishes no "add-ons per cluster" quota, so this ceiling is CHOSEN: it
-/// is what bounds the store, since add-on names are caller-supplied and
-/// repeated creates would otherwise let one cluster retain an unbounded number
-/// of records. It is generous next to the handful of add-ons a real cluster
-/// runs, and `MAX_STORED_CLUSTERS` bounds how many clusters can hold that many.
+/// AWS publishes no "add-ons per cluster" quota, so this ceiling is CHOSEN. What
+/// bounds this part of the store is the catalog: an add-on installs only under a
+/// name the catalog publishes for the cluster's Kubernetes version
+/// ([`ComAmazonawsEksAwswesleyfrontendState::publishes_addon_for`]) and one name
+/// installs at most once per cluster, so [`ADDON_CATALOG`] already caps how many
+/// records a cluster can retain. This ceiling is the backstop behind that cap: it
+/// is generous next to the handful of add-ons a real cluster runs, and
+/// `MAX_STORED_CLUSTERS` bounds how many clusters can hold that many.
 pub const MAX_ADDONS_PER_CLUSTER: usize = 100;
 
 /// The change an in-flight add-on update puts on its add-on when it completes.
@@ -5668,6 +5695,47 @@ impl ComAmazonawsEksAwswesleyfrontendState {
         Some((addon, version))
     }
 
+    /// Whether the catalog publishes any build of one add-on that supports one
+    /// Kubernetes version at `now`.
+    ///
+    /// This is what "the name must match one of the names returned by
+    /// `DescribeAddonVersions`" (`CreateAddon$addonName`) means for a request
+    /// against one cluster: the names that listing reports when it is narrowed
+    /// to that cluster's Kubernetes version, which is exactly the add-ons that
+    /// have a build for it.
+    pub fn publishes_addon_for(
+        &self,
+        addon_name: &str,
+        kubernetes_version: &str,
+        now: SystemTime,
+    ) -> bool {
+        self.published_addon(addon_name, now).is_some_and(|addon| {
+            addon
+                .published_versions(now)
+                .any(|version| version.supports(kubernetes_version))
+        })
+    }
+
+    /// Whether the catalog publishes the build one `(addonName, addonVersion)`
+    /// pair names AND lists one Kubernetes version among that build's
+    /// compatibilities at `now`.
+    ///
+    /// This is what "the version must match one of the versions returned by
+    /// `DescribeAddonVersions`" (`CreateAddon$addonVersion`) means for a request
+    /// against one cluster: a build the catalog does not publish at all, and a
+    /// published build whose `compatibilities` do not carry the cluster's
+    /// Kubernetes version, are both builds that listing does not offer for it.
+    pub fn publishes_addon_build_for(
+        &self,
+        addon_name: &str,
+        addon_version: &str,
+        kubernetes_version: &str,
+        now: SystemTime,
+    ) -> bool {
+        self.published_addon_build(addon_name, addon_version, now)
+            .is_some_and(|(_, build)| build.supports(kubernetes_version))
+    }
+
     /// The version the catalog publishes as the DEFAULT build of one add-on for
     /// one Kubernetes version — the version `CreateAddon` installs when the
     /// caller names none — or `None` when this catalog publishes no build of
@@ -6907,10 +6975,10 @@ pub fn derive_addon_arn(
 /// installed add-on cannot disagree.
 ///
 /// This is the fallback for a request the catalog cannot answer: the published
-/// catalog is the Amazon EKS-managed add-ons ([`ADDON_CATALOG`]) for the
-/// Kubernetes versions the calendar carries ([`VERSION_CALENDAR`]), and an
-/// add-on name outside it is still accepted ([`is_addon_name_shaped`]), so a
-/// version has to come from somewhere. It builds one in the `vX.Y.Z-eksbuild.N`
+/// catalog is the add-ons [`ADDON_CATALOG`] carries for the Kubernetes versions
+/// the calendar carries ([`VERSION_CALENDAR`]), so a cluster whose record
+/// somehow reports a Kubernetes version outside that calendar still reports a
+/// version for its add-ons. It builds one in the `vX.Y.Z-eksbuild.N`
 /// form every EKS add-on version takes out of the cluster's own Kubernetes
 /// version, so a cluster on one Kubernetes version always reports the same
 /// default and the value a caller reads back is the one the record was created
@@ -6931,14 +6999,14 @@ pub fn derive_default_addon_version(kubernetes_version: &str) -> String {
 /// `CreateAddon$addonName` targets a plain `String` with no `length` or
 /// `pattern` trait (`smithy_query query="operation" operation="CreateAddon"`),
 /// so the boundary validator accepts anything — including the empty string —
-/// and this is the check that refuses a value no add-on name can be. It is a
-/// FORM check, not a catalog check: "the name must match one of the names
-/// returned by `DescribeAddonVersions`", and the catalog this emulator
-/// publishes ([`ADDON_CATALOG`]) is the Amazon EKS-managed add-ons alone, so
-/// matching against it would refuse the AWS Marketplace add-ons the real
-/// service accepts. The character set is the one every published add-on name
-/// uses, EKS-managed (`vpc-cni`) and Marketplace (`<publisher>_<product>`)
-/// alike.
+/// and this is the check that refuses a value no add-on name can be. It is the
+/// FORM check that runs BEFORE the catalog one
+/// ([`ComAmazonawsEksAwswesleyfrontendState::publishes_addon_for`]), which is
+/// what "the name must match one of the names returned by
+/// `DescribeAddonVersions`" states: a value no add-on name can be is reported as
+/// the form it broke rather than as a catalog miss. The character set is the one
+/// every published add-on name uses, EKS-managed (`vpc-cni`) and Marketplace
+/// (`<publisher>_<product>`) alike.
 ///
 /// The LENGTH ceiling is [`MAX_KUBERNETES_NAME_LEN`], the DNS-1123 subdomain
 /// limit this module already bounds Kubernetes names by: an add-on name names
@@ -6952,6 +7020,32 @@ pub fn is_addon_name_shaped(name: &str) -> bool {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
 }
+
+/// The sentence Amazon EKS refuses an `addonName` the catalog does not publish
+/// for the cluster's Kubernetes version with.
+///
+/// "The name must match one of the names returned by `DescribeAddonVersions`"
+/// (`CreateAddon$addonName`), and that listing is per Kubernetes version, so the
+/// refusal names both the add-on asked for and the Kubernetes version of the
+/// cluster it was asked for — the version held on the cluster record, not
+/// anything the request carried.
+#[must_use]
+pub fn addon_not_supported_message(addon_name: &str, kubernetes_version: &str) -> String {
+    format!(
+        "Addon {addon_name} specified is not supported in {kubernetes_version} kubernetes \
+         version"
+    )
+}
+
+/// The sentence Amazon EKS refuses an `addonVersion` the catalog does not offer
+/// for the cluster's Kubernetes version with.
+///
+/// It names no value: the build asked for and the cluster's Kubernetes version
+/// are both in the request and the record the caller already has, so the
+/// refusal is one fixed sentence for every build the catalog does not offer —
+/// one it does not publish at all, and one whose `compatibilities` do not carry
+/// that Kubernetes version.
+pub const ADDON_VERSION_NOT_SUPPORTED_MESSAGE: &str = "Addon version specified is not supported";
 
 /// The digest one registration's server-generated values are derived from.
 ///

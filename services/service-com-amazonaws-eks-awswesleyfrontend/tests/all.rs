@@ -31,6 +31,8 @@ mod addon_deletion;
 mod addon_install_outcome;
 #[path = "all/addon_lifecycle.rs"]
 mod addon_lifecycle;
+#[path = "all/addon_request_validation.rs"]
+mod addon_request_validation;
 #[path = "all/addon_update.rs"]
 mod addon_update;
 #[path = "all/addon_versions.rs"]

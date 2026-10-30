@@ -541,10 +541,9 @@ async fn the_addon_check_reports_builds_that_do_not_cover_the_next_version() {
     let (current, target) = version_pair(&engine);
     // Rows differ in the add-on build installed: none at all; the catalog's default
     // build for the cluster's own version, which is published for that version and the
-    // one before it and so not for the version the cluster would move to; the default
-    // build for THAT version, which is published for it; and a build the catalog does
-    // not publish at all, whose compatibilities this service does not know and so does
-    // not report as a finding.
+    // one before it and so not for the version the cluster would move to; and the
+    // default build for THAT version, which is published for it. A build the catalog
+    // does not publish cannot be installed at all, so no row can carry one.
     let build_for_current = default_addon_version(&engine, &current);
     let build_for_target = default_addon_version(&engine, &target);
     assert_ne!(
@@ -561,11 +560,6 @@ async fn the_addon_check_reports_builds_that_do_not_cover_the_next_version() {
         (
             "the default build for the version the cluster would move to",
             Some(build_for_target.clone()),
-            INSIGHT_STATUS_PASSING,
-        ),
-        (
-            "a build the catalog does not publish",
-            Some("v9.99.0-eksbuild.1".to_string()),
             INSIGHT_STATUS_PASSING,
         ),
     ];

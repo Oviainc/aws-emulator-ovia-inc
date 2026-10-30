@@ -234,8 +234,10 @@ async fn an_install_settles_in_the_state_the_cluster_could_give_it() {
     let router = emulator();
 
     // The rows differ along the add-on's workload, the form the cluster's
-    // compute takes (or its absence), the namespace the add-on is installed
-    // into, and whether the catalog publishes the add-on at all.
+    // compute takes (or its absence), and the namespace the add-on is installed
+    // into. Every row names an add-on the catalog publishes, because an install is
+    // the only way a record is written and a name the catalog does not publish for
+    // the cluster's Kubernetes version is refused before any install runs.
     let rows = vec![
         Row {
             case: "a per-node add-on has no replica to place, so no nodes is no problem",
@@ -313,9 +315,12 @@ async fn an_install_settles_in_the_state_the_cluster_could_give_it() {
             expected_codes: vec!["InsufficientNumberOfReplicas"],
         },
         Row {
-            case: "an add-on this catalog publishes nothing about",
+            // A row the issue did not cite, to show the rule is not keyed to one
+            // add-on: `eks-node-monitoring-agent` is published by the same catalog
+            // as a per-node workload, so it has no replica to place either.
+            case: "a third per-node add-on, on the same cluster with no compute",
             compute: Compute::None,
-            addon: "vendor-private-addon",
+            addon: "eks-node-monitoring-agent",
             namespace: None,
             expected_status: "ACTIVE",
             expected_codes: vec![],

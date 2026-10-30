@@ -103,21 +103,15 @@ const MAX_TAG_VALUE_LENGTH: i64 = 256;
 /// BEHAVIOUR of the tagging front end; the model names no path for it.
 const ADDED_TAGS_MEMBER: &str = "addedTags";
 
-/// How much of a caller-supplied key or value one clause echoes.
-///
-/// A clause interpolates the offending value, and the caller chooses its length, so
-/// an unbounded echo would amplify one request into an arbitrarily long response.
-/// The framework bounds its own echo the same way and at the same length.
-const MAX_ECHOED_VALUE: usize = 256;
+/// How much of a caller-supplied key or value one clause echoes: the cap every
+/// refusal this service words shares ([`crate::state::MAX_ECHOED_VALUE`]).
+const MAX_ECHOED_VALUE: usize = crate::state::MAX_ECHOED_VALUE;
 
 /// `value` elided at `limit` characters, on a character boundary, with the elision
-/// marked.
+/// marked — the one echo form this service words every refusal in
+/// ([`crate::state::elided_value`]).
 fn elided(value: &str, limit: usize) -> String {
-    if value.chars().count() <= limit {
-        return value.to_string();
-    }
-    let kept: String = value.chars().take(limit).collect();
-    format!("{kept}…")
+    crate::state::elided_value(value, limit)
 }
 
 /// `value` as a clause may echo it: elided at [`MAX_ECHOED_VALUE`] characters.
