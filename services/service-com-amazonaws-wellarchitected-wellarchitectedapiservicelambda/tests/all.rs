@@ -470,3 +470,8 @@ mod review_template_not_found_wording;
 // sorted position for a workload suite falls in a crowded run of this list.
 #[path = "all/workload_ftr_support.rs"]
 mod workload_ftr_support;
+
+// Appended at the end of this list for the same reason as the declaration above: modules
+// are appended here so a new suite does not collide with another insertion.
+#[path = "all/workload_lens_list_projections.rs"]
+mod workload_lens_list_projections;
