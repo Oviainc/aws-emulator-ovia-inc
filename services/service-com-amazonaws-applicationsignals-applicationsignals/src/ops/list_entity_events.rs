@@ -179,6 +179,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// ([`crate::state::ComAmazonawsApplicationsignalsApplicationsignalsState::entity_change_events`]),
     /// which states the rule it follows; the order is newest first, which is what makes the
     /// page cursor a stable boundary.
+    ///
+    /// The `Entity` map may also state the ACCOUNT the entity is in, which is not one of the
+    /// attributes a record's identity is held under: it is read as an account id and judged
+    /// against the one account this store holds, exactly as the account id a sibling read
+    /// takes in a member of its own is ([`crate::state::names_other_account`]), so naming this
+    /// store's own account reports the same history as naming no account and naming any other
+    /// selects nothing.
     async fn handle(
         &self,
         input: Self::Input,
@@ -204,11 +211,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
-        let observed = {
+        // The `Entity` map may state the account the entity is in ("`AwsAccountId` specifies
+        // the account where this object is in"), which is an ACCOUNT rather than one of the
+        // attributes a record's identity is held under: it is judged against the one account
+        // this store holds (`crate::state::names_other_account`, the one reader of that rule,
+        // reached here through `crate::state::entity_account_id`) and the remaining entries
+        // are the identity the records are matched on
+        // ([`crate::state::entity_identity_attributes`]). A request asking about an entity in
+        // any other account therefore selects nothing, and the expiry pass below is not made
+        // either: this store holds no record of that account to report one of.
+        let other_account =
+            crate::state::names_other_account(crate::state::entity_account_id(&input.entity));
+        let identity = crate::state::entity_identity_attributes(&input.entity);
+
+        let observed = if other_account {
+            Vec::new()
+        } else {
+            let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
             let mut store = state.lock();
             store.expire_instrumentation_configurations(&now);
-            store.entity_change_events(&input.entity, &input.start_time, &input.end_time)
+            store.entity_change_events(&identity, &input.start_time, &input.end_time)
         };
 
         // `MaxResults` carries both its range and a documented `@default`, so the page size is
@@ -222,10 +244,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The cursor is an offset into the ordered history THIS request selects, so the
         // selection — the entity and the period the history is read over — is bound into the
         // token's tag, and a token issued over another selection is refused rather than
-        // honoured as a boundary here ([`crate::state::entity_token_tag`]).
+        // honoured as a boundary here ([`crate::state::entity_token_tag`]). The entity bound
+        // in is the RESOLVED identity, not the map as spelled, so a token issued to a read
+        // that named this store's own account resumes the read that names no account.
         let token_tag = crate::state::entity_token_tag(
             crate::state::ENTITY_EVENTS_TOKEN_TAG,
-            &input.entity,
+            &identity,
             &input.start_time,
             &input.end_time,
         );

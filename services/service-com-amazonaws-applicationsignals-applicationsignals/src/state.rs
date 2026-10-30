@@ -642,7 +642,8 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// is why the answer for `None` is `false`.
 ///
 /// Every reader that takes an account id — a list's own `AwsAccountId`, an SLO list's
-/// `SloOwnerAwsAccountId`, the account an audited entity names, and the account field of a
+/// `SloOwnerAwsAccountId`, the account an audited entity names, the account an entity MAP
+/// states as one of its attributes ([`entity_account_id`]), and the account field of a
 /// `ResourceArn` (always present, so `Some`) — reads it through here, so the reads that must
 /// agree about which account a request names cannot drift apart.
 pub fn names_other_account(account: Option<&str>) -> bool {
@@ -2054,6 +2055,18 @@ const RESOURCE_TYPE_ATTRIBUTE: &str = "ResourceType";
 /// [`NAME_ATTRIBUTE`]).
 const IDENTIFIER_ATTRIBUTE: &str = "Identifier";
 
+/// The `Attributes` entry that says which ACCOUNT the entity is in: "`AwsAccountId` specifies
+/// the account where this object is in" (`smithy_query(query="doc",
+/// shape="ListEntityEventsInput", member="Entity")`, the one entity map whose doc lists it).
+///
+/// An account id, not an identifying attribute: it says WHERE the entity lives rather than
+/// WHICH entity it is, and no identity this store holds a record under carries such an entry
+/// ([`service_entity_attributes`] and an objective's own `KeyAttributes` are built from the
+/// identifying attributes alone). It is therefore read as an account
+/// ([`entity_account_id`], [`names_other_account`]) and left out of the identity records are
+/// matched on ([`entity_identity_attributes`]).
+const ACCOUNT_ID_ATTRIBUTE: &str = "AwsAccountId";
+
 /// The entity types whose identity NAMES the object: `Name` "is used only if the value of
 /// the `Type` field is `Service`, `RemoteService`, or `AWS::Service`"
 /// (`smithy_query(query="doc", shape="GetServiceInput", member="KeyAttributes")`).
@@ -2097,6 +2110,34 @@ fn identifying_attributes(entity_type: &str) -> [&'static str; 2] {
     } else {
         [NAME_ATTRIBUTE, ENVIRONMENT_ATTRIBUTE]
     }
+}
+
+/// The account id an entity map states, or `None` when it states none — the one place an
+/// `Attributes` entry is read as an ACCOUNT rather than as part of an identity
+/// ([`ACCOUNT_ID_ATTRIBUTE`]).
+///
+/// Hand the answer to [`names_other_account`], exactly as a reader whose account id arrives
+/// in a member of its own does: an account named inside a map and one named beside it are the
+/// same fact, so the reads that must agree about which account a request names cannot drift
+/// apart.
+pub fn entity_account_id(entity: &HashMap<String, String>) -> Option<&str> {
+    entity.get(ACCOUNT_ID_ATTRIBUTE).map(String::as_str)
+}
+
+/// The identity an entity map names a stored record BY: its entries except the account id,
+/// which is an account rather than an identifying attribute ([`ACCOUNT_ID_ATTRIBUTE`]).
+///
+/// This is the identity a record is matched against ([`attributes_contain`]) and the resolved
+/// subject a page cursor over that selection is tagged with ([`subject_token_tag`]): the
+/// account the entity is in is decided once, as an account ([`entity_account_id`] through
+/// [`names_other_account`]), so naming the account this store holds selects exactly what
+/// naming no account selects instead of selecting nothing.
+pub fn entity_identity_attributes(entity: &HashMap<String, String>) -> HashMap<String, String> {
+    entity
+        .iter()
+        .filter(|(attribute, _)| attribute.as_str() != ACCOUNT_ID_ATTRIBUTE)
+        .map(|(attribute, value)| (attribute.clone(), value.clone()))
+        .collect()
 }
 
 /// The refusal a key-attribute map that is supposed to IDENTIFY an entity earns, or `None`

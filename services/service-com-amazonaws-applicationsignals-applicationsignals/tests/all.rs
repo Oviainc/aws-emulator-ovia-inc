@@ -35,6 +35,8 @@ mod discovery_enablement;
 mod entity_events;
 #[path = "all/entity_identity.rs"]
 mod entity_identity;
+#[path = "all/entity_map_account_scope.rs"]
+mod entity_map_account_scope;
 #[path = "all/error_identity.rs"]
 mod error_identity;
 #[path = "all/exclusion_window_page_stability.rs"]

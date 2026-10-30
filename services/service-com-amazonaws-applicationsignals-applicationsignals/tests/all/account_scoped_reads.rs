@@ -8,8 +8,9 @@
 //! Each reader here takes that decision through the same place in `crate::state`, so this
 //! suite drives all of them over one table of account ids: `ListServices` and
 //! `ListServiceStates` (their own `AwsAccountId`), `ListServiceLevelObjectives`
-//! (`SloOwnerAwsAccountId`), `ListGroupingAttributeDefinitions` (`AwsAccountId`) and
-//! `ListAuditFindings` (the account an audited `ServiceEntity` names). Every request goes
+//! (`SloOwnerAwsAccountId`), `ListGroupingAttributeDefinitions` (`AwsAccountId`),
+//! `ListAuditFindings` (the account an audited `ServiceEntity` names) and `ListEntityEvents`
+//! (the account an `Entity` map states as one of its attributes). Every request goes
 //! over the real `restJson1` surface the router mounts in production, so the statuses and
 //! JSON bodies are the ones a client sees.
 
@@ -138,15 +139,17 @@ enum Reader {
     ServiceLevelObjectives,
     GroupingAttributeDefinitions,
     AuditFindings,
+    EntityEvents,
 }
 
 /// Every reader that takes an account id, one per place the rule used to be written out.
-const READERS: [Reader; 5] = [
+const READERS: [Reader; 6] = [
     Reader::Services,
     Reader::ServiceStates,
     Reader::ServiceLevelObjectives,
     Reader::GroupingAttributeDefinitions,
     Reader::AuditFindings,
+    Reader::EntityEvents,
 ];
 
 impl Reader {
@@ -159,6 +162,7 @@ impl Reader {
             Self::ServiceLevelObjectives => "SloSummaries",
             Self::GroupingAttributeDefinitions => "GroupingAttributeDefinitions",
             Self::AuditFindings => "AuditFindings",
+            Self::EntityEvents => "ChangeEvents",
         }
     }
 
@@ -226,6 +230,28 @@ impl Reader {
                     &format!("/auditFindings?StartTime={start}&EndTime={end}"),
                     Some(json!({
                         "AuditTargets": [{ "Type": "service", "Data": { "Service": entity } }]
+                    })),
+                )
+                .await
+            }
+            Self::EntityEvents => {
+                // The account this reader takes is an ENTRY of the entity map it reports on,
+                // which the member's own doc lists among that map's fields: "`AwsAccountId`
+                // specifies the account where this object is in"
+                // (`smithy_query(query="doc", shape="ListEntityEventsInput",
+                // member="Entity")`).
+                let mut entity = audited_service();
+                if let Some(account) = account {
+                    entity["AwsAccountId"] = json!(account);
+                }
+                call(
+                    router,
+                    "POST",
+                    "/events",
+                    Some(json!({
+                        "Entity": entity,
+                        "StartTime": start,
+                        "EndTime": end
                     })),
                 )
                 .await
