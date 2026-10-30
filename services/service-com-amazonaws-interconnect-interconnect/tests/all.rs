@@ -39,6 +39,8 @@ mod bandwidth_availability;
 mod billing_tier;
 #[path = "all/caller_created_gateways_are_attach_points.rs"]
 mod caller_created_gateways_are_attach_points;
+#[path = "all/client_fault_status_and_validation_wording.rs"]
+mod client_fault_status_and_validation_wording;
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
 #[path = "all/connection_proposal.rs"]
@@ -59,6 +61,8 @@ mod list_tags_for_resource;
 mod proposal_parameters_are_captured;
 #[path = "all/provider_member_constraints.rs"]
 mod provider_member_constraints;
+#[path = "all/published_environment_catalog.rs"]
+mod published_environment_catalog;
 #[path = "all/refusals_and_gateway_attach_points.rs"]
 mod refusals_and_gateway_attach_points;
 #[path = "all/region_scoped_connections.rs"]

@@ -167,9 +167,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // binds no CreateEnvironment — so this one function is the only source, and
         // GetEnvironment answers for the same Region from the same records.
         //
-        // The two modelled filters are conjunctive and exact: an environment is listed
-        // only when it matches every filter the caller supplied, on top of the Region
-        // scope the catalog itself is.
+        // `provider` narrows the catalog exactly: the member filters results "to only
+        // include Environment objects that connect to the Provider", and an Environment
+        // names one partner on one side of that union, so an Environment is listed only
+        // when it names the same partner on the same side.
+        //
+        // `location` narrows NOTHING. It filters on "a given location distiguisher",
+        // which is not the Environment's own remote-side `location`: the service answers
+        // a listing whose distinguisher is not any published Environment's `location`
+        // with that Environment in it all the same, so no member of a published record
+        // is what that filter selects on and no entry of this catalog is excluded by it.
+        //
+        // That is the reading preferred DELIBERATELY, and what rules the alternatives
+        // out: every narrower reading of the distinguisher was tried against the
+        // recorded listing and each one excluded the Environment the service returned —
+        // equality with the remote-side `location`, equality ignoring case, a prefix of
+        // it, the called Region's id, and the facility the `environmentId` embeds. What
+        // the service DOES select on cannot be named from the catalog's own members, so
+        // the honest implementation is that this member excludes nothing here rather
+        // than one that answers an empty page where the service answers the catalog.
+        // The value is still held to its modelled `@length(max: 255)` before the handler
+        // runs, like every other input.
         let matching: Vec<(String, Environment)> = crate::state::environment_catalog(&region)
             .into_iter()
             .filter(|(_, environment)| {
@@ -177,10 +195,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .provider
                     .as_ref()
                     .is_none_or(|wanted| crate::state::provider_eq(&environment.provider, wanted))
-                    && input
-                        .location
-                        .as_ref()
-                        .is_none_or(|wanted| environment.location == *wanted)
             })
             .collect();
 

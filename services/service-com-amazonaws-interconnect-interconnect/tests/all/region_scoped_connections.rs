@@ -147,12 +147,32 @@ async fn create(emulator: &Emulator, case: &RegionCase) -> Value {
     connection
 }
 
-/// Assert `(status, body)` is the 404 this service answers an identifier that names
-/// no connection with, worded `expected`.
+/// Assert `(status, body)` is the refusal this service answers an identifier that names
+/// no connection with — the modelled `ResourceNotFoundException` under the HTTP 400 it
+/// answers a client fault with — worded `expected`.
 fn assert_absent(case: &str, status: u16, body: &Value, expected: &str) {
+    assert_absent_with(case, 400, status, body, expected)
+}
+
+/// [`assert_absent`] for a lookup addressed by an `activationKey` rather than by a
+/// `ConnectionId`: the same modelled error and the same wording, under the status the
+/// proposal read answers it with.
+fn assert_proposal_absent(case: &str, status: u16, body: &Value, expected: &str) {
+    assert_absent_with(case, 404, status, body, expected)
+}
+
+/// The shared assertion both of the above make: the modelled
+/// `ResourceNotFoundException`, worded `expected`, under `expected_status`.
+fn assert_absent_with(
+    case: &str,
+    expected_status: u16,
+    status: u16,
+    body: &Value,
+    expected: &str,
+) {
     assert_eq!(
-        status, 404,
-        "case {case:?}: expected HTTP 404 for an identifier this endpoint does not hold, got {status} with {body:?}"
+        status, expected_status,
+        "case {case:?}: expected HTTP {expected_status} for an identifier this endpoint does not hold, got {status} with {body:?}"
     );
     assert!(
         code(body).contains("ResourceNotFoundException"),
@@ -303,7 +323,7 @@ async fn a_connection_is_reached_only_through_the_region_that_created_it() {
                     json!({ "activationKey": activation_key }),
                 )
                 .await;
-            assert_absent(
+            assert_proposal_absent(
                 &format!("{label} proposal from {region}"),
                 status,
                 &body,

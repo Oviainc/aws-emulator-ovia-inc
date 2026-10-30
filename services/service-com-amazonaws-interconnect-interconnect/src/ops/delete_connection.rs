@@ -148,16 +148,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Scoped to the Region this request was signed for: a connection created
         // through another Region's endpoint is not one this endpoint can delete,
-        // and is refused the way an identifier that names nothing is.
+        // and is refused the way an identifier that names nothing is — a fault in the
+        // REQUEST, answered with the status this service gives a client fault
+        // (`crate::scaffolded::CLIENT_FAULT_STATUS`) under the modeled
+        // connection-scoped error shape.
         let Some(stored) = store.connection_in_mut(&region, &input.identifier) else {
-            return Err(DeleteConnectionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::connection_not_retrievable_message(
-                        &input.identifier,
-                    )),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::client_fault(
+                DeleteConnectionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::connection_not_retrievable_message(
+                            &input.identifier,
+                        )),
+                    },
+                ),
+            ));
         };
 
         // "deleting: the connection is being deleted" -> "deleted: the connection has

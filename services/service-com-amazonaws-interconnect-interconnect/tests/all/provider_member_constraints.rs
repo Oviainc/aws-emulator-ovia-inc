@@ -299,8 +299,8 @@ async fn a_well_formed_provider_filter_is_still_filtered_on() {
         seen
     };
     assert!(
-        partners.len() > 1,
-        "case \"catalog\": expected the catalog to name more than one partner, got {partners:?}"
+        !partners.is_empty(),
+        "case \"catalog\": expected the catalog to name a partner, got {partners:?}"
     );
     for partner in &partners {
         let expected: BTreeSet<String> = catalog

@@ -128,8 +128,8 @@ async fn an_attach_point_that_resolves_to_nothing_is_refused_and_provisions_noth
 
     let environments = creatable_environments(&catalog);
     assert!(
-        environments.len() >= 2,
-        "case \"catalog\": expected at least two environments that take connections, got {}",
+        !environments.is_empty(),
+        "case \"catalog\": expected an environment that takes connections, got {}",
         environments.len()
     );
 
@@ -137,13 +137,16 @@ async fn an_attach_point_that_resolves_to_nothing_is_refused_and_provisions_noth
     // resolves to nothing: a gateway id of each UUID flavour the member's pattern
     // allows, a case variant of a gateway the account does hold, and connection ARNs
     // that name no connection — one in the Region the request addresses, one in another
-    // Region, one in another account.
+    // Region, one in another account. They also differ in the Region the create
+    // addresses, since the catalog publishes one Environment per regional endpoint.
     let account = engine::EMULATOR_ACCOUNT_ID;
-    for (index, environment) in environments.iter().enumerate() {
-        let region = REGIONS[index % REGIONS.len()];
+    for (index, region) in REGIONS.iter().enumerate() {
+        let region = *region;
         // The Environment this row's Region offers for that partner offering: an
         // Environment belongs to the Region whose connections it produces.
-        let environment = &emulator.counterpart_in(region, environment).await;
+        let environment = &emulator
+            .counterpart_in(region, &environments[index % environments.len()])
+            .await;
         let environment_id = text(environment, "environmentId");
         let bandwidths = available_bandwidths(environment);
         let bandwidth = bandwidths[index % bandwidths.len()].clone();

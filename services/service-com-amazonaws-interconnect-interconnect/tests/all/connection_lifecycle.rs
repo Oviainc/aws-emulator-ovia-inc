@@ -211,15 +211,15 @@ async fn environment_catalog_is_seeded_and_every_filter_selects_its_subset() {
     ));
 
     for (case, filter) in cases {
+        // `provider` selects exactly the environments placed with that partner;
+        // `location` selects nothing, so an environment is listed whatever location
+        // distinguisher the request names.
         let expected: Vec<Value> = catalog
             .iter()
             .filter(|environment| {
                 filter
                     .get("provider")
                     .is_none_or(|wanted| environment["provider"] == *wanted)
-                    && filter
-                        .get("location")
-                        .is_none_or(|wanted| environment["location"] == *wanted)
             })
             .cloned()
             .collect();
@@ -1278,14 +1278,14 @@ async fn update_connection_refuses_an_unknown_or_unofferable_change() {
             )
             .await;
         assert_eq!(
-            status, 404,
-            "case {identifier:?}: expected HTTP 404 for an unknown connection, got {status} with {body:?}"
+            status, 400,
+            "case {identifier:?}: expected HTTP 400 for an unknown connection, got {status} with {body:?}"
         );
         let (status, body) = emulator
             .ic("GetConnection", json!({ "identifier": identifier }))
             .await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {identifier:?}: expected the refused update to have created nothing, got {status} with {body:?}"
         );
     }
@@ -1422,12 +1422,13 @@ async fn delete_connection_moves_through_deleting_to_deleted() {
         }
     }
 
-    // A delete of something that never existed is a 404.
+    // A delete of something that never existed is the client fault this service answers
+    // with HTTP 400.
     let (status, body) = emulator
         .ic("DeleteConnection", json!({ "identifier": "mcc-ffffffff" }))
         .await;
     assert_eq!(
-        status, 404,
-        "case \"unknown connection\": expected HTTP 404, got {status} with {body:?}"
+        status, 400,
+        "case \"unknown connection\": expected HTTP 400, got {status} with {body:?}"
     );
 }

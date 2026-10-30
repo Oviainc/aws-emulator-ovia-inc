@@ -156,12 +156,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.materialise_due_transitions(now);
         // Dereferenced once so the connection is looked up ONCE, mutably, and mutated
-        // in place below. That keeps a single 404 path.
+        // in place below. That keeps a single not-found path.
         let store = &mut *guard;
 
-        // An identifier that names no stored connection is a 404: an update never
-        // brings a connection into existence. The message is built from the request's
-        // own identifier, in this operation's own construction.
+        // An identifier that names no stored connection is a fault in the REQUEST: an
+        // update never brings a connection into existence, so it is answered with the
+        // status this service gives a client fault
+        // (`crate::scaffolded::CLIENT_FAULT_STATUS`) under the modeled connection-scoped
+        // error shape. The message is built from the request's own identifier, in this
+        // operation's own construction.
         //
         // The same Region scope every connection lookup applies, spelled with the
         // store's own predicate so this field borrow keeps one rule: a
@@ -172,12 +175,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.identifier)
             .filter(|stored| crate::state::visible_in(stored, &region))
         else {
-            return Err(UpdateConnectionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::connection_absent_message(&input.identifier)),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::client_fault(
+                UpdateConnectionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::connection_absent_message(&input.identifier)),
+                    },
+                ),
+            ));
         };
 
         // An update that asks for a CHANGE is permitted only FROM the states the

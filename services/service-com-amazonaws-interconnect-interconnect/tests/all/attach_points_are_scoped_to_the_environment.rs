@@ -11,9 +11,11 @@
 //! (`CreateConnection$attachPoint`).
 //!
 //! Every row below is built from the LIVE Environment catalog and the LIVE gateways of
-//! the account rather than from a copy of either, and the rows differ in the
-//! Environment's state, its provider kind, its location, the bandwidths it offers and
-//! how many gateways the account holds.
+//! the account rather than from a copy of either, and the rows differ in the Region the
+//! Environment is published in, its id, the bandwidths it offers and how many gateways
+//! the account holds. The published catalog offers no Environment that can carry no
+//! Connection, so the rows that need one are contributed only when the catalog publishes
+//! one — the branch stays stated for a catalog that does.
 
 use std::collections::BTreeSet;
 
@@ -21,7 +23,7 @@ use serde_json::{json, Value};
 
 use crate::emulator::{
     available_bandwidths, carries_connections, code, creatable_environments, identifiers, message,
-    remote_account_for, text, Emulator,
+    remote_account_for, text, Emulator, DEFAULT_SIGNING_REGION,
 };
 
 /// The gateway rows the account is stocked with: the name's shape and the
@@ -34,14 +36,17 @@ const GATEWAY_ROWS: [(&str, Option<i64>); 3] = [
     ("ic-scoped-32bit-asn", Some(4_200_000_000)),
 ];
 
+/// The Regions the rows read a catalog through: the one the rest of this crate's suites
+/// sign for plus two more, so no row's Environment is the harness default by accident.
+const REGIONS: [&str; 3] = [DEFAULT_SIGNING_REGION, "eu-west-1", "ap-southeast-2"];
+
 /// RULE: the attach points listed for an Environment are those valid FOR it — the
 /// account's ready gateways on an Environment that can carry a Connection, and none at
-/// all on one that cannot — so two environments of the same account can report different
-/// pages.
+/// all on one that cannot — and the member is judged, so an `environmentId` the endpoint
+/// publishes no Environment under is refused rather than answered with a page.
 #[tokio::test]
 async fn the_listing_is_scoped_to_the_environment_it_is_asked_for() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let owned: BTreeSet<String> = emulator
         .ready_gateways(&GATEWAY_ROWS)
         .await
@@ -53,56 +58,65 @@ async fn the_listing_is_scoped_to_the_environment_it_is_asked_for() {
         "setup: expected one gateway per row, got {owned:?}"
     );
 
-    // One row per seeded Environment: they differ in state, provider kind, location and
-    // the bandwidths they offer.
-    let mut carrying = 0;
-    let mut not_carrying = 0;
-    for environment in &catalog {
-        let id = text(environment, "environmentId");
-        let listed = emulator.attach_points(&id).await;
-        let case = format!("{id} / state {}", text(environment, "state"));
-        if carries_connections(environment) {
-            carrying += 1;
+    // One row per Region's published Environment: the rows differ in the Region the
+    // listing is read through and in the Environment it is read for.
+    let mut rows = 0;
+    for region in REGIONS {
+        let catalog = emulator.environments_in(region).await;
+        for environment in &catalog {
+            let id = text(environment, "environmentId");
+            let listed = emulator.attach_points_in(region, &id).await;
+            let case = format!("{region} / {id} / state {}", text(environment, "state"));
+            if carries_connections(environment) {
+                assert_eq!(
+                    identifiers(&listed),
+                    owned,
+                    "case {case:?}: expected the account's ready gateways to be valid here, got {listed:?}"
+                );
+            } else {
+                assert!(
+                    listed.is_empty(),
+                    "case {case:?}: expected no attach point valid for an environment that carries no connection, got {listed:?}"
+                );
+            }
+            rows += 1;
+
+            // Reading the page changes nothing a later caller sees.
+            let again = emulator.attach_points_in(region, &id).await;
             assert_eq!(
-                identifiers(&listed),
-                owned,
-                "case {case:?}: expected the account's ready gateways to be valid here, got {listed:?}"
-            );
-        } else {
-            not_carrying += 1;
-            assert!(
-                listed.is_empty(),
-                "case {case:?}: expected no attach point valid for an environment that carries no connection, got {listed:?}"
+                again, listed,
+                "case {case:?}: expected a repeated read to report the same page, got {again:?}"
             );
         }
     }
     assert!(
-        carrying >= 1 && not_carrying >= 1,
-        "case \"catalog\": expected the catalog to span environments that do and do not carry connections, got {carrying} and {not_carrying}"
+        rows >= REGIONS.len(),
+        "case \"catalog\": expected a row per Region's published Environment, got {rows}"
     );
 
-    // The member is therefore NOT ignored: the two pages differ, which is what lets a
-    // caller tell the attach points one environment accepts from another's.
-    let carrying_id = text(&creatable_environments(&catalog)[0], "environmentId");
-    let barren_id = catalog
-        .iter()
-        .find(|environment| !carries_connections(environment))
-        .map(|environment| text(environment, "environmentId"))
-        .expect("the catalog holds an environment that carries no connection");
-    let carrying_page = emulator.attach_points(&carrying_id).await;
-    let barren_page = emulator.attach_points(&barren_id).await;
-    assert_ne!(
-        carrying_page, barren_page,
-        "case \"{carrying_id} vs {barren_id}\": expected environmentId to scope the page, got {carrying_page:?} twice"
+    // The member is therefore NOT ignored: an `environmentId` this endpoint publishes no
+    // Environment under is refused, which is what lets a caller tell "this Environment
+    // has no valid attach point" from "there is no such Environment here".
+    let foreign = text(
+        &emulator.environments_in(REGIONS[1]).await[0],
+        "environmentId",
     );
-
-    // Reading either page changes nothing a later caller sees.
-    for id in [&carrying_id, &barren_id] {
-        let before = emulator.attach_points(id).await;
-        let again = emulator.attach_points(id).await;
+    for environment_id in [foreign.as_str(), "not-an-environment"] {
+        let (status, body) = emulator
+            .ic_in(
+                REGIONS[0],
+                "ListAttachPoints",
+                json!({ "environmentId": environment_id }),
+            )
+            .await;
         assert_eq!(
-            again, before,
-            "case {id:?}: expected a repeated read to report the same page, got {again:?}"
+            status, 400,
+            "case {environment_id:?}: expected HTTP 400 for an environmentId this endpoint does not publish, got {status} with {body:?}"
+        );
+        assert!(
+            code(&body).contains("InterconnectClientException"),
+            "case {environment_id:?}: expected InterconnectClientException, got {:?}",
+            code(&body)
         );
     }
 }
@@ -117,56 +131,64 @@ async fn a_create_accepts_exactly_what_the_environments_listing_offers() {
     let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
 
-    // Rows differ in the environment and, for each, in the gateway and the bandwidth
-    // used — and the environments differ in whether they can carry a Connection at all.
+    // Rows differ in the environment, the gateway the create names and the bandwidth it
+    // asks for — and the environments differ in whether they can carry a Connection at
+    // all.
     let mut rows = 0;
     for (index, environment) in catalog.iter().enumerate() {
         let id = text(environment, "environmentId");
         let listed = identifiers(&emulator.attach_points(&id).await);
-        for gateway in &gateways {
-            let bandwidths = available_bandwidths(environment);
+        let offered = available_bandwidths(environment);
+        // Two sizes where the Environment offers any, so the attach point is judged on
+        // more than one otherwise-valid request.
+        let sizes: Vec<String> = match (offered.first(), offered.last()) {
+            (Some(first), Some(last)) if first != last => vec![first.clone(), last.clone()],
+            (Some(first), _) => vec![first.clone()],
             // An environment offering no bandwidth refuses every value for the required
             // member, so the one sent there is the first bandwidth the catalog offers
             // anywhere: what is under test is the attach point, and the refusal order is
             // asserted by the state checks the create makes first.
-            let bandwidth = bandwidths
-                .first()
-                .cloned()
-                .unwrap_or_else(|| available_bandwidths(&creatable_environments(&catalog)[0])[0].clone());
-            let attach_point = json!({ "directConnectGateway": gateway });
-            let mut request = serde_json::Map::new();
-            request.insert("environmentId".to_string(), json!(id));
-            request.insert("bandwidth".to_string(), json!(bandwidth));
-            request.insert("attachPoint".to_string(), attach_point.clone());
-            request.insert(
-                "description".to_string(),
-                json!(format!("scoped case {index} {rows}")),
-            );
-            if let Some(remote_account) = remote_account_for(environment) {
-                request.insert("remoteAccount".to_string(), remote_account);
+            (None, _) => {
+                vec![available_bandwidths(&creatable_environments(&catalog)[0])[0].clone()]
             }
-            let (status, body) = emulator
-                .ic("CreateConnection", Value::Object(request))
-                .await;
-            let case = format!("{id} / {gateway} / {bandwidth}");
+        };
+        for gateway in &gateways {
+            for bandwidth in &sizes {
+                let attach_point = json!({ "directConnectGateway": gateway });
+                let mut request = serde_json::Map::new();
+                request.insert("environmentId".to_string(), json!(id));
+                request.insert("bandwidth".to_string(), json!(bandwidth));
+                request.insert("attachPoint".to_string(), attach_point.clone());
+                request.insert(
+                    "description".to_string(),
+                    json!(format!("scoped case {index} {rows}")),
+                );
+                if let Some(remote_account) = remote_account_for(environment) {
+                    request.insert("remoteAccount".to_string(), remote_account);
+                }
+                let (status, body) = emulator
+                    .ic("CreateConnection", Value::Object(request))
+                    .await;
+                let case = format!("{id} / {gateway} / {bandwidth}");
 
-            if listed.contains(gateway) {
-                assert_eq!(
-                    status, 200,
-                    "case {case:?}: expected a listed attach point to be accepted, got {status} with {body:?}"
-                );
-                assert_eq!(
-                    body["connection"]["attachPoint"], attach_point,
-                    "case {case:?}: expected the connection to carry the attach point it was created on, got {:?}",
-                    body["connection"]["attachPoint"]
-                );
-            } else {
-                assert_ne!(
-                    status, 200,
-                    "case {case:?}: expected an attach point the listing does not offer to be refused, got {body:?}"
-                );
+                if listed.contains(gateway) {
+                    assert_eq!(
+                        status, 200,
+                        "case {case:?}: expected a listed attach point to be accepted, got {status} with {body:?}"
+                    );
+                    assert_eq!(
+                        body["connection"]["attachPoint"], attach_point,
+                        "case {case:?}: expected the connection to carry the attach point it was created on, got {:?}",
+                        body["connection"]["attachPoint"]
+                    );
+                } else {
+                    assert_ne!(
+                        status, 200,
+                        "case {case:?}: expected an attach point the listing does not offer to be refused, got {body:?}"
+                    );
+                }
+                rows += 1;
             }
-            rows += 1;
         }
     }
     assert!(
@@ -189,15 +211,18 @@ async fn an_attach_point_outside_the_environments_listing_is_never_accepted() {
         .await
         .remove(0);
     let carrying = creatable_environments(&catalog);
+    assert!(
+        !carrying.is_empty(),
+        "case \"catalog\": expected an environment that carries connections, got {catalog:?}"
+    );
+    // An Environment that can carry no Connection, when the catalog publishes one: the
+    // published catalog does not, so this row has no subject there and the branch below
+    // is contributed only for a catalog that publishes such an Environment.
     let barren: Vec<Value> = catalog
         .iter()
         .filter(|environment| !carries_connections(environment))
         .cloned()
         .collect();
-    assert!(
-        !barren.is_empty(),
-        "case \"catalog\": expected an environment that carries no connection, got {catalog:?}"
-    );
 
     // Rows differ in WHY the attach point is not valid, and each row names the refusal
     // it expects: an identifier the account does not hold at all, offered for an

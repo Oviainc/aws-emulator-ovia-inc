@@ -154,15 +154,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|stored| stored.connection.clone())
         };
 
+        // An identifier that names no connection of this endpoint is a fault in the
+        // REQUEST, so it is answered with the status this service gives a client fault
+        // (`crate::scaffolded::CLIENT_FAULT_STATUS`) while keeping the modeled
+        // connection-scoped error shape and its request-derived wording.
         let Some(connection) = found else {
-            return Err(GetConnectionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
+            return Err(crate::scaffolded::Scaffolded::client_fault(
+                GetConnectionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     message: Some(crate::state::connection_not_retrievable_message(
                         &input.identifier,
                     )),
-                },
-            )
-            .into());
+                }),
+            ));
         };
         Ok(GetConnectionOutput {
             connection: Some(connection),

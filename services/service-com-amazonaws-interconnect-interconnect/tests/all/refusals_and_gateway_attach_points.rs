@@ -163,8 +163,9 @@ async fn an_unresolvable_environment_id_is_a_client_refusal_everywhere_it_is_res
 // A connection identifier that names nothing
 // ---------------------------------------------------------------------------
 
-/// RULE: an identifier that names no stored connection is `ResourceNotFoundException`
-/// (404) with a message built from the request — `UpdateConnection` stating that the
+/// RULE: an identifier that names no stored connection is the modelled
+/// `ResourceNotFoundException` under the HTTP 400 this service answers a client fault
+/// with, carrying a message built from the request — `UpdateConnection` stating that the
 /// connection does not exist for the identifier it was asked to modify, the connection
 /// READS stating that the retrieval could not be served.
 #[tokio::test]
@@ -189,8 +190,8 @@ async fn a_connection_identifier_that_names_nothing_is_worded_from_the_request()
             )
             .await;
         assert_eq!(
-            status, 404,
-            "case {identifier:?}: expected HTTP 404 for an unknown connection, got {status} with {body:?}"
+            status, 400,
+            "case {identifier:?}: expected HTTP 400 for an unknown connection, got {status} with {body:?}"
         );
         assert!(
             code(&body).contains("ResourceNotFoundException"),
@@ -204,15 +205,15 @@ async fn a_connection_identifier_that_names_nothing_is_worded_from_the_request()
             message(&body)
         );
 
-        // The reads word the same absence their own way, and still as a 404.
+        // The reads word the same absence their own way, and still with the same status.
         for operation in ["GetConnection", "DeleteConnection"] {
             let case = format!("{operation} / {identifier}");
             let (status, body) = emulator
                 .ic(operation, json!({ "identifier": identifier }))
                 .await;
             assert_eq!(
-                status, 404,
-                "case {case:?}: expected HTTP 404 for an unknown connection, got {status} with {body:?}"
+                status, 400,
+                "case {case:?}: expected HTTP 400 for an unknown connection, got {status} with {body:?}"
             );
             assert_eq!(
                 message(&body),
@@ -231,7 +232,7 @@ async fn a_connection_identifier_that_names_nothing_is_worded_from_the_request()
         // A refused update creates nothing.
         let (status, body) = emulator.get_connection(identifier).await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {identifier:?}: expected the refused update to have created nothing, got {status} with {body:?}"
         );
     }
@@ -254,13 +255,14 @@ async fn an_update_is_permitted_only_from_the_states_the_service_names() {
     // below attaches to is created through that service first.
     let gateway = emulator.attach_point().await;
     assert!(
-        creatable.len() >= 2,
-        "case \"catalog\": expected at least two environments that take connections, got {}",
+        !creatable.is_empty(),
+        "case \"catalog\": expected an environment that takes connections, got {}",
         creatable.len()
     );
 
-    // Rows span the provider kinds (so both `ConnectionId` prefixes are covered) and,
-    // within each, the states a connection can be driven into.
+    // Rows span the environments the catalog publishes (and so the `ConnectionId` prefix
+    // each one's provider kind dictates) and, within each, the states a connection can be
+    // driven into.
     for environment in &creatable {
         let environment_id = text(environment, "environmentId");
         let bandwidths = available_bandwidths(environment);
@@ -461,9 +463,13 @@ async fn a_deleted_connection_converges_to_a_terminal_state_promptly() {
             let started = Instant::now();
             let terminal = loop {
                 let (status, body) = emulator.get_connection(&connection_id).await;
-                if status == 404 {
+                if status == 400 {
                     break "not found".to_string();
                 }
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected the poll to be served or to report the record gone, got {status} with {body:?}"
+                );
                 let state = text(&body["connection"], "state");
                 if state == "deleted" {
                     break state;
@@ -483,7 +489,7 @@ async fn a_deleted_connection_converges_to_a_terminal_state_promptly() {
             // restarting the tear-down, and the record stays readable.
             let repeat = emulator.ic("DeleteConnection", json!({ "identifier": connection_id })).await;
             assert!(
-                repeat.0 == 200 || repeat.0 == 404,
+                repeat.0 == 200 || repeat.0 == 400,
                 "case {case:?}: expected a repeated delete to replay the record or report it gone, got {} with {:?}",
                 repeat.0,
                 repeat.1

@@ -1684,17 +1684,119 @@ pub fn paginate<T>(
     (page, token)
 }
 
-/// The `environmentId` the catalog entry for the partner offering `slug` carries on
-/// the regional endpoint of `region`.
+/// The code the interconnection facility of `region` is named by, which is the city it
+/// sits in: `pdx` (Portland) for the Oregon Region, `iad` (Ashburn) for Northern
+/// Virginia.
 ///
-/// The Region is part of the identifier because an Environment belongs to one: the
-/// same partner offering reached through two regional endpoints is two Environments,
-/// each producing connections that land in its own Region, so no single id can name
-/// both. Well inside the `@length(min: 1, max: 64)` the model gives `EnvironmentId`
-/// for every Region id AWS publishes.
-fn environment_id_in(slug: &str, region: &str) -> String {
-    format!("env-{slug}-{region}")
+/// These are the city codes AWS names the facilities of a Region by — the same codes
+/// its Direct Connect locations and edge sites there carry — and an Environment's id
+/// embeds the one of the facility that publishes it (the catalog of the Oregon Region
+/// publishes `mce-aws-gcp-pdx`). A Region the table does not name is named by its Region
+/// id instead, so an id is tied to exactly ONE Region either way.
+const REGION_FACILITY_CODES: [(&str, &str); 29] = [
+    ("af-south-1", "cpt"),
+    ("ap-east-1", "hkg"),
+    ("ap-northeast-1", "nrt"),
+    ("ap-northeast-2", "icn"),
+    ("ap-northeast-3", "kix"),
+    ("ap-south-1", "bom"),
+    ("ap-south-2", "hyd"),
+    ("ap-southeast-1", "sin"),
+    ("ap-southeast-2", "syd"),
+    ("ap-southeast-3", "cgk"),
+    ("ap-southeast-4", "mel"),
+    ("ca-central-1", "yul"),
+    ("ca-west-1", "yyc"),
+    ("eu-central-1", "fra"),
+    ("eu-central-2", "zrh"),
+    ("eu-north-1", "arn"),
+    ("eu-south-1", "mxp"),
+    ("eu-south-2", "zaz"),
+    ("eu-west-1", "dub"),
+    ("eu-west-2", "lhr"),
+    ("eu-west-3", "cdg"),
+    ("il-central-1", "tlv"),
+    ("me-central-1", "dxb"),
+    ("me-south-1", "bah"),
+    ("sa-east-1", "gru"),
+    ("us-east-1", "iad"),
+    ("us-east-2", "cmh"),
+    ("us-west-1", "sfo"),
+    ("us-west-2", "pdx"),
+];
+
+/// The facility code of `region`, or the Region id itself when the table names no code
+/// for it.
+fn region_facility_code(region: &str) -> &str {
+    REGION_FACILITY_CODES
+        .iter()
+        .find(|(named, _)| *named == region)
+        .map_or(region, |(_, code)| *code)
 }
+
+/// The `environmentId` the Environment of the `partner` offering carries on the
+/// regional endpoint of `region`.
+///
+/// The published form is `mce-aws-<partner>-<facility>`: a Multicloud Environment
+/// between AWS and that partner, at the facility the connections it produces land at.
+/// The model's own AcceptConnectionProposal / CreateConnection examples spell an
+/// `environmentId` that way (`mce-aws-acme-1`), and so does the catalog the service
+/// publishes.
+///
+/// The facility — and so the Region — is part of the identifier because an Environment
+/// belongs to one: the same partner offering reached through two regional endpoints is
+/// two Environments, each producing connections that land in its own Region, so no
+/// single id can name both. Well inside the `@length(min: 1, max: 64)` the model gives
+/// `EnvironmentId` for every Region id AWS publishes.
+fn environment_id_in(partner: &str, region: &str) -> String {
+    format!("mce-aws-{partner}-{}", region_facility_code(region))
+}
+
+/// The partner the service publishes its cloud-service-provider offering with, spelled
+/// as the catalog spells it: the partner's own lower-case token, which is what
+/// `Provider$cloudServiceProvider` carries and what the `environmentId` embeds.
+const MULTICLOUD_PARTNER: &str = "gcp";
+
+/// The offering's `location`: "the provider specific location on the remote side" of
+/// the connection, in the PARTNER's own region naming rather than an AWS Region id.
+///
+/// It belongs to the OFFERING, not to the Region the offering is asked for in: the
+/// remote side of this interconnection is one partner region, and the same offering
+/// published at a second facility is still terminated there, so it reads the same on
+/// every endpoint. It is deliberately NOT derived per Region the way the facility of the
+/// `environmentId` is: which partner region an offering terminates in is published by
+/// the service, and deriving a different one per Region would be inventing partner
+/// geography the service does not publish — the very thing this catalog must not do.
+const MULTICLOUD_REMOTE_LOCATION: &str = "us-west1";
+
+/// The offering's `ProductType`. `ProductType` is an unconstrained string, and
+/// `"Multicloud"` is the `type` the model's own AcceptConnectionProposal /
+/// CreateConnection examples show for a `cloudServiceProvider` environment.
+const MULTICLOUD_PRODUCT_TYPE: &str = "Multicloud";
+
+/// The offering's `EnvironmentState`: `limited`, documented as "available, but overall
+/// capacity is limited", which is what an offering whose `available` bandwidths are a
+/// strict subset of its `supported` ones is in.
+const LIMITED_ENVIRONMENT_STATE: &str = "limited";
+
+/// The `RemoteAccountIdentifierType` the offering declares — "the type of identifying
+/// information that should be supplied to the `remoteAccount` parameter of a
+/// `CreateConnection` call for this specific Environment" — one of the two values
+/// `RemoteAccountIdentifierType` models (`account`, `email`).
+const MULTICLOUD_REMOTE_IDENTIFIER_TYPE: &str = "account";
+
+/// The bandwidths the offering CURRENTLY offers ("the list of currently available
+/// bandwidths"), in the order the catalog publishes them.
+const MULTICLOUD_AVAILABLE_BANDWIDTHS: [&str; 7] = [
+    "1Gbps", "2Gbps", "5Gbps", "10Gbps", "20Gbps", "50Gbps", "500Mbps",
+];
+
+/// The bandwidths the offering supports ("the list of bandwidths supported by this
+/// environment"), in the order the catalog publishes them: the available ones plus the
+/// size it supports without currently offering it, which is what `limited` means.
+const MULTICLOUD_SUPPORTED_BANDWIDTHS: [&str; 8] = [
+    "500Mbps", "1Gbps", "2Gbps", "5Gbps", "10Gbps", "20Gbps", "50Gbps", "100Gbps",
+];
 
 /// The Environment catalog the regional endpoint of `region` serves.
 ///
@@ -1710,104 +1812,37 @@ fn environment_id_in(slug: &str, region: &str) -> String {
 /// `CreateEnvironment`), so a catalog derived per call is the same catalog on every
 /// call, whoever asks and whenever.
 ///
-/// AWS manages Environments itself and publishes no list, so WHICH partner offerings
-/// the catalog presents is fixed here. Every member the model marks `@required` is
-/// set, and the three `EnvironmentState` values are all represented: a `limited`
-/// environment offers fewer `available` bandwidths than it `supported`s (the state's
-/// own documentation), and an `unavailable` one offers none, so `CreateConnection`
-/// refuses on it. An offering's `location` is "the provider specific location on the
-/// remote side" of the connection — the partner's own geography, not the AWS Region the
-/// connection lands in — so it belongs to the offering and reads the same on every
-/// endpoint.
-///
-/// `ProductType` is an unconstrained string, so the two values used here are taken
-/// from the model's own wording: `"Multicloud"` is the `type` the
-/// AcceptConnectionProposal / CreateConnection examples show for a
-/// `cloudServiceProvider` environment, and `"LastMile"` is how
-/// `Provider$lastMileProvider` names the other side's product ("LastMile
-/// connections").
+/// AWS manages Environments itself and the model publishes no catalog contents, so
+/// WHICH partner offering a Region's endpoint presents is the SERVICE's to say, not
+/// this emulator's to invent: the entry below is the offering the service publishes,
+/// with the partner token, the remote-side location naming and the two bandwidth lists
+/// it publishes them with, and without the members it leaves out (`activationPageUrl`).
+/// The catalog is the same for every caller in a Region, which is what makes the one
+/// published offering of its facility the whole of it.
 pub fn environment_catalog(region: &str) -> BTreeMap<String, Environment> {
-    let catalog = vec![
-        Environment {
-            provider: Provider::cloudServiceProvider("Azure".to_string()),
-            location: "us-east-1".to_string(),
-            environment_id: environment_id_in("csp-azure", region),
-            state: "available".to_string(),
-            bandwidths: Bandwidths {
-                available: Some(vec!["1Gbps".to_string(), "10Gbps".to_string()]),
-                supported: Some(vec![
-                    "1Gbps".to_string(),
-                    "10Gbps".to_string(),
-                    "100Gbps".to_string(),
-                ]),
-            },
-            r#type: "Multicloud".to_string(),
-            activation_page_url: Some(
-                "https://portal.example-azure.test/interconnect/activate".to_string(),
+    let catalog = vec![Environment {
+        provider: Provider::cloudServiceProvider(MULTICLOUD_PARTNER.to_string()),
+        location: MULTICLOUD_REMOTE_LOCATION.to_string(),
+        environment_id: environment_id_in(MULTICLOUD_PARTNER, region),
+        state: LIMITED_ENVIRONMENT_STATE.to_string(),
+        bandwidths: Bandwidths {
+            available: Some(
+                MULTICLOUD_AVAILABLE_BANDWIDTHS
+                    .iter()
+                    .map(|bandwidth| (*bandwidth).to_string())
+                    .collect(),
             ),
-            remote_identifier_type: Some("account".to_string()),
-        },
-        Environment {
-            provider: Provider::cloudServiceProvider("GoogleCloud".to_string()),
-            location: "us-west-2".to_string(),
-            environment_id: environment_id_in("csp-googlecloud", region),
-            state: "limited".to_string(),
-            bandwidths: Bandwidths {
-                available: Some(vec!["1Gbps".to_string()]),
-                supported: Some(vec!["1Gbps".to_string(), "10Gbps".to_string()]),
-            },
-            r#type: "Multicloud".to_string(),
-            activation_page_url: Some(
-                "https://portal.example-googlecloud.test/interconnect/activate".to_string(),
+            supported: Some(
+                MULTICLOUD_SUPPORTED_BANDWIDTHS
+                    .iter()
+                    .map(|bandwidth| (*bandwidth).to_string())
+                    .collect(),
             ),
-            remote_identifier_type: Some("account".to_string()),
         },
-        Environment {
-            provider: Provider::cloudServiceProvider("OracleCloud".to_string()),
-            location: "eu-west-1".to_string(),
-            environment_id: environment_id_in("csp-oraclecloud", region),
-            state: "available".to_string(),
-            bandwidths: Bandwidths {
-                available: Some(vec!["1Gbps".to_string(), "10Gbps".to_string()]),
-                supported: Some(vec!["1Gbps".to_string(), "10Gbps".to_string()]),
-            },
-            r#type: "Multicloud".to_string(),
-            activation_page_url: None,
-            remote_identifier_type: None,
-        },
-        Environment {
-            provider: Provider::lastMileProvider("Lumen".to_string()),
-            location: "Ashburn, VA".to_string(),
-            environment_id: environment_id_in("lmp-lumen", region),
-            state: "available".to_string(),
-            bandwidths: Bandwidths {
-                available: Some(vec!["100Mbps".to_string(), "1Gbps".to_string()]),
-                supported: Some(vec![
-                    "100Mbps".to_string(),
-                    "1Gbps".to_string(),
-                    "10Gbps".to_string(),
-                ]),
-            },
-            r#type: "LastMile".to_string(),
-            activation_page_url: Some(
-                "https://portal.example-lumen.test/interconnect/activate".to_string(),
-            ),
-            remote_identifier_type: Some("email".to_string()),
-        },
-        Environment {
-            provider: Provider::lastMileProvider("Megaport".to_string()),
-            location: "Sydney, NSW".to_string(),
-            environment_id: environment_id_in("lmp-megaport", region),
-            state: UNAVAILABLE_ENVIRONMENT_STATE.to_string(),
-            bandwidths: Bandwidths {
-                available: Some(Vec::new()),
-                supported: Some(vec!["1Gbps".to_string(), "10Gbps".to_string()]),
-            },
-            r#type: "LastMile".to_string(),
-            activation_page_url: None,
-            remote_identifier_type: Some("email".to_string()),
-        },
-    ];
+        r#type: MULTICLOUD_PRODUCT_TYPE.to_string(),
+        activation_page_url: None,
+        remote_identifier_type: Some(MULTICLOUD_REMOTE_IDENTIFIER_TYPE.to_string()),
+    }];
     catalog
         .into_iter()
         .map(|environment| (environment.environment_id.clone(), environment))
