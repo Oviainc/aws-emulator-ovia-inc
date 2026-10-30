@@ -206,9 +206,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateScraperLoggingConfigurationErrorModeled::ConflictException(
                     ConflictException {
-                        message: format!(
-                            "The scraper logging configuration is {}",
-                            crate::state::SCRAPER_LOGGING_STATUS_DELETING,
+                        message: crate::state::status_forbids_call_message(
+                            "update",
+                            "scraper logging configuration",
+                            &configuration.status_code,
                         ),
                         resource_id: input.scraper_id.clone(),
                         resource_type: crate::state::SCRAPER_LOGGING_RESOURCE_TYPE.to_string(),

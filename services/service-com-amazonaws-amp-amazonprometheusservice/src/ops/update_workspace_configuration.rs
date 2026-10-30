@@ -267,11 +267,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if workspace.configuration.status_code != crate::state::CONFIG_STATUS_ACTIVE {
             return Err(UpdateWorkspaceConfigurationErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "The workspace configuration is {}; an update is disallowed \
-                         until workspace configuration is {}",
-                        workspace.configuration.status_code,
-                        crate::state::CONFIG_STATUS_ACTIVE,
+                    message: crate::state::status_forbids_call_message(
+                        "update",
+                        "workspace configuration",
+                        &workspace.configuration.status_code,
                     ),
                     resource_id: workspace.workspace_id.clone(),
                     resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),

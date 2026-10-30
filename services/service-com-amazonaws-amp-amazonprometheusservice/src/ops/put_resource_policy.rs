@@ -270,13 +270,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The optimistic lock: a `revisionId` that does not name the policy's current
         // revision is a stale writer, and applying it would lose the revision in
         // between. The value the caller SENT is what is wrong, and no retry of the same
-        // request can fix it — so this is the modelled ValidationException (400) naming
-        // `revisionId`, not the 409 a transient resource status answers
-        // (`crate::state::stale_revision_rejection`). Nothing is written: the stored
-        // document and revision are left exactly as they were.
+        // request can fix it — so this is the modelled ValidationException (400) carrying
+        // the service's own sentence for the failed precondition, not the 409 a transient
+        // resource status answers (`crate::state::stale_revision_rejection`). Nothing is
+        // written: the stored document and revision are left exactly as they were.
         if !crate::state::revision_matches(existing.as_ref(), input.revision_id.as_deref()) {
             return Err(PutResourcePolicyErrorModeled::ValidationException(
-                crate::state::stale_revision_rejection(),
+                crate::state::stale_revision_rejection(crate::state::POLICY_UPDATE_ACTION),
             )
             .into());
         }

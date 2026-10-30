@@ -309,10 +309,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             if detector.status_code != crate::state::STATUS_ACTIVE {
                 return Err(conflict(
-                    format!(
-                        "The anomaly detector is {}; updates are allowed only when status is {}",
-                        detector.status_code,
-                        crate::state::STATUS_ACTIVE,
+                    crate::state::status_forbids_call_message(
+                        "update",
+                        "anomaly detector",
+                        &detector.status_code,
                     ),
                     detector.anomaly_detector_id.clone(),
                     crate::state::ANOMALY_DETECTOR_RESOURCE_TYPE,

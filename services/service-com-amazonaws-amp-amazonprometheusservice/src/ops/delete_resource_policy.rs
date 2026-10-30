@@ -265,11 +265,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The same optimistic lock a put takes: a `revisionId` that does not name
             // the policy's current revision would delete a revision the caller never
             // read. The value the caller sent is what is wrong, so it is refused as the
-            // modelled ValidationException (400) naming `revisionId`, exactly as a put
-            // refuses it (`crate::state::stale_revision_rejection`).
+            // modelled ValidationException (400) carrying the service's own sentence for
+            // the failed precondition, exactly as a put refuses it
+            // (`crate::state::stale_revision_rejection`) — naming the DELETE this call
+            // was going to make.
             if !crate::state::revision_matches(Some(policy), input.revision_id.as_deref()) {
                 return Err(DeleteResourcePolicyErrorModeled::ValidationException(
-                    crate::state::stale_revision_rejection(),
+                    crate::state::stale_revision_rejection(crate::state::POLICY_DELETE_ACTION),
                 )
                 .into());
             }

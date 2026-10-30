@@ -7,8 +7,8 @@
 //! 2. the shape of a REFUSED request — the modelled `ValidationException`, with `reason`,
 //!    a `fieldList` entry per refused member and a `message` naming the member and the
 //!    requirement it failed, never the value the caller sent;
-//! 3. the message a MISSING resource reports — one constant sentence per kind of
-//!    resource, with the requested identifier in `resourceId` and nowhere else.
+//! 3. the message a MISSING resource reports — a constant sentence per kind of resource
+//!    and per operation, with the requested identifier in `resourceId` and nowhere else.
 //!
 //! Each suite is a TABLE: the rule is a property of the service, so the rows span
 //! statuses, operations, constraint classes and member types rather than restating one
@@ -16,10 +16,10 @@
 
 use crate::workspace_lifecycle::{text, Amp, Reply};
 use service_com_amazonaws_amp_amazonprometheusservice::state::{
-    JSON_CONTENT_TYPE, LOGGING_NOT_FOUND_MESSAGE, POLICY_NOT_FOUND_MESSAGE,
-    QUERY_LOGGING_NOT_FOUND_MESSAGE, RESOURCE_NOT_FOUND_CODE, RESOURCE_NOT_FOUND_MESSAGE,
-    RESPONSE_CONTENT_TYPE, RULE_GROUPS_NAMESPACE_NOT_FOUND_MESSAGE, VALIDATION_REASON,
-    WORKSPACE_NOT_FOUND_MESSAGE,
+    DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE, JSON_CONTENT_TYPE, LOGGING_NOT_FOUND_MESSAGE,
+    POLICY_NOT_FOUND_MESSAGE, QUERY_LOGGING_NOT_FOUND_MESSAGE, RESOURCE_NOT_FOUND_CODE,
+    RESOURCE_NOT_FOUND_MESSAGE, RESPONSE_CONTENT_TYPE, RULE_GROUPS_NAMESPACE_NOT_FOUND_MESSAGE,
+    VALIDATION_REASON, WORKSPACE_NOT_FOUND_MESSAGE,
 };
 use service_com_amazonaws_amp_amazonprometheusservice::EmulatedService;
 
@@ -503,9 +503,12 @@ async fn a_value_at_a_published_bound_is_accepted() {
     }
 }
 
-/// A workspace no store holds is refused with ONE constant sentence, whichever operation
-/// looked it up and whichever id it looked up: the message carries nothing from the
-/// request, and the requested id is reported in `resourceId`.
+/// A workspace no store holds is refused with a CONSTANT sentence: the text is that
+/// OPERATION's own and carries nothing from the request, so the same operation answers the
+/// same sentence for every id it cannot resolve, and the requested id is reported in
+/// `resourceId`. `DescribeWorkspace` answers its own recorded spelling
+/// ([`DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE`]); the operations with no recording of their
+/// own share [`WORKSPACE_NOT_FOUND_MESSAGE`].
 #[tokio::test]
 async fn a_missing_workspace_reports_one_constant_message() {
     let region = "us-east-2";
@@ -513,84 +516,97 @@ async fn a_missing_workspace_reports_one_constant_message() {
     let mut reported: Vec<(String, String)> = Vec::new();
 
     for absent in ABSENT_WORKSPACES {
-        let cases: Vec<(&str, &str, String, String)> = vec![
+        let cases: Vec<(&str, &str, String, String, &str)> = vec![
             (
                 "DescribeWorkspace",
                 "GET",
                 format!("/workspaces/{absent}"),
                 String::new(),
+                DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE,
             ),
             (
                 "UpdateWorkspaceAlias",
                 "POST",
                 format!("/workspaces/{absent}/alias"),
                 serde_json::json!({ "alias": "renamed" }).to_string(),
+                WORKSPACE_NOT_FOUND_MESSAGE,
             ),
             (
                 "DeleteWorkspace",
                 "DELETE",
                 format!("/workspaces/{absent}"),
                 String::new(),
+                WORKSPACE_NOT_FOUND_MESSAGE,
             ),
             (
                 "DescribeWorkspaceConfiguration",
                 "GET",
                 format!("/workspaces/{absent}/configuration"),
                 String::new(),
+                WORKSPACE_NOT_FOUND_MESSAGE,
             ),
             (
                 "UpdateWorkspaceConfiguration",
                 "PATCH",
                 format!("/workspaces/{absent}/configuration"),
                 serde_json::json!({ "retentionPeriodInDays": 30 }).to_string(),
+                WORKSPACE_NOT_FOUND_MESSAGE,
             ),
             (
                 "DescribeLoggingConfiguration",
                 "GET",
                 format!("/workspaces/{absent}/logging"),
                 String::new(),
+                WORKSPACE_NOT_FOUND_MESSAGE,
             ),
             (
                 "CreateLoggingConfiguration",
                 "POST",
                 format!("/workspaces/{absent}/logging"),
                 serde_json::json!({ "logGroupArn": log_group_arn(region) }).to_string(),
+                WORKSPACE_NOT_FOUND_MESSAGE,
             ),
             (
                 "DescribeQueryLoggingConfiguration",
                 "GET",
                 format!("/workspaces/{absent}/logging/query"),
                 String::new(),
+                WORKSPACE_NOT_FOUND_MESSAGE,
             ),
             (
                 "CreateQueryLoggingConfiguration",
                 "POST",
                 format!("/workspaces/{absent}/logging/query"),
                 serde_json::json!({ "destinations": destinations_json(region) }).to_string(),
+                WORKSPACE_NOT_FOUND_MESSAGE,
             ),
             (
                 "UpdateQueryLoggingConfiguration",
                 "PUT",
                 format!("/workspaces/{absent}/logging/query"),
                 serde_json::json!({ "destinations": destinations_json(region) }).to_string(),
+                WORKSPACE_NOT_FOUND_MESSAGE,
             ),
             (
                 "DeleteQueryLoggingConfiguration",
                 "DELETE",
                 format!("/workspaces/{absent}/logging/query"),
                 String::new(),
+                WORKSPACE_NOT_FOUND_MESSAGE,
             ),
             (
                 "CreateRuleGroupsNamespace",
                 "POST",
                 format!("/workspaces/{absent}/rulegroupsnamespaces"),
                 serde_json::json!({ "name": "rules", "data": "Z3JvdXBzOiBbXQ==" }).to_string(),
+                WORKSPACE_NOT_FOUND_MESSAGE,
             ),
             (
                 "DescribeRuleGroupsNamespace",
                 "GET",
                 format!("/workspaces/{absent}/rulegroupsnamespaces/rules"),
                 String::new(),
+                WORKSPACE_NOT_FOUND_MESSAGE,
             ),
             (
                 "DescribeAnomalyDetector",
@@ -600,6 +616,7 @@ async fn a_missing_workspace_reports_one_constant_message() {
                      ad-00000000-0000-0000-0000-000000000000"
                 ),
                 String::new(),
+                WORKSPACE_NOT_FOUND_MESSAGE,
             ),
             (
                 "DeleteAnomalyDetector",
@@ -609,6 +626,7 @@ async fn a_missing_workspace_reports_one_constant_message() {
                      ad-00000000-0000-0000-0000-000000000000"
                 ),
                 String::new(),
+                WORKSPACE_NOT_FOUND_MESSAGE,
             ),
             (
                 "CreateAnomalyDetector",
@@ -619,41 +637,51 @@ async fn a_missing_workspace_reports_one_constant_message() {
                     "configuration": { "randomCutForest": { "query": "sum(up)" } },
                 })
                 .to_string(),
+                WORKSPACE_NOT_FOUND_MESSAGE,
             ),
             (
                 "DescribeResourcePolicy",
                 "GET",
                 format!("/workspaces/{absent}/policy"),
                 String::new(),
+                WORKSPACE_NOT_FOUND_MESSAGE,
             ),
             (
                 "PutResourcePolicy",
                 "PUT",
                 format!("/workspaces/{absent}/policy"),
                 serde_json::json!({ "policyDocument": "{}" }).to_string(),
+                WORKSPACE_NOT_FOUND_MESSAGE,
             ),
             (
                 "DeleteResourcePolicy",
                 "DELETE",
                 format!("/workspaces/{absent}/policy"),
                 String::new(),
+                WORKSPACE_NOT_FOUND_MESSAGE,
             ),
         ];
 
-        for (operation, method, uri, body) in cases {
+        for (operation, method, uri, body, message) in cases {
             let case = format!("{operation} on {absent}");
             let reply = amp.call(method, &uri, region, &body).await;
-            assert_missing(&reply, &case, WORKSPACE_NOT_FOUND_MESSAGE, absent);
-            reported.push((case, text(&reply.body["message"])));
+            assert_missing(&reply, &case, message, absent);
+            reported.push((operation.to_string(), text(&reply.body["message"])));
         }
     }
 
-    let first = reported[0].1.clone();
-    for (case, message) in &reported {
+    // The sentence is a property of the OPERATION, not of the id asked for: each operation
+    // reported the same text for both absent ids.
+    for (operation, message) in &reported {
+        let first = reported
+            .iter()
+            .find(|(name, _)| name == operation)
+            .map(|(_, message)| message.clone())
+            .unwrap_or_default();
         assert_eq!(
             message, &first,
-            "case {case:?}: every operation must report the same not-found message, \
-             got {message:?} against {first:?}"
+            "case {operation:?}: one operation must report the same not-found message for \
+             every id it cannot resolve, got {message:?} against {first:?}"
         );
     }
 }

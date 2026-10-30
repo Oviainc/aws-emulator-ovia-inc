@@ -287,11 +287,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if namespace.status_code != crate::state::NAMESPACE_STATUS_ACTIVE {
             return Err(PutRuleGroupsNamespaceErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "The rule groups namespace is {}; an update is disallowed until \
-                         the namespace is {}",
-                        namespace.status_code,
-                        crate::state::NAMESPACE_STATUS_ACTIVE,
+                    message: crate::state::status_forbids_call_message(
+                        "update",
+                        "rule groups namespace",
+                        &namespace.status_code,
                     ),
                     resource_id: namespace.arn.clone(),
                     resource_type: crate::state::RULE_GROUPS_NAMESPACE_RESOURCE_TYPE.to_string(),

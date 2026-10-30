@@ -199,10 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !replays_pending_delete && scraper.status_code != crate::state::STATUS_ACTIVE {
             return Err(DeleteScraperErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "The scraper is {}; deletions are allowed only when status is {}",
-                        scraper.status_code,
-                        crate::state::STATUS_ACTIVE,
+                    message: crate::state::status_forbids_call_message(
+                        "delete",
+                        "scraper",
+                        &scraper.status_code,
                     ),
                     resource_id: scraper.scraper_id.clone(),
                     resource_type: crate::state::SCRAPER_RESOURCE_TYPE.to_string(),

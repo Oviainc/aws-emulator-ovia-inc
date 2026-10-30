@@ -221,9 +221,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateQueryLoggingConfigurationErrorModeled::ConflictException(
                     ConflictException {
-                        message: format!(
-                            "The query logging configuration is {}",
-                            crate::state::QUERY_LOGGING_STATUS_DELETING,
+                        message: crate::state::status_forbids_call_message(
+                            "update",
+                            "query logging configuration",
+                            &configuration.status_code,
                         ),
                         resource_id: input.workspace_id.clone(),
                         resource_type: crate::state::QUERY_LOGGING_RESOURCE_TYPE.to_string(),

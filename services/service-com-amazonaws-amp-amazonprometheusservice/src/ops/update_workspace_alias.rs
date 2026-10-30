@@ -227,10 +227,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !replays_pending_update && workspace.status_code != crate::state::STATUS_ACTIVE {
             return Err(UpdateWorkspaceAliasErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "The workspace is {}; updates are allowed only when status is {}",
-                        workspace.status_code,
-                        crate::state::STATUS_ACTIVE,
+                    message: crate::state::status_forbids_call_message(
+                        "update",
+                        "workspace",
+                        &workspace.status_code,
                     ),
                     resource_id: workspace.workspace_id.clone(),
                     resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),

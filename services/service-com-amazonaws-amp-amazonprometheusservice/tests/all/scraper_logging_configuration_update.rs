@@ -24,7 +24,7 @@ use service_com_amazonaws_amp_amazonprometheusservice::ops::types::{
     ComponentConfig, ScraperComponent, ScraperLoggingDestination, SCRAPER_COMPONENT_TYPE_VALUES,
 };
 use service_com_amazonaws_amp_amazonprometheusservice::state::{
-    ScraperLoggingConfiguration, SCRAPER_LOGGING_NOT_FOUND_MESSAGE,
+    status_forbids_call_message, ScraperLoggingConfiguration, SCRAPER_LOGGING_NOT_FOUND_MESSAGE,
     SCRAPER_LOGGING_RESOURCE_TYPE, SCRAPER_LOGGING_STATUS_ACTIVE, SCRAPER_LOGGING_STATUS_DELETING,
     SCRAPER_LOGGING_STATUS_UPDATING, SCRAPER_NOT_FOUND_MESSAGE, SCRAPER_RESOURCE_TYPE,
     STATUS_ACTIVE,
@@ -496,7 +496,11 @@ async fn an_update_of_a_configuration_being_deleted_is_the_modelled_conflict() {
         &reply,
         409,
         "ConflictException",
-        &format!("The scraper logging configuration is {SCRAPER_LOGGING_STATUS_DELETING}"),
+        &status_forbids_call_message(
+            "update",
+            "scraper logging configuration",
+            SCRAPER_LOGGING_STATUS_DELETING,
+        ),
         &seeded.scraper_id,
         SCRAPER_LOGGING_RESOURCE_TYPE,
     );

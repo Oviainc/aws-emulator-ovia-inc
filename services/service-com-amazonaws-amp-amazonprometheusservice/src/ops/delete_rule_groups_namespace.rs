@@ -264,11 +264,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(DeleteRuleGroupsNamespaceErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "The rule groups namespace is {}; a deletion is disallowed until \
-                         the namespace is {}",
-                        namespace.status_code,
-                        crate::state::NAMESPACE_STATUS_ACTIVE,
+                    message: crate::state::status_forbids_call_message(
+                        "delete",
+                        "rule groups namespace",
+                        &namespace.status_code,
                     ),
                     resource_id: namespace.arn.clone(),
                     resource_type: crate::state::RULE_GROUPS_NAMESPACE_RESOURCE_TYPE.to_string(),

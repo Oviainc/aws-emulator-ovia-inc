@@ -7,9 +7,9 @@
 //!
 //! * a `revisionId` that does not name the revision a workspace's resource-based policy is
 //!   currently at is a value the CALLER got wrong, so every operation taking that
-//!   optimistic lock refuses it with the modelled `ValidationException` (400) naming the
-//!   `revisionId` member — never with the 409 `ConflictException` that says the resource's
-//!   STATUS forbids the call;
+//!   optimistic lock refuses it with the modelled `ValidationException` (400) carrying the
+//!   service's own sentence for the failed precondition — never with the 409
+//!   `ConflictException` that says the resource's STATUS forbids the call;
 //! * a `resourceArn` the ARN-addressed `/tags/{resourceArn}` operations resolve to no live
 //!   resource is refused 404 with `state::RESOURCE_NOT_FOUND_CODE`, whatever resource type
 //!   the ARN names.
@@ -21,8 +21,8 @@
 
 use crate::workspace_lifecycle::{text, wait_for_due_transition, Amp, Reply};
 use service_com_amazonaws_amp_amazonprometheusservice::state::{
-    stale_revision_requirement, NO_POLICY_REVISION_ID, RESOURCE_NOT_FOUND_CODE,
-    RESOURCE_NOT_FOUND_MESSAGE, VALIDATION_REASON,
+    stale_revision_message, NO_POLICY_REVISION_ID, POLICY_DELETE_ACTION, POLICY_UPDATE_ACTION,
+    RESOURCE_NOT_FOUND_CODE, RESOURCE_NOT_FOUND_MESSAGE, VALIDATION_REASON,
 };
 use serde_json::{json, Value};
 
@@ -88,9 +88,10 @@ async fn stored_policy(amp: &Amp, region: &str, workspace_id: &str) -> (String, 
 }
 
 /// Every assertion the optimistic-lock refusal makes: the modelled `ValidationException`
-/// at 400, naming the `revisionId` member and the requirement it failed in `fieldList`,
-/// in `reason` and in `message` — the one composition every aps refusal takes.
-fn assert_refused_as_a_bad_revision(case: &str, reply: &Reply) {
+/// at 400, carrying the service's fixed sentence for the failed precondition in `message`
+/// — which names the ACTION the refused call was going to make and no member path — the
+/// recorded `reason`, and no `fieldList`, since no member failed a constraint.
+fn assert_refused_as_a_bad_revision(case: &str, reply: &Reply, action: &str) {
     assert_eq!(
         reply.status, 400,
         "case {case:?}: a revisionId that is not the current one must be refused 400, \
@@ -109,35 +110,36 @@ fn assert_refused_as_a_bad_revision(case: &str, reply: &Reply) {
     );
     assert_eq!(
         reply.body["fieldList"],
-        json!([{ "name": "revisionId", "message": stale_revision_requirement() }]),
-        "case {case:?}: expected one fieldList entry naming revisionId, got {reply:?}"
+        Value::Null,
+        "case {case:?}: a refusal naming no member carries no fieldList, got {reply:?}"
     );
     assert_eq!(
         text(&reply.body["message"]),
-        format!("Invalid revisionId: {}", stale_revision_requirement()),
-        "case {case:?}: expected the message to name the member and its requirement, \
-         got {reply:?}"
+        stale_revision_message(action),
+        "case {case:?}: expected the service's optimistic-lock sentence, got {reply:?}"
     );
 }
 
 /// Every value of `revisionId` that is not the revision the policy is at is refused as a
-/// bad MEMBER (400 `ValidationException`), by `PutResourcePolicy` and by
+/// failed PRECONDITION (400 `ValidationException`), by `PutResourcePolicy` and by
 /// `DeleteResourcePolicy` alike, with the stored policy left exactly as it was.
 ///
 /// One row per form the stale value can take: the revision the policy was at before the
 /// last accepted put, a well-formed revision id no put of this store ever minted,
 /// `NO_POLICY` (which asserts the workspace holds none, and it holds one), a value that is
 /// not a revision id at all, and the empty string (`revisionId` carries no `@length`, so
-/// the model accepts it and the handler decides).
+/// the model accepts it and the handler decides). Each refusal names the action its own
+/// operation was going to make.
 #[tokio::test]
-async fn a_revision_id_that_is_not_the_current_one_is_refused_as_a_bad_member() {
+async fn a_revision_id_that_is_not_the_current_one_is_refused_as_a_failed_precondition() {
     struct Case {
         name: &'static str,
         /// `None` means "the revision the policy was at before the last accepted put",
         /// which only the running workspace can supply.
         revision: Option<&'static str>,
-        /// Whether the refusal's text can be checked for not echoing the sent value: the
-        /// requirement itself names `NO_POLICY`, so that row has nothing to compare.
+        /// Whether the refusal's text can be checked for not echoing the sent value: every
+        /// row can, since the sentence carries nothing from the request at all, but the
+        /// empty string is skipped at the comparison (it is a substring of everything).
         echo_free: bool,
     }
 
@@ -155,7 +157,7 @@ async fn a_revision_id_that_is_not_the_current_one_is_refused_as_a_bad_member() 
         Case {
             name: "NO_POLICY while the workspace holds a policy",
             revision: Some(NO_POLICY_REVISION_ID),
-            echo_free: false,
+            echo_free: true,
         },
         Case {
             name: "a value that is not a revision id",
@@ -169,7 +171,10 @@ async fn a_revision_id_that_is_not_the_current_one_is_refused_as_a_bad_member() 
         },
     ];
 
-    for operation in ["PutResourcePolicy", "DeleteResourcePolicy"] {
+    for (operation, action) in [
+        ("PutResourcePolicy", POLICY_UPDATE_ACTION),
+        ("DeleteResourcePolicy", POLICY_DELETE_ACTION),
+    ] {
         for case in &cases {
             let region = "eu-west-1";
             let amp = Amp::new();
@@ -213,7 +218,7 @@ async fn a_revision_id_that_is_not_the_current_one_is_refused_as_a_bad_member() 
             } else {
                 delete_policy(&amp, region, &workspace_id, &named).await
             };
-            assert_refused_as_a_bad_revision(&label, &reply);
+            assert_refused_as_a_bad_revision(&label, &reply, action);
             if case.echo_free && !named.is_empty() {
                 let rendered = reply.body.to_string();
                 assert!(
@@ -296,7 +301,7 @@ async fn the_first_put_refuses_every_revision_id_but_no_policy() {
             );
             continue;
         }
-        assert_refused_as_a_bad_revision(case, &reply);
+        assert_refused_as_a_bad_revision(case, &reply, POLICY_UPDATE_ACTION);
         let still_empty = describe_policy(&amp, region, &workspace_id).await;
         assert_eq!(
             still_empty.status, 404,

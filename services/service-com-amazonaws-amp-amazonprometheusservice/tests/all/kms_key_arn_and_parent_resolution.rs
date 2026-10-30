@@ -26,7 +26,8 @@ use serde_json::{json, Value};
 
 use crate::workspace_lifecycle::{text, Amp, Reply};
 use service_com_amazonaws_amp_amazonprometheusservice::state::{
-    VALIDATION_REASON, WORKSPACE_NOT_FOUND_MESSAGE, WORKSPACE_RESOURCE_TYPE,
+    DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE, VALIDATION_REASON, WORKSPACE_NOT_FOUND_MESSAGE,
+    WORKSPACE_RESOURCE_TYPE,
 };
 
 /// `WorkspaceId`s no store mints (`[0-9A-Za-z][-.0-9A-Z_a-z]*`, length 1..64), in three
@@ -77,6 +78,9 @@ struct Scoped {
     /// The path under `/workspaces/{workspaceId}`, empty for the workspace itself.
     suffix: &'static str,
     body: Value,
+    /// The not-found sentence THIS operation answers: each operation's text is its own,
+    /// and `DescribeWorkspace`'s is the one without the trailing period.
+    message: &'static str,
 }
 
 /// The requests the table drives against a workspace that does not resolve — four
@@ -94,36 +98,42 @@ fn workspace_scoped_requests(region: &str) -> Vec<Scoped> {
                 "configuration": detector_configuration(),
                 "evaluationIntervalInSeconds": 60,
             }),
+            message: WORKSPACE_NOT_FOUND_MESSAGE,
         },
         Scoped {
             operation: "CreateRuleGroupsNamespace",
             method: "POST",
             suffix: "/rulegroupsnamespaces",
             body: json!({ "name": "rules", "data": "Z3JvdXBzOiBbXQ==" }),
+            message: WORKSPACE_NOT_FOUND_MESSAGE,
         },
         Scoped {
             operation: "CreateLoggingConfiguration",
             method: "POST",
             suffix: "/logging",
             body: json!({ "logGroupArn": log_group_arn(region) }),
+            message: WORKSPACE_NOT_FOUND_MESSAGE,
         },
         Scoped {
             operation: "CreateQueryLoggingConfiguration",
             method: "POST",
             suffix: "/logging/query",
             body: json!({ "destinations": destinations_json(region) }),
+            message: WORKSPACE_NOT_FOUND_MESSAGE,
         },
         Scoped {
             operation: "PutResourcePolicy",
             method: "PUT",
             suffix: "/policy",
             body: json!({ "policyDocument": "{}" }),
+            message: WORKSPACE_NOT_FOUND_MESSAGE,
         },
         Scoped {
             operation: "DescribeWorkspace",
             method: "GET",
             suffix: "",
             body: Value::Null,
+            message: DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE,
         },
     ]
 }
@@ -170,7 +180,7 @@ async fn an_unresolvable_parent_workspace_is_a_not_found() {
             );
             assert_eq!(
                 text(&reply.body["message"]),
-                WORKSPACE_NOT_FOUND_MESSAGE,
+                request.message,
                 "case {case:?}: expected the constant not-found sentence, got {reply:?}"
             );
             assert_eq!(

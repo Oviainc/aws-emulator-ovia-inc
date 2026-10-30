@@ -26,9 +26,9 @@
 use crate::workspace_lifecycle::{tags_of, text, wait_for_due_transition, Amp, Reply};
 use service_com_amazonaws_amp_amazonprometheusservice::ops::types::ANOMALY_DETECTOR_STATUS_CODE_VALUES;
 use service_com_amazonaws_amp_amazonprometheusservice::state::{
-    ANOMALY_DETECTOR_RESOURCE_TYPE, RANDOM_CUT_FOREST_AGGREGATION_OPERATORS, STATUS_ACTIVE,
-    STATUS_CREATING, STATUS_DELETING, STATUS_UPDATING, WORKSPACE_NOT_FOUND_MESSAGE,
-    WORKSPACE_RESOURCE_TYPE,
+    ANOMALY_DETECTOR_RESOURCE_TYPE, RANDOM_CUT_FOREST_AGGREGATION_OPERATORS,
+    RANDOM_CUT_FOREST_QUERY_UNSUPPORTED_MESSAGE, STATUS_ACTIVE, STATUS_CREATING, STATUS_DELETING,
+    STATUS_UPDATING, WORKSPACE_NOT_FOUND_MESSAGE, WORKSPACE_RESOURCE_TYPE,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -945,9 +945,10 @@ async fn put_requires_a_query_wrapped_by_a_supported_aggregation_operator() {
             "case {query:?}: unexpected error code, got {refused:?}"
         );
         assert_eq!(
-            text(&refused.body["fieldList"][0]["name"]),
-            "configuration.randomCutForest.query",
-            "case {query:?}: the refusal must name the member it refused, got {refused:?}"
+            text(&refused.body["message"]),
+            RANDOM_CUT_FOREST_QUERY_UNSUPPORTED_MESSAGE,
+            "case {query:?}: expected the service's sentence for an unsupported \
+             expression, got {refused:?}"
         );
         // Refused before anything was stored: the detector still holds the last accepted
         // specification, and is still usable.

@@ -47,6 +47,8 @@ mod map_key_constraints;
 mod namespace_tag_removal;
 #[path = "all/query_logging_configuration.rs"]
 mod query_logging_configuration;
+#[path = "all/refusal_messages.rs"]
+mod refusal_messages;
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
 #[path = "all/rejection_codes.rs"]

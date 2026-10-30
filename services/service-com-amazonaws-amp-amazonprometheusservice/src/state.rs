@@ -276,10 +276,26 @@ pub const SCRAPER_LOGGING_NOT_FOUND_MESSAGE: &str = "Scraper logging configurati
 /// One CONSTANT sentence, exactly as [`QUERY_LOGGING_NOT_FOUND_MESSAGE`] is for a
 /// configuration: `ResourceNotFoundException` models `resourceId` (@required) beside
 /// `message`, so the identifier of the missing resource has its own home and the
-/// sentence carries nothing from the request. Every per-workspace operation shares this
-/// one constant, so a caller comparing the not-found message across calls — or across
-/// operations — reads the same value every time.
+/// sentence carries nothing from the request.
+///
+/// It is the sentence of every workspace-addressed operation RECORDED answering it —
+/// `DeleteWorkspace` among them — but not of ALL of them: the recorded text is each
+/// OPERATION's own, and `DescribeWorkspace` answers
+/// [`DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE`] instead. An operation with no recording of
+/// its own answers this one, so a caller still reads one value across the operations that
+/// share it.
 pub const WORKSPACE_NOT_FOUND_MESSAGE: &str = "Workspace not found.";
+
+/// The `message` `DescribeWorkspace` reports for a workspace this account does not hold:
+/// [`WORKSPACE_NOT_FOUND_MESSAGE`] without the trailing period.
+///
+/// RECORDED BEHAVIOUR: in the recorded delete lifecycle, the `DescribeWorkspace` that
+/// finds a deleted workspace gone is refused "Workspace not found" while the
+/// `DeleteWorkspace` on that same gone id is refused "Workspace not found." — so this
+/// service does not have ONE workspace not-found sentence, it has one per operation, and
+/// each answers the text recorded for it. Constant and id-free like every other refusal
+/// sentence here: the id asked for is reported in `resourceId`.
+pub const DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE: &str = "Workspace not found";
 
 /// The `message` the ARN-addressed `/tags/{resourceArn}` operations report for a
 /// `resourceArn` that resolves to nothing — RECORDED BEHAVIOUR, like
@@ -312,7 +328,14 @@ pub const RULE_GROUPS_NAMESPACE_NOT_FOUND_MESSAGE: &str = "Rule groups namespace
 /// The `message` the modelled `ResourceNotFoundException` reports for a workspace that
 /// holds no rules-and-alerting logging configuration — constant and id-free for the same
 /// reason [`QUERY_LOGGING_NOT_FOUND_MESSAGE`] is.
-pub const LOGGING_NOT_FOUND_MESSAGE: &str = "Logging configuration not found.";
+///
+/// RECORDED BEHAVIOUR: the recorded `DescribeLoggingConfiguration` and
+/// `UpdateLoggingConfiguration` on a workspace whose configuration has been deleted are
+/// both refused "Workspace logging configuration not found." — the sentence names the
+/// resource FAMILY as the service names it, a logging configuration OF a workspace, which
+/// is the same sentence the query logging configuration's own absence is recorded
+/// answering.
+pub const LOGGING_NOT_FOUND_MESSAGE: &str = "Workspace logging configuration not found.";
 
 /// The `message` the modelled `ValidationException` reports when the workspace's
 /// rules-and-alerting logging configuration is asked to be CREATED while the one the
@@ -350,7 +373,12 @@ pub const WORKSPACE_DELETING_MESSAGE: &str =
 /// The `message` the modelled `ResourceNotFoundException` reports for a workspace that
 /// holds no resource-based policy — constant and id-free for the same reason
 /// [`WORKSPACE_NOT_FOUND_MESSAGE`] is; the workspace is reported in `resourceId`.
-pub const POLICY_NOT_FOUND_MESSAGE: &str = "Resource-based policy not found.";
+///
+/// RECORDED BEHAVIOUR: the recorded `DescribeResourcePolicy` and repeat
+/// `DeleteResourcePolicy` on a workspace whose policy has been deleted are both refused
+/// "Workspace resource policy not found." — the noun phrase is the service's own for this
+/// family, a resource policy OF a workspace.
+pub const POLICY_NOT_FOUND_MESSAGE: &str = "Workspace resource policy not found.";
 
 /// The `message` the modelled `ResourceNotFoundException` reports for a workspace that
 /// holds no query logging configuration.
@@ -557,6 +585,29 @@ pub fn workspace_refuses_new_detector_message(workspace_status: &str) -> String 
     format!("The workspace is {workspace_status}; it cannot take new anomaly detectors")
 }
 
+/// The `message` the modelled `ConflictException` carries when the status a resource is
+/// CURRENTLY in forbids the call that names it.
+///
+/// RECORDED BEHAVIOUR: a `DeleteWorkspace` on a workspace that is already `DELETING` is
+/// refused "Can't delete workspace in non-ACTIVE state. Current status is DELETING" —
+/// fixed text up to ONE variable part, the resource's current status code read from this
+/// store (and no trailing period). Every status enum this service models states the rule
+/// the same way ("Deletions are allowed only when status is ACTIVE", "Updates are allowed
+/// only when status is ACTIVE"), so every refusal that turns on the status of the resource
+/// the call ACTS ON is worded with this one template and a caller reads one sentence for
+/// the whole class: `action` is what the call does to it ("delete", "update") and
+/// `resource` is that resource as the service names it in prose.
+///
+/// A refusal that turns on the status of the PARENT a resource lives in, or on two
+/// resources' statuses at once, says something else and is worded by its own handler: the
+/// template carries one status and names one resource.
+pub fn status_forbids_call_message(action: &str, resource: &str, current_status: &str) -> String {
+    format!(
+        "Can't {action} {resource} in non-{STATUS_ACTIVE} state. Current status is \
+         {current_status}"
+    )
+}
+
 /// How many scrapers ONE REGION's store holds before `CreateScraper` refuses with the
 /// modelled `ServiceQuotaExceededException`.
 ///
@@ -578,6 +629,20 @@ pub const SCRAPERS_PER_ACCOUNT_QUOTA: usize = 1_000;
 pub const RANDOM_CUT_FOREST_AGGREGATION_OPERATORS: &[&str] = &[
     "avg", "count", "group", "max", "min", "quantile", "stddev", "stdvar", "sum",
 ];
+
+/// The `message` the modelled `ValidationException` carries for a `randomCutForest` query
+/// no supported aggregation operator wraps.
+///
+/// RECORDED BEHAVIOUR: a syntactically valid but unwrapped query is refused 400 with
+/// "Unsupported PromQL expression for RandomCutForest, expression's root must be a
+/// supported aggregation operator" — the WHOLE sentence is fixed: it echoes neither the
+/// rejected expression nor the member path nor the operator list. This is the service
+/// judging what the request MEANS, not a member failing a constraint the model declares,
+/// so it is raised through [`request_validation_failed`] (no `fieldList`) rather than
+/// through the member template [`member_validation_failed`] composes.
+pub const RANDOM_CUT_FOREST_QUERY_UNSUPPORTED_MESSAGE: &str =
+    "Unsupported PromQL expression for RandomCutForest, expression's root must be a \
+     supported aggregation operator";
 
 /// This service's ARN namespace (`OPERATIONS.md`: "ARN namespace: `aps`").
 const ARN_SERVICE: &str = "aps";
@@ -1702,8 +1767,8 @@ pub fn arn_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
 }
 
 /// How a `revisionId` that does not name the policy's current revision is refused: the
-/// modelled `ValidationException` (400) naming the `revisionId` member and the
-/// requirement it failed.
+/// modelled `ValidationException` (400) carrying the service's own fixed sentence for the
+/// failed precondition ([`stale_revision_message`]).
 ///
 /// RECORDED BEHAVIOUR: `PutResourcePolicy` and `DeleteResourcePolicy` model BOTH
 /// `ValidationException` (@httpError 400) and `ConflictException` (@httpError 409), and a
@@ -1717,23 +1782,30 @@ pub fn arn_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
 /// `ConflictException` stays what it is for: the resource being in a status that forbids
 /// the call at all ("Update/Deletion is disallowed until Resource-based Policy is ACTIVE
 /// and Workspace is ACTIVE"), which no value in the request can fix.
-pub fn stale_revision_rejection() -> crate::ops::types::ValidationException {
-    member_validation_failed(REVISION_ID_MEMBER, &stale_revision_requirement())
+///
+/// `action` is what the refused call was going to do to the policy — see
+/// [`POLICY_UPDATE_ACTION`] and [`POLICY_DELETE_ACTION`].
+pub fn stale_revision_rejection(action: &str) -> crate::ops::types::ValidationException {
+    request_validation_failed(&stale_revision_message(action))
 }
 
-/// The wire name of the optimistic-lock member, as `fieldList` reports it.
-const REVISION_ID_MEMBER: &str = "revisionId";
+/// What a `PutResourcePolicy` holding the lock was going to do to the workspace's
+/// resource policy, as [`stale_revision_message`] names it.
+pub const POLICY_UPDATE_ACTION: &str = "update";
+/// [`POLICY_UPDATE_ACTION`] for `DeleteResourcePolicy`.
+pub const POLICY_DELETE_ACTION: &str = "delete";
 
-/// The requirement a `revisionId` fails when it does not name the revision the policy is
-/// currently at, worded as [`constraint_requirement`] words a modelled constraint — the
-/// same reason [`reserved_tag_key_requirement`] is worded that way. It names the member's
-/// own documented purpose ("Use this parameter to ensure that you are updating the correct
-/// version of the policy") and echoes no value from the request.
-pub fn stale_revision_requirement() -> String {
-    format!(
-        "Member must name the current revision of the resource-based policy, or {NO_POLICY_REVISION_ID} \
-         while the workspace holds none"
-    )
+/// The sentence the service answers when the optimistic lock on a workspace's resource
+/// policy fails.
+///
+/// RECORDED BEHAVIOUR: a `PutResourcePolicy` naming a revision the policy is no longer at
+/// is refused "Can't conditionally update a workspace resource policy with a wrong
+/// revisionId." — fixed text with no variable parts: neither the revision the caller sent
+/// nor the one the policy is at appears in it. The only part that moves is the ACTION the
+/// refused call named, since the same lock guards the conditional delete; the sentence
+/// names what the call was going to do, as it does for the put it was recorded on.
+pub fn stale_revision_message(action: &str) -> String {
+    format!("Can't conditionally {action} a workspace resource policy with a wrong revisionId.")
 }
 
 /// The reserved tag key a request carries, if any — the lowest one, so the refusal
@@ -1862,6 +1934,12 @@ pub fn leading_call_operator(expression: &str) -> Option<&str> {
 /// PromQL aggregation operator" — so the whole expression must BE a call to one of
 /// [`RANDOM_CUT_FOREST_AGGREGATION_OPERATORS`]. Shared, because the rule is the
 /// configuration's own and every operation that stores one applies it.
+///
+/// The refusal is the service's own fixed sentence for this class
+/// ([`RANDOM_CUT_FOREST_QUERY_UNSUPPORTED_MESSAGE`]): the expression is a well-formed
+/// value of a member that satisfies every constraint the model declares, and what the
+/// service rejects is the EXPRESSION it denotes — not a member constraint, so not the
+/// member template.
 pub fn check_random_cut_forest_configuration(
     configuration: &crate::ops::types::AnomalyDetectorConfiguration,
 ) -> Result<(), crate::ops::types::ValidationException> {
@@ -1872,13 +1950,8 @@ pub fn check_random_cut_forest_configuration(
     if wrapping.is_some_and(|operator| operators.contains(&operator)) {
         return Ok(());
     }
-    Err(member_validation_failed(
-        "configuration.randomCutForest.query",
-        &format!(
-            "Member must be wrapped by one of the supported PromQL aggregation operators \
-             ({})",
-            operators.join(", ")
-        ),
+    Err(request_validation_failed(
+        RANDOM_CUT_FOREST_QUERY_UNSUPPORTED_MESSAGE,
     ))
 }
 

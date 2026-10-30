@@ -214,14 +214,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `WorkspaceStatusCode$DELETING` documents the rule: "Deletions are allowed
         // only when status is ACTIVE" (and `CREATING` repeats it: "Deletion is
         // disallowed until status is ACTIVE"). Deleting a workspace in any other
-        // status would leave an inconsistent state — ConflictException (409).
+        // status would leave an inconsistent state — ConflictException (409), worded
+        // with the service's own template for a status that forbids the call
+        // ([`crate::state::status_forbids_call_message`]).
         if !replays_pending_delete && workspace.status_code != crate::state::STATUS_ACTIVE {
             return Err(DeleteWorkspaceErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "The workspace is {}; deletions are allowed only when status is {}",
-                        workspace.status_code,
-                        crate::state::STATUS_ACTIVE,
+                    message: crate::state::status_forbids_call_message(
+                        "delete",
+                        "workspace",
+                        &workspace.status_code,
                     ),
                     resource_id: workspace.workspace_id.clone(),
                     resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),

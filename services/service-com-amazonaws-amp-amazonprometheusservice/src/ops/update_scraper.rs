@@ -239,10 +239,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !replays_pending_update && scraper.status_code != crate::state::STATUS_ACTIVE {
             return Err(UpdateScraperErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "The scraper is {}; updates are allowed only when status is {}",
-                        scraper.status_code,
-                        crate::state::STATUS_ACTIVE,
+                    message: crate::state::status_forbids_call_message(
+                        "update",
+                        "scraper",
+                        &scraper.status_code,
                     ),
                     resource_id: scraper.scraper_id.clone(),
                     resource_type: crate::state::SCRAPER_RESOURCE_TYPE.to_string(),

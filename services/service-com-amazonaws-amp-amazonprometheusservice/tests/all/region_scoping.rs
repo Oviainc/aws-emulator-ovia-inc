@@ -26,8 +26,8 @@ use crate::scraper_listing::{dataset_destination, eks_source, listed, scraper, s
 use crate::workspace_lifecycle::{tags_of, text, wait_for_due_transition, Amp, Reply};
 use service_com_amazonaws_amp_amazonprometheusservice::state::{
     prometheus_endpoint, region_ceiling_message, workspace_arn, Workspace, WorkspaceConfiguration,
-    MAX_REGIONS, RESOURCE_NOT_FOUND_CODE, RESOURCE_NOT_FOUND_MESSAGE, STATUS_ACTIVE,
-    WORKSPACE_NOT_FOUND_MESSAGE, WORKSPACE_QUOTA,
+    DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE, MAX_REGIONS, RESOURCE_NOT_FOUND_CODE,
+    RESOURCE_NOT_FOUND_MESSAGE, STATUS_ACTIVE, WORKSPACE_NOT_FOUND_MESSAGE, WORKSPACE_QUOTA,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
@@ -85,8 +85,10 @@ fn listed_workspaces(body: &serde_json::Value) -> Vec<String> {
 }
 
 /// Every assertion a cross-Region call on a workspace must satisfy: the modelled 404 for
-/// a workspace this endpoint does not hold, naming the id that was asked for.
-fn assert_workspace_not_found(case: &str, reply: &Reply, workspace_id: &str) {
+/// a workspace this endpoint does not hold, naming the id that was asked for. `message` is
+/// the sentence the OPERATION under test is recorded answering, which for
+/// `DescribeWorkspace` is `DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE`.
+fn assert_workspace_not_found(case: &str, reply: &Reply, workspace_id: &str, message: &str) {
     assert_eq!(
         reply.status, 404,
         "case {case:?}: a workspace of another Region must not be found, got {reply:?}"
@@ -98,7 +100,7 @@ fn assert_workspace_not_found(case: &str, reply: &Reply, workspace_id: &str) {
     );
     assert_eq!(
         text(&reply.body["message"]),
-        WORKSPACE_NOT_FOUND_MESSAGE,
+        message,
         "case {case:?}: expected the workspace not-found sentence, got {reply:?}"
     );
     assert_eq!(
@@ -159,6 +161,7 @@ async fn a_workspace_is_reported_only_by_the_region_that_created_it() {
                 &case,
                 &amp.describe(other, workspace_id).await,
                 workspace_id,
+                DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE,
             );
             let foreign_listing = amp.list(other, "").await;
             assert!(
@@ -320,7 +323,14 @@ async fn every_workspace_scoped_operation_is_not_found_from_another_region() {
     for (case, method, path, body) in &rows {
         let uri = format!("/workspaces/{workspace_id}{path}");
         let refused = amp.call(method, &uri, other, body).await;
-        assert_workspace_not_found(case, &refused, &workspace_id);
+        // `DescribeWorkspace` answers its own recorded spelling of the sentence; every
+        // other workspace-addressed operation shares the one constant.
+        let expected = if *case == "DescribeWorkspace" {
+            DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE
+        } else {
+            WORKSPACE_NOT_FOUND_MESSAGE
+        };
+        assert_workspace_not_found(case, &refused, &workspace_id, expected);
 
         // The very same request, signed for the Region that holds the workspace, is not
         // the missing-workspace refusal — whatever it answers about the child resource it
@@ -328,7 +338,7 @@ async fn every_workspace_scoped_operation_is_not_found_from_another_region() {
         let served = amp.call(method, &uri, home, body).await;
         assert_ne!(
             (served.status, text(&served.body["message"])),
-            (404, WORKSPACE_NOT_FOUND_MESSAGE.to_string()),
+            (404, expected.to_string()),
             "case {case:?}: the Region holding the workspace must not answer the \
              missing-workspace refusal, got {served:?}"
         );
