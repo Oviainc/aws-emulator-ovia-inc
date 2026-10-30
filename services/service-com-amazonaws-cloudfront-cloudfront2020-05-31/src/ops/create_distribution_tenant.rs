@@ -319,7 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .any(|tenant| tenant.name == input.name)
         {
             return Err(CreateDistributionTenantErrorModeled::EntityAlreadyExists(
-                crate::state::distribution_tenant_already_exists(&input.name),
+                crate::state::distribution_tenant_already_exists(),
             )
             .into());
         }

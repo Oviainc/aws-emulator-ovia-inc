@@ -216,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot name a second one.
         if store.connection_group_named(&input.name).is_some() {
             return Err(CreateConnectionGroupErrorModeled::EntityAlreadyExists(
-                crate::state::connection_group_already_exists(&input.name),
+                crate::state::connection_group_already_exists(),
             )
             .into());
         }

@@ -252,7 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot name a second one.
         if store.connection_function_named(&input.name).is_some() {
             return Err(CreateConnectionFunctionErrorModeled::EntityAlreadyExists(
-                crate::state::connection_function_already_exists(&input.name),
+                crate::state::connection_function_already_exists(),
             )
             .into());
         }

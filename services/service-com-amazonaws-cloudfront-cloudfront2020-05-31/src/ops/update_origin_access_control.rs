@@ -244,19 +244,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // conflict is over the whole set of parameters, so an update asking for exactly
         // what ANOTHER stored control asks for is refused leaving both untouched. The
         // control being updated already holds its own parameters, which is why the
-        // holder's id is compared: re-submitting them is not a conflict with itself.
-        if let Some(holder) = store
+        // holder's id is compared: re-submitting them is not a conflict with itself. The
+        // refusal itself carries the service's fixed sentence for this code, which names
+        // neither control.
+        if store
             .origin_access_control_with_config(&config)
-            .filter(|holder| holder.id != input.id)
-            .map(|holder| holder.id.clone())
+            .is_some_and(|holder| holder.id != input.id)
         {
             return Err(
                 UpdateOriginAccessControlErrorModeled::OriginAccessControlAlreadyExists(
-                    OriginAccessControlAlreadyExists {
-                        message: Some(
-                            crate::state::origin_access_control_already_exists_message(&holder),
-                        ),
-                    },
+                    crate::state::origin_access_control_already_exists(),
                 )
                 .into(),
             );

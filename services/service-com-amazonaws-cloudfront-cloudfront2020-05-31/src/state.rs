@@ -9650,13 +9650,32 @@ pub fn connection_group_not_disabled() -> crate::ops::types::ResourceNotDisabled
     }
 }
 
+/// The sentence CloudFront answers a connection group name that is already taken with, on
+/// the wire.
+///
+/// The WIRE text — what the recorded service answers `EntityAlreadyExists` with for THIS
+/// resource kind, and what this emulator therefore serves. `EntityAlreadyExists` is shared
+/// by several resource kinds and the served sentence names the kind whose name is taken, so
+/// each kind carries its own constant ([`DISTRIBUTION_TENANT_ALREADY_EXISTS_MESSAGE`] is
+/// the tenant's); the sentence the MODEL's documentation of the shape uses ("The entity
+/// already exists. You must provide a unique entity.") documents the condition for all of
+/// them and is not served. Do not "correct" this constant to the documentation sentence.
+///
+/// The WHOLE sentence is fixed: what the refusal states is that the account already holds a
+/// group of that name, which is a property of the CONDITION rather than of the request, so
+/// neither the submitted name nor the id of the group holding it is any part of it.
+pub const CONNECTION_GROUP_ALREADY_EXISTS_MESSAGE: &str =
+    "A connection group with the same name already exists in this AWS account.";
+
 /// The modelled `EntityAlreadyExists` (HTTP 409) for a connection group name that is
 /// already taken: the name is "unique within your Amazon Web Services account".
-pub fn connection_group_already_exists(name: &str) -> EntityAlreadyExists {
+///
+/// Takes no name: the sentence is fixed service text
+/// ([`CONNECTION_GROUP_ALREADY_EXISTS_MESSAGE`]), so every refusal of this condition reads
+/// the same.
+pub fn connection_group_already_exists() -> EntityAlreadyExists {
     EntityAlreadyExists {
-        message: Some(format!(
-            "A connection group with the name {name} already exists in this account"
-        )),
+        message: Some(CONNECTION_GROUP_ALREADY_EXISTS_MESSAGE.to_string()),
     }
 }
 
@@ -9757,13 +9776,21 @@ pub fn anycast_ip_pool_exhausted() -> crate::ops::types::EntityLimitExceeded {
     }
 }
 
+/// The sentence CloudFront answers a distribution tenant name that is already taken with,
+/// on the wire: the WIRE text for `EntityAlreadyExists` on THIS resource kind, worded as
+/// [`CONNECTION_GROUP_ALREADY_EXISTS_MESSAGE`] words it for the neighbouring one, and fixed
+/// whole for the reason that one is — nothing from the request or from the store belongs in
+/// it.
+pub const DISTRIBUTION_TENANT_ALREADY_EXISTS_MESSAGE: &str =
+    "A distribution tenant with the same name already exists in this AWS account.";
+
 /// The modelled `EntityAlreadyExists` (HTTP 409) for a distribution tenant name that is
 /// already taken: the name is "unique within your Amazon Web Services account".
-pub fn distribution_tenant_already_exists(name: &str) -> EntityAlreadyExists {
+///
+/// Takes no name, for the reason [`connection_group_already_exists`] takes none.
+pub fn distribution_tenant_already_exists() -> EntityAlreadyExists {
     EntityAlreadyExists {
-        message: Some(format!(
-            "A distribution tenant with the name {name} already exists in this account"
-        )),
+        message: Some(DISTRIBUTION_TENANT_ALREADY_EXISTS_MESSAGE.to_string()),
     }
 }
 
@@ -10167,13 +10194,40 @@ pub const INVALID_LAMBDA_FUNCTION_ASSOCIATION_PREFIX: &str =
     "The function ARN must reference a specific function version. (The ARN must end with \
      the version number.) ARN: ";
 
-/// The sentence `OriginAccessControlAlreadyExists` carries, up to the control that
-/// already holds the submitted parameters, which it names at the end — the one piece of
-/// store-derived detail in it, and the one a caller cannot work out for itself.
-pub fn origin_access_control_already_exists_message(existing_id: &str) -> String {
-    format!(
-        "An origin access control with the specified parameters already exists: {existing_id}"
-    )
+/// The sentence `OriginAccessControlAlreadyExists` carries, on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with, and what this emulator
+/// therefore serves. Like [`CNAME_ALREADY_EXISTS_MESSAGE`] it differs from the sentence the
+/// MODEL's documentation of the error shape uses for the same condition ("An origin access
+/// control with the specified parameters already exists."): that one documents the
+/// condition, this one is served. Do not "correct" this constant to the documentation
+/// sentence.
+///
+/// The WHOLE sentence is fixed: what the refusal states is that the account already holds
+/// such a control, so neither the submitted configuration nor the id of the control that
+/// holds it is any part of it.
+///
+/// This constant is the SENTENCE the refusal carries, not the predicate that raises it:
+/// what makes a submitted configuration a conflict is `origin_access_control_with_config`'s
+/// own rule, which this does not decide. The recorded service words the sentence around the
+/// control's name, so a predicate that admitted a second control under a name already taken
+/// would never serve it — a question about the predicate, answered where the predicate
+/// lives.
+pub const ORIGIN_ACCESS_CONTROL_ALREADY_EXISTS_MESSAGE: &str =
+    "An origin access control with the same name already exists.";
+
+/// The modelled `OriginAccessControlAlreadyExists` (HTTP 409) for a create or an update
+/// whose configuration a stored control already holds.
+///
+/// Takes no identifier: the sentence is fixed service text
+/// ([`ORIGIN_ACCESS_CONTROL_ALREADY_EXISTS_MESSAGE`]), so both entry points into the
+/// uniqueness rule refuse this condition with the one text and neither leaks the id of the
+/// control that holds the configuration.
+pub fn origin_access_control_already_exists() -> crate::ops::types::OriginAccessControlAlreadyExists
+{
+    crate::ops::types::OriginAccessControlAlreadyExists {
+        message: Some(ORIGIN_ACCESS_CONTROL_ALREADY_EXISTS_MESSAGE.to_string()),
+    }
 }
 
 /// The sentence CloudFront answers `OriginAccessControlInUse` with, on the wire.
@@ -10217,17 +10271,31 @@ pub fn origin_access_control_name_too_long(length: usize) -> crate::ops::types::
     }
 }
 
+/// The sentence `ResponseHeadersPolicyAlreadyExists` carries, on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with, and what this emulator
+/// therefore serves. It differs from the sentence the MODEL's documentation of the error
+/// shape uses for the same rule ("A response headers policy with this name already exists.
+/// You must provide a unique name. To modify an existing response headers policy, use
+/// UpdateResponseHeadersPolicy."): that one documents the condition and tells the caller
+/// what to do instead, this one is served. Do not "correct" this constant to the
+/// documentation sentence.
+///
+/// The WHOLE sentence is fixed, as [`CACHE_POLICY_ALREADY_EXISTS_MESSAGE`] and
+/// [`ORIGIN_REQUEST_POLICY_ALREADY_EXISTS_MESSAGE`] are for the same rule over the other two
+/// policy families: nothing from the request or from the store belongs in it.
+pub const RESPONSE_HEADERS_POLICY_ALREADY_EXISTS_MESSAGE: &str =
+    "Another response headers policy with the same name already exists within the aws account.";
+
 /// The modelled `ResponseHeadersPolicyAlreadyExists` (HTTP 409) for a policy name that is
-/// already taken — "A response headers policy with this name already exists. You must
-/// provide a unique name. To modify an existing response headers policy, use
-/// UpdateResponseHeadersPolicy."
-pub fn response_headers_policy_already_exists(name: &str) -> ResponseHeadersPolicyAlreadyExists {
+/// already taken.
+///
+/// Takes no name: the sentence is fixed service text
+/// ([`RESPONSE_HEADERS_POLICY_ALREADY_EXISTS_MESSAGE`]), so the create and the update refuse
+/// a taken name with the one text.
+pub fn response_headers_policy_already_exists() -> ResponseHeadersPolicyAlreadyExists {
     ResponseHeadersPolicyAlreadyExists {
-        message: Some(format!(
-            "A response headers policy with the name {name} already exists in this account. You \
-             must provide a unique name. To modify an existing response headers policy, use \
-             UpdateResponseHeadersPolicy."
-        )),
+        message: Some(RESPONSE_HEADERS_POLICY_ALREADY_EXISTS_MESSAGE.to_string()),
     }
 }
 
@@ -10251,17 +10319,23 @@ pub fn no_such_origin_request_policy() -> NoSuchOriginRequestPolicy {
 pub const NO_SUCH_ORIGIN_REQUEST_POLICY_MESSAGE: &str =
     "The specified origin request policy does not exist.";
 
+/// The sentence `OriginRequestPolicyAlreadyExists` carries, on the wire: the WIRE text for
+/// this code, worded as [`RESPONSE_HEADERS_POLICY_ALREADY_EXISTS_MESSAGE`] words the same
+/// rule for the other policy family, and fixed whole for the reason that one is. It differs
+/// from the sentence the MODEL's documentation of the shape uses ("An origin request policy
+/// with this name already exists. You must provide a unique name. To modify an existing
+/// origin request policy, use UpdateOriginRequestPolicy."); do not "correct" this constant
+/// to the documentation sentence.
+pub const ORIGIN_REQUEST_POLICY_ALREADY_EXISTS_MESSAGE: &str =
+    "Another origin request policy with the same name already exists within the aws account.";
+
 /// The modelled `OriginRequestPolicyAlreadyExists` (HTTP 409) for a policy name that is
-/// already taken — "An origin request policy with this name already exists. You must
-/// provide a unique name. To modify an existing origin request policy, use
-/// UpdateOriginRequestPolicy."
-pub fn origin_request_policy_already_exists(name: &str) -> OriginRequestPolicyAlreadyExists {
+/// already taken.
+///
+/// Takes no name, for the reason [`response_headers_policy_already_exists`] takes none.
+pub fn origin_request_policy_already_exists() -> OriginRequestPolicyAlreadyExists {
     OriginRequestPolicyAlreadyExists {
-        message: Some(format!(
-            "An origin request policy with the name {name} already exists in this account. You \
-             must provide a unique name. To modify an existing origin request policy, use \
-             UpdateOriginRequestPolicy."
-        )),
+        message: Some(ORIGIN_REQUEST_POLICY_ALREADY_EXISTS_MESSAGE.to_string()),
     }
 }
 
@@ -10387,15 +10461,22 @@ pub fn illegal_update_managed_policy() -> crate::ops::types::IllegalUpdate {
 pub const ILLEGAL_UPDATE_MANAGED_POLICY_MESSAGE: &str =
     "The request failed because update is not allowed for this policy.";
 
+/// The sentence `CachePolicyAlreadyExists` carries, on the wire: the WIRE text for this
+/// code, worded as [`RESPONSE_HEADERS_POLICY_ALREADY_EXISTS_MESSAGE`] words the same rule
+/// for the other policy family, and fixed whole for the reason that one is. It differs from
+/// the sentence the MODEL's documentation of the shape uses ("A cache policy with this name
+/// already exists. You must provide a unique name. To modify an existing cache policy, use
+/// UpdateCachePolicy."); do not "correct" this constant to the documentation sentence.
+pub const CACHE_POLICY_ALREADY_EXISTS_MESSAGE: &str =
+    "Another cache policy with the same name already exists within the aws account.";
+
 /// The modelled `CachePolicyAlreadyExists` (HTTP 409) for a policy name that is already
-/// taken — "A cache policy with this name already exists. You must provide a unique name.
-/// To modify an existing cache policy, use UpdateCachePolicy."
-pub fn cache_policy_already_exists(name: &str) -> CachePolicyAlreadyExists {
+/// taken.
+///
+/// Takes no name, for the reason [`response_headers_policy_already_exists`] takes none.
+pub fn cache_policy_already_exists() -> CachePolicyAlreadyExists {
     CachePolicyAlreadyExists {
-        message: Some(format!(
-            "A cache policy with the name {name} already exists in this account. You must \
-             provide a unique name. To modify an existing cache policy, use UpdateCachePolicy."
-        )),
+        message: Some(CACHE_POLICY_ALREADY_EXISTS_MESSAGE.to_string()),
     }
 }
 
@@ -10756,19 +10837,25 @@ pub const MAX_KEY_GROUP_COMMENT: usize = MAX_ORIGIN_ACCESS_IDENTITY_COMMENT;
 /// The modelled `KeyGroupAlreadyExists` (HTTP 409) for a key group name that is already
 /// taken.
 ///
-/// The sentence is the one the model states on the shape itself, and it names no part of
-/// the request: what it reports is that the name is taken and what to do instead, which is
-/// a property of the store rather than of the value submitted.
+/// The sentence is fixed service text ([`KEY_GROUP_ALREADY_EXISTS_MESSAGE`]) and it names
+/// no part of the request: what it reports is that the account already holds a group of
+/// that name, which is a property of the store rather than of the value submitted.
 pub fn key_group_already_exists() -> crate::ops::types::KeyGroupAlreadyExists {
     crate::ops::types::KeyGroupAlreadyExists {
         message: Some(KEY_GROUP_ALREADY_EXISTS_MESSAGE.to_string()),
     }
 }
 
-/// `KeyGroupAlreadyExists`'s message, as the model documents the shape.
+/// `KeyGroupAlreadyExists`'s message, on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with, and what this emulator
+/// therefore serves. It differs from the sentence the MODEL's documentation of the shape
+/// uses for the same rule ("A key group with this name already exists. You must provide a
+/// unique name. To modify an existing key group, use UpdateKeyGroup."): that one documents
+/// the condition and tells the caller what to do instead, this one is served. Do not
+/// "correct" this constant to the documentation sentence.
 pub const KEY_GROUP_ALREADY_EXISTS_MESSAGE: &str =
-    "A key group with this name already exists. You must provide a unique name. To modify \
-     an existing key group, use UpdateKeyGroup.";
+    "Another key group with the same name already exists within the aws account.";
 
 /// The modelled `NoSuchResource` (HTTP 404) for a key group id the store does not hold.
 ///

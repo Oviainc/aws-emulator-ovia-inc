@@ -238,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.response_headers_policy_named(&config.name).is_some() {
             return Err(
                 CreateResponseHeadersPolicyErrorModeled::ResponseHeadersPolicyAlreadyExists(
-                    crate::state::response_headers_policy_already_exists(&config.name),
+                    crate::state::response_headers_policy_already_exists(),
                 )
                 .into(),
             );

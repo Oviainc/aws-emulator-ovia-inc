@@ -175,14 +175,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // conflict is over the whole set of parameters, so a request asking for exactly
         // what a stored control already asks for names THAT control rather than a second
         // one, and is refused leaving it untouched. A request that differs in any member
-        // describes a different control and creates one.
-        if let Some(existing) = store.origin_access_control_with_config(&config) {
-            let message = crate::state::origin_access_control_already_exists_message(&existing.id);
+        // describes a different control and creates one. The refusal carries the service's
+        // fixed sentence for this code, so it names neither the submitted parameters nor
+        // the control that holds them.
+        if store.origin_access_control_with_config(&config).is_some() {
             return Err(
                 CreateOriginAccessControlErrorModeled::OriginAccessControlAlreadyExists(
-                    OriginAccessControlAlreadyExists {
-                        message: Some(message),
-                    },
+                    crate::state::origin_access_control_already_exists(),
                 )
                 .into(),
             );

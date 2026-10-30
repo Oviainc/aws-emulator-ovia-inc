@@ -234,7 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.origin_request_policy_named(&config.name).is_some() {
             return Err(
                 CreateOriginRequestPolicyErrorModeled::OriginRequestPolicyAlreadyExists(
-                    crate::state::origin_request_policy_already_exists(&config.name),
+                    crate::state::origin_request_policy_already_exists(),
                 )
                 .into(),
             );

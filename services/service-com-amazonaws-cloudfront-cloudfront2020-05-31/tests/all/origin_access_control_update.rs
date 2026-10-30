@@ -22,10 +22,10 @@
 //!   submitting a longer name is `InvalidArgument` (400) and the stored configuration is
 //!   left as it was — an update cannot store a configuration the create would have
 //!   refused;
-//! * "An origin access control with the specified parameters already exists" — parameters
-//!   ANOTHER stored control holds cannot be moved onto this one (409), while an update
-//!   re-submitting the control's OWN parameters is not a conflict with itself and still
-//!   mints a fresh version.
+//! * `OriginAccessControlAlreadyExists` — the parameters ANOTHER stored control holds
+//!   cannot be moved onto this one (409, carrying the service's fixed sentence for that
+//!   code, which names neither control), while an update re-submitting the control's OWN
+//!   parameters is not a conflict with itself and still mints a fresh version.
 //!
 //! The table rows differ along everything these rules generalise over: the configuration
 //! updated and the configuration updated TO (every row of the lifecycle suite's table, so
@@ -48,6 +48,11 @@ use crate::distribution_lifecycle::{call, emulator, is_version_token, Answer, AP
 use crate::origin_access_control_lifecycle::{
     create_control, get_control, list_controls, page_ids, table, Control,
 };
+
+/// The sentence `OriginAccessControlAlreadyExists` carries: the service's fixed text for
+/// that code, written out here rather than read from the crate's own constant so a wrong
+/// constant cannot make the assertion below pass.
+const ALREADY_EXISTS_MESSAGE: &str = "An origin access control with the same name already exists.";
 
 // ---------------------------------------------------------------------------
 // Calling the surface under test
@@ -586,9 +591,10 @@ async fn a_name_past_the_published_bound_is_refused() {
     }
 }
 
-/// "An origin access control with the specified parameters already exists": the parameters
-/// ANOTHER stored control holds cannot be moved onto this one, while an update re-submitting
-/// the control's OWN parameters is not a conflict with itself.
+/// `OriginAccessControlAlreadyExists`: the parameters ANOTHER stored control holds cannot
+/// be moved onto this one — and the refusal carries the service's fixed sentence for that
+/// code — while an update re-submitting the control's OWN parameters is not a conflict with
+/// itself.
 #[tokio::test]
 async fn parameters_another_control_holds_cannot_be_moved_onto_this_one() {
     let rows = table();
@@ -615,9 +621,19 @@ async fn parameters_another_control_holds_cannot_be_moved_onto_this_one() {
             conflict.error_code(),
             conflict.raw
         );
+        // The refusal carries the service's fixed sentence for this code, so it names
+        // neither the parameters submitted nor the control that holds them. The sentence is
+        // a LITERAL here rather than the crate's own constant, so a wrong constant cannot
+        // make this assertion pass.
+        let message = conflict.root().find_text("Message").unwrap_or_default();
+        assert_eq!(
+            message, ALREADY_EXISTS_MESSAGE,
+            "case {case}: expected the fixed conflict sentence, got {}",
+            conflict.raw
+        );
         assert!(
-            conflict.raw.contains(other_id.as_str()),
-            "case {case}: expected the refusal to name the control that holds the \
+            !conflict.raw.contains(other_id.as_str()),
+            "case {case}: expected the refusal not to name the control that holds the \
              parameters ({other_id}), got {}",
             conflict.raw
         );

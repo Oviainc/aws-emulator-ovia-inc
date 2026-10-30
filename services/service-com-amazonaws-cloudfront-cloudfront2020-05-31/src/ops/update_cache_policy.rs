@@ -293,7 +293,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some_and(|holder| holder.id != input.id)
         {
             return Err(UpdateCachePolicyErrorModeled::CachePolicyAlreadyExists(
-                crate::state::cache_policy_already_exists(&config.name),
+                crate::state::cache_policy_already_exists(),
             )
             .into());
         }

@@ -347,14 +347,24 @@ pub fn connection_function_not_found() -> EntityNotFound {
     }
 }
 
+/// The sentence CloudFront answers a connection function name that is already taken with,
+/// on the wire: the WIRE text for `EntityAlreadyExists` on THIS resource kind, worded as
+/// [`super::CONNECTION_GROUP_ALREADY_EXISTS_MESSAGE`] words it for the neighbouring one,
+/// and fixed whole for the reason that one is — the sentence the MODEL's documentation of
+/// the shape uses ("The entity already exists. You must provide a unique entity.")
+/// documents the condition for every kind sharing the code and is not served, and nothing
+/// from the request or from the store belongs in the served text.
+pub const CONNECTION_FUNCTION_ALREADY_EXISTS_MESSAGE: &str =
+    "A connection function with the same name already exists in this AWS account.";
+
 /// The modelled `EntityAlreadyExists` (HTTP 409) for a connection function name that is
-/// already taken, worded as the model documents the shape: "The entity already exists. You
-/// must provide a unique entity."
-pub fn connection_function_already_exists(name: &str) -> EntityAlreadyExists {
+/// already taken.
+///
+/// Takes no name, for the reason [`super::connection_group_already_exists`] takes none:
+/// every refusal of this condition reads the same
+/// ([`CONNECTION_FUNCTION_ALREADY_EXISTS_MESSAGE`]).
+pub fn connection_function_already_exists() -> EntityAlreadyExists {
     EntityAlreadyExists {
-        message: Some(format!(
-            "The entity already exists. You must provide a unique entity: a connection \
-             function with the name {name} already exists in this Amazon Web Services account"
-        )),
+        message: Some(CONNECTION_FUNCTION_ALREADY_EXISTS_MESSAGE.to_string()),
     }
 }
