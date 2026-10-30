@@ -336,6 +336,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // values it stores. Resolved HERE, before anything in the store is touched, so a
         // submission this cannot build a run from leaves the store exactly as it was.
         let templated_run = templated.is_some();
+        // The driver the submission carried ITSELF, kept beside the one the run ends up
+        // with: the `JobDriver` rule below is about every value of that shape the request
+        // presents, and a template supplying the run's driver does not turn a submitted
+        // `jobDriver` that names no driver — or two — into a legal one.
+        let submitted_job_driver = input.job_driver.clone();
         let mut tags = input.tags.clone().unwrap_or_default();
         let (execution_role_arn, release_label, job_driver, configuration_overrides) =
             match templated {
@@ -392,20 +397,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
-        // The run has to name the one driver it runs on: the constraint walk above reads
-        // the model's `@length`, `@pattern` and bounds, and both `JobDriver` members are
-        // optional there, so a driver naming neither of the two or both passes it and
-        // still cannot run ([`crate::state::job_driver_refusal`]). Judged on the driver
-        // the run WOULD carry — the request's, or the one the named template resolved to —
-        // so the rule does not depend on where the value came from, and judged before
-        // anything in the store is touched.
-        if let Some(driver) = candidate.job_driver.as_ref() {
-            if let Some(message) = crate::state::job_driver_refusal("jobDriver", driver) {
-                return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
-                    message: Some(message),
-                })
-                .into());
-            }
+        // Every `JobDriver` this submission presents has to name the one driver a job runs
+        // on: the constraint walk above reads the model's `@length`, `@pattern` and
+        // bounds, and both `JobDriver` members are optional there, so a value naming
+        // neither of the two or both passes it and still cannot run
+        // ([`crate::state::job_driver_refusal`]). Judged on the driver the run WOULD carry
+        // — the request's, or the one the named template resolved to — AND on the one the
+        // request carried itself, which is a `JobDriver` the caller sent whether or not a
+        // template overrides it, so the rule does not depend on where the value came from
+        // or on which value the run runs. Judged before anything in the store is touched.
+        if let Some(message) = [submitted_job_driver.as_ref(), candidate.job_driver.as_ref()]
+            .into_iter()
+            .flatten()
+            .find_map(|driver| crate::state::job_driver_refusal("jobDriver", driver))
+        {
+            return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into());
         }
 
         // `clientToken` is `@idempotencyToken`: the same token replayed names the job

@@ -19,6 +19,11 @@
 //! (`CreateJobTemplate`). A value naming exactly one driver is accepted at both and
 //! reads back unchanged, whichever of the two it names and whichever of that driver's own
 //! optional members it fills in.
+//!
+//! The rule is about the value the caller SENT, not only about the one the run ends up
+//! running: a submission that names a `jobTemplateId` takes the run's driver from the
+//! template, and a `jobDriver` the request carries beside it is still a `JobDriver` the
+//! caller sent, so it is judged by the same rule.
 
 use serde_json::{json, Value};
 
@@ -256,6 +261,67 @@ async fn a_job_run_is_submitted_only_with_a_driver_that_names_exactly_one() {
             run_count(&emr, &cluster, label).await,
             1,
             "case {label:?}: the accepted submission must be the cluster's only run"
+        );
+    }
+}
+
+/// The same rule at `StartJobRun` when the submission ALSO names a job template: the run's
+/// driver comes from the template, but the `jobDriver` the request carried is a `JobDriver`
+/// the caller sent, so a value naming neither driver or both is refused and no run is
+/// created, while one naming exactly one is accepted and the run still runs the template's
+/// driver.
+#[tokio::test]
+async fn a_templated_submission_is_refused_for_the_driver_it_carries_itself() {
+    // The driver the template stores, so the run always has one that names exactly one
+    // driver whatever the request carried: the refusals below are about the request's
+    // value alone.
+    let stored = json!({"sparkSubmitJobDriver": {"entryPoint": "s3://bucket/template.py"}});
+    for case in cases() {
+        let label = case.label;
+        let emr = Emr::new();
+        let cluster = emr.cluster("driver-rule", "tok-driver-cluster").await;
+        let created = emr
+            .send(
+                "POST",
+                "/jobtemplates",
+                Some(json!({
+                    "name": "driver.rule.templated",
+                    "clientToken": "tok-driver-templated",
+                    "jobTemplateData": template_data(&stored),
+                })),
+            )
+            .await;
+        let template = text(created.ok(label), "/id", label);
+
+        let answer = emr
+            .start_job(
+                &cluster,
+                json!({
+                    "clientToken": "tok-driver-templated-run",
+                    "jobTemplateId": template,
+                    "jobDriver": case.driver,
+                }),
+            )
+            .await;
+
+        if !case.accepted {
+            answer.refused(label, 400, "ValidationException");
+            assert_refusal_names_the_rule(&answer.body, label, "jobDriver");
+            assert_eq!(
+                run_count(&emr, &cluster, label).await,
+                0,
+                "case {label:?}: a refused submission must create no job run"
+            );
+            continue;
+        }
+
+        let run = text(answer.ok(label), "/id", label);
+        let described = emr.describe_job(&cluster, &run).await;
+        let job_run = field(described.ok(label), "/jobRun", label);
+        assert_eq!(
+            job_run.get("jobDriver"),
+            Some(&stored),
+            "case {label:?}: the run must carry the template's driver, got {job_run}"
         );
     }
 }
