@@ -170,16 +170,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A change the clock still owes this application is an operation already under
-        // way on it, which is what `ConflictException` reports.
-        if application.pending.is_some() {
-            return Err(StartApplicationErrorModeled::ConflictException(
-                crate::state::conflict(format!(
-                    "Application {} is {} and cannot be started until that completes",
-                    application.id, application.status
-                )),
-            )
-            .into());
-        }
+        // way on it, which is what `ConflictException` reports — decided and worded in
+        // the one place every control call of this service refuses that condition from.
+        crate::state::application_control_available(
+            &application,
+            crate::state::ApplicationControl::Start,
+        )
+        .map_err(StartApplicationErrorModeled::ConflictException)?;
 
         // Starting the application starts the database management system it is connected
         // to: this call carries no switch to leave it down, and an application cannot run

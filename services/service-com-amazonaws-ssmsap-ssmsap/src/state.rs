@@ -4329,6 +4329,83 @@ pub fn conflict(message: impl Into<String>) -> ConflictException {
     }
 }
 
+/// A call that controls ONE registered application: the operations this service files
+/// asynchronous work against an application with.
+///
+/// One variant per handler that has to refuse a request because work is already under way
+/// on the application it names, so the condition AND its wording have a single
+/// construction site ([`application_control_available`]) — the same convention
+/// [`application_not_found_message`] states for the condition it reports, and the reason a
+/// control path added later has something to call rather than a sixth copy to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicationControl {
+    /// `StartApplication`.
+    Start,
+    /// `StopApplication`.
+    Stop,
+    /// `StartApplicationRefresh`.
+    Refresh,
+    /// `UpdateApplicationSettings`.
+    SettingsUpdate,
+    /// `StartConfigurationChecks`.
+    ConfigurationChecks,
+}
+
+impl ApplicationControl {
+    /// How this call states what it could not do while the application is busy.
+    const fn refusal(self) -> ControlRefusal {
+        match self {
+            Self::Start => ControlRefusal::Transition("started"),
+            Self::Stop => ControlRefusal::Transition("stopped"),
+            Self::Refresh => ControlRefusal::Transition("refreshed"),
+            Self::SettingsUpdate => ControlRefusal::Outstanding("its settings cannot be updated"),
+            Self::ConfigurationChecks => {
+                ControlRefusal::Outstanding("configuration checks cannot be started")
+            }
+        }
+    }
+}
+
+/// How a refused control call words the work already under way on the application.
+enum ControlRefusal {
+    /// A call that MOVES the application's own `Status` names the status it is in and the
+    /// action it could not take, because that status is what the work in flight already
+    /// reports to every reader.
+    Transition(&'static str),
+    /// A call that leaves the `Status` where it is — the settings an update leaves
+    /// outstanding, the runs a check start would file — names the operation in flight
+    /// instead, and the clause that operation blocks.
+    Outstanding(&'static str),
+}
+
+/// Whether `control` can run against `application` now, or the modelled
+/// `ConflictException` (HTTP 409) refusing it.
+///
+/// A change the clock still owes an application ([`StoredApplication::pending`]) is an
+/// operation already under way on it, which is the condition `ConflictException` reports —
+/// one rule, so one place decides it and one place words it, and every control call lifts
+/// what comes back into its own modelled error variant. The caller applies this BEFORE
+/// writing anything, so a refused call leaves the application exactly as it was.
+pub fn application_control_available(
+    application: &StoredApplication,
+    control: ApplicationControl,
+) -> Result<(), ConflictException> {
+    if application.pending.is_none() {
+        return Ok(());
+    }
+    Err(conflict(match control.refusal() {
+        ControlRefusal::Transition(action) => format!(
+            "Application {} is {} and cannot be {action} until that completes",
+            application.id, application.status
+        ),
+        ControlRefusal::Outstanding(clause) => format!(
+            "Application {} has an operation in progress and {clause} until that \
+             operation completes",
+            application.id
+        ),
+    }))
+}
+
 /// The `Name` values a `ListApplications` filter may carry: the members the model
 /// gives `ApplicationSummary`, which is the shape the listing returns. Filter names
 /// are case-sensitive, as `Filter$Name`'s documentation states.

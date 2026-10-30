@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/app_registry_arn.rs"]
 mod app_registry_arn;
+#[path = "all/application_control_conflict.rs"]
+mod application_control_conflict;
 #[path = "all/application_lifecycle.rs"]
 mod application_lifecycle;
 #[path = "all/application_reference_refusals.rs"]

@@ -205,19 +205,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A change the clock still owes this application is an operation already under
-        // way on it, which is what `ConflictException` reports. The settings an update
-        // leaves outstanding do not move the application's `Status`, so what the refusal
-        // states is the work in flight rather than the status it is in.
-        if application.pending.is_some() {
-            return Err(UpdateApplicationSettingsErrorModeled::ConflictException(
-                crate::state::conflict(format!(
-                    "Application {} has an operation in progress and its settings cannot \
-                     be updated until that operation completes",
-                    application.id
-                )),
-            )
-            .into());
-        }
+        // way on it, which is what `ConflictException` reports — decided and worded in
+        // the one place every control call of this service refuses that condition from.
+        // The settings an update leaves outstanding do not move the application's
+        // `Status`, so what the refusal states is the work in flight rather than the
+        // status it is in.
+        crate::state::application_control_available(
+            &application,
+            crate::state::ApplicationControl::SettingsUpdate,
+        )
+        .map_err(UpdateApplicationSettingsErrorModeled::ConflictException)?;
 
         // What the credentials of this application become. Computed — and refused —
         // BEFORE anything is written, so an update the application cannot take leaves

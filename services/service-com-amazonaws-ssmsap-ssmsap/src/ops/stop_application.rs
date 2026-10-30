@@ -278,16 +278,13 @@ fn record_stop(
     };
 
     // A change the clock still owes this application is an operation already under
-    // way on it, which is what `ConflictException` reports.
-    if application.pending.is_some() {
-        return Err(StopApplicationErrorModeled::ConflictException(
-            crate::state::conflict(format!(
-                "Application {} is {} and cannot be stopped until that completes",
-                application.id, application.status
-            )),
-        )
-        .into());
-    }
+    // way on it, which is what `ConflictException` reports — decided and worded in the
+    // one place every control call of this service refuses that condition from.
+    crate::state::application_control_available(
+        &application,
+        crate::state::ApplicationControl::Stop,
+    )
+    .map_err(StopApplicationErrorModeled::ConflictException)?;
 
     // The connected entity the call names is stopped WITH the application: the model's
     // only `ConnectedEntityType` is the DBMS, so naming one stops the database management

@@ -171,16 +171,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A change the clock still owes this application is an operation already under
-        // way on it, which is what `ConflictException` reports.
-        if application.pending.is_some() {
-            return Err(StartApplicationRefreshErrorModeled::ConflictException(
-                crate::state::conflict(format!(
-                    "Application {} is {} and cannot be refreshed until that completes",
-                    application.id, application.status
-                )),
-            )
-            .into());
-        }
+        // way on it, which is what `ConflictException` reports — decided and worded in
+        // the one place every control call of this service refuses that condition from.
+        crate::state::application_control_available(
+            &application,
+            crate::state::ApplicationControl::Refresh,
+        )
+        .map_err(StartApplicationRefreshErrorModeled::ConflictException)?;
 
         // A refresh re-runs the application's DISCOVERY, which is what
         // `Application$DiscoveryStatus` reports the latest result of: the application is

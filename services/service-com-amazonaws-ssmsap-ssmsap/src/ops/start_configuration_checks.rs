@@ -180,20 +180,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let application_id = application.id.clone();
 
         // A change the clock still owes this application is an operation already under
-        // way on it, which is what `ConflictException` reports — so no run is filed
-        // against an application whose own state is still moving, and in particular none
-        // against one whose deregistration is in flight, whose records would stop
-        // existing the instant the removal falls due.
-        if application.pending.is_some() {
-            return Err(StartConfigurationChecksErrorModeled::ConflictException(
-                crate::state::conflict(format!(
-                    "Application {} has an operation in progress and configuration checks \
-                     cannot be started until that operation completes",
-                    application.id
-                )),
-            )
-            .into());
-        }
+        // way on it, which is what `ConflictException` reports — decided and worded in
+        // the one place every control call of this service refuses that condition from —
+        // so no run is filed against an application whose own state is still moving, and
+        // in particular none against one whose deregistration is in flight, whose records
+        // would stop existing the instant the removal falls due.
+        crate::state::application_control_available(
+            &application,
+            crate::state::ApplicationControl::ConfigurationChecks,
+        )
+        .map_err(StartConfigurationChecksErrorModeled::ConflictException)?;
 
         // How many checks one request may name, re-stated in this crate before the
         // checks are resolved or any record is filed, so the work this request causes is
