@@ -156,7 +156,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
-        let guard = state.lock();
+        let mut guard = state.lock();
+        // The one write this read makes: a fleet whose removal `DeleteFleet` scheduled
+        // and the clock has already made due is gone, whether or not anybody called,
+        // so it is no longer part of the registry this call reports.
+        guard.settle_fleet_deletions(crate::state::now_millis());
         // Sorted by the requested criterion, which AWS documents as "the criterion to
         // be used to list compute fleet names". The model documents no default for
         // either member, so this service lists by name — the store's own stable order,

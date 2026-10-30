@@ -563,6 +563,7 @@ async fn creating_a_fleet_past_the_account_quota_is_refused() {
                     created_millis: 0,
                     last_modified_millis: 0,
                     active_due_millis: 0,
+                    removal_due_millis: None,
                 },
             );
         }

@@ -19,6 +19,8 @@ mod batch_get_reports;
 mod command_execution_lifecycle;
 #[path = "all/delete_build_batch.rs"]
 mod delete_build_batch;
+#[path = "all/delete_fleet.rs"]
+mod delete_fleet;
 #[path = "all/delete_report_group.rs"]
 mod delete_report_group;
 #[path = "all/fleet_lifecycle.rs"]

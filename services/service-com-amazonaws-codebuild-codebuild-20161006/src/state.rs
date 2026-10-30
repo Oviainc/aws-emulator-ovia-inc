@@ -5,7 +5,8 @@
 //! Every implemented CodeBuild operation computes its answer from the records
 //! here: `CreateProject` writes a [`Project`] and `UpdateProjectVisibility`
 //! rewrites that project's visibility, `CreateFleet` writes a
-//! [`StoredFleet`] and `UpdateFleet` rewrites one, `CreateWebhook` writes that
+//! [`StoredFleet`], `UpdateFleet` rewrites one and `DeleteFleet` starts the
+//! deletion of one, `CreateWebhook` writes that
 //! project's [`crate::ops::types::Webhook`], `StartBuild` writes a
 //! [`StoredBuild`], `StartBuildBatch` writes a [`StoredBuildBatch`],
 //! `StartSandbox` writes a [`StoredSandbox`] and `StopSandbox` ends one,
@@ -155,6 +156,16 @@ pub fn capacity_below_floor_message() -> String {
     format!("Capacity must be greater or equal to {MIN_FLEET_CAPACITY}")
 }
 
+/// What CodeBuild states as the reason a value handed to a fleet-addressing
+/// operation is not a compute fleet ARN, carried by the modelled
+/// `InvalidInputException`.
+///
+/// [`INVALID_REPORT_GROUP_ARN_MESSAGE`]'s rule for the resource kind `DeleteFleet`
+/// addresses by ARN alone: the sentence is wholly fixed, quoting neither the rejected
+/// value nor the ARN form that would be accepted, so every malformed value is refused
+/// with the same text and a client can key on it.
+pub const INVALID_FLEET_ARN_MESSAGE: &str = "Invalid fleet ARN";
+
 /// How long after the call that starts provisioning a fleet's capacity
 /// (`CreateFleet`, or an `UpdateFleet` that re-provisions it) the clock owes that
 /// fleet's transition into [`FLEET_STATUS_ACTIVE`].
@@ -175,6 +186,23 @@ pub const FLEET_STATUS_UPDATING: &str = "UPDATING";
 
 /// `FleetStatusCode` for a fleet that finished provisioning and can take builds.
 pub const FLEET_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `FleetStatusCode` for a fleet whose deletion a caller has asked for — "the compute
+/// fleet is pending deletion" (`FleetStatus$statusCode`).
+pub const FLEET_STATUS_PENDING_DELETION: &str = "PENDING_DELETION";
+
+/// How long after `DeleteFleet` the clock owes a deleted fleet's REMOVAL from the
+/// store — the span its capacity is torn down in, during which the fleet is still
+/// reported, in [`FLEET_STATUS_PENDING_DELETION`].
+///
+/// AWS documents no deletion time for a compute fleet, so this span is CHOSEN. It is
+/// deliberately not zero — a caller that reads the fleet straight after deleting it
+/// still observes the deletion the model's `PENDING_DELETION` status describes, and
+/// the fleet's name stays taken until the record is gone — and it is deliberately
+/// short, so a caller that waits for the deletion to finish does not wait on a span
+/// no real capacity is being torn down behind. The due instant is stored, never slept
+/// on.
+pub const FLEET_DELETE_MILLIS: i64 = 3_000;
 
 /// The `FleetStatusCode` values that describe capacity work still in flight, and
 /// so the ones the clock owes a move into [`FLEET_STATUS_ACTIVE`] from: the model
@@ -688,6 +716,16 @@ pub struct ComAmazonawsCodebuildCodebuild20161006State {
     pub start_build_tokens: BTreeMap<(String, String), StartBuildToken>,
     /// Compute fleets, keyed by fleet name (names are unique per account).
     pub fleets: BTreeMap<String, StoredFleet>,
+    /// How many compute fleets have ever been created in this store — the sequence
+    /// number that goes into the next fleet's id ([`fleet_uuid`]).
+    ///
+    /// A fleet is addressed by name and `DeleteFleet` frees that name, so the name
+    /// and the creation instant alone do not identify a fleet: a name recreated
+    /// inside one millisecond would derive the deleted fleet's id, whose ARN would
+    /// then resolve to the new record. This counter never goes backwards and a
+    /// number is never reused, which is what makes each created fleet's id its own;
+    /// it is one integer, so it costs nothing as fleets come and go.
+    pub fleets_created: i64,
     /// Batch builds, keyed by batch build id (`<projectName>:<uuid>`). Batch
     /// builds are their own resource — a batch id is never a build id — so they
     /// are held beside `builds` rather than mixed into it.
@@ -837,8 +875,9 @@ pub struct StoredBuild {
 }
 
 /// A persisted compute fleet: the modelled [`Fleet`] plus the instants its
-/// `created` / `lastModified` timestamps report and the instant at which the
-/// clock owes its move out of `CREATING`.
+/// `created` / `lastModified` timestamps report, the instant at which the clock
+/// owes its move out of `CREATING` and, once `DeleteFleet` has been called, the
+/// instant at which the clock owes its removal from the store.
 #[derive(Debug, Clone)]
 pub struct StoredFleet {
     /// The record every reader hands back.
@@ -852,6 +891,10 @@ pub struct StoredFleet {
     /// Epoch millis at which this fleet's move to `ACTIVE` became due — set by
     /// the call that started provisioning its capacity.
     pub active_due_millis: i64,
+    /// Epoch millis at which this fleet's removal from the store became due —
+    /// `None` until `DeleteFleet` starts tearing its capacity down, and that
+    /// call's instant plus [`FLEET_DELETE_MILLIS`] after.
+    pub removal_due_millis: Option<i64>,
 }
 
 /// A persisted batch build: the modelled [`BuildBatch`] plus the instant at
@@ -1220,6 +1263,13 @@ pub enum BuildTokenStore {
 }
 
 impl ComAmazonawsCodebuildCodebuild20161006State {
+    /// Hand out the sequence number the next created compute fleet derives its id
+    /// from, and advance the counter — see [`Self::fleets_created`].
+    pub fn allocate_fleet_sequence(&mut self) -> i64 {
+        self.fleets_created = self.fleets_created.saturating_add(1);
+        self.fleets_created
+    }
+
     /// Hand out `project_name`'s next `buildNumber` and advance the counter.
     pub fn allocate_build_number(&mut self, project_name: &str) -> i64 {
         allocate_number(&mut self.next_build_numbers, project_name)
@@ -1681,10 +1731,25 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         identifier: &str,
         now_millis: i64,
     ) -> Option<&mut StoredFleet> {
+        // A fleet whose removal the clock has already made due is gone before this
+        // read resolves anything: the removal was owed at that instant whether or
+        // not anybody called.
+        self.settle_fleet_deletions(now_millis);
         let key = self.fleet_key(identifier)?;
         let stored = self.fleets.get_mut(&key)?;
         stored.settle(now_millis);
         Some(stored)
+    }
+
+    /// Remove every fleet whose deletion the clock has made due.
+    ///
+    /// The write `DeleteFleet` scheduled, materialised from the stored instants the
+    /// way [`StoredFleet::settle`] materialises the move to `ACTIVE`: the removal was
+    /// owed at the same instant even if nobody had called, so this is idempotent and
+    /// purely a function of those instants. A fleet whose removal is not due yet is
+    /// left where it is, still reported in [`FLEET_STATUS_PENDING_DELETION`].
+    pub fn settle_fleet_deletions(&mut self, now_millis: i64) {
+        self.fleets.retain(|_, stored| !stored.removal_due(now_millis));
     }
 
     /// The `fleets` key of the fleet `identifier` addresses, if this account
@@ -1701,8 +1766,10 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
     pub fn fleet_key(&self, identifier: &str) -> Option<String> {
         let by_arn = identifier.starts_with("arn:");
         let name = if by_arn {
-            // `fleet/<name>:<uuid>`: the name is what the store is keyed by.
-            identifier.rsplit_once(":fleet/")?.1.split_once(':')?.0
+            // A fleet id is `<name>:<uuid>`, and the name is what the store is
+            // keyed by. The ARN itself is parsed by the one parser every
+            // fleet-addressing operation uses ([`fleet_id_from_arn`]).
+            fleet_id_from_arn(identifier)?.split_once(':')?.0
         } else {
             identifier
         };
@@ -1711,6 +1778,47 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
             return None;
         }
         Some(name.to_string())
+    }
+
+    /// Start the deletion of the compute fleet `identifier` addresses, handing back
+    /// the record as this call leaves it — `None` when this account holds no fleet it
+    /// addresses.
+    ///
+    /// Resolved through [`Self::fleet_key`], exactly as every fleet read resolves an
+    /// identifier, so an ARN for another partition, region, account, resource type or
+    /// fleet id deletes nothing.
+    ///
+    /// A fleet's capacity has to be torn down, so the deletion is not instant: the
+    /// fleet is left in the `PENDING_DELETION` status the model documents ("the compute
+    /// fleet is pending deletion") and its removal from the store becomes due
+    /// [`FLEET_DELETE_MILLIS`] later, materialised from the stored instant by whoever
+    /// reads the store next ([`Self::settle_fleet_deletions`]). A delete repeated
+    /// while the first is still in flight reports that same record and leaves the due
+    /// instant where it was, so a retry can neither postpone the removal nor report a
+    /// fleet it did not find.
+    ///
+    /// The builds that ran on the fleet are untouched: AWS documents the deletion as
+    /// "when you delete a compute fleet, its builds are not deleted", and a project
+    /// configured to run on it keeps the setting it was configured with.
+    pub fn begin_fleet_deletion(
+        &mut self,
+        identifier: &str,
+        now_millis: i64,
+    ) -> Option<&StoredFleet> {
+        self.settle_fleet_deletions(now_millis);
+        let key = self.fleet_key(identifier)?;
+        let stored = self.fleets.get_mut(&key)?;
+        if stored.removal_due_millis.is_none() {
+            stored.removal_due_millis = Some(now_millis + FLEET_DELETE_MILLIS);
+            stored.fleet.status = Some(FleetStatus {
+                status_code: Some(FLEET_STATUS_PENDING_DELETION.to_string()),
+                // A fleet being deleted carries no `FleetContextCode`: the values
+                // `FleetStatus$context` documents explain a failure.
+                context: None,
+                message: None,
+            });
+        }
+        Some(stored)
     }
 
     /// Read a build, first materialising the transition the clock already owes
@@ -2105,10 +2213,19 @@ fn record_token<T: IssuedToken>(
 }
 
 impl StoredFleet {
+    /// Whether this fleet's removal from the store has fallen due — `DeleteFleet`
+    /// stored the instant the clock owes it at.
+    pub fn removal_due(&self, now_millis: i64) -> bool {
+        self.removal_due_millis
+            .is_some_and(|due| now_millis >= due)
+    }
+
     /// Materialise this fleet's `ACTIVE` status once its due instant has passed.
     ///
     /// Idempotent and purely a function of the stored instants: a fleet that is
-    /// not provisioning, or whose span has not elapsed, is left alone.
+    /// not provisioning, or whose span has not elapsed, is left alone — which
+    /// includes a fleet being deleted, whose status is terminal for as long as
+    /// the record is kept.
     pub fn settle(&mut self, now_millis: i64) {
         if now_millis < self.active_due_millis {
             return;
@@ -2430,19 +2547,17 @@ pub fn sandbox_store_id(entry: &str) -> &str {
 /// A compute fleet's unique identifier — the UUID AWS puts after `<fleetName>:`.
 ///
 /// [`build_uuid`]'s derivation in its own namespace, over the values that already
-/// make a fleet unique: its name, which identifies one fleet per account at any
-/// instant, and the instant it was created. A fleet is addressed by that name
-/// rather than by a per-name sequence number, so it has none to derive from —
-/// which also means a name deleted and recreated inside the SAME millisecond
-/// derives the same id again; once `DeleteFleet` exists it needs a per-name
-/// counter here, the way `allocate_build_number` feeds [`build_uuid`].
-pub fn fleet_uuid(name: &str, created_millis: i64) -> String {
-    derived_uuid("fleet", name, NO_SEQUENCE_NUMBER, created_millis)
+/// make a fleet unique: its name, the sequence number allocated for it under the
+/// state lock
+/// ([`ComAmazonawsCodebuildCodebuild20161006State::allocate_fleet_sequence`]) and
+/// the instant it was created. `DeleteFleet` frees a fleet's name again, so the
+/// name and the instant alone do not identify a fleet — a name recreated inside
+/// the SAME millisecond would derive the deleted fleet's id, and that fleet's
+/// stale ARN would then address the new one. The sequence number is what keeps
+/// them apart, the way `allocate_build_number` feeds [`build_uuid`].
+pub fn fleet_uuid(name: &str, sequence: i64, created_millis: i64) -> String {
+    derived_uuid("fleet", name, sequence, created_millis)
 }
-
-/// The `sequence` [`derived_uuid`] takes for a resource that has no per-name
-/// sequence number of its own, because its name already identifies it.
-const NO_SEQUENCE_NUMBER: i64 = 0;
 
 /// An RFC 9562 version-8 (custom, hash-based) UUID over the values that already make
 /// a resource unique: what KIND of resource it is, the name it belongs to, the
@@ -2560,17 +2675,31 @@ pub fn build_arn(region: &str, id: &str) -> String {
 /// resource is the whole sixth field, everything after the fifth colon, so a build
 /// id's own `<projectName>:<uuid>` colon is recovered intact.
 pub fn build_id_from_arn(arn: &str) -> Option<&str> {
-    // Walked field by field rather than collected, so resolving an ARN allocates
-    // nothing.
+    resource_from_arn(arn, "build/")
+}
+
+/// The resource `prefix` names inside a `arn:<partition>:codebuild:<region>:<account>:`
+/// ARN of this service, or `None` when the value is not one — the one place the ARN
+/// field rule is stated, for every resource kind this service addresses by ARN.
+///
+/// The partition, the service and the resource must be non-empty and the service must
+/// be this one; the region and the account are NOT checked, because an ARN answers the
+/// syntax question only and a caller keeps a record only when its STORED ARN is exactly
+/// the one asked for (see [`project_name_from_arn`]). The resource is the whole sixth
+/// field, everything after the fifth colon, so a resource id that carries a colon of
+/// its own (a build's `<projectName>:<uuid>`, a fleet's `<name>:<uuid>`, a report group
+/// name) is recovered intact.
+///
+/// Walked field by field rather than collected, so resolving an ARN allocates nothing.
+fn resource_from_arn<'a>(arn: &'a str, prefix: &str) -> Option<&'a str> {
     let mut fields = arn.splitn(6, ':');
     if fields.next()? != "arn" || fields.next()?.is_empty() || fields.next()? != ARN_NAMESPACE {
         return None;
     }
-    // The region and the account are not checked here; see `project_name_from_arn`.
     fields.next()?;
     fields.next()?;
-    let id = fields.next()?.strip_prefix("build/")?;
-    (!id.is_empty()).then_some(id)
+    let resource = fields.next()?.strip_prefix(prefix)?;
+    (!resource.is_empty()).then_some(resource)
 }
 
 /// The project name an `arn:<partition>:codebuild:<region>:<account>:project/<name>`
@@ -2586,17 +2715,7 @@ pub fn build_id_from_arn(arn: &str) -> Option<&str> {
 /// local record. A project name cannot contain `:` (the model's `@pattern` on
 /// `CreateProjectInput$name`), so the six ARN fields split cleanly.
 pub fn project_name_from_arn(arn: &str) -> Option<&str> {
-    // Walked field by field rather than collected, so resolving an ARN allocates
-    // nothing.
-    let mut fields = arn.splitn(6, ':');
-    if fields.next()? != "arn" || fields.next()?.is_empty() || fields.next()? != ARN_NAMESPACE {
-        return None;
-    }
-    // The region and the account are not checked here; see above.
-    fields.next()?;
-    fields.next()?;
-    let name = fields.next()?.strip_prefix("project/")?;
-    (!name.is_empty()).then_some(name)
+    resource_from_arn(arn, "project/")
 }
 
 /// The report group name an
@@ -2613,17 +2732,7 @@ pub fn project_name_from_arn(arn: &str) -> Option<&str> {
 /// the name is recovered intact even though `ReportGroupName` constrains only its
 /// length and may therefore carry a colon itself.
 pub fn report_group_name_from_arn(arn: &str) -> Option<&str> {
-    // Walked field by field rather than collected, so resolving an ARN allocates
-    // nothing.
-    let mut fields = arn.splitn(6, ':');
-    if fields.next()? != "arn" || fields.next()?.is_empty() || fields.next()? != ARN_NAMESPACE {
-        return None;
-    }
-    // The region and the account are not checked here; see above.
-    fields.next()?;
-    fields.next()?;
-    let name = fields.next()?.strip_prefix("report-group/")?;
-    (!name.is_empty()).then_some(name)
+    resource_from_arn(arn, "report-group/")
 }
 
 /// A public project's `publicProjectAlias` — "the project identifier used with the
@@ -2645,6 +2754,22 @@ pub fn public_project_alias(project_arn: &str) -> String {
 /// `<name>:<uuid>` identifier — the form `UpdateFleet` and `DeleteFleet` take.
 pub fn fleet_arn(region: &str, id: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("fleet/{id}"))
+}
+
+/// The fleet id an `arn:<partition>:codebuild:<region>:<account>:fleet/<id>` ARN
+/// identifies, or `None` when the value is not a CodeBuild compute fleet ARN.
+///
+/// The inverse of [`fleet_arn`]'s resource segment, and [`project_name_from_arn`]'s
+/// rule for the resource kind a fleet operation addresses by ARN: it answers the
+/// SYNTAX question only — whether the value is a compute fleet ARN of this service at
+/// all — so a caller that resolves a record still keeps it only if its STORED ARN is
+/// exactly the one asked for
+/// ([`ComAmazonawsCodebuildCodebuild20161006State::fleet_key`]), which is what keeps
+/// an ARN for another partition, region or account from resolving to a local record.
+/// The resource is the whole sixth field, everything after the fifth colon, so a
+/// fleet id's own `<name>:<uuid>` colon is kept intact.
+pub fn fleet_id_from_arn(arn: &str) -> Option<&str> {
+    resource_from_arn(arn, "fleet/")
 }
 
 /// The CodeBuild endpoint a project's webhook events are sent to, as
@@ -2882,6 +3007,9 @@ pub enum AuditOutcome {
     FleetCreated,
     /// A compute fleet's settings were changed and stored.
     FleetUpdated,
+    /// A compute fleet's deletion was started: the fleet is `PENDING_DELETION` until
+    /// the clock makes its removal from the store due.
+    FleetDeleted,
     /// The request was refused as invalid (400 `InvalidInputException`).
     ValidationRefused,
     /// A resource of that name already exists (400
@@ -2919,6 +3047,7 @@ impl AuditOutcome {
             Self::ReportGroupDeleted => "report-group-deleted",
             Self::FleetCreated => "fleet-created",
             Self::FleetUpdated => "fleet-updated",
+            Self::FleetDeleted => "fleet-deleted",
             Self::ValidationRefused => "validation-refused",
             Self::AlreadyExists => "already-exists",
             Self::QuotaExceeded => "quota-exceeded",

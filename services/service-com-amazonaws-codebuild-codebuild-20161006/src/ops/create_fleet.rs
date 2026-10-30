@@ -226,6 +226,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let created = crate::state::datetime(now);
         let mut guard = state.lock();
 
+        // A fleet whose removal `DeleteFleet` scheduled and the clock has already
+        // made due is gone before this call reads the registry, so the name it held
+        // is free again (`settle_fleet_deletions`).
+        guard.settle_fleet_deletions(now);
+
         // Fleet names are unique per account: a second create under a held name is
         // refused rather than replacing the fleet builds may be running on.
         if let Some(held) = guard.fleets.get(&input.name) {
@@ -267,11 +272,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `<name>:<uuid>`, the same shape a build id has, and what the fleet ARN
-        // carries after `fleet/`.
+        // carries after `fleet/`. The uuid is derived from the per-store sequence
+        // number allocated here under the lock, so a name `DeleteFleet` freed never
+        // derives the id of the fleet that is gone.
         let id = format!(
             "{}:{}",
             input.name,
-            crate::state::fleet_uuid(&input.name, now)
+            crate::state::fleet_uuid(&input.name, guard.allocate_fleet_sequence(), now)
         );
         let fleet = Fleet {
             arn: Some(crate::state::fleet_arn(&region, &id)),
@@ -321,6 +328,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 created_millis: now,
                 last_modified_millis: now,
                 active_due_millis: now + crate::state::FLEET_SETTLE_MILLIS,
+                // Nothing has asked for this fleet to be deleted, so the clock owes
+                // its removal at no instant.
+                removal_due_millis: None,
             },
         );
         // The lock is dropped before the audit record is written, so a log consumer
