@@ -15,6 +15,8 @@
 mod cluster_lifecycle;
 #[path = "all/error_resource_identity.rs"]
 mod error_resource_identity;
+#[path = "all/maintenance_and_restore.rs"]
+mod maintenance_and_restore;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/state_roundtrip.rs"]

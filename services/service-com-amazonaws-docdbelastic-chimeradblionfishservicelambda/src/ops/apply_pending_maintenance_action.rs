@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ApplyPendingMaintenanceAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ApplyPendingMaintenanceAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ApplyPendingMaintenanceAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +73,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -117,6 +109,103 @@ pub type ApplyPendingMaintenanceActionError = crate::scaffolded::Scaffolded<Appl
 impl From<ApplyPendingMaintenanceActionErrorModeled> for ApplyPendingMaintenanceActionError {
     fn from(modeled: ApplyPendingMaintenanceActionErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// The opt-in a request asks for, once the request-level rules of `optInType` hold.
+///
+/// Parsing the request into this enum first is what keeps the request rules (which
+/// members may travel together) apart from the state rules (which actions are pending),
+/// so a request that cannot hold together is refused before any record is looked at.
+enum OptIn {
+    /// Apply the action on the date the request named (`APPLY_ON`).
+    On(String),
+    /// Apply the action as soon as the opt-in is recorded (`IMMEDIATE`).
+    Immediate,
+    /// Apply the action in the resource's next maintenance window
+    /// (`NEXT_MAINTENANCE`).
+    NextMaintenance,
+    /// Withdraw an opt-in already recorded for the action (`UNDO_OPT_IN`).
+    Undo,
+}
+
+impl OptIn {
+    /// The opt-in `opt_in_type` names, or the refusal of a request whose members cannot
+    /// hold together.
+    fn parse(opt_in_type: &str, apply_on: Option<&str>) -> Result<Self, ValidationException> {
+        match opt_in_type {
+            state::OPT_IN_APPLY_ON => match apply_on {
+                Some(date) => Ok(Self::On(date.to_string())),
+                None => Err(apply_on_required()),
+            },
+            state::OPT_IN_IMMEDIATE => Ok(Self::Immediate),
+            state::OPT_IN_NEXT_MAINTENANCE => Ok(Self::NextMaintenance),
+            state::OPT_IN_UNDO_OPT_IN => Ok(Self::Undo),
+            // Unreachable while the modelled `OptInType` enum is validated at the
+            // boundary; refused rather than ignored, because applying an opt-in nobody
+            // asked for is worse than refusing the request.
+            other => Err(state::invalid_input(
+                other,
+                &format!(
+                    "OptInType must be one of {}.",
+                    OPT_IN_TYPE_VALUES.join(", ")
+                ),
+            )),
+        }
+    }
+
+    /// Record this opt-in on the pending action it was requested for.
+    fn apply_to(self, detail: &mut PendingMaintenanceActionDetails) {
+        match self {
+            // The date the request named is when the action is applied.
+            Self::On(date) => {
+                detail.opt_in_status = Some(state::OPT_IN_APPLY_ON.to_string());
+                detail.current_apply_date = Some(date);
+            }
+            // Opted in with no date to wait for, so the action applies from now.
+            Self::Immediate => {
+                detail.opt_in_status = Some(state::OPT_IN_IMMEDIATE.to_string());
+                detail.current_apply_date = Some(state::now_utc());
+            }
+            // `autoAppliedAfterDate` is where the service publishes the date of "the
+            // first maintenance window after this date", so it is the effective date
+            // this opt-in takes.
+            Self::NextMaintenance => {
+                detail.opt_in_status = Some(state::OPT_IN_NEXT_MAINTENANCE.to_string());
+                detail.current_apply_date = detail.auto_applied_after_date.clone();
+            }
+            // The opt-in is withdrawn: the action stays pending, with no opt-in status
+            // and no effective date of its own.
+            Self::Undo => {
+                detail.opt_in_status = None;
+                detail.current_apply_date = None;
+            }
+        }
+    }
+}
+
+/// The refusal of an `APPLY_ON` opt-in that names no date.
+///
+/// `applyOn` is documented "Required if opt-in-type is APPLY_ON", and the sentence is
+/// fixed text: `ApplyOn` and `OptInType` are the member names as the service spells
+/// them in a sentence, not values the request carried.
+fn apply_on_required() -> ValidationException {
+    ValidationException {
+        message: format!(
+            "ApplyOn is required when OptInType is {}",
+            state::OPT_IN_APPLY_ON
+        ),
+    }
+}
+
+/// The refusal of an `applyAction` that is not pending for the resource the request
+/// named.
+///
+/// Fixed text followed by the `resourceArn` the request carried: the request named an
+/// action, and the service is saying that resource has no such action pending.
+fn pending_action_not_found(resource_arn: &str) -> ValidationException {
+    ValidationException {
+        message: format!("Pending maintenance action not found for ResourceArn {resource_arn}"),
     }
 }
 
@@ -156,18 +245,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ApplyPendingMaintenanceAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ApplyPendingMaintenanceActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ApplyPendingMaintenanceAction"))
+        let _ = ctx;
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(
+                ApplyPendingMaintenanceActionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: state::STORE_UNREACHABLE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Request rules first: whether the members can hold together does not depend on
+        // any record, and a request that breaks them records nothing.
+        let opt_in = OptIn::parse(&input.opt_in_type, input.apply_on.as_deref())
+            .map_err(ApplyPendingMaintenanceActionErrorModeled::ValidationException)?;
+
+        let mut guard = store.lock();
+        // A pending maintenance action belongs to a cluster, so an ARN no cluster
+        // carries is the cluster not-found refusal.
+        let Some(record) = guard.clusters.get_mut(&input.resource_arn) else {
+            return Err(
+                ApplyPendingMaintenanceActionErrorModeled::ResourceNotFoundException(
+                    state::not_found(state::ResourceKind::Cluster, &input.resource_arn),
+                )
+                .into(),
+            );
+        };
+        // Completes the transition the clock already made due on the cluster being
+        // addressed, which was owed at this instant whether or not anybody called.
+        record.settle_due();
+
+        // Only an action the service has already scheduled for this cluster can be
+        // opted in to. There is no such action for a cluster with nothing pending, so
+        // the request is refused and no record is created — the opt-in is recorded on
+        // an existing action or not at all.
+        let Some(detail) = record
+            .pending_maintenance_actions
+            .iter_mut()
+            .find(|detail| detail.action == input.apply_action)
+        else {
+            return Err(
+                ApplyPendingMaintenanceActionErrorModeled::ValidationException(
+                    pending_action_not_found(&input.resource_arn),
+                )
+                .into(),
+            );
+        };
+        opt_in.apply_to(detail);
+
+        let resource_pending_maintenance_action = record.as_resource_pending_maintenance_action();
+        drop(guard);
+
+        Ok(ApplyPendingMaintenanceActionOutput {
+            resource_pending_maintenance_action,
+        })
     }
 }

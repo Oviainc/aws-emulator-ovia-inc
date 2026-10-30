@@ -185,6 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let kms_key_id = cluster.kms_key_id.clone();
         let subnet_ids = cluster.subnet_ids.clone();
         let vpc_security_group_ids = cluster.vpc_security_group_ids.clone();
+        // The rest of the cluster's configuration travels with the snapshot, so a
+        // restore can rebuild the cluster from it even once this cluster is deleted.
+        let source_config = cluster.source_config();
 
         // The snapshot map is reclaimed only by DeleteClusterSnapshot, so the record
         // count is capped.
@@ -221,6 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             subnet_ids,
             vpc_security_group_ids,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
+            source_config,
             // Reported CREATING, with ACTIVE owed by the clock.
             settles_at: Some(state::settle_instant()),
         };

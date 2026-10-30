@@ -9,8 +9,9 @@
 //! the only place a response body is built from.
 
 use crate::ops::types::{
-    Cluster, ClusterInList, ClusterSnapshot, ConflictException, ResourceNotFoundException,
-    ServiceQuotaExceededException, Shard, ValidationException,
+    Cluster, ClusterInList, ClusterSnapshot, ConflictException, PendingMaintenanceActionDetails,
+    ResourceNotFoundException, ResourcePendingMaintenanceAction, ServiceQuotaExceededException,
+    Shard, ValidationException,
 };
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -68,6 +69,16 @@ pub struct ClusterRecord {
     pub kms_key_id: String,
     pub shards: Vec<ShardRecord>,
     pub tags: BTreeMap<String, String>,
+    /// The maintenance actions that are pending for this cluster, as
+    /// `GetPendingMaintenanceAction` reports them and `ApplyPendingMaintenanceAction`
+    /// opts in to them.
+    ///
+    /// A pending maintenance action exists because the SERVICE scheduled an engine, OS
+    /// or security update for the cluster — no request creates one — so a cluster this
+    /// emulator mints starts with nothing pending, exactly as a cluster AWS has just
+    /// created does. Both maintenance operations read the list from here rather than
+    /// assuming what it holds.
+    pub pending_maintenance_actions: Vec<PendingMaintenanceActionDetails>,
     /// When the clock owes this cluster a move to `ACTIVE`; `None` once it is settled.
     pub settles_at: Option<Instant>,
 }
@@ -78,6 +89,50 @@ pub struct ShardRecord {
     pub shard_id: String,
     pub create_time: String,
     pub status: String,
+}
+
+/// The source cluster's configuration a snapshot carries so a restore can rebuild the
+/// cluster from it.
+///
+/// These are the members `RestoreClusterFromSnapshot` needs that the modelled
+/// `ClusterSnapshot` shape does NOT report on the wire; the ones it does report
+/// (`adminUserName`, `kmsKeyId`, `subnetIds`, `vpcSecurityGroupIds`) stay on
+/// [`SnapshotRecord`] itself and are not duplicated here. Holding them on the snapshot
+/// is what lets a restore rebuild the cluster after the source cluster is gone.
+///
+/// `admin_user_password` is held for the same reason [`ClusterRecord`] holds it — a
+/// restored cluster keeps the source's administrator credentials — and `Debug` is
+/// written by hand so the `@sensitive` value cannot reach a log or a panic message.
+#[derive(Clone)]
+pub struct SourceClusterConfig {
+    pub admin_user_password: String,
+    pub auth_type: String,
+    pub shard_capacity: i32,
+    pub shard_count: i32,
+    pub shard_instance_count: Option<i32>,
+    pub preferred_maintenance_window: String,
+    pub preferred_backup_window: Option<String>,
+    pub backup_retention_period: Option<i32>,
+}
+
+impl ::std::fmt::Debug for SourceClusterConfig {
+    /// Everything except the administrator password, which is `@sensitive` and so is
+    /// rendered as a fixed placeholder.
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.debug_struct("SourceClusterConfig")
+            .field("admin_user_password", &"<redacted>")
+            .field("auth_type", &self.auth_type)
+            .field("shard_capacity", &self.shard_capacity)
+            .field("shard_count", &self.shard_count)
+            .field("shard_instance_count", &self.shard_instance_count)
+            .field(
+                "preferred_maintenance_window",
+                &self.preferred_maintenance_window,
+            )
+            .field("preferred_backup_window", &self.preferred_backup_window)
+            .field("backup_retention_period", &self.backup_retention_period)
+            .finish()
+    }
 }
 
 /// One persisted cluster snapshot.
@@ -95,6 +150,9 @@ pub struct SnapshotRecord {
     pub subnet_ids: Vec<String>,
     pub vpc_security_group_ids: Vec<String>,
     pub tags: BTreeMap<String, String>,
+    /// The rest of the source cluster's configuration, captured when the snapshot was
+    /// taken, so `RestoreClusterFromSnapshot` can rebuild a cluster from it.
+    pub source_config: SourceClusterConfig,
     /// When the clock owes this snapshot a move to `ACTIVE`; `None` once settled.
     pub settles_at: Option<Instant>,
 }
@@ -126,6 +184,10 @@ impl ::std::fmt::Debug for ClusterRecord {
             .field("kms_key_id", &self.kms_key_id)
             .field("shards", &self.shards)
             .field("tags", &self.tags)
+            .field(
+                "pending_maintenance_actions",
+                &self.pending_maintenance_actions,
+            )
             .field("settles_at", &self.settles_at)
             .finish()
     }
@@ -195,6 +257,34 @@ impl ClusterRecord {
             status: self.status.clone(),
         }
     }
+
+    /// The modelled `ResourcePendingMaintenanceAction` for this cluster: the ARN the
+    /// actions belong to, and every action currently pending for it.
+    ///
+    /// The details list is always present, and empty for a cluster with nothing
+    /// pending, which is how the service reports "this resource has no pending
+    /// maintenance action" — not as a missing member and not as a not-found refusal.
+    pub fn as_resource_pending_maintenance_action(&self) -> ResourcePendingMaintenanceAction {
+        ResourcePendingMaintenanceAction {
+            resource_arn: Some(self.cluster_arn.clone()),
+            pending_maintenance_action_details: Some(self.pending_maintenance_actions.clone()),
+        }
+    }
+
+    /// The configuration a snapshot of this cluster captures, so a restore of that
+    /// snapshot rebuilds the cluster even after this record is gone.
+    pub fn source_config(&self) -> SourceClusterConfig {
+        SourceClusterConfig {
+            admin_user_password: self.admin_user_password.clone(),
+            auth_type: self.auth_type.clone(),
+            shard_capacity: self.shard_capacity,
+            shard_count: self.shard_count,
+            shard_instance_count: self.shard_instance_count,
+            preferred_maintenance_window: self.preferred_maintenance_window.clone(),
+            preferred_backup_window: self.preferred_backup_window.clone(),
+            backup_retention_period: self.backup_retention_period,
+        }
+    }
 }
 
 impl SnapshotRecord {
@@ -231,6 +321,16 @@ pub const STATUS_CREATING: &str = "CREATING";
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 pub const STATUS_UPDATING: &str = "UPDATING";
 pub const STATUS_DELETING: &str = "DELETING";
+
+/// The `OptInType` values the maintenance-action opt-in path names.
+///
+/// Source: `smithy_query(query="shape", shape="OptInType")` reports the wire values as
+/// `IMMEDIATE` / `NEXT_MAINTENANCE` / `APPLY_ON` / `UNDO_OPT_IN`, which is also the
+/// scaffold's own `ops::types::OPT_IN_TYPE_VALUES`.
+pub const OPT_IN_APPLY_ON: &str = "APPLY_ON";
+pub const OPT_IN_IMMEDIATE: &str = "IMMEDIATE";
+pub const OPT_IN_NEXT_MAINTENANCE: &str = "NEXT_MAINTENANCE";
+pub const OPT_IN_UNDO_OPT_IN: &str = "UNDO_OPT_IN";
 
 /// The `SnapshotType` a caller-requested snapshot carries (`CreateClusterSnapshot`);
 /// AWS reserves `AUTOMATED` for the ones it takes on the backup window.
@@ -631,6 +731,19 @@ impl ResourceKind {
         }
     }
 
+    /// The sentence the service answers when a resource of this kind cannot be found.
+    ///
+    /// The WHOLE message is fixed text, one sentence per resource class: the
+    /// identifier the request named is reported in `ResourceNotFoundException$resourceId`
+    /// and is never spliced into the message, so the refusal a client logs, localizes or
+    /// deduplicates on does not vary per request.
+    pub const fn not_found_message(self) -> &'static str {
+        match self {
+            Self::Cluster => "Unable to find the cluster",
+            Self::ClusterSnapshot => "Unable to find the snapshot",
+        }
+    }
+
     /// The ARN of the resource of this kind with id `resource_id`, in `region`.
     pub fn arn(self, region: &str, resource_id: &str) -> String {
         docdb_elastic_arn(region, &format!("{}/{resource_id}", self.arn_segment()))
@@ -641,11 +754,11 @@ impl ResourceKind {
 ///
 /// The two structured members are what a client branches on: `resourceType` is the
 /// AWS resource type name of the kind that was looked up (see [`ResourceKind`]) and
-/// `resourceId` is the ARN the request named. The message restates them in prose and
-/// is not where either is read from.
+/// `resourceId` is the ARN the request named. The message is the fixed sentence for
+/// that resource class ([`ResourceKind::not_found_message`]) and carries neither.
 pub fn not_found(kind: ResourceKind, arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("{} {arn} not found", kind.type_name()),
+        message: kind.not_found_message().to_string(),
         resource_id: arn.to_string(),
         resource_type: kind.type_name().to_string(),
     }

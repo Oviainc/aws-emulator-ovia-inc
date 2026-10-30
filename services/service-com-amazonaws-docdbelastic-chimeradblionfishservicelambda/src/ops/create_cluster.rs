@@ -286,6 +286,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_else(|| state::AWS_OWNED_KMS_KEY.to_string()),
             shards: state::shards_for(input.shard_count, &create_time, &[]),
             tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // Nothing is pending for a cluster the service has only just created: a
+            // maintenance action becomes pending when the service schedules an update
+            // for the cluster, which no request does.
+            pending_maintenance_actions: Vec::new(),
         };
         // A new cluster is reported CREATING and the clock owes it ACTIVE.
         record.begin_transition(state::STATUS_CREATING);

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreClusterFromSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreClusterFromSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreClusterFromSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +162,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreClusterFromSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreClusterFromSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreClusterFromSnapshot"))
+        use crate::state;
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(RestoreClusterFromSnapshotErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: state::STORE_UNREACHABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The restored cluster is a NEW cluster, so every value the request may carry
+        // for it is held to the same rule `CreateCluster` holds it to, and refused
+        // before anything is minted.
+        state::validate_cluster_name("clusterName", &input.cluster_name)
+            .map_err(RestoreClusterFromSnapshotErrorModeled::ValidationException)?;
+        if let Some(capacity) = input.shard_capacity {
+            state::validate_shard_capacity("shardCapacity", capacity)
+                .map_err(RestoreClusterFromSnapshotErrorModeled::ValidationException)?;
+        }
+        if let Some(count) = input.shard_instance_count {
+            state::validate_shard_instance_count("shardInstanceCount", count)
+                .map_err(RestoreClusterFromSnapshotErrorModeled::ValidationException)?;
+        }
+        if let Some(ids) = input.vpc_security_group_ids.as_deref() {
+            state::validate_id_list("vpcSecurityGroupIds", ids)
+                .map_err(RestoreClusterFromSnapshotErrorModeled::ValidationException)?;
+        }
+        if let Some(ids) = input.subnet_ids.as_deref() {
+            state::validate_id_list("subnetIds", ids)
+                .map_err(RestoreClusterFromSnapshotErrorModeled::ValidationException)?;
+        }
+        if let Some(tags) = input.tags.as_ref() {
+            state::validate_tags("tags", tags)
+                .map_err(RestoreClusterFromSnapshotErrorModeled::ValidationException)?;
+        }
+        if let Some(key) = input.kms_key_id.as_deref() {
+            state::validate_kms_key_id("kmsKeyId", key)
+                .map_err(RestoreClusterFromSnapshotErrorModeled::ValidationException)?;
+        }
+
+        // A cluster name is stored as a lowercase string, so the restored cluster takes
+        // its name in the one form the cluster-name index is keyed by.
+        let cluster_name = input.cluster_name.to_ascii_lowercase();
+        let region = state::request_region(ctx.parts());
+
+        let mut guard = store.lock();
+        // The snapshot being restored is resolved FIRST, so a request naming a snapshot
+        // that does not exist is the snapshot not-found refusal rather than a name or
+        // quota refusal. Everything the restored cluster inherits is taken here.
+        let Some(snapshot) = guard.snapshots.get_mut(&input.snapshot_arn) else {
+            return Err(RestoreClusterFromSnapshotErrorModeled::ResourceNotFoundException(
+                state::not_found(state::ResourceKind::ClusterSnapshot, &input.snapshot_arn),
+            )
+            .into());
+        };
+        // Completes the transition the clock already made due on the snapshot being
+        // read, which was owed at this instant whether or not anybody called.
+        snapshot.settle_due();
+        let source = snapshot.source_config.clone();
+        let admin_user_name = snapshot.admin_user_name.clone();
+        let snapshot_kms_key_id = snapshot.kms_key_id.clone();
+        let snapshot_subnet_ids = snapshot.subnet_ids.clone();
+        let snapshot_vpc_security_group_ids = snapshot.vpc_security_group_ids.clone();
+
+        // The store lives for the life of the process and is reclaimed only by an
+        // explicit delete, so the record count is capped.
+        state::ensure_cluster_capacity(guard.clusters.len())
+            .map_err(RestoreClusterFromSnapshotErrorModeled::ServiceQuotaExceededException)?;
+        // A name already in use is refused as request validation here, not as a state
+        // conflict: the recorded refusal of a restore under an existing cluster's name
+        // is HTTP 400 `ValidationException`, where `CreateCluster` answers 409.
+        if guard.cluster_names.contains_key(&cluster_name) {
+            return Err(RestoreClusterFromSnapshotErrorModeled::ValidationException(
+                state::invalid_input(
+                    &cluster_name,
+                    "ClusterName must not name an elastic cluster that already exists.",
+                ),
+            )
+            .into());
+        }
+
+        let cluster_id = state::new_resource_id();
+        let cluster_arn = state::ResourceKind::Cluster.arn(&region, &cluster_id);
+        let create_time = state::now_utc();
+        // Everything the request does not carry comes from the snapshot's record of the
+        // cluster it was taken from; the members `RestoreClusterFromSnapshot` models are
+        // the ones a restore may change.
+        let mut record = state::ClusterRecord {
+            cluster_name: cluster_name.clone(),
+            cluster_arn: cluster_arn.clone(),
+            // `begin_transition` below sets the status and the instant it settles at.
+            status: String::new(),
+            settles_at: None,
+            cluster_endpoint: state::cluster_endpoint(&cluster_name, &cluster_id, &region),
+            create_time: create_time.clone(),
+            admin_user_name,
+            admin_user_password: source.admin_user_password,
+            auth_type: source.auth_type,
+            shard_capacity: input.shard_capacity.unwrap_or(source.shard_capacity),
+            shard_count: source.shard_count,
+            shard_instance_count: input
+                .shard_instance_count
+                .or(source.shard_instance_count),
+            vpc_security_group_ids: input
+                .vpc_security_group_ids
+                .unwrap_or(snapshot_vpc_security_group_ids),
+            subnet_ids: input.subnet_ids.unwrap_or(snapshot_subnet_ids),
+            preferred_maintenance_window: source.preferred_maintenance_window,
+            preferred_backup_window: source.preferred_backup_window,
+            backup_retention_period: source.backup_retention_period,
+            kms_key_id: input.kms_key_id.unwrap_or(snapshot_kms_key_id),
+            shards: state::shards_for(source.shard_count, &create_time, &[]),
+            // Tags are the restore request's own, as its `tags` member is "the tag names
+            // to be assigned to the restored elastic cluster".
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // Nothing is pending for a cluster that has only just been restored.
+            pending_maintenance_actions: Vec::new(),
+        };
+        // A restored cluster is reported CREATING and the clock owes it ACTIVE.
+        record.begin_transition(state::STATUS_CREATING);
+
+        let cluster = record.as_cluster();
+        guard.cluster_names.insert(cluster_name, cluster_arn.clone());
+        guard.clusters.insert(cluster_arn, record);
+        drop(guard);
+
+        Ok(RestoreClusterFromSnapshotOutput { cluster })
     }
 }
