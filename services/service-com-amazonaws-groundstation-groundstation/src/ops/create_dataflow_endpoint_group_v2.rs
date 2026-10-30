@@ -177,12 +177,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ::std::collections::HashMap::new();
         for (index, details) in stored_endpoints.iter().enumerate() {
             // Every address the endpoint carries is a socket Ground Station connects a
-            // stream to, so each port it names has to be one a transport can address, and
-            // the name it is selected by has to be one no other endpoint of this group
-            // took. Both rules belong to every create of a dataflow endpoint group, so both
-            // are held in `crate::state` rather than in one of its handlers.
+            // stream to, so each port it names has to be one a transport can address and
+            // each MTU it is framed at one the documented range allows, and the name it is
+            // selected by has to be one no other endpoint of this group took. Both rules
+            // belong to every create of a dataflow endpoint group, so both are held in
+            // `crate::state` rather than in one of its handlers.
             let path = format!("endpoints[{index}]");
-            crate::state::check_endpoint_ports(&path, details)
+            crate::state::check_endpoint_addresses(&path, details)
                 .map_err(CreateDataflowEndpointGroupV2ErrorModeled::InvalidParameterException)?;
             let member = crate::state::endpoint_members(details)
                 .first()

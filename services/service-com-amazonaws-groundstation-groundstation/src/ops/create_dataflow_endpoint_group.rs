@@ -251,12 +251,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             // Every address the endpoint carries is a socket Ground Station connects a
-            // stream to, so each port it names has to be one a transport can address, and
-            // the name it is selected by has to be one no other endpoint of this group
-            // took: both rules belong to every create of a dataflow endpoint group, so both
-            // are held in `crate::state`.
+            // stream to, so each port it names has to be one a transport can address and
+            // each MTU it is framed at one the documented range allows, and the name it is
+            // selected by has to be one no other endpoint of this group took: both rules
+            // belong to every create of a dataflow endpoint group, so both are held in
+            // `crate::state`.
             let path = format!("endpointDetails[{index}]");
-            crate::state::check_endpoint_ports(&path, details)
+            crate::state::check_endpoint_addresses(&path, details)
                 .map_err(CreateDataflowEndpointGroupErrorModeled::InvalidParameterException)?;
             crate::state::claim_endpoint_name(&path, member, details, &mut names)
                 .map_err(CreateDataflowEndpointGroupErrorModeled::InvalidParameterException)?;

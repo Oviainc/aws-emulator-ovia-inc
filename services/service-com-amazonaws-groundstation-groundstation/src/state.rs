@@ -2839,10 +2839,26 @@ pub const PORT_MIN: i32 = 1;
 /// See [`PORT_MIN`].
 pub const PORT_MAX: i32 = 65535;
 
-/// Refuse an endpoint any of whose addresses names a port no socket can be addressed by.
+/// The transmission units a dataflow endpoint's MTU can be sized in bytes.
 ///
-/// Walks every port-valued member reachable from one `EndpointDetails`, whichever endpoint
-/// member describes it: a `DataflowEndpoint`'s own `address`, an agent endpoint's
+/// Every `mtu` of this service's endpoint shapes is the "Maximum transmission unit (MTU)
+/// size in bytes of a dataflow endpoint", one documented member of one documented range:
+/// the model states that range as 1400..1500 on `DataflowEndpoint$mtu` and on
+/// `RangedConnectionDetails$mtu` (`smithy_query(query="shape", shape="DataflowEndpoint")`,
+/// `smithy_query(query="shape", shape="RangedConnectionDetails")`), so a value outside it
+/// is not a size the service will frame a stream at. `ConnectionDetails$mtu` — the egress
+/// half of every agent connection pair — carries the same sentence and no `range` of its
+/// own (`smithy_query(query="shape", shape="ConnectionDetails")`), so nothing upstream of
+/// a handler bounds it and the handler holds it to the same bound as its siblings.
+pub const MTU_MIN: i32 = 1400;
+/// See [`MTU_MIN`].
+pub const MTU_MAX: i32 = 1500;
+
+/// Refuse an endpoint any of whose addresses names a port no socket can be addressed by,
+/// or sizes its MTU outside the bytes a dataflow endpoint's MTU can take.
+///
+/// Walks every port- and mtu-valued member reachable from one `EndpointDetails`, whichever
+/// endpoint member describes it: a `DataflowEndpoint`'s own `address`, an agent endpoint's
 /// `egressAddress`/`ingressAddress`, and the connection pair an uplink or downlink agent
 /// endpoint's `dataflowDetails` carries (`smithy_query(query="closure",
 /// operation="CreateDataflowEndpointGroup")`). `path` is how a refusal spells the item, and
@@ -2850,7 +2866,7 @@ pub const PORT_MAX: i32 = 65535;
 ///
 /// Written here rather than in a handler because every create of a dataflow endpoint group
 /// holds its endpoints' addresses to the same rule.
-pub fn check_endpoint_ports(
+pub fn check_endpoint_addresses(
     path: &str,
     details: &EndpointDetails,
 ) -> Result<(), InvalidParameterException> {
@@ -2898,7 +2914,9 @@ pub fn check_endpoint_ports(
     Ok(())
 }
 
-/// Refuse a `ConnectionDetails` whose socket address names an unusable port.
+/// Refuse a `ConnectionDetails` whose socket address names an unusable port, or whose
+/// `mtu` is sized outside [`MTU_MIN`]..=[`MTU_MAX`] — the bound nothing upstream of a
+/// handler applies to this half of a connection pair.
 fn check_connection(
     path: &str,
     connection: &ConnectionDetails,
@@ -2906,7 +2924,8 @@ fn check_connection(
     check_port(
         &format!("{path}.socketAddress.port"),
         connection.socket_address.port,
-    )
+    )?;
+    check_mtu(&format!("{path}.mtu"), connection.mtu)
 }
 
 /// Refuse a `RangedConnectionDetails` whose socket address names an unusable port range:
@@ -2944,6 +2963,21 @@ fn check_port(path: &str, port: i32) -> Result<(), InvalidParameterException> {
             "{path} is {port}; a dataflow endpoint's port must be between {PORT_MIN} and \
              {PORT_MAX}"
         ),
+    ))
+}
+
+/// Refuse an MTU sized outside [`MTU_MIN`]..=[`MTU_MAX`], naming where it was carried. An
+/// absent `mtu` asks for no particular size and is accepted; the member is optional.
+fn check_mtu(path: &str, mtu: Option<i32>) -> Result<(), InvalidParameterException> {
+    let Some(mtu) = mtu else {
+        return Ok(());
+    };
+    if (MTU_MIN..=MTU_MAX).contains(&mtu) {
+        return Ok(());
+    }
+    Err(invalid_parameter(
+        path,
+        format!("Value '{mtu}' at '{path}' is outside the valid range of {MTU_MIN} to {MTU_MAX}."),
     ))
 }
 
