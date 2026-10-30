@@ -123,13 +123,15 @@ impl From<SendCustomVerificationEmailErrorModeled> for SendCustomVerificationEma
 /// How this operation words the refusal of a call by an account that has not
 /// been granted production access.
 ///
-/// The sentence states the condition the modelled error is documented to report,
-/// in the model's own words for this error class — `smithy_query(query="doc",
-/// shape="ProductionAccessNotGrantedException")` is "Indicates that the account
-/// has not been granted production access" — so it is about the ACCOUNT, not
-/// about the address, the template or the configuration set the request named,
-/// and carries no part of the request.
-const NO_PRODUCTION_ACCESS: &str = "The account has not been granted production access.";
+/// The sentence this service answers for that error class is FIXED: it states
+/// the condition `ProductionAccessNotGrantedException` reports (the ACCOUNT has
+/// not been granted production access) and then the one action that lifts it, so
+/// it carries nothing from the request — not the address, the template or the
+/// configuration set it named — and nothing from the store. A constant rather
+/// than a formatter, because there is nothing to interpolate; the second
+/// sentence ends without a full stop, as the service words it.
+const NO_PRODUCTION_ACCESS: &str = "Production access not granted. Please request production \
+                                    access prior to sending custom verification emails";
 
 /// Refuse the message, as `MessageRejected` (HTTP 400): "Indicates that the
 /// action failed, and the message could not be sent."

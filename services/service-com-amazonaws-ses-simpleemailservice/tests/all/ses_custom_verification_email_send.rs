@@ -234,7 +234,11 @@ async fn the_production_access_gate_refuses_every_request_before_anything_it_nam
             error(&body),
             (
                 Some("ProductionAccessNotGranted".to_string()),
-                Some("The account has not been granted production access.".to_string())
+                Some(
+                    "Production access not granted. Please request production access prior to \
+                     sending custom verification emails"
+                        .to_string()
+                )
             ),
             "case {case:?}: expected the account-wide refusal, got {body}"
         );
