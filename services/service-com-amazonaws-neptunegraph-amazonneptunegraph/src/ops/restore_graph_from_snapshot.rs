@@ -5,8 +5,9 @@
 //! the snapshot out of this service's state and persisting the graph it creates.
 //!
 //! A restore mints a NEW graph: the request names it and may override each
-//! configuration member it carries, while every member it omits is restored as the
-//! snapshot captured it.
+//! configuration member it carries. A member it omits takes the default its model
+//! documentation states, when the documentation states one (`replicaCount`); every
+//! other omitted member is restored as the snapshot captured it.
 //!
 //! ## Shape of an operation
 //!
@@ -345,9 +346,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status_reason: None,
             create_time,
             // Each configuration member the request carries overrides the snapshotted
-            // graph's value for it; one it omits is restored as the snapshot captured
-            // it, which is what makes this a restore of that graph rather than a create
-            // with this service's defaults.
+            // graph's value for it. One it omits takes the default the model documents
+            // for it when the model documents one, and is otherwise restored as the
+            // snapshot captured it, which is what makes this a restore of that graph
+            // rather than a create with this service's defaults.
             provisioned_memory: input
                 .provisioned_memory
                 .unwrap_or(captured_configuration.provisioned_memory),
@@ -357,9 +359,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deletion_protection: input
                 .deletion_protection
                 .unwrap_or(captured_configuration.deletion_protection),
+            // `replicaCount` is the one member of this request whose documentation
+            // spells out a default for an omitted value — "Min =0, Max = 2, Default =1"
+            // (`crate::state::DEFAULT_REPLICA_COUNT`) — so an omitted member takes that
+            // default here, exactly as it does on every other graph-minting operation,
+            // rather than the count the snapshot captured.
             replica_count: input
                 .replica_count
-                .unwrap_or(captured_configuration.replica_count),
+                .unwrap_or(crate::state::DEFAULT_REPLICA_COUNT),
             kms_key_identifier,
             // This request models no `vectorSearchConfiguration` member, so the restored
             // graph indexes its vectors exactly as the snapshotted one did.

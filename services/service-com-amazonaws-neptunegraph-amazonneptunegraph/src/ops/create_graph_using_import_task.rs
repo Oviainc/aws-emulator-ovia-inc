@@ -421,7 +421,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // boolean, so an unsupplied member is stored as `false`.
             public_connectivity: input.public_connectivity.unwrap_or(false),
             deletion_protection: input.deletion_protection.unwrap_or(false),
-            replica_count: input.replica_count.unwrap_or(DEFAULT_REPLICA_COUNT),
+            // The one configuration member whose documentation spells out a default
+            // for an omitted value (`crate::state::DEFAULT_REPLICA_COUNT`).
+            replica_count: input
+                .replica_count
+                .unwrap_or(crate::state::DEFAULT_REPLICA_COUNT),
             // The graph's data is encrypted either way: with the key the request named,
             // or with the service-owned key the sentinel names when it named none.
             kms_key_identifier: crate::state::graph_encryption_key(input.kms_key_identifier),
@@ -503,12 +507,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
         CreateGraphUsingImportTaskErrorModeled::AccessDeniedException(denial).into()
     }
 }
-
-/// The number of replicas a graph gets when `replicaCount` is not supplied.
-///
-/// From the member's own documentation: "The number of replicas in other AZs to
-/// provision on the new graph after import. Default = 1, Min = 0, Max = 2."
-const DEFAULT_REPLICA_COUNT: i32 = 1;
 
 /// The `attemptNumber` a newly minted import task reports: it has been run once, and
 /// nothing in this emulator retries a task.

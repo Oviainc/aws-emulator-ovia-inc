@@ -11,8 +11,9 @@
 //!   `sourceSnapshotId`, the snapshot's encryption key, and a `CREATING` status the
 //!   clock settles to `AVAILABLE`.
 //! * Every configuration member the request carries overrides the captured value for
-//!   it, and every member it omits is restored as the snapshot captured it — including
-//!   `vectorSearchConfiguration`, which the request cannot carry at all
+//!   it. A member it omits takes the default its own model documentation states where
+//!   it states one (`replicaCount`), and is otherwise restored as the snapshot captured
+//!   it — including `vectorSearchConfiguration`, which the request cannot carry at all
 //!   (`smithy_query(query="operation",operation="RestoreGraphFromSnapshot")`).
 //! * The capture is of the graph AS IT WAS when the snapshot was taken, so a restore
 //!   reproduces that configuration even after the source graph is reconfigured or
@@ -148,6 +149,23 @@ fn is_graph_id(value: &str) -> bool {
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     })
+}
+
+/// The default the model documents for one member of a restore input, when its own
+/// documentation states one.
+///
+/// `replicaCount` is the only member here whose documentation states a default: "The
+/// number of replicas in other AZs. Min =0, Max = 2, Default =1"
+/// (`smithy_query(query="doc",shape="RestoreGraphFromSnapshotInput",
+/// member="replicaCount")`). The others state none — `provisionedMemory` states "Min =
+/// 16" only — so an omitted one is restored as the snapshot captured it.
+/// `documented_member_defaults.rs` spans this rule over every count a snapshot can
+/// capture and every graph-minting operation.
+fn documented_default(member: &str) -> Option<Value> {
+    match member {
+        "replicaCount" => Some(json!(1)),
+        _ => None,
+    }
 }
 
 /// `POST /snapshots/{snapshotIdentifier}/restore` with `body`.
@@ -365,13 +383,14 @@ async fn a_restore_reports_the_capture_with_the_requests_overrides() {
             "case {case:?}: expected the captured vectorSearchConfiguration {}, got {}",
             source["vectorSearchConfiguration"], restored["vectorSearchConfiguration"]
         );
-        // The rule itself: an overridden member reports the request's value, an
-        // omitted one reports what the snapshot captured.
+        // The rule itself: an overridden member reports the request's value, and an
+        // omitted one reports the default its own model documentation states where it
+        // states one, otherwise what the snapshot captured.
         for member in OVERRIDABLE_MEMBERS {
             let expected = overrides
                 .get(*member)
                 .cloned()
-                .unwrap_or_else(|| source[*member].clone());
+                .unwrap_or_else(|| documented_default(member).unwrap_or_else(|| source[*member].clone()));
             assert_eq!(
                 restored[*member], expected,
                 "case {case:?}: expected {member} {expected}, got {}",
@@ -455,7 +474,7 @@ async fn a_restore_reproduces_the_snapshotted_graph_not_the_current_one() {
         &json!({
             "provisionedMemory": 32,
             "publicConnectivity": false,
-            "replicaCount": 1,
+            "replicaCount": 2,
         }),
     )
     .await;
@@ -501,16 +520,19 @@ async fn a_restore_reproduces_the_snapshotted_graph_not_the_current_one() {
             status, 201,
             "case {case:?}: expected 201, got {status}: {restored}"
         );
-        // (member, the value the snapshot captured)
+        // (member, the value the restore reports for it when the request omits it) —
+        // the captured value, except for the member whose own documentation states a
+        // default, which that default answers for however many replicas the source
+        // graph held.
         let expected: &[(&str, Value)] = &[
             ("provisionedMemory", json!(32)),
             ("publicConnectivity", json!(false)),
-            ("replicaCount", json!(1)),
+            ("replicaCount", documented_default("replicaCount").expect("a documented default")),
         ];
         for (member, value) in expected {
             assert_eq!(
                 restored[*member], *value,
-                "case {case:?}: expected the captured {member} {value}, got {}",
+                "case {case:?}: expected {member} {value}, got {}",
                 restored[*member]
             );
         }

@@ -111,6 +111,18 @@ pub fn graph_encryption_key(requested: Option<String>) -> String {
     requested.unwrap_or_else(|| SERVICE_OWNED_KMS_KEY.to_string())
 }
 
+/// The number of replicas a graph gets when the request that mints it supplies no
+/// `replicaCount`, from the member's own documentation: "The number of replicas in
+/// other AZs. Min =0, Max = 2, Default = 1."
+/// (`smithy_query(query="doc",shape="CreateGraphInput",member="replicaCount")`, and the
+/// same sentence on `CreateGraphUsingImportTaskInput` and
+/// `RestoreGraphFromSnapshotInput`).
+///
+/// Stated once here because it is the documented answer for EVERY operation that mints
+/// a graph: a member whose model documentation spells out a default takes that default
+/// when the request omits it, whatever value the call could otherwise have inherited.
+pub const DEFAULT_REPLICA_COUNT: i32 = 1;
+
 /// The build a graph record reports for the software serving it: "The build number of
 /// the graph software"
 /// (`smithy_query(query="doc",shape="CreateGraphOutput",member="buildNumber")`).
@@ -508,7 +520,10 @@ impl Graph {
 /// reports one (`smithy_query(query="operation",
 /// operation="RestoreGraphFromSnapshot")`), so the value can only come from the
 /// snapshot, and the members it does accept override the captured value rather than
-/// replacing a graph's configuration with defaults.
+/// replacing a graph's configuration with defaults. The exception is a member whose own
+/// documentation states a default for an omitted value — [`DEFAULT_REPLICA_COUNT`] —
+/// which the documented default answers for, so the capture of it is a record of the
+/// snapshotted graph rather than the value a restore reports.
 #[derive(Debug, Clone)]
 pub struct GraphConfiguration {
     pub provisioned_memory: i32,

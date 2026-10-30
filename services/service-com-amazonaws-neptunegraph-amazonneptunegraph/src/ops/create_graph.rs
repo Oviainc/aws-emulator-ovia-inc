@@ -308,7 +308,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // boolean, so an unsupplied member is stored as `false`.
             public_connectivity: input.public_connectivity.unwrap_or(false),
             deletion_protection: input.deletion_protection.unwrap_or(false),
-            replica_count: input.replica_count.unwrap_or(DEFAULT_REPLICA_COUNT),
+            // The one configuration member whose documentation spells out a default
+            // for an omitted value (`crate::state::DEFAULT_REPLICA_COUNT`).
+            replica_count: input
+                .replica_count
+                .unwrap_or(crate::state::DEFAULT_REPLICA_COUNT),
             // The graph's data is encrypted either way: with the key the request named,
             // or with the service-owned key the sentinel names when it named none.
             kms_key_identifier: crate::state::graph_encryption_key(input.kms_key_identifier),
@@ -334,12 +338,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(output)
     }
 }
-
-/// The number of replicas a graph gets when `replicaCount` is not supplied.
-///
-/// From the member's own documentation: "The number of replicas in other AZs. Min =0,
-/// Max = 2, Default = 1."
-const DEFAULT_REPLICA_COUNT: i32 = 1;
 
 /// The modelled `GraphName` pattern, exactly as the model spells it
 /// (`smithy_query(query="shape",shape="GraphName")`): the expression a refusal reports,

@@ -15,6 +15,8 @@
 mod accumulated_constraint_refusals;
 #[path = "all/create_graph_using_import_task.rs"]
 mod create_graph_using_import_task;
+#[path = "all/documented_member_defaults.rs"]
+mod documented_member_defaults;
 #[path = "all/duplicate_name_conflicts.rs"]
 mod duplicate_name_conflicts;
 #[path = "all/duplicate_private_graph_endpoint_conflict.rs"]

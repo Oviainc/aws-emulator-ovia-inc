@@ -46,6 +46,13 @@ const REGION: &str = "us-east-1";
 const KMS_KEY_ARN: &str =
     "arn:aws:kms:us-east-1:000000000000:key/12345678-1234-1234-1234-123456789012";
 
+/// The replica count a restored graph reports when the restore request carries none,
+/// from the member's own documentation: "The number of replicas in other AZs. Min =0,
+/// Max = 2, Default =1"
+/// (`smithy_query(query="doc",shape="RestoreGraphFromSnapshotInput",
+/// member="replicaCount")`).
+const DOCUMENTED_DEFAULT_REPLICA_COUNT: i64 = 1;
+
 /// One node of a seeded graph: its id, its labels, and the property keys set on it.
 type SeedNode<'a> = (&'a str, &'a [&'a str], &'a [&'a str]);
 
@@ -636,7 +643,6 @@ async fn both_final_snapshot_paths_capture_the_graph_the_same_way() {
             for member in [
                 "provisionedMemory",
                 "publicConnectivity",
-                "replicaCount",
                 "deletionProtection",
                 "kmsKeyIdentifier",
                 "vectorSearchConfiguration",
@@ -648,6 +654,20 @@ async fn both_final_snapshot_paths_capture_the_graph_the_same_way() {
                     restored[member], source[member]
                 );
             }
+            // `replicaCount` is the one member of a restore input whose own model
+            // documentation states a default for an omitted value ("Min =0, Max = 2,
+            // Default =1"), and this restore omits it, so the documented default
+            // answers for it rather than the count the snapshot captured
+            // (`documented_member_defaults.rs` spans that rule).
+            assert_eq!(
+                restored["replicaCount"],
+                json!(DOCUMENTED_DEFAULT_REPLICA_COUNT),
+                "case {case:?}: expected the graph restored from {operation}'s final \
+                 snapshot to report the documented default \
+                 {DOCUMENTED_DEFAULT_REPLICA_COUNT} replicas for the member the restore \
+                 omitted, got {}",
+                restored["replicaCount"]
+            );
             assert_eq!(
                 restored["sourceSnapshotId"],
                 json!(snapshot_id),
