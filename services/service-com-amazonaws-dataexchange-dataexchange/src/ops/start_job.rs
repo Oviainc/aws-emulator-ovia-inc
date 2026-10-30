@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // terminal state, both conflict with a start.
         if !job.is_waiting() {
             return Err(StartJobErrorModeled::ConflictException(
-                crate::state::job_state_conflict(&input.job_id, &job.state, STARTED_VERB),
+                crate::state::job_state_conflict(&input.job_id, START_VERB),
             )
             .into());
         }
@@ -188,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// What this operation asks of the job, for the wording of the 409 a job in a state
 /// that does not admit it is refused with.
-const STARTED_VERB: &str = "started";
+const START_VERB: &str = "start";
 
 /// The `Code` of the job error an execution reports when the content it had to work
 /// on is not there: one of the model's `Code` values, enumerated by

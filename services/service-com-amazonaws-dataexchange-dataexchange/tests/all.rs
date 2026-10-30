@@ -19,6 +19,8 @@ mod data_sets;
 mod event_actions;
 #[path = "all/job_lifecycle.rs"]
 mod job_lifecycle;
+#[path = "all/job_state_conflict_message.rs"]
+mod job_state_conflict_message;
 #[path = "all/jobs.rs"]
 mod jobs;
 #[path = "all/not_found_message.rs"]

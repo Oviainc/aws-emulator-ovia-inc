@@ -145,21 +145,21 @@ fn assert_unreadable_source(job_type: &str, errors: &Value) {
     }
 }
 
-async fn start_job(router: &MultiServiceRouter, job_id: &str) -> Answer {
+pub(crate) async fn start_job(router: &MultiServiceRouter, job_id: &str) -> Answer {
     call(router, "PATCH", &format!("/v1/jobs/{job_id}"), None).await
 }
 
-async fn cancel_job(router: &MultiServiceRouter, job_id: &str) -> Answer {
+pub(crate) async fn cancel_job(router: &MultiServiceRouter, job_id: &str) -> Answer {
     call(router, "DELETE", &format!("/v1/jobs/{job_id}"), None).await
 }
 
-async fn get_job(router: &MultiServiceRouter, job_id: &str) -> Answer {
+pub(crate) async fn get_job(router: &MultiServiceRouter, job_id: &str) -> Answer {
     call(router, "GET", &format!("/v1/jobs/{job_id}"), None).await
 }
 
 /// Create one job of `case`'s `Type` against the data set and revision the caller
 /// prepared, and hand back its `Id` and `CreatedAt`.
-async fn job_of_type(
+pub(crate) async fn job_of_type(
     router: &MultiServiceRouter,
     job_type: &str,
     member: &str,
@@ -186,7 +186,7 @@ async fn job_of_type(
 /// wall-clock time. `polling_a_started_job_reaches_a_terminal_state` is the test that
 /// does spend it, and shows a client reaches the same state with nobody writing
 /// state.
-fn settle_past_the_execution_span(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn settle_past_the_execution_span(engine: &Arc<engine::InMemoryEngine>) {
     let state = dataexchange::state::service_state(&**engine).expect("the dataexchange store");
     let past = dataexchange::state::later(
         dataexchange::state::now(),

@@ -67,7 +67,7 @@ use super::types::*;
 
 /// What this operation asks of the job, for the wording of the 409 a job in a state
 /// that does not admit it is refused with.
-const CANCELLED_VERB: &str = "cancelled";
+const CANCEL_VERB: &str = "cancel";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request.
         if !job.is_waiting() {
             return Err(CancelJobErrorModeled::ConflictException(
-                crate::state::job_state_conflict(&input.job_id, &job.state, CANCELLED_VERB),
+                crate::state::job_state_conflict(&input.job_id, CANCEL_VERB),
             )
             .into());
         }

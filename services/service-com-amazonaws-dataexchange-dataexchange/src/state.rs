@@ -522,16 +522,19 @@ pub fn revision_conflict(revision_id: &str, message: impl Into<String>) -> Confl
 
 /// The modelled 409 for a job operation the job's current `State` does not admit.
 ///
-/// `state` is the `State` the job is actually in, so the caller can tell a job that
-/// has already run from one somebody else cancelled; `verb` is what was asked of it.
-/// Both `CancelJob` and `StartJob` act on a job that has not started yet — the
-/// model's `CancelJob` documentation says "Jobs can be cancelled only when they are
-/// in the WAITING state" — so this is the refusal for either in any other state.
-pub fn job_state_conflict(job_id: &str, state: &str, verb: &str) -> ConflictException {
+/// The sentence names only what was asked of the job (`verb`, the operation's own
+/// verb — "cancel", "start") and the `State` a job has to be in for that to be
+/// admitted: both `CancelJob` and `StartJob` act on a job that has not started yet,
+/// and the model's `CancelJob` documentation says "Jobs can be cancelled only when
+/// they are in the WAITING state". The identity of the job travels in the
+/// exception's own `ResourceId` and `ResourceType` members, as it does in every
+/// other refusal this service composes, so neither the job's id nor the state it is
+/// actually in appears in the text.
+pub fn job_state_conflict(job_id: &str, verb: &str) -> ConflictException {
     ConflictException {
         message: format!(
-            "The job {job_id} is in state {state} and can't be {verb}. \
-             Jobs can be {verb} only when they are in the {JOB_STATE_WAITING} state."
+            "Cannot {verb} the requested Job. \
+             To {verb} a Job, it must be in the {JOB_STATE_WAITING} state."
         ),
         resource_id: Some(job_id.to_string()),
         resource_type: Some(RESOURCE_TYPE_JOB.to_string()),
