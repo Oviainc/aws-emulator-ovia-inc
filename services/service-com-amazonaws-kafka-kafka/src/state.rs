@@ -69,7 +69,7 @@
 //! A cluster's configuration also changes after creation: an update operation
 //! (`UpdateConnectivity`, `UpdateStorage`, `UpdateBrokerStorage`,
 //! `UpdateClusterKafkaVersion`, `UpdateClusterConfiguration`,
-//! `UpdateSecurity`) records a
+//! `UpdateSecurity`, `UpdateBrokerCount`) records a
 //! [`PendingUpdate`] on the cluster, and [`Cluster::settle`] folds it into the
 //! record once the clock owes its completion — so one place decides what every
 //! reader then reports. The operation itself is kept in the cluster-operation
@@ -153,7 +153,8 @@ use std::time::{Duration, SystemTime};
 use regex::RegexSet;
 
 use crate::ops::types::{
-    BadRequestException, BrokerEBSVolumeInfo, BrokerNodeGroupInfo, BrokerNodeInfo,
+    BadRequestException, BrokerCountUpdateInfo, BrokerEBSVolumeInfo, BrokerNodeGroupInfo,
+    BrokerNodeInfo,
     BrokerSoftwareInfo,
     ChannelLoggingInfo, ClientAuthentication, ClientVpcConnection, ClusterInfo, ClusterOperationInfo,
     ClusterOperationV2,
@@ -211,6 +212,9 @@ pub const MAX_OPERATIONS_PER_CLUSTER: usize = 64;
 
 /// The `OperationType` an `UpdateBrokerType` call records, in the same form.
 pub const OPERATION_TYPE_UPDATE_BROKER_TYPE: &str = "UPDATE_BROKER_TYPE";
+
+/// The `OperationType` an `UpdateBrokerCount` call records, in the same form.
+pub const OPERATION_TYPE_UPDATE_BROKER_COUNT: &str = "UPDATE_BROKER_COUNT";
 
 /// The `OperationType` an `UpdateStorage` call records, which is the API name in
 /// the SCREAMING_SNAKE_CASE form MSK's cluster-operation types take.
@@ -1123,6 +1127,12 @@ pub struct Cluster {
     pub tags: BTreeMap<String, String>,
     pub zookeeper_connect_string: String,
     pub zookeeper_connect_string_tls: String,
+    /// The opaque cluster id plus cell every endpoint of this cluster sits
+    /// under, as [`cluster_identity`] derived it from the cluster's ordinal:
+    /// `b-1.<name>.<dns suffix>.kafka.<region>.amazonaws.com`. STORED, because
+    /// a broker node added to the cluster after its creation has to be given an
+    /// endpoint under the same suffix as the nodes already there.
+    pub dns_suffix: String,
     pub brokers: Vec<BrokerNode>,
     /// The ARNs of this cluster's recorded operations, oldest first. It is the
     /// cluster's own index into the operation registry, which is what keeps the
@@ -1255,6 +1265,10 @@ pub enum ClusterChange {
     /// `UpdateBrokerType`: the EC2 instance type every broker of the cluster
     /// runs on.
     BrokerType { instance_type: String },
+    /// `UpdateBrokerCount`: how many broker nodes the cluster is to hold once
+    /// the operation completes. The request always names one, so there is
+    /// nothing optional about this change.
+    BrokerCount { number_of_broker_nodes: i32 },
     /// `UpdateClusterKafkaVersion`: the Apache Kafka version the brokers run,
     /// and the custom configuration to apply on that new version when the
     /// request named one — `None` leaves the cluster's configuration as it is.
@@ -3546,6 +3560,39 @@ impl ComAmazonawsKafkaKafkaState {
         )
     }
 
+    /// Start a broker-count update: the cluster holds
+    /// `target_number_of_broker_nodes` broker nodes once the clock owes the
+    /// operation its completion.
+    pub fn start_broker_count_update(
+        &mut self,
+        region: &str,
+        arn: &str,
+        now: SystemTime,
+        target_number_of_broker_nodes: i32,
+    ) -> Option<String> {
+        // Bounded where the request value ENTERS the registry, so neither the
+        // operation record it files nor the pending change it stores can carry a
+        // count the model's range does not admit.
+        let target = admissible_broker_count(target_number_of_broker_nodes);
+        self.start_cluster_update(
+            region,
+            arn,
+            now,
+            OPERATION_TYPE_UPDATE_BROKER_COUNT,
+            |cluster| {
+                let source_cluster_info = cluster.broker_count_cluster_info();
+                let target_cluster_info = cluster.broker_count_cluster_info_after(target);
+                (
+                    source_cluster_info,
+                    target_cluster_info,
+                    ClusterChange::BrokerCount {
+                        number_of_broker_nodes: target,
+                    },
+                )
+            },
+        )
+    }
+
     /// Start an Apache Kafka version update: the brokers move to
     /// `kafka_version`, together with the custom configuration the request
     /// named for that version, once the clock owes the operation its
@@ -5160,12 +5207,10 @@ impl Cluster {
         let name = input.cluster_name.as_str();
         let ClusterIdentity { arn, dns_suffix } = cluster_identity(region, name, suffix);
 
-        // CLAMPED, not trusted: the model's own 1..15 range already refuses an
+        // BOUNDED, not trusted: the model's own 1..15 range already refuses an
         // out-of-range request at the boundary, but this constructor must not let
         // any caller size a heap allocation from an unchecked value.
-        let broker_count = input
-            .number_of_broker_nodes
-            .clamp(1, MAX_BROKER_NODES_PER_CLUSTER);
+        let broker_count = admissible_broker_count(input.number_of_broker_nodes);
         let mut brokers = Vec::with_capacity(usize::try_from(broker_count).unwrap_or(0));
         for id in 1..=broker_count {
             brokers.push(BrokerNode::placed(
@@ -5218,6 +5263,7 @@ impl Cluster {
                 zookeeper_hosts.iter().map(String::as_str),
                 PORT_ZOOKEEPER_TLS,
             ),
+            dns_suffix,
             brokers,
             operation_arns: Vec::new(),
             // A provisioned cluster comes up with ZooKeeper access on; only
@@ -5314,6 +5360,7 @@ impl Cluster {
             tags: tags.unwrap_or_default().into_iter().collect(),
             zookeeper_connect_string: String::new(),
             zookeeper_connect_string_tls: String::new(),
+            dns_suffix,
             brokers: Vec::new(),
             operation_arns: Vec::new(),
             // There is no ZooKeeper ensemble to reach.
@@ -5452,7 +5499,12 @@ impl Cluster {
             // record, so the change is dropped rather than folded into a
             // cluster that has moved on.
             Some(update) if now >= update.due && self.state == CLUSTER_STATE_UPDATING => {
-                self.apply_change(update.change);
+                // The operation finished when the clock owed it, not when this
+                // caller happened to look, so that instant is what a change
+                // which records a time of its own (a broker node joining the
+                // cluster) carries.
+                let applied_at = update.due;
+                self.apply_change(update.change, applied_at);
                 // "When this update operation is successful, it generates a new
                 // cluster version" (`CurrentVersion` on every update request),
                 // so the version token follows the new revision.
@@ -5545,6 +5597,90 @@ impl Cluster {
     /// operation describes what it touches rather than the whole cluster.
     pub fn broker_type_cluster_info(&self) -> MutableClusterInfo {
         broker_type_cluster_info(&self.broker_node_group_info.instance_type)
+    }
+
+    /// The cluster's broker count as the `MutableClusterInfo` a cluster
+    /// operation reports: the one attribute an `UpdateBrokerCount` call
+    /// changes, since an operation describes what it touches rather than the
+    /// whole cluster — the same rule [`Self::storage_cluster_info`] follows.
+    pub fn broker_count_cluster_info(&self) -> MutableClusterInfo {
+        MutableClusterInfo {
+            number_of_broker_nodes: Some(self.number_of_broker_nodes),
+            ..MutableClusterInfo::default()
+        }
+    }
+
+    /// The same attribute as the update leaves it, plus the ids of the broker
+    /// nodes the operation has to create or delete to get there, which is what
+    /// `MutableClusterInfo$BrokerCountUpdateInfo` reports. Both lists are
+    /// DERIVED from the stored nodes and the target through
+    /// [`Self::broker_count_change`], the same derivation
+    /// [`Self::apply_broker_count_change`] then applies, so the ids the
+    /// operation reports are the nodes the cluster really gains or loses — and
+    /// the count reported is the one that will land, since both go through
+    /// [`admissible_broker_count`].
+    pub fn broker_count_cluster_info_after(&self, target: i32) -> MutableClusterInfo {
+        let target = admissible_broker_count(target);
+        let (created_broker_ids, deleted_broker_ids) = self.broker_count_change(target);
+        MutableClusterInfo {
+            number_of_broker_nodes: Some(target),
+            broker_count_update_info: Some(BrokerCountUpdateInfo {
+                created_broker_ids: Some(created_broker_ids),
+                deleted_broker_ids: Some(deleted_broker_ids),
+            }),
+            ..MutableClusterInfo::default()
+        }
+    }
+
+    /// Which broker ids a move to `target` creates and which it deletes:
+    /// growing the cluster adds the ids past the ones it holds, shrinking it
+    /// takes the highest-numbered ones away, and a target the cluster is
+    /// already at does neither. Both `BrokerCountUpdateInfo` members target
+    /// `__listOf__double`, so a 1-based broker id travels as the number it is.
+    ///
+    /// `target` is bounded by [`admissible_broker_count`] before it reaches
+    /// here, so each list holds at most [`MAX_BROKER_NODES_PER_CLUSTER`]
+    /// entries and neither bound can overflow.
+    fn broker_count_change(&self, target: i32) -> (Vec<f64>, Vec<f64>) {
+        let target = admissible_broker_count(target);
+        let current = admissible_broker_count(self.number_of_broker_nodes);
+        (
+            (current + 1..=target).map(f64::from).collect(),
+            (target + 1..=current).map(f64::from).collect(),
+        )
+    }
+
+    /// Resize the broker list to `target` nodes, each node added carrying
+    /// `joined_at` as the instant it joined the cluster.
+    ///
+    /// The nodes themselves are the record, so every reader derived from them —
+    /// the bootstrap strings, the node listing and the reported broker count —
+    /// follows from this one write. A node added later is laid out by the SAME
+    /// [`BrokerNode::placed`] the create lays its brokers out with, so it
+    /// continues the cluster's own rotation through its client subnets and sits
+    /// under the cluster's own DNS suffix; shrinking the cluster removes the
+    /// highest-numbered nodes, the ones
+    /// [`Self::broker_count_change`] reports as deleted.
+    fn apply_broker_count_change(&mut self, target: i32, joined_at: SystemTime) {
+        // BOUNDED for the same reason the create bounds its own count: the
+        // target sizes an allocation, so no path through this module can size
+        // it from a value the model's range did not admit.
+        let target = admissible_broker_count(target);
+        let highest = self.brokers.iter().map(|broker| broker.id).max().unwrap_or(0);
+        let mut added = Vec::new();
+        for id in highest + 1..=target {
+            added.push(BrokerNode::placed(
+                &self.region,
+                &self.name,
+                &self.dns_suffix,
+                id,
+                &self.broker_node_group_info.client_subnets,
+                joined_at,
+            ));
+        }
+        self.brokers.extend(added);
+        self.brokers.retain(|broker| broker.id <= target);
+        self.number_of_broker_nodes = target;
     }
 
     /// The Apache Kafka version the brokers run and the configuration revision
@@ -5691,8 +5827,10 @@ impl Cluster {
     }
 
     /// Fold a completed operation's change into the stored record, so every
-    /// reader derives the cluster's new behaviour from one place.
-    fn apply_change(&mut self, change: ClusterChange) {
+    /// reader derives the cluster's new behaviour from one place. `applied_at`
+    /// is the instant the operation was due, which a change that records a time
+    /// of its own uses.
+    fn apply_change(&mut self, change: ClusterChange, applied_at: SystemTime) {
         match change {
             ClusterChange::Connectivity {
                 connectivity_info,
@@ -5714,6 +5852,14 @@ impl Cluster {
                 // named, which is what `BrokerNodeGroupInfo$InstanceType` is: the
                 // type of the group's nodes, not of one node.
                 self.broker_node_group_info.instance_type = instance_type;
+            }
+            ClusterChange::BrokerCount {
+                number_of_broker_nodes,
+            } => {
+                // The brokers ARE the record: the count the cluster reports and
+                // the nodes its endpoints and its node listing are built from
+                // move together.
+                self.apply_broker_count_change(number_of_broker_nodes, applied_at);
             }
             ClusterChange::KafkaVersion {
                 kafka_version,
@@ -6057,6 +6203,21 @@ fn join_endpoints<'a>(hosts: impl Iterator<Item = &'a str>, port: u16) -> String
         .map(|host| format!("{host}:{port}"))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// How many broker nodes a cluster may be left holding: `target` bounded to the
+/// range the model admits for a broker count
+/// (`CreateClusterRequest$NumberOfBrokerNodes` and
+/// `UpdateBrokerCountRequest$TargetNumberOfBrokerNodes` are both
+/// `__integerMin1Max15`), i.e. 1..=[`MAX_BROKER_NODES_PER_CLUSTER`].
+///
+/// Every path that sizes a broker list, or derives the ids of the nodes a change
+/// adds or removes, goes through this ONE bound: a request value is what those
+/// paths are driven by, and the handlers that refuse an out-of-range value are
+/// what make such a value a bad request rather than an allocation. Bounding it
+/// first is also what keeps the id arithmetic those paths do inside `i32`.
+fn admissible_broker_count(target: i32) -> i32 {
+    target.clamp(1, MAX_BROKER_NODES_PER_CLUSTER)
 }
 
 /// What one cluster ordinal seeds: the cluster's ARN, and the DNS suffix its

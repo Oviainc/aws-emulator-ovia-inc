@@ -220,6 +220,15 @@ fn cluster_calls() -> Vec<ClusterCall> {
             None,
         ),
         ClusterCall::control(
+            "UpdateBrokerCount",
+            "PUT",
+            "/nodes/count",
+            Some(json!({
+                "currentVersion": "K3AEGXETSR30VB",
+                "targetNumberOfBrokerNodes": 4,
+            })),
+        ),
+        ClusterCall::control(
             "UpdateBrokerStorage",
             "PUT",
             "/nodes/storage",
