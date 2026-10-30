@@ -14,9 +14,9 @@
 //! the source — into the `AWS/Lambda` namespace, each series dimensioned on the mapping's
 //! own `UUID` and carrying the unit `Count`, with a 0-valued poll count for a minute in
 //! which the mapping polled nothing. A mapping whose `MetricsConfig` does not select
-//! `EventCount` — one carrying none, one whose `Metrics` list is empty, and one that selects
-//! only the other metrics the model's enum declares — publishes none of them, however much
-//! its poller is doing.
+//! `EventCount` — one carrying none and one whose `Metrics` list is empty — publishes none
+//! of them, however much its poller is doing, including when it is the TWIN of an opted-in
+//! mapping doing exactly the same filtering work beside it.
 //!
 //! Two invariants hold in every row, whatever the poller came to, and are asserted as such
 //! rather than against one run's numbers: an event is deleted from the source only because
@@ -486,11 +486,12 @@ struct SelectionRow {
     published: bool,
 }
 
-/// The catalog of `MetricsConfig` values, over the `EventSourceMappingMetric` enum the model
-/// declares (`EventCount`, `ErrorCount`, `KafkaMetrics` — `smithy_query(query="shape",
-/// shape="EventSourceMappingMetric")`): no configuration at all, an empty selection, each
-/// of the two metrics that are NOT the event counts, the event counts alone, and the event
-/// counts beside another metric.
+/// The catalog of `MetricsConfig` values an Amazon SQS mapping can be created with, over the
+/// `EventSourceMappingMetric` enum the model declares (`EventCount`, `ErrorCount`,
+/// `KafkaMetrics` — `smithy_query(query="shape", shape="EventSourceMappingMetric")`): no
+/// configuration at all, an empty selection, and the one value of the enum that is not scoped
+/// to the Kafka event sources. The other two are refused on a queue source altogether, which
+/// is the table in `event_source_mapping_metrics_scope`.
 fn selection_rows() -> Vec<SelectionRow> {
     vec![
         SelectionRow {
@@ -504,23 +505,8 @@ fn selection_rows() -> Vec<SelectionRow> {
             published: false,
         },
         SelectionRow {
-            case: "ErrorCount alone",
-            metrics_config: json!({ "Metrics": ["ErrorCount"] }),
-            published: false,
-        },
-        SelectionRow {
-            case: "KafkaMetrics alone",
-            metrics_config: json!({ "Metrics": ["KafkaMetrics"] }),
-            published: false,
-        },
-        SelectionRow {
             case: "EventCount alone",
             metrics_config: json!({ "Metrics": ["EventCount"] }),
-            published: true,
-        },
-        SelectionRow {
-            case: "EventCount beside another metric",
-            metrics_config: json!({ "Metrics": ["ErrorCount", "EventCount"] }),
             published: true,
         },
     ]
@@ -614,6 +600,158 @@ async fn an_idle_mapping_publishes_a_zero_valued_poll_count() {
         holding, 0,
         "case {case:?}: nothing was sent to the queue, so it must hold nothing, got {holding}"
     );
+}
+
+/// One row of the twin table: the filter the two mappings share, and what is sent to each of
+/// their queues.
+struct TwinRow {
+    case: &'static str,
+    /// The `Pattern` of each `FilterCriteria` filter both mappings carry.
+    patterns: Vec<&'static str>,
+    /// Each message body sent to BOTH queues, beside whether the row's patterns admit it.
+    bodies: Vec<(&'static str, bool)>,
+}
+
+/// The catalog of twinned work: a JSON-body filter admitting some of the messages, one
+/// admitting none of them, and a plain-text filter admitting all but one — so the contrast is
+/// asserted over a filter that rejects some, all and one of what arrives.
+fn twin_rows() -> Vec<TwinRow> {
+    vec![
+        TwinRow {
+            case: "a json body filter admitting one of four",
+            patterns: vec![r#"{"body":{"kind":["keep"]}}"#],
+            bodies: vec![
+                (r#"{"kind":"keep"}"#, true),
+                (r#"{"kind":"drop"}"#, false),
+                (r#"{"kind":"other"}"#, false),
+                ("not json at all", false),
+            ],
+        },
+        TwinRow {
+            case: "a json body filter admitting none of three",
+            patterns: vec![r#"{"body":{"kind":["keep"]}}"#],
+            bodies: vec![
+                (r#"{"kind":"drop"}"#, false),
+                (r#"{"kind":"other"}"#, false),
+                (r#"{"kind":"later"}"#, false),
+            ],
+        },
+        TwinRow {
+            case: "a plain-text filter rejecting one of two",
+            patterns: vec![r#"{"body":["keep"]}"#],
+            bodies: vec![("keep", true), ("drop", false)],
+        },
+    ]
+}
+
+/// RULE: the per-mapping event counts are published for the mapping whose `MetricsConfig`
+/// selects `EventCount` and for no other mapping — two mappings filtering the same messages
+/// with the same criteria, one opted in and one not, do the same polling, filtering and
+/// deleting, and only the opted-in one has a series at CloudWatch.
+#[tokio::test]
+async fn only_the_opted_in_twin_of_two_filtering_mappings_publishes_its_event_counts() {
+    let router = emulator();
+    for (index, row) in twin_rows().iter().enumerate() {
+        let case = row.case;
+        let filters: Vec<Value> = row
+            .patterns
+            .iter()
+            .map(|pattern| json!({ "Pattern": pattern }))
+            .collect();
+        // The two mappings differ in exactly ONE member: whether the `MetricsConfig` selects
+        // the event counts. Everything else — the filter, the batch size, the function, the
+        // messages — is the same, which is what makes the contrast the selection's own.
+        let shared = json!({
+            "BatchSize": 10,
+            "FilterCriteria": { "Filters": filters },
+        });
+        let mut opted_in = shared.clone();
+        opted_in["MetricsConfig"] = json!({ "Metrics": ["EventCount"] });
+        let (metered_uuid, metered_url) =
+            given_mapping(&router, case, &format!("twin-metered-{index}"), &opted_in).await;
+        let (silent_uuid, silent_url) =
+            given_mapping(&router, case, &format!("twin-silent-{index}"), &shared).await;
+
+        for (body, _) in &row.bodies {
+            send_message(&router, case, &metered_url, body).await;
+            send_message(&router, case, &silent_url, body).await;
+        }
+
+        let sent = u32::try_from(row.bodies.len()).unwrap_or(u32::MAX);
+        let admitted =
+            u32::try_from(row.bodies.iter().filter(|(_, keep)| *keep).count()).unwrap_or(u32::MAX);
+        let rejected = sent - admitted;
+
+        // The opted-in mapping reports what its pass did with the events it polled.
+        let polled = wait_for_sum(
+            &router,
+            case,
+            POLLED_EVENT_COUNT_METRIC,
+            &metered_uuid,
+            f64::from(sent),
+        )
+        .await;
+        assert!(
+            polled >= f64::from(sent),
+            "case {case:?}: every one of the {sent} messages sent to the opted-in mapping's \
+             queue must be counted as polled, got a {POLLED_EVENT_COUNT_METRIC} of {polled}"
+        );
+        let filtered_out = wait_for_sum(
+            &router,
+            case,
+            FILTERED_OUT_EVENT_COUNT_METRIC,
+            &metered_uuid,
+            f64::from(rejected),
+        )
+        .await;
+        assert_eq!(
+            filtered_out,
+            f64::from(rejected),
+            "case {case:?}: the filter rejects {rejected} of the {sent} messages, got a \
+             {FILTERED_OUT_EVENT_COUNT_METRIC} of {filtered_out}"
+        );
+
+        // Both mappings did the same work: a rejected message leaves its queue, so each
+        // queue is left holding only what the filter admitted.
+        for (label, url) in [("opted-in", &metered_url), ("opt-out twin", &silent_url)] {
+            let holding = wait_for_held(&router, case, url, admitted).await;
+            assert_eq!(
+                holding, admitted,
+                "case {case:?}: the {label} mapping must leave its queue holding only the \
+                 {admitted} messages its filter admits, got {holding}"
+            );
+        }
+
+        // And the twin, which did that work with no selection, has no series at all.
+        tokio::time::sleep(SEVERAL_PASSES).await;
+        for metric in EVENT_COUNT_FAMILY {
+            let points = datapoints(&router, case, metric, &silent_uuid).await;
+            assert!(
+                points.is_empty(),
+                "case {case:?}: the opt-out twin selects no metric, so it must publish no \
+                 {metric}, got {} datapoint(s)",
+                points.len()
+            );
+        }
+        // The opted-in mapping's own series count its OWN queue's events and none of its
+        // twin's: the twin rejected the same messages on the same filter, so a series fed by
+        // both would report twice the rejections.
+        let sums = family_sums(&router, case, &metered_uuid).await;
+        assert_eq!(
+            sums[1],
+            f64::from(rejected),
+            "case {case:?}: the opted-in mapping's filtered-out count must stay at the \
+             {rejected} events its own filter rejected, got {sums:?}"
+        );
+        // An event is deleted only because the filter rejected it or an invocation accepted
+        // it, which holds whatever the invocation came to.
+        assert_eq!(
+            sums[3],
+            sums[1] + sums[2],
+            "case {case:?}: an event is deleted only because the filter rejected it or an \
+             invocation accepted it, got {sums:?}"
+        );
+    }
 }
 
 /// RULE: emptying a mapping's `MetricsConfig` stops the family — the mapping stays

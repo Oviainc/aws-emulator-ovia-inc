@@ -3829,6 +3829,41 @@ pub fn is_stream_source(vendor: Option<&str>, self_managed: bool) -> bool {
     self_managed || is_shard_source(vendor) || vendor == Some(EVENT_SOURCE_VENDOR_KAFKA)
 }
 
+/// Whether the event source is one of the two KAFKA ones the model names together wherever
+/// it scopes a member to them — "(Amazon MSK and self-managed Apache Kafka)": an Amazon MSK
+/// cluster or VPC connection named by `EventSourceArn`, or the `SelfManagedEventSource` of a
+/// self-managed Apache Kafka cluster.
+///
+/// `self_managed` says whether the request named that cluster instead of an event source
+/// ARN, which is a Kafka source with no ARN to read a vendor from.
+#[must_use]
+pub fn is_kafka_source(vendor: Option<&str>, self_managed: bool) -> bool {
+    self_managed || vendor == Some(EVENT_SOURCE_VENDOR_KAFKA)
+}
+
+/// What a request whose `MetricsConfig` cannot be satisfied is refused with, and `None` for
+/// a configuration the mapping's event source supports.
+///
+/// `EventSourceMappingMetricsConfig$Metrics` is "the metrics you want your event source
+/// mapping to produce", which is a SET of the values the enum declares drawn from the ones
+/// the source the mapping polls supports ([`metrics::supported_metrics`]): two of the three
+/// are documented for the Kafka event sources alone, so a metric the source has no consumers
+/// or processing errors to report cannot be produced for it at all, and a value named twice
+/// asks for one metric twice. Each is refused with the modelled 400 the operations wrap this
+/// message in — which names the values that source DOES expect (see
+/// [`metrics::unsupported_metrics_refusal`]) — and nothing is stored or changed: a mapping
+/// advertising a metric vocabulary its source cannot apply would report a configuration no
+/// poller could honour.
+#[must_use]
+pub fn metrics_config_refusal(
+    metrics_config: Option<&crate::ops::types::EventSourceMappingMetricsConfig>,
+    vendor: Option<&str>,
+    self_managed: bool,
+) -> Option<String> {
+    let metrics = metrics_config.and_then(|config| config.metrics.as_deref())?;
+    metrics::unsupported_metrics_refusal(metrics, is_kafka_source(vendor, self_managed))
+}
+
 /// Whether the event source supports reading from a stated instant, from
 /// `StartingPosition`'s own documentation: "AT_TIMESTAMP is supported only for Amazon
 /// Kinesis streams, Amazon DocumentDB, Amazon MSK, and self-managed Apache Kafka."

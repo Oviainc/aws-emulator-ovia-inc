@@ -16,6 +16,13 @@
 //! with the modelled `InvalidParameterValueException` rather than stored as a mapping of
 //! a source nothing could poll.
 //!
+//! What the mapping may be asked to MEASURE is held to that same source:
+//! `EventSourceMappingMetricsConfig$Metrics` is "the metrics you want your event source
+//! mapping to produce", which is a SET of the values its enum declares drawn from the ones
+//! that source supports — two of the three are documented for the Kafka event sources alone —
+//! so anything else is refused with that same modelled 400, naming the values the source does
+//! expect, and no mapping is created (see [`crate::state::metrics_config_refusal`]).
+//!
 //! A mapping on a QUEUE is also held to the queue's own configuration: a queue hands a
 //! message to one consumer for the length of its `VisibilityTimeout` and makes it visible
 //! again once that lapses, so a queue whose timeout is below the invoked function's
@@ -445,6 +452,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stream_source = crate::state::is_stream_source(vendor, self_managed);
 
         let now = ::std::time::SystemTime::now();
+
+        // "The metrics you want your event source mapping to produce" is a SET of the
+        // values the enum declares drawn from the ones the source this mapping would poll
+        // supports: two of the three are documented for the Kafka event sources alone, and a
+        // value named twice is no selection either (see
+        // [`crate::state::metrics_config_refusal`]).
+        if let Some(message) = crate::state::metrics_config_refusal(
+            input.metrics_config.as_ref(),
+            vendor,
+            self_managed,
+        ) {
+            return Err(invalid_parameter(message));
+        }
 
         // `StartingPosition` is "Required for Amazon Kinesis and Amazon DynamoDB Stream
         // event sources".

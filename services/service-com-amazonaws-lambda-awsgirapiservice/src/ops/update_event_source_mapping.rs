@@ -22,6 +22,12 @@
 //! role may not read the source this mapping polls changes nothing (see
 //! [`crate::state::event_source_authorization`]).
 //!
+//! A `MetricsConfig` the update states is held to the same rule the create's is: it is a SET
+//! of the values `EventSourceMappingMetricsConfig$Metrics` declares drawn from the ones the
+//! mapping's own event source supports, and anything else is refused with the same modelled
+//! `InvalidParameterValueException` and changes nothing (see
+//! [`crate::state::metrics_config_refusal`]).
+//!
 //! The operation answers 202 Accepted, so the change is NOT in effect when the call
 //! returns: the mapping moves into `Updating` — one of the states
 //! `EventSourceMappingConfiguration$State` enumerates — and the move to the state its
@@ -416,6 +422,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .event_source_mappings
             .get(&input.uuid)
             .and_then(|record| record.event_source_arn.clone());
+        // A mapping names exactly one event source, so one with no ARN is the self-managed
+        // Apache Kafka cluster the create named instead.
+        let self_managed = mapped_source.is_none();
+        // A `MetricsConfig` this update states is held to exactly what the create's is: a
+        // SET of the values the enum declares drawn from the ones the source the mapping
+        // polls supports (see [`crate::state::metrics_config_refusal`]). A selection it
+        // cannot satisfy changes nothing.
+        if let Some(message) = crate::state::metrics_config_refusal(
+            input.metrics_config.as_ref(),
+            mapped_source
+                .as_deref()
+                .and_then(crate::state::event_source_vendor),
+            self_managed,
+        ) {
+            return Err(invalid_parameter(message));
+        }
+
         // Only a queue carries a visibility timeout, so only a queue source is one of those
         // comparisons.
         let queue_source = mapped_source.clone().filter(|arn| {

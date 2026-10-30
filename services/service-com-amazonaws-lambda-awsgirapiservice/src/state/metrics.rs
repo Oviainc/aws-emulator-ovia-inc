@@ -12,7 +12,10 @@
 //! its poller took out of the source, how many its filter criteria rejected, how many
 //! reached the function and how many it deleted from the source are quantities of that one
 //! mapping ([`EVENT_SOURCE_MAPPING_UUID_DIMENSION`]), and a client asks for them with the
-//! mapping's own `MetricsConfig` ([`publishes_event_counts`]).
+//! mapping's own `MetricsConfig` ([`publishes_event_counts`]). Not every value that member
+//! takes is selectable on every mapping: two of them are documented for the Kafka event
+//! sources alone, so what a given source can be asked to produce is read here
+//! ([`supported_metrics`]) and refused by the operations that take a `MetricsConfig`.
 //!
 //! The datapoints are appended to the CloudWatch store directly rather than sent through
 //! `PutMetricData`: CloudWatch reserves the `AWS/` namespaces for the services that own
@@ -68,6 +71,65 @@ pub const EVENT_SOURCE_MAPPING_UUID_DIMENSION: &str = "EventSourceMappingUUID";
 /// on with: "`EventCount` to receive metrics related to the number of events processed by
 /// your event source mapping" (`EventSourceMappingMetricsConfig$Metrics`).
 pub const EVENT_COUNT_METRICS_SELECTOR: &str = "EventCount";
+
+/// The `EventSourceMappingMetric` that same member documents as "`ErrorCount` (Amazon MSK
+/// and self-managed Apache Kafka) to receive metrics related to the number of errors in your
+/// event source mapping processing".
+pub const ERROR_COUNT_METRICS_SELECTOR: &str = "ErrorCount";
+
+/// The `EventSourceMappingMetric` that same member documents as "`KafkaMetrics` (Amazon MSK
+/// and self-managed Apache Kafka) to receive metrics related to the Kafka consumers from your
+/// event source mapping".
+pub const KAFKA_METRICS_SELECTOR: &str = "KafkaMetrics";
+
+/// The `EventSourceMappingMetric` values an event source can be asked for, in the order the
+/// model's enum declares them (`EventCount`, `ErrorCount`, `KafkaMetrics`).
+///
+/// `EventSourceMappingMetricsConfig$Metrics` scopes two of the three to the KAFKA event
+/// sources, each by the parenthesis its own entry opens with — "`ErrorCount` (Amazon MSK and
+/// self-managed Apache Kafka)" and "`KafkaMetrics` (Amazon MSK and self-managed Apache
+/// Kafka)" — so those two are selectable only there. `EventCount` carries no such
+/// parenthesis, which makes it the one value every event source produces.
+///
+/// `kafka_source` says whether the resolved event source is one of the two the parentheses
+/// name.
+#[must_use]
+pub fn supported_metrics(kafka_source: bool) -> &'static [&'static str] {
+    if kafka_source {
+        &[
+            EVENT_COUNT_METRICS_SELECTOR,
+            ERROR_COUNT_METRICS_SELECTOR,
+            KAFKA_METRICS_SELECTOR,
+        ]
+    } else {
+        &[EVENT_COUNT_METRICS_SELECTOR]
+    }
+}
+
+/// Whether `metrics` is a selection the event source supports, and if not, what it is
+/// refused with: the values that source expects instead.
+///
+/// A selection is a SET of the values the enum declares — which is why the member's own
+/// length stops at the number of values there are — drawn from the ones the source supports
+/// ([`supported_metrics`]). So a value that source does not support, and a value named twice,
+/// each leave it short of being one, and both are refused with the values that source does
+/// expect. The empty selection asks for nothing and is a selection.
+///
+/// The sentence is the one AWS states for this refusal, with the values it names taken from
+/// the source the request resolved.
+#[must_use]
+pub fn unsupported_metrics_refusal(metrics: &[String], kafka_source: bool) -> Option<String> {
+    let supported = supported_metrics(kafka_source);
+    let unsupported = metrics.iter().enumerate().any(|(index, metric)| {
+        !supported.contains(&metric.as_str()) || metrics[..index].contains(metric)
+    });
+    unsupported.then(|| {
+        format!(
+            "Invalid EventSourceMapping metrics. Expected values: [{}]",
+            supported.join(", ")
+        )
+    })
+}
 
 /// How many events a mapping's poller took out of its event source.
 pub const POLLED_EVENT_COUNT_METRIC: &str = "PolledEventCount";
