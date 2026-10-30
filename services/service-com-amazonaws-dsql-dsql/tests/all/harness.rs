@@ -362,11 +362,11 @@ pub async fn names_a_resource_of_its_own_type(
 
 /// A well-formed cluster id for a cluster that was never created.
 ///
-/// Well-formed means more than `ClusterId`'s `^[a-z0-9]{26}$`: an identifier is
-/// the 26-character base32 rendering of a 128-bit value, so the leading symbol
-/// carries only three bits (`state::is_base32_resource_identifier`). A value
-/// outside that form is refused as input instead of reported as an absent
-/// resource, which is what `tests/all/malformed_resource_identifier.rs` pins.
+/// Well-formed is exactly `ClusterId`'s `^[a-z0-9]{26}$` (`smithy_query(query=
+/// "shape", shape="ClusterId")`), which is the whole form of an identifier: every
+/// value it admits reaches the store, so one the account does not hold is reported
+/// as an absent resource rather than refused as input, which is what
+/// `tests/all/resource_identifier_absence.rs` pins.
 pub fn absent_identifier() -> String {
     "0zzzzzzzzzzzzzzzzzzzzzzzzz".to_string()
 }

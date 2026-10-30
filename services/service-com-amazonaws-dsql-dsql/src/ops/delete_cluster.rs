@@ -179,18 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The FORM of the identifier is decided before any lookup and before the
-        // idempotency ledger: a value that is no identifier this service could
-        // have minted names no cluster, so the request is refused rather than
-        // answered as a cluster that is absent — which a delete-until-gone loop
-        // would read as "already deleted".
-        if let Err(invalid) = crate::state::validate_cluster_identifier(
-            crate::state::IDENTIFIER_MEMBER,
-            &input.identifier,
-        ) {
-            return Err(DeleteClusterErrorModeled::ValidationException(invalid).into());
-        }
-
+        // The identifier's FORM is `ClusterId`'s `^[a-z0-9]{26}$`, already decided
+        // by the boundary constraint walk, so the request goes to the store and a
+        // cluster this account does not hold is reported as absent — which is what
+        // a delete-until-gone loop reads as "already deleted".
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteClusterErrorModeled::InternalServerException(
                 InternalServerException {

@@ -77,6 +77,8 @@ mod quota_refusal_identity;
 mod refusal_resource_identity;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
+#[path = "all/resource_identifier_absence.rs"]
+mod resource_identifier_absence;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/retired_cluster_token_cleanup.rs"]

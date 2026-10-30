@@ -162,17 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The FORM of the identifier is decided before any lookup: a value that is
-        // no identifier this service could have minted names no cluster, so the
-        // answer is the refusal of the request rather than a report that some
-        // cluster is absent.
-        if let Err(invalid) = crate::state::validate_cluster_identifier(
-            crate::state::IDENTIFIER_MEMBER,
-            &input.identifier,
-        ) {
-            return Err(GetClusterErrorModeled::ValidationException(invalid).into());
-        }
-
+        // The identifier's FORM is `ClusterId`'s `^[a-z0-9]{26}$`, already decided
+        // by the boundary constraint walk, so the request goes to the store and a
+        // cluster this account does not hold is reported as absent below.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetClusterErrorModeled::InternalServerException(
                 InternalServerException {
