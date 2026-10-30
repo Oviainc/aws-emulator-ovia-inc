@@ -7,7 +7,7 @@
 //! `ListTargetResourceTypes` pages over, so the two cannot disagree. A resource type is
 //! service-owned data (no API creates, updates or deletes one), so this is a REPORTING
 //! operation that writes nothing: two reads at any two instants report the same type, and
-//! an id the catalog does not hold answers `ResourceNotFoundException` rather than a
+//! an id the catalog does not hold is refused with `ValidationException` rather than a
 //! fabricated type.
 //!
 //! ## Shape of an operation
@@ -145,10 +145,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Reporting only: nothing here writes, so two reads at any two instants report the
         // same resource type and a later caller sees exactly what this one saw. The id is
-        // matched exactly, so a differently cased or suffixed id names no resource type.
+        // matched exactly, so a differently cased or suffixed id names no resource type —
+        // and naming no published type is a bad REQUEST here (see
+        // [`crate::state::target_resource_type_not_found`]), not a resource that is missing.
         let Some(entry) = crate::state::target_resource_type_catalog_entry(&input.resource_type)
         else {
-            return Err(GetTargetResourceTypeErrorModeled::ResourceNotFoundException(
+            return Err(GetTargetResourceTypeErrorModeled::ValidationException(
                 crate::state::target_resource_type_not_found(&input.resource_type),
             )
             .into());

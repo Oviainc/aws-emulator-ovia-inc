@@ -438,7 +438,7 @@ pub(crate) fn unaddressable_arns() -> Vec<(&'static str, String)> {
         (
             // An action is service-owned: no API creates one and it carries no caller tag.
             "a fis action ARN",
-            format!("arn:aws:fis:{FALLBACK_REGION}::action/aws:fis:wait"),
+            format!("arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:action/aws:fis:wait"),
         ),
         (
             // Nor does the account's safety lever: no API creates, lists or deletes one.

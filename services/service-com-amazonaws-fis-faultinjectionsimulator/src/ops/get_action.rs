@@ -145,7 +145,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same action and a later caller sees exactly what this one saw.
         let Some(entry) = crate::state::action_catalog_entry(&input.id) else {
             return Err(GetActionErrorModeled::ResourceNotFoundException(
-                crate::state::action_not_found(&input.id),
+                crate::state::action_not_found(),
             )
             .into());
         };

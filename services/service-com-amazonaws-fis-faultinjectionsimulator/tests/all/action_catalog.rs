@@ -9,9 +9,8 @@
 //! * an ACTION is service-owned, so `GetAction` reports the catalogued action the
 //!   requested id names — that id echoed, a description, the action's parameter set with
 //!   each parameter's `required` flag, and the target resource types it supports keyed by
-//!   the name an experiment template refers to them by — under an ARN that names the
-//!   region the request was signed for and carries NO account segment, because the action
-//!   belongs to the service rather than to an account;
+//!   the name an experiment template refers to them by — under a fully qualified ARN that
+//!   names the region the request was signed for and the account serving the request;
 //! * the catalog is constant: no call creates, changes or removes an entry, so repeating
 //!   a read reports the same action, and an id the catalog does not hold (including a
 //!   differently cased or truncated one) answers `ResourceNotFoundException` (HTTP 404)
@@ -41,6 +40,10 @@ const ACTION_ID_CEILING: usize = 128;
 
 /// The region an ARN names when the request's credential scope offers none usable.
 const FALLBACK_REGION: &str = "us-east-1";
+
+/// The account every ARN this emulator reports names, spelled out here rather than
+/// imported so a changed account field fails this suite.
+const ACCOUNT_ID: &str = "000000000000";
 
 /// A SigV4 credential scope naming this service, for `region`. The service field is what
 /// routes the request to fis; the region field is what a reported ARN names.
@@ -228,8 +231,8 @@ fn assert_row(row: &Row, region: &str, answer: &Answer) {
     );
     assert_eq!(
         action["arn"].as_str().unwrap_or_default(),
-        format!("arn:aws:fis:{region}::action/{}", row.id),
-        "case {case:?}: expected the action arn to name {region} with no account segment, \
+        format!("arn:aws:fis:{region}:{ACCOUNT_ID}:action/{}", row.id),
+        "case {case:?}: expected the action arn to name {region} and account {ACCOUNT_ID}, \
          got {:?}",
         action["arn"]
     );

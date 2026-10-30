@@ -14,9 +14,11 @@
 //! * the reported parameter map is present for every published type, EMPTY for a type that
 //!   takes no parameters: the type has a parameter contract either way;
 //! * an id the catalog does not publish — including a differently cased, truncated or
-//!   suffixed one — answers `ResourceNotFoundException` (HTTP 404) rather than a fabricated
-//!   resource type, and an id outside `TargetResourceTypeId`'s modelled
-//!   `@length(min: 0, max: 128)` is refused with HTTP 400 before any lookup;
+//!   suffixed one — is refused with `ValidationException` (HTTP 400) rather than reported
+//!   as a fabricated resource type: FIS judges a `resourceType` against its published
+//!   catalog as INPUT, so naming no published type is a bad request and not a resource
+//!   that happens to be missing, and an id outside `TargetResourceTypeId`'s modelled
+//!   `@length(min: 0, max: 128)` is refused for the bound before any lookup;
 //! * reading changes nothing: the same request answers the same body afterwards, and the
 //!   read agrees with what `ListTargetResourceTypes` publishes for the same type.
 //!
@@ -366,7 +368,7 @@ async fn every_listed_resource_type_is_readable_and_the_two_reports_agree() {
 }
 
 #[tokio::test]
-async fn an_unpublished_resource_type_is_not_found_and_an_over_long_id_is_refused() {
+async fn an_unpublished_resource_type_is_refused_and_an_over_long_id_is_refused() {
     let router = emulator();
 
     // Each row is an id the catalog publishes no resource type for: a plain word, a
@@ -388,15 +390,21 @@ async fn an_unpublished_resource_type_is_not_found_and_an_over_long_id_is_refuse
     ] {
         let answer = get_resource_type(&router, &id).await;
         assert_eq!(
-            answer.status, 404,
-            "case {case:?} ({id:?}): expected HTTP 404, got {} with {:?}",
+            answer.status, 400,
+            "case {case:?} ({id:?}): expected HTTP 400, got {} with {:?}",
             answer.status, answer.body
         );
         assert_eq!(
             answer.error_code(),
-            "ResourceNotFoundException",
-            "case {case:?} ({id:?}): expected ResourceNotFoundException, got {:?}",
+            "ValidationException",
+            "case {case:?} ({id:?}): expected ValidationException, got {:?}",
             answer.body
+        );
+        assert_eq!(
+            answer.body["message"].as_str(),
+            Some(format!("TargetResourceType with ID {id} not found.").as_str()),
+            "case {case:?} ({id:?}): expected the refusal to name the requested type, got {:?}",
+            answer.body["message"]
         );
     }
 

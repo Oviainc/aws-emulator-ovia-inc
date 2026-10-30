@@ -9,8 +9,9 @@
 //!
 //! * a page reports actions FIS publishes, each carrying the id an experiment template's
 //!   action names, a description, the target resource types it supports keyed by the name a
-//!   template refers to them by, an ARN naming the region the request was signed for with
-//!   no account segment, and no tags — an action is service-owned, so nothing a caller
+//!   template refers to them by, a fully qualified ARN naming the region the request was
+//!   signed for and the account serving it, and no tags — an action is service-owned, so
+//!   nothing a caller
 //!   could have created or tagged appears on it;
 //! * a page is at most `maxResults` long, a `nextToken` arrives only with a full page, and
 //!   following that token enumerates every published action exactly once at any page size —
@@ -56,6 +57,10 @@ const ARN_FLOOR: usize = 20;
 
 /// The region an ARN names when the request's credential scope offers none usable.
 const FALLBACK_REGION: &str = "us-east-1";
+
+/// The account every ARN this emulator reports names, spelled out here rather than
+/// imported so a changed account field fails this suite.
+const ACCOUNT_ID: &str = "000000000000";
 
 /// A SigV4 credential scope naming this service, for `region`. The service field is what
 /// routes the request to fis; the region field is what a reported ARN names.
@@ -235,16 +240,17 @@ fn ids(case: &str, listed: &[Value]) -> Vec<String> {
 /// The action ids this suite expects the list to publish, by the reference named in the
 /// module docs.
 ///
-/// They span thirteen AWS services and every family of fault the reference documents:
+/// They span fourteen AWS services and every family of fault the reference documents:
 /// instance lifecycle (`aws:ec2:stop-instances`, `aws:ec2:terminate-instances`), API faults
 /// (`aws:ec2:api-error`, the `aws:fis:inject-api-*` family), container faults (the
 /// `aws:ecs:task-*` and `aws:eks:pod-*` families), storage and database faults
 /// (`aws:ebs:pause-volume-io`, `aws:rds:failover-db-cluster`,
-/// `aws:s3:bucket-pause-replication`), networking (`aws:network:*`), observability
-/// (`aws:cloudwatch:assert-alarm-state`), orchestration (`aws:ssm:*`) and the parameterised
-/// no-op (`aws:fis:wait`).
+/// `aws:s3:bucket-pause-replication`), networking (`aws:network:*`), zonal recovery
+/// (`aws:arc:start-zonal-autoshift`), observability (`aws:cloudwatch:assert-alarm-state`),
+/// orchestration (`aws:ssm:*`) and the parameterised no-op (`aws:fis:wait`).
 fn expected_ids() -> BTreeSet<String> {
     [
+        "aws:arc:start-zonal-autoshift",
         "aws:cloudwatch:assert-alarm-state",
         "aws:dynamodb:global-table-pause-replication",
         "aws:ebs:pause-volume-io",
@@ -370,16 +376,16 @@ async fn a_listed_action_carries_the_modelled_summary_and_nothing_else() {
              {ACTION_ID_CEILING} characters, got {id:?}"
         );
 
-        // An action belongs to the SERVICE, not to an account: its ARN names the region the
-        // request was signed for and carries no account segment.
+        // An action belongs to the SERVICE, but the ARN reported for one is still complete:
+        // it names the region the request was signed for and the serving account.
         let arn = entry["arn"]
             .as_str()
             .unwrap_or_else(|| panic!("case {case:?}: expected an arn, got {entry:?}"));
         assert_eq!(
             arn,
-            format!("arn:aws:fis:{FALLBACK_REGION}::action/{id}"),
-            "case {case:?}: expected the action arn to name {FALLBACK_REGION} with no account \
-             segment, got {arn:?}"
+            format!("arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:action/{id}"),
+            "case {case:?}: expected the action arn to name {FALLBACK_REGION} and account \
+             {ACCOUNT_ID}, got {arn:?}"
         );
         assert!(
             arn.chars().count() >= ARN_FLOOR,
@@ -511,7 +517,7 @@ async fn a_listed_action_is_reported_in_the_region_the_request_was_signed_for() 
                 .unwrap_or_else(|| panic!("a listed action carries no id: {entry:?}"));
             assert_eq!(
                 entry["arn"].as_str().unwrap_or_default(),
-                format!("arn:aws:fis:{region}::action/{id}"),
+                format!("arn:aws:fis:{region}:{ACCOUNT_ID}:action/{id}"),
                 "case {signed:?}/{id:?}: expected the arn to name {region}, got {:?}",
                 entry["arn"]
             );

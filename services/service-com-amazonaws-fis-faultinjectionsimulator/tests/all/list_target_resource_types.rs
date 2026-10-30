@@ -201,18 +201,32 @@ fn ids(case: &str, listed: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// The published resource types this crate's action table records no action for.
+///
+/// FIS publishes a target resource type as soon as one of its own actions can target it,
+/// and `ACTION_CATALOG` records an action only where the reference named in the module docs
+/// states one, so these two are published while no catalogued action targets them. Named
+/// here so the cross-table check below stays an assertion rather than an exception.
+const UNTARGETED_PUBLISHED_TYPES: &[&str] =
+    &["aws:directconnect:virtual-interface", "aws:dsql:cluster"];
+
 /// The resource type ids this suite expects the list to publish, by the reference named in
 /// the module docs.
 ///
-/// They span eight AWS services and every family of target the reference documents:
+/// They span eleven AWS services and every family of target the reference documents:
 /// compute (`aws:ec2:instance`, `aws:ec2:spot-instance`, `aws:lambda:function`),
 /// containers (`aws:ecs:cluster`, `aws:ecs:task`, `aws:eks:cluster`, `aws:eks:nodegroup`,
 /// `aws:eks:pod`), storage and databases (`aws:ec2:ebs-volume`, `aws:s3:bucket`,
-/// `aws:rds:cluster`, `aws:rds:db`, `aws:dynamodb:global-table`,
+/// `aws:rds:cluster`, `aws:rds:db`, `aws:dynamodb:global-table`, `aws:dsql:cluster`,
 /// `aws:elasticache:replicationgroup`), networking (`aws:ec2:subnet`,
-/// `aws:ec2:route-table`, `aws:ec2:transit-gateway`) and identity (`aws:iam:role`).
+/// `aws:ec2:route-table`, `aws:ec2:transit-gateway`,
+/// `aws:directconnect:virtual-interface`), resilience
+/// (`aws:arc:zonal-shift-managed-resource`) and identity (`aws:iam:role`).
 fn expected_ids() -> BTreeSet<String> {
     [
+        "aws:arc:zonal-shift-managed-resource",
+        "aws:directconnect:virtual-interface",
+        "aws:dsql:cluster",
         "aws:dynamodb:global-table",
         "aws:ec2:autoscaling-group",
         "aws:ec2:ebs-volume",
@@ -343,8 +357,13 @@ async fn a_listed_resource_type_carries_a_published_id_and_a_description() {
 async fn the_list_publishes_every_resource_type_a_catalogued_action_targets() {
     // The invariant that ties the two service-owned tables together: an action's
     // `ActionTarget$resourceType` names a type an experiment template may target, so every
-    // such type has to be one this list publishes, and a type no action targets would be
-    // one no template could use.
+    // such type has to be one this list publishes.
+    //
+    // The converse is NOT an invariant of the published data: the type catalog is its own
+    // published list, and FIS publishes a type as soon as one of its own actions can target
+    // it, so a type whose action `ACTION_CATALOG` records no row for is still published. The
+    // types in that position are named below rather than skipped, so adding one is a
+    // deliberate edit of this list and not an unnoticed orphan.
     let router = emulator();
     let expected = expected_ids();
     let listed: BTreeSet<String> = ids(
@@ -365,14 +384,19 @@ async fn the_list_publishes_every_resource_type_a_catalogued_action_targets() {
              published by ListTargetResourceTypes, got {listed:?}"
         );
     }
-    let orphans: Vec<&String> = listed
+    let untargeted: BTreeSet<&str> = listed
         .iter()
-        .filter(|resource_type| !targeted.contains(resource_type.as_str()))
+        .map(String::as_str)
+        .filter(|resource_type| !targeted.contains(resource_type))
         .collect();
-    assert!(
-        orphans.is_empty(),
-        "case action-targets: expected every published resource type to be targeted by some \
-         catalogued action, got {orphans:?}"
+    assert_eq!(
+        untargeted,
+        UNTARGETED_PUBLISHED_TYPES
+            .iter()
+            .copied()
+            .collect::<BTreeSet<&str>>(),
+        "case action-targets: expected exactly the published types no catalogued action \
+         targets, got {untargeted:?}"
     );
 }
 

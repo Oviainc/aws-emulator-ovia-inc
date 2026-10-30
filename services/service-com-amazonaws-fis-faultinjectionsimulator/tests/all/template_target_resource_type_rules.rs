@@ -10,8 +10,8 @@
 //!
 //! * `resourceType` names one of the target resource types the service PUBLISHES (the same
 //!   table `ListTargetResourceTypes` and `GetTargetResourceType` report from), so an id that
-//!   table holds no entry for — exactly the id `GetTargetResourceType` answers
-//!   `ResourceNotFoundException` for — is refused rather than stored;
+//!   table holds no entry for — exactly the id `GetTargetResourceType` refuses with its own
+//!   `ValidationException` — is refused rather than stored;
 //! * a target supplies every parameter the published entry for its resource type marks
 //!   `required` (`TargetResourceTypeParameter$required`, "indicates whether the parameter is
 //!   required"), because a target without one names a resolution the published contract
@@ -29,7 +29,7 @@
 //! The two halves of the one table are checked against each other: for every row the
 //! template rule admits a resource type for, `GetTargetResourceType` reports that type with
 //! the same `required` flags, and for every id the template rule refuses,
-//! `GetTargetResourceType` answers 404.
+//! `GetTargetResourceType` answers 400.
 //!
 //! The rules belong to the TEMPLATE and not to the call that produced it, so the last test
 //! drives rows of each kind through `UpdateExperimentTemplate` and asserts it answers
@@ -407,8 +407,8 @@ const UNPUBLISHED: &[(&str, &str)] = &[
 /// id its published table holds no entry for is refused when the template is created instead
 /// of being stored as a target no resolution could identify.
 ///
-/// The same miss on the same table is what `GetTargetResourceType` answers
-/// `ResourceNotFoundException` for, so each row asserts both halves.
+/// The same miss on the same table is what `GetTargetResourceType` refuses with
+/// `ValidationException`, so each row asserts both halves.
 #[tokio::test]
 async fn a_resource_type_the_service_publishes_no_entry_for_is_refused() {
     let router = emulator();
@@ -438,15 +438,15 @@ async fn a_resource_type_the_service_publishes_no_entry_for_is_refused() {
 
         let answer = get_resource_type(&router, resource_type).await;
         assert_eq!(
-            answer.status, 404,
-            "case {case:?}: expected HTTP 404 from GetTargetResourceType over the same id, \
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400 from GetTargetResourceType over the same id, \
              got {} with {:?}",
             answer.status, answer.body
         );
         assert_eq!(
             answer.error_code(),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {:?}",
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {:?}",
             answer.body
         );
     }

@@ -11,8 +11,8 @@
 //! * what it reports for each is the same contract the sibling suite asserts: the id
 //!   echoed, a description, the action's parameter set with every parameter's `required`
 //!   flag, the target resource types it supports keyed by the name an experiment template
-//!   refers to them by, and an ARN naming the region the request was signed for with no
-//!   account segment.
+//!   refers to them by, and a fully qualified ARN naming the region the request was signed
+//!   for and the account serving it.
 //!
 //! SOURCE for the expected rows below: the AWS FIS actions reference
 //! (<https://docs.aws.amazon.com/fis/latest/userguide/fis-actions-reference.html>), which
@@ -39,6 +39,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region an ARN names when the request's credential scope offers none usable.
 const FALLBACK_REGION: &str = "us-east-1";
+
+/// The account every ARN this emulator reports names, spelled out here rather than
+/// imported so a changed account field fails this suite.
+const ACCOUNT_ID: &str = "000000000000";
 
 /// A SigV4 credential scope naming this service, for `region`. The service field is what
 /// routes the request to fis; the region field is what a reported ARN names.
@@ -360,8 +364,8 @@ fn assert_row(row: &Row, region: &str, answer: &Answer) {
     );
     assert_eq!(
         action["arn"].as_str().unwrap_or_default(),
-        format!("arn:aws:fis:{region}::action/{}", row.id),
-        "case {case:?}: expected the action arn to name {region} with no account segment, got {:?}",
+        format!("arn:aws:fis:{region}:{ACCOUNT_ID}:action/{}", row.id),
+        "case {case:?}: expected the action arn to name {region} and account {ACCOUNT_ID}, got {:?}",
         action["arn"]
     );
     assert!(
