@@ -822,25 +822,16 @@ async fn a_deployment_must_acknowledge_the_templates_required_capabilities() {
     );
 }
 
-/// The limit of rule 2, pinned: the requirement is derived from a template body this
-/// emulator can READ, and it reads JSON only.
+/// RULE 2 over the OTHER form a packaged SAM template is written in: the requirement is a
+/// function of the resources the template declares, not of whether the publisher wrote it
+/// as JSON or as YAML.
 ///
-/// A version published with a YAML SAM template is stored as supplied and parsed by
-/// nothing here — the `parse_template` policy this crate already applies to the
-/// parameters it reports, filed as the serverlessrepo "template handling is JSON only"
-/// issue — so it declares no requirement and deploys without one, even though the same
-/// resources in JSON would require `CAPABILITY_NAMED_IAM`. This case is what makes that
-/// gap observable: implementing the YAML reader has to change it.
-///
-/// CloudFormation, which DOES read YAML, derives the requirement itself and plans the
-/// template's resources, so what is missing is only this service's derivation — which is
-/// observable twice over: this service asks for no acknowledgement, and the deployment it
-/// then makes is refused by CloudFormation, surfaced as this operation's modelled 400
-/// carrying the capability CloudFormation named. Acknowledging that capability deploys,
-/// because what the request acknowledges is passed on whether or not this service derived
-/// a requirement of its own.
+/// The same resources as the `CAPABILITY_NAMED_IAM` row of the table above, published as
+/// YAML, declare the same requirement — so a deployment that acknowledges nothing is
+/// refused by THIS service, with its own capability refusal, and one that acknowledges the
+/// derived capability deploys and is planned by CloudFormation.
 #[tokio::test]
-async fn a_yaml_template_declares_no_requirement_this_emulator_can_read() {
+async fn a_yaml_template_declares_the_same_requirement_as_its_json_spelling() {
     let deploy = Deploy::new();
     // The same application as the CAPABILITY_NAMED_IAM row above, in YAML.
     let yaml = "Transform: AWS::Serverless-2016-10-31\n\
@@ -871,19 +862,18 @@ async fn a_yaml_template_declares_no_requirement_this_emulator_can_read() {
     );
     assert_eq!(
         published["requiredCapabilities"],
-        json!([]),
-        "a template this emulator cannot read declares no requirement, got {published}"
+        json!(["CAPABILITY_NAMED_IAM"]),
+        "the YAML spelling of a named IAM resource declares the same requirement its JSON \
+         spelling does, got {published}"
     );
 
-    // This service derived nothing, so it asks for no acknowledgement — and CloudFormation,
-    // which read the YAML, requires one, which this operation answers as its modelled 400
-    // built from what CloudFormation said.
+    // Derived here, so the refusal of an unacknowledged deployment is THIS service's.
     let (status, answer) = deploy
         .create_change_set(&application_id, json!({ "stackName": "yaml-stack" }))
         .await;
     assert_eq!(
         status, 400,
-        "a requirement this service cannot derive is CloudFormation's to refuse, got \
+        "a requirement this service derived is this service's to refuse, got \
          {status} with {answer}"
     );
     assert_eq!(
@@ -891,13 +881,14 @@ async fn a_yaml_template_declares_no_requirement_this_emulator_can_read() {
         "BadRequestException",
         "expected the modelled BadRequestException, got {answer}"
     );
+    let message = text(&answer, "message");
     assert!(
-        text(&answer, "message").contains("CAPABILITY_NAMED_IAM"),
-        "the refusal must name the capability CloudFormation requires, got {answer}"
+        message.starts_with("Required capabilities [") && message.contains("CAPABILITY_NAMED_IAM"),
+        "the refusal must be this service's and name the capability required, got {message:?}"
     );
 
-    // Acknowledged, the same deployment is made: the acknowledgement is passed on whether
-    // or not this service derived a requirement of its own.
+    // Acknowledged, the same deployment is made, and what is forwarded is the same set the
+    // JSON spelling of this template forwards.
     let (status, answer) = deploy
         .create_change_set(
             &application_id,
@@ -909,7 +900,7 @@ async fn a_yaml_template_declares_no_requirement_this_emulator_can_read() {
         .await;
     assert_eq!(
         status, 201,
-        "acknowledging what CloudFormation requires must deploy, got {status} with {answer}"
+        "acknowledging what the template requires must deploy, got {status} with {answer}"
     );
     let change_set_id = text(&answer, "changeSetId");
     let (status, xml) = deploy

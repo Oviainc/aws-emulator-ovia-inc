@@ -39,17 +39,21 @@ sha2 = { workspace = true }
 aws-sigv4 = { version = "1", features = ["http1"] }
 # The signing identity `aws-sigv4` takes: this service's own ephemeral document-plane key.
 aws-credential-types = "1"
+# AWS CloudFormation's own template reader, which is the emulator's ONE reading of a
+# CloudFormation/SAM template body in either of the forms it is written in (JSON, or YAML
+# with the short-form intrinsic tags): a packaged SAM template is a CloudFormation
+# template, so `state::template_document` reads a published body through
+# `state::template::document_within` rather than a second reader of the same format. This
+# crate already drives the service itself through the in-process SDK client above.
+service-com-amazonaws-cloudformation-cloudformation = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-# The change-set tests mount the CloudFormation service beside this one on a single
-# engine, because CreateCloudFormationChangeSet creates its change set by calling it.
-service-com-amazonaws-cloudformation-cloudformation = { workspace = true }
-# Executing one of those change sets makes CloudFormation provision the template's
-# `AWS::SQS::Queue` in the service that OWNS it, so Amazon SQS is mounted beside the two
-# as `core/router/src/lib.rs` mounts them.
+# Executing a change set makes CloudFormation provision the template's
+# `AWS::SQS::Queue` in the service that OWNS it, so Amazon SQS is mounted beside
+# CloudFormation and this service as `core/router/src/lib.rs` mounts them.
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 
 [lints]

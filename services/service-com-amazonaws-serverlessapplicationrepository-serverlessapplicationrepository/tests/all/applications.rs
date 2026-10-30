@@ -1273,8 +1273,8 @@ async fn parameter_definitions_come_from_the_stored_template() {
         definitions[2]
     );
 
-    // A template with no parameters, one the emulator cannot read, and one it never
-    // saw at all: an empty list each time — never a guess.
+    // A template declaring no parameters — in either form — one the emulator never sees,
+    // and no template at all: an empty list each time, never a guess.
     let empty_cases: Vec<(&str, &str, Value)> = vec![
         (
             "a JSON template with no Parameters",
@@ -1282,8 +1282,7 @@ async fn parameter_definitions_come_from_the_stored_template() {
             json!({ "templateBody": "{\"Transform\":\"AWS::Serverless-2016-10-31\",\"Resources\":{}}" }),
         ),
         (
-            "a YAML template, which no reader here parses and which is therefore \
-             neither judged nor guessed at",
+            "a YAML template declaring no Parameters section",
             "3.0.0",
             json!({ "templateBody": "Transform: AWS::Serverless-2016-10-31\nResources:\n  Fn:\n    Type: AWS::Serverless::Function\n" }),
         ),

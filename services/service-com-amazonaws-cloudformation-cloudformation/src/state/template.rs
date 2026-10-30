@@ -256,7 +256,8 @@ impl Default for Budget {
 /// Pre-flight bounds on an untrusted YAML body, applied BEFORE the loader builds a tree
 /// from it. Only the YAML spelling needs these: the JSON spelling is read by `serde_json`,
 /// which enforces its own nesting limit. (The body LENGTH is bounded for both spellings in
-/// [`document`]; it is re-checked here so this guard holds on its own terms.)
+/// [`document_within`]; `max_bytes` is re-checked here so this guard holds on its own
+/// terms.)
 ///
 /// What has to be bounded is how deep the loader can RECURSE, because an `EventReceiver`
 /// cannot abort `load` (`on_event` returns `()`) and because exhausting the stack aborts
@@ -280,8 +281,8 @@ impl Default for Budget {
 /// depth only while it is open. Over-counting (a `[` inside a quoted scalar) is the only
 /// failure mode, and each bound sits far above the nesting a CloudFormation template
 /// written in YAML reaches.
-fn guard_yaml_body(body: &str) -> Option<()> {
-    if body.len() > super::TEMPLATE_BODY_MAX_BYTES {
+fn guard_yaml_body(body: &str, max_bytes: usize) -> Option<()> {
+    if body.len() > max_bytes {
         return None;
     }
     let mut flow_depth = 0usize;
@@ -752,7 +753,7 @@ fn yaml_failure_position(body: &str) -> Option<(usize, usize)> {
 
     // The same guard the reader itself applies, so a body refused for its nesting is not
     // scanned a second time.
-    guard_yaml_body(body)?;
+    guard_yaml_body(body, super::TEMPLATE_BODY_MAX_BYTES)?;
     let error = ::yaml_rust2::parser::Parser::new_from_str(body)
         .load(&mut Discard, true)
         .err()?;
@@ -916,7 +917,21 @@ pub(crate) fn s3_uri_parts(uri: &str) -> Option<(&str, &str, Option<&str>)> {
 /// of it), and `serde_json`'s own limit bounds nesting depth rather than size, so a large
 /// FLAT body would otherwise be read and copied unbounded.
 pub(crate) fn document(body: &str) -> Option<Value> {
-    if body.len() > super::TEMPLATE_BODY_MAX_BYTES {
+    document_within(body, super::TEMPLATE_BODY_MAX_BYTES)
+}
+
+/// [`document`] under the caller's OWN ceiling on the body.
+///
+/// The reader is the one reading of this format in the emulator, and a template body is the
+/// same document wherever it is submitted — but the maximum SIZE of one is a quota of the
+/// API that takes it, not a property of the format: AWS SAR publishes a packaged template as
+/// an S3 object, whose documented maximum is far above this service's inline `TemplateBody`
+/// quota. So that service reads its own bodies through here with its own ceiling, rather
+/// than through a second reader of the same format. Every other bound the reader applies —
+/// nodes, depth, flow and block nesting, one document, no alias — belongs to the format and
+/// is the same for both callers.
+pub fn document_within(body: &str, max_bytes: usize) -> Option<Value> {
+    if body.len() > max_bytes {
         return None;
     }
     if let Ok(value) = ::serde_json::from_str::<Value>(body) {
@@ -924,7 +939,7 @@ pub(crate) fn document(body: &str) -> Option<Value> {
         // built is held to the same node bound the YAML builder applies as it builds.
         return within_node_bound(&value).then_some(value);
     }
-    yaml_document(body)
+    yaml_document(body, max_bytes)
 }
 
 /// Whether a built tree is within [`MAX_TEMPLATE_NODES`] nodes.
@@ -1136,7 +1151,7 @@ fn scalar_text(value: &Value) -> Option<String> {
 /// loader drops the `!Ref`/`!GetAtt` tags that carry a template's whole meaning, and an
 /// event walk sees a YAML alias (`*anchor`) BEFORE the loader copies the anchored node,
 /// so an alias chain cannot be expanded here at all.
-fn yaml_document(body: &str) -> Option<Value> {
+fn yaml_document(body: &str, max_bytes: usize) -> Option<Value> {
     #[derive(Default)]
     struct Builder {
         /// The open collections, innermost last: each holds the items/entries read so
@@ -1271,7 +1286,7 @@ fn yaml_document(body: &str) -> Option<Value> {
     }
 
     let mut builder = Builder::default();
-    guard_yaml_body(body)?;
+    guard_yaml_body(body, max_bytes)?;
     ::yaml_rust2::parser::Parser::new_from_str(body)
         .load(&mut builder, true)
         .ok()?;

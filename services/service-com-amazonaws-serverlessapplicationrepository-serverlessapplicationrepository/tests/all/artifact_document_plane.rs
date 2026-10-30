@@ -77,8 +77,8 @@ fn json_template(resource: &str) -> String {
 }
 
 /// The same packaged SAM template as the YAML document a publisher may send instead —
-/// retained as supplied, because this emulator reads only the JSON form and never
-/// rewrites what it cannot read.
+/// retained as supplied, byte for byte, because this emulator serves back the document it
+/// was handed and never rewrites it into the other form.
 fn yaml_template(resource: &str) -> String {
     format!(
         "Transform: {SAM_TRANSFORM}\nResources:\n  {resource}:\n    Type: AWS::SQS::Queue\n"

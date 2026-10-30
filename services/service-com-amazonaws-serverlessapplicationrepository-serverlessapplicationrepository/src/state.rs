@@ -46,6 +46,10 @@ use crate::ops::types::{
     InternalServerErrorException, NotFoundException, ParameterDefinition, Version, VersionSummary,
 };
 
+/// Reads an inline `TemplateBody` — JSON or YAML — into the one tree everything below
+/// derives a template's members from.
+mod template_document;
+
 /// The region an ARN carries when the request names none.
 ///
 /// A request's region is its SigV4 credential scope (see [`request_region`]); an
@@ -1622,8 +1626,9 @@ pub enum TemplateRefusal {
     /// More than [`MAX_TEMPLATE_RESOURCES`] entries in `Resources`.
     TooManyResources,
     /// A template that declares no `Transform` field, so it is not a packaged AWS SAM
-    /// template; see [`declares_transform`]. Carries the template as read, because the
-    /// refusal AWS gives quotes it back.
+    /// template; see [`declares_transform`]. Carries the template as the refusal quotes
+    /// it back ([`quoted_template`]), because the refusal AWS gives names the document it
+    /// rejected.
     MissingTransform(String),
 }
 
@@ -1665,10 +1670,11 @@ const TEMPLATE_RESOURCE: &str = "template";
 /// input. The rule the message states (the missing `Transform` field) is unaffected.
 const MAX_QUOTED_TEMPLATE_BYTES: usize = 512;
 
-/// `template` as the refusal quotes it: its JSON form, cut at
-/// [`MAX_QUOTED_TEMPLATE_BYTES`] on a character boundary and marked as cut.
-fn quoted_template(template: &::serde_json::Value, body: &str) -> String {
-    let rendered = ::serde_json::to_string(template).unwrap_or_else(|_| body.to_string());
+/// `template` as the refusal quotes it: the parsed document in the form AWS's own refusal
+/// echoes it ([`template_document::echoed`]), cut at [`MAX_QUOTED_TEMPLATE_BYTES`] on a
+/// character boundary and marked as cut.
+fn quoted_template(template: &::serde_json::Value) -> String {
+    let rendered = template_document::echoed(template);
     if rendered.len() <= MAX_QUOTED_TEMPLATE_BYTES {
         return rendered;
     }
@@ -1715,11 +1721,13 @@ pub fn declares_transform(template: &::serde_json::Value) -> bool {
 /// that reference it, which a template states as `{"Ref": "<name>"}` or as `${name}`
 /// inside an `Fn::Sub`.
 ///
-/// Only a template the caller supplied INLINE and in JSON form is read: an emulator
-/// makes no outbound connections, so a template named only by `TemplateUrl` is never
-/// fetched, and a template in YAML is not parsed (no YAML reader is available here). A
-/// template this emulator cannot read is neither judged nor guessed at: it is stored as
-/// supplied and reports no parameters.
+/// Only a template the caller supplied INLINE is read, in either of the two forms a
+/// packaged SAM template is written in — JSON or YAML, read by
+/// [`template_document::read`], which spells a short-form intrinsic (`!Ref`, `!Sub`) as
+/// the long form a JSON template carries. An emulator makes no outbound connections, so a
+/// template named only by `TemplateUrl` is never fetched, and a body that is not a
+/// template document at all is neither judged nor guessed at: it is stored as supplied and
+/// reports no parameters.
 ///
 /// # The work is bounded before it is done
 ///
@@ -1743,7 +1751,7 @@ pub fn parse_template(
     if body.len() > MAX_TEMPLATE_BYTES {
         return Err(TemplateRefusal::TemplateTooLarge);
     }
-    let Ok(template) = ::serde_json::from_str::<::serde_json::Value>(body) else {
+    let Some(template) = template_document::read(body) else {
         return Ok(Vec::new());
     };
     // The shape bounds come first: counting two maps is the cheapest thing this function
@@ -1762,7 +1770,7 @@ pub fn parse_template(
     // the template as read, so the caller sees which document was rejected.
     if !declares_transform(&template) {
         return Err(TemplateRefusal::MissingTransform(quoted_template(
-            &template, body,
+            &template,
         )));
     }
     let Some(parameters) = parameters else {
@@ -1869,14 +1877,16 @@ const IAM_NAME_PROPERTIES: &[(&str, &str)] = &[
 /// application contains IAM resources with custom names, you must specify
 /// CAPABILITY_NAMED_IAM."
 ///
-/// A template this emulator cannot read — one the caller named only by `TemplateUrl`, or
-/// one in YAML — declares nothing it can judge, so it requires nothing: the same policy
-/// [`parse_template`] applies to the parameters it reports.
+/// Derived from the template as [`template_document::read`] reads it, so a YAML template's
+/// resources are judged exactly as the same resources in JSON are. A template this
+/// emulator never sees — one the caller named only by `TemplateUrl` — or a body that is not
+/// a template document declares nothing it can judge, so it requires nothing: the same
+/// policy [`parse_template`] applies to the parameters it reports.
 pub fn required_capabilities_of(template_body: Option<&String>) -> Vec<String> {
     let Some(body) = template_body else {
         return Vec::new();
     };
-    let Ok(template) = ::serde_json::from_str::<::serde_json::Value>(body) else {
+    let Some(template) = template_document::read(body) else {
         return Vec::new();
     };
     let Some(resources) = template.get("Resources").and_then(|r| r.as_object()) else {
