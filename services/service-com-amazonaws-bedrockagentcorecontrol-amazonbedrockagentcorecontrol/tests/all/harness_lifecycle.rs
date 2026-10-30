@@ -253,12 +253,12 @@ async fn every_modelled_harness_route_reaches_its_own_operation() {
             error_type: "NotImplemented",
         },
         Route {
-            case: "ListHarnessVersions, scaffolded",
+            case: "ListHarnessVersions on a stored harness, implemented",
             method: "GET",
             uri: format!("/harnesses/{existing}/versions"),
             body: None,
-            status: 501,
-            error_type: "NotImplemented",
+            status: 200,
+            error_type: "",
         },
     ];
 

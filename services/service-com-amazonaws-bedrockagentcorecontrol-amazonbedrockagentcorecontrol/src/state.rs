@@ -38,7 +38,7 @@ use crate::ops::types::{
     Harness, HarnessAgentCoreRuntimeEnvironment, HarnessAgentCoreRuntimeEnvironmentRequest,
     HarnessEnvironmentArtifact, HarnessEnvironmentProvider, HarnessEnvironmentProviderRequest,
     HarnessHook, HarnessMemoryConfiguration, HarnessModelConfiguration, HarnessSkill,
-    HarnessSystemContentBlock, HarnessTool, HarnessTruncationConfiguration,
+    HarnessSystemContentBlock, HarnessTool, HarnessTruncationConfiguration, HarnessVersionSummary,
     HttpTargetConfiguration, IndexedKey, InferenceTargetConfiguration, LifecycleConfiguration,
     McpTargetConfiguration, Memory, MemoryStrategy, MetadataConfiguration, NamespaceKeyEntry,
     NetworkConfiguration, PrivateEndpoint, ProtocolConfiguration, RequestHeaderConfiguration,
@@ -776,6 +776,29 @@ pub const HARNESS_MODEL_REQUIRED: &str =
     "must be specified: a harness reports the model it runs with, and this service has no \
      default model to run one with";
 
+/// The modelled not-found error for a harness this account does not hold.
+///
+/// This control plane words a missing harness in terms of the agent it runs:
+/// "Agent with name <harnessId> not found." — the sentence around the
+/// identifier is fixed, and the identifier itself is the one the request named.
+/// Shared by the handlers rather than written per operation, so one harness
+/// cannot be reported missing in two different sentences by two operations.
+pub fn harness_not_found(harness_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Agent with name {harness_id} not found.")),
+    }
+}
+
+/// One harness version's key in the version-ordered map a listing pages over:
+/// the version number zero-padded to the five digits `HarnessVersion` allows
+/// (pattern `^([1-9][0-9]{0,4})$`), so ascending KEY order is ascending VERSION
+/// order for every version the wire can carry — which is what makes the shared
+/// page walk's "resume strictly after the key the last page ended on" cursor
+/// sound for a listing of versions.
+fn harness_version_key(version: u32) -> String {
+    format!("{version:05}")
+}
+
 /// One harness: everything the caller configured, plus what the service minted
 /// for it and the status the clock drives.
 ///
@@ -848,6 +871,39 @@ impl HarnessRecord {
             None => true,
             Some(raw) => raw.parse::<u32>().is_ok_and(|version| version == self.version),
         }
+    }
+
+    /// This harness's `HarnessVersionSummary` for the version it holds, as a
+    /// listing of versions reports it at `now`. Rendered from the same record
+    /// [`Self::harness`] reads, so a summary and a full read cannot disagree on
+    /// the identity, the version or the status of one harness.
+    pub fn version_summary(&self, now: SystemTime) -> HarnessVersionSummary {
+        HarnessVersionSummary {
+            harness_id: self.harness_id.clone(),
+            harness_name: self.harness_name.clone(),
+            arn: self.harness_arn.clone(),
+            harness_version: self.version_string(),
+            status: self.status_at(now).to_string(),
+            created_at: timestamp(self.created_at),
+            updated_at: timestamp(self.updated_at),
+            // Reported only for a version in a failed status; one this emulator
+            // drives reaches READY, which has no failure.
+            failure_reason: None,
+        }
+    }
+
+    /// Every version this harness holds, keyed by [`harness_version_key`] so the
+    /// map's own order IS ascending version order.
+    ///
+    /// A harness gains one version per publish: a create publishes
+    /// [`FIRST_HARNESS_VERSION`] and only an update publishes another, so a
+    /// stored harness holds exactly the version in [`Self::version`] — the
+    /// listing reports the versions this record persists rather than a range of
+    /// numbers nothing was ever stored for.
+    pub fn version_summaries(&self, now: SystemTime) -> BTreeMap<String, HarnessVersionSummary> {
+        [(harness_version_key(self.version), self.version_summary(now))]
+            .into_iter()
+            .collect()
     }
 
     /// This harness as every harness operation reports it, at `now`.

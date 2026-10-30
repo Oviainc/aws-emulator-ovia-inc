@@ -26,7 +26,15 @@ pub struct ListHarnessVersionsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#HarnessVersionSummary")]
+/// `HarnessVersionSummary`, the row `ListHarnessVersions` carries. Its schema and codec come
+/// from [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `updatedAt` target `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="shape",
+/// shape="HarnessVersionSummary")`), and the derive does not put that trait on a member
+/// schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct HarnessVersionSummary {
     pub harness_id: String,
@@ -38,4 +46,34 @@ pub struct HarnessVersionSummary {
     pub updated_at: ::aws_smithy_types::DateTime,
     pub failure_reason: Option<String>,
 }
+
+agentcore_schema_and_codec!(
+    HarnessVersionSummary,
+    HARNESS_VERSION_SUMMARY_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#HarnessVersionSummary",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "HarnessVersionSummary",
+    (M_HARNESS_ID, harness_id, "harnessId", 0, req, string),
+    (M_HARNESS_NAME, harness_name, "harnessName", 1, req, string),
+    (M_ARN, arn, "arn", 2, req, string),
+    (
+        M_HARNESS_VERSION,
+        harness_version,
+        "harnessVersion",
+        3,
+        req,
+        string
+    ),
+    (M_STATUS, status, "status", 4, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 5, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 6, req, date_time),
+    (
+        M_FAILURE_REASON,
+        failure_reason,
+        "failureReason",
+        7,
+        opt,
+        string
+    ),
+);
 

@@ -33,6 +33,8 @@ mod gateway_target_listing;
 mod gateway_wire_shape;
 #[path = "all/harness_lifecycle.rs"]
 mod harness_lifecycle;
+#[path = "all/harness_version_listing.rs"]
+mod harness_version_listing;
 #[path = "all/memory_lifecycle.rs"]
 mod memory_lifecycle;
 #[path = "all/service_claim.rs"]

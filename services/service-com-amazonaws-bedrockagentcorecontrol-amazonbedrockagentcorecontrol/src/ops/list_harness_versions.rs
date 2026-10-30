@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListHarnessVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListHarnessVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListHarnessVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the versions one stored harness holds in [`crate::state`], one
+//! `HarnessVersionSummary` per version, each with the status the clock owes that
+//! harness at the instant of this read. `@readonly` and `@paginated`, so it writes
+//! nothing and resumes exactly where the previous page ended; a harness this account
+//! does not hold is the modelled `ResourceNotFoundException`, never an empty page.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +152,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListHarnessVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListHarnessVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListHarnessVersions"))
+        // This listing reads the harness store only; `ctx` carries request metadata
+        // this operation needs none of.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListHarnessVersionsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the harness store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // A version is addressed only through its harness, so a listing for a
+        // harness that does not exist is the modelled 404 — never an empty page,
+        // which would say the harness is there and holds no version.
+        let harness = store.harnesses.get(&input.harness_id).ok_or_else(|| {
+            ListHarnessVersionsErrorModeled::ResourceNotFoundException(
+                crate::state::harness_not_found(&input.harness_id),
+            )
+        })?;
+
+        // The token is opaque on the wire: it carries the version key the previous
+        // page ended on, and the next page starts strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListHarnessVersionsErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this service issued".to_string(),
+                    reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "nextToken".to_string(),
+                        message:
+                            "must be a nextToken returned by a previous ListHarnessVersions call"
+                                .to_string(),
+                    }]),
+                })
+            })?),
+        };
+
+        // `maxResults` has the modeled range 1..100; absent, a page holds that same
+        // documented maximum. The page walk is `crate::state`'s, so every listing of
+        // this service pages by one rule.
+        let page_size = crate::state::page_size(input.max_results, MAX_PAGE_SIZE);
+        let summaries = harness.version_summaries(now);
+        let (harness_versions, next_token) =
+            crate::state::page_over(&summaries, resume_after.as_deref(), page_size, |summary| {
+                Some(summary.clone())
+            });
+
+        Ok(ListHarnessVersionsOutput {
+            harness_versions,
+            next_token,
+        })
     }
 }
+
+/// The modeled upper bound of `maxResults` (`MaxResults`, range 1..100), used as the
+/// page size when the caller names none.
+const MAX_PAGE_SIZE: i32 = 100;
