@@ -85,6 +85,10 @@ const FRAMEWORK_REFUSAL_CODE: &str = "ValidationException";
 /// The status the framework answers such a refusal with.
 const REFUSED: u16 = 400;
 
+/// The XML declaration the pre-dispatch renderer opens its envelope with, and
+/// the protocol's own serializer never writes — see [`framework_refusal`].
+const XML_DECLARATION: &str = "<?xml";
+
 /// The path space the asynchronous Multi-Region Access Point request
 /// operations are bound under: `DescribeMultiRegionAccessPointOperation` is
 /// `GET /v20180820/async-requests/mrap/{RequestTokenARN+}`, so a GET under this
@@ -96,6 +100,26 @@ const ASYNC_REQUEST_PATH: &str = "/v20180820/async-requests/mrap/";
 /// (`Value '<x>' at '<member>' failed to satisfy constraint: …`) — the member
 /// path of `DescribeMultiRegionAccessPointOperationRequest$RequestTokenARN`.
 const REQUEST_TOKEN_MEMBER: &str = "requestTokenARN";
+
+/// The path space an access point is addressed in: every route that names one
+/// is `/v20180820/accesspoint/{Name}` or a sub-resource of it
+/// (`.../policy`, `.../policyStatus`, `.../scope`), so the segment after this
+/// prefix is the access point NAME
+/// (`smithy_query(query="digest")`). The Object Lambda access points under
+/// `/v20180820/accesspointforobjectlambda` are a different resource with its
+/// own name rules and are NOT in this space — the prefix ends in a separator,
+/// so a sibling segment that merely starts with it is not claimed.
+const ACCESS_POINT_PATH: &str = "/v20180820/accesspoint/";
+
+/// The fixed words the framework's own refusal envelope states a value it READ
+/// and found to break a rule in (`N validation error(s) detected: …`).
+///
+/// A codec failure — a body that is not a document this protocol can parse, or
+/// a value that is not of the type its member declares — has no structured
+/// form, so it is rendered under the same code and status from the codec's own
+/// sentence instead. The marker is what tells the two apart; see
+/// [`refused_as_unreadable`].
+const VALIDATION_ENVELOPE_MARKER: &str = "validation error";
 
 /// The path component of a request URI, without the scheme, the authority or
 /// the query.
@@ -162,16 +186,27 @@ fn with_bound_path(req: &RtRequest, path: &str) -> Option<RtRequest> {
 }
 
 /// The error envelope this service answers `status` / `code` / `message` with,
-/// carrying its correlation pair.
+/// carrying its correlation pair and the members the refusal names what the
+/// request named in.
 ///
 /// The one renderer for a failure this module answers itself; a failure a
 /// handler raised or the boundary refused is rendered by the protocol and
 /// reaches the same envelope through [`with_error_correlation`].
-fn error_response(status: u16, code: &str, message: &str) -> RtResponse {
+fn error_response(status: u16, code: &str, message: &str, details: &[(&str, &str)]) -> RtResponse {
     let (request_id, host_id) = crate::state::new_error_correlation();
+    let named: String = details
+        .iter()
+        .map(|(element, value)| {
+            format!(
+                "<{element}>{value}</{element}>",
+                element = xml_escape(element),
+                value = xml_escape(value)
+            )
+        })
+        .collect();
     let body = format!(
         "<ErrorResponse xmlns=\"{namespace}\"><Error><Type>{SENDER}</Type><Code>{code}</Code>\
-         <Message>{message}</Message></Error>\
+         <Message>{message}</Message>{named}</Error>\
          <{REQUEST_ID_ELEMENT}>{request_id}</{REQUEST_ID_ELEMENT}>\
          <{HOST_ID_ELEMENT}>{host_id}</{HOST_ID_ELEMENT}></ErrorResponse>",
         namespace = xml_escape(XML_NAMESPACE),
@@ -241,12 +276,22 @@ pub fn with_error_correlation(mut resp: RtResponse) -> RtResponse {
 
 /// `resp`'s body when `resp` is a refusal the request boundary made before any
 /// handler ran, and `None` for anything else — including every refusal this
-/// service's own handlers answer, whose codes are its own.
+/// service's own handlers answer.
+///
+/// A handler's refusal can carry the framework's own error code too
+/// ([`FRAMEWORK_REFUSAL_CODE`] is what `Scaffolded::validation` renders), so
+/// the code alone does not say which layer refused: the document does. The
+/// pre-dispatch renderer writes the XML DECLARATION ahead of its envelope and
+/// the protocol's own serializer writes none, which is what tells a refusal
+/// made before any handler ran from one a handler answered.
 fn framework_refusal(resp: &RtResponse) -> Option<&str> {
     if resp.status().as_u16() != REFUSED {
         return None;
     }
     let body = body_text(resp)?;
+    if !body.trim_start().starts_with(XML_DECLARATION) {
+        return None;
+    }
     (element_text(body, "Code")? == FRAMEWORK_REFUSAL_CODE).then_some(body)
 }
 
@@ -270,26 +315,88 @@ fn refused_over_request_token(refusal: &str) -> bool {
     .any(|marker| message.contains(marker))
 }
 
+/// Whether `refusal` is the boundary refusing the request because it could not
+/// READ it, rather than because a value it did read broke a rule the model
+/// states.
+///
+/// The two are rendered alike — 400 under the framework's own code — and only
+/// the second has a structured form: an absent required member and a value
+/// outside a declared bound are described as a `Refusal` and stated through one
+/// envelope, while a codec failure carries the codec's own sentence. The
+/// envelope's fixed words ([`VALIDATION_ENVELOPE_MARKER`]) are what tells them
+/// apart.
+fn refused_as_unreadable(refusal: &str) -> bool {
+    element_text(refusal, "Message").is_some_and(|message| {
+        !message.contains(VALIDATION_ENVELOPE_MARKER)
+    })
+}
+
+/// Whether `path` names an access point by a name the wire cannot address, and
+/// whether it names one an access point may not be given.
+///
+/// Read off the PATH and not off a deserialized member: an access point name is
+/// one segment of the request path, so the rules it is held to are answered
+/// before any operation runs — for every route that addresses an access point
+/// by name — and the two rules are answered apart (see
+/// [`crate::state::addressable_access_point_name`] and
+/// [`crate::state::valid_access_point_name`]). `None` for a path that names no
+/// access point at all.
+fn access_point_name_refusal(path: &str) -> Option<(u16, &'static str, &'static str)> {
+    let rest = path.strip_prefix(ACCESS_POINT_PATH)?;
+    let name = rest.split('/').next().unwrap_or_default();
+    if name.is_empty() {
+        return None;
+    }
+    if !crate::state::addressable_access_point_name(name) {
+        return Some((
+            crate::state::INVALID_URI_STATUS,
+            crate::state::INVALID_URI_CODE,
+            crate::state::INVALID_URI_MESSAGE,
+        ));
+    }
+    if !crate::state::valid_access_point_name(name) {
+        return Some((
+            crate::state::REQUEST_INVALID_STATUS,
+            crate::state::REQUEST_INVALID_CODE,
+            crate::state::INVALID_ACCESS_POINT_NAME_MESSAGE,
+        ));
+    }
+    None
+}
+
 /// This service's own answer to a refusal the boundary stated in the
 /// framework's vocabulary, or `None` to keep the framework's rendering.
 ///
 /// Reads the REQUEST and the REFUSAL, not the operation: a GET under the
 /// asynchronous-request path space addresses one request token, and a token the
 /// boundary would not read is one this service never minted, so it names no
-/// request — which is the one refusal that says so (see the module docs).
+/// request — which is the one refusal that says so (see the module docs). A
+/// request whose BODY the codec could not read at all is restated as the one
+/// refusal this service answers a request it will not carry out with, whatever
+/// the member and whatever the value: the codec's own sentence is neither this
+/// service's wording nor a code a client branches on.
 fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
     let refusal = framework_refusal(resp)?;
-    if !req.method().eq_ignore_ascii_case("GET")
-        || !request_path(req.uri()).starts_with(ASYNC_REQUEST_PATH)
-        || !refused_over_request_token(refusal)
+    if req.method().eq_ignore_ascii_case("GET")
+        && request_path(req.uri()).starts_with(ASYNC_REQUEST_PATH)
+        && refused_over_request_token(refusal)
     {
-        return None;
+        return Some(error_response(
+            crate::state::NO_SUCH_ASYNC_REQUEST_STATUS,
+            crate::state::NO_SUCH_ASYNC_REQUEST_CODE,
+            crate::state::NO_SUCH_ASYNC_REQUEST_MESSAGE,
+            &[],
+        ));
     }
-    Some(error_response(
-        crate::state::NO_SUCH_ASYNC_REQUEST_STATUS,
-        crate::state::NO_SUCH_ASYNC_REQUEST_CODE,
-        crate::state::NO_SUCH_ASYNC_REQUEST_MESSAGE,
-    ))
+    if refused_as_unreadable(refusal) {
+        return Some(error_response(
+            crate::state::REQUEST_INVALID_STATUS,
+            crate::state::REQUEST_INVALID_CODE,
+            crate::state::REQUEST_INVALID_MESSAGE,
+            &[],
+        ));
+    }
+    None
 }
 
 /// The generated definition, with the error envelope finished on the three
@@ -397,6 +504,18 @@ impl ErasedOperation for Dispatch {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
+            // The URI-parsing stage: a path that names an access point by a
+            // name the wire cannot address is not a path this service can
+            // parse, and one naming a name an access point may not be given is
+            // a request it will not carry out. Both are answered here — before
+            // an operation is named, and so before anything is read, created or
+            // deleted — and each names the path the caller sent.
+            let path = request_path(req.uri());
+            if let Some((status, code, message)) = access_point_name_refusal(path) {
+                // The `URI` member carries the path the caller sent, which is
+                // what it has to change.
+                return error_response(status, code, message, &[("URI", path)]);
+            }
             // A sub-resource of a Multi-Region Access Point: the operation that
             // route names, handed the request with the route's trailing literal
             // segments taken off its path, so the greedy label binds the
@@ -430,8 +549,8 @@ mod tests {
 
     use super::*;
 
-    /// An error envelope as the protocol serializer renders one: no correlation
-    /// pair.
+    /// An error envelope as the PROTOCOL serializer renders one, for a failure a
+    /// handler answered: no correlation pair, and no XML declaration.
     fn serialized_error(status: u16, code: &str, message: &str) -> RtResponse {
         let body = format!(
             "<ErrorResponse xmlns=\"{XML_NAMESPACE}\"><Error><Type>Sender</Type>\
@@ -439,6 +558,21 @@ mod tests {
         );
         RtResponse::new(
             StatusCode::try_from(status).expect("a valid status"),
+            SdkBody::from(body),
+        )
+    }
+
+    /// An error envelope as the PRE-DISPATCH renderer renders one, for a request
+    /// refused before any handler ran: the same envelope behind the XML
+    /// declaration that renderer opens with.
+    fn boundary_refusal(code: &str, message: &str) -> RtResponse {
+        let body = format!(
+            "<?xml version=\"1.0\"?><ErrorResponse xmlns=\"{XML_NAMESPACE}\">\
+             <Error><Type>Sender</Type><Code>{code}</Code><Message>{message}</Message>\
+             </Error></ErrorResponse>"
+        );
+        RtResponse::new(
+            StatusCode::try_from(REFUSED).expect("a valid status"),
             SdkBody::from(body),
         )
     }
@@ -511,8 +645,7 @@ mod tests {
     #[test]
     fn a_token_the_boundary_refused_is_restated_as_the_not_found_refusal() {
         let req = request("GET", "/v20180820/async-requests/mrap/not-an-arn");
-        let refusal = serialized_error(
-            400,
+        let refusal = boundary_refusal(
             FRAMEWORK_REFUSAL_CODE,
             "1 validation error detected: Value &apos;not-an-arn&apos; at \
              &apos;requestTokenARN&apos; failed to satisfy constraint: Member must satisfy \
@@ -539,13 +672,110 @@ mod tests {
     }
 
     #[test]
+    fn a_body_the_codec_could_not_read_is_restated_as_the_invalid_request_refusal() {
+        // One row per way the codec can fail to READ a request: a value that is
+        // not of the type its member declares, and a body that is not a
+        // document at all. Neither has a structured form, so neither carries
+        // the refusal envelope's own words.
+        for (case, message) in [
+            ("a boolean member carrying something else", "invalid boolean: &apos;maybe&apos;"),
+            ("an integer member carrying something else", "invalid integer: &apos;soon&apos;"),
+            ("a body that is not XML", "xml parse error: ill-formed document"),
+        ] {
+            let req = request("PUT", "/v20180820/accesspoint/reports-ap");
+            let refusal = boundary_refusal(FRAMEWORK_REFUSAL_CODE, message);
+            let restated = restated(&req, &refusal).expect("the refusal is restated");
+            let body = body_text(&restated).expect("a text body").to_string();
+            assert_eq!(
+                (
+                    restated.status().as_u16(),
+                    element_text(&body, "Code").map(str::to_string),
+                    element_text(&body, "Message").map(str::to_string),
+                ),
+                (
+                    crate::state::REQUEST_INVALID_STATUS,
+                    Some(crate::state::REQUEST_INVALID_CODE.to_string()),
+                    Some(crate::state::REQUEST_INVALID_MESSAGE.to_string()),
+                ),
+                "case {case:?}: expected the invalid-request refusal, got {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_rules_an_access_point_name_is_held_to_are_answered_apart() {
+        let shortest = *crate::state::ACCESS_POINT_NAME_LEN.start();
+        let longest = *crate::state::ACCESS_POINT_NAME_LEN.end();
+        let unparseable = Some((
+            crate::state::INVALID_URI_STATUS,
+            crate::state::INVALID_URI_CODE,
+            crate::state::INVALID_URI_MESSAGE,
+        ));
+        let invalid_name = Some((
+            crate::state::REQUEST_INVALID_STATUS,
+            crate::state::REQUEST_INVALID_CODE,
+            crate::state::INVALID_ACCESS_POINT_NAME_MESSAGE,
+        ));
+        // Each published bound and one past it, plus one row per rule the name
+        // is held to: parsing the path reads the characters a segment carries
+        // unencoded, within the length a name may have, and the parsed segment
+        // is then held to the name's own rules.
+        let cases = [
+            ("at the shortest", "a".repeat(shortest), None),
+            ("one under the shortest", "a".repeat(shortest - 1), invalid_name),
+            ("one character", "a".to_string(), invalid_name),
+            ("one inside the longest", "a".repeat(longest - 1), None),
+            ("at the longest", "b".repeat(longest), None),
+            ("one past the longest", "c".repeat(longest + 1), unparseable),
+            ("far past the longest", "d".repeat(longest * 4), unparseable),
+            ("digits and hyphens", "ap-7-9".to_string(), None),
+            ("an upper-case letter", "Reports-ap".to_string(), unparseable),
+            ("an underscore", "reports_ap".to_string(), unparseable),
+            ("a dot", "reports.ap".to_string(), invalid_name),
+            ("a leading hyphen", "-reports-ap".to_string(), invalid_name),
+            ("a trailing hyphen", "reports-ap-".to_string(), invalid_name),
+            ("the alias suffix", "reports-s3alias".to_string(), invalid_name),
+            ("an escaped character", "reports%20ap".to_string(), unparseable),
+            ("a sub-delimiter", "reports+ap".to_string(), unparseable),
+            ("a character outside the set", "reports!ap".to_string(), unparseable),
+        ];
+        for (case, name, refusal) in cases {
+            for path in [
+                format!("/v20180820/accesspoint/{name}"),
+                format!("/v20180820/accesspoint/{name}/policy"),
+            ] {
+                assert_eq!(
+                    access_point_name_refusal(&path),
+                    refusal,
+                    "case {case:?} ({} characters) at {path:?}: expected {refusal:?}",
+                    name.chars().count()
+                );
+            }
+            assert_eq!(
+                access_point_name_refusal(&format!(
+                    "/v20180820/accesspointforobjectlambda/{name}"
+                )),
+                None,
+                "case {case:?}: an Object Lambda access point is not in this path space"
+            );
+        }
+        // The listing route names no access point at all.
+        for path in ["/v20180820/accesspoint", "/v20180820/accesspoint/"] {
+            assert_eq!(
+                access_point_name_refusal(path),
+                None,
+                "case {path:?}: expected a path that names no access point to be served"
+            );
+        }
+    }
+
+    #[test]
     fn a_refusal_this_rule_does_not_own_keeps_its_own_wording() {
-        let cases: [(&str, RtRequest, RtResponse); 3] = [
+        let cases: [(&str, RtRequest, RtResponse); 4] = [
             (
                 "a refusal over another member of the same route",
                 request("GET", "/v20180820/async-requests/mrap/arn:aws:s3:::request"),
-                serialized_error(
-                    400,
+                boundary_refusal(
                     FRAMEWORK_REFUSAL_CODE,
                     "1 validation error detected: Value &apos;nope&apos; at &apos;accountId&apos; \
                      failed to satisfy constraint: Member must satisfy regular expression \
@@ -555,8 +785,7 @@ mod tests {
             (
                 "a token refusal on another route",
                 request("GET", "/v20180820/mrap/instances/reports-mrap"),
-                serialized_error(
-                    400,
+                boundary_refusal(
                     FRAMEWORK_REFUSAL_CODE,
                     "1 validation error detected: Value &apos;x&apos; at \
                      &apos;requestTokenARN&apos; failed to satisfy constraint: Member must \
@@ -567,6 +796,18 @@ mod tests {
                 "a refusal this service worded itself",
                 request("GET", "/v20180820/async-requests/mrap/arn:aws:s3:::request"),
                 serialized_error(404, "NoSuchAsyncRequest", "The specified request was not found."),
+            ),
+            // A handler's own refusal can carry the framework's error code; the
+            // document says which layer answered, so the handler's wording
+            // stands.
+            (
+                "a handler refusing the request it was given",
+                request("GET", "/v20180820/accesspoint?nextToken=not-a-token"),
+                serialized_error(
+                    400,
+                    FRAMEWORK_REFUSAL_CODE,
+                    "NextToken is not a continuation token this service issued",
+                ),
             ),
         ];
         for (case, req, resp) in cases {

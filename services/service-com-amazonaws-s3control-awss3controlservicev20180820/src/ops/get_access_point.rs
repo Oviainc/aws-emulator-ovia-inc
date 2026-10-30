@@ -193,14 +193,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_date: Some(record.creation_date),
             alias: Some(record.alias.clone()),
             access_point_arn: Some(record.arn.clone()),
-            // `Endpoints` is reported for S3 on Outposts access points only, and
-            // Outposts is not emulated.
-            endpoints: None,
-            bucket_account_id: record.bucket_account_id.clone(),
+            // The access point's data-plane hosts, derived from the Region it
+            // lives in: a client resolves them from here rather than building
+            // one.
+            endpoints: Some(crate::state::access_point_endpoints(&record.region)),
+            bucket_account_id: Some(record.bucket_account_id.clone()),
             // Set only for an access point attached to a data source (FSx), which
             // `CreateAccessPoint` here never does.
             data_source_id: None,
             data_source_type: None,
+            access_point_type: Some(record.access_point_type.clone()),
         })
     }
 }

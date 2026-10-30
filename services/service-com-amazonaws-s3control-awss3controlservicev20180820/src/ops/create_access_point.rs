@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.access_points.contains_key(&key) {
             // A name identifies one access point within an account, so a repeat
             // create is a conflict, not a second record under the same key.
-            return Err(crate::state::access_point_already_owned_by_you(&input.name));
+            return Err(crate::state::access_point_already_owned_by_you());
         }
         // The store is bounded: past its quota a create is refused rather than
         // adding another record, so a caller cannot grow this process's state
@@ -209,9 +209,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name.clone(),
             account_id: input.account_id.clone(),
             bucket: input.bucket.clone(),
-            bucket_account_id: input.bucket_account_id.clone(),
+            // An absent `BucketAccountId` means the bucket belongs to the
+            // account that owns the access point, not that it has no owner.
+            bucket_account_id: crate::state::effective_bucket_account_id(
+                input.bucket_account_id.as_deref(),
+                &input.account_id,
+            ),
             arn: crate::state::access_point_arn(&region, &input.name),
+            region: region.clone(),
             alias: crate::state::access_point_alias(&input.account_id, &input.name),
+            // What this create makes: an access point over a general-purpose
+            // bucket. The creates that would make another kind do not reach
+            // here — a `Scope` is refused above, and an Outposts or data-source
+            // access point is not served at all.
+            access_point_type: crate::state::ACCESS_POINT_TYPE_REGULAR.to_string(),
             network_origin: crate::state::network_origin(input.vpc_configuration.as_ref()),
             vpc_configuration: input.vpc_configuration.clone(),
             // An access point is blocked from public access by default: the

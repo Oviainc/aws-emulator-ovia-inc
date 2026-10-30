@@ -18,7 +18,15 @@ pub struct GetAccessPointInput {
     pub name: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.s3control#GetAccessPointResult")]
+/// What `GetAccessPoint` reports: the modelled `GetAccessPointResult`, plus
+/// `AccessPointType`.
+///
+/// Member set, order and requiredness from
+/// `smithy_query(query="operation", operation="GetAccessPoint")`, plus
+/// `AccessPointType`, which is RECORDED BEHAVIOUR rather than modelled — see
+/// `AccessPoint` in `types::shared_types`, whose listing entry carries the same
+/// member, and `types::unmodelled_member_wire` for why the shape is
+/// hand-written.
 #[derive(Debug, Clone, Default)]
 pub struct GetAccessPointOutput {
     pub name: Option<String>,
@@ -33,5 +41,90 @@ pub struct GetAccessPointOutput {
     pub bucket_account_id: Option<String>,
     pub data_source_id: Option<String>,
     pub data_source_type: Option<String>,
+    pub access_point_type: Option<String>,
 }
+
+s3c_schema_and_codec!(
+    GetAccessPointOutput,
+    GET_ACCESS_POINT_OUTPUT_SCHEMA,
+    "com.amazonaws.s3control#GetAccessPointResult",
+    "com.amazonaws.s3control",
+    "GetAccessPointResult",
+    (M_NAME, name, "Name", 0, opt, string),
+    (M_BUCKET, bucket, "Bucket", 1, opt, string),
+    (
+        M_NETWORK_ORIGIN,
+        network_origin,
+        "NetworkOrigin",
+        2,
+        opt,
+        string
+    ),
+    (
+        M_VPC_CONFIGURATION,
+        vpc_configuration,
+        "VpcConfiguration",
+        3,
+        opt,
+        struct_of(VpcConfiguration)
+    ),
+    (
+        M_PUBLIC_ACCESS_BLOCK_CONFIGURATION,
+        public_access_block_configuration,
+        "PublicAccessBlockConfiguration",
+        4,
+        opt,
+        struct_of(PublicAccessBlockConfiguration)
+    ),
+    (
+        M_CREATION_DATE,
+        creation_date,
+        "CreationDate",
+        5,
+        opt,
+        date_time
+    ),
+    (M_ALIAS, alias, "Alias", 6, opt, string),
+    (
+        M_ACCESS_POINT_ARN,
+        access_point_arn,
+        "AccessPointArn",
+        7,
+        opt,
+        string
+    ),
+    (M_ENDPOINTS, endpoints, "Endpoints", 8, opt, map_of_string),
+    (
+        M_BUCKET_ACCOUNT_ID,
+        bucket_account_id,
+        "BucketAccountId",
+        9,
+        opt,
+        string
+    ),
+    (
+        M_DATA_SOURCE_ID,
+        data_source_id,
+        "DataSourceId",
+        10,
+        opt,
+        string
+    ),
+    (
+        M_DATA_SOURCE_TYPE,
+        data_source_type,
+        "DataSourceType",
+        11,
+        opt,
+        string
+    ),
+    (
+        M_ACCESS_POINT_TYPE,
+        access_point_type,
+        "AccessPointType",
+        12,
+        opt,
+        string
+    ),
+);
 

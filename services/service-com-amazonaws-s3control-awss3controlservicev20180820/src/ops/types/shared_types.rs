@@ -1117,7 +1117,19 @@ pub struct StorageLensTag {
     pub value: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.s3control#AccessPoint")]
+/// One entry of an access point listing: the modelled `AccessPoint`, plus
+/// `AccessPointType`.
+///
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.s3control#AccessPoint")`,
+/// plus `AccessPointType`, which is RECORDED BEHAVIOUR rather than modelled:
+/// the on-disk model declares only
+/// `Name`/`NetworkOrigin`/`VpcConfiguration`/`Bucket`/`AccessPointArn`/`Alias`/
+/// `BucketAccountId`/`DataSourceId`/`DataSourceType`, while the service reports
+/// the access point's type on every entry of every listing. The model evidently
+/// predates the member, so it is appended LAST and the shape is hand-written
+/// (see `types::unmodelled_member_wire`): the derive admits only the members
+/// the model declares.
 #[derive(Debug, Clone, Default)]
 pub struct AccessPoint {
     pub name: String,
@@ -1129,7 +1141,75 @@ pub struct AccessPoint {
     pub bucket_account_id: Option<String>,
     pub data_source_id: Option<String>,
     pub data_source_type: Option<String>,
+    pub access_point_type: Option<String>,
 }
+
+s3c_schema_and_codec!(
+    AccessPoint,
+    ACCESS_POINT_SCHEMA,
+    "com.amazonaws.s3control#AccessPoint",
+    "com.amazonaws.s3control",
+    "AccessPoint",
+    (M_NAME, name, "Name", 0, req, string),
+    (
+        M_NETWORK_ORIGIN,
+        network_origin,
+        "NetworkOrigin",
+        1,
+        req,
+        string
+    ),
+    (
+        M_VPC_CONFIGURATION,
+        vpc_configuration,
+        "VpcConfiguration",
+        2,
+        opt,
+        struct_of(VpcConfiguration)
+    ),
+    (M_BUCKET, bucket, "Bucket", 3, req, string),
+    (
+        M_ACCESS_POINT_ARN,
+        access_point_arn,
+        "AccessPointArn",
+        4,
+        opt,
+        string
+    ),
+    (M_ALIAS, alias, "Alias", 5, opt, string),
+    (
+        M_BUCKET_ACCOUNT_ID,
+        bucket_account_id,
+        "BucketAccountId",
+        6,
+        opt,
+        string
+    ),
+    (
+        M_DATA_SOURCE_ID,
+        data_source_id,
+        "DataSourceId",
+        7,
+        opt,
+        string
+    ),
+    (
+        M_DATA_SOURCE_TYPE,
+        data_source_type,
+        "DataSourceType",
+        8,
+        opt,
+        string
+    ),
+    (
+        M_ACCESS_POINT_TYPE,
+        access_point_type,
+        "AccessPointType",
+        9,
+        opt,
+        string
+    ),
+);
 
 /// The values `AsyncOperationName` accepts on the wire.
 pub const ASYNC_OPERATION_NAME_VALUES: &[&str] = &["CreateMultiRegionAccessPoint", "DeleteMultiRegionAccessPoint", "PutMultiRegionAccessPointPolicy"];

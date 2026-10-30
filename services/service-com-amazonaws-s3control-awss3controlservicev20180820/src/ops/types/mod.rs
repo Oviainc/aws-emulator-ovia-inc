@@ -14,6 +14,13 @@
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
 
+// The schema and codec macros a structure needs when the wire carries a member
+// the on-disk model does not declare — see that module's own note.
+// `#[macro_use]`, and declared FIRST, so the macros are in the textual scope of
+// every `*_types` module below.
+#[macro_use]
+pub mod unmodelled_member_wire;
+
 pub mod associate_access_grants_identity_center_types;
 pub mod create_access_grant_types;
 pub mod create_access_grants_instance_types;

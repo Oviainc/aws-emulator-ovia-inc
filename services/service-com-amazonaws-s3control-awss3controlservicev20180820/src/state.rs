@@ -36,9 +36,23 @@ pub struct AccessPointRecord {
     /// on the record so a record passed on its own still names its owner.
     pub account_id: String,
     pub bucket: String,
-    pub bucket_account_id: Option<String>,
+    /// The account that owns the BUCKET this access point fronts — the account
+    /// the create request named in `BucketAccountId`, or the account that owns
+    /// the access point when it named none ([`effective_bucket_account_id`]).
+    /// Not an `Option`: a bucket always has an owning account, so every read
+    /// reports it.
+    pub bucket_account_id: String,
     pub arn: String,
+    /// The Region the access point lives in — the one the create request was
+    /// signed for. Recorded because the access point's data-plane endpoints are
+    /// Regional ([`access_point_endpoints`]) and its ARN names the same Region.
+    pub region: String,
     pub alias: String,
+    /// What this access point fronts, as `AccessPointType` reports it: one of
+    /// [`ACCESS_POINT_TYPE_REGULAR`]. Recorded by the create, which is what
+    /// decides it, so every read projects the stored value rather than deciding
+    /// again.
+    pub access_point_type: String,
     /// One of [`NETWORK_ORIGIN_VALUES`] — `VPC` when the access point is
     /// VPC-restricted, otherwise `Internet`.
     pub network_origin: String,
@@ -72,13 +86,36 @@ impl AccessPointRecord {
             bucket: self.bucket.clone(),
             access_point_arn: Some(self.arn.clone()),
             alias: Some(self.alias.clone()),
-            bucket_account_id: self.bucket_account_id.clone(),
+            bucket_account_id: Some(self.bucket_account_id.clone()),
             // S3 on Outposts / FSx data sources are not emulated, so a record
             // created here is attached to no data source.
             data_source_id: None,
             data_source_type: None,
+            access_point_type: Some(self.access_point_type.clone()),
         }
     }
+}
+
+/// The type an access point over a general-purpose bucket reports, which is
+/// the one kind `CreateAccessPoint` makes here: a create that would make
+/// another — one scoped to a directory bucket, one on an Outpost, one attached
+/// to a data source — is refused rather than served, so no record carries
+/// another type.
+pub const ACCESS_POINT_TYPE_REGULAR: &str = "Regular";
+
+/// The account that owns the bucket an access point fronts: the one the create
+/// request named, or — when it named none — the account that owns the access
+/// point.
+///
+/// `CreateAccessPoint$BucketAccountId` states the rule: "For same account
+/// access point when your bucket and access point belong to the same account
+/// owner, the BucketAccountId is not required. For cross-account access point
+/// when your bucket and access point are not in the same account, the
+/// BucketAccountId is required." So an absent member means the two accounts
+/// are the SAME one, not that the bucket has no owner — which is why every
+/// read reports the owning account whether the create named it or not.
+pub fn effective_bucket_account_id(requested: Option<&str>, account_id: &str) -> String {
+    requested.unwrap_or(account_id).to_string()
 }
 
 /// The public-access block settings an access point resource carries when the
@@ -2205,6 +2242,105 @@ pub fn access_point_arn(region: &str, name: &str) -> String {
     ::emulator_server::emulator_arn("s3", region, &format!("accesspoint/{name}"))
 }
 
+/// The host an access point's data plane is reached at, in `region`, over
+/// `variant` — the Regional S3 access point endpoints, whose host is built from
+/// the `s3-accesspoint` service name, the FIPS and dual-stack markers the
+/// variant carries, the Region and the partition's DNS suffix.
+fn access_point_endpoint(region: &str, fips: bool, dualstack: bool) -> String {
+    let service = if fips {
+        "s3-accesspoint-fips"
+    } else {
+        "s3-accesspoint"
+    };
+    let stack = if dualstack { "dualstack." } else { "" };
+    format!("{service}.{stack}{region}.{DNS_SUFFIX}")
+}
+
+/// The DNS suffix of the partition this emulator answers for.
+const DNS_SUFFIX: &str = "amazonaws.com";
+
+/// The endpoints an access point is reachable at, keyed by the IP stack and
+/// FIPS mode each one serves — what `GetAccessPoint$Endpoints` reports.
+///
+/// A client resolves the access point's DATA-PLANE host from this map rather
+/// than building one, so all four Regional variants are reported: plain IPv4,
+/// FIPS, dual-stack, and FIPS over dual-stack. Every host is DERIVED from the
+/// Region the access point lives in, so an access point in another Region
+/// reports another four.
+pub fn access_point_endpoints(region: &str) -> ::std::collections::HashMap<String, String> {
+    [
+        ("ipv4", false, false),
+        ("fips", true, false),
+        ("fips_dualstack", true, true),
+        ("dualstack", false, true),
+    ]
+    .into_iter()
+    .map(|(variant, fips, dualstack)| {
+        (
+            variant.to_string(),
+            access_point_endpoint(region, fips, dualstack),
+        )
+    })
+    .collect()
+}
+
+/// The bounds Amazon S3 states for the LENGTH of an access point name: "Must be
+/// between 3 and 50 characters long".
+///
+/// The modelled `AccessPointName` maximum is far higher (255) because the same
+/// member also carries the URL-encoded ARN of an S3 on Outposts access point,
+/// which this service does not serve, and the modelled minimum (3) is the only
+/// one of S3's rules the model states at all.
+pub const ACCESS_POINT_NAME_LEN: ::std::ops::RangeInclusive<usize> = 3..=50;
+
+/// The characters the HOST an access point is reached at is written in: the
+/// lowercase letters, digits and hyphens a label carries, and the dots that
+/// separate labels. A character outside this set cannot be part of a host at
+/// all, so a path naming an access point with one cannot be parsed — see
+/// [`addressable_access_point_name`].
+fn host_character(character: char) -> bool {
+    character.is_ascii_lowercase() || character.is_ascii_digit() || matches!(character, '-' | '.')
+}
+
+/// Whether `name` is one the wire can ADDRESS.
+///
+/// An access point name is one segment of the request path
+/// (`/v20180820/accesspoint/{Name}`) and the leading label of the access
+/// point's own alias host, and the rules S3 states for a name split in two
+/// across the stages that read it. PARSING the path comes first, and it reads
+/// the name as part of a HOST: at most [`ACCESS_POINT_NAME_LEN`]'s maximum
+/// characters ("Must be between 3 and 50 characters long"), all of them
+/// [`host_character`]s. A segment that is not that cannot be parsed, and is
+/// answered [`INVALID_URI_CODE`]. The rest of the rules are the name's own and
+/// are held against the parsed name by [`valid_access_point_name`].
+pub fn addressable_access_point_name(name: &str) -> bool {
+    name.chars().count() <= *ACCESS_POINT_NAME_LEN.end() && name.chars().all(host_character)
+}
+
+/// Whether `name` is a name an access point may be GIVEN, for a path segment
+/// this service could already parse ([`addressable_access_point_name`]).
+///
+/// The rest of the rules S3 states for an access point name: it must be at
+/// least [`ACCESS_POINT_NAME_LEN`]'s minimum, it "can consist only of lowercase
+/// letters, numbers, and hyphens", it "must begin and end with a letter or
+/// number", and it "must not end with the suffix -s3alias" ([`ALIAS_TAIL`],
+/// which is what an ALIAS ends in, so a name ending in it could not be told
+/// from one). A name that breaks one of these sits in a path this service
+/// parses perfectly well, so it is refused as a request this service will not
+/// carry out ([`INVALID_ACCESS_POINT_NAME_MESSAGE`]) rather than as an
+/// unparseable URI.
+pub fn valid_access_point_name(name: &str) -> bool {
+    let alphanumeric =
+        |character: char| character.is_ascii_lowercase() || character.is_ascii_digit();
+    ACCESS_POINT_NAME_LEN.contains(&name.chars().count())
+        && name
+            .chars()
+            .all(|character| alphanumeric(character) || character == '-')
+        && name.starts_with(alphanumeric)
+        && name.ends_with(alphanumeric)
+        && !name.ends_with(ALIAS_TAIL)
+}
+
 /// The ARN of an S3 Storage Lens configuration.
 ///
 /// `StorageLensConfiguration$StorageLensArn` documents the member as read-only
@@ -2553,13 +2689,101 @@ pub fn put_policy_details_fingerprint(details: &PutMultiRegionAccessPointPolicyI
 
 /// `NoSuchAccessPoint` (HTTP 404): no access point of that name is owned by the
 /// account the request names.
+///
+/// The message is FIXED text, naming no access point: it is what the service
+/// answers for every access point that is not there. WHICH name was looked up
+/// travels in the member beside it ([`ACCESS_POINT_NAME_MEMBER`]), which is
+/// where a client reads the offending identity from instead of re-parsing the
+/// request it sent.
 pub fn no_such_access_point<E>(name: &str) -> crate::scaffolded::Scaffolded<E> {
-    crate::scaffolded::Scaffolded::service_failure(
+    crate::scaffolded::Scaffolded::service_failure_naming(
         "NoSuchAccessPoint",
         404,
-        format!("The specified access point does not exist: {name}"),
+        "The specified accesspoint does not exist",
+        vec![crate::scaffolded::ErrorDetail::new(
+            &ACCESS_POINT_NAME_MEMBER,
+            name,
+        )],
     )
 }
+
+/// `InvalidURI` (HTTP 400): the request path is not one this service can parse,
+/// because the access point name it carries is longer than the wire can address
+/// ([`ADDRESSABLE_ACCESS_POINT_NAME_LEN`]).
+///
+/// A refusal of the URI rather than of a member: it is answered by
+/// `crate::service::envelope`, which reads the path before any operation is
+/// named, so no access point is looked up, created or deleted. The message is
+/// fixed text and the path the caller sent travels in the `URI` member beside
+/// it.
+///
+/// The wire `<Code>` a client branches on.
+pub const INVALID_URI_CODE: &str = "InvalidURI";
+
+/// The HTTP status of an [`INVALID_URI_CODE`] refusal.
+pub const INVALID_URI_STATUS: u16 = 400;
+
+/// The message of an [`INVALID_URI_CODE`] refusal: fixed text, naming no path.
+pub const INVALID_URI_MESSAGE: &str = "Couldn't parse the specified URI.";
+
+/// `InvalidRequest` (HTTP 400): a request this service will not carry out,
+/// including one whose body it could not READ at all.
+///
+/// The message is the fixed sentence S3 Control answers such a request with. It
+/// states the CLASS and nothing about the value that caused it: a message built
+/// from request text would make a client branch on prose, and the condition is
+/// the same one whatever the value.
+pub fn request_invalid<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        REQUEST_INVALID_CODE,
+        REQUEST_INVALID_STATUS,
+        REQUEST_INVALID_MESSAGE,
+    )
+}
+
+/// The wire `<Code>` of [`request_invalid`], which a client branches on.
+///
+/// Named separately because the refusal is answered from two places: a handler
+/// that will not carry out the request it was given, and
+/// `crate::service::envelope`, which answers it for a request body the codec
+/// could not read — the same refusal, so it carries the same code, status and
+/// message.
+pub const REQUEST_INVALID_CODE: &str = "InvalidRequest";
+
+/// The HTTP status of [`request_invalid`].
+pub const REQUEST_INVALID_STATUS: u16 = 400;
+
+/// The message of [`request_invalid`]: fixed text, naming no value.
+pub const REQUEST_INVALID_MESSAGE: &str = "Request invalid";
+
+/// The message S3 Control answers a request naming an access point whose name
+/// it will not accept with, under [`REQUEST_INVALID_CODE`] and
+/// [`REQUEST_INVALID_STATUS`]: fixed text, naming no name.
+///
+/// A name the wire can ADDRESS but an access point may not be GIVEN
+/// ([`valid_access_point_name`]) is a request this service will not carry out,
+/// which is a different answer from a path it could not parse at all
+/// ([`INVALID_URI_CODE`]) — the two rules the name is held to are what the
+/// refusals tell apart.
+pub const INVALID_ACCESS_POINT_NAME_MESSAGE: &str = "Your Amazon S3 AccessPoint name is invalid";
+
+/// The `<Error>` member a refusal names the access point it was asked about in.
+///
+/// S3 Control's model declares no error shape for these operations, so this
+/// member exists only on the wire: it carries the name the REQUEST named, which
+/// is what a client reads the offending identity out of instead of re-parsing
+/// the request it sent.
+static ACCESS_POINT_NAME_MEMBER: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.s3control#ErrorDetails$AccessPointName",
+        "com.amazonaws.s3control",
+        "AccessPointName",
+    ),
+    ShapeType::String,
+    "AccessPointName",
+    1,
+)
+.with_xml_name("AccessPointName");
 
 /// `NoSuchAccessPointPolicy` (HTTP 404): the access point exists but carries no
 /// policy, because none was ever put on it (or it was deleted).
@@ -2584,11 +2808,15 @@ pub fn public_policy_access_denied<E>() -> crate::scaffolded::Scaffolded<E> {
 /// `AccessPointAlreadyOwnedByYou` (HTTP 409): the account already owns an access
 /// point of that name, so creating it again would be a second resource under one
 /// name.
-pub fn access_point_already_owned_by_you<E>(name: &str) -> crate::scaffolded::Scaffolded<E> {
+///
+/// The message is the fixed sentence the S3 family answers a create of a
+/// resource the caller already owns with, naming no access point: the caller
+/// asked for one by name and the answer is about that same one.
+pub fn access_point_already_owned_by_you<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_failure(
         "AccessPointAlreadyOwnedByYou",
         409,
-        format!("An access point with the same name already exists: {name}"),
+        "Your previous request to create the named accesspoint succeeded and you already own it.",
     )
 }
 
@@ -2851,10 +3079,10 @@ pub fn no_such_multi_region_access_point<E>(
 /// The routing operations take a `MultiRegionAccessPointId` — the
 /// service-assigned ALIAS of an access point, not its name — and a value that
 /// names none is a request this service will not carry out rather than a
-/// resource that is missing: the code and the fixed message are the ones S3
-/// Control answers such a request with.
+/// resource that is missing — which is [`request_invalid`], the one refusal
+/// this service answers a request it will not carry out with.
 pub fn invalid_multi_region_access_point_request<E>() -> crate::scaffolded::Scaffolded<E> {
-    crate::scaffolded::Scaffolded::service_failure("InvalidRequest", 400, "Request invalid")
+    request_invalid()
 }
 
 /// `MultiRegionAccessPointAlreadyOwnedByYou` (HTTP 409): the account already

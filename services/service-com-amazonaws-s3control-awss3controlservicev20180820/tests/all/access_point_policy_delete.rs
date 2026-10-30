@@ -423,8 +423,17 @@ async fn deleting_a_policy_refuses_an_access_point_the_account_does_not_own() {
         );
         assert_eq!(
             refused.text("Message").as_deref(),
-            Some(format!("The specified access point does not exist: {name}").as_str()),
+            Some("The specified accesspoint does not exist"),
             "case {label:?}: expected the service's missing-access-point message, got body {}",
+            refused.body
+        );
+        // The message is fixed text, so WHICH access point was asked about is
+        // read out of the member beside it.
+        assert_eq!(
+            refused.text("AccessPointName").as_deref(),
+            Some(name),
+            "case {label:?}: expected the refusal to name the access point asked about, \
+             got body {}",
             refused.body
         );
     }

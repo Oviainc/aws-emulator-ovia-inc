@@ -496,8 +496,9 @@ async fn create_then_get_reports_the_stored_access_point_for_every_shape_of_crea
         );
         assert_eq!(
             read.text("BucketAccountId").as_deref(),
-            case.bucket_account_id,
-            "case {:?}: expected the stored BucketAccountId, got body {}",
+            Some(case.bucket_account_id.unwrap_or(ACCOUNT)),
+            "case {:?}: expected the account that owns the bucket — the one the create \
+             named, or this account when it named none — got body {}",
             case.case,
             read.body
         );
