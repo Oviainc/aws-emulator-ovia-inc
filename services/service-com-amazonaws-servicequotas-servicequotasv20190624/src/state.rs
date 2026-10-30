@@ -3217,6 +3217,11 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             vec![
                 quota("User pools per account", 1000.0),
                 quota("App clients per user pool", 1000.0),
+                // AWS publishes the resource-server quota of a user pool under
+                // this code ("Quotas in Amazon Cognito", Amazon Cognito
+                // Developer Guide), so a client holding a code read out of AWS's
+                // catalog resolves the quota it names here too.
+                quota("Resource servers per user pool", 25.0).code("L-7CDAF993"),
             ],
         ),
         service(

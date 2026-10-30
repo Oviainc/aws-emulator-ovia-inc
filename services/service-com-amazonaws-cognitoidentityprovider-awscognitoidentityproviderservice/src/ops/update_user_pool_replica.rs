@@ -160,6 +160,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // "The Region of the replica user pool" (`RegionName`): a value that
+        // names no AWS Region names no replica, so it is a parameter error
+        // rather than a lookup that finds nothing. The modelled `RegionNameType`
+        // bounds only the length, so this is the service's own rule and every
+        // operation taking a `RegionName` asks the same one
+        // ([`crate::state::is_aws_region`]).
+        if !crate::state::is_aws_region(&input.region_name) {
+            return Err(invalid_parameter(
+                crate::state::INVALID_REGION_MESSAGE.to_string(),
+            ));
+        }
         // The write and the read that renders the response happen under ONE
         // hold of the state lock, so two calls that race on the same replica
         // are serialized: each stores its own `Status` and answers with the
@@ -226,6 +237,17 @@ fn user_pool_not_found(user_pool_id: &str) -> UpdateUserPoolReplicaError {
 fn replica_not_found() -> UpdateUserPoolReplicaError {
     UpdateUserPoolReplicaErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some("Replica not found in the requested region".to_string()),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> UpdateUserPoolReplicaError {
+    UpdateUserPoolReplicaErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        // `ReasonCode` is an optional machine code AWS fills in for a few
+        // specific refusals only, so none is invented here.
+        reason_code: None,
     })
     .into()
 }

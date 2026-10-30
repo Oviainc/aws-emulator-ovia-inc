@@ -351,11 +351,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(message.to_string()));
         }
 
+        // The machine-to-machine grant is the only OAuth flow an app client that
+        // issues it may carry: a request combining it with a user-facing grant
+        // describes an app client that cannot exist, which is a parameter
+        // contradiction decided before any resource is looked up. The rule lives
+        // in `state.rs` so this path and the update path enforce the same one.
+        if let Some(message) = input
+            .allowed_o_auth_flows
+            .as_deref()
+            .and_then(crate::state::invalid_oauth_flow_violation)
+        {
+            return Err(invalid_oauth_flow(message.to_string()));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
         let pool = guard
             .pool_mut(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // An app-client configuration member whose feature plan the POOL is not
+        // on is refused the way every other tier refusal of this service is,
+        // before any client is stored.
+        if let Some(message) = crate::state::client_feature_plan_refusal(
+            &pool.user_pool_tier,
+            input.explicit_auth_flows.as_deref(),
+        ) {
+            return Err(feature_unavailable_in_tier(message));
+        }
+
+        // "You can only activate `EnablePropagateAdditionalUserContextData` in
+        // an app client that has a client secret"
+        // (`EnablePropagateAdditionalUserContextData`), and the secret this
+        // create gives the client is the one it generates or the one the request
+        // supplies — so a public app client asking to propagate that data is
+        // refused.
+        if input
+            .enable_propagate_additional_user_context_data
+            .unwrap_or(false)
+            && !(input.generate_secret || input.client_secret.is_some())
+        {
+            return Err(invalid_parameter(
+                crate::state::CLIENT_SECRET_REQUIRED_FOR_CONTEXT_DATA_MESSAGE.to_string(),
+            ));
+        }
+
+        // "The OAuth, OpenID Connect (OIDC), and custom scopes that you want to
+        // permit your app client to authorize access with ... Custom scopes with
+        // resource servers authorize access to external APIs"
+        // (`AllowedOAuthScopes`): a scope that is neither a standard one nor one
+        // a resource server of THIS pool defines does not exist, so the app
+        // client cannot be permitted to authorize it. Resolved against the
+        // stored pool ([`crate::state::UserPool::authorizes_scope`]) before
+        // anything is stored, so a refused create leaves the pool with no new
+        // app client.
+        if let Some(scope) = input
+            .allowed_o_auth_scopes
+            .iter()
+            .flatten()
+            .find(|scope| !pool.authorizes_scope(scope))
+        {
+            return Err(scope_does_not_exist(
+                crate::state::scope_does_not_exist_message(scope),
+            ));
+        }
 
         // This emulator holds a pool's app clients in memory, so the store is
         // bounded.
@@ -451,6 +510,35 @@ fn invalid_parameter(message: String) -> CreateUserPoolClientError {
         message: Some(message),
         reason_code: None,
     })
+    .into()
+}
+
+/// This operation's `InvalidOAuthFlowException` for an `AllowedOAuthFlows`
+/// combination no app client can hold.
+fn invalid_oauth_flow(message: String) -> CreateUserPoolClientError {
+    CreateUserPoolClientErrorModeled::InvalidOAuthFlowException(InvalidOAuthFlowException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's `ScopeDoesNotExistException` for an `AllowedOAuthScopes`
+/// entry the pool has no definition of.
+fn scope_does_not_exist(message: String) -> CreateUserPoolClientError {
+    CreateUserPoolClientErrorModeled::ScopeDoesNotExistException(ScopeDoesNotExistException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's `FeatureUnavailableInTierException` for an app-client
+/// configuration the pool's feature plan does not include.
+fn feature_unavailable_in_tier(message: String) -> CreateUserPoolClientError {
+    CreateUserPoolClientErrorModeled::FeatureUnavailableInTierException(
+        FeatureUnavailableInTierException {
+            message: Some(message),
+        },
+    )
     .into()
 }
 

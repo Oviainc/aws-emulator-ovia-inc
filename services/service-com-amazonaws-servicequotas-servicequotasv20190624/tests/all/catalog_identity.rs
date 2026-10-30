@@ -201,6 +201,7 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("backup", "L-FB1D55EC"),
     ("backup", "L-FFD6444F"),
     ("codecommit", "L-81790602"),
+    ("cognito-idp", "L-7CDAF993"),
     ("config", "L-0BE82991"),
     ("dynamodb", "L-F98FE922"),
     ("ec2", "L-0263D0A3"),

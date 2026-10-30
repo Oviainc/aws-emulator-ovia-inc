@@ -10,10 +10,12 @@
 //! configured logging for, because
 //! `LogDeliveryConfigurationType.LogConfigurations` is a modelled required member.
 //! A set REPLACES the collection and is accepted only when every entry is one the
-//! pool can deliver: `LogConfigurationType.LogLevel` pairs `userNotification` with
-//! `ERROR` and `CloudWatchLogsConfiguration`, and `userAuthEvents` with `INFO`,
-//! one of the three destinations and the Plus feature plan. A request that fails
-//! any of that is refused and leaves the stored collection exactly as it was.
+//! pool can deliver: `LogConfigurationType` pairs `userNotification` with
+//! `CloudWatchLogsConfiguration`, and `userAuthEvents` with one of the three
+//! destinations and the Plus feature plan, each entry naming exactly one
+//! destination and each source configured at most once. The `LogLevel` is the
+//! caller's choice among the modelled values. A request that fails any of that is
+//! refused and leaves the stored collection exactly as it was.
 //!
 //! Each table row names the case it asserts and every assertion reports the actual
 //! value.
@@ -201,8 +203,9 @@ async fn a_set_collection_is_what_every_reader_renders() {
     let router = router();
 
     // The rows differ along what the rule generalises over: which source is
-    // configured, which destination it is exported to, how many entries the
-    // collection carries, and the empty collection.
+    // configured, which LEVEL it is configured with, which destination it is
+    // exported to, how many entries the collection carries, and the empty
+    // collection.
     let rows: Vec<(&str, Value)> = vec![
         ("the empty collection", json!([])),
         (
@@ -212,6 +215,26 @@ async fn a_set_collection_is_what_every_reader_renders() {
         (
             "userNotification against another log group",
             json!([user_notification(OTHER_LOG_GROUP_ARN)]),
+        ),
+        // Each source takes either modelled `LogLevel`
+        // (`smithy_query(query="shape",shape="LogLevel")`: ERROR | INFO): the
+        // level a source's documentation recommends is a recommendation, not a
+        // restriction, and the pool reports back the level the request named.
+        (
+            "userNotification at the INFO level",
+            json!([{
+                "LogLevel": "INFO",
+                "EventSource": "userNotification",
+                "CloudWatchLogsConfiguration": { "LogGroupArn": LOG_GROUP_ARN },
+            }]),
+        ),
+        (
+            "userAuthEvents at the ERROR level",
+            json!([{
+                "LogLevel": "ERROR",
+                "EventSource": "userAuthEvents",
+                "S3Configuration": { "BucketArn": BUCKET_ARN },
+            }]),
         ),
         (
             "userAuthEvents to CloudWatch Logs",
@@ -279,9 +302,9 @@ async fn a_refused_set_leaves_the_stored_collection_unchanged() {
     let router = router();
 
     // Every row is a collection the pool cannot deliver, with the condition the
-    // refusal names. `LogConfigurationType.LogLevel`: `userNotification` goes
-    // `ERROR` to `CloudWatchLogsConfiguration`; `userAuthEvents` goes `INFO` to
-    // one of the three destinations.
+    // refusal names. `LogConfigurationType.LogLevel`: `userNotification` is
+    // exported to `CloudWatchLogsConfiguration`; `userAuthEvents` to one of the
+    // three destinations.
     let rows: Vec<(&str, Value, String)> = vec![
         (
             "a userNotification entry with no destination",
@@ -303,24 +326,6 @@ async fn a_refused_set_leaves_the_stored_collection_unchanged() {
                 "have no destination",
                 &["userNotification", "userAuthEvents"],
             ),
-        ),
-        (
-            "userNotification at the INFO level",
-            json!([{
-                "LogLevel": "INFO",
-                "EventSource": "userNotification",
-                "CloudWatchLogsConfiguration": { "LogGroupArn": LOG_GROUP_ARN },
-            }]),
-            request_validation_message("have an unsupported log level", &["userNotification"]),
-        ),
-        (
-            "userAuthEvents at the ERROR level",
-            json!([{
-                "LogLevel": "ERROR",
-                "EventSource": "userAuthEvents",
-                "S3Configuration": { "BucketArn": BUCKET_ARN },
-            }]),
-            request_validation_message("have an unsupported log level", &["userAuthEvents"]),
         ),
         (
             "userNotification exported to Amazon S3",

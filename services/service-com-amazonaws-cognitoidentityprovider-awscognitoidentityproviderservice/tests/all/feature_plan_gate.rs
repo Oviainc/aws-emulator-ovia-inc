@@ -214,7 +214,7 @@ const GATED_FEATURES: [GatedFeature; 4] = [
         // replicated to a second Region.
         case: "multi-Region replication through CreateUserPoolReplica",
         floor: "ESSENTIALS",
-        feature: "Multi-Region user pool replication",
+        feature: "Multi-Region Replication",
         operation: "CreateUserPoolReplica",
         request: |user_pool_id, _slug| {
             json!({ "UserPoolId": user_pool_id, "RegionName": SECONDARY_REGION })

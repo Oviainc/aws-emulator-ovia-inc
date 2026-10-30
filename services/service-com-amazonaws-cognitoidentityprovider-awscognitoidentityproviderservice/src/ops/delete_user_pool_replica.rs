@@ -164,6 +164,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(internal_error());
         };
 
+        // "The Region of the replica user pool" (`RegionName`): a value that
+        // names no AWS Region names no replica, so it is a parameter error
+        // rather than a lookup that finds nothing. The modelled `RegionNameType`
+        // bounds only the length, so this is the service's own rule and every
+        // operation taking a `RegionName` asks the same one
+        // ([`crate::state::is_aws_region`]).
+        if !crate::state::is_aws_region(&input.region_name) {
+            return Err(invalid_parameter(
+                crate::state::INVALID_REGION_MESSAGE.to_string(),
+            ));
+        }
+
         let now = ::std::time::SystemTime::now();
         let request_region = crate::state::request_region(ctx.parts());
         let mut guard = state.lock();

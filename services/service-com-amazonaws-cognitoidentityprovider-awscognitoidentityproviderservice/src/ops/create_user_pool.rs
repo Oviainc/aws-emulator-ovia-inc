@@ -343,6 +343,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         pool.sms_authentication_message = input.sms_authentication_message;
         pool.tags = input.user_pool_tags.unwrap_or_default();
 
+        // A pool configuration member whose feature plan the pool is not on is
+        // refused before the pool exists, so nothing is stored: the plan judged
+        // is the EFFECTIVE one this create asks for, and the rule is the one
+        // `UpdateUserPool` applies to the same members.
+        if let Some(message) = crate::state::pool_feature_plan_refusal(
+            &pool.user_pool_tier,
+            Some(&pool.policies),
+            pool.user_pool_add_ons.as_ref(),
+        ) {
+            return Err(feature_unavailable_in_tier(message));
+        }
+
         let mut guard = state.lock();
         // This emulator holds its pools in memory, so the store is bounded.
         if guard.user_pools.len() >= crate::state::MAX_USER_POOLS {
@@ -368,6 +380,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             user_pool: Some(stored),
         })
     }
+}
+
+/// This operation's `FeatureUnavailableInTierException` for a pool configuration
+/// the pool's own feature plan does not include.
+fn feature_unavailable_in_tier(message: String) -> CreateUserPoolError {
+    CreateUserPoolErrorModeled::FeatureUnavailableInTierException(
+        FeatureUnavailableInTierException {
+            message: Some(message),
+        },
+    )
+    .into()
 }
 
 /// This operation's `LimitExceededException` for a store at its bound.

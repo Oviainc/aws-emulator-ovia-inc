@@ -39,6 +39,8 @@ mod admin_user_enabled_state;
 mod admin_user_global_sign_out;
 #[path = "all/admin_user_pool_lifecycle.rs"]
 mod admin_user_pool_lifecycle;
+#[path = "all/app_client_and_pool_configuration.rs"]
+mod app_client_and_pool_configuration;
 #[path = "all/auth_flow_not_enabled.rs"]
 mod auth_flow_not_enabled;
 #[path = "all/authentication_success_shape.rs"]

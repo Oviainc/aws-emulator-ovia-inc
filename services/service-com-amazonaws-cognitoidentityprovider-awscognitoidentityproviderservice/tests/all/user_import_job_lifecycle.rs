@@ -17,9 +17,10 @@
 //!   clock: `Created` until started, `Pending` until the import is due,
 //!   `InProgress` from then on, `Stopping` until the stop is due and `Stopped`
 //!   from then on, and `Expired` for a job left unstarted past its window;
-//! * only a job waiting to be started can be started and only a running job can
-//!   be stopped, so any other status is a `PreconditionNotMetException` that
-//!   leaves the stored job alone;
+//! * only a job waiting to be started, with the CSV file uploaded to its
+//!   `PreSignedUrl`, can be started and only a running job can be stopped, so
+//!   any other status is a `PreconditionNotMetException` that leaves the stored
+//!   job alone;
 //! * a read renders the stored job and changes nothing a later caller sees.
 //!
 //! Each table row names the case it asserts.
@@ -149,6 +150,39 @@ async fn status(router: &MultiServiceRouter, user_pool_id: &str, job_id: &str) -
         .and_then(Value::as_str)
         .unwrap_or("<no Status>")
         .to_string()
+}
+
+/// A CSV file with the pool's header row and one user, which a client uploads to
+/// a job's `PreSignedUrl` before the import is started.
+const CSV_FILE: &str = "cognito:username,email\nalice,alice@example.com\n";
+
+/// Upload [`CSV_FILE`] to `job`'s `PreSignedUrl` — the ANONYMOUS `PUT` a client
+/// writes the file with, carrying no credential and no `X-Amz-Target`, only the
+/// path of the locator this service handed out — and require it to be accepted.
+///
+/// "Starts importing users from a CSV file" (`StartUserImportJob`), so a job has
+/// nothing to import until its upload target carries one.
+async fn upload_csv(router: &MultiServiceRouter, case: &str, job: &Value) {
+    let url = job["PreSignedUrl"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: a created job carries its locator: {job}"));
+    let path = url
+        .strip_prefix(&format!("https://{ENDPOINT_HOST}"))
+        .unwrap_or_else(|| panic!("case {case:?}: {url} must be a locator on {ENDPOINT_HOST}"));
+    let request = http::Request::builder()
+        .method("PUT")
+        .uri(path)
+        .header("host", ENDPOINT_HOST)
+        .header("content-type", "text/csv")
+        .body(Bytes::from(CSV_FILE))
+        .expect("the request is well formed");
+    let response = router.dispatch(request).await;
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "case {case:?}: the upload target {path} must accept the CSV, got {}",
+        response.status()
+    );
 }
 
 /// One row of the `CreateUserImportJob` table: the job name, the logging role
@@ -391,6 +425,9 @@ async fn a_job_reaches_the_status_the_clock_owes_it() {
             .as_str()
             .expect("a minted job id")
             .to_string();
+        // A job imports the CSV uploaded to its target, so the file is written
+        // there before the import is started.
+        upload_csv(&router, case, &created["UserImportJob"]).await;
 
         let started = ok(
             &router,
@@ -500,6 +537,9 @@ async fn only_a_waiting_job_starts_and_only_a_running_job_stops() {
             .as_str()
             .expect("a minted job id")
             .to_string();
+        // Every row that drives the job past `Created` starts it, which needs
+        // the CSV on its upload target.
+        upload_csv(&router, label, &created["UserImportJob"]).await;
         let start = json!({ "UserPoolId": user_pool_id, "JobId": job_id });
 
         // Drive the stored job into the status this row is about.

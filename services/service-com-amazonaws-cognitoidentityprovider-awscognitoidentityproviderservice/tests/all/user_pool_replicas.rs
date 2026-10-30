@@ -195,12 +195,12 @@ struct ReplicaCase {
     tags: Option<Value>,
 }
 
-/// The table. `RegionName` spans its modelled length 5..32
-/// (`smithy_query(query="shape",shape="RegionNameType")`) with a name at each
-/// published bound beside ordinary Region names the issue did not cite;
-/// `UserPoolTier` spans the two plans that include replication; `UserPoolTags`
-/// spans absent, empty and populated; and the replica count spans one and
-/// several per pool.
+/// The table. `RegionName` spans Regions of several AWS partitions — drawn from
+/// the Region catalog (`cognito_idp::state::AWS_REGIONS`) and including entries
+/// the issue did not cite — all inside its modelled length 5..32
+/// (`smithy_query(query="shape",shape="RegionNameType")`); `UserPoolTier` spans
+/// the two plans that include replication; `UserPoolTags` spans absent, empty
+/// and populated; and the replica count spans one and several per pool.
 fn replica_cases() -> Vec<ReplicaCase> {
     vec![
         ReplicaCase {
@@ -222,15 +222,15 @@ fn replica_cases() -> Vec<ReplicaCase> {
             tags: Some(json!({})),
         },
         ReplicaCase {
-            case: "a Region name of 5 characters, the modelled length minimum",
+            case: "a Region of the GovCloud partition",
             tier: Some("PLUS"),
-            regions: &["us-e1"],
+            regions: &["us-gov-west-1"],
             tags: None,
         },
         ReplicaCase {
-            case: "a Region name of 32 characters, the modelled length maximum",
+            case: "the longest Region name the catalog carries",
             tier: Some("ESSENTIALS"),
-            regions: &["us-east-1-aaaaaaaaaaaaaaaaaaaaaa"],
+            regions: &["us-isof-south-1"],
             tags: None,
         },
     ]
@@ -835,17 +835,20 @@ async fn all_replicas(router: &MultiServiceRouter, user_pool_id: &str) -> Vec<Va
     panic!("the listing must terminate, got {} replicas", collected.len());
 }
 
-/// A pool holds no more replicas than this emulator bounds it to, and a listing
-/// of more replicas than one page serves pages through them all — each Region
-/// exactly once, ascending.
+/// A pool holds at most one replica per AWS Region other than its own — the
+/// Region catalog is what bounds the store — and a listing of more replicas than
+/// one page serves pages through them all, each Region exactly once, ascending.
 #[tokio::test]
-async fn the_listing_pages_through_every_replica_and_the_store_bound_refuses_more() {
+async fn the_listing_pages_through_every_replica_and_the_region_catalog_bounds_the_store() {
     let router = router();
     let (user_pool_id, _) = pool_in_tier(&router, "bounded", Some("PLUS")).await;
 
-    // Region names of the modelled form, one per replica up to the bound.
-    let regions: Vec<String> = (0..cognito_idp::state::MAX_REPLICAS_PER_POOL)
-        .map(|index| format!("eu-west-{index}"))
+    // Every Region a replica of this pool can live in: the shared catalog minus
+    // the pool's own Region, which holds the PRIMARY replica.
+    let regions: Vec<String> = cognito_idp::state::AWS_REGIONS
+        .iter()
+        .filter(|region| **region != PRIMARY_REGION)
+        .map(|region| (*region).to_string())
         .collect();
     for region in &regions {
         ok(
@@ -874,22 +877,37 @@ async fn the_listing_pages_through_every_replica_and_the_store_bound_refuses_mor
         "paging through the listing serves every Region exactly once, ascending"
     );
 
-    let (status, payload) = call(
-        &router,
-        "CreateUserPoolReplica",
-        &json!({ "UserPoolId": user_pool_id, "RegionName": "us-west-2" }),
-    )
-    .await;
-    assert_eq!(
-        (status, error_code(&payload)),
-        (400, "LimitExceededException"),
-        "a create past the bound on one pool's replicas is refused, got {status} with {payload}"
-    );
-    assert_eq!(
-        all_replicas(&router, &user_pool_id).await.len(),
-        expected.len(),
-        "the refused create stored no replica"
-    );
+    // Nothing is left to replicate to, so the store cannot grow: every Region of
+    // the catalog already holds a replica of this pool or holds its primary, and
+    // a value outside the catalog names no Region at all.
+    for (case, region) in [
+        (
+            "a Region this pool already holds a replica in",
+            "us-west-2",
+        ),
+        (
+            "the pool's own Region, which holds the primary replica",
+            PRIMARY_REGION,
+        ),
+        ("a value that names no AWS Region", "not-a-real-region"),
+    ] {
+        let (status, payload) = call(
+            &router,
+            "CreateUserPoolReplica",
+            &json!({ "UserPoolId": user_pool_id, "RegionName": region }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&payload)),
+            (400, "InvalidParameterException"),
+            "case {case:?}: a further create is refused, got {status} with {payload}"
+        );
+        assert_eq!(
+            all_replicas(&router, &user_pool_id).await.len(),
+            expected.len(),
+            "case {case:?}: the refused create stored no replica"
+        );
+    }
 }
 
 /// Replication is a feature-plan feature: a pool on the plan that does not

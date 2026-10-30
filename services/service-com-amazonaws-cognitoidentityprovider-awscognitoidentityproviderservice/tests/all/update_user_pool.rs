@@ -318,7 +318,11 @@ fn update_cases() -> Vec<UpdateCase> {
                 },
                 "MfaConfiguration": "ON",
                 "DeletionProtection": "ACTIVE",
-                "UserPoolTier": "LITE"
+                // The plan the row leaves the pool on has to include the
+                // sign-in policy it configures: a first authentication factor
+                // beyond username and password needs "the Essentials tier or
+                // higher" (`SignInPolicyType` in this service's model).
+                "UserPoolTier": "ESSENTIALS"
             }),
             expected: overriding(vec![
                 ("Policies.PasswordPolicy.MinimumLength", json!(6)),
@@ -332,7 +336,7 @@ fn update_cases() -> Vec<UpdateCase> {
                 ),
                 ("MfaConfiguration", json!("ON")),
                 ("DeletionProtection", json!("ACTIVE")),
-                ("UserPoolTier", json!("LITE")),
+                ("UserPoolTier", json!("ESSENTIALS")),
             ]),
         },
         UpdateCase {

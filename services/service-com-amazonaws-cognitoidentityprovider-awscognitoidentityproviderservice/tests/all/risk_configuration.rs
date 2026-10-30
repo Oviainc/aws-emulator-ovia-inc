@@ -45,6 +45,12 @@ const MAX_IP_RANGES: usize = 200;
 /// The message a `UserPoolAddOnNotEnabledException` carries.
 const ADD_ONS_NOT_ENABLED_MESSAGE: &str = "User pool add-ons is not enabled.";
 
+/// The feature plan a pool that carries `UserPoolAddOns` is put on here, so
+/// every add-on mode is served: "to activate this setting, your user pool must
+/// be on the Plus tier" (`UserPoolAddOnsType` in this service's model), one of
+/// the modelled `UserPoolTierType` values.
+const THREAT_PROTECTION_TIER: &str = "PLUS";
+
 /// One emulator with just this service mounted.
 fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -114,15 +120,22 @@ fn error_message(payload: &Value) -> &str {
 
 /// A pool created in the add-on mode `mode` names — or with no `UserPoolAddOns`
 /// member at all when `mode` is `None` — and its minted id.
+///
+/// A pool that carries `UserPoolAddOns` at all is created on the feature plan
+/// that includes threat protection in every mode: "to activate this setting,
+/// your user pool must be on the Plus tier" (`UserPoolAddOnsType` in this
+/// service's model).
 async fn pool_in_mode(router: &MultiServiceRouter, case: &str, mode: Option<&str>) -> String {
     let mut body = json!({ "PoolName": "risk-configuration-pool" });
     if let Some(mode) = mode {
-        body.as_object_mut()
-            .expect("a request body is a JSON object")
-            .insert(
-                "UserPoolAddOns".to_string(),
-                json!({ "AdvancedSecurityMode": mode }),
-            );
+        let target = body
+            .as_object_mut()
+            .expect("a request body is a JSON object");
+        target.insert(
+            "UserPoolAddOns".to_string(),
+            json!({ "AdvancedSecurityMode": mode }),
+        );
+        target.insert("UserPoolTier".to_string(), json!(THREAT_PROTECTION_TIER));
     }
     let created = ok(router, "CreateUserPool", &body).await;
     created["UserPool"]["Id"]
@@ -178,6 +191,10 @@ async fn set_add_on_mode(
             "UserPoolAddOns".to_string(),
             json!({ "AdvancedSecurityMode": mode }),
         );
+        // An update REPLACES every member it models, the feature plan included,
+        // so a pool that keeps its threat protection has to keep naming the plan
+        // that includes it.
+        target.insert("UserPoolTier".to_string(), json!(THREAT_PROTECTION_TIER));
     }
     ok(router, "UpdateUserPool", &body).await;
 

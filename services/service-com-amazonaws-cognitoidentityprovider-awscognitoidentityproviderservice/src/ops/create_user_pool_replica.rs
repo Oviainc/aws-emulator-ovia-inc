@@ -215,6 +215,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(feature_unavailable_in_tier(message));
         }
 
+        // "The Region in which the replica user pool will be created"
+        // (`RegionName`): a value that names no AWS Region names no Region a
+        // replica can live in, so it is refused before anything is stored. The
+        // modelled `RegionNameType` bounds only the length, so this is the
+        // service's own rule and every operation taking a `RegionName` asks the
+        // same one ([`crate::state::is_aws_region`]).
+        if !crate::state::is_aws_region(&input.region_name) {
+            return Err(invalid_parameter(
+                crate::state::INVALID_REGION_MESSAGE.to_string(),
+            ));
+        }
+
         // A replica lives in a Region OTHER than the pool's own: the pool
         // already is the PRIMARY replica there, and this operation creates a
         // secondary one.

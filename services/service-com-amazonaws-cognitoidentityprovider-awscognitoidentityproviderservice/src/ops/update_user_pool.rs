@@ -311,10 +311,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // The configuration this update would leave the pool with, computed from
+        // the request before anything is stored: each member's effective value is
+        // the request's when it carries one and the service default when it does
+        // not, which `state.rs` owns so a create and an update agree on what
+        // "unset" means.
+        let policies = crate::state::effective_policies(input.policies);
+        let user_pool_tier = crate::state::effective_user_pool_tier(input.user_pool_tier);
         let mut guard = state.lock();
         let pool = guard
             .pool_mut(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // A pool configuration member whose feature plan the pool is not on is
+        // refused with the same rule the create path applies, judged on the plan
+        // this update would leave the pool on — and judged BEFORE the first
+        // member is written, so a refused update leaves the pool exactly as it
+        // was.
+        if let Some(message) = crate::state::pool_feature_plan_refusal(
+            &user_pool_tier,
+            Some(&policies),
+            input.user_pool_add_ons.as_ref(),
+        ) {
+            return Err(feature_unavailable_in_tier(message));
+        }
 
         // `PoolName` is "the updated name of your user pool" and a pool must carry a
         // name — there is no default to fall back to — so an absent `PoolName` leaves
@@ -326,10 +346,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Structures with documented defaults go back to those defaults, which
         // `state.rs` owns, so a create and an update agree on what "unset" means.
-        pool.policies = crate::state::effective_policies(input.policies);
+        pool.policies = policies;
         pool.admin_create_user_config =
             crate::state::effective_admin_create_user_config(input.admin_create_user_config);
-        pool.user_pool_tier = crate::state::effective_user_pool_tier(input.user_pool_tier);
+        pool.user_pool_tier = user_pool_tier;
         pool.mfa_configuration = crate::state::effective_mfa_configuration(input.mfa_configuration);
         pool.deletion_protection =
             crate::state::effective_deletion_protection(input.deletion_protection);
@@ -378,6 +398,17 @@ fn user_pool_not_found(user_pool_id: &str) -> UpdateUserPoolError {
     UpdateUserPoolErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(format!("User pool {user_pool_id} does not exist.")),
     })
+    .into()
+}
+
+/// This operation's `FeatureUnavailableInTierException` for a pool configuration
+/// the pool's own feature plan does not include.
+fn feature_unavailable_in_tier(message: String) -> UpdateUserPoolError {
+    UpdateUserPoolErrorModeled::FeatureUnavailableInTierException(
+        FeatureUnavailableInTierException {
+            message: Some(message),
+        },
+    )
     .into()
 }
 

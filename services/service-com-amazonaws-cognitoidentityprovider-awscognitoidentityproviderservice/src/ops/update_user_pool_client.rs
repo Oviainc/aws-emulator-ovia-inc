@@ -342,15 +342,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(message.to_string()));
         }
 
+        // The machine-to-machine grant is the only OAuth flow an app client that
+        // issues it may carry, so a request combining it with a user-facing
+        // grant describes an app client that cannot exist. Asked through the same
+        // `state.rs` rule the create path asks, before anything is stored.
+        if let Some(message) = input
+            .allowed_o_auth_flows
+            .as_deref()
+            .and_then(crate::state::invalid_oauth_flow_violation)
+        {
+            return Err(invalid_oauth_flow(message.to_string()));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
         let pool = guard
             .pool_mut(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        // An app-client configuration member whose feature plan the POOL is not
+        // on is refused with the same rule the create path applies, asked on the
+        // pool's STORED plan and before anything is written.
+        if let Some(message) = crate::state::client_feature_plan_refusal(
+            &pool.user_pool_tier,
+            input.explicit_auth_flows.as_deref(),
+        ) {
+            return Err(feature_unavailable_in_tier(message));
+        }
+
+        // A scope an app client may be permitted to authorize is a standard one
+        // or one a resource server of THIS pool defines
+        // ([`crate::state::UserPool::authorizes_scope`]), the same question the
+        // create path asks — resolved before anything is written, so a refused
+        // update leaves the app client exactly as it was.
+        if let Some(scope) = input
+            .allowed_o_auth_scopes
+            .iter()
+            .flatten()
+            .find(|scope| !pool.authorizes_scope(scope))
+        {
+            return Err(scope_does_not_exist(
+                crate::state::scope_does_not_exist_message(scope),
+            ));
+        }
+
         let client = pool
             .clients
             .get_mut(&input.client_id)
             .ok_or_else(|| client_not_found(&input.client_id))?;
+
+        // "You can only activate `EnablePropagateAdditionalUserContextData` in
+        // an app client that has a client secret"
+        // (`EnablePropagateAdditionalUserContextData`): this operation models no
+        // secret member, so the secret is the one the STORED app client holds —
+        // a public app client asking to propagate that data is refused, and
+        // nothing is written.
+        if input
+            .enable_propagate_additional_user_context_data
+            .unwrap_or(false)
+            && client.client_secrets.is_empty()
+        {
+            return Err(invalid_parameter(
+                crate::state::CLIENT_SECRET_REQUIRED_FOR_CONTEXT_DATA_MESSAGE.to_string(),
+            ));
+        }
 
         // "If you don't provide a value for an attribute, Amazon Cognito sets it to
         // its default value" (this operation's documentation): every member this
@@ -378,12 +432,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::effective_prevent_user_existence_errors(
                 input.prevent_user_existence_errors,
             );
-        client.explicit_auth_flows = input.explicit_auth_flows.unwrap_or_else(|| {
-            crate::state::DEFAULT_EXPLICIT_AUTH_FLOWS
-                .iter()
-                .map(|flow| (*flow).to_string())
-                .collect()
-        });
+        // `ExplicitAuthFlows` is replaced like every other writable member: the
+        // model documents its default for a CREATE ("if you don't specify a
+        // value ... your app client supports ALLOW_REFRESH_TOKEN_AUTH,
+        // ALLOW_USER_SRP_AUTH, and ALLOW_CUSTOM_AUTH"), which is the set a NEW
+        // app client starts with; an update that names no flows configures an app
+        // client with none rather than putting the create-time set back.
+        client.explicit_auth_flows = input.explicit_auth_flows.unwrap_or_default();
         // "If you don't include this parameter, token revocation is automatically
         // activated" (`EnableTokenRevocation`), and additional user context data is
         // off until a request asks for it.
@@ -437,6 +492,35 @@ fn invalid_parameter(message: String) -> UpdateUserPoolClientError {
         message: Some(message),
         reason_code: None,
     })
+    .into()
+}
+
+/// This operation's `InvalidOAuthFlowException` for an `AllowedOAuthFlows`
+/// combination no app client can hold.
+fn invalid_oauth_flow(message: String) -> UpdateUserPoolClientError {
+    UpdateUserPoolClientErrorModeled::InvalidOAuthFlowException(InvalidOAuthFlowException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's `ScopeDoesNotExistException` for an `AllowedOAuthScopes`
+/// entry the pool has no definition of.
+fn scope_does_not_exist(message: String) -> UpdateUserPoolClientError {
+    UpdateUserPoolClientErrorModeled::ScopeDoesNotExistException(ScopeDoesNotExistException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's `FeatureUnavailableInTierException` for an app-client
+/// configuration the pool's feature plan does not include.
+fn feature_unavailable_in_tier(message: String) -> UpdateUserPoolClientError {
+    UpdateUserPoolClientErrorModeled::FeatureUnavailableInTierException(
+        FeatureUnavailableInTierException {
+            message: Some(message),
+        },
+    )
     .into()
 }
 

@@ -7,7 +7,8 @@
 //! later. Only a job that was created and not yet started can be started, so a
 //! job in any other status — including one the clock has `Expired`, which "can't
 //! be started" (`UserImportJobType.Status`) — is refused with
-//! `PreconditionNotMetException`. A `UserPoolId` or `JobId` that names no stored
+//! `PreconditionNotMetException`, as is one whose CSV file was never uploaded to
+//! the job's `PreSignedUrl`. A `UserPoolId` or `JobId` that names no stored
 //! resource is refused with `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
@@ -184,6 +185,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "User import job {} is in status {status} and cannot be started.",
                 input.job_id
             )));
+        }
+
+        // "Instructs your user pool to start importing users from a CSV file"
+        // (this operation's own documentation), and the file is the one uploaded
+        // to the job's `PreSignedUrl` — so a job whose upload target was never
+        // written to has nothing to import, and the precondition for starting it
+        // is not met. Asked before the status move is stored, so a refused start
+        // leaves the job `Created` and startable once its CSV arrives.
+        if !job.has_uploaded_csv() {
+            return Err(precondition_not_met(
+                crate::state::NO_CSV_UPLOADED_MESSAGE.to_string(),
+            ));
         }
 
         // Written first, then rendered from the stored record, so the response is

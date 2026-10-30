@@ -219,12 +219,14 @@ struct UpdateCase {
 
 /// The members every row that sets none of them expects back at their defaults.
 /// The defaults are the model's documented ones, which `src/state.rs` owns:
-/// `ExplicitAuthFlows` is "ALLOW_REFRESH_TOKEN_AUTH, ALLOW_USER_SRP_AUTH, and
-/// ALLOW_CUSTOM_AUTH", `PreventUserExistenceErrors` "Defaults to LEGACY",
+/// `PreventUserExistenceErrors` "Defaults to LEGACY",
 /// `EnableTokenRevocation` is "automatically activated",
 /// `AllowedOAuthFlowsUserPoolClient` and
 /// `EnablePropagateAdditionalUserContextData` default to `false`, and
-/// `RefreshTokenValidity` carries the model default `0`.
+/// `RefreshTokenValidity` carries the model default `0`. `ExplicitAuthFlows` has
+/// a documented default for a CREATE — the set a NEW app client starts with —
+/// so an update that names no flows leaves the app client with NONE of them
+/// rather than putting that create-time set back.
 fn reset_to_defaults() -> Vec<(&'static str, Value)> {
     vec![
         ("AccessTokenValidity", Value::Null),
@@ -246,14 +248,7 @@ fn reset_to_defaults() -> Vec<(&'static str, Value)> {
         ("EnablePropagateAdditionalUserContextData", json!(false)),
         ("EnableTokenRevocation", json!(true)),
         ("PreventUserExistenceErrors", json!("LEGACY")),
-        (
-            "ExplicitAuthFlows",
-            json!([
-                "ALLOW_REFRESH_TOKEN_AUTH",
-                "ALLOW_USER_SRP_AUTH",
-                "ALLOW_CUSTOM_AUTH"
-            ]),
-        ),
+        ("ExplicitAuthFlows", json!([])),
         // `ClientName` has no documented default and an app client must carry a
         // name, so an update that omits it keeps the stored one.
         ("ClientName", json!(CREATED_CLIENT_NAME)),
@@ -635,9 +630,8 @@ async fn a_replaced_auth_flow_list_is_observable_through_admin_initiate_auth() {
         "case \"flow enabled by the update\": a sign-in must issue tokens, got {signed_in}"
     );
 
-    // And an update that omits `ExplicitAuthFlows` resets the list to the
-    // documented default, which does not include the admin password flow, so the
-    // same sign-in is refused again.
+    // And an update that omits `ExplicitAuthFlows` leaves the app client with
+    // none of them, so the same sign-in is refused again.
     ok(
         &router,
         "UpdateUserPoolClient",

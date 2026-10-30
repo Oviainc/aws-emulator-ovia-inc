@@ -515,6 +515,14 @@ fn password_policy_message(requirement: &str) -> String {
 /// the value a pool that carries no `UserPoolAddOns` behaves as.
 pub const ADVANCED_SECURITY_MODE_OFF: &str = "OFF";
 
+/// The `AdvancedSecurityMode` under which threat protection ACTS on traffic: "to
+/// configure automatic security responses to potentially unwanted traffic to
+/// your user pool, set to `ENFORCED`" (`UserPoolAddOnsType` in this service's
+/// model), as against `AUDIT`, which logs "user security information but take[s]
+/// no action". One of the modelled
+/// [`crate::ops::types::ADVANCED_SECURITY_MODE_TYPE_VALUES`].
+pub const ADVANCED_SECURITY_MODE_ENFORCED: &str = "ENFORCED";
+
 /// The message a `UserPoolAddOnNotEnabledException` carries.
 ///
 /// `UserPoolAddOnNotEnabledException` is thrown "when user pool add-ons aren't
@@ -611,6 +619,22 @@ pub fn feature_unavailable_in_tier_message(tier: &str, feature: &str) -> String 
     format!("The following feature is not available for the {tier} pricing tier configured: {feature}")
 }
 
+/// The message a `FeatureUnavailableInTierException` carries for a pool whose
+/// OWN configuration asks for a feature its feature plan excludes: the request
+/// sets the plan and the feature TOGETHER, so the refusal reports the features
+/// that have to be off for the plan it configured rather than a feature that is
+/// unavailable to configure.
+///
+/// `tier` is the plan the pool is left on and `feature` the feature's display
+/// name, as [`feature_unavailable_in_tier_message`] renders it for the
+/// operations that configure a feature on a pool whose plan is already set.
+pub fn features_need_disabling_message(tier: &str, feature: &str) -> String {
+    format!(
+        "The following features need to be disabled for the {tier} pricing tier configured: \
+         {feature}"
+    )
+}
+
 /// The feature a tier refusal names for user pool email message MFA: the
 /// `EmailMfaConfiguration` member of `SetUserPoolMfaConfig` configures "user
 /// pool email message MFA and sign-in with one-time passwords (OTPs)"
@@ -624,6 +648,188 @@ pub const EMAIL_MFA_FEATURE: &str = "Email MFA";
 /// [`LITE_USER_POOL_TIER`].
 pub fn managed_login_feature_name(version: i32) -> String {
     format!("Managed Login Version {version}")
+}
+
+/// The feature a tier refusal names for choice-based (selection-based) sign-in:
+/// the pool's `SignInPolicy` and the app client's `ALLOW_USER_AUTH` flow are the
+/// two halves of ONE feature, and each documents the same floor — "To activate
+/// this setting, your user pool must be in the Essentials tier or higher"
+/// (`SignInPolicyType`, and `ALLOW_USER_AUTH` under
+/// `CreateUserPoolClient.ExplicitAuthFlows`) — so both halves are refused under
+/// this one name.
+pub const CHOICE_BASED_SIGN_IN_FEATURE: &str = "Choice Based Authentication";
+
+/// The feature a tier refusal names for threat protection: `UserPoolAddOnsType`
+/// carries "settings for activation of threat protection" and "to activate this
+/// setting, your user pool must be on the Plus tier" (this service's model).
+pub const THREAT_PROTECTION_FEATURE: &str = "Threat Protection";
+
+/// Whether `policies` configures choice-based sign-in — a first authentication
+/// factor BEYOND username and password.
+///
+/// `SignInPolicyType.AllowedFirstAuthFactors` is "the sign-in methods that a
+/// user pool supports as the first factor. You can permit users to start
+/// authentication with a standard username and password, or with other one-time
+/// password and hardware factors" (this service's model), and a pool that
+/// configures no policy admits [`PASSWORD_AUTH_FACTOR`] alone
+/// ([`effective_policies`]) — so a policy naming only that factor asks for
+/// nothing beyond what every plan serves, while any other factor is the gated
+/// feature. Both the create and the update path ask this one function, so the
+/// two cannot disagree about which configuration needs which plan.
+#[must_use]
+pub fn configures_choice_based_sign_in(policies: Option<&UserPoolPolicyType>) -> bool {
+    policies
+        .and_then(|policies| policies.sign_in_policy.as_ref())
+        .and_then(|policy| policy.allowed_first_auth_factors.as_ref())
+        .is_some_and(|factors| factors.iter().any(|factor| factor != PASSWORD_AUTH_FACTOR))
+}
+
+/// Whether `flows` configures choice-based sign-in on an app client: the
+/// `ALLOW_USER_AUTH` flow "covers username-password, secure remote password
+/// (SRP), passwordless, and passkey authentication" and names the same floor
+/// ([`CHOICE_BASED_SIGN_IN_FEATURE`]). Asked by the create and the update path
+/// alike.
+#[must_use]
+pub fn configures_user_auth_flow(flows: &[String]) -> bool {
+    flows
+        .iter()
+        .any(|flow| USER_AUTH_FLOWS.contains(&flow.as_str()))
+}
+
+/// The refusal an APP CLIENT configuration owes the feature plan of the pool it
+/// belongs to, or `None` when that plan includes every feature the
+/// configuration asks for.
+///
+/// An app-client member whose own documentation names a feature plan is gated on
+/// it: `ALLOW_USER_AUTH` documents "the Essentials tier or higher"
+/// ([`CHOICE_BASED_SIGN_IN_FEATURE`]), which is the only such member of an app
+/// client's configuration (this service's model). The plan is the POOL's stored
+/// one, which the client request does not set, so the refusal reports the
+/// feature as unavailable ([`feature_unavailable_in_tier_message`]) rather than
+/// as one to disable. Both the create and the update path ask this one function.
+#[must_use]
+pub fn client_feature_plan_refusal(tier: &str, explicit_auth_flows: Option<&[String]>) -> Option<String> {
+    if explicit_auth_flows.is_some_and(configures_user_auth_flow) {
+        if let Some(message) = feature_plan_refusal(
+            tier,
+            ESSENTIALS_USER_POOL_TIER,
+            CHOICE_BASED_SIGN_IN_FEATURE,
+        ) {
+            return Some(message);
+        }
+    }
+    None
+}
+
+/// The message an app client that asks to propagate additional user context data
+/// without holding a client secret is refused with: "You can only activate
+/// `EnablePropagateAdditionalUserContextData` in an app client that has a client
+/// secret" (`CreateUserPoolClient` and `UpdateUserPoolClient` in this service's
+/// model). It names no value from the request, so every such refusal carries
+/// this one sentence, and both paths read it here.
+pub const CLIENT_SECRET_REQUIRED_FOR_CONTEXT_DATA_MESSAGE: &str =
+    "Client Secret is required to set EnablePropagateAdditionalUserContextData as true";
+
+/// The refusal a USER POOL configuration owes the feature plan it is on, or
+/// `None` when that plan includes every feature the configuration asks for.
+///
+/// A member whose own documentation names a feature plan is gated on it, and
+/// each one states its own floor: `SignInPolicyType` ("the Essentials tier or
+/// higher") and `UserPoolAddOnsType` ("the Plus tier") are the two such members
+/// of a pool's configuration (this service's model). What each member asks FOR
+/// is what the gate reads, not whether the member is present: `UserPoolAddOns`
+/// asks for the gated feature in the mode that acts on traffic
+/// ([`ADVANCED_SECURITY_MODE_ENFORCED`]) and for neither logging-only threat
+/// protection ([`ADVANCED_SECURITY_MODE_OFF`] and `AUDIT`, which "take[s] no
+/// action") nor a `SignInPolicy` naming only [`PASSWORD_AUTH_FACTOR`], which
+/// configures no further factor.
+///
+/// The pool's EFFECTIVE plan is what decides, so a create is judged against the
+/// plan it asks for and an update against the plan it leaves the pool on; both
+/// paths ask this one function, so neither can gate a feature the other serves.
+#[must_use]
+pub fn pool_feature_plan_refusal(
+    tier: &str,
+    policies: Option<&UserPoolPolicyType>,
+    add_ons: Option<&UserPoolAddOnsType>,
+) -> Option<String> {
+    let refusal = |minimum: &str, feature: &str| {
+        (!user_pool_tier_includes(tier, minimum)).then(|| features_need_disabling_message(tier, feature))
+    };
+    if configures_choice_based_sign_in(policies) {
+        if let Some(message) = refusal(ESSENTIALS_USER_POOL_TIER, CHOICE_BASED_SIGN_IN_FEATURE) {
+            return Some(message);
+        }
+    }
+    if add_ons.is_some_and(|add_ons| {
+        add_ons.advanced_security_mode == ADVANCED_SECURITY_MODE_ENFORCED
+    }) {
+        if let Some(message) = refusal(PLUS_USER_POOL_TIER, THREAT_PROTECTION_FEATURE) {
+            return Some(message);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// App client OAuth configuration
+// ---------------------------------------------------------------------------
+
+/// The `OAuthFlowType` value of the machine-to-machine grant: "`client_credentials`
+/// Issue the access token from the /oauth2/token endpoint directly to a non-person
+/// user" (`CreateUserPoolClient.AllowedOAuthFlows` in this service's model).
+pub const CLIENT_CREDENTIALS_OAUTH_FLOW: &str = "client_credentials";
+
+/// The message an app client whose `AllowedOAuthFlows` combine the
+/// machine-to-machine grant with a user-facing one is refused with
+/// (`InvalidOAuthFlowException`). It names no value from the request, so every
+/// such refusal carries this one sentence.
+pub const CLIENT_CREDENTIALS_FLOW_EXCLUSIVE_MESSAGE: &str =
+    "client_credentials flow can not be selected along with code flow or implicit flow.";
+
+/// The refusal an `AllowedOAuthFlows` list owes when it asks for a combination
+/// no app client can hold, and `None` when it describes one the service accepts.
+///
+/// "To create an app client that generates client credentials grants, you must
+/// add `client_credentials` as the only allowed OAuth flow"
+/// (`CreateUserPoolClient.AllowedOAuthFlows` in this service's model): the
+/// machine-to-machine grant is issued to a non-person user, while `code` and
+/// `implicit` are grants a signed-in human is redirected through, so a list
+/// naming `client_credentials` beside either of them describes an app client
+/// that cannot exist. A list naming it alone — or not at all, or repeating it —
+/// is accepted: the rule is about which grants are configured, not how many
+/// times each is sent. Both the create and the update path ask this one
+/// function, so the two cannot disagree about what an app client may hold.
+#[must_use]
+pub fn invalid_oauth_flow_violation(flows: &[String]) -> Option<&'static str> {
+    let names_client_credentials = flows
+        .iter()
+        .any(|flow| flow == CLIENT_CREDENTIALS_OAUTH_FLOW);
+    let names_a_user_grant = flows
+        .iter()
+        .any(|flow| flow != CLIENT_CREDENTIALS_OAUTH_FLOW);
+    (names_client_credentials && names_a_user_grant).then_some(CLIENT_CREDENTIALS_FLOW_EXCLUSIVE_MESSAGE)
+}
+
+/// The scopes every user pool authorizes without a resource server of its own:
+/// "Scope values include `phone`, `email`, `openid`, and `profile`. The
+/// `aws.cognito.signin.user.admin` scope authorizes user self-service
+/// operations" (`CreateUserPoolClient.AllowedOAuthScopes` in this service's
+/// model). Every other scope value is a custom one, which only a resource server
+/// of the pool can define ([`UserPool::defines_scope`]).
+pub const STANDARD_OAUTH_SCOPES: [&str; 5] = [
+    "phone",
+    "email",
+    "openid",
+    "profile",
+    USER_ADMIN_SCOPE,
+];
+
+/// The message a `ScopeDoesNotExistException` carries for `scope`: the scope the
+/// request asked for is the one value such a refusal reports, echoed only as far
+/// as this service echoes any submitted value.
+pub fn scope_does_not_exist_message(scope: &str) -> String {
+    format!("Invalid scope requested: {}", echoed_value(scope))
 }
 
 /// The `DomainStatusType` a freshly created domain is in, until the clock makes
@@ -718,7 +924,33 @@ pub const REPLICA_DELETION_SPAN: Duration = Duration::from_millis(500);
 /// another Region needs a feature plan other than [`LITE_USER_POOL_TIER`], and
 /// a refusal reports it through [`feature_unavailable_in_tier_message`] the way
 /// every other tier refusal does.
-pub const REPLICATION_FEATURE: &str = "Multi-Region user pool replication";
+pub const REPLICATION_FEATURE: &str = "Multi-Region Replication";
+
+/// The Regions a `RegionName` may name: the emulator's SHARED Region catalog,
+/// not a copy of it.
+///
+/// A `RegionNameType` is "the Region in which the replica user pool will be
+/// created" (`CreateUserPoolReplica.RegionName`), and the model bounds only its
+/// length (5..32), so the set of values that name a Region at all is not on the
+/// wire. That set is `emulator_telemetry::policy::KNOWN_REGIONS` ("every AWS
+/// region the wire may carry, sorted for binary search", maintained centrally
+/// and already a dependency of this crate), so the Regions this service accepts
+/// cannot drift from the ones the rest of the emulator knows.
+pub const AWS_REGIONS: &[&str] = ::emulator_telemetry::policy::KNOWN_REGIONS;
+
+/// Whether `region` names an AWS Region ([`AWS_REGIONS`]). Every operation that
+/// takes a `RegionName` asks this one question, so none of them can accept a
+/// Region the others refuse. The lookup is the binary search the shared
+/// catalog's ordering is maintained for.
+#[must_use]
+pub fn is_aws_region(region: &str) -> bool {
+    AWS_REGIONS.binary_search(&region).is_ok()
+}
+
+/// The message an operation refusing a `RegionName` that names no AWS Region
+/// carries. It reports that the submitted Region name is not one and quotes
+/// nothing from the request, so every such refusal carries this one sentence.
+pub const INVALID_REGION_MESSAGE: &str = "Invalid region name";
 
 /// How much of a caller-supplied value a refusal message echoes before it
 /// elides: the bound the framework's own constraint messages use, so a long
@@ -825,6 +1057,15 @@ pub const JOB_STATUS_EXPIRED: &str = "Expired";
 /// `StartUserImportJob` returns. Never zero, so a caller reading the job right
 /// after starting it still sees the transient status.
 pub const JOB_START_SPAN: Duration = Duration::from_millis(500);
+
+/// The message a start refused because the job's CSV file was never uploaded
+/// carries: a job "imports users from a CSV file" that the client writes to the
+/// job's `PreSignedUrl` (`StartUserImportJob` and
+/// `UserImportJobType.PreSignedUrl` in this service's model), so the refusal
+/// reports that the file is missing and names no value from the request.
+pub const NO_CSV_UPLOADED_MESSAGE: &str =
+    "No users are available for import. Upload the CSV file to the job's pre-signed URL before \
+     starting it.";
 
 /// How long a stopped job stays `Stopping` before the clock owes it `Stopped`.
 ///
@@ -2746,6 +2987,46 @@ impl UserPool {
                 .iter()
                 .any(|defined| defined.scope_name == name)
         })
+    }
+
+    /// The CSV header of this pool: "a comma-separated value (CSV) list
+    /// populated with available user attributes in the user pool ... the header
+    /// for the CSV file that determines the users in a user import job"
+    /// (`GetCSVHeader`), as the list of column names it is modelled as.
+    ///
+    /// COMPUTED from the stored schema, so a pool whose schema carries a custom
+    /// attribute reports a column for it: every attribute a user import can
+    /// carry, then the two columns Amazon Cognito's import format adds
+    /// ([`CSV_HEADER_TRAILING_COLUMNS`]). [`SUB_ATTRIBUTE`] is not among them —
+    /// the pool mints it for every user and no import supplies it.
+    pub fn csv_header(&self) -> Vec<String> {
+        self.schema
+            .iter()
+            .filter_map(|attribute| attribute.name.clone())
+            .filter(|name| name != SUB_ATTRIBUTE)
+            .chain(
+                CSV_HEADER_TRAILING_COLUMNS
+                    .iter()
+                    .map(|column| (*column).to_string()),
+            )
+            .collect()
+    }
+
+    /// Whether `scope` is one an app client of this pool may be permitted to
+    /// authorize access with: a standard scope every pool serves
+    /// ([`STANDARD_OAUTH_SCOPES`]), or a custom scope a resource server of THIS
+    /// pool defines ([`UserPool::defines_scope`]).
+    ///
+    /// "Scope values include `phone`, `email`, `openid`, and `profile`. The
+    /// `aws.cognito.signin.user.admin` scope authorizes user self-service
+    /// operations. Custom scopes with resource servers authorize access to
+    /// external APIs" (`CreateUserPoolClient.AllowedOAuthScopes` in this
+    /// service's model), so a value that is neither names a scope this pool has
+    /// no definition of. Every writer of `AllowedOAuthScopes` asks this one
+    /// question, so the create and the update path cannot disagree about which
+    /// scopes exist.
+    pub fn authorizes_scope(&self, scope: &str) -> bool {
+        STANDARD_OAUTH_SCOPES.contains(&scope) || self.defines_scope(scope)
     }
 
     /// This pool's terms documents that app client `client_id` holds under
@@ -4770,6 +5051,15 @@ pub struct UserImportJob {
     /// was created, so every read of the job reports the same locator. Absent
     /// when the create named no endpoint to build one from.
     pub pre_signed_url: Option<String>,
+    /// The instant a CSV file was uploaded to this job's
+    /// [`UserImportJob::pre_signed_url`], absent until one is: a job "imports
+    /// users from a CSV file" (`StartUserImportJob`), so a job whose upload
+    /// target was never written to has nothing to import.
+    pub csv_uploaded_at: Option<SystemTime>,
+    /// How many bytes the uploaded CSV carried. The bytes themselves are not
+    /// held: this emulator imports no users from them, so the record is the
+    /// upload's size and instant rather than a copy of the file.
+    pub csv_bytes: usize,
     pub creation_date: SystemTime,
     /// When `StartUserImportJob` accepted this job, absent until it does.
     pub start_date: Option<SystemTime>,
@@ -4800,6 +5090,8 @@ impl UserImportJob {
             cloud_watch_logs_role_arn,
             password_hashing_algorithm,
             pre_signed_url,
+            csv_uploaded_at: None,
+            csv_bytes: 0,
             creation_date: now,
             start_date: None,
             in_progress_at: None,
@@ -4841,6 +5133,22 @@ impl UserImportJob {
             self.status(now),
             JOB_STATUS_PENDING | JOB_STATUS_IN_PROGRESS
         )
+    }
+
+    /// Record that a CSV of `bytes` bytes arrived at this job's upload target at
+    /// `now`. The latest upload is what the job holds: a client that writes the
+    /// target twice has replaced the file the job is going to import.
+    pub fn record_csv_upload(&mut self, bytes: usize, now: SystemTime) {
+        self.csv_uploaded_at = Some(now);
+        self.csv_bytes = bytes;
+    }
+
+    /// Whether a CSV file has been uploaded to this job's target, which is what
+    /// a start has to import. An EMPTY body uploads no CSV: a file of no bytes
+    /// carries neither the header row nor a user.
+    #[must_use]
+    pub fn has_uploaded_csv(&self) -> bool {
+        self.csv_uploaded_at.is_some() && self.csv_bytes > 0
     }
 
     /// Record that the import was started at `now`, which makes the job
@@ -5856,6 +6164,13 @@ const STANDARD_SCHEMA: [(&str, &str, bool, bool); 20] = [
 pub fn is_standard_attribute(name: &str) -> bool {
     STANDARD_SCHEMA.iter().any(|(standard, ..)| *standard == name)
 }
+
+/// The columns Amazon Cognito's user-import CSV carries BEYOND the pool's own
+/// attributes, in the order the import format puts them: the MFA state of the
+/// imported user and the username to create them under (Amazon Cognito
+/// Developer Guide, "Importing users from a CSV file"). They are not attributes
+/// of the pool's schema, so they are not reported by any other read of it.
+const CSV_HEADER_TRAILING_COLUMNS: [&str; 2] = ["cognito:mfa_enabled", "cognito:username"];
 
 /// How many digits a minted verification code carries: Amazon Cognito's
 /// verification messages carry a six-digit code.
@@ -7050,22 +7365,45 @@ pub fn new_user_import_job_id() -> String {
     format!("import-{}", new_uuid())
 }
 
+/// Whether `job_id` could be a `JobId` at all: the modelled pattern
+/// `^import-[0-9a-zA-Z-]+$` and length 1..55
+/// (`smithy_query(query="shape",shape="UserImportJobIdType")`). Asked by the
+/// non-modelled upload route, so a path of some other shape is not mistaken for
+/// one of this service's CSV upload targets.
+#[must_use]
+pub fn is_user_import_job_id_shaped(job_id: &str) -> bool {
+    let Some(suffix) = job_id.strip_prefix("import-") else {
+        return false;
+    };
+    job_id.len() <= 55
+        && !suffix.is_empty()
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// The first path segment of the locator a user import job's CSV is uploaded to.
+/// Shared by the locator [`user_import_csv_upload_url`] hands out and by the
+/// route that accepts the upload (`crate::service`), so the two cannot drift.
+pub const USER_IMPORT_CSV_ROUTE: &str = "user-import-jobs";
+
 /// Where a client uploads the CSV file of the import job `job_id`:
 /// `UserImportJobType.PreSignedUrl`, "The pre-signed URL target for uploading
 /// the CSV file".
 ///
 /// AWS answers an Amazon S3 pre-signed URL here. This emulator provisions no
 /// object store, so the URL names THIS job's CSV on the endpoint THIS REQUEST
-/// ARRIVED AT: no operation of this service serves it, and nothing reads it back
-/// as content. It is a locator built from the request's own host and the stored
-/// ids, never a stand-in for a CSV that was uploaded — and a request that names
-/// no host of its own gets no locator at all rather than a baked-in one, which
-/// would point a following client's upload at the real service.
+/// ARRIVED AT, and this service accepts the upload on that path itself (see
+/// `crate::service`) — a URL a client can really write the file to, rather than
+/// one pointing at the real service. A request that names no host of its own gets
+/// no locator at all rather than a baked-in one, which would point a following
+/// client's upload at the real service.
 ///
 /// `host` is taken only when it LOOKS like a `host[:port]`, so a caller cannot
 /// get a string of its own into the value this service reports.
 pub fn user_import_csv_upload_url(host: &str, user_pool_id: &str, job_id: &str) -> Option<String> {
-    is_host_shaped(host).then(|| format!("https://{host}/user-import-jobs/{user_pool_id}/{job_id}"))
+    is_host_shaped(host)
+        .then(|| format!("https://{host}/{USER_IMPORT_CSV_ROUTE}/{user_pool_id}/{job_id}"))
 }
 
 /// The path segment under a user pool's level that the classic hosted UI serves

@@ -435,6 +435,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             // still needs one of the two routing keys above.
             || (parts.method == http::Method::GET
                 && hosted_logo_route(&parts.uri.to_string()).is_some())
+            // The CSV upload target of a user import job
+            // (`UserImportJobType.PreSignedUrl`) is written by whatever client
+            // holds the locator this service handed out, with no credential
+            // scope and no `X-Amz-Target` either — exactly as a pre-signed S3
+            // URL is written. A PUT of exactly that path is therefore claimed
+            // here, so the file can really be uploaded to the URL this service
+            // reported.
+            || (parts.method == http::Method::PUT
+                && user_import_csv_route(&parts.uri.to_string()).is_some())
     }
 
     fn override_operation(
@@ -498,6 +507,38 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // image of one level of a pool, which `UICustomizationType.ImageUrl`
         // locates for an anonymous browser to fetch. Every other unrouted
         // request keeps the framework's protocol-correct refusal.
+        // The CSV upload target of a user import job is written with PUT, so it
+        // is answered before the GET routes below: the locator this service
+        // published describes an upload, and the job records the file that
+        // arrived so `StartUserImportJob` has something to import.
+        if req.method() == "PUT" {
+            let (user_pool_id, job_id) = user_import_csv_route(req.uri())?;
+            let state = crate::state::service_state(&*self.engine)?;
+            // The router materialises a request before it dispatches one, so the
+            // body is already in memory here; only its LENGTH is recorded, so
+            // nothing proportional to the upload is retained.
+            let body = req.body().bytes()?;
+            let now = ::std::time::SystemTime::now();
+            {
+                let mut guard = state.lock();
+                // A path naming no stored job is not this route: it falls
+                // through to the framework's refusal rather than accepting an
+                // upload nothing will import.
+                let job = guard
+                    .pool_mut(user_pool_id)?
+                    .user_import_jobs
+                    .get_mut(job_id)?;
+                job.record_csv_upload(body.len(), now);
+            }
+            // The answer a pre-signed S3 PUT gives once the object is written:
+            // 200 with no body.
+            let mut response = aws_smithy_runtime_api::http::Response::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(200).ok()?,
+                ::aws_smithy_types::body::SdkBody::empty(),
+            );
+            response.headers_mut().insert("content-length", "0");
+            return Some(response);
+        }
         if req.method() != "GET" {
             return None;
         }
@@ -591,6 +632,27 @@ fn hosted_logo_route(uri: &str) -> Option<(&str, &str)> {
         && is_user_pool_id_shaped(user_pool_id)
         && is_client_id_shaped(client_id))
     .then_some((user_pool_id, client_id))
+}
+
+/// The pool and the job whose user-import CSV upload target `uri` addresses, for
+/// a request path of the form `/user-import-jobs/<UserPoolId>/<JobId>`, and
+/// `None` for every other path.
+///
+/// This is the path [`crate::state::user_import_csv_upload_url`] builds — the two
+/// read the same [`crate::state::USER_IMPORT_CSV_ROUTE`], so a locator this
+/// service hands out and the route that accepts the upload cannot drift. Both
+/// ids have to have the FORM this service mints them in, so a path of the same
+/// shape addressed to another mounted service is not mistaken for a locator this
+/// service published.
+fn user_import_csv_route(uri: &str) -> Option<(&str, &str)> {
+    let path = uri.split(['?', '#']).next().unwrap_or(uri);
+    let (prefix, tail) = path.strip_prefix('/')?.split_once('/')?;
+    if prefix != crate::state::USER_IMPORT_CSV_ROUTE {
+        return None;
+    }
+    let (user_pool_id, job_id) = tail.split_once('/')?;
+    (is_user_pool_id_shaped(user_pool_id) && crate::state::is_user_import_job_id_shaped(job_id))
+        .then_some((user_pool_id, job_id))
 }
 
 /// Whether `candidate` has the form of a `UserPoolIdType`: the modelled pattern

@@ -185,15 +185,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// Whether the collection a request carries is one the named pool can deliver.
 ///
-/// `LogConfigurationType.LogLevel` pairs each event source with the level and the
-/// destinations it supports: "To send `userNotification` activity with information
-/// about message delivery, choose `ERROR` with `CloudWatchLogsConfiguration`. To
-/// send `userAuthEvents` activity with user logs from threat protection with the
-/// Plus feature plan, choose `INFO` with one of `CloudWatchLogsConfiguration`,
+/// `LogConfigurationType.LogLevel` pairs each event source with the destinations
+/// it supports: "To send `userNotification` activity with information about
+/// message delivery, choose `ERROR` with `CloudWatchLogsConfiguration`. To send
+/// `userAuthEvents` activity with user logs from threat protection with the Plus
+/// feature plan, choose `INFO` with one of `CloudWatchLogsConfiguration`,
 /// `FirehoseConfiguration`, or `S3Configuration`" (this service's model). So an
-/// entry is acceptable when its level is the one its source emits, it names
-/// exactly one destination that source may be exported to, it is the only entry
-/// for its source, and the pool's feature plan includes that source.
+/// entry is acceptable when it names exactly one destination that source may be
+/// exported to, it is the only entry for its source, and the pool's feature plan
+/// includes that source. The LEVEL is the caller's choice among the modelled
+/// `LogLevel` values (see [`DELIVERABLE_SOURCES`]).
 ///
 /// Amazon Cognito validates the REQUEST rather than one entry: a refusal names
 /// the condition once and lists every event source in the request that fails it,
@@ -295,13 +296,6 @@ const REQUEST_CONDITIONS: &[RequestCondition] = &[
         },
     },
     RequestCondition {
-        clause: "have an unsupported log level",
-        failed_by: |configuration, _| {
-            source_rule(&configuration.event_source)
-                .is_some_and(|rule| rule.log_level != configuration.log_level)
-        },
-    },
-    RequestCondition {
         clause: "have no destination",
         failed_by: |configuration, _| named_destinations(configuration).is_empty(),
     },
@@ -334,14 +328,11 @@ fn request_validation_message(clause: &str, event_sources: &[&str]) -> String {
     )
 }
 
-/// What one `EventSourceName` may be exported as: the level it emits, the
-/// destinations it may be exported to, and the feature plan that includes it.
+/// What one `EventSourceName` may be exported as: the destinations it may be
+/// exported to, and the feature plan that includes it.
 struct DeliverableSource {
     /// One of the modelled [`crate::ops::types::EVENT_SOURCE_NAME_VALUES`].
     event_source: &'static str,
-    /// The one [`crate::ops::types::LOG_LEVEL_VALUES`] entry this source's logs
-    /// carry.
-    log_level: &'static str,
     /// The `LogConfigurationType` destination members this source may be
     /// exported to, in the order the model lists them.
     destinations: &'static [&'static str],
@@ -363,10 +354,15 @@ struct RequiredPlan {
 
 /// Each modelled event source, as `LogConfigurationType.LogLevel` and
 /// `LogConfigurationType.EventSource` describe it.
+///
+/// The LEVEL is not part of the rule: `LogLevel` is "the `errorlevel` selection
+/// of logs that a user pool sends" and its documentation RECOMMENDS a level per
+/// source rather than restricting one — every value the modelled `LogLevel` enum
+/// declares is a level a source can be configured with, and the pool reports
+/// back the one the request named.
 const DELIVERABLE_SOURCES: [DeliverableSource; 2] = [
     DeliverableSource {
         event_source: "userNotification",
-        log_level: "ERROR",
         destinations: &["CloudWatchLogsConfiguration"],
         // "User pools can export user notification logs and, when threat
         // protection is active, user-activity logs"
@@ -377,7 +373,6 @@ const DELIVERABLE_SOURCES: [DeliverableSource; 2] = [
     },
     DeliverableSource {
         event_source: "userAuthEvents",
-        log_level: "INFO",
         destinations: &[
             "CloudWatchLogsConfiguration",
             "FirehoseConfiguration",
