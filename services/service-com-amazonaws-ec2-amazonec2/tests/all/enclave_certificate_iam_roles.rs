@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for `AssociateEnclaveCertificateIamRole` and the read that reports its
-//! writes back, driven over the wire the service actually speaks: `ec2Query` — an
+//! End-to-end cover for `AssociateEnclaveCertificateIamRole`, the write that removes what it
+//! wrote (`DisassociateEnclaveCertificateIamRole`) and the read that reports both back,
+//! driven over the wire the service actually speaks: `ec2Query` — an
 //! `application/x-www-form-urlencoded` POST whose body carries `Action=<Operation>`,
 //! answered with XML (README.md / OPERATIONS.md "Wire protocol"). ec2Query is selected by
 //! the `ec2` signing name in the request's SigV4 credential scope, so every call here
@@ -13,12 +14,14 @@
 //! accepted pair is STORED: the association is reported back with the bundle location
 //! derived from the pair (the object key is `role_arn/certificate_arn`) and the one bucket
 //! and encryption key the certificate's bundle was stored under, up to the documented
-//! sixteen roles per certificate.
+//! sixteen roles per certificate — until the pair is disassociated, which removes that one
+//! association and nothing else and is reported back by its absence.
 //!
 //! Every table row is a distinct input along what that generalises over: the partition, the
 //! Region and the account of each ARN, the form and the length of the certificate id, the
-//! path and the characters of the role name, how many roles one certificate holds, and —
-//! for the refusals — which member cannot be served and in which way.
+//! path and the characters of the role name, how many roles one certificate holds, whether
+//! the pair a disassociation names is in force at all, and — for the refusals — which member
+//! cannot be served and in which way.
 
 use ec2::state::{
     uuid_suffixed_id_is_well_formed, ComAmazonawsEc2Amazonec2State as Ec2State,
@@ -53,6 +56,9 @@ const ROLE_REFUSAL: (&str, &str) = (
     "The request must contain a valid role arn",
 );
 
+/// The write that removes what the association wrote.
+const DISASSOCIATE: &str = "DisassociateEnclaveCertificateIamRole";
+
 /// A certificate ARN the suite associates when the row under test is about something else.
 const A_CERTIFICATE: &str =
     "arn:aws:acm:us-east-1:123456789012:certificate/0f2c1b7e-7f1a-4a0b-9f4d-5b8c9d0e1f23";
@@ -85,6 +91,28 @@ async fn associate(
 /// The report of the roles `certificate_arn` holds, as its status and body.
 async fn get(router: &MultiServiceRouter, certificate_arn: &str) -> (u16, String) {
     call(router, GET, &[param("CertificateArn", certificate_arn)]).await
+}
+
+/// One disassociation of `role_arn` from `certificate_arn`, as its status and body.
+async fn disassociate(
+    router: &MultiServiceRouter,
+    certificate_arn: &str,
+    role_arn: &str,
+) -> (u16, String) {
+    call(
+        router,
+        DISASSOCIATE,
+        &[
+            param("CertificateArn", certificate_arn),
+            param("RoleArn", role_arn),
+        ],
+    )
+    .await
+}
+
+/// The one member a disassociation answers: `<return>`.
+fn answered_return(case: &str, body: &str) -> String {
+    element(body, "return").unwrap_or_else(|| panic!("case {case:?}: no <return> in {body}"))
 }
 
 /// The three members an association answers: the bucket, the object key and the KMS key id.
@@ -731,5 +759,471 @@ async fn the_association_answers_its_three_members_in_the_ec2_query_envelope() {
         set_items(parsed.root_element(), "associatedRoleSet").len(),
         1,
         "case {case:?}: expected one <associatedRoleSet> item, got {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What a disassociation removes
+// ---------------------------------------------------------------------------
+
+/// Every pair an association put in force is removed again by a disassociation naming that
+/// pair: the call answers `true`, the store holds the association no longer, and the report
+/// of the certificate no longer carries the role.
+///
+/// The rows are the spread of certificate and role forms the association is driven over, so
+/// the removal is shown to read each ARN member by FORM exactly as the write does rather
+/// than for one shape of input.
+#[tokio::test]
+async fn every_disassociated_pair_is_removed_and_no_longer_reported() {
+    let (router, engine) = super::ec2_query::emulator();
+    for row in rows() {
+        let case = row.case;
+        let (status, body) = associate(&router, &row.certificate_arn, &row.role_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from {ASSOCIATE}, got {status} with body {body}"
+        );
+
+        let (status, body) = disassociate(&router, &row.certificate_arn, &row.role_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from {DISASSOCIATE}, got {status} with body \
+             {body}"
+        );
+        assert_eq!(
+            answered_return(case, &body),
+            "true",
+            "case {case:?}: expected <return>true</return>, got {:?}",
+            answered_return(case, &body)
+        );
+        assert!(
+            stored_roles(&engine, &row.certificate_arn).is_empty(),
+            "case {case:?}: expected the store to hold no role for the certificate, got {:?}",
+            stored_roles(&engine, &row.certificate_arn)
+        );
+
+        let (status, body) = get(&router, &row.certificate_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from {GET}, got {status} with body {body}"
+        );
+        assert!(
+            reported_roles(case, &body).is_empty(),
+            "case {case:?}: expected {GET} to report no roles, got {:?}",
+            reported_roles(case, &body)
+        );
+    }
+    assert_eq!(
+        stored_certificates(&engine),
+        0,
+        "case {:?}: expected the store to hold no certificate once every role of each one \
+         was disassociated, got {}",
+        "every row disassociated",
+        stored_certificates(&engine)
+    );
+}
+
+/// A disassociation removes the ONE pair it names: the certificate's other roles keep their
+/// association and the very bundle they were reported under, another certificate is
+/// untouched, and the certificate's record goes only with the last of its roles.
+#[tokio::test]
+async fn a_disassociation_removes_only_the_pair_it_names() {
+    let (router, engine) = super::ec2_query::emulator();
+    let case = "one role of three, with a second certificate beside it";
+    let roles = [
+        "arn:aws:iam::123456789012:role/first-role",
+        "arn:aws:iam::123456789012:role/second/path/role",
+        "arn:aws:iam::123456789012:role/third-role",
+    ];
+    let mut bundles = Vec::new();
+    for role_arn in roles {
+        let (status, body) = associate(&router, A_CERTIFICATE, role_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 associating {role_arn}, got {status} with body \
+             {body}"
+        );
+        bundles.push(answered_bundle(case, &body));
+    }
+    let other_certificate =
+        "arn:aws:acm:us-east-1:123456789012:certificate/11112222-3333-4444-5555-666677778888";
+    let (status, body) = associate(&router, other_certificate, A_ROLE).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 for a second certificate, got {status} with body \
+         {body}"
+    );
+
+    // The middle role goes; the first and the third stay, under the bundle they were
+    // reported under before.
+    let (status, body) = disassociate(&router, A_CERTIFICATE, roles[1]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from {DISASSOCIATE}, got {status} with body {body}"
+    );
+    assert_eq!(
+        answered_return(case, &body),
+        "true",
+        "case {case:?}: expected <return>true</return>, got {:?}",
+        answered_return(case, &body)
+    );
+    let (status, body) = get(&router, A_CERTIFICATE).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from {GET}, got {status} with body {body}"
+    );
+    let mut expected: Vec<(String, String, String, String)> = [0usize, 2]
+        .into_iter()
+        .map(|index| {
+            let (bucket, key, kms_key_id) = bundles[index].clone();
+            (roles[index].to_string(), bucket, key, kms_key_id)
+        })
+        .collect();
+    expected.sort();
+    assert_eq!(
+        reported_roles(case, &body),
+        expected,
+        "case {case:?}: expected the two remaining roles under the bundle they were \
+         associated with, got {:?}",
+        reported_roles(case, &body)
+    );
+    let (status, body) = get(&router, other_certificate).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from {GET} for the second certificate, got \
+         {status} with body {body}"
+    );
+    assert_eq!(
+        reported_roles(case, &body)
+            .into_iter()
+            .map(|(role_arn, _, _, _)| role_arn)
+            .collect::<Vec<String>>(),
+        vec![A_ROLE.to_string()],
+        "case {case:?}: expected the second certificate to keep its role"
+    );
+    assert_eq!(
+        stored_certificates(&engine),
+        2,
+        "case {case:?}: expected the store to still hold both certificates, got {}",
+        stored_certificates(&engine)
+    );
+
+    // The record of a certificate goes with the LAST of its roles, and only then.
+    for role_arn in [roles[0], roles[2]] {
+        let (status, body) = disassociate(&router, A_CERTIFICATE, role_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 disassociating {role_arn}, got {status} with \
+             body {body}"
+        );
+    }
+    assert_eq!(
+        stored_certificates(&engine),
+        1,
+        "case {case:?}: expected only the second certificate to be left stored, got {}",
+        stored_certificates(&engine)
+    );
+    assert_eq!(
+        stored_roles(&engine, other_certificate),
+        vec![A_ROLE.to_string()],
+        "case {case:?}: expected the second certificate's association to be untouched, got \
+         {:?}",
+        stored_roles(&engine, other_certificate)
+    );
+}
+
+/// A disassociation of a pair that is not in force is served and removes nothing: the
+/// request asks for a state — this role has no access to this certificate — that already
+/// holds, so it is answered `true` and every association the store does hold is still
+/// there. The rows are the ways a pair can fail to be in force, and the repeat of a
+/// disassociation that DID remove something is the same request a second time.
+#[tokio::test]
+async fn a_pair_the_store_does_not_hold_is_answered_and_removes_nothing() {
+    let (router, engine) = super::ec2_query::emulator();
+    let (status, body) = associate(&router, A_CERTIFICATE, A_ROLE).await;
+    assert_eq!(
+        status, 200,
+        "case {:?}: expected HTTP 200 from {ASSOCIATE}, got {status} with body {body}",
+        "the one association in force"
+    );
+    let unknown_certificate =
+        "arn:aws:acm:us-east-1:123456789012:certificate/aaaabbbb-cccc-dddd-eeee-ffff00001111";
+    let unknown_role = "arn:aws:iam::123456789012:role/never-associated";
+    let rows: Vec<(&str, &str, &str)> = vec![
+        (
+            "a certificate nothing is associated with",
+            unknown_certificate,
+            A_ROLE,
+        ),
+        (
+            "a role the certificate is not associated with",
+            A_CERTIFICATE,
+            unknown_role,
+        ),
+        (
+            "neither the certificate nor the role is known",
+            unknown_certificate,
+            unknown_role,
+        ),
+    ];
+    for (case, certificate_arn, role_arn) in rows {
+        let (status, body) = disassociate(&router, certificate_arn, role_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from {DISASSOCIATE}, got {status} with body \
+             {body}"
+        );
+        assert_eq!(
+            answered_return(case, &body),
+            "true",
+            "case {case:?}: expected <return>true</return>, got {:?}",
+            answered_return(case, &body)
+        );
+        assert_eq!(
+            stored_roles(&engine, A_CERTIFICATE),
+            vec![A_ROLE.to_string()],
+            "case {case:?}: expected the association in force to be untouched, got {:?}",
+            stored_roles(&engine, A_CERTIFICATE)
+        );
+        assert_eq!(
+            stored_certificates(&engine),
+            1,
+            "case {case:?}: expected the store to hold one certificate, got {}",
+            stored_certificates(&engine)
+        );
+    }
+
+    let case = "the same disassociation twice";
+    for round in 0..2 {
+        let (status, body) = disassociate(&router, A_CERTIFICATE, A_ROLE).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?} round {round}: expected HTTP 200, got {status} with body {body}"
+        );
+        assert_eq!(
+            answered_return(case, &body),
+            "true",
+            "case {case:?} round {round}: expected <return>true</return>, got {:?}",
+            answered_return(case, &body)
+        );
+        assert_eq!(
+            stored_certificates(&engine),
+            0,
+            "case {case:?} round {round}: expected the store to hold nothing, got {}",
+            stored_certificates(&engine)
+        );
+    }
+}
+
+/// The disassociation refuses exactly the values the association refuses, with the code that
+/// says which of the two members the request got wrong, and no refusal removes the
+/// association in force.
+#[tokio::test]
+async fn the_disassociation_refuses_the_values_the_surface_will_not_read() {
+    let (router, engine) = super::ec2_query::emulator();
+    let (status, body) = associate(&router, A_CERTIFICATE, A_ROLE).await;
+    assert_eq!(
+        status, 200,
+        "case {:?}: expected HTTP 200 from {ASSOCIATE}, got {status} with body {body}",
+        "the one association in force"
+    );
+
+    let (expected_code, expected_message) = CERTIFICATE_REFUSAL;
+    for (why, value) in malformed_certificate_arns() {
+        let case = format!("the certificate member: {why}");
+        let (status, body) = disassociate(&router, &value, A_ROLE).await;
+        assert_refused(
+            &case,
+            status,
+            &body,
+            expected_code,
+            expected_message,
+            &engine,
+        );
+    }
+    let (expected_code, expected_message) = ROLE_REFUSAL;
+    for (why, value) in malformed_role_arns() {
+        let case = format!("the role member: {why}");
+        let (status, body) = disassociate(&router, A_CERTIFICATE, &value).await;
+        assert_refused(
+            &case,
+            status,
+            &body,
+            expected_code,
+            expected_message,
+            &engine,
+        );
+    }
+}
+
+/// One refusal of the disassociation: HTTP 400 carrying `expected_code` and
+/// `expected_message`, with the one association in force left where it was.
+fn assert_refused(
+    case: &str,
+    status: u16,
+    body: &str,
+    expected_code: &str,
+    expected_message: &str,
+    engine: &engine::InMemoryEngine,
+) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} with body {body}"
+    );
+    assert_eq!(
+        error_code(body),
+        expected_code,
+        "case {case:?}: expected {expected_code}, got {:?} in {body}",
+        error_code(body)
+    );
+    assert_eq!(
+        error_message(body),
+        expected_message,
+        "case {case:?}: expected {expected_message:?}, got {:?}",
+        error_message(body)
+    );
+    assert_eq!(
+        stored_roles(engine, A_CERTIFICATE),
+        vec![A_ROLE.to_string()],
+        "case {case:?}: expected the refusal to remove nothing, got {:?}",
+        stored_roles(engine, A_CERTIFICATE)
+    );
+}
+
+/// A dry run of the disassociation reports the permission outcome every caller of this
+/// emulator gets and removes nothing: the association it would have removed is still
+/// reported afterwards.
+#[tokio::test]
+async fn a_dry_run_of_the_disassociation_removes_nothing() {
+    let (router, engine) = super::ec2_query::emulator();
+    let case = "a dry run of the disassociation";
+    let (status, body) = associate(&router, A_CERTIFICATE, A_ROLE).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from {ASSOCIATE}, got {status} with body {body}"
+    );
+    let (status, body) = call(
+        &router,
+        DISASSOCIATE,
+        &[
+            param("CertificateArn", A_CERTIFICATE),
+            param("RoleArn", A_ROLE),
+            param("DryRun", "true"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 412,
+        "case {case:?}: expected HTTP 412, got {status} with body {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "DryRunOperation",
+        "case {case:?}: expected DryRunOperation, got {:?} in {body}",
+        error_code(&body)
+    );
+    assert_eq!(
+        stored_roles(&engine, A_CERTIFICATE),
+        vec![A_ROLE.to_string()],
+        "case {case:?}: expected the dry run to remove nothing, got {:?}",
+        stored_roles(&engine, A_CERTIFICATE)
+    );
+    let (status, body) = get(&router, A_CERTIFICATE).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from {GET}, got {status} with body {body}"
+    );
+    assert_eq!(
+        reported_roles(case, &body).len(),
+        1,
+        "case {case:?}: expected the association to still be reported, got {:?}",
+        reported_roles(case, &body)
+    );
+}
+
+/// A disassociation gives the certificate room under the documented maximum back: the role
+/// refused while sixteen were in force is taken once one of them is removed.
+#[tokio::test]
+async fn a_disassociation_makes_room_under_the_documented_maximum() {
+    let (router, engine) = super::ec2_query::emulator();
+    let case = "room under the documented maximum";
+    for index in 0..MAX_ENCLAVE_CERTIFICATE_IAM_ROLES {
+        let role_arn = format!("arn:aws:iam::123456789012:role/enclave-role-{index}");
+        let (status, body) = associate(&router, A_CERTIFICATE, &role_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 for role {index}, got {status} with body {body}"
+        );
+    }
+    let one_more = "arn:aws:iam::123456789012:role/one-role-too-many";
+    let (status, body) = associate(&router, A_CERTIFICATE, one_more).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400 while the certificate is full, got {status} with \
+         body {body}"
+    );
+
+    let removed = "arn:aws:iam::123456789012:role/enclave-role-0";
+    let (status, body) = disassociate(&router, A_CERTIFICATE, removed).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from {DISASSOCIATE}, got {status} with body {body}"
+    );
+    let (status, body) = associate(&router, A_CERTIFICATE, one_more).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the role refused before to be taken now, got {status} with \
+         body {body}"
+    );
+    let held = stored_roles(&engine, A_CERTIFICATE);
+    assert_eq!(
+        held.len(),
+        MAX_ENCLAVE_CERTIFICATE_IAM_ROLES,
+        "case {case:?}: expected the certificate to hold the documented maximum again, got \
+         {held:?}"
+    );
+    assert!(
+        !held.iter().any(|role_arn| role_arn == removed),
+        "case {case:?}: expected the disassociated role to be gone, got {held:?}"
+    );
+    assert!(
+        held.iter().any(|role_arn| role_arn == one_more),
+        "case {case:?}: expected the newly associated role to be held, got {held:?}"
+    );
+}
+
+/// The ec2Query envelope of a successful disassociation: the one member it answers, read as
+/// a direct child of the response element, plus the `requestId` every EC2 response carries.
+#[tokio::test]
+async fn the_disassociation_answers_its_one_member_in_the_ec2_query_envelope() {
+    let (router, _engine) = super::ec2_query::emulator();
+    let case = "the disassociation envelope";
+    let (status, body) = associate(&router, A_CERTIFICATE, A_ROLE).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from {ASSOCIATE}, got {status} with body {body}"
+    );
+    let (status, body) = disassociate(&router, A_CERTIFICATE, A_ROLE).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200, got {status} with body {body}"
+    );
+    let parsed = document(case, &body);
+    let root = parsed.root_element();
+    assert_eq!(
+        root.tag_name().name(),
+        format!("{DISASSOCIATE}Response"),
+        "case {case:?}: expected a <{DISASSOCIATE}Response> root, got {body}"
+    );
+    let request_id = child_text(root, "requestId")
+        .unwrap_or_else(|| panic!("case {case:?}: no <requestId> in {body}"));
+    assert!(
+        !request_id.is_empty(),
+        "case {case:?}: expected <requestId> to carry a value, got {request_id:?}"
+    );
+    assert_eq!(
+        child_text(root, "return").as_deref(),
+        Some("true"),
+        "case {case:?}: expected <return>true</return> as a direct child, got {body}"
     );
 }

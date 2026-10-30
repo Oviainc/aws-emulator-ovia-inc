@@ -18,7 +18,7 @@
 //! An association has no status member and no lifecycle
 //! (`AssociateEnclaveCertificateIamRoleResult` answers the bucket, the key and the KMS key id
 //! and nothing else), so nothing here is owed a clock-driven move: the association is in
-//! force when the call returns.
+//! force when the call returns, and it stays in force until it is disassociated.
 //!
 //! A child module of [`crate::state`] rather than more lines in it: everything here belongs
 //! to one subject and reaches the rest of the store through `use super::*`. Everything it
@@ -344,5 +344,39 @@ impl ComAmazonawsEc2Amazonec2State {
             associated_enclave_certificate_iam_role(certificate_arn, role_arn, record);
         self.add_stored_bytes(payload_bytes);
         Some(association)
+    }
+
+    /// Disassociate `role_arn` from `certificate_arn`.
+    ///
+    /// The ONE remover seam, the exact inverse of
+    /// [`Self::associate_enclave_certificate_iam_role`]: the role goes, the bytes that
+    /// association was charged go back to the store's budget, and the certificate's record
+    /// goes with the LAST of its roles — "disassociating an IAM role from an ACM certificate
+    /// removes the Amazon S3 object that contains the certificate, certificate chain, and
+    /// encrypted private key from the Amazon S3 bucket" (`DisassociateEnclaveCertificateIamRole`),
+    /// so a certificate no role is associated with has no bundle stored for it, and a later
+    /// association of it uploads one again and decides its bucket and encryption key then.
+    ///
+    /// A pair this store does not hold leaves it exactly as it was: there is no association
+    /// to remove, and the state the request asks for — this role has no access to this
+    /// certificate — is the state that already holds.
+    pub fn disassociate_enclave_certificate_iam_role(
+        &mut self,
+        certificate_arn: &str,
+        role_arn: &str,
+    ) {
+        let Some(record) = self.enclave_certificate_iam_roles.get_mut(certificate_arn) else {
+            return;
+        };
+        if !record.role_arns.remove(role_arn) {
+            return;
+        }
+        if record.role_arns.is_empty() {
+            self.enclave_certificate_iam_roles.remove(certificate_arn);
+        }
+        self.release_stored_bytes(
+            enclave_certificate_iam_role_payload_bytes(certificate_arn, role_arn)
+                .saturating_add(STORED_RECORD_OVERHEAD_BYTES),
+        );
     }
 }

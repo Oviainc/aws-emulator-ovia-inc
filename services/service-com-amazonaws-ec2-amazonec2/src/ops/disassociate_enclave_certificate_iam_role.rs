@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateEnclaveCertificateIamRole
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateEnclaveCertificateIamRole`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes one IAM role's association with one ACM certificate for ACM for
+//! Nitro Enclaves — the association `AssociateEnclaveCertificateIamRole` wrote and
+//! `GetAssociatedEnclaveCertificateIamRoles` reports — and answers `true`. A value that is
+//! not an ACM certificate ARN and a value that is not an IAM role ARN are each refused with
+//! the code that says which of the two the request got wrong, and write nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateEnclaveCertificateIamRole::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -138,20 +136,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateEnclaveCertificateIamRole` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateEnclaveCertificateIamRoleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateEnclaveCertificateIamRole"))
+        // The engine is reachable from `&self` (constructor-injected). Nothing here reads
+        // request metadata: a disassociation is decided by the pair it names and the store.
+        use crate::state;
+
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation"
+        // (`DisassociateEnclaveCertificateIamRoleRequest$DryRun`): a PERMISSION check and
+        // nothing else, so it is answered FIRST and neither reads nor writes anything.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "The ARN of the ACM certificate from which to disassociate the IAM role" and "the
+        // ARN of the IAM role to disassociate"
+        // (`DisassociateEnclaveCertificateIamRoleRequest`): both members are `@required` AND
+        // `@clientOptional`, so an empty value reaches this handler, and both are read by
+        // FORM through the readers the whole enclave certificate surface shares — so this
+        // operation accepts exactly the values its association and its report accept, and
+        // each refusal says which of the two the request got wrong.
+        let certificate_arn = state::require_enclave_certificate_arn(&input.certificate_arn)?;
+        let role_arn = state::require_enclave_certificate_role_arn(&input.role_arn)?;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock-owed moves this call must see before it decides, the way every operation
+        // of this crate that touches the store applies them: each was due at its instant
+        // whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // The one remover seam: the role loses its access to the certificate, and the
+        // certificate's stored bundle goes with the last of its roles. A pair the store does
+        // not hold is served by this call too — it writes nothing — because the state the
+        // request asks for (this role has no access to this certificate) is the state that
+        // holds when it returns. AWS publishes no refusal for that request, and the
+        // association half of this surface answers a repeat with the association in force
+        // rather than refusing it, so this half is idempotent in the same way.
+        store.disassociate_enclave_certificate_iam_role(certificate_arn, role_arn);
+
+        // "Returns true if the request succeeds; otherwise, it returns an error"
+        // (`DisassociateEnclaveCertificateIamRoleResult$Return`) — the request succeeded, so
+        // there is no other value this member can carry.
+        Ok(DisassociateEnclaveCertificateIamRoleOutput {
+            r#return: Some(true),
+        })
     }
 }
