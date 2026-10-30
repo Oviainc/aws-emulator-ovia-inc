@@ -23,6 +23,8 @@ mod cancel_message_move_task;
 mod dead_letter_drain_cycle;
 #[path = "all/dead_letter_instants.rs"]
 mod dead_letter_instants;
+#[path = "all/dead_letter_move_on_visibility_change.rs"]
+mod dead_letter_move_on_visibility_change;
 #[path = "all/dead_letter_redrive.rs"]
 mod dead_letter_redrive;
 #[path = "all/dead_letter_source_attribution.rs"]
