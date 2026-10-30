@@ -31,9 +31,9 @@
 //!   when its ARN names nothing.
 
 use crate::harness::{
-    call, call_in_region, create_tagged_resource, create_tagged_resource_in, expected_tags, pair,
-    past_the_transition_span, read_resource, read_resource_in, router, tag_object, tags_of,
-    tags_path, unresolvable_arns, untag_resource, TAGGABLE_KINDS,
+    call, create_tagged_resource, create_tagged_resource_in, expected_tags, list_tags_in, pair,
+    past_the_transition_span, read_resource, read_resource_in, router, tag_resource_in, tags_of,
+    unresolvable_arns, untag_resource, REGION, TAGGABLE_KINDS,
 };
 use crate::region_isolation::REGIONS;
 use serde_json::{json, Value};
@@ -49,19 +49,10 @@ use std::collections::BTreeMap;
 /// generated shape.
 const NOT_FOUND_CODE: &str = "NotFoundException";
 
-/// `GET /v1/tags/{resourceArn}` — the one route this suite lists tags through.
+/// `GET /v1/tags/{resourceArn}` — the one route this suite lists tags through, through
+/// the Region every suite that is not testing the Region dimension signs for.
 async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> (u16, Value) {
-    call(router, "GET", &tags_path(resource_arn), None).await
-}
-
-/// As [`list_tags`], through `region`'s endpoint — for the cases that assert which
-/// Region owns the resource a listing names.
-async fn list_tags_in(
-    router: &MultiServiceRouter,
-    region: &str,
-    resource_arn: &str,
-) -> (u16, Value) {
-    call_in_region(router, region, "GET", &tags_path(resource_arn), None).await
+    list_tags_in(router, REGION, resource_arn).await
 }
 
 /// `POST /v1/tags/{resourceArn}` carrying `tags`: the write whose result a listing has
@@ -71,13 +62,7 @@ async fn tag_resource(
     resource_arn: &str,
     tags: &[(String, String)],
 ) -> (u16, Value) {
-    call(
-        router,
-        "POST",
-        &tags_path(resource_arn),
-        Some(json!({"tags": tag_object(tags)})),
-    )
-    .await
+    tag_resource_in(router, REGION, resource_arn, tags).await
 }
 
 /// The map a listing reports, asserted to be a 200 first.

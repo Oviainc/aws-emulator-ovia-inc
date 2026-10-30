@@ -172,7 +172,10 @@ pub fn parse_of<'a>(value: &'a str, expected: &str) -> Option<Arn<'a>> {
 ///
 /// Every `*Arn` pattern in the AWS models bounds the Region field at `[a-z0-9-]{1,20}`,
 /// so a longer label is not a Region any AWS endpoint has.
-const MAX_REGION_LENGTH: usize = 20;
+///
+/// Public so a suite asserting the boundary of [`region_label`]'s grammar states that
+/// bound once, here, rather than restating the figure and drifting from it.
+pub const MAX_REGION_LENGTH: usize = 20;
 
 /// `value` when it is a well-formed AWS Region LABEL, and `None` otherwise.
 ///

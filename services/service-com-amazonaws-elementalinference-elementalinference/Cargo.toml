@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `service-common` carries this tree's ONE statement of the AWS Region grammar
+# (`arn::region_label`), which `state::request_region` reads the caller's credential
+# scope through before that value names a Region of the store or is spliced into an ARN.
+service-common = { path = "../common" }
 # Opaque `nextToken` codec for the paginated operations (ListFeeds, ListDictionaries,
 # SearchFixtures).
 hex = { workspace = true }

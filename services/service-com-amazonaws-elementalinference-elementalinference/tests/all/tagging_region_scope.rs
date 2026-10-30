@@ -16,30 +16,12 @@
 //! and through both ARN-based operations.
 
 use crate::harness::{
-    call_in_region, create_tagged_resource_in, expected_tags, pair, read_resource_in, router,
-    tag_object, tags_of, tags_path, untag_resource_in, TAGGABLE_KINDS,
+    create_tagged_resource_in, expected_tags, pair, read_resource_in, router, tag_resource_in,
+    tags_of, untag_resource_in, TAGGABLE_KINDS,
 };
 use crate::region_isolation::{arn_region, assert_not_found, REGIONS};
-use serde_json::{json, Value};
+use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
-
-/// `POST /v1/tags/{resourceArn}` through `region`'s endpoint — the write half of the
-/// tagging path, which no other suite sends through a chosen Region.
-async fn tag_in(
-    router: &MultiServiceRouter,
-    region: &str,
-    resource_arn: &str,
-    tags: &[(String, String)],
-) -> (u16, Value) {
-    call_in_region(
-        router,
-        region,
-        "POST",
-        &tags_path(resource_arn),
-        Some(json!({"tags": tag_object(tags)})),
-    )
-    .await
-}
 
 /// `DELETE /v1/tags/{resourceArn}?tagKeys=…` through `region`'s endpoint, for keys given
 /// as `&str`.
@@ -99,7 +81,7 @@ async fn the_tagging_path_reaches_only_the_resources_of_the_signed_for_region() 
                     ),
                 ] {
                     let label = format!("{kind} of {owner}, other Region {other}: {form}");
-                    let (status, body) = tag_in(
+                    let (status, body) = tag_resource_in(
                         &router,
                         signed_for,
                         &presented,
@@ -127,7 +109,8 @@ async fn the_tagging_path_reaches_only_the_resources_of_the_signed_for_region() 
             // ...and the refusals are about the Region, not about the path: the owning
             // endpoint with the ARN it minted still tags the resource,
             let added = pair("added", "by-its-own-region");
-            let (status, body) = tag_in(&router, owner, &arn, std::slice::from_ref(&added)).await;
+            let (status, body) =
+                tag_resource_in(&router, owner, &arn, std::slice::from_ref(&added)).await;
             assert_eq!(
                 status, 204,
                 "case {kind} of {owner:?}: its own Region tags it through its own ARN, got \

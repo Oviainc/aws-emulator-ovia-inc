@@ -87,6 +87,35 @@ pub fn tags_path(resource_arn: &str) -> String {
     format!("/v1/tags/{}", percent_encode(resource_arn))
 }
 
+/// `GET /v1/tags/{resourceArn}` through `region`'s endpoint — the reporting half of the
+/// tagging path ([`ListTagsForResource`]), beside [`tag_resource_in`] and
+/// [`untag_resource_in`], so a suite about a Region reads tags through one place.
+pub async fn list_tags_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    resource_arn: &str,
+) -> (u16, Value) {
+    call_in_region(router, region, "GET", &tags_path(resource_arn), None).await
+}
+
+/// `POST /v1/tags/{resourceArn}` carrying `tags`, through `region`'s endpoint — the write
+/// half of the tagging path.
+pub async fn tag_resource_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    resource_arn: &str,
+    tags: &[(String, String)],
+) -> (u16, Value) {
+    call_in_region(
+        router,
+        region,
+        "POST",
+        &tags_path(resource_arn),
+        Some(json!({"tags": tag_object(tags)})),
+    )
+    .await
+}
+
 /// `DELETE /v1/tags/{resourceArn}?tagKeys=…`: the one path every suite deletes tags
 /// through.
 ///

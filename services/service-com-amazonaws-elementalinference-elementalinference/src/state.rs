@@ -42,7 +42,10 @@
 //! Region's own. The ARN-based tagging path resolves within that same Region
 //! ([`ComAmazonawsElementalinferenceElementalinferenceState::tagged_resource_mut`]), so
 //! the id-based and the ARN-based paths cannot disagree about which resources a Region
-//! holds.
+//! holds. WHICH Region a request reached is read off its own credential scope, held to
+//! the Region grammar first ([`request_region`]), so every ARN this service mints
+//! carries a Region field the modelled `resourceArn` admits and a resource this service
+//! handed an ARN for is one its tagging operations can be called with.
 //!
 //! A FIXTURE is not one of those resources: no operation of this service creates,
 //! updates or deletes one. A fixture is a sports event "as provided by the data
@@ -81,6 +84,10 @@ pub const SERVICE_NAMESPACE: &str = "elemental-inference";
 
 /// The region an unsigned request is attributed to. `emulator_arn` documents
 /// `us-east-1` as the generated emulator's default region.
+///
+/// Also where a request whose SigV4 credential scope names something that is not a
+/// Region code at all is attributed ([`request_region`]): such a scope names no Region,
+/// so the request is treated as one that carries none.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// Length of a `FeedId` — the modelled pattern is `^[a-z0-9]{19}$`.
@@ -2367,10 +2374,24 @@ pub fn output_config_with_defaults(
     config
 }
 
-/// The region this request was signed for, or [`DEFAULT_REGION`] when it carries no
-/// SigV4 credential scope.
+/// The Region this request was signed for — the endpoint it reached, and the Region
+/// field of every ARN the response carries.
+///
+/// The value comes from the caller's own SigV4 credential scope, which is free text in
+/// the `Authorization` header, so it is read through the shared Region grammar
+/// (`service_common::arn::region_label`, the one place this tree states that grammar:
+/// non-empty, at most 20 characters and composed only of `[a-z0-9-]`, the form every
+/// model's ARN pattern states for the field — here
+/// `…:elemental-inference[a-z\-]*:[a-z0-9\-]+:…`) before it names a Region of this store
+/// or is spliced into an ARN. A scope whose region field is no Region label names no
+/// Region at all, so such a request is attributed to [`DEFAULT_REGION`] exactly as a
+/// request carrying no SigV4 credential scope is. That keeps every ARN this service
+/// mints a value the modelled `resourceArn` admits, so the ARN a create hands back is
+/// one the tagging operations — whose only handle is a `resourceArn` — can be called
+/// with.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .filter(|scope| ::service_common::arn::region_label(&scope.region).is_some())
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }

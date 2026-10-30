@@ -61,6 +61,8 @@ mod fixture_data_source;
 mod fixture_search;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/minted_arn_region.rs"]
+mod minted_arn_region;
 #[path = "all/output_config_defaults.rs"]
 mod output_config_defaults;
 #[path = "all/output_list_rule.rs"]
