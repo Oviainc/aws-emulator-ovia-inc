@@ -6,11 +6,12 @@
 //! wire through the same `MultiServiceRouter::dispatch` the served emulator uses.
 //!
 //! The rule under test throughout: every response is computed from the persisted store,
-//! so a definition reads back member for member as it was supplied, an update is visible
-//! to the next read, and a delete is visible to every later read. Each test asserts that
-//! over a TABLE of inputs spanning what the rule generalises over (member values, the
-//! modelled enum catalogs, list sizes, which optional members are present, report count),
-//! not just one recorded request.
+//! so a definition reads back as the service holds it — the members supplied plus the
+//! members the service populates itself — an update is visible to the next read, and a
+//! delete is visible to every later read. Each test asserts that over a TABLE of inputs
+//! spanning what the rule generalises over (member values, the modelled enum catalogs,
+//! list sizes, which optional members are present, report count), not just one recorded
+//! request.
 
 use std::sync::Arc;
 
@@ -106,6 +107,17 @@ impl Cur {
         }
     }
 
+    /// Every definition the account holds, as the service reports it, with each element's
+    /// per-run `ReportCreationDate` checked for its form and removed (see [`read_back_of`])
+    /// so what is left compares exactly against [`expected_read_back`].
+    pub(crate) async fn read_back_all(&self, case: &str) -> Vec<Value> {
+        self.describe_all()
+            .await
+            .iter()
+            .map(|listed| read_back_of(listed, case))
+            .collect()
+    }
+
     pub(crate) async fn tags_of(&self, report_name: &str) -> (u16, Value) {
         self.call(
             "ListTagsForResource",
@@ -159,6 +171,85 @@ pub(crate) fn error_code(body: &Value) -> &str {
     body["__type"].as_str().unwrap_or("<no __type>")
 }
 
+/// The primary billing view of the account this emulator presents: the billing service's
+/// `billingview/primary` under `engine::mock_account_id`, with no region segment, which
+/// is the form the modelled `BillingViewArn` pattern admits
+/// (`smithy_query(shape="BillingViewArn")`).
+pub(crate) fn primary_billing_view_arn() -> String {
+    format!(
+        "arn:aws:billing::{}:billingview/primary",
+        engine::emulator_account_id()
+    )
+}
+
+/// The read-back the service answers for a definition it was given: EVERY member of the
+/// wire shape, filled.
+///
+/// Those the request named come back as supplied; those it left unset come back as the
+/// service resolved them — no additional artifacts is the empty list, an unstated refresh
+/// preference is on, an unstated versioning preference delivers a new version, and an
+/// unstated billing view is the account's primary one. The report's delivery status is the
+/// service's and not the caller's: nothing in this service delivers a report, so a report
+/// created through the API has never been delivered and both members of its status are
+/// empty. `ReportCreationDate` is a per-run instant, so [`read_back_of`] checks its form
+/// and drops it rather than this expectation carrying a value.
+pub(crate) fn expected_read_back(definition: &Value) -> Value {
+    let mut expected = definition.clone();
+    let object = expected
+        .as_object_mut()
+        .expect("a report definition is an object");
+    object
+        .entry("AdditionalArtifacts")
+        .or_insert_with(|| json!([]));
+    object
+        .entry("RefreshClosedReports")
+        .or_insert_with(|| json!(true));
+    object
+        .entry("ReportVersioning")
+        .or_insert_with(|| json!("CREATE_NEW_REPORT"));
+    object
+        .entry("BillingViewArn")
+        .or_insert_with(|| json!(primary_billing_view_arn()));
+    object.insert(
+        "ReportStatus".to_string(),
+        json!({ "lastDelivery": "", "lastStatus": "" }),
+    );
+    expected
+}
+
+/// One definition from a `DescribeReportDefinitions` page with its `ReportCreationDate`
+/// checked and removed.
+///
+/// The date must be PRESENT and stated in the form this service states a report timestamp
+/// in; its value names the run and is not asserted here (the suite in
+/// `service_populated_read_back.rs` pins the rendering against known instants).
+pub(crate) fn read_back_of(listed: &Value, case: &str) -> Value {
+    let mut listed = listed.clone();
+    let object = listed
+        .as_object_mut()
+        .expect("a report definition is an object");
+    let created = object.remove("ReportCreationDate");
+    let created = created.as_ref().and_then(Value::as_str).unwrap_or_default();
+    assert!(
+        is_report_timestamp(created),
+        "case {case:?}: expected a ReportCreationDate stated as yyyymmddThhmmssZ, got {created:?}"
+    );
+    listed
+}
+
+/// Whether `value` is an instant in the form this service states a report timestamp in:
+/// eight date digits, `T`, six time digits and `Z` — the UTC spelling of the modelled
+/// `LastDelivery` pattern `^[0-9]{8}[T][0-9]{6}([Z]|[+-][0-9]{4})$`
+/// (`smithy_query(shape="LastDelivery")`).
+pub(crate) fn is_report_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 16
+        && bytes[..8].iter().all(u8::is_ascii_digit)
+        && bytes[8] == b'T'
+        && bytes[9..15].iter().all(u8::is_ascii_digit)
+        && bytes[15] == b'Z'
+}
+
 /// Definitions spanning the class: which optional members are present, how long the
 /// lists are, which enum values and which name spelling. Every row is a different point
 /// along what the round-trip rule generalises over.
@@ -180,7 +271,10 @@ fn definition_table() -> Vec<(&'static str, Value, Value)> {
                 "S3Bucket": "full.bucket-name",
                 "S3Prefix": "teams/finance/cur/",
                 "S3Region": "eu-west-1",
-                "AdditionalArtifacts": ["ATHENA", "QUICKSIGHT", "REDSHIFT"],
+                // A Parquet report may subscribe to the Athena manifest, and only to it:
+                // see `service_populated_read_back.rs` for the whole Parquet-preference
+                // rule.
+                "AdditionalArtifacts": ["ATHENA"],
                 "RefreshClosedReports": true,
                 "ReportVersioning": "OVERWRITE_REPORT",
                 "BillingViewArn": "arn:aws:billing::123456789012:billingview/123456789012",
@@ -246,15 +340,17 @@ async fn a_put_definition_reads_back_member_for_member_through_describe() {
         let (status, body) = cur.put(&definition, Some(&tags)).await;
         assert_eq!(status, 200, "case {case:?}: PutReportDefinition got {body:?}");
 
-        let listed = cur.describe_all().await;
+        let listed = cur.read_back_all(case).await;
         assert_eq!(
             listed.len(),
             1,
             "case {case:?}: expected exactly one definition, got {listed:?}"
         );
         assert_eq!(
-            listed[0], definition,
-            "case {case:?}: expected the definition as supplied, got {:?}",
+            listed[0],
+            expected_read_back(&definition),
+            "case {case:?}: expected the definition as supplied plus the service-populated \
+             members, got {:?}",
             listed[0]
         );
 
@@ -295,6 +391,14 @@ async fn every_value_in_the_modelled_enum_catalogs_round_trips() {
             let cur = Cur::new();
             let mut definition = minimal_definition("catalog-report");
             definition[member] = json!(value);
+            // A report's Parquet preference is stated by `Format` and `Compression`
+            // together, so the Parquet entry of either catalog is exercised with both set:
+            // a definition that states Parquet in only one of them is refused (the rule is
+            // asserted whole in `service_populated_read_back.rs`).
+            if *value == "Parquet" {
+                definition["Format"] = json!("Parquet");
+                definition["Compression"] = json!("Parquet");
+            }
 
             let (status, body) = cur.put(&definition, None).await;
             assert_eq!(
@@ -302,10 +406,11 @@ async fn every_value_in_the_modelled_enum_catalogs_round_trips() {
                 "case {member:?}={value:?}: PutReportDefinition got {body:?}"
             );
 
-            let listed = cur.describe_all().await;
+            let listed = cur.read_back_all(&format!("{member:?}={value:?}")).await;
             assert_eq!(
-                listed.first(), Some(&definition),
-                "case {member:?}={value:?}: expected the definition as supplied, got {listed:?}"
+                listed.first(), Some(&expected_read_back(&definition)),
+                "case {member:?}={value:?}: expected the definition as supplied plus the \
+                 service-populated members, got {listed:?}"
             );
         }
     }
@@ -334,10 +439,11 @@ async fn every_value_in_the_modelled_enum_catalogs_round_trips() {
                 "case {member:?}={list:?}: PutReportDefinition got {body:?}"
             );
 
-            let listed = cur.describe_all().await;
+            let listed = cur.read_back_all(&format!("{member:?}={list:?}")).await;
             assert_eq!(
-                listed.first(), Some(&definition),
-                "case {member:?}={list:?}: expected the definition as supplied, got {listed:?}"
+                listed.first(), Some(&expected_read_back(&definition)),
+                "case {member:?}={list:?}: expected the definition as supplied plus the \
+                 service-populated members, got {listed:?}"
             );
         }
     }
@@ -388,9 +494,9 @@ async fn a_name_the_account_already_holds_is_refused_as_a_duplicate() {
         );
 
         // The refusal left the stored definition untouched.
-        let listed = cur.describe_all().await;
+        let listed = cur.read_back_all(case).await;
         assert_eq!(
-            listed, vec![first.clone()],
+            listed, vec![expected_read_back(&first)],
             "case {case:?}: expected only the first definition, got {listed:?}"
         );
     }
@@ -535,10 +641,13 @@ async fn modify_replaces_the_stored_definition() {
             .await;
         assert_eq!(status, 200, "case {case:?}: ModifyReportDefinition got {body:?}");
 
-        let listed = cur.describe_all().await;
+        let listed = cur.read_back_all(case).await;
         assert_eq!(
             listed,
-            vec![replacement.clone(), bystander.clone()],
+            vec![
+                expected_read_back(&replacement),
+                expected_read_back(&bystander)
+            ],
             "case {case:?}: expected the replacement in place and the bystander untouched, got {listed:?}"
         );
 
@@ -596,12 +705,12 @@ async fn modify_refuses_a_name_the_account_does_not_hold_or_a_colliding_rename()
         );
     }
 
-    let listed = cur.describe_all().await;
+    let listed = cur.read_back_all("a refused modify").await;
     assert_eq!(
         listed,
         vec![
-            minimal_definition("held-report"),
-            minimal_definition("other-report")
+            expected_read_back(&minimal_definition("held-report")),
+            expected_read_back(&minimal_definition("other-report"))
         ],
         "a refused modify must change nothing, got {listed:?}"
     );
@@ -880,16 +989,16 @@ async fn a_deleted_report_is_gone_from_every_later_read() {
         )
         .await;
     assert_eq!(status, 200, "case delete: got {body:?}");
-    let message = body["ResponseMessage"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("doomed-report"),
-        "case delete: expected a ResponseMessage naming the report, got {body:?}"
+    assert_eq!(
+        body,
+        json!({}),
+        "case delete: expected an empty body, got {body:?}"
     );
 
-    let listed = cur.describe_all().await;
+    let listed = cur.read_back_all("delete").await;
     assert_eq!(
         listed,
-        vec![kept.clone()],
+        vec![expected_read_back(&kept)],
         "case delete: expected only the kept report, got {listed:?}"
     );
 
@@ -901,8 +1010,8 @@ async fn a_deleted_report_is_gone_from_every_later_read() {
         "case tags after delete: expected ResourceNotFoundException, got {body:?}"
     );
 
-    // Deleting it again is not refused — the operation models no not-found error, and its
-    // ResponseMessage is modelled as "whether the deletion was successful or not".
+    // Deleting it again is not refused — the operation models no not-found error — and it
+    // answers the SAME empty body: nothing distinguishes the two legs on the wire.
     let (status, body) = cur
         .call(
             "DeleteReportDefinition",
@@ -910,14 +1019,14 @@ async fn a_deleted_report_is_gone_from_every_later_read() {
         )
         .await;
     assert_eq!(status, 200, "case repeated delete: got {body:?}");
-    assert_ne!(
-        body["ResponseMessage"].as_str().unwrap_or_default(),
-        message,
-        "case repeated delete: the message must report that nothing was deleted, got {body:?}"
+    assert_eq!(
+        body,
+        json!({}),
+        "case repeated delete: expected an empty body, got {body:?}"
     );
     assert_eq!(
-        cur.describe_all().await,
-        vec![kept],
+        cur.read_back_all("repeated delete").await,
+        vec![expected_read_back(&kept)],
         "case repeated delete: the store must be unchanged"
     );
 

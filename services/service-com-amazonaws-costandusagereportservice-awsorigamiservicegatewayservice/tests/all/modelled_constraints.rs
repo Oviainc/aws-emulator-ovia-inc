@@ -25,7 +25,9 @@
 
 use serde_json::{json, Value};
 
-use super::report_definition_lifecycle::{error_code, minimal_definition, stored, Cur};
+use super::report_definition_lifecycle::{
+    error_code, expected_read_back, minimal_definition, stored, Cur,
+};
 
 /// The wire status and error code a refused request must carry.
 ///
@@ -71,8 +73,19 @@ async fn put_refuses_a_definition_member_outside_its_modelled_constraint() {
         ("TimeUnit MONTHLY", definition_with("TimeUnit", json!("MONTHLY")), true),
         ("TimeUnit WEEKLY", definition_with("TimeUnit", json!("WEEKLY")), false),
         ("TimeUnit lowercase daily", definition_with("TimeUnit", json!("daily")), false),
-        // ReportFormat catalog: textORcsv | Parquet.
-        ("Format Parquet", definition_with("Format", json!("Parquet")), true),
+        // ReportFormat catalog: textORcsv | Parquet. The Parquet value is accepted with
+        // the Compression that states the same preference — a definition that states
+        // Parquet in only one of the two is refused, which
+        // `service_populated_read_back.rs` asserts as its own rule.
+        (
+            "Format and Compression Parquet",
+            {
+                let mut definition = definition_with("Format", json!("Parquet"));
+                definition["Compression"] = json!("Parquet");
+                definition
+            },
+            true,
+        ),
         ("Format JSON", definition_with("Format", json!("JSON")), false),
         // CompressionFormat catalog: ZIP | GZIP | Parquet.
         ("Compression ZIP", definition_with("Compression", json!("ZIP")), true),
@@ -212,15 +225,17 @@ async fn put_refuses_a_definition_member_outside_its_modelled_constraint() {
 
         if accepted {
             assert_eq!(status, 200, "case {case:?}: expected HTTP 200, got {status} {body:?}");
-            let stored_reports = cur.describe_all().await;
+            let stored_reports = cur.read_back_all(case).await;
             assert_eq!(
                 stored_reports.len(),
                 1,
                 "case {case:?}: expected the accepted definition to be stored, got {stored_reports:?}"
             );
             assert_eq!(
-                stored_reports[0], definition,
-                "case {case:?}: expected the stored definition to match what was supplied, got {:?}",
+                stored_reports[0],
+                expected_read_back(&definition),
+                "case {case:?}: expected the stored definition plus the service-populated \
+                 members, got {:?}",
                 stored_reports[0]
             );
         } else {

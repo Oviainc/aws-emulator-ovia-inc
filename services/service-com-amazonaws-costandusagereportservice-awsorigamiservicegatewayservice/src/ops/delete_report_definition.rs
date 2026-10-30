@@ -135,9 +135,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// later read — `DescribeReportDefinitions`, `ListTagsForResource` — stops seeing it.
     ///
     /// Deleting a report the account does not hold is not refused: the operation models
-    /// no not-found error, and its output member `ResponseMessage` is modelled as
-    /// "Whether the deletion was successful or not", so the outcome is reported in that
-    /// message, computed from what the store actually held.
+    /// no not-found error, so a repeated delete of the same name is a no-op that succeeds.
+    ///
+    /// The response is the empty object on both legs. `ResponseMessage` is an OPTIONAL
+    /// output member and the service serializes none, so nothing distinguishes the body of
+    /// the delete that removed a report from the body of the one that found nothing to
+    /// remove, and no part of the request is echoed back in it.
     async fn handle(
         &self,
         input: Self::Input,
@@ -154,17 +157,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        let report_name = input.report_name;
-        let response_message = match store.position(&report_name) {
-            Some(at) => {
-                store.reports.remove(at);
-                format!("Successfully deleted report {report_name}")
-            }
-            None => format!("The report {report_name} in the request doesn't exist."),
-        };
+        if let Some(at) = store.position(&input.report_name) {
+            store.reports.remove(at);
+        }
 
         Ok(DeleteReportDefinitionOutput {
-            response_message: Some(response_message),
+            response_message: None,
         })
     }
 }

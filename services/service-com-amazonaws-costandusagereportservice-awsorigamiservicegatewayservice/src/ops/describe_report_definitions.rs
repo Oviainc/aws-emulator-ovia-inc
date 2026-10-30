@@ -134,6 +134,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// A reporting operation: it only reads the store. The page starts at the report the
     /// `NextToken` names (the beginning of the list when there is none), runs for at most
     /// `MaxResults` reports, and carries a `NextToken` only when reports remain after it.
+    ///
+    /// Each report on the page is the stored record projected onto the wire shape by
+    /// [`crate::state::StoredReport::wire_definition`] — the definition as supplied plus
+    /// the members the service itself populates — rather than the supplied definition
+    /// alone.
     async fn handle(
         &self,
         input: Self::Input,
@@ -167,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let end = start.saturating_add(page_size).min(store.reports.len());
         let page: Vec<ReportDefinition> = store.reports[start..end]
             .iter()
-            .map(|report| report.definition.clone())
+            .map(crate::state::StoredReport::wire_definition)
             .collect();
 
         // Only a page with reports after it carries a token; the last page has none, so

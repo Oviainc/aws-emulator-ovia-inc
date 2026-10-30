@@ -39,6 +39,7 @@ pub struct ReportDefinition {
     pub report_versioning: Option<String>,
     pub billing_view_arn: Option<String>,
     pub report_status: Option<ReportStatus>,
+    pub report_creation_date: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.costandusagereportservice#ReportStatus")]

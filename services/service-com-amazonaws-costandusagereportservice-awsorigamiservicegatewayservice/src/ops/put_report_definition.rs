@@ -140,8 +140,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// Refuses a name the account already holds with `DuplicateReportNameException`,
     /// and refuses any creation once the account holds [`crate::state::MAX_REPORTS`]
     /// definitions with `ReportLimitReachedException` — the two conditions the modelled
-    /// error docs state. Otherwise the definition is stored member for member, with the
-    /// tags supplied beside it, and becomes visible to every later read.
+    /// error docs state — and refuses a definition whose Parquet preference is not usable
+    /// ([`crate::state::parquet_preference_is_usable`]) with `ValidationException`.
+    /// Otherwise the definition is stored member for member, with the tags supplied beside
+    /// it, and becomes visible to every later read, which reports it through
+    /// [`crate::state::StoredReport::wire_definition`].
     async fn handle(
         &self,
         input: Self::Input,
@@ -178,6 +181,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.reports.len() >= crate::state::MAX_REPORTS {
             return Err(PutReportDefinitionErrorModeled::ReportLimitReachedException(
                 ReportLimitReachedException { message: None },
+            )
+            .into());
+        }
+
+        // A report's Parquet preference is stated by its `Format`, its `Compression` and
+        // the artifacts it subscribes to at once, and a definition that states it
+        // inconsistently is refused rather than stored: a report the service would hold
+        // but could never deliver is not a report. The same gate runs on the update path.
+        if !crate::state::parquet_preference_is_usable(&input.report_definition) {
+            return Err(PutReportDefinitionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::PARQUET_PREFERENCE_MESSAGE.to_string()),
+                },
             )
             .into());
         }

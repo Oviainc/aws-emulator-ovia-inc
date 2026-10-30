@@ -4,15 +4,16 @@
 //!
 //! The service's single primary resource is the *report definition*: every operation
 //! this crate implements creates, reads, updates, tags or deletes one of them, so the
-//! whole store is the insertion-ordered list of definitions below plus the tags
-//! attached to each. Insertion order is the enumeration order
+//! whole store is the insertion-ordered list of definitions below, the tags attached to
+//! each, and what the service itself knows about each one — when it was created and when
+//! it was last delivered. Insertion order is the enumeration order
 //! `DescribeReportDefinitions` pages over, which is what makes its pagination
 //! deterministic.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
-use crate::ops::types::{ReportDefinition, ResourceNotFoundException, Tag};
+use crate::ops::types::{ReportDefinition, ReportStatus, ResourceNotFoundException, Tag};
 
 /// How many report definitions one account may hold.
 ///
@@ -46,6 +47,100 @@ pub fn report_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException { message: None }
 }
 
+/// The billing view a report definition is scoped to when its creation named none: the
+/// PRIMARY billing view of the account that holds it.
+///
+/// A report definition read back from the service always names a billing view, and one
+/// created without a `BillingViewArn` names the account's primary view. The ARN is the
+/// billing service's `billingview/primary` under this emulator's account — built through
+/// `engine::emulator_arn`, so the account id is never a literal here — and carries no
+/// region, which is the form the modelled `BillingViewArn` pattern
+/// `^(arn:aws(-cn)?:billing::[0-9]{12}:billingview/)?...` admits
+/// (`smithy_query(shape="BillingViewArn")`).
+pub fn primary_billing_view_arn() -> String {
+    ::engine::emulator_arn("billing", "", "billingview/primary")
+}
+
+/// Whether a report is refreshed after it has been finalized, when its definition does
+/// not say.
+///
+/// `RefreshClosedReports` is optional on the way in, but a report definition read back
+/// from the service always states it, so what comes back for a definition that named none
+/// is the value the service resolved for it: a report IS refreshed when charges for a
+/// closed month appear unless its definition turns that off.
+pub const DEFAULT_REFRESH_CLOSED_REPORTS: bool = true;
+
+/// How a report is versioned when its definition does not say.
+///
+/// `ReportVersioning` is optional on the way in — "whether you want Amazon Web Services to
+/// overwrite the previous version of each report or to deliver the report in addition to
+/// the previous versions" (`smithy_query(shape="ReportDefinition",
+/// member="ReportVersioning")`) — but a report definition read back from the service
+/// always states it, so what comes back for a definition that named none is the value the
+/// service resolved for it: each delivery is a NEW version, keeping the ones already
+/// delivered. One of the modelled `ReportVersioning` values
+/// (`smithy_query(shape="ReportVersioning")`).
+pub const DEFAULT_REPORT_VERSIONING: &str = "CREATE_NEW_REPORT";
+
+/// One instant in the form this service states a report timestamp in
+/// (`yyyymmddThhmmssZ`).
+///
+/// That form is the modelled `LastDelivery` pattern
+/// `^[0-9]{8}[T][0-9]{6}([Z]|[+-][0-9]{4})$` (`smithy_query(shape="LastDelivery")`) — the
+/// only timestamp form this service's model declares — so every instant this service
+/// reports is stated in it. The calendar conversion comes from
+/// `aws_smithy_types::DateTime`, the timestamp type every modelled member is serialized
+/// through: only the separators that form leaves out are removed here.
+pub fn report_timestamp(at: SystemTime) -> String {
+    let at = ::aws_smithy_types::DateTime::from(at);
+    ::aws_smithy_types::DateTime::from_secs(at.secs())
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| !matches!(character, '-' | ':'))
+        .collect()
+}
+
+/// The refusal text for a definition whose Parquet preference is not usable.
+///
+/// Fixed text, with nothing from the request in it: a report's Parquet preference is
+/// stated by several members at once, so the refusal names the whole rule rather than one
+/// member.
+pub const PARQUET_PREFERENCE_MESSAGE: &str = "For valid Parquet preference, report format \
+     and compression must be 'Parquet' and cannot subscribe to QuickSight and/or Redshift";
+
+/// How `ReportFormat` and `CompressionFormat` both spell Parquet
+/// (`smithy_query(shape="ReportFormat,CompressionFormat")`).
+const PARQUET: &str = "Parquet";
+
+/// The additional artifacts a Parquet report may not subscribe to: the manifests built for
+/// the two engines that read a report in the delimited-text form
+/// (`smithy_query(shape="AdditionalArtifact")`).
+const NON_PARQUET_ARTIFACTS: [&str; 2] = ["QUICKSIGHT", "REDSHIFT"];
+
+/// Whether `definition` states a usable Parquet preference.
+///
+/// A report's Parquet preference is its `Format` and `Compression` taken together with the
+/// artifacts it subscribes to: a definition that states Parquet at all must state it in
+/// BOTH members and may not also ask for the artifacts that are built from a
+/// delimited-text report, while a definition that states it nowhere has no Parquet
+/// preference to be wrong about. Shared by the two operations that take a
+/// `ReportDefinition`, so the create and the update cannot drift apart.
+pub fn parquet_preference_is_usable(definition: &ReportDefinition) -> bool {
+    let format = definition.format == PARQUET;
+    let compression = definition.compression == PARQUET;
+    if !format && !compression {
+        return true;
+    }
+    format
+        && compression
+        && !definition
+            .additional_artifacts
+            .iter()
+            .flatten()
+            .any(|artifact| NON_PARQUET_ARTIFACTS.contains(&artifact.as_str()))
+}
+
 /// Why a tag merge was refused: it would leave the report holding more tags than
 /// [`MAX_TAGS_PER_REPORT`].
 ///
@@ -59,8 +154,24 @@ pub struct TagLimitExceeded {
     pub limit: usize,
 }
 
+/// The last delivery of a report: when the report was delivered and how that delivery
+/// ended.
+///
+/// What [`StoredReport::delivery_status`] reports as the modelled `ReportStatus`. Nothing
+/// in this service's modelled surface delivers a report — delivery is the billing
+/// pipeline's, not an API call's — so a report created through `PutReportDefinition`
+/// holds none until a delivery is recorded against it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportDelivery {
+    /// The instant the report was delivered, reported through [`report_timestamp`].
+    pub at: SystemTime,
+    /// How the delivery ended: one of the modelled `LastStatus` values
+    /// (`smithy_query(shape="LastStatus")`).
+    pub status: String,
+}
+
 /// One persisted report definition: the definition exactly as the caller supplied it,
-/// its tags, and when it was first created.
+/// its tags, when it was first created, and the last delivery recorded against it.
 ///
 /// Tags live in a `BTreeMap` because a report definition carries at most one tag per
 /// key ("Each report definition can only have up to one tag with the same key", per
@@ -73,6 +184,8 @@ pub struct StoredReport {
     pub tags: BTreeMap<String, String>,
     /// When `PutReportDefinition` first inserted this report.
     pub created_at: SystemTime,
+    /// The last delivery of this report, or `None` while it has never been delivered.
+    pub last_delivery: Option<ReportDelivery>,
 }
 
 impl StoredReport {
@@ -85,9 +198,73 @@ impl StoredReport {
             definition,
             tags: BTreeMap::new(),
             created_at: SystemTime::now(),
+            last_delivery: None,
         };
         stored.merge_tags(tags)?;
         Ok(stored)
+    }
+
+    /// This report as the service reports it: every member of the wire shape, filled.
+    ///
+    /// A read-back of a report definition is not the echo of the creation request. It
+    /// states EVERY member: the ones the definition named, the value the service resolved
+    /// for each optional member it left unset — no additional artifacts is the empty list,
+    /// an unstated refresh preference is [`DEFAULT_REFRESH_CLOSED_REPORTS`], an unstated
+    /// versioning preference is [`DEFAULT_REPORT_VERSIONING`], and an unstated billing view
+    /// is the account's primary one ([`primary_billing_view_arn`]) — and the service's own
+    /// facts about the report: the status of its last delivery
+    /// ([`Self::delivery_status`]) and the date it was created, which is the STORED instant
+    /// and so the same on every read rather than the moment of the read.
+    pub fn wire_definition(&self) -> ReportDefinition {
+        ReportDefinition {
+            additional_artifacts: Some(
+                self.definition
+                    .additional_artifacts
+                    .clone()
+                    .unwrap_or_default(),
+            ),
+            refresh_closed_reports: Some(
+                self.definition
+                    .refresh_closed_reports
+                    .unwrap_or(DEFAULT_REFRESH_CLOSED_REPORTS),
+            ),
+            report_versioning: Some(
+                self.definition
+                    .report_versioning
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_REPORT_VERSIONING.to_string()),
+            ),
+            billing_view_arn: Some(
+                self.definition
+                    .billing_view_arn
+                    .clone()
+                    .unwrap_or_else(primary_billing_view_arn),
+            ),
+            report_status: Some(self.delivery_status()),
+            report_creation_date: Some(report_timestamp(self.created_at)),
+            ..self.definition.clone()
+        }
+    }
+
+    /// The modelled `ReportStatus` of this report: "the date and status of the last
+    /// delivered report for a particular report definition" (the modelled `ReportStatus`
+    /// doc).
+    ///
+    /// A report with no delivery recorded against it reports BOTH members empty rather
+    /// than absent — the two-element dictionary the service answers with for a report that
+    /// has never been delivered — so a client reading `lastStatus` to find out whether a
+    /// report has ever been delivered always has a value to read.
+    pub fn delivery_status(&self) -> ReportStatus {
+        match &self.last_delivery {
+            Some(delivery) => ReportStatus {
+                last_delivery: Some(report_timestamp(delivery.at)),
+                last_status: Some(delivery.status.clone()),
+            },
+            None => ReportStatus {
+                last_delivery: Some(String::new()),
+                last_status: Some(String::new()),
+            },
+        }
     }
 
     /// Merge `tags` onto this report: a key already present takes the new value, a key

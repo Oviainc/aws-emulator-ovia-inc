@@ -17,5 +17,7 @@ mod modelled_constraints;
 mod refusal_envelope;
 #[path = "all/report_definition_lifecycle.rs"]
 mod report_definition_lifecycle;
+#[path = "all/service_populated_read_back.rs"]
+mod service_populated_read_back;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
