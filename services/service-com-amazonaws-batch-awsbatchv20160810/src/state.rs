@@ -293,13 +293,32 @@ fn validate_tag_key(key: &str) -> Result<(), String> {
 pub const QUOTA_SHARE_ARN_NOT_VALID: &str =
     "Quota Share arn should match a valid Quota Share arn pattern";
 
-/// What a scheduling-policy operation answers for an identifier that is not a
-/// scheduling-policy ARN at all ([`parse_scheduling_policy_arn`]).
-///
-/// Worded as the quota-share twin above is: the pattern requirement, without echoing the
-/// value the caller gave or spelling the pattern out.
+/// The rule a scheduling-policy identifier that is not a scheduling-policy ARN at all
+/// ([`parse_scheduling_policy_arn`]) broke: a valid pattern governs it. The pattern itself
+/// is not spelled out, so the response publishes no shape a client could then encode.
 pub const SCHEDULING_POLICY_ARN_NOT_VALID: &str =
     "Scheduling policy arn should match a valid Scheduling policy arn pattern";
+
+/// That refusal as a scheduling-policy operation answers it: the rule above, then the
+/// identifier the request submitted, verbatim.
+///
+/// The offending value is what makes the refusal actionable — `DescribeSchedulingPolicies`
+/// takes a LIST of identifiers, so a refusal that states the rule alone leaves the caller
+/// unable to tell which entry broke it — and it is the sentence's only variable part.
+///
+/// Answered BARE: Batch's frontend envelope ([`client_exception_enveloped`]) belongs to the
+/// refusal classes AWS is recorded to wrap, and this identifier-shape class is not one of
+/// them, so the message carries the sentence alone and no request id of its own (the
+/// response still reports one in the header AWS carries it in,
+/// `crate::service::request_id_header`).
+///
+/// The two EVIDENCED parts are the rule text and that the value refused comes from the
+/// request; the `": "` joining them is this crate's choice, because the recorded refusal of
+/// this class is asserted by shape rather than by value. A later recording that pins the
+/// exact form changes this one expression and nothing else.
+pub fn scheduling_policy_arn_not_valid(reference: &str) -> ClientException {
+    client_exception(format!("{SCHEDULING_POLICY_ARN_NOT_VALID}: {reference}"))
+}
 
 /// What `DescribeSchedulingPolicies` answers for a request whose `arns` names nothing.
 ///
@@ -3695,7 +3714,7 @@ pub fn is_scheduling_policy_arn(region: &str, value: &str) -> bool {
 /// another resource kind or of no kind, an empty identifier, a value outside the charset
 /// the `name` member documents — names no policy at all, which is a DIFFERENT answer from
 /// an identifier of the right shape naming nothing stored (that one is reported as absent,
-/// or is already deleted); the refusal is [`SCHEDULING_POLICY_ARN_NOT_VALID`].
+/// or is already deleted); the refusal is [`scheduling_policy_arn_not_valid`].
 ///
 /// The WRITERS (`DeleteSchedulingPolicy`, `UpdateSchedulingPolicy`) resolve both shapes,
 /// the way every other identifier in this service resolves: their `arn` member is

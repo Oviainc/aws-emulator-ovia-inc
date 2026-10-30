@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if !batch::is_scheduling_policy_reference(&region, &input.arn) {
             return Err(UpdateSchedulingPolicyErrorModeled::ClientException(
-                batch::client_exception_enveloped(batch::SCHEDULING_POLICY_ARN_NOT_VALID),
+                batch::scheduling_policy_arn_not_valid(&input.arn),
             )
             .into());
         }

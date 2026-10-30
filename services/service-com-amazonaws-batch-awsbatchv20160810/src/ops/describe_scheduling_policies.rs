@@ -11,7 +11,8 @@
 //! A policy is identified HERE by its ARN alone — `arns` is "a list of up to 100 scheduling
 //! policy Amazon Resource Name (ARN) entries" — so an entry of any other shape (a bare
 //! name, an ARN of another region, account, partition or resource kind) is refused with the
-//! modelled `ClientException` ([`crate::state::is_scheduling_policy_arn`]), and so is an
+//! modelled `ClientException` naming that entry
+//! ([`crate::state::scheduling_policy_arn_not_valid`]), and so is an
 //! `arns` list that names nothing at all
 //! ([`crate::state::SCHEDULING_POLICY_ARNS_REQUIRED`]), which is REQUIRED. An ARN of the
 //! right shape that names no stored policy is reported as absent instead.
@@ -189,14 +190,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Every entry is an ARN of this endpoint's own: a bare name, or an ARN of another
         // region, account, partition or resource kind, names no scheduling policy here, so
-        // it is refused rather than reported as absent.
-        if !input
+        // it is refused rather than reported as absent. The refusal names the entry it
+        // refused — the first one that breaks the rule — so a caller that submitted several
+        // can tell which one to repair.
+        if let Some(refused) = input
             .arns
             .iter()
-            .all(|reference| batch::is_scheduling_policy_arn(&region, reference))
+            .find(|reference| !batch::is_scheduling_policy_arn(&region, reference))
         {
             return Err(DescribeSchedulingPoliciesErrorModeled::ClientException(
-                batch::client_exception_enveloped(batch::SCHEDULING_POLICY_ARN_NOT_VALID),
+                batch::scheduling_policy_arn_not_valid(refused),
             )
             .into());
         }
