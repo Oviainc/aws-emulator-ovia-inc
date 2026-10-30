@@ -182,13 +182,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         // The token resumes THIS listing — this operation over this region's
-        // custom plugins — so one another listing minted is refused rather than
-        // honoured against a key space it says nothing about.
+        // custom plugins AS THE REQUEST'S `namePrefix` narrowed them — so one
+        // another listing minted, including this operation's own under another
+        // prefix, is refused rather than honoured against a key space it says
+        // nothing about.
         let Ok(page) = crate::state::page(
             keyed,
             input.max_results,
             input.next_token.as_deref(),
-            crate::state::Listing::regional(Self::NAME, &region),
+            crate::state::Listing::regional(Self::NAME, &region).narrowed_by(&prefix),
         ) else {
             // Same rejected member, same message form, as in every other
             // kafkaconnect parameter rejection.

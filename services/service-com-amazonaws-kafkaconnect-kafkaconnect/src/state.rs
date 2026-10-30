@@ -2486,12 +2486,14 @@ pub struct BadPageToken;
 /// A token is a resume point for exactly ONE listing — the operation that minted
 /// it, over the key space that call paged. No two of this service's listings
 /// page one key space: each kind of resource is keyed by its own ARN kind, a
-/// connector's operations are keyed by their creation instant, and a listing
-/// only ever covers the resources of the region it is answered through. So a
-/// token carries the listing that minted it and [`page`] refuses one minted
-/// anywhere else, instead of comparing a key from a foreign key space against
-/// its own keys — which silently truncates a page (every key sorting past the
-/// foreign one is dropped) or silently replays one (none of them does).
+/// connector's operations are keyed by their creation instant, a listing only
+/// ever covers the resources of the region it is answered through, and a listing
+/// the request NARROWED (a name prefix, a parent resource) covers only the keys
+/// that survived the narrowing. So a token carries the listing that minted it
+/// and [`page`] refuses one minted anywhere else, instead of comparing a key
+/// from a foreign key space against its own keys — which silently truncates a
+/// page (every key sorting past the foreign one is dropped) or silently replays
+/// one (none of them does).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Listing<'a> {
     /// The operation that both mints and accepts the token: its wire name.
@@ -2499,6 +2501,11 @@ pub struct Listing<'a> {
     /// The key space that operation paged: what distinguishes two listings of
     /// the same operation from each other.
     scope: &'a str,
+    /// What the REQUEST narrowed that key space to, verbatim — the filter value
+    /// the call paged under, or `""` when the call paged the whole scope. Two
+    /// calls that filter differently page different key spaces, so neither one's
+    /// resume key means anything in the other's.
+    filter: &'a str,
 }
 
 impl<'a> Listing<'a> {
@@ -2508,6 +2515,7 @@ impl<'a> Listing<'a> {
         Self {
             operation,
             scope: region,
+            filter: "",
         }
     }
 
@@ -2517,7 +2525,26 @@ impl<'a> Listing<'a> {
         Self {
             operation,
             scope: parent_arn,
+            filter: "",
         }
+    }
+
+    /// The same listing narrowed by a filter the REQUEST carried — the name
+    /// prefix every one of this service's filtered listings takes.
+    ///
+    /// Narrowing drops keys, so a narrowed listing is a key space of its own:
+    /// its resume key is the first key of ITS next page, which in the wider
+    /// listing has keys before it that the wider listing still owes the caller.
+    /// Binding the filter into the listing is what makes a token minted under
+    /// one filter refused under another, rather than honoured and answered with
+    /// a page that silently drops everything sorting below that key.
+    ///
+    /// A filter of `""` narrows nothing — every key starts with the empty
+    /// prefix — so it names the SAME key space as a request that carried no
+    /// filter at all, and their tokens are interchangeable, as they must be: the
+    /// two calls page identical keys.
+    pub fn narrowed_by(self, filter: &'a str) -> Self {
+        Self { filter, ..self }
     }
 
     /// The prefix a token this listing minted carries, behind the service-wide
@@ -2526,9 +2553,22 @@ impl<'a> Listing<'a> {
     /// A digest rather than the identity itself, so no listing's prefix can be a
     /// prefix of another's however the scope happens to be punctuated, and so a
     /// token's length says nothing about the resource it resumes after.
+    ///
+    /// Each part of the identity is digested behind its own length, so the parts
+    /// cannot be re-cut: with a separator alone, a caller choosing a filter that
+    /// contains the separator could make two different listings digest the same
+    /// bytes and so share a token.
     fn token_prefix(&self) -> String {
-        let digest = sha2::Sha256::digest(format!("{}\n{}", self.operation, self.scope).as_bytes());
-        format!("{PAGE_TOKEN_MARKER}{}:", hex::encode(&digest[..8]))
+        let mut digest = sha2::Sha256::new();
+        for part in [self.operation, self.scope, self.filter] {
+            let length = u64::try_from(part.len()).unwrap_or(u64::MAX);
+            digest.update(length.to_be_bytes());
+            digest.update(part.as_bytes());
+        }
+        format!(
+            "{PAGE_TOKEN_MARKER}{}:",
+            hex::encode(&digest.finalize()[..8])
+        )
     }
 }
 

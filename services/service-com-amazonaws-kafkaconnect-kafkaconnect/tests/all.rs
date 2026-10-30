@@ -51,6 +51,8 @@ mod iso8601_timestamps;
 mod list_worker_configurations;
 #[path = "all/page_token_belongs_to_one_listing.rs"]
 mod page_token_belongs_to_one_listing;
+#[path = "all/page_token_carries_the_filter_that_narrowed_it.rs"]
+mod page_token_carries_the_filter_that_narrowed_it;
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
 #[path = "all/restart_connector_scope.rs"]
