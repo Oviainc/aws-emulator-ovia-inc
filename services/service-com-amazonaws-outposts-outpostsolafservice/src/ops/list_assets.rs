@@ -14,7 +14,10 @@
 //! installation the clock has already made due, which is the same transition the
 //! Outpost reaches its settled lifecycle status by
 //! ([`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::settle_outposts`]),
-//! and an Outpost whose form factor names no hardware configuration is answered with
+//! and the capacity configuration a task whose completion has fallen due leaves on
+//! the hardware it named
+//! ([`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::settle_capacity_tasks`]);
+//! an Outpost whose form factor names no hardware configuration is answered with
 //! no asset.
 //!
 //! ## Shape of an operation
@@ -214,6 +217,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // seen anyway.
         let mut store = state.lock();
         store.settle_outposts();
+        // An asset's `ComputeAttributes$InstanceTypeCapacities` is what a capacity
+        // task has configured on that hardware, so the capacity-task transitions the
+        // clock has already made due are materialised too: a task whose completion
+        // fell due has configured the asset it named by the instant this list is
+        // asked for, exactly as `GetOutpostInstanceTypes` reports the configuration
+        // that stands on the Outpost. Nothing a later caller would not have seen
+        // anyway is written.
+        store.settle_capacity_tasks();
         // An Outpost's assets are listed OFF that Outpost, so one the store does not
         // hold is the not-found error this operation models, worded as the identifier
         // echo of the value AS SUPPLIED — not of the bare id an ARN resolved to.

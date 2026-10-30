@@ -116,7 +116,7 @@ fn reported(output: &Value) -> Vec<(String, Option<i64>)> {
 
 /// The whole published instance-type catalog, as `ListOrderableInstanceTypes` reports
 /// it: the source every `VCPUs` expectation below is computed from.
-async fn catalog(outposts: &Outposts) -> Vec<Value> {
+pub(crate) async fn catalog(outposts: &Outposts) -> Vec<Value> {
     outposts.ok("GET", "/instanceTypes?MaxResults=1000", None).await["InstanceTypes"]
         .as_array()
         .cloned()
@@ -125,7 +125,7 @@ async fn catalog(outposts: &Outposts) -> Vec<Value> {
 
 /// Every configuration `ListCatalogItems` publishes of one class, in the order it
 /// publishes them.
-async fn catalog_items(outposts: &Outposts, item_class: &str) -> Vec<Value> {
+pub(crate) async fn catalog_items(outposts: &Outposts, item_class: &str) -> Vec<Value> {
     outposts
         .ok(
             "GET",
@@ -180,7 +180,7 @@ fn push_once(values: &mut Vec<String>, value: &str) {
 
 /// One site and one Outpost on it carrying `hardware_type`, as that Outpost's
 /// `OutpostId`. An Outpost belongs to a site, so the site comes first.
-async fn an_outpost(outposts: &Outposts, name: &str, hardware_type: &str) -> String {
+pub(crate) async fn an_outpost(outposts: &Outposts, name: &str, hardware_type: &str) -> String {
     let site = outposts
         .create_site(&json!({ "Name": format!("{name}-site") }))
         .await;
@@ -196,7 +196,7 @@ async fn an_outpost(outposts: &Outposts, name: &str, hardware_type: &str) -> Str
 
 /// Order one unit of `catalog_item_id` for an Outpost, exactly as a caller places an
 /// order: the hardware whose configuration then arrives on it.
-async fn order(outposts: &Outposts, outpost_id: &str, catalog_item_id: &str) {
+pub(crate) async fn order(outposts: &Outposts, outpost_id: &str, catalog_item_id: &str) {
     outposts
         .ok(
             "POST",

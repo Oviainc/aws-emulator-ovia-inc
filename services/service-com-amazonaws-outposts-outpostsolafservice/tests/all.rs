@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_partition.rs"]
 mod arn_partition;
+#[path = "all/asset_configured_capacity.rs"]
+mod asset_configured_capacity;
 #[path = "all/asset_instances.rs"]
 mod asset_instances;
 #[path = "all/asset_scoped_capacity_configuration.rs"]

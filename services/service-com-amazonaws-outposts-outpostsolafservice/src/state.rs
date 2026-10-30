@@ -35,7 +35,8 @@ use sha2::{Digest, Sha256};
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    Address, AssetInfo, AssetInstance, AssetLocation, CapacityTaskFailure, CatalogItem,
+    Address, AssetInfo, AssetInstance, AssetInstanceTypeCapacity, AssetLocation,
+    CapacityTaskFailure, CatalogItem,
     ComputeAttributes, ConnectionDetails, DetailedInstanceTypeItem, EC2Capacity, FormFactorConfig,
     InstanceTypeCapacity, InstanceTypeItem, InstancesToExclude, Order, OrderingRequirement,
     Outpost, PricingOption, PrivateConnectivityConfig, Quote, QuoteCapacity, QuoteOption, Site,
@@ -735,6 +736,25 @@ pub struct CapacityTaskTransition {
     /// ([`ComAmazonawsOutpostsOutpostsolafserviceState::settle_capacity_tasks`]
     /// applies it with the status).
     pub failed: Option<CapacityTaskFailure>,
+}
+
+/// The configuration one capacity task COMPLETING leaves on the hardware it named —
+/// what [`ComAmazonawsOutpostsOutpostsolafserviceState::settle_capacity_tasks`]
+/// collects while it walks the tasks and applies once it has.
+#[derive(Debug, Clone)]
+struct SettledConfiguration {
+    /// The wall clock the completion was owed AT, which orders two tasks that
+    /// configured one piece of hardware.
+    at: std::time::SystemTime,
+    /// The task's creation order, which orders two completions owed at one instant.
+    /// See [`SiteRecord::sequence`].
+    sequence: u64,
+    /// The bare `OutpostId` of the Outpost whose hardware the task configured.
+    outpost_id: String,
+    /// The `AssetId` the task named, or `None` for one that named the Outpost itself.
+    asset_id: Option<String>,
+    /// The per-instance-type capacity the task leaves configured there.
+    capacities: Vec<AssetInstanceTypeCapacity>,
 }
 
 /// A persisted capacity task: every member `StartCapacityTask` / `GetCapacityTask`
@@ -2761,9 +2781,11 @@ pub fn installed_hardware(
                         state: Some(COMPUTE_ASSET_STATE_ACTIVE.to_string()),
                         instance_families: Some(instance_families.clone()),
                         // "The instance type capacities configured for this asset.
-                        // This can be changed through a capacity task": nothing has
-                        // configured this host's capacity per instance type, so it
-                        // reports none rather than a split nobody asked for.
+                        // This can be changed through a capacity task": hardware
+                        // being installed has had no capacity task run on it, so it
+                        // carries none until one configures it
+                        // ([`ComAmazonawsOutpostsOutpostsolafserviceState::configure_hardware`])
+                        // rather than a split nobody asked for.
                         instance_type_capacities: None,
                         max_vcpus: Some(max_vcpus),
                     }
@@ -4117,8 +4139,19 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// A step that fails the task carries the `CapacityTaskFailure` the course was
     /// weighed with ([`Self::capacity_task_course`]), so `Failed` appears exactly when
     /// the status it explains does and never before it.
+    ///
+    /// A task reaching [`CAPACITY_TASK_COMPLETED`] is a task that has RUN, so the step
+    /// that completes it also leaves its configuration on the hardware it named
+    /// ([`Self::configure_hardware`]): the pools of a completed task are the capacity
+    /// configured on that hardware, which is the one thing the configuration a task
+    /// leaves behind can be read off. Nothing else here writes outside the task
+    /// record.
     pub fn settle_capacity_tasks(&mut self) {
         let now = std::time::Instant::now();
+        // What the tasks completing in this settle leave configured on the hardware
+        // they named. Collected while the tasks are walked and applied after, because
+        // both records live in this one store (as in [`Self::settle_orders`]).
+        let mut configured: Vec<SettledConfiguration> = Vec::new();
         for record in self.capacity_tasks.values_mut() {
             while record.pending.front().is_some_and(|next| now >= next.due) {
                 let Some(next) = record.pending.pop_front() else {
@@ -4127,11 +4160,115 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
                 record.last_modified_at = next.at;
                 if next.status == CAPACITY_TASK_COMPLETED {
                     record.completed_at = Some(next.at);
+                    configured.push(SettledConfiguration {
+                        at: next.at,
+                        sequence: record.sequence,
+                        outpost_id: record.outpost_id.clone(),
+                        asset_id: record.asset_id.clone(),
+                        capacities: configured_capacities(record),
+                    });
                 }
                 record.status = next.status;
                 record.failed = next.failed;
             }
         }
+        // In the order the completions were OWED, so where two tasks configured one
+        // piece of hardware the one that completed last is the configuration that
+        // stands — the same rule the Outpost-wide report reads them by
+        // ([`Self::configured_instance_types`]).
+        configured.sort_by(|left, right| {
+            (left.at, left.sequence).cmp(&(right.at, right.sequence))
+        });
+        for settled in configured {
+            self.configure_hardware(
+                &settled.outpost_id,
+                settled.asset_id.as_deref(),
+                settled.capacities,
+            );
+        }
+    }
+
+    /// Record `capacities` as the per-instance-type capacity CONFIGURED on the compute
+    /// hardware a completed capacity task named on the Outpost `outpost_id`: the asset
+    /// `asset_id` names, or the Outpost's own compute hardware when the task named
+    /// none.
+    ///
+    /// "The instance type capacities configured for this asset. This can be changed
+    /// through a capacity task", as `ComputeAttributes$InstanceTypeCapacities`
+    /// documents it — so the capacity a task leaves behind is reported on the hardware
+    /// that task configured, and a task that leaves it configured with no instance of
+    /// any type (every pool at a `Count` that configures none) leaves it reporting no
+    /// per-type capacity at all, exactly as hardware no task has configured does.
+    ///
+    /// Capacity is configured ON compute hardware, so a task that named a unit
+    /// carrying no `ComputeAttributes` configures nothing. A task that named NO asset
+    /// configured the Outpost ITSELF, which is the compute hardware no task of its own
+    /// has reconfigured ([`Self::configured_instance_types`] reads the same records by
+    /// that same scope): where that hardware is a single asset it is that asset's
+    /// configuration, and where it is several the split of the task's pools between
+    /// them is not a fact this service holds, so none of them is recorded a split
+    /// nobody asked for.
+    fn configure_hardware(
+        &mut self,
+        outpost_id: &str,
+        asset_id: Option<&str>,
+        capacities: Vec<AssetInstanceTypeCapacity>,
+    ) {
+        // Which of the Outpost's hardware the task configured, resolved before
+        // anything is written because the Outpost-wide case reads the tasks already
+        // standing on that Outpost's assets.
+        let configured = match asset_id {
+            // The one asset the task named.
+            Some(asset_id) => Some(asset_id.to_string()),
+            // The Outpost itself. See [`Self::sole_unreconfigured_compute`].
+            None => self.sole_unreconfigured_compute(outpost_id),
+        };
+        let Some(record) = self.outposts.get_mut(outpost_id) else {
+            return;
+        };
+        // Capacity is configured ON compute hardware, so only a unit carrying
+        // `ComputeAttributes` takes a configuration at all.
+        let configured = configured.and_then(|asset_id| {
+            record
+                .assets
+                .iter_mut()
+                .filter(|asset| asset.compute_attributes.is_some())
+                .find(|asset| asset.asset_id.as_deref() == Some(asset_id.as_str()))
+        });
+        if let Some(attributes) = configured.and_then(|asset| asset.compute_attributes.as_mut()) {
+            attributes.instance_type_capacities = (!capacities.is_empty()).then_some(capacities);
+        }
+    }
+
+    /// The `AssetId` of the compute hardware a task that named NO asset configured on
+    /// the Outpost `outpost_id`, or `None` where no one asset of it is that hardware.
+    ///
+    /// A task that named no asset configured the Outpost itself, which is the compute
+    /// hardware no task of the Outpost's own has reconfigured — the scope
+    /// [`Self::configured_instance_types`] reads the same stored tasks by, so the
+    /// per-asset view and the Outpost-wide one cannot disagree about which task
+    /// configured which hardware. One asset of it is that hardware exactly when the
+    /// Outpost holds a single compute asset and no COMPLETED task of its own has named
+    /// that asset; an Outpost holding several (or holding that asset reconfigured
+    /// already) is hardware whose share of the pools this service does not hold.
+    fn sole_unreconfigured_compute(&self, outpost_id: &str) -> Option<String> {
+        let mut compute = self
+            .outposts
+            .get(outpost_id)?
+            .assets
+            .iter()
+            .filter(|asset| asset.compute_attributes.is_some());
+        let sole = compute.next()?;
+        if compute.next().is_some() {
+            return None;
+        }
+        let asset_id = sole.asset_id.as_deref()?;
+        let reconfigured = self.capacity_tasks.values().any(|task| {
+            task.outpost_id == outpost_id
+                && task.status == CAPACITY_TASK_COMPLETED
+                && task.asset_id.as_deref() == Some(asset_id)
+        });
+        (!reconfigured).then(|| asset_id.to_string())
     }
 
     /// Materialise every quote expiry the clock has already made due.
@@ -6451,6 +6588,37 @@ fn push_configured_pools(values: &mut Vec<String>, task: &CapacityTaskRecord) {
             push_once(values, &pool.instance_type);
         }
     }
+}
+
+/// The per-instance-type capacity one COMPLETED capacity task leaves CONFIGURED on
+/// the hardware it named: one entry per instance type its pools configure an instance
+/// of, carrying how many instances of that type they asked for, in the order the task
+/// first named each type.
+///
+/// The same reading of the same pools [`push_configured_pools`] takes, carrying the
+/// counts through: `InstanceTypeCapacity$Count` is "the number of instances for the
+/// specified instance type", so pools of one type together configure that many
+/// instances of it and a pool of `Count` zero configures none — which is why a type
+/// asked for none of is no part of the configuration that stands, here as there. See
+/// [`ComAmazonawsOutpostsOutpostsolafserviceState::configure_hardware`].
+fn configured_capacities(task: &CapacityTaskRecord) -> Vec<AssetInstanceTypeCapacity> {
+    let mut capacities: Vec<AssetInstanceTypeCapacity> = Vec::new();
+    for pool in &task.requested_instance_pools {
+        if pool.count <= 0 {
+            continue;
+        }
+        match capacities
+            .iter_mut()
+            .find(|held| held.instance_type == pool.instance_type)
+        {
+            Some(held) => held.count = held.count.saturating_add(pool.count),
+            None => capacities.push(AssetInstanceTypeCapacity {
+                instance_type: pool.instance_type.clone(),
+                count: pool.count,
+            }),
+        }
+    }
+    capacities
 }
 
 /// Whether a record's value for ONE filtered member is accepted by the `*Filter`
