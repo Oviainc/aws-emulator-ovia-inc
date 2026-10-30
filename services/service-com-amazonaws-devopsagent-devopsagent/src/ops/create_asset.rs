@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAsset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAsset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAsset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints an asset under its parent AgentSpace in [`crate::state`],
+//! materialising the files its `content` carries.
 //!
 //! ## Shape of an operation
 //!
@@ -93,12 +86,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-devopsagent-devopsagent
 // here — hence the `CreateAssetError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.devopsagent#CreateAsset")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.devopsagent#CreateAsset",
+    extra_errors = ["ContentSizeExceededException", "ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum CreateAssetErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
+    // Widened in through `extra_errors`: the SERVICE declares both of these as common
+    // errors. `ContentSizeExceededException` (HTTP 413) is what content past the size
+    // this service stores for one asset has to answer with, and
+    // `ServiceQuotaExceededException` (HTTP 402) what a per-agent-space asset quota
+    // has to answer with.
+    ContentSizeExceededException(ContentSizeExceededException),
     InternalServerException(InternalServerException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -154,18 +157,416 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAsset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAssetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAsset"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAssetErrorModeled::InternalServerException(InternalServerException {
+                message: "the DevOps Agent state store is unavailable".to_string(),
+            })
+        })?;
+
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // The asset plane authorises the caller against the named Agent Space before it
+        // can know whether anything inside it exists, so an `agentSpaceId` that names
+        // no space is an authorization failure, not a missing asset.
+        if !store.agent_spaces.contains_key(&input.agent_space_id) {
+            return Err(CreateAssetErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // `@idempotencyToken`: a repeat with the same token returns the asset the first
+        // call created instead of minting a second one. An asset lives inside its agent
+        // space, so the token record is scoped to that space as well as to this
+        // operation: the same token used in two spaces names two different assets, and
+        // neither create can overwrite the other's record.
+        let token_scope = token_scope(&input.agent_space_id);
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = store
+                .replayed_id(&token_scope, token, now)
+                .and_then(|asset_id| {
+                    store
+                        .agent_spaces
+                        .get(&input.agent_space_id)
+                        .and_then(|space| space.assets.get(&asset_id))
+                })
+            {
+                return Ok(CreateAssetOutput {
+                    asset: existing.to_api(),
+                });
+            }
+        }
+
+        let metadata = asset_metadata(input.metadata, &input.asset_type)?;
+        let files = content_files(&input.content, now)?;
+        let source_url = match &input.content {
+            AssetContent::sourceUrl(source) => Some(source.url.clone()),
+            AssetContent::File(_) | AssetContent::Zip(_) => None,
+        };
+
+        // Every asset is a stored record under its agent space, so the number of them
+        // one space can hold is bounded: past the quota this operation answers the
+        // service's `ServiceQuotaExceededException` (HTTP 402) instead of growing the
+        // space without end.
+        let asset_count = store
+            .agent_spaces
+            .get(&input.agent_space_id)
+            .map_or(0, |space| space.assets.len());
+        if asset_count >= crate::state::MAX_ASSETS_PER_AGENT_SPACE {
+            return Err(CreateAssetErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The request would exceed the maximum number of assets ({}) for agent space {}",
+                        crate::state::MAX_ASSETS_PER_AGENT_SPACE,
+                        input.agent_space_id
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let asset_id = store.mint_id(ASSET_ID_PREFIX);
+        let record = crate::state::AssetRecord {
+            asset_id: asset_id.clone(),
+            agent_space_id: input.agent_space_id.clone(),
+            asset_type: input.asset_type,
+            metadata,
+            version: crate::state::INITIAL_ASSET_VERSION,
+            created_at: now,
+            updated_at: now,
+            files,
+            source_url,
+        };
+        if let Some(token) = input.client_token.as_deref() {
+            store.record_client_token(&token_scope, token, &asset_id, now);
+        }
+        let space = store
+            .agent_spaces
+            .get_mut(&input.agent_space_id)
+            .ok_or_else(|| {
+                CreateAssetErrorModeled::AccessDeniedException(AccessDeniedException {
+                    message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
+                })
+            })?;
+        space.assets.insert(asset_id.clone(), record);
+
+        // Read the response back out of the store, so what the caller sees is what was
+        // persisted.
+        let stored = space.assets.get(&asset_id).ok_or_else(|| {
+            CreateAssetErrorModeled::InternalServerException(InternalServerException {
+                message: format!("asset {asset_id} was not persisted"),
+            })
+        })?;
+        Ok(CreateAssetOutput {
+            asset: stored.to_api(),
+        })
     }
 }
+
+/// The prefix every minted `assetId` carries. Alphanumeric, so the minted id
+/// satisfies `ResourceId`'s `^[a-zA-Z0-9_.-]+$`.
+const ASSET_ID_PREFIX: &str = "asset";
+
+/// The scope one `CreateAsset` idempotency-token record belongs to: this operation
+/// in one agent space, because the asset it names lives in that space and is
+/// reachable nowhere else.
+fn token_scope(agent_space_id: &str) -> String {
+    format!("CreateAsset@{agent_space_id}")
+}
+
+/// The longest `AssetFilePath` this service stores, from the model's own
+/// `@length(min: 1, max: 512)` (`smithy_query(query="shape",
+/// shape="AssetFilePath")`).
+const MAX_ASSET_FILE_PATH_LEN: usize = 512;
+
+/// The metadata to persist for a new asset.
+///
+/// `CreateAssetInput$metadata` is "the metadata describing this asset", i.e. the
+/// members that describe it, so a document that is not a set of members describes
+/// nothing and is refused. `Asset$metadata` is required on the wire, so an asset of
+/// a type that requires no field and was created without metadata holds an empty
+/// set of members rather than nothing.
+///
+/// What metadata an asset MUST carry belongs to its asset type
+/// ([`crate::state::ASSET_TYPE_RULES`]): a create that omits a field the type
+/// requires is refused with HTTP 400 `ValidationException` naming that field and
+/// the type that requires it.
+fn asset_metadata(
+    metadata: Option<::aws_smithy_types::Document>,
+    asset_type: &str,
+) -> Result<::aws_smithy_types::Document, CreateAssetError> {
+    let metadata = match metadata {
+        None | Some(::aws_smithy_types::Document::Null) => crate::state::empty_metadata(),
+        Some(document @ ::aws_smithy_types::Document::Object(_)) => document,
+        Some(other) => {
+            let kind = document_kind(&other);
+            return Err(
+                CreateAssetErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "metadata must describe the asset as a set of members, but {kind} was provided"
+                    ),
+                    field_list: Some(vec![ValidationExceptionField {
+                        path: "metadata".to_string(),
+                        message: format!("Expected a set of members, but {kind} was provided"),
+                    }]),
+                })
+                .into(),
+            );
+        }
+    };
+
+    // A type with no rule imposes no metadata requirement of its own, so its
+    // metadata is persisted as the caller described it.
+    if let Some(rule) = crate::state::asset_type_rule(asset_type) {
+        for field in rule.required_metadata {
+            if !crate::state::metadata_field_is_provided(&metadata, field) {
+                return Err(CreateAssetErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::missing_metadata_field_message(
+                            field,
+                            rule.display_name,
+                        ),
+                        field_list: Some(vec![ValidationExceptionField {
+                            path: format!("metadata.{field}"),
+                            message: crate::state::missing_metadata_field_message(
+                                field,
+                                rule.display_name,
+                            ),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+    }
+    Ok(metadata)
+}
+
+/// What a document node IS, for a refusal that has to tell the caller what they
+/// sent instead of a set of members.
+fn document_kind(document: &::aws_smithy_types::Document) -> &'static str {
+    match document {
+        ::aws_smithy_types::Document::Object(_) => "a set of members",
+        ::aws_smithy_types::Document::Array(_) => "a list",
+        ::aws_smithy_types::Document::Number(_) => "a number",
+        ::aws_smithy_types::Document::String(_) => "a string",
+        ::aws_smithy_types::Document::Bool(_) => "a boolean",
+        ::aws_smithy_types::Document::Null => "nothing",
+    }
+}
+
+/// The files one `AssetContent` materialises into, by the path each is stored at.
+///
+/// A single `file` is stored at the path the request names. A `zip` bundle becomes
+/// the archive's own entries, read with the `zip` crate — the content is what a
+/// later read of the asset serves, so the bundle is unpacked at create time rather
+/// than held as an opaque blob. A `sourceUrl` names content outside this emulator,
+/// which makes no outbound connections: the asset is created and the URL persisted,
+/// and no file is invented for content nothing fetched.
+///
+/// ONE rule decides what an asset's file may be called, whichever variant it
+/// arrived in: [`names_a_file_of_the_asset`]. A path the request names and a name an
+/// archive carries are the same thing once stored, so they are held to the same
+/// requirement.
+fn content_files(
+    content: &AssetContent,
+    now: ::std::time::SystemTime,
+) -> Result<::std::collections::BTreeMap<String, crate::state::AssetFileRecord>, CreateAssetError> {
+    let mut files: ::std::collections::BTreeMap<String, crate::state::AssetFileRecord> =
+        ::std::collections::BTreeMap::new();
+    match content {
+        AssetContent::File(file) => {
+            if !names_a_file_of_the_asset(&file.path) {
+                return Err(invalid_content(
+                    "content.file.path",
+                    format!("{} does not name a file of the asset", file.path),
+                ));
+            }
+            files.insert(
+                file.path.clone(),
+                crate::state::AssetFileRecord {
+                    path: file.path.clone(),
+                    body: file.body.clone(),
+                    metadata: file.metadata.clone(),
+                    version: crate::state::INITIAL_ASSET_VERSION,
+                    created_at: now,
+                    updated_at: now,
+                },
+            );
+        }
+        AssetContent::Zip(zip) => {
+            for (path, bytes) in archive_entries(&zip.zip_file)? {
+                files.insert(
+                    path.clone(),
+                    crate::state::AssetFileRecord {
+                        path,
+                        // The archive carries bytes and records nothing about how a
+                        // caller meant them to be read, so each entry is stored as the
+                        // bytes it holds rather than guessed at.
+                        body: AssetFileBody::Bytes(bytes),
+                        metadata: None,
+                        version: crate::state::INITIAL_ASSET_VERSION,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                );
+            }
+        }
+        AssetContent::sourceUrl(_) => {}
+    }
+
+    // The content of one asset is bounded however it arrived, so what is stored for
+    // one create can never be more than this service holds for an asset.
+    let total = files
+        .values()
+        .map(crate::state::AssetFileRecord::content_bytes)
+        .fold(0usize, |total, size| total.saturating_add(size));
+    if total > crate::state::MAX_ASSET_CONTENT_BYTES {
+        return Err(CreateAssetErrorModeled::ContentSizeExceededException(
+            ContentSizeExceededException {
+                message: format!(
+                    "The content exceeds the maximum size of {} bytes for one asset",
+                    crate::state::MAX_ASSET_CONTENT_BYTES
+                ),
+            },
+        )
+        .into());
+    }
+    Ok(files)
+}
+
+/// Every file entry of a zip bundle, by the path it is stored at, with its content.
+///
+/// Reading the archive format is the `zip` crate's job; what this function owns is
+/// the BOUNDS, because the archive is caller content: no more entries than one asset
+/// holds ([`crate::state::MAX_ASSET_FILES`]) and no more decompressed content than
+/// one asset carries ([`crate::state::MAX_ASSET_CONTENT_BYTES`]), so a small
+/// compressed stream cannot expand into this process. A directory entry names no
+/// file; an entry whose name is no file of the asset
+/// ([`names_a_file_of_the_asset`]) is refused rather than stored under a name no
+/// read can name.
+fn archive_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, CreateAssetError> {
+    let mut archive = ::zip::ZipArchive::new(::std::io::Cursor::new(bytes)).map_err(|err| {
+        invalid_content(
+            ZIP_MEMBER,
+            format!("content.zip.zipFile is not a zip archive this service can read: {err}"),
+        )
+    })?;
+    if archive.len() > crate::state::MAX_ASSET_FILES {
+        return Err(CreateAssetErrorModeled::ServiceQuotaExceededException(
+            ServiceQuotaExceededException {
+                message: format!(
+                    "The request would exceed the maximum number of files ({}) for one asset",
+                    crate::state::MAX_ASSET_FILES
+                ),
+            },
+        )
+        .into());
+    }
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut total = 0usize;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|err| {
+            invalid_content(ZIP_MEMBER, format!("an entry could not be read: {err}"))
+        })?;
+        // zip reports an entry's name as a `Result`, because a name that is not valid
+        // UTF-8 can be no file path at all.
+        let name = entry
+            .name()
+            .map_err(|err| {
+                invalid_content(
+                    ZIP_MEMBER,
+                    format!("an entry's name could not be read: {err}"),
+                )
+            })?
+            .to_string();
+        if name.ends_with('/') {
+            continue;
+        }
+        if !names_a_file_of_the_asset(&name) {
+            return Err(invalid_content(
+                ZIP_MEMBER,
+                format!("the entry {name} does not name a file of the asset"),
+            ));
+        }
+        // The bound is applied to what is DECOMPRESSED, one byte past the budget at
+        // most: `take` is what stops a stream that claims to be small and is not.
+        let budget = crate::state::MAX_ASSET_CONTENT_BYTES.saturating_sub(total);
+        let mut content: Vec<u8> = Vec::new();
+        ::std::io::Read::read_to_end(
+            &mut ::std::io::Read::take(&mut entry, u64::try_from(budget).unwrap_or(u64::MAX) + 1),
+            &mut content,
+        )
+        .map_err(|err| {
+            invalid_content(
+                ZIP_MEMBER,
+                format!("the entry {name} could not be read: {err}"),
+            )
+        })?;
+        if content.len() > budget {
+            return Err(CreateAssetErrorModeled::ContentSizeExceededException(
+                ContentSizeExceededException {
+                    message: format!(
+                        "The content exceeds the maximum size of {} bytes for one asset",
+                        crate::state::MAX_ASSET_CONTENT_BYTES
+                    ),
+                },
+            )
+            .into());
+        }
+        total = total.saturating_add(content.len());
+        entries.push((name, content));
+    }
+    Ok(entries)
+}
+
+/// The member a zip bundle arrives in, named by a refusal of one so the caller can
+/// fix the request from the message alone.
+const ZIP_MEMBER: &str = "content.zip.zipFile";
+
+/// Refuse the content as invalid: a 400 `ValidationException` naming the member the
+/// content arrived in, so the caller can fix the request from the message alone.
+fn invalid_content(member: &str, message: String) -> CreateAssetError {
+    CreateAssetErrorModeled::ValidationException(ValidationException {
+        message: message.clone(),
+        field_list: Some(vec![ValidationExceptionField {
+            path: member.to_string(),
+            message,
+        }]),
+    })
+    .into()
+}
+
+/// Whether `path` names a file OF the asset: an `AssetFilePath` (the model's
+/// `^[a-zA-Z0-9_./ ()-]+$` and its length bound, [`MAX_ASSET_FILE_PATH_LEN`]) that
+/// is relative to the asset's own root.
+///
+/// The modelled pattern admits `.` and `/`, so it also admits a path that walks out
+/// of the asset (`..`) or starts at a root (`/`). Such a path names no file of this
+/// asset, so it is refused for a file the request names and for an entry an archive
+/// carries alike.
+fn names_a_file_of_the_asset(path: &str) -> bool {
+    is_asset_file_path(path)
+        && !path.starts_with('/')
+        && !path.split('/').any(|segment| segment == "..")
+}
+
+/// Whether `path` is an `AssetFilePath`: the model's `^[a-zA-Z0-9_./ ()-]+$`
+/// pattern and its length bound ([`MAX_ASSET_FILE_PATH_LEN`]).
+///
+/// The framework already refuses a `content.file.path` that violates either, before
+/// this handler runs; what needs the check here is a name an ARCHIVE carries, which
+/// reaches no modelled member on the way in and so is held to the same requirement
+/// as the path a request names.
+fn is_asset_file_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= MAX_ASSET_FILE_PATH_LEN
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b' ' | b'(' | b')' | b'-'))
+}
+

@@ -4,17 +4,18 @@
 //!
 //! The records here are the single home for every resource this service persists:
 //! an AgentSpace (the control-plane resource `CreateAgentSpace` mints) and the
-//! backlog tasks that live inside one. Handlers read and write them through
-//! [`service_state`]; the `to_api` methods are the one place a record is rendered
-//! into the modelled wire shape, so `Create`, `Get` and `List` cannot disagree
-//! about what a stored resource looks like.
+//! backlog tasks, Triggers and assets that live inside one. Handlers read and write
+//! them through [`service_state`]; the `to_api` methods are the one place a record is
+//! rendered into the modelled wire shape, so `Create`, `Get` and `List` cannot
+//! disagree about what a stored resource looks like.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AgentSpace, IamAuthConfiguration, IdcAuthConfiguration, IdpAuthConfiguration, Recurrence,
-    ReferenceOutput, ScheduleCondition, ScheduleSpec, Task, Trigger, TriggerCondition,
+    AgentSpace, Asset, AssetFile, AssetFileBody, IamAuthConfiguration, IdcAuthConfiguration,
+    IdpAuthConfiguration, Recurrence, ReferenceOutput, ScheduleCondition, ScheduleSpec, Task,
+    Trigger, TriggerCondition,
 };
 
 /// The most AgentSpaces this emulator stores for the account before
@@ -34,6 +35,107 @@ pub const MAX_TASKS_PER_AGENT_SPACE: usize = 1_000;
 /// `ServiceQuotaExceededException`. CHOSEN for the same reason as
 /// [`MAX_AGENT_SPACES`]: the model states no Trigger quota.
 pub const MAX_TRIGGERS_PER_AGENT_SPACE: usize = 1_000;
+
+/// The most assets one AgentSpace holds before `CreateAsset` answers
+/// `ServiceQuotaExceededException`. CHOSEN for the same reason as
+/// [`MAX_AGENT_SPACES`]: the model states no asset quota.
+pub const MAX_ASSETS_PER_AGENT_SPACE: usize = 1_000;
+
+/// The most files one asset's content materialises.
+///
+/// CHOSEN: the model bounds the SIZE of a content bundle but not the number of
+/// entries in it, so this caps how many records one archive can turn into.
+pub const MAX_ASSET_FILES: usize = 1_000;
+
+/// The most bytes of file content one asset's content may carry in total.
+///
+/// Cited: the model bounds every content blob and text body this service accepts —
+/// `AssetZipBytes`, `AssetFileBytes` and `AssetFileText` — at `@length(max:
+/// 6291456)`, so that is the largest content one request can carry. A zip bundle's
+/// entries are held to the same total once decompressed, which is also what stops a
+/// small archive from expanding without bound inside this process.
+pub const MAX_ASSET_CONTENT_BYTES: usize = 6_291_456;
+
+/// The version a freshly created asset, and each file created with it, carries.
+///
+/// `Asset$version` and `AssetFile$version` are the resource's revision counter, so
+/// the first stored revision is 1 and an update mints the next one.
+pub const INITIAL_ASSET_VERSION: i32 = 1;
+
+/// What one asset type requires of an asset, and how a refusal names items of it.
+///
+/// `AssetType` is an open string in the model, so the metadata an asset must carry
+/// is not expressed there: it belongs to the type. This table is the one place that
+/// knowledge lives, so every asset operation enforces and words it the same way.
+#[derive(Debug)]
+pub struct AssetTypeRule {
+    /// The `assetType` value this rule applies to.
+    pub asset_type: &'static str,
+    /// How the service names an item of this type when it refuses one.
+    pub display_name: &'static str,
+    /// The metadata fields an asset of this type must carry.
+    pub required_metadata: &'static [&'static str],
+}
+
+/// The asset types whose requirements this service enforces, each with the
+/// metadata field an item of that type is identified by.
+///
+/// The model leaves `AssetType` an open string and names its values only by
+/// example — `AssetType` is documented as "The type of asset (e.g. skill,
+/// artifact)" — and states no metadata requirement for any of them, so what each
+/// type requires is the service's own behaviour: every knowledge item of a type
+/// must carry the member that type names it by, which is what a refusal of a
+/// create without it reports. A type with no entry here imposes no metadata
+/// requirement of its own, so a create of one is not refused for a field this
+/// table does not know about.
+pub const ASSET_TYPE_RULES: &[AssetTypeRule] = &[
+    AssetTypeRule {
+        asset_type: "skill",
+        display_name: "Skill knowledge",
+        required_metadata: &["name"],
+    },
+    AssetTypeRule {
+        asset_type: "artifact",
+        display_name: "Artifact knowledge",
+        required_metadata: &["title"],
+    },
+    AssetTypeRule {
+        asset_type: "attachment",
+        display_name: "Attachment knowledge",
+        required_metadata: &["filename"],
+    },
+];
+
+/// The rule for `asset_type`, when this service enforces one for it.
+pub fn asset_type_rule(asset_type: &str) -> Option<&'static AssetTypeRule> {
+    ASSET_TYPE_RULES
+        .iter()
+        .find(|rule| rule.asset_type == asset_type)
+}
+
+/// The refusal message for an asset whose metadata omits a field its type requires.
+///
+/// The fixed text is "<field> is required for <type> items": the field is the
+/// member of `metadata` that is missing and the type is how the service names items
+/// of that asset type ([`AssetTypeRule::display_name`]).
+pub fn missing_metadata_field_message(field: &str, display_name: &str) -> String {
+    format!("{field} is required for {display_name} items")
+}
+
+/// Whether `metadata` carries a value for `field`.
+///
+/// A member that is absent, null or an empty string carries no value, so it does
+/// not satisfy a requirement that the field be provided.
+pub fn metadata_field_is_provided(metadata: &::aws_smithy_types::Document, field: &str) -> bool {
+    let ::aws_smithy_types::Document::Object(members) = metadata else {
+        return false;
+    };
+    match members.get(field) {
+        None | Some(::aws_smithy_types::Document::Null) => false,
+        Some(::aws_smithy_types::Document::String(value)) => !value.is_empty(),
+        Some(_) => true,
+    }
+}
 
 /// How long a recorded `@idempotencyToken` replays the result of the create that
 /// first used it.
@@ -155,6 +257,33 @@ pub fn agent_space_not_found_message(agent_space_id: &str) -> String {
     )
 }
 
+/// The message an asset-plane refusal of an AgentSpace the caller cannot reach
+/// carries.
+///
+/// The asset plane authorises the caller against the named AgentSpace before it can
+/// know whether anything inside it exists, so a space it cannot see fails closed:
+/// the refusal names no identifier at all, because naming one would tell a caller
+/// which spaces exist outside their authorization. The text is wholly fixed, with
+/// no variable part.
+pub const ACCESS_DENIED_MESSAGE: &str = "Access denied";
+
+/// The refusal message an asset operation answers with when the `assetId` it was
+/// given names no asset in an AgentSpace the caller can reach.
+///
+/// The fixed text names the kind of resource and the identifier the request
+/// carried, taken verbatim from the request; the parent space is already known to
+/// the caller, so it is not repeated.
+pub fn asset_not_found_message(asset_id: &str) -> String {
+    format!("Asset not found: {asset_id}")
+}
+
+/// The refusal message an asset read answers with when the version it names is not
+/// one the asset has: the same form as [`asset_not_found_message`], naming the
+/// revision that was asked for.
+pub fn asset_version_not_found_message(asset_id: &str, asset_version: i32) -> String {
+    format!("Asset not found: {asset_id} version {asset_version}")
+}
+
 /// The URL operators use to reach the Operator App of one AgentSpace.
 ///
 /// One host per AgentSpace in the region the enabling request was signed for,
@@ -245,6 +374,10 @@ pub struct AgentSpaceRecord {
     /// The Triggers created in this AgentSpace, keyed by `triggerId`. Bounded by
     /// [`MAX_TRIGGERS_PER_AGENT_SPACE`].
     pub triggers: HashMap<String, TriggerRecord>,
+    /// The assets created in this AgentSpace, keyed by their minted `assetId`.
+    /// Bounded by [`MAX_ASSETS_PER_AGENT_SPACE`]. An asset is reachable only
+    /// through its space, so deleting the space takes its assets with it.
+    pub assets: HashMap<String, AssetRecord>,
     /// The Operator App configured for this AgentSpace, absent until an
     /// authentication flow is enabled for it.
     pub operator_app: Option<OperatorAppRecord>,
@@ -451,6 +584,86 @@ impl TaskRecord {
             has_linked_tasks: false,
         }
     }
+}
+
+/// A persisted asset: what it is, the metadata describing it, and the files its
+/// content materialised into.
+///
+/// The files are keyed by path in sorted order, so a read of one asset renders its
+/// content in the same order however it was created.
+#[derive(Debug, Clone)]
+pub struct AssetRecord {
+    pub asset_id: String,
+    pub agent_space_id: String,
+    pub asset_type: String,
+    /// The metadata describing this asset. `Asset$metadata` is required on the
+    /// wire, so an asset created without any is stored with an empty set of
+    /// members rather than nothing.
+    pub metadata: ::aws_smithy_types::Document,
+    pub version: i32,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    /// The files this asset holds, by path.
+    pub files: BTreeMap<String, AssetFileRecord>,
+    /// The external source the asset's content is imported from, when the create
+    /// named one instead of supplying the content inline. Held so a read reports
+    /// where the content comes from; nothing is fetched, because this emulator
+    /// makes no outbound connections, so the import materialises no files.
+    pub source_url: Option<String>,
+}
+
+impl AssetRecord {
+    /// The modelled `Asset` for this record.
+    pub fn to_api(&self) -> Asset {
+        Asset {
+            asset_id: self.asset_id.clone(),
+            asset_type: self.asset_type.clone(),
+            metadata: self.metadata.clone(),
+            version: self.version,
+            created_at: to_date_time(self.created_at),
+            updated_at: to_date_time(self.updated_at),
+        }
+    }
+}
+
+/// One persisted file of an asset's content.
+#[derive(Debug, Clone)]
+pub struct AssetFileRecord {
+    pub path: String,
+    pub body: AssetFileBody,
+    pub metadata: Option<::aws_smithy_types::Document>,
+    pub version: i32,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl AssetFileRecord {
+    /// The modelled `AssetFile` for this record.
+    pub fn to_api(&self) -> AssetFile {
+        AssetFile {
+            path: self.path.clone(),
+            content: self.body.clone(),
+            metadata: self.metadata.clone(),
+            version: self.version,
+            created_at: to_date_time(self.created_at),
+            updated_at: to_date_time(self.updated_at),
+        }
+    }
+
+    /// The size of this file's content, in bytes: the bytes themselves, or the
+    /// encoded length of the text.
+    pub fn content_bytes(&self) -> usize {
+        match &self.body {
+            AssetFileBody::Bytes(bytes) => bytes.len(),
+            AssetFileBody::Text(text) => text.len(),
+        }
+    }
+}
+
+/// An empty set of document members: what an asset's required `metadata` holds
+/// when the create named none.
+pub fn empty_metadata() -> ::aws_smithy_types::Document {
+    ::aws_smithy_types::Document::Object(HashMap::new())
 }
 
 /// A persisted Trigger: the schedule it fires on, the action it performs, and the

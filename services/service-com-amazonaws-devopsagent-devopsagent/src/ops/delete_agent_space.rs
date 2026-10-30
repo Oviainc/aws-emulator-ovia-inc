@@ -140,8 +140,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // Deleting the space removes the tasks and Triggers it owns with it: both are
-        // reachable only through their parent space, so nothing can outlive it.
+        // Deleting the space removes the tasks, Triggers and assets it owns with it:
+        // each is reachable only through its parent space, so nothing can outlive it.
         let mut store = state.lock();
         let Some(removed) = store.agent_spaces.remove(&input.agent_space_id) else {
             // The model declares `ResourceNotFoundException` for this operation, so an
@@ -156,14 +156,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The idempotency-token entries that named the space, or any task or Trigger
-        // inside it, can never replay anything now: reclaim them with the resources
-        // rather than leaving them to wait out their TTL.
-        let mut gone: Vec<String> =
-            Vec::with_capacity(removed.tasks.len() + removed.triggers.len() + 1);
+        // The idempotency-token entries that named the space, or any task, Trigger or
+        // asset inside it, can never replay anything now: reclaim them with the
+        // resources rather than leaving them to wait out their TTL.
+        let mut gone: Vec<String> = Vec::with_capacity(
+            removed.tasks.len() + removed.triggers.len() + removed.assets.len() + 1,
+        );
         gone.push(removed.agent_space_id.clone());
         gone.extend(removed.tasks.keys().cloned());
         gone.extend(removed.triggers.keys().cloned());
+        gone.extend(removed.assets.keys().cloned());
         store.forget_client_tokens_for(&gone);
 
         Ok(DeleteAgentSpaceOutput {})
