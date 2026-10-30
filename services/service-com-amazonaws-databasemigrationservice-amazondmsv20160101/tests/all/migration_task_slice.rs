@@ -35,6 +35,7 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 /// path.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -42,8 +43,14 @@ impl Emulator {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// The engine the service is mounted on, so a suite can seed a record for a
+    /// resource whose own create operation is still a stub.
+    pub(crate) fn engine(&self) -> &engine::InMemoryEngine {
+        &self.engine
     }
 
     /// Call `operation` with `body`, signed for [`REGION`] so the service resolves the
@@ -80,7 +87,7 @@ impl Emulator {
     }
 
     /// A replication instance that has finished provisioning, and its ARN.
-    async fn available_instance(&self, identifier: &str) -> String {
+    pub(crate) async fn available_instance(&self, identifier: &str) -> String {
         let created = self
             .ok(
                 identifier,
@@ -96,7 +103,12 @@ impl Emulator {
     }
 
     /// An endpoint of `endpoint_type`, and its ARN.
-    async fn endpoint(&self, identifier: &str, endpoint_type: &str, engine_name: &str) -> String {
+    pub(crate) async fn endpoint(
+        &self,
+        identifier: &str,
+        endpoint_type: &str,
+        engine_name: &str,
+    ) -> String {
         let created = self
             .ok(
                 identifier,
@@ -113,7 +125,7 @@ impl Emulator {
 }
 
 /// The `__type` an awsJson1_1 error body carries.
-fn error_code(response: &Value) -> String {
+pub(crate) fn error_code(response: &Value) -> String {
     response
         .get("__type")
         .and_then(Value::as_str)
@@ -1338,6 +1350,35 @@ async fn every_documented_filter_narrows_the_describe() {
             "DescribeEndpoints" => "EndpointArn",
             _ => "ReplicationTaskArn",
         };
+        // DMS raises its one modelled error rather than answering an empty list when
+        // the filters narrow a describe to nothing. The two describes that do so each
+        // have their own fixed message.
+        let no_match_message = match operation {
+            "DescribeReplicationInstances" => Some("No instances found matching provided filters"),
+            "DescribeEndpoints" => Some("No Endpoints found matching provided filters"),
+            _ => None,
+        };
+        if expected.is_empty() {
+            if let Some(message) = no_match_message {
+                let (status, response) = emulator
+                    .call(
+                        operation,
+                        &json!({ "Filters": [{ "Name": name, "Values": [value] }] }),
+                    )
+                    .await;
+                assert_eq!(
+                    (
+                        status,
+                        error_code(&response),
+                        text(&response, "/message").as_str()
+                    ),
+                    (400, "ResourceNotFoundFault".to_string(), message),
+                    "case {name:?}={value:?} on {operation}: expected 400 ResourceNotFoundFault \
+                     {message:?}, got {status} {response}"
+                );
+                continue;
+            }
+        }
         let described = emulator
             .ok(
                 &format!("{name}={value}"),

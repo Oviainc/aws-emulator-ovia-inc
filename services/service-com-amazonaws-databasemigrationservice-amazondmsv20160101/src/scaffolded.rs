@@ -177,6 +177,69 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic `InvalidParameterValueException` error shape.
+static INVALID_PARAMETER_VALUE_EXCEPTION_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#InvalidParameterValueException$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `InvalidParameterValueException` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the
+/// shape is not in this service's model at all. DMS nevertheless answers a parameter
+/// whose VALUE names no resource or no catalog entry with this error code, so an
+/// operation that has to refuse one has no modeled error to reach for.
+pub static INVALID_PARAMETER_VALUE_EXCEPTION_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#InvalidParameterValueException",
+        "smithy.framework",
+        "InvalidParameterValueException",
+    ),
+    ShapeType::Structure,
+    &[&INVALID_PARAMETER_VALUE_EXCEPTION_MESSAGE],
+);
+
+/// The payload of an `InvalidParameterValueException`: which value the service would
+/// not accept.
+#[derive(Debug, Clone)]
+pub struct InvalidParameterValueException {
+    pub message: String,
+}
+
+impl InvalidParameterValueException {
+    /// An `InvalidParameterValueException` carrying `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for InvalidParameterValueException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InvalidParameterValueException: {}", self.message)
+    }
+}
+
+impl std::error::Error for InvalidParameterValueException {}
+
+impl SerializableStruct for InvalidParameterValueException {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(
+            &INVALID_PARAMETER_VALUE_EXCEPTION_MESSAGE,
+            self.message.as_str(),
+        )?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -196,6 +259,11 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// A parameter's VALUE named no resource or no entry in a catalog the service
+    /// publishes. Renders as HTTP 400 with the error code
+    /// `InvalidParameterValueException`, which is the code DMS answers for it even
+    /// though its model declares the shape nowhere.
+    InvalidParameterValueException(InvalidParameterValueException),
 }
 
 impl<E> Scaffolded<E> {
@@ -221,6 +289,18 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Refuse the request because a parameter's VALUE is not one the service accepts,
+    /// with HTTP 400 `InvalidParameterValueException`.
+    ///
+    /// Reach for this where the member is well formed — so neither the model's
+    /// constraints nor [`Self::validation`]'s shape rules catch it — but its value has
+    /// to name something the service knows: an entry in a catalog the service
+    /// publishes, or another resource the account holds. `message` must carry the
+    /// service's own wording for that refusal.
+    pub fn invalid_parameter_value(message: impl Into<String>) -> Self {
+        Self::InvalidParameterValueException(InvalidParameterValueException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -229,6 +309,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::InvalidParameterValueException(e) => write!(f, "{e}"),
         }
     }
 }
@@ -241,6 +322,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::InvalidParameterValueException(e) => e.source(),
         }
     }
 }
@@ -255,6 +337,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
+            Self::InvalidParameterValueException(e) => e,
         }
     }
 
@@ -263,6 +346,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::InvalidParameterValueException(_) => &INVALID_PARAMETER_VALUE_EXCEPTION_SCHEMA,
         }
     }
 
@@ -275,6 +359,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            Self::InvalidParameterValueException(_) => "InvalidParameterValueException",
         }
     }
 
@@ -287,6 +372,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
+            Self::InvalidParameterValueException(_) => 400,
         }
     }
 
@@ -299,6 +385,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
+            // Same again.
+            Self::InvalidParameterValueException(_) => None,
         }
     }
 }

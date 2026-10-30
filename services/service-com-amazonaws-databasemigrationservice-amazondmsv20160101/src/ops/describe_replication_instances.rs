@@ -2,7 +2,8 @@
 
 //! @op DescribeReplicationInstances
 //! IMPLEMENTED: reports the replication instances persisted in [`crate::state`],
-//! narrowed by the documented `Filters` and paged with an opaque `Marker`. The notes
+//! narrowed by the documented `Filters` and paged with an opaque `Marker`. Filters
+//! that narrow the answer to nothing raise `ResourceNotFoundFault`. The notes
 //! below are the scaffold's, kept for the next reader.
 //!
 //! ## Shape of an operation
@@ -166,6 +167,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|record| matches_filters(record, &filters))
             .collect();
 
+        // A filtered describe that narrows to nothing is a resource DMS could not
+        // find, not an empty answer: it raises the one error this operation models
+        // rather than reporting an empty list. An UNFILTERED describe reports what the
+        // account holds, which may legitimately be nothing.
+        if !filters.is_empty() && matching.is_empty() {
+            return Err(
+                DescribeReplicationInstancesErrorModeled::ResourceNotFoundFault(
+                    ResourceNotFoundFault {
+                        message: Some(NO_MATCH_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let (page, marker) = crate::state::paginate(
             &matching,
             input.marker.as_ref(),
@@ -178,13 +194,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             replication_instances: Some(
                 matching[page]
                     .iter()
-                    .map(|record| record.to_shape())
+                    .map(|record| record.to_shape(&store.replication_subnet_groups))
                     .collect(),
             ),
             marker,
         })
     }
 }
+
+/// What DMS says when the `Filters` a request carried match no replication instance.
+/// Fixed text, with no variable part: the request's filters are not quoted back.
+const NO_MATCH_MESSAGE: &str = "No instances found matching provided filters";
 
 /// The filter names the `Filters` member doc publishes: "Valid filter names:
 /// replication-instance-arn | replication-instance-id | replication-instance-class |

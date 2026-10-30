@@ -383,8 +383,11 @@ fn invalid_state(message: String) -> CreateReplicationTaskError {
 
 /// Resolve `arn` to a persisted endpoint of `endpoint_type`.
 ///
-/// An ARN that names no endpoint is `ResourceNotFoundFault`; one that names an
-/// endpoint of the other type is refused, because `SourceEndpointArn` and
+/// An ARN that names no endpoint is `ResourceNotFoundFault`, worded as DMS words an
+/// unresolved endpoint ARN: the fixed text, the offending ARN from the request, and
+/// no mention of which input member carried it — both `SourceEndpointArn` and
+/// `TargetEndpointArn` are refused with the same sentence. An ARN that names an
+/// endpoint of the other type is refused separately, because `SourceEndpointArn` and
 /// `TargetEndpointArn` each name an endpoint of exactly one `EndpointType`.
 fn endpoint_of_type(
     store: &crate::state::ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State,
@@ -393,9 +396,7 @@ fn endpoint_of_type(
     endpoint_type: &str,
 ) -> Result<(), CreateReplicationTaskError> {
     let Some(endpoint) = store.endpoints.get(arn) else {
-        return Err(not_found(format!(
-            "{member} {arn} does not name an endpoint in this account"
-        )));
+        return Err(not_found(format!("Endpoint ARN:{arn} does not exist")));
     };
     if endpoint.endpoint_type != endpoint_type {
         return Err(crate::scaffolded::Scaffolded::validation(format!(

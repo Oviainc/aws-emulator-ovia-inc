@@ -15,5 +15,7 @@
 mod endpoint_projection;
 #[path = "all/migration_task_slice.rs"]
 mod migration_task_slice;
+#[path = "all/rejection_paths.rs"]
+mod rejection_paths;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

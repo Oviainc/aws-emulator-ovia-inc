@@ -15,11 +15,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    DmsTransferSettings, DocDbSettings, DynamoDbSettings, ElasticsearchSettings, Endpoint,
-    GcpMySQLSettings, IBMDb2Settings, KafkaSettings, KinesisSettings, MicrosoftSQLServerSettings,
-    MongoDbSettings, MySQLSettings, NeptuneSettings, OracleSettings, PostgreSQLSettings,
-    RedisSettings, RedshiftSettings, ReplicationInstance, ReplicationTask, S3Settings,
-    SybaseSettings, Tag, TimestreamSettings, VpcSecurityGroupMembership,
+    AvailabilityZone, DmsTransferSettings, DocDbSettings, DynamoDbSettings, ElasticsearchSettings,
+    Endpoint, GcpMySQLSettings, IBMDb2Settings, KafkaSettings, KinesisSettings,
+    MicrosoftSQLServerSettings, MongoDbSettings, MySQLSettings, NeptuneSettings, OracleSettings,
+    PostgreSQLSettings, RedisSettings, RedshiftSettings, ReplicationInstance,
+    ReplicationSubnetGroup, ReplicationTask, S3Settings, Subnet, SybaseSettings, Tag,
+    TimestreamSettings, VpcSecurityGroupMembership,
 };
 
 /// A replication instance `CreateReplicationInstance` has accepted but not finished
@@ -188,6 +189,77 @@ pub const DEFAULT_MAINTENANCE_WINDOW: &str = "sun:03:00-sun:03:30";
 /// The status a VPC security group carries once it is attached to an instance.
 pub const VPC_SECURITY_GROUP_ACTIVE: &str = "active";
 
+/// The status a replication subnet group carries once every subnet in it is usable,
+/// which is what `ReplicationSubnetGroup$SubnetGroupStatus` reports. The model
+/// publishes no value list for it, so this is the value THIS emulator reports for a
+/// group that is ready.
+pub const SUBNET_GROUP_COMPLETE: &str = "Complete";
+
+/// The status one subnet of a replication subnet group carries
+/// (`Subnet$SubnetStatus`). As with the group status, the model publishes no value
+/// list, so this is the value this emulator reports for a usable subnet.
+pub const SUBNET_ACTIVE: &str = "Active";
+
+/// The replication instance classes DMS offers, as `(family, sizes)`.
+///
+/// `ReplicationInstanceClass` is a plain string in the model (length 0..30, no
+/// `@enum`), and the catalog lives in the page the member doc links instead —
+/// "Selecting the right DMS replication instance for your migration" in the DMS user
+/// guide, whose instance-class table this mirrors. `CreateReplicationInstance`'s own
+/// `ReplicationInstanceClass` doc names `dms.c4.large` as an example, which is the
+/// `c4` row below.
+///
+/// A class names a family and a size: `dms.<family>.<size>`.
+const REPLICATION_INSTANCE_CLASS_FAMILIES: &[(&str, &[&str])] = &[
+    ("t2", &["micro", "small", "medium", "large"]),
+    ("t3", &["micro", "small", "medium", "large"]),
+    ("c4", &["large", "xlarge", "2xlarge", "4xlarge"]),
+    (
+        "c5",
+        &[
+            "large", "xlarge", "2xlarge", "4xlarge", "9xlarge", "12xlarge", "18xlarge", "24xlarge",
+        ],
+    ),
+    (
+        "c6i",
+        &[
+            "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge",
+            "32xlarge",
+        ],
+    ),
+    ("r4", &["large", "xlarge", "2xlarge", "4xlarge", "8xlarge"]),
+    (
+        "r5",
+        &[
+            "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge",
+        ],
+    ),
+    (
+        "r6i",
+        &[
+            "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge",
+            "32xlarge",
+        ],
+    ),
+];
+
+/// Whether `class` names a replication instance class DMS offers.
+///
+/// The value is `dms.<family>.<size>` with both parts drawn from
+/// [`REPLICATION_INSTANCE_CLASS_FAMILIES`]; anything else — another prefix, a family
+/// DMS does not run, or a size that family is not offered in — names no class.
+pub fn is_known_replication_instance_class(class: &str) -> bool {
+    let Some(rest) = class.strip_prefix("dms.") else {
+        return false;
+    };
+    let Some((family, size)) = rest.split_once('.') else {
+        return false;
+    };
+    REPLICATION_INSTANCE_CLASS_FAMILIES
+        .iter()
+        .any(|(known_family, sizes)| *known_family == family && sizes.contains(&size))
+}
+
 /// Smallest `MaxRecords` a paginated DMS describe accepts, per the member doc:
 /// "Constraints: Minimum 20, maximum 100."
 pub const MAX_RECORDS_MIN: i32 = 20;
@@ -261,6 +333,63 @@ impl Pending {
     }
 }
 
+/// One replication subnet group: the subnets a replication instance can be placed in.
+///
+/// `CreateReplicationSubnetGroup` is the operation that persists one, and it is still
+/// a 501 stub; the record and the store live here so every operation that RESOLVES a
+/// `ReplicationSubnetGroupIdentifier` reads the one place groups are held.
+#[derive(Debug, Clone)]
+pub struct ReplicationSubnetGroupRecord {
+    /// The caller's identifier, stored lowercased: "This value is stored as a
+    /// lowercase string" (`CreateReplicationSubnetGroup$ReplicationSubnetGroupIdentifier`).
+    pub identifier: String,
+    /// The description the caller gave the group.
+    pub description: String,
+    /// The VPC the group's subnets belong to.
+    pub vpc_id: String,
+    /// The group's subnets, each with the Availability Zone it sits in.
+    pub subnets: Vec<SubnetRecord>,
+}
+
+/// One subnet of a [`ReplicationSubnetGroupRecord`].
+#[derive(Debug, Clone)]
+pub struct SubnetRecord {
+    /// The subnet's own identifier.
+    pub identifier: String,
+    /// The Availability Zone the subnet sits in.
+    pub availability_zone: String,
+}
+
+impl ReplicationSubnetGroupRecord {
+    /// This record as the modelled `ReplicationSubnetGroup` shape.
+    pub fn to_shape(&self) -> ReplicationSubnetGroup {
+        ReplicationSubnetGroup {
+            replication_subnet_group_identifier: Some(self.identifier.clone()),
+            replication_subnet_group_description: Some(self.description.clone()),
+            vpc_id: Some(self.vpc_id.clone()),
+            subnet_group_status: Some(SUBNET_GROUP_COMPLETE.to_string()),
+            subnets: Some(
+                self.subnets
+                    .iter()
+                    .map(|subnet| Subnet {
+                        subnet_identifier: Some(subnet.identifier.clone()),
+                        subnet_availability_zone: Some(AvailabilityZone {
+                            name: Some(subnet.availability_zone.clone()),
+                        }),
+                        subnet_status: Some(SUBNET_ACTIVE.to_string()),
+                    })
+                    .collect(),
+            ),
+            // The emulator models no EC2, so it reports no addressing protocol for a
+            // group's subnets.
+            supported_network_types: None,
+            // A group a caller created is its own, not one DMS manages for a zero-ETL
+            // integration, so it is not read-only.
+            is_read_only: Some(DEFAULT_IS_READ_ONLY),
+        }
+    }
+}
+
 /// One replication instance.
 #[derive(Debug, Clone)]
 pub struct ReplicationInstanceRecord {
@@ -298,6 +427,11 @@ pub struct ReplicationInstanceRecord {
     pub network_type: Option<String>,
     /// The VPC security groups the caller named.
     pub vpc_security_group_ids: Vec<String>,
+    /// The identifier of the replication subnet group the caller placed the instance
+    /// in, if any. Resolved against [`ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State::replication_subnet_groups`]
+    /// when the instance is reported, so a group that has left the store is not
+    /// reported as though it were still there.
+    pub replication_subnet_group: Option<String>,
     /// The instance's tags.
     pub tags: Vec<Tag>,
     /// The transition the clock owes this instance, if any.
@@ -307,8 +441,12 @@ pub struct ReplicationInstanceRecord {
 }
 
 impl ReplicationInstanceRecord {
-    /// This record as the modelled `ReplicationInstance` shape.
-    pub fn to_shape(&self) -> ReplicationInstance {
+    /// This record as the modelled `ReplicationInstance` shape, with its subnet group
+    /// resolved against `subnet_groups`.
+    pub fn to_shape(
+        &self,
+        subnet_groups: &BTreeMap<String, ReplicationSubnetGroupRecord>,
+    ) -> ReplicationInstance {
         ReplicationInstance {
             replication_instance_identifier: Some(self.identifier.clone()),
             replication_instance_class: Some(self.instance_class.clone()),
@@ -325,9 +463,14 @@ impl ReplicationInstanceRecord {
                     .collect(),
             ),
             availability_zone: Some(self.availability_zone.clone()),
-            // A subnet group is only attached by `CreateReplicationSubnetGroup`, which
-            // this slice does not implement.
-            replication_subnet_group: None,
+            // "The subnet group for the replication instance"
+            // (`ReplicationInstance$ReplicationSubnetGroup`): the group the create
+            // resolved, read back from the store rather than copied into the record.
+            replication_subnet_group: self
+                .replication_subnet_group
+                .as_ref()
+                .and_then(|identifier| subnet_groups.get(identifier))
+                .map(ReplicationSubnetGroupRecord::to_shape),
             preferred_maintenance_window: Some(self.preferred_maintenance_window.clone()),
             // Only `ModifyReplicationInstance` leaves pending modifications behind.
             pending_modified_values: None,
@@ -743,6 +886,9 @@ pub struct ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State {
     pub replication_instances: BTreeMap<String, ReplicationInstanceRecord>,
     /// `ReplicationInstanceIdentifier` -> ARN, so a duplicate create is refused.
     pub instance_arn_by_identifier: BTreeMap<String, String>,
+    /// Every replication subnet group this emulator holds, keyed by its (lowercased)
+    /// identifier, which is how `CreateReplicationInstance` resolves one.
+    pub replication_subnet_groups: BTreeMap<String, ReplicationSubnetGroupRecord>,
     /// Every endpoint this emulator holds, keyed by ARN.
     pub endpoints: BTreeMap<String, EndpointRecord>,
     /// `EndpointIdentifier` -> ARN, so a duplicate create is refused.

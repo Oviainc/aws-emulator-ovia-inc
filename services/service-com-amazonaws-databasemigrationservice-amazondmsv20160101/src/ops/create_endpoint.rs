@@ -300,8 +300,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(existing) = store.endpoint_arn_by_identifier.get(&identifier) {
             return Err(CreateEndpointErrorModeled::ResourceAlreadyExistsFault(
                 ResourceAlreadyExistsFault {
+                    // DMS reports the identifier the CALLER sent, double-quoted, in
+                    // its own fixed sentence; the existing endpoint's ARN has no place
+                    // in the message text, and travels in the modelled `resourceArn`
+                    // member instead.
                     message: Some(format!(
-                        "endpoint {identifier} already exists as {existing}"
+                        r#"ReplicationEndpoint "{identifier}" already in use."#
                     )),
                     resource_arn: Some(existing.clone()),
                 },

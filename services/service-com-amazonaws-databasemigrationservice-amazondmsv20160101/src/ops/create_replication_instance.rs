@@ -2,7 +2,10 @@
 
 //! @op CreateReplicationInstance
 //! IMPLEMENTED: mints a replication instance and persists it in [`crate::state`], so
-//! `DescribeReplicationInstances` and `CreateReplicationTask` read the same record. The
+//! `DescribeReplicationInstances` and `CreateReplicationTask` read the same record. Its
+//! `ReplicationInstanceClass` is resolved against the classes DMS offers and its
+//! `ReplicationSubnetGroupIdentifier` against the groups the account holds, before
+//! anything is persisted. The
 //! notes below are the scaffold's, kept for the next reader.
 //!
 //! ## Shape of an operation
@@ -236,6 +239,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(refusal));
         }
 
+        // `ReplicationInstanceClass` has to name a class DMS actually offers; the
+        // model bounds its length but publishes no catalog, so the catalog in
+        // `crate::state` is what the value is resolved against. DMS refuses a value
+        // that names no class with this fixed text, and nothing is persisted.
+        if !crate::state::is_known_replication_instance_class(&input.replication_instance_class) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                "Invalid ReplicationInstance class",
+            ));
+        }
+
         // "You can't set the AvailabilityZone parameter if the Multi-AZ parameter is set
         // to true" (`MultiAZ` doc).
         let multi_az = input.multi_az.unwrap_or_default();
@@ -262,6 +275,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         store.settle(now);
+
+        // A `ReplicationSubnetGroupIdentifier` names another resource: it is resolved
+        // against the groups the account holds, and an identifier that resolves to
+        // nothing is refused with DMS's wording for it. This parameter check runs
+        // BEFORE the identifier-uniqueness check below, so an unknown subnet group is
+        // reported even when the instance identifier is also contentious.
+        let replication_subnet_group = match &input.replication_subnet_group_identifier {
+            Some(requested) => {
+                // The group's identifier "is stored as a lowercase string"
+                // (`CreateReplicationSubnetGroup$ReplicationSubnetGroupIdentifier`), so
+                // the lookup folds the request's value the same way.
+                let identifier = requested.to_lowercase();
+                if !store.replication_subnet_groups.contains_key(&identifier) {
+                    return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                        format!("Replication Subnet Group '{requested}' does not exist."),
+                    ));
+                }
+                Some(identifier)
+            }
+            None => None,
+        };
 
         if let Some(existing) = store.instance_arn_by_identifier.get(&identifier) {
             return Err(
@@ -345,6 +379,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             dns_name_servers: input.dns_name_servers,
             network_type: input.network_type,
             vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
+            replication_subnet_group,
             tags: crate::state::tags_for(&arn, input.tags),
             // `creating` is not terminal: the instance is owed `available`, so a caller
             // that creates a task straight away still sees the transient status.
@@ -355,7 +390,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sequence,
         };
 
-        let replication_instance = record.to_shape();
+        let replication_instance = record.to_shape(&store.replication_subnet_groups);
         store.instance_arn_by_identifier.insert(identifier, arn.clone());
         store.replication_instances.insert(arn, record);
 
