@@ -125,6 +125,8 @@ mod metric_stream_additional_statistics;
 mod metric_stream_scope;
 #[path = "all/metric_stream_unknown_names.rs"]
 mod metric_stream_unknown_names;
+#[path = "all/metric_stream_value_rules.rs"]
+mod metric_stream_value_rules;
 #[path = "all/metric_streams.rs"]
 mod metric_streams;
 #[path = "all/metrics_and_alarms.rs"]

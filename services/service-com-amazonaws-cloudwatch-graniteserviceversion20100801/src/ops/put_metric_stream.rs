@@ -211,7 +211,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // handler having satisfied every modelled constraint already: `Name`'s 1..255
         // length, both ARNs' 1..1024 length, and `OutputFormat` being one of
         // `METRIC_STREAM_OUTPUT_FORMAT_VALUES`. None of those is re-checked here.
-        validate_name(&input.name)?;
+        //
+        // The two PARAMETER-VALUE rules — the role and the name — are judged FIRST, and are
+        // judged on the way in as well ([`parameter_value_refusal`], which this service
+        // mounts ahead of the boundary walk), so a request that breaks one of them is told
+        // about it whatever else it carries.
+        if let Some(refusal) = parameter_value_refusal(&input) {
+            return Err(refusal.into());
+        }
         validate_arn_scope(&input, &region)?;
         let (include_filters, exclude_filters) = validate_filters(&input)?;
         validate_statistics_configurations(&input)?;
@@ -303,20 +310,29 @@ fn invalid_parameter_value(message: String) -> PutMetricStreamError {
     .into()
 }
 
-/// The characters a stream name may use: "Valid characters are A-Z, a-z, 0-9, \"-\" and
-/// \"_\"." (`PutMetricStreamInput$Name`) — prose the model carries no `pattern` for, so the
-/// boundary validator cannot refuse it.
-fn validate_name(name: &str) -> Result<(), PutMetricStreamError> {
-    if name
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
-    {
-        return Ok(());
-    }
-    Err(invalid_parameter_value(format!(
-        "The value {name} for parameter Name is not valid: valid characters are A-Z, a-z, 0-9, \
-         \"-\" and \"_\""
-    )))
+/// The parameter-value refusal this configuration owes, or `None` when both values are ones
+/// a metric stream can carry.
+///
+/// The two members CloudWatch judges as VALUES — the IAM role the stream delivers through and
+/// the stream's own name — neither of which the model constrains to the form the service
+/// requires, so the boundary walk lets both through. The ROLE is judged first: it is what the
+/// stream delivers with, so a configuration naming no role could never stream anything,
+/// whatever the rest of the request says.
+///
+/// Reached from two places, which is the point: this operation's handler calls it, and the
+/// service mounts it AHEAD of the framework's deserialize -> validate -> handle walk
+/// (`crate::service`), so one of these refusals also wins over a modelled constraint the
+/// boundary would otherwise answer first — a value outside `MetricStreamOutputFormat`, say.
+pub fn parameter_value_refusal(
+    input: &PutMetricStreamInput,
+) -> Option<PutMetricStreamErrorModeled> {
+    let message = crate::state::metric_stream_role_arn_error(&input.role_arn)
+        .or_else(|| crate::state::metric_stream_name_error(&input.name))?;
+    Some(PutMetricStreamErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message.to_string()),
+        },
+    ))
 }
 
 /// Either of the two namespace filter lists a stream can carry.

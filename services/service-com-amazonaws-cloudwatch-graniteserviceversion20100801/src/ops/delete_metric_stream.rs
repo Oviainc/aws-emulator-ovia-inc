@@ -144,6 +144,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // all (`InternalServiceFault`, `InvalidParameterValueException` and
         // `MissingRequiredParameterException` are its whole error list), unlike
         // `GetMetricStream`, which models `ResourceNotFoundException`.
+        //
+        // That covers a name no stream could ever carry too, which is why the name is NOT
+        // judged as a value here the way the operations that act on or report a stream judge
+        // it (`crate::state::metric_stream_name_error`): such a name already names no stream,
+        // so the state this request asks for holds, and the recorded delete of one answers
+        // 200.
         state.lock().metric_streams.remove(&input.name);
 
         Ok(DeleteMetricStreamOutput {})

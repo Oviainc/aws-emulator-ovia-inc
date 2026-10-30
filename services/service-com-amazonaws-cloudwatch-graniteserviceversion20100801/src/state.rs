@@ -2047,12 +2047,37 @@ pub fn unknown_dataset(identifier: &str) -> ResourceNotFoundException {
 /// whether CloudWatch may assume it, is not decided here: that is settled when the query runs
 /// and is reported on the alarm, not refused at configuration time.
 pub fn role_arn_error(member: &str, value: &str) -> Option<String> {
-    let fields: Vec<&str> = value.splitn(6, ':').collect();
-    let is_role_arn = matches!(fields.as_slice(), ["arn", partition, "iam", "", account, resource]
-        if !partition.is_empty()
-            && !account.is_empty()
-            && resource.strip_prefix("role/").is_some_and(|name| !name.is_empty()));
-    (!is_role_arn).then(|| format!("{member} is not the ARN of an IAM role: {value}"))
+    (!is_role_arn(value)).then(|| format!("{member} is not the ARN of an IAM role: {value}"))
+}
+
+/// Whether `value` is the ARN of an IAM role: `arn:<partition>:iam::<account>:role/<name>`.
+///
+/// The vendor-and-resource-type half is the shared requirement every member documented as the
+/// ARN of an IAM role is judged by (`service_common::arn::IAM_ROLE`), so this crate and every
+/// other service agree on what a role ARN is; the rest are the fields that requirement leaves
+/// to the member — IAM is a global service, so a role's ARN carries no Region; it names an
+/// account; and the role itself is named.
+///
+/// WHOSE account it names stays with the scope rule ([`foreign_arn_scope`]) — which is why
+/// this is not `service_common::iam_role::role_name`, the reading that resolves a role of THIS
+/// account: a role of another account IS a role ARN, and a member that requires its own
+/// account says so in its own words rather than calling the value malformed.
+pub fn is_role_arn(value: &str) -> bool {
+    // ONE parse of the value: the shared requirement's own vendor-and-resource-type test is
+    // re-stated against those fields rather than run as a second parse of the same string.
+    ::service_common::arn::parse_of(value, ::service_common::arn::IAM_ROLE.vendor).is_some_and(
+        |arn| {
+            ::service_common::arn::IAM_ROLE
+                .resource_type
+                .is_none_or(|kind| arn.resource_type() == kind)
+                && arn.region.is_empty()
+                && !arn.account.is_empty()
+                && arn
+                    .resource
+                    .strip_prefix("role/")
+                    .is_some_and(|name| !name.is_empty())
+        },
+    )
 }
 
 /// The time units a `rate()` schedule expression accepts, each in its singular and plural
@@ -2114,6 +2139,48 @@ pub const METRIC_STREAM_RUNNING: &str = "running";
 /// (`GetMetricStreamOutput$State`) — `StopMetricStreams` moves a stream into this state and
 /// `StartMetricStreams` moves it back.
 pub const METRIC_STREAM_STOPPED: &str = "stopped";
+
+/// How CloudWatch states a metric-stream name that is not one a stream can carry.
+///
+/// A fixed sentence with no variable part: the member's own rule is published
+/// ("Valid characters are A-Z, a-z, 0-9, \"-\" and \"_\".", `PutMetricStreamInput$Name`), so
+/// the refusal names the fault rather than echoing the value. Every operation that acts on or
+/// reports the stream a NAME identifies refuses one the same way, which is why the sentence
+/// lives here.
+pub const INVALID_METRIC_STREAM_NAME: &str = "Invalid Name";
+
+/// How CloudWatch states a metric stream's `RoleArn` that is not the ARN of an IAM role —
+/// the same fixed form as [`INVALID_METRIC_STREAM_NAME`], and for the same reason.
+pub const INVALID_METRIC_STREAM_ROLE_ARN: &str = "Invalid Role ARN";
+
+/// Whether `name` is a name a metric stream can carry: "Valid characters are A-Z, a-z, 0-9,
+/// \"-\" and \"_\"." (`PutMetricStreamInput$Name`) — prose the model carries no `pattern`
+/// for, so the boundary validator cannot judge it and every metric-stream operation judges
+/// it here. The LENGTH is the model's own (`MetricStreamName`, 1..255) and is not re-checked.
+pub fn is_metric_stream_name(name: &str) -> bool {
+    name.chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+}
+
+/// [`INVALID_METRIC_STREAM_NAME`] when `name` is no metric-stream name, else `None`.
+///
+/// The one entry point every metric-stream operation that ACTS ON or REPORTS the stream a
+/// name identifies refuses a bad NAME through, so none of them can answer one name two ways.
+/// `DeleteMetricStream` is not one of them: it asks for the ABSENCE of a stream under the
+/// name, which a name no stream can carry already satisfies, so it accepts one.
+pub fn metric_stream_name_error(name: &str) -> Option<&'static str> {
+    (!is_metric_stream_name(name)).then_some(INVALID_METRIC_STREAM_NAME)
+}
+
+/// [`INVALID_METRIC_STREAM_ROLE_ARN`] when `value` is not the ARN of an IAM role, else
+/// `None`.
+///
+/// "The ARN of an IAM role that this metric stream will use to access Amazon Kinesis Data
+/// Firehose resources." (`PutMetricStreamInput$RoleArn`) — a value that is no role ARN names
+/// no role to assume, so the stream it configures could never deliver anything.
+pub fn metric_stream_role_arn_error(value: &str) -> Option<&'static str> {
+    (!is_role_arn(value)).then_some(INVALID_METRIC_STREAM_ROLE_ARN)
+}
 
 /// Encode a pagination cursor — the key the NEXT page starts at — as an opaque token.
 ///

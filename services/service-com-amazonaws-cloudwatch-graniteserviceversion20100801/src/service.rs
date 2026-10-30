@@ -26,7 +26,9 @@
 //!   API; `PutMetricData` is served through [`ReportingDroppedEntities`], so an accepted call
 //!   whose entity this service could not hold says so in its response header, and
 //!   `GetMetricStatistics` through [`RefusingValuesOutsideAnEnum`], so a value outside an
-//!   enumerated type is refused as one of the parameter faults ITS model declares.
+//!   enumerated type is refused as one of the parameter faults ITS model declares, and
+//!   `PutMetricStream` through [`RefusingAValueFirst`], so the two members CloudWatch judges
+//!   as parameter VALUES are judged before the model's own shape checks.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -45,8 +47,8 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
-    Refused, ServerHttpProtocol, Service,
+    http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext,
+    OperationError, OperationRoutingTable, Refusal, Refused, ServerHttpProtocol, Service,
 };
 use std::sync::Arc;
 
@@ -76,7 +78,9 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The operations whose ANSWER this file owns a part of — the one whose accepted response
     /// carries something its body cannot ([`ReportingDroppedEntities`]), and the one metric
     /// read whose model declares a parameter fault to refuse a value outside an enumerated
-    /// type with ([`RefusingValuesOutsideAnEnum`]). Each is built from the SAME shared engine
+    /// type with ([`RefusingValuesOutsideAnEnum`]), and the metric-stream writer whose own
+    /// parameter-value rules are judged ahead of the boundary walk ([`RefusingAValueFirst`]).
+    /// Each is built from the SAME shared engine
     /// as the generated table's and keyed by the routing key the protocol resolves, so the
     /// operation served is the modelled one, and each is METERED ([`Metering`]) like every
     /// other operation of this service.
@@ -117,6 +121,20 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                         &engine,
                     )),
                     parameter_fault_for,
+                ),
+            )) as Box<dyn ErasedOperation>,
+        );
+        // `PutMetricStream` judges the two members CloudWatch judges as parameter VALUES —
+        // the IAM role the stream delivers through and the stream's own name — BEFORE the
+        // framework's constraint walk, so one of those refusals wins over a modelled
+        // constraint the walk would otherwise answer first ([`RefusingAValueFirst`]).
+        overridden.add_operation(
+            "PutMetricStream",
+            Box::new(Metering::new(
+                Arc::clone(&engine),
+                RefusingAValueFirst::new(
+                    crate::ops::put_metric_stream::PutMetricStream::new(Arc::clone(&engine)),
+                    crate::ops::put_metric_stream::parameter_value_refusal,
                 ),
             )) as Box<dyn ErasedOperation>,
         );
@@ -383,6 +401,136 @@ where
     }
 }
 
+/// One modelled operation, served so that this service's own PARAMETER-VALUE rules are
+/// judged BEFORE the framework's constraint walk.
+///
+/// The framework's per-request sequence is deserialize -> validate -> handle, so a handler
+/// never sees a request that breaks a modelled constraint — and a request that breaks BOTH a
+/// modelled constraint and one of the rules the service judges values by is answered for the
+/// constraint, under the generic validation code, when CloudWatch answers the parameter-value
+/// fault. A caller repairing what it was told about is then refused again for the fault it was
+/// never shown. This wrapper takes the value decision on the way IN and answers it with the
+/// operation's OWN modelled error.
+///
+/// Nothing else is re-implemented: a request the policy does not refuse is handed to the
+/// generated [`ErasedOperation::run`], which owns deserialize -> validate -> handle ->
+/// serialize and every modelled error, and the refusal comes from the operation's own file
+/// (`crate::ops::put_metric_stream::parameter_value_refusal`, which its handler calls too), so
+/// the answer here and the answer behind it are one decision. The cost is DELIBERATE: such a
+/// request is read twice, because the framework hands no already-built input to an operation.
+struct RefusingAValueFirst<O: Operation, E> {
+    operation: O,
+    /// The modelled error this operation owes for the values the request carries, or `None` to
+    /// leave the request to the operation itself.
+    refusal: fn(&O::Input) -> Option<E>,
+}
+
+impl<O: Operation, E> RefusingAValueFirst<O, E> {
+    /// Wrap the operation, already constructed from the shared engine, with the policy that
+    /// judges the values its input carries.
+    fn new(operation: O, refusal: fn(&O::Input) -> Option<E>) -> Self {
+        Self { operation, refusal }
+    }
+}
+
+impl<O, E> ErasedOperation for RefusingAValueFirst<O, E>
+where
+    O: Operation + ErasedOperation,
+    E: Into<O::Error> + Send + Sync + 'static,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            // The protocol is read, used and dropped inside this one statement:
+            // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
+            // below would make this future non-`Send`.
+            let refused = {
+                let protocol = svc.definition().protocol();
+                read_input::<O>(protocol, req)
+                    .and_then(|input| (self.refusal)(&input))
+                    .map(|refusal| modelled_error_response(protocol, req, &refusal.into()))
+            };
+            match refused {
+                Some(response) => response,
+                None => self.operation.run(svc, req, ctx).await,
+            }
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not change
+    /// which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
+    }
+}
+
+/// `req` read into `O`'s input shape through the service's own protocol, or `None` when it
+/// does not READ as that input at all.
+///
+/// Deliberately NOT validated: the whole point of the wrapper above is to judge a value the
+/// constraint walk would have refused the request for first. A body no codec can read, or one
+/// missing a required member, yields `None` and is left to the framework's own refusal, which
+/// is the only answer there is for a request that names no values to judge.
+fn read_input<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &aws_smithy_runtime_api::http::Request,
+) -> Option<O::Input> {
+    let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA).ok()?;
+    let read = <O::Input as DeserializableStruct>::deserialize(&mut *deserializer);
+    drop(deserializer);
+    read.ok()
+}
+
+/// The header an `awsQueryCompatible` service reports the legacy query error code in, for a
+/// client that asked for it.
+const QUERY_ERROR_HEADER: &str = "x-amzn-query-error";
+
+/// The header a query-compatible SDK opts into that report with.
+const QUERY_MODE_HEADER: &str = "x-amzn-query-mode";
+
+/// `error` rendered as this service answers a modelled failure: the error shape through the
+/// service's own protocol, under its wire code and its modelled status
+/// (`service_common::event_stream::error_response`, the shared renderer), plus the
+/// `awsQueryCompatible` header when the client asked for the legacy code.
+///
+/// Rendered from the SAME facts the per-operation sequence renders a modelled error from
+/// ([`OperationError`]), so a refusal answered ahead of that sequence and the same refusal
+/// answered from the handler are one response. The header is added HERE because the framework
+/// adds it inside the sequence this refusal precedes; `awsQueryCompatible` carries the legacy
+/// code in it rather than in the body, and the body's own code is the shape name on this
+/// service's protocol (`awsJson1_0`).
+fn modelled_error_response<E: OperationError>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &aws_smithy_runtime_api::http::Request,
+    error: &E,
+) -> aws_smithy_runtime_api::http::Response {
+    let mut response = service_common::event_stream::error_response(protocol, error);
+    // A query-compat SDK opts in with `x-amzn-query-mode: true`, and only then is the legacy
+    // query error code and its fault reported in the header; a native awsJson client gets the
+    // unadorned awsJson error.
+    let query_mode = req
+        .headers()
+        .get(QUERY_MODE_HEADER)
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    if query_mode {
+        if let Some(code) = error.query_error_code() {
+            let fault = if response.status().as_u16() >= 500 {
+                "Receiver"
+            } else {
+                "Sender"
+            };
+            response
+                .headers_mut()
+                .insert(QUERY_ERROR_HEADER, format!("{code};{fault}"));
+        }
+    }
+    response
+}
+
 /// `refused` rendered in this service's own error envelope: its code and its one `message`,
 /// with the status every refused request value carries ([`REFUSAL_STATUS`]).
 ///
@@ -621,7 +769,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // `GetMetricStatistics` wrapped in [`RefusingValuesOutsideAnEnum`] so a value outside
         // an enumerated type is refused as one of the parameter faults its model declares —
         // where a refusal of such a value by any OTHER operation keeps this service's own
-        // validation code ([`scalar_enum_refusal`]).
+        // validation code ([`scalar_enum_refusal`]), and `PutMetricStream` wrapped in
+        // [`RefusingAValueFirst`] so the values its model does not constrain to the form the
+        // service requires are judged before the boundary walk.
         //
         // Every modelled key resolves here, because every call this service answers is counted
         // into the usage telemetry it publishes about its own API ([`Metering`]): a key the two

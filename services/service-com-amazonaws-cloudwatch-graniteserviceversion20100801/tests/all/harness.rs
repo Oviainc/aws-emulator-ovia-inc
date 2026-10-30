@@ -439,7 +439,29 @@ pub async fn call_with_headers_in_region(
     operation: &str,
     body: &Value,
 ) -> (u16, http::HeaderMap, Value) {
-    let request = http::Request::builder()
+    answered(router, request_for(region, operation, body, false)).await
+}
+
+/// The same call as a query-compatible SDK makes it: `x-amzn-query-mode: true`, the header such
+/// an SDK opts into the legacy `x-amzn-query-error` report with (`awsQueryCompatible`, which
+/// this service's model carries). The seam for asserting that report.
+pub async fn call_in_query_mode(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, http::HeaderMap, Value) {
+    answered(router, request_for(DEFAULT_REGION, operation, body, true)).await
+}
+
+/// One request as this service's wire protocol carries it: `awsJson1_0` over `POST /`, with
+/// `query_mode` adding the header a query-compatible SDK sends.
+fn request_for(
+    region: &str,
+    operation: &str,
+    body: &Value,
+    query_mode: bool,
+) -> http::Request<bytes::Bytes> {
+    let mut builder = http::Request::builder()
         .method("POST")
         .uri("/")
         .header("content-type", "application/x-amz-json-1.0")
@@ -452,12 +474,22 @@ pub async fn call_with_headers_in_region(
                 "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{region}/monitoring/aws4_request, \
                  SignedHeaders=host;x-amz-date, Signature=deadbeef"
             ),
-        )
+        );
+    if query_mode {
+        builder = builder.header("x-amzn-query-mode", "true");
+    }
+    builder
         .body(bytes::Bytes::from(
             serde_json::to_vec(body).expect("the request body serializes"),
         ))
-        .expect("a well-formed request");
+        .expect("a well-formed request")
+}
 
+/// `request` dispatched through the emulator, as its status, headers and parsed body.
+async fn answered(
+    router: &MultiServiceRouter,
+    request: http::Request<bytes::Bytes>,
+) -> (u16, http::HeaderMap, Value) {
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     let headers = response.headers().clone();

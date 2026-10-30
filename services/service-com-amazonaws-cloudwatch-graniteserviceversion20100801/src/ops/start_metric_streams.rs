@@ -144,6 +144,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// that is not there — unlike `GetMetricStream`, which declares
     /// `ResourceNotFoundException`. An empty list names no stream and so starts none.
     ///
+    /// A name that is no metric-stream name at all is a different matter: it is refused as a
+    /// parameter VALUE ([`crate::state::metric_stream_name_error`]) before any stream is
+    /// touched, because no stream could ever carry it, so the request can only be a mistake
+    /// the caller has to repair.
+    ///
     /// The "all or nothing" clause the input documents is about authorization ("If you do not
     /// have permission to access all of the metric streams that you list here, then none of
     /// the streams that you list in the operation will start streaming."), and every stream in
@@ -161,6 +166,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the CloudWatch metric stream store is unavailable".into()),
             })
         })?;
+
+        // Judged over the WHOLE batch before any of it is applied, so a request carrying one
+        // name no stream could have starts none of the streams it also named.
+        for name in &input.names {
+            if let Some(message) = crate::state::metric_stream_name_error(name) {
+                return Err(
+                    StartMetricStreamsErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
 
         let mut store = state.lock();
         for name in &input.names {

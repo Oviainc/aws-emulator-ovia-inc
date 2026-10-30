@@ -177,6 +177,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The name is judged as a VALUE before anything is looked up: a name no stream could
+        // ever carry is a parameter fault, not a resource that is missing, and the two are
+        // different answers to a client deciding whether to create the stream or repair the
+        // request ([`crate::state::metric_stream_name_error`], the one rule every
+        // metric-stream operation that reports or moves a stream reads).
+        if let Some(message) = crate::state::metric_stream_name_error(&input.name) {
+            return Err(
+                GetMetricStreamErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let store = state.lock();
         let stored = store.metric_streams.get(&input.name).ok_or_else(|| {
             // "The named resource does not exist." is what the SHAPE documents, and the
