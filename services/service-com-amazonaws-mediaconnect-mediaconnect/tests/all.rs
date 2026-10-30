@@ -217,3 +217,5 @@ mod retired_bridge_reconfiguration;
 mod bridge_source_removal_failover_integrity;
 #[path = "all/bridge_deletion_flow_source_integrity.rs"]
 mod bridge_deletion_flow_source_integrity;
+#[path = "all/flow_ndi_discovery_servers.rs"]
+mod flow_ndi_discovery_servers;

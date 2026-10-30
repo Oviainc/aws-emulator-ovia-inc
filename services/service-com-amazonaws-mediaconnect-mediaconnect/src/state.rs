@@ -1133,6 +1133,40 @@ pub fn ndi_flow_size_rejection(ndi_feature: &str, flow_size: Option<&str>) -> Op
     ))
 }
 
+/// The ceiling on how many NDI® discovery servers ONE FLOW's `NdiConfig` declares: "a list
+/// of up to three NDI discovery server configurations"
+/// (`smithy_query(query="doc",shape="NdiConfig",member="NdiDiscoveryServers")`), the same
+/// count the member's target shape publishes ("a maximum of 3 servers is allowed",
+/// `smithy_query(query="shape",shape="NdiDiscoveryServerConfig")`).
+///
+/// Like [`MAX_FLOW_MEDIA_STREAMS`] this bounds the STORED flow: the config is kept verbatim
+/// on a record nothing evicts and every later DescribeFlow reports it, so the count is
+/// bounded before it is stored. Named ONCE here because every operation that writes a
+/// flow's `NdiConfig` reads it (CreateFlow and UpdateFlow). Neither models a count
+/// exception for it, so both refuse past the bound with `BadRequestException`, the error
+/// the model describes for "a semantic error" in the request.
+pub const MAX_NDI_DISCOVERY_SERVERS: usize = 3;
+
+/// The detail a request is refused with when the `NdiConfig` it carries under `member`
+/// declares more discovery servers than [`MAX_NDI_DISCOVERY_SERVERS`], or `None` when the
+/// config is one a flow may hold (including a request that carries no config, and one whose
+/// `NdiDiscoveryServers` is absent or empty — the member is optional).
+///
+/// One wording for one rule, so the create side and the update side state the same bound
+/// for the same reason.
+pub fn ndi_discovery_servers_rejection(member: &str, config: Option<&NdiConfig>) -> Option<String> {
+    let declared = config
+        .and_then(|config| config.ndi_discovery_servers.as_ref())
+        .map_or(0, |servers| servers.len());
+    if declared <= MAX_NDI_DISCOVERY_SERVERS {
+        return None;
+    }
+    Some(format!(
+        "{member}.NdiDiscoveryServers may declare at most {MAX_NDI_DISCOVERY_SERVERS} NDI \
+         discovery server configurations; this one declares {declared}."
+    ))
+}
+
 /// Whether `hour` is a maintenance start hour: "UTC time when the maintenance will happen.
 /// Use 24-hour HH:MM format. Minutes must be 00. Example: 13:00."
 /// (`smithy_query(query="doc",shape="AddMaintenance",member="MaintenanceStartHour")`, the

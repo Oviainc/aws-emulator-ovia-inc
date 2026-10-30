@@ -357,6 +357,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The `NdiConfig` a request REPLACES the stored one with is kept verbatim on the
+        // flow record, so the discovery servers it declares are bounded before they are
+        // stored — the count the model publishes, read from the one place this crate words
+        // it, so a config this update stores is one CreateFlow would also have stored (see
+        // `crate::state::MAX_NDI_DISCOVERY_SERVERS`). Only a request that carries the member
+        // is checked: one that does not touch it may not be refused for a stored value it
+        // did not introduce.
+        if let Some(rejection) =
+            crate::state::ndi_discovery_servers_rejection("NdiConfig", input.ndi_config.as_ref())
+        {
+            return Err(bad_request(rejection));
+        }
+
         let requested_failover = input.source_failover_config.as_ref();
 
         // "If the state is inactive, the flow can have only one source. If the state is

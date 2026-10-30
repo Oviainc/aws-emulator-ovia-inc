@@ -380,6 +380,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The `NdiConfig` this request would store is kept verbatim on the flow record, so
+        // the discovery servers it declares are bounded before they are stored — the count
+        // the model publishes, read from the one place this crate words it, so the create
+        // side and UpdateFlow admit exactly the same configs (see
+        // `crate::state::MAX_NDI_DISCOVERY_SERVERS`).
+        if let Some(rejection) =
+            crate::state::ndi_discovery_servers_rejection("NdiConfig", input.ndi_config.as_ref())
+        {
+            return Err(bad_request(rejection));
+        }
+
         // A source and an output reference the flow's own media streams and VPC interfaces
         // BY NAME, and a flow being created holds exactly what THIS request creates — so
         // each such name is resolved against the request's own `MediaStreams` /
