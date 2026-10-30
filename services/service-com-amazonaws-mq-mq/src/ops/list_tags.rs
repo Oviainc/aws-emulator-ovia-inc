@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the tags of the resource an ARN names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `ResourceArn` that names no resource this service holds is refused with the
+//! modelled `NotFoundException` (HTTP 404); otherwise the tags recorded on that
+//! resource are reported. This operation only reports: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -69,6 +65,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -141,18 +138,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTags"))
+        let _ = ctx;
+        let Some(service_state) = state::service_state(&*self.engine) else {
+            return Err(ListTagsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the service state store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
+
+        let store = service_state.lock();
+        // The same ARN resolution every tag operation of this service uses, so an
+        // ARN that names nothing reads the same here as it does on a write.
+        let Some(tags) = store.tags_of(&input.resource_arn) else {
+            return Err(ListTagsErrorModeled::NotFoundException(NotFoundException {
+                error_attribute: None,
+                message: Some(state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                resource_share_errors: None,
+            })
+            .into());
+        };
+
+        Ok(ListTagsOutput {
+            tags: state::optional_tag_map(tags),
+        })
     }
 }

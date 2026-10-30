@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports this account's configurations, a page at a time, out of this service's state.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `MaxResults` outside its modelled range and a `NextToken` this service did not issue
+//! are refused with the modelled `BadRequestException` (HTTP 400) naming the member.
+//! This operation only reports: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +71,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -146,18 +143,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConfigurations"))
+        let _ = ctx;
+        let Some(service_state) = state::service_state(&*self.engine) else {
+            return Err(ListConfigurationsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the service state store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
+
+        // `maxResults` carries the modelled `@range(min: 1, max: 100)`, which this
+        // handler enforces so the refusal names the member, exactly as every
+        // other listing of this service does.
+        if let Some(max_results) = input.max_results {
+            state::validate_range(
+                "maxResults",
+                max_results,
+                state::MIN_MAX_RESULTS,
+                state::MAX_MAX_RESULTS,
+            )
+            .map_err(bad_request)?;
+        }
+
+        // Only a token this service issued names an offset; anything else is a
+        // client error, not an empty page.
+        let offset = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
+            None => 0,
+            Some(token) => match state::decode_page_token(token) {
+                Some(offset) => offset,
+                None => {
+                    return Err(bad_request(state::Invalid::new(
+                        "nextToken",
+                        state::invalid_page_token_message(token),
+                    )));
+                }
+            },
+        };
+
+        let store = service_state.lock();
+        let ordered = store.configurations_in_order();
+        let page = state::page_of(ordered.len(), input.max_results, offset);
+        let configurations = state::page_slice(&ordered, &page)
+            .iter()
+            .map(|configuration| {
+                let latest = configuration.latest_revision();
+                Configuration {
+                    arn: configuration.configuration_arn.clone(),
+                    authentication_strategy: configuration.authentication_strategy.clone(),
+                    created: configuration.created_timestamp(),
+                    description: latest.description.clone(),
+                    engine_type: configuration.engine_type.clone(),
+                    engine_version: configuration.engine_version.clone(),
+                    id: configuration.configuration_id.clone(),
+                    latest_revision: ConfigurationRevision {
+                        created: ::aws_smithy_types::DateTime::from(latest.created),
+                        description: Some(latest.description),
+                        revision: latest.revision,
+                    },
+                    name: configuration.name.clone(),
+                    tags: configuration.optional_tags(),
+                }
+            })
+            .collect();
+
+        Ok(ListConfigurationsOutput {
+            configurations: Some(configurations),
+            // The page size this answer was built with: the one the request asked
+            // for, else the default every listing of this service uses.
+            max_results: Some(
+                input
+                    .max_results
+                    .unwrap_or(state::DEFAULT_MAX_RESULTS as i32),
+            ),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// Lift a refused value into this operation's modelled `BadRequestException` (HTTP 400).
+fn bad_request(invalid: state::Invalid) -> ListConfigurationsError {
+    ListConfigurationsErrorModeled::BadRequestException(BadRequestException {
+        error_attribute: invalid.attribute,
+        message: Some(invalid.message),
+        resource_share_errors: None,
+    })
+    .into()
 }

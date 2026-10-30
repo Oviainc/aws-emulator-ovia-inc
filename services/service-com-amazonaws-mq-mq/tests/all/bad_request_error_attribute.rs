@@ -47,6 +47,7 @@ use service_com_amazonaws_mq_mq::state::{
 };
 
 use crate::broker_lifecycle::{create_body, string_at, Mq};
+use crate::configuration_name::configuration_body;
 
 /// One input member whose modelled value set this service refuses itself: the
 /// operation that carries it, the member's `jsonName`, and the set the model declares.
@@ -57,8 +58,7 @@ struct EnumMember {
 }
 
 /// Every enum-typed input member of the operations a caller can reach today —
-/// `CreateBroker` (implemented) and `CreateConfiguration` (whose remaining behaviour is
-/// still scaffolded, but whose input is refused like the real service's).
+/// `CreateBroker` and `CreateConfiguration`.
 const ENUM_MEMBERS: &[EnumMember] = &[
     EnumMember {
         operation: "CreateBroker",
@@ -96,11 +96,6 @@ const ENUM_MEMBERS: &[EnumMember] = &[
         allowed: AUTHENTICATION_STRATEGY_VALUES,
     },
 ];
-
-/// A valid `CreateConfiguration` body: the two members the model marks required.
-fn configuration_body(name: &str) -> Value {
-    json!({"name": name, "engineType": ENGINE_TYPE_VALUES[0]})
-}
 
 /// The request `operation` is refused for, with `attribute` set to `value`.
 fn body_with(operation: &str, name: &str, attribute: &str, value: &str) -> (&'static str, Value) {
@@ -196,9 +191,8 @@ async fn a_value_outside_a_modelled_enum_is_refused_naming_the_member() {
     );
 }
 
-/// A value INSIDE every modelled set is not refused by these checks: `CreateBroker`
-/// stores the broker, and `CreateConfiguration` still answers 501 because the rest of
-/// that operation is scaffolded — the input check did not become an implementation.
+/// A value INSIDE every modelled set is not refused by these checks: the resource is
+/// created and reads back — the input check did not become a refusal of every request.
 #[tokio::test]
 async fn a_value_inside_every_modelled_enum_is_accepted() {
     let mq = Mq::new("us-east-1");
@@ -237,19 +231,26 @@ async fn a_value_inside_every_modelled_enum_is_accepted() {
         }
     }
 
-    for engine_type in ENGINE_TYPE_VALUES {
+    for (index, engine_type) in ENGINE_TYPE_VALUES.iter().enumerate() {
         for strategy in AUTHENTICATION_STRATEGY_VALUES {
             let case = format!("CreateConfiguration {engine_type}/{strategy}");
-            let mut body = configuration_body("valid-configuration");
+            // A configuration name is unique per account, so each row names its own.
+            let name = format!("valid-configuration-{index}-{strategy}");
+            let mut body = configuration_body(&name);
             body["engineType"] = json!(engine_type);
             body["authenticationStrategy"] = json!(strategy);
-            let (status, _code, answer) = mq
+            let (status, code, answer) = mq
                 .call_with_code("POST", "/v1/configurations", Some(body))
                 .await;
             assert_eq!(
-                status, 501,
-                "case {case:?}: a valid request must still report the operation as \
-                 unimplemented, got {status} {answer:?}"
+                status, 200,
+                "case {case:?}: a valid request must be served, got {status} {code:?} \
+                 {answer:?}"
+            );
+            assert_eq!(
+                string_at(&answer, "/name"),
+                name,
+                "case {case:?}: expected the name sent back, got {answer:?}"
             );
         }
     }

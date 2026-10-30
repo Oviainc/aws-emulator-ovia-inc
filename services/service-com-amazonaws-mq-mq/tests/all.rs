@@ -17,5 +17,11 @@ mod bad_request_error_attribute;
 mod broker_instance_options;
 #[path = "all/broker_lifecycle.rs"]
 mod broker_lifecycle;
+#[path = "all/configuration_lifecycle.rs"]
+mod configuration_lifecycle;
+#[path = "all/configuration_name.rs"]
+mod configuration_name;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

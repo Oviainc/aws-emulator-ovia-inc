@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a configuration from the engine's default settings and persists it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request Amazon MQ refuses on the input alone — a `name` outside the character set
+//! or the length the member documents, an `engineType` or `authenticationStrategy`
+//! outside the enum the model declares — is answered with the modelled
+//! `BadRequestException` (HTTP 400) naming that member in `errorAttribute`, and nothing
+//! is stored. A `name` another configuration of this account already carries is refused
+//! with the modelled `ConflictException` (HTTP 409). A create past the per-Region
+//! configuration quota is refused too — that bound is the emulator's own, set at the
+//! quota the Developer Guide publishes, so one caller cannot grow the store without end.
 //!
-//! One thing this operation DOES assert: a request whose `engineType` or
-//! `authenticationStrategy` falls outside the enum the model declares is refused with
-//! Amazon MQ's modelled `BadRequestException` (HTTP 400) naming that member in
-//! `errorAttribute` — the refusal the real service makes, which does not depend on the
-//! unwritten behaviour. Everything a VALID request would need still answers 501.
+//! What a served request mints is read back by `DescribeConfiguration` and reported by
+//! `ListConfigurations`; its `Data` and later revisions belong to the operations that
+//! own them (`UpdateConfiguration`, `DescribeConfigurationRevision`), which are still
+//! scaffolded.
 //!
 //! ## Shape of an operation
 //!
@@ -170,19 +170,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (ctx, &self.engine);
+        let Some(service_state) = state::service_state(&*self.engine) else {
+            return Err(CreateConfigurationErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the service state store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
 
-        // A request Amazon MQ refuses is refused HERE, whatever this operation
-        // still cannot do: the refusal does not depend on the behaviour nobody
-        // has written yet, and answering 501 for it would tell a caller that a
-        // request the real service rejects might otherwise have worked. Both
-        // members below are modelled enums whose boundary check the input
-        // schema skips (`skip_validation` in
+        // A request Amazon MQ refuses on the input alone is refused first, before
+        // anything is minted or stored. Both enum-typed members below are ones
+        // whose boundary check the input schema skips (`skip_validation` in
         // `super::types::create_configuration_types`), so this is where a value
-        // outside the declared set becomes Amazon MQ's own
-        // `BadRequestException` with `errorAttribute` naming the member.
+        // outside the declared set becomes Amazon MQ's own `BadRequestException`
+        // with `errorAttribute` naming the member; `Name` carries its own
+        // documented value rule (character set and length).
+        state::validate_configuration_name(&input.name).map_err(bad_request)?;
         state::validate_enum("engineType", &input.engine_type, ENGINE_TYPE_VALUES)
             .map_err(bad_request)?;
         if let Some(strategy) = &input.authentication_strategy {
@@ -193,14 +198,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .map_err(bad_request)?;
         }
+        if let Some(tags) = &input.tags {
+            state::validate_list_size("tags", tags.len(), 0, state::MAX_TAGS)
+                .map_err(bad_request)?;
+        }
 
-        // Everything past input validation — minting the configuration, its
-        // first revision and its default engine data — is still unwritten, so a
-        // VALID request keeps answering 501. Implement `CreateConfiguration`
-        // here, then delete the SCAFFOLDED marker at the top of this file.
-        // Return modeled failures as
-        // `Err(CreateConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfiguration"))
+        // `EngineVersion` "Defaults to the latest available version for the
+        // specified broker engine type"; a version the request named is stored as
+        // sent, exactly as `CreateBroker` stores one.
+        let engine_version = input
+            .engine_version
+            .clone()
+            .filter(|version| !version.is_empty())
+            .unwrap_or_else(|| state::latest_engine_version(&input.engine_type).to_string());
+        let authentication_strategy = input
+            .authentication_strategy
+            .clone()
+            .unwrap_or_else(|| state::DEFAULT_AUTHENTICATION_STRATEGY.to_string());
+        let region = state::request_region(ctx.parts());
+
+        let mut store = service_state.lock();
+
+        // A configuration name is unique within an account: the corpus holds a
+        // recorded check for exactly that refusal
+        // (`mq.create-configuration-duplicate-name-conflict-rejected`), and
+        // `ConflictException` is the error this operation models for a request
+        // that conflicts with what the account already holds. So a second create
+        // under a taken name is refused rather than minting a second
+        // configuration a caller cannot tell from the first.
+        //
+        // No recorded response covers the SENTENCE for this refusal, so it is
+        // worded the way this service words its other conflicts (see
+        // `CreateBroker`'s duplicate-broker-name refusal), naming the member and
+        // the configuration that already holds the name — both read from the
+        // request and from stored state.
+        if let Some(existing) = store.configuration_by_name(&input.name) {
+            return Err(CreateConfigurationErrorModeled::ConflictException(
+                ConflictException {
+                    error_attribute: Some("name".to_string()),
+                    message: Some(format!(
+                        "a configuration named {:?} already exists in this account as {:?}",
+                        input.name, existing.configuration_id
+                    )),
+                    resource_share_errors: None,
+                },
+            )
+            .into());
+        }
+
+        // The emulator's own bound on how far this store may grow, set at the
+        // per-Region quota the Developer Guide publishes ([`state::MAX_CONFIGURATIONS`]):
+        // a create past it is refused rather than persisted, exactly as
+        // `CreateBroker` bounds the broker map. Checked before anything is
+        // stored, and with no `errorAttribute`, because no member of the request
+        // is at fault — the account's configuration count is.
+        if store.configurations.len() >= state::MAX_CONFIGURATIONS {
+            return Err(bad_request(state::Invalid {
+                attribute: None,
+                message: format!(
+                    "this account already holds its quota of {} configurations in this \
+                     Region; delete a configuration before creating another",
+                    state::MAX_CONFIGURATIONS
+                ),
+            }));
+        }
+
+        let created = ::std::time::SystemTime::now();
+        // The id is MINTED by the store, which owns the mint sequence that makes
+        // it unique; the ARN is then built around it.
+        let configuration_id = store.mint_configuration_id(created, &input.name);
+        let configuration_arn = ::engine::emulator_arn(
+            ctx.identity().signing_name(),
+            &region,
+            &format!("configuration:{configuration_id}"),
+        );
+        // A created configuration holds the engine's default settings, so its
+        // first revision is the one Amazon MQ generates, numbered from one.
+        let first_revision = state::ConfigurationRevisionRecord {
+            revision: state::FIRST_CONFIGURATION_REVISION,
+            created,
+            description: state::default_configuration_description(
+                &input.name,
+                &input.engine_type,
+                &engine_version,
+            ),
+        };
+        let configuration = state::ConfigurationRecord {
+            configuration_id: configuration_id.clone(),
+            configuration_arn: configuration_arn.clone(),
+            name: input.name.clone(),
+            engine_type: input.engine_type.clone(),
+            engine_version,
+            authentication_strategy: authentication_strategy.clone(),
+            created,
+            revisions: vec![first_revision.clone()],
+            tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
+        };
+        store
+            .configurations
+            .insert(configuration_id.clone(), configuration);
+
+        Ok(CreateConfigurationOutput {
+            arn: Some(configuration_arn),
+            authentication_strategy: Some(authentication_strategy),
+            created: Some(::aws_smithy_types::DateTime::from(created)),
+            id: Some(configuration_id),
+            latest_revision: Some(ConfigurationRevision {
+                created: ::aws_smithy_types::DateTime::from(first_revision.created),
+                description: Some(first_revision.description),
+                revision: first_revision.revision,
+            }),
+            name: Some(input.name),
+        })
     }
 }
 

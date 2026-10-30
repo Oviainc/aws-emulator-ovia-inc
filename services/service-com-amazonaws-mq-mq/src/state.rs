@@ -117,8 +117,55 @@ pub const MAX_SECURITY_GROUPS: usize = 125;
 pub const MAX_SUBNET_IDS: usize = 1_000;
 
 /// AWS's tags-per-resource limit (50), identical for every taggable resource,
-/// and the bound on one broker record's `tags` map.
+/// and the bound on one taggable record's `tags` map.
 pub const MAX_TAGS: usize = 50;
+
+/// Amazon MQ's documented per-Region, per-account configuration quota (Amazon MQ
+/// Developer Guide, "Quotas in Amazon MQ": 50 configurations per Region), and —
+/// like [`MAX_BROKERS`] — the bound that keeps the store from growing with the
+/// number of creates a caller makes.
+pub const MAX_CONFIGURATIONS: usize = 50;
+
+/// The engine versions Amazon MQ publishes for ActiveMQ, oldest first, so the
+/// last entry is the latest available one. From the Developer Guide's ActiveMQ
+/// version-support page; `DescribeBrokerInstanceOptions` reports the same list,
+/// and `CreateConfiguration` defaults `EngineVersion` to its last entry.
+pub const ACTIVEMQ_ENGINE_VERSIONS: &[&str] = &["5.15.16", "5.16.7", "5.17.6", "5.18.4"];
+
+/// The engine versions Amazon MQ publishes for RabbitMQ, oldest first — see
+/// [`ACTIVEMQ_ENGINE_VERSIONS`].
+pub const RABBITMQ_ENGINE_VERSIONS: &[&str] = &["3.11.28", "3.12.13", "3.13.7"];
+
+/// The engine versions published for `engine_type`, or none for a value outside
+/// the model's `EngineType` set — a handler refuses such a value before it gets
+/// here, and attributing one engine's versions to another would be worse than
+/// reporting none.
+pub fn published_engine_versions(engine_type: &str) -> &'static [&'static str] {
+    match engine_type {
+        ENGINE_TYPE_ACTIVEMQ => ACTIVEMQ_ENGINE_VERSIONS,
+        ENGINE_TYPE_RABBITMQ => RABBITMQ_ENGINE_VERSIONS,
+        _ => &[],
+    }
+}
+
+/// The latest published engine version of `engine_type` — what a create that
+/// names no `EngineVersion` gets: "Defaults to the latest available version for
+/// the specified broker engine type".
+pub fn latest_engine_version(engine_type: &str) -> &'static str {
+    published_engine_versions(engine_type)
+        .last()
+        .copied()
+        .unwrap_or_default()
+}
+
+/// The shortest `Name` a configuration may carry — from the member's own
+/// documentation: "This value must be 1-150 characters long"
+/// (`smithy_query(query="doc", shape="CreateConfigurationRequest", member="Name")`).
+pub const MIN_CONFIGURATION_NAME_LEN: usize = 1;
+
+/// The longest `Name` a configuration may carry — see
+/// [`MIN_CONFIGURATION_NAME_LEN`] for the sentence both bounds come from.
+pub const MAX_CONFIGURATION_NAME_LEN: usize = 150;
 
 /// A broker user. The password is held so the record is complete, and is never
 /// put in a response: no modelled output member carries it.
@@ -240,17 +287,97 @@ impl Broker {
 
     /// `Tags`, as the modelled map, or `None` when the broker carries none.
     pub fn optional_tags(&self) -> Option<std::collections::HashMap<String, String>> {
-        if self.tags.is_empty() {
-            None
-        } else {
-            Some(
-                self.tags
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            )
-        }
+        optional_tag_map(&self.tags)
     }
+}
+
+/// A stored tag map as the modelled `__mapOf__string`, or `None` when the
+/// resource carries no tag — restJson1 omits a `None` member rather than
+/// emitting an empty object for tags nobody set.
+///
+/// A free function because every operation that reports a resource's tags goes
+/// through it, whichever record holds them.
+pub fn optional_tag_map(
+    tags: &BTreeMap<String, String>,
+) -> Option<std::collections::HashMap<String, String>> {
+    if tags.is_empty() {
+        None
+    } else {
+        Some(tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
+}
+
+/// One revision of a configuration: the revision number, when it was made, and
+/// its description. A configuration holds its revisions oldest first, so the
+/// last one is its latest.
+#[derive(Debug, Clone)]
+pub struct ConfigurationRevisionRecord {
+    pub revision: i32,
+    pub created: SystemTime,
+    pub description: String,
+}
+
+/// A configuration, as `CreateConfiguration` persisted it. Named `*Record` so it
+/// cannot be confused with the modelled `Configuration` shape a handler
+/// serializes it into.
+#[derive(Debug, Clone)]
+pub struct ConfigurationRecord {
+    pub configuration_id: String,
+    pub configuration_arn: String,
+    pub name: String,
+    pub engine_type: String,
+    pub engine_version: String,
+    pub authentication_strategy: String,
+    pub created: SystemTime,
+    /// Every revision, oldest first; a created configuration starts with one.
+    pub revisions: Vec<ConfigurationRevisionRecord>,
+    pub tags: BTreeMap<String, String>,
+}
+
+/// The revision number a configuration's first revision carries: Amazon MQ
+/// numbers revisions from one, and an update makes the next one.
+pub const FIRST_CONFIGURATION_REVISION: i32 = 1;
+
+impl ConfigurationRecord {
+    /// This configuration's latest revision — the last one made. A configuration
+    /// always has one, so a record that somehow holds none reports its first.
+    pub fn latest_revision(&self) -> ConfigurationRevisionRecord {
+        self.revisions
+            .last()
+            .cloned()
+            .unwrap_or_else(|| ConfigurationRevisionRecord {
+                revision: FIRST_CONFIGURATION_REVISION,
+                created: self.created,
+                description: default_configuration_description(
+                    &self.name,
+                    &self.engine_type,
+                    &self.engine_version,
+                ),
+            })
+    }
+
+    /// `Created`, in the modelled `__timestampIso8601` type.
+    pub fn created_timestamp(&self) -> ::aws_smithy_types::DateTime {
+        ::aws_smithy_types::DateTime::from(self.created)
+    }
+
+    /// `Tags`, as the modelled map, or `None` when the configuration carries none.
+    pub fn optional_tags(&self) -> Option<std::collections::HashMap<String, String>> {
+        optional_tag_map(&self.tags)
+    }
+}
+
+/// The description Amazon MQ gives the revision it generates for a configuration
+/// nobody described: the configuration is created from the engine's default
+/// settings (`CreateConfiguration`: "Amazon MQ uses the default configuration
+/// (the engine type and version)"), so the sentence is built from the stored
+/// record — never from a request member this operation does not carry.
+pub fn default_configuration_description(
+    name: &str,
+    engine_type: &str,
+    engine_version: &str,
+) -> String {
+    format!("Auto-generated default for {name} on {engine_type} {engine_version}")
 }
 
 /// Per-service state for com-amazonaws-mq-mq. A handler reaches it through [`service_state`].
@@ -261,6 +388,11 @@ pub struct ComAmazonawsMqMqState {
     /// The strictly increasing sequence the next minted `BrokerId` is derived
     /// from, so two creates in the same instant cannot mint one id.
     pub next_broker_sequence: u64,
+    /// Every configuration that exists, keyed by its minted `ConfigurationId`.
+    pub configurations: BTreeMap<String, ConfigurationRecord>,
+    /// The mint sequence behind the next `ConfigurationId` — see
+    /// [`Self::next_broker_sequence`].
+    pub next_configuration_sequence: u64,
 }
 
 impl ComAmazonawsMqMqState {
@@ -289,28 +421,82 @@ impl ComAmazonawsMqMqState {
         loop {
             let sequence = self.next_broker_sequence;
             self.next_broker_sequence = sequence.wrapping_add(1);
-            let nanos = created
-                .duration_since(::std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let mut digest = <::sha2::Sha256 as ::sha2::Digest>::new();
-            ::sha2::Digest::update(&mut digest, sequence.to_be_bytes());
-            ::sha2::Digest::update(&mut digest, nanos.to_be_bytes());
-            ::sha2::Digest::update(&mut digest, broker_name.as_bytes());
-            let bytes = ::sha2::Digest::finalize(digest);
-            let hex: String = bytes[..16].iter().map(|b| format!("{b:02x}")).collect();
-            let candidate = format!(
-                "b-{}-{}-{}-{}-{}",
-                &hex[0..8],
-                &hex[8..12],
-                &hex[12..16],
-                &hex[16..20],
-                &hex[20..32]
-            );
+            let candidate = mint_resource_id("b", sequence, created, broker_name);
             if !self.brokers.contains_key(&candidate) {
                 return candidate;
             }
         }
+    }
+
+    /// The configuration carrying `name`. Configuration names are unique per
+    /// account, so this scan over the one map is the name index.
+    pub fn configuration_by_name(&self, name: &str) -> Option<&ConfigurationRecord> {
+        self.configurations.values().find(|c| c.name == name)
+    }
+
+    /// Mint the `ConfigurationId` of a configuration created at `created`: `c-`
+    /// and the same minted bits a `BrokerId` carries — see
+    /// [`Self::mint_broker_id`] for where they come from.
+    pub fn mint_configuration_id(&mut self, created: SystemTime, name: &str) -> String {
+        loop {
+            let sequence = self.next_configuration_sequence;
+            self.next_configuration_sequence = sequence.wrapping_add(1);
+            let candidate = mint_resource_id("c", sequence, created, name);
+            if !self.configurations.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// Every configuration in a stable order — the ordering guarantee
+    /// [`Self::brokers_in_order`] documents, over the configuration map.
+    pub fn configurations_in_order(&self) -> Vec<&ConfigurationRecord> {
+        let mut all: Vec<&ConfigurationRecord> = self.configurations.values().collect();
+        all.sort_by(|a, b| {
+            a.created
+                .cmp(&b.created)
+                .then_with(|| a.configuration_id.cmp(&b.configuration_id))
+        });
+        all
+    }
+
+    /// The tag map of the resource `resource_arn` names, or `None` when this
+    /// service holds no resource with that ARN.
+    ///
+    /// Every tag operation resolves its `ResourceArn` through this one lookup (or
+    /// through [`Self::tags_of_mut`]), so reading, adding and removing tags all
+    /// agree on which ARNs name something. The ARN is matched against the one a
+    /// resource was minted with, so an ARN naming another account, Region,
+    /// resource type or id resolves to nothing. A record type that becomes
+    /// taggable later is resolved here too rather than in a handler.
+    pub fn tags_of(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
+        if let Some(broker) = self
+            .brokers
+            .values()
+            .find(|broker| broker.broker_arn == resource_arn)
+        {
+            return Some(&broker.tags);
+        }
+        self.configurations
+            .values()
+            .find(|configuration| configuration.configuration_arn == resource_arn)
+            .map(|configuration| &configuration.tags)
+    }
+
+    /// The tag map of the resource `resource_arn` names, for an operation that
+    /// changes it. See [`Self::tags_of`] for how an ARN is resolved.
+    pub fn tags_of_mut(&mut self, resource_arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        if let Some(broker) = self
+            .brokers
+            .values_mut()
+            .find(|broker| broker.broker_arn == resource_arn)
+        {
+            return Some(&mut broker.tags);
+        }
+        self.configurations
+            .values_mut()
+            .find(|configuration| configuration.configuration_arn == resource_arn)
+            .map(|configuration| &mut configuration.tags)
     }
 
     /// Every broker in a stable order: by creation instant, then by id, so two
@@ -327,6 +513,35 @@ impl ComAmazonawsMqMqState {
         });
         all
     }
+}
+
+/// Mint the id of a resource created at `created`: `prefix-` followed by 128
+/// bits in the 8-4-4-4-12 grouping Amazon MQ's ids carry.
+///
+/// The bits are a digest of the store's own mint sequence, the creating instant
+/// and the resource's name, so the id is unique within the store (the sequence
+/// alone guarantees that), is not guessable from the request alone, and is
+/// MINTED here rather than taken from any caller-supplied value. Both resource
+/// kinds mint through this one function, so their ids carry the same shape.
+fn mint_resource_id(prefix: &str, sequence: u64, created: SystemTime, name: &str) -> String {
+    let nanos = created
+        .duration_since(::std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut digest = <::sha2::Sha256 as ::sha2::Digest>::new();
+    ::sha2::Digest::update(&mut digest, sequence.to_be_bytes());
+    ::sha2::Digest::update(&mut digest, nanos.to_be_bytes());
+    ::sha2::Digest::update(&mut digest, name.as_bytes());
+    let bytes = ::sha2::Digest::finalize(digest);
+    let hex: String = bytes[..16].iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{prefix}-{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// A list member, or `None` when nothing was stored — restJson1 omits a `None`
@@ -473,6 +688,12 @@ pub fn validate_present(attribute: &str, value: &str) -> Result<(), Invalid> {
     Ok(())
 }
 
+/// The sentence Amazon MQ answers an operation whose `ResourceArn` names a
+/// resource it does not hold with. It is the whole sentence for that failure:
+/// nothing from the request is interpolated, so the ARN that resolved to
+/// nothing — its Region, account and resource id — is not part of it.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
 /// The sentence Amazon MQ answers a `BrokerId` that resolves to no broker
 /// with, on every operation that resolves one. Only the requested id varies, so
 /// the four handlers that look a broker up share this one sentence rather than
@@ -513,6 +734,44 @@ pub fn validate_broker_name(name: &str) -> Result<(), Invalid> {
     Ok(())
 }
 
+/// The character set Amazon MQ documents for a name a caller chooses:
+/// "alphanumeric characters, dashes, periods, underscores, and tildes (- . _ ~)"
+/// — the same set for a configuration `Name`, a `Username` and a group name, so
+/// the three share one predicate and cannot drift apart.
+fn is_name_character(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~')
+}
+
+/// A configuration `Name`'s constraint, as the model documents it: "This value
+/// can contain only alphanumeric characters, dashes, periods, underscores, and
+/// tildes (- . _ ~). This value must be 1-150 characters long."
+///
+/// Amazon MQ states the character-set half with one fixed sentence that
+/// interpolates nothing from the request. No recorded response covers the length
+/// half, so that one is worded the way this service words every other length
+/// refusal (see [`validate_broker_name`]), naming the member and the published
+/// bounds.
+pub fn validate_configuration_name(name: &str) -> Result<(), Invalid> {
+    const ATTRIBUTE: &str = "name";
+    let length = name.chars().count();
+    if !(MIN_CONFIGURATION_NAME_LEN..=MAX_CONFIGURATION_NAME_LEN).contains(&length) {
+        return Err(Invalid::new(
+            ATTRIBUTE,
+            format!(
+                "{ATTRIBUTE} must be {MIN_CONFIGURATION_NAME_LEN}-\
+                 {MAX_CONFIGURATION_NAME_LEN} characters long, got {length} characters"
+            ),
+        ));
+    }
+    if !name.chars().all(is_name_character) {
+        return Err(Invalid::new(
+            ATTRIBUTE,
+            "Make sure your Configuration name only contains valid characters.",
+        ));
+    }
+    Ok(())
+}
+
 /// A user's `Username` constraint, as the model documents it: "can contain only
 /// alphanumeric characters, dashes, periods, underscores, and tildes (- . _ ~).
 /// This value must be 2-100 characters long."
@@ -524,10 +783,7 @@ pub fn validate_username(attribute: &str, username: &str) -> Result<(), Invalid>
             format!("{attribute} must be 2-100 characters long, got {length} characters"),
         ));
     }
-    if let Some(bad) = username
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~')))
-    {
+    if let Some(bad) = username.chars().find(|c| !is_name_character(*c)) {
         return Err(Invalid::new(
             attribute,
             format!(
@@ -728,6 +984,16 @@ pub fn page_of(total: usize, max_results: Option<i32>, offset: usize) -> Page {
         end,
         next_token: (end < total).then(|| encode_page_token(end)),
     }
+}
+
+/// The items a [`Page`] selects out of `items`, through a CHECKED accessor.
+///
+/// The page's bounds come from an offset a request supplied, so the slice is
+/// taken with `get` and falls back to no items: a request can never index past
+/// the end of what this call actually has, whatever offset its token carries.
+/// Every listing of this service pages through this one function.
+pub fn page_slice<'a, T>(items: &'a [T], page: &Page) -> &'a [T] {
+    items.get(page.start..page.end).unwrap_or_default()
 }
 
 /// The region to build an ARN in: the one the caller signed for, else

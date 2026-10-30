@@ -192,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let ordered = store.brokers_in_order();
         let page = state::page_of(ordered.len(), input.max_results, offset);
-        let summaries = ordered[page.start..page.end]
+        let summaries = state::page_slice(&ordered, &page)
             .iter()
             .map(|broker| BrokerSummary {
                 broker_id: Some(broker.broker_id.clone()),

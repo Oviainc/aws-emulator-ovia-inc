@@ -218,7 +218,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let page = state::page_of(options.len(), input.max_results, offset);
         Ok(DescribeBrokerInstanceOptionsOutput {
-            broker_instance_options: Some(options[page.start..page.end].to_vec()),
+            // The page is taken through the checked accessor every listing of this
+            // service pages with, so an offset a token carries can never index
+            // past what THIS call's filters left to report.
+            broker_instance_options: Some(state::page_slice(&options, &page).to_vec()),
             max_results: Some(input.max_results.unwrap_or(DEFAULT_PAGE_SIZE)),
             next_token: page.next_token,
         })
@@ -253,14 +256,17 @@ struct PublishedEngineOptions {
     engine_type: &'static str,
     /// Smallest first, as the instance-type table lists them.
     host_instance_types: &'static [&'static str],
-    /// The engine versions a broker on this engine can be created with.
+    /// The engine versions a broker on this engine can be created with, from the
+    /// service's own published lists.
     engine_versions: &'static [&'static str],
 }
 
 /// Amazon MQ's published instance-option catalog, per engine — see
-/// [`PublishedEngineOptions`] for where each column comes from. The storage types and
-/// deployment modes of one entry are not a column here: they follow from the engine and
-/// the instance type ([`offers_storage_type`], [`supports_deployment_mode`]).
+/// [`PublishedEngineOptions`] for where each column comes from. The engine versions are
+/// the service's own published lists ([`state::published_engine_versions`]), shared with
+/// the operations that default an `EngineVersion` to the latest of them. The storage
+/// types and deployment modes of one entry are not a column here: they follow from the
+/// engine and the instance type ([`offers_storage_type`], [`supports_deployment_mode`]).
 const PUBLISHED_ENGINE_OPTIONS: &[PublishedEngineOptions] = &[
     PublishedEngineOptions {
         engine_type: state::ENGINE_TYPE_ACTIVEMQ,
@@ -272,7 +278,7 @@ const PUBLISHED_ENGINE_OPTIONS: &[PublishedEngineOptions] = &[
             "mq.m5.2xlarge",
             "mq.m5.4xlarge",
         ],
-        engine_versions: &["5.15.16", "5.16.7", "5.17.6", "5.18.4"],
+        engine_versions: state::ACTIVEMQ_ENGINE_VERSIONS,
     },
     PublishedEngineOptions {
         engine_type: state::ENGINE_TYPE_RABBITMQ,
@@ -283,7 +289,7 @@ const PUBLISHED_ENGINE_OPTIONS: &[PublishedEngineOptions] = &[
             "mq.m5.2xlarge",
             "mq.m5.4xlarge",
         ],
-        engine_versions: &["3.11.28", "3.12.13", "3.13.7"],
+        engine_versions: state::RABBITMQ_ENGINE_VERSIONS,
     },
 ];
 
