@@ -50,19 +50,13 @@ const OUTPUT_FORMATS: [&str; 5] = ["json", "parquet", "plain", "raw", "w3c"];
 const TRACE_LOG_TYPE: &str = "TRACES";
 
 /// What the operation must publish for a delivery that can be written in a delimited format,
-/// and for one that writes S3 objects — spelled out here rather than imported, so an edit to
-/// either published set is caught instead of agreeing with itself.
-const FIELD_DELIMITERS: [&str; 5] = [",", "\t", "|", ";", " "];
-const SUFFIX_PATH_FIELDS: [&str; 8] = [
-    "account-id",
-    "region",
-    "service",
-    "log-type",
-    "yyyy",
-    "MM",
-    "dd",
-    "HH",
-];
+/// and the fields every S3 delivery's suffix path may use whatever the log source — the
+/// account and Region it is made in first, the time partition of the object last, with the
+/// variables naming the sending resource between them. Spelled out here rather than imported,
+/// so an edit to either published set is caught instead of agreeing with itself.
+const FIELD_DELIMITERS: [&str; 3] = ["\t", " ", ","];
+const SUFFIX_PATH_ACCOUNT_FIELDS: [&str; 2] = ["accountid", "region"];
+const SUFFIX_PATH_TIME_FIELDS: [&str; 4] = ["yyyy", "MM", "dd", "HH"];
 
 /// The IAM action, without its service prefix, that a template names as the permission a
 /// caller needs "to be able to successfully create a delivery source on the desired resource
@@ -75,12 +69,14 @@ const VENDED_LOGS_DELIVERY_ACTION: &str = "AllowVendedLogDeliveryForResource";
 /// `service|logType|resourceType|deliveryDestinationType`: a CloudFront access log delivered
 /// to S3, a WorkMail access-control log delivered to a log group, an Application Load
 /// Balancer access log delivered to Firehose, and an AgentCore trace delivered to X-Ray.
-const CATALOGUE_TEMPLATES: usize = 58;
-const PINNED_TEMPLATES: [&str; 4] = [
+const CATALOGUE_TEMPLATES: usize = 143;
+const PINNED_TEMPLATES: [&str; 6] = [
     "cloudfront|ACCESS_LOGS|distribution|S3",
     "workmail|ACCESS_CONTROL_LOGS|organization|CWL",
     "elasticloadbalancing|ALB_ACCESS_LOGS|loadbalancer|FH",
     "bedrock-agentcore|TRACES|runtime|XRAY",
+    "apigateway|EXECUTION_LOGS|stages|S3",
+    "eks|AUTO_MODE_LOAD_BALANCING_LOGS|cluster|FH",
 ];
 
 /// The published bounds of the members a request names: `limit` is `DescribeLimit`
@@ -131,8 +127,9 @@ fn catalogue() -> Vec<(String, String)> {
     let mut templates: Vec<(String, String)> = Vec::new();
     for source in CONFIGURATION_TEMPLATE_SOURCES {
         for log_type in source.log_types {
+            let log_type = log_type.log_type;
             for destination_type in DESTINATION_TYPES {
-                if (destination_type == TRACE_DESTINATION_TYPE) != (*log_type == TRACE_LOG_TYPE) {
+                if (destination_type == TRACE_DESTINATION_TYPE) != (log_type == TRACE_LOG_TYPE) {
                     continue;
                 }
                 templates.push((
@@ -140,7 +137,7 @@ fn catalogue() -> Vec<(String, String)> {
                         "{}|{log_type}|{}|{destination_type}",
                         source.service, source.resource_type
                     ),
-                    (*log_type).to_string(),
+                    log_type.to_string(),
                 ));
             }
         }
@@ -474,14 +471,27 @@ async fn every_template_derives_its_allowed_values_from_its_destination_type() {
             "case {case}: suffix path fields are reported exactly for an S3 destination, got {suffix_fields:?}"
         );
         if let (Some(s3), Some(suffix_fields)) = (s3, suffix_fields) {
-            assert_eq!(
-                suffix_fields.as_slice(),
-                SUFFIX_PATH_FIELDS
-                    .iter()
-                    .map(|field| (*field).to_string())
-                    .collect::<Vec<String>>()
-                    .as_slice(),
-                "case {case}: expected the published suffix path fields {SUFFIX_PATH_FIELDS:?}, got {suffix_fields:?}"
+            assert!(
+                suffix_fields.starts_with(
+                    &SUFFIX_PATH_ACCOUNT_FIELDS
+                        .iter()
+                        .map(|field| (*field).to_string())
+                        .collect::<Vec<String>>()
+                ),
+                "case {case}: the published suffix path fields open with {SUFFIX_PATH_ACCOUNT_FIELDS:?}, got {suffix_fields:?}"
+            );
+            assert!(
+                suffix_fields.ends_with(
+                    &SUFFIX_PATH_TIME_FIELDS
+                        .iter()
+                        .map(|field| (*field).to_string())
+                        .collect::<Vec<String>>()
+                ),
+                "case {case}: the published suffix path fields close with {SUFFIX_PATH_TIME_FIELDS:?}, got {suffix_fields:?}"
+            );
+            assert!(
+                suffix_fields.len() > SUFFIX_PATH_ACCOUNT_FIELDS.len() + SUFFIX_PATH_TIME_FIELDS.len(),
+                "case {case}: the published suffix path fields name the sending resource too, got {suffix_fields:?}"
             );
             let suffix_path = s3
                 .get("suffixPath")

@@ -199,3 +199,5 @@ mod syslog_configurations;
 mod transformers;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;
+#[path = "all/vended_log_template_schemas.rs"]
+mod vended_log_template_schemas;
