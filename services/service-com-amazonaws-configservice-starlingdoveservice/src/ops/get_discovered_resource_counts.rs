@@ -116,36 +116,6 @@ use super::types::*;
 // `GetDiscoveredResourceCountsError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-configservice-starlingdoveservice.json");
 
-/// The separator inside this operation's page token. A resource type name is made of
-/// alphanumeric segments joined by `::`, so it can never carry this byte and the split
-/// is unambiguous.
-const RESOURCE_COUNT_TOKEN_SEPARATOR: char = '|';
-
-/// Encode the place a page resumes at — the number of resources and the resource type
-/// of the first entry it should report — as an opaque `NextToken`, with the base64
-/// codec [`crate::state::encode_page_token`] carries.
-///
-/// The whole sort key is in the token, not an offset, so a page resumes at the same
-/// place even when resources are recorded or deleted between pages.
-fn encode_resource_count_token(count: i64, resource_type: &str) -> String {
-    crate::state::encode_page_token(&format!(
-        "{count}{RESOURCE_COUNT_TOKEN_SEPARATOR}{resource_type}"
-    ))
-}
-
-/// The count and resource type a `NextToken` resumes at, or `None` when the token is
-/// not one [`encode_resource_count_token`] produced: a count no inventory can hold is
-/// not one of ours either.
-fn decode_resource_count_token(token: &str) -> Option<(i64, String)> {
-    let decoded = crate::state::decode_page_token(token)?;
-    let (count, resource_type) = decoded.split_once(RESOURCE_COUNT_TOKEN_SEPARATOR)?;
-    if resource_type.is_empty() {
-        return None;
-    }
-    let count: i64 = count.parse().ok()?;
-    (count >= 0).then_some((count, resource_type.to_string()))
-}
-
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `GetDiscoveredResourceCountsError` alias below. An operation that models no errors
@@ -245,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token is opaque: anything this operation did not issue is malformed.
         let resume_at = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match decode_resource_count_token(token) {
+            Some(token) => match crate::state::decode_grouped_count_token(token) {
                 Some(resume_at) => Some(resume_at),
                 None => {
                     return Err(
@@ -301,7 +271,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             if resource_counts.len() == page_size {
-                next_token = Some(encode_resource_count_token(*count, resource_type));
+                next_token =
+                    Some(crate::state::encode_grouped_count_token(*count, resource_type));
                 break;
             }
             resource_counts.push(ResourceCount {

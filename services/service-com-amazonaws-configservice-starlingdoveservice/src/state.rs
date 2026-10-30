@@ -389,6 +389,19 @@ pub const COMPLIANCE_SUMMARY_GROUP_BY_ACCOUNT_ID: &str = "ACCOUNT_ID";
 /// See [`COMPLIANCE_SUMMARY_GROUP_BY_ACCOUNT_ID`].
 pub const COMPLIANCE_SUMMARY_GROUP_BY_AWS_REGION: &str = "AWS_REGION";
 
+/// `ResourceCountGroupKey` values
+/// (`com.amazonaws.configservice#ResourceCountGroupKey`), which are the keys a grouped
+/// aggregate resource count may be grouped by, and so what
+/// `GroupedResourceCount$GroupName` carries ("The name of the group that can be region,
+/// account ID, or resource type"). `ACCOUNT_ID` and `AWS_REGION` are spelled the same
+/// as in [`COMPLIANCE_SUMMARY_GROUP_BY_ACCOUNT_ID`], but they belong to this enum and
+/// are named for it.
+pub const RESOURCE_COUNT_GROUP_BY_RESOURCE_TYPE: &str = "RESOURCE_TYPE";
+/// See [`RESOURCE_COUNT_GROUP_BY_RESOURCE_TYPE`].
+pub const RESOURCE_COUNT_GROUP_BY_ACCOUNT_ID: &str = "ACCOUNT_ID";
+/// See [`RESOURCE_COUNT_GROUP_BY_RESOURCE_TYPE`].
+pub const RESOURCE_COUNT_GROUP_BY_AWS_REGION: &str = "AWS_REGION";
+
 /// The largest `Limit` a grouped aggregate read may ask for, and the page size it
 /// serves a request that asks for none (`GroupByAPILimit`, `@range(min: 0, max: 1000)`;
 /// `GetAggregateConfigRuleComplianceSummaryRequest$Limit`: "The maximum number of
@@ -5213,6 +5226,37 @@ pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "The nextToken provided is invalid"
 pub fn decode_page_token(token: &str) -> Option<String> {
     let bytes = ::aws_smithy_types::base64::decode(token).ok()?;
     String::from_utf8(bytes).ok()
+}
+
+/// The separator inside the page token of a read that reports COUNTS per group, which
+/// orders its groups by the count before the group's name. Neither a resource type
+/// (alphanumeric segments joined by `::`), an account id (twelve digits) nor a Region
+/// name can carry this byte, so the split is unambiguous.
+const GROUPED_COUNT_TOKEN_SEPARATOR: char = '|';
+
+/// Encode the place a page of per-group counts resumes at — the count and the group
+/// name of the first group it should report — as an opaque `NextToken`, with the codec
+/// [`encode_page_token`] carries.
+///
+/// The whole sort key is in the token rather than an offset, so a page resumes at the
+/// same place even when resources are recorded or deleted between pages.
+pub fn encode_grouped_count_token(count: i64, group_name: &str) -> String {
+    encode_page_token(&format!(
+        "{count}{GROUPED_COUNT_TOKEN_SEPARATOR}{group_name}"
+    ))
+}
+
+/// The count and group name a `NextToken` resumes at, or `None` when the token is not
+/// one [`encode_grouped_count_token`] produced: a count no inventory can hold is not
+/// one of ours either.
+pub fn decode_grouped_count_token(token: &str) -> Option<(i64, String)> {
+    let decoded = decode_page_token(token)?;
+    let (count, group_name) = decoded.split_once(GROUPED_COUNT_TOKEN_SEPARATOR)?;
+    if group_name.is_empty() {
+        return None;
+    }
+    let count: i64 = count.parse().ok()?;
+    (count >= 0).then_some((count, group_name.to_string()))
 }
 
 /// The `detail` of the `Config Rules Compliance Change` event for one verdict change.

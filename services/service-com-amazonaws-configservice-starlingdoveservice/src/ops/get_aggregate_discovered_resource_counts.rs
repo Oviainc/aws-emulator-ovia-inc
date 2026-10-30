@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAggregateDiscoveredResourceCounts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAggregateDiscoveredResourceCounts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The AGGREGATOR's view of HOW MANY resources the discovered-resource inventory holds,
+//! grouped by the key the request names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAggregateDiscoveredResourceCounts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it counts is the SAME inventory the aggregate discovered-resource listing
+//! projects — the one a running configuration recorder writes — narrowed to the sources
+//! the aggregator's scope takes in and to whatever the request's `Filters` ask for. This
+//! store stands for one account in one Region, so the only source it can count is that
+//! account in the Region the request is signed for, and a grouping by account or by
+//! Region therefore resolves to at most that one group.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +108,15 @@ use super::types::*;
 // `GetAggregateDiscoveredResourceCountsError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-configservice-starlingdoveservice.json");
 
+/// The value a `ResourceCountFilters` member narrows the counts to, or `None` when the
+/// request states no value for it: a member a request leaves out, and one it sends
+/// empty, narrow nothing.
+fn named(filtered: Option<&String>) -> Option<&str> {
+    filtered
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+}
+
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `GetAggregateDiscoveredResourceCountsError` alias below. An operation that models no errors
@@ -173,18 +182,206 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAggregateDiscoveredResourceCounts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAggregateDiscoveredResourceCountsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAggregateDiscoveredResourceCounts"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // `Limit` is the page size, and 0 asks for the default (`Limit`: "The maximum
+        // number of GroupedResourceCount objects returned on each page. The default is
+        // 1000. You cannot specify a number greater than 1000. If you specify 0, Config
+        // uses the default"). The modelled 0..1000 range is refused before this handler
+        // runs; a value outside it reaching here is still the limit error this operation
+        // models, never a page.
+        let max = crate::state::GROUP_BY_API_MAX_LIMIT;
+        let page_size = match usize::try_from(input.limit)
+            .ok()
+            .filter(|limit| *limit <= max)
+        {
+            Some(0) => max,
+            Some(limit) => limit,
+            None => {
+                // Defensive, and unreachable in the assembled emulator: the shared
+                // request validation refuses the modelled 0..1000 range before this
+                // handler runs, so nothing reaches this arm.
+                return Err(
+                    GetAggregateDiscoveredResourceCountsErrorModeled::InvalidLimitException(
+                        InvalidLimitException {
+                            message: Some(format!(
+                                "The specified Limit {} is outside the allowable range of \
+                                 0 to {max}.",
+                                input.limit
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_grouped_count_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        GetAggregateDiscoveredResourceCountsErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // `GroupByKey` is echoed back as "the key passed into the request object", and a
+        // request that names no key gets no groups at all ("If GroupByKey is not
+        // provided, the result will be empty") — the total is still counted.
+        let group_by_key = input
+            .group_by_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .map(str::to_string);
+
+        // This store stands for ONE account in ONE Region, so the Config data it holds
+        // is this account's, in the Region the request is signed for.
+        let account_id = ::emulator_server::emulator_account_id();
+        let region = crate::state::request_region(ctx);
+        let store = state.lock();
+
+        let Some(aggregator) = store
+            .configuration_aggregators
+            .get(&input.configuration_aggregator_name)
+        else {
+            return Err(
+                GetAggregateDiscoveredResourceCountsErrorModeled::NoSuchConfigurationAggregatorException(
+                    NoSuchConfigurationAggregatorException {
+                        message: Some(
+                            crate::state::NO_SUCH_CONFIGURATION_AGGREGATOR_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Nothing of this store is aggregated when its source sits outside the
+        // aggregator's scope, and the counts are the ones "by providing filters", so a
+        // filter naming any other source narrows this store away too.
+        let filters = input.filters.unwrap_or_default();
+        let in_scope = aggregator.aggregates_source(account_id, &region)
+            && named(filters.account_id.as_ref()).is_none_or(|filtered| filtered == account_id)
+            && named(filters.region.as_ref()).is_none_or(|filtered| filtered == region);
+
+        // How many resources of each type the aggregator holds: the resources whose
+        // deletion Config has not recorded ("The API does not return results for deleted
+        // resources"), of the types the aggregator takes in, and of the one type the
+        // request's filter names when it names one.
+        let mut per_type: ::std::collections::BTreeMap<&str, i64> =
+            ::std::collections::BTreeMap::new();
+        if in_scope {
+            for entry in store.discovered_resources.values() {
+                if entry.deleted_at.is_some() {
+                    continue;
+                }
+                if !aggregator.aggregates_resource_type(&entry.resource_type) {
+                    continue;
+                }
+                if named(filters.resource_type.as_ref())
+                    .is_some_and(|filtered| filtered != entry.resource_type)
+                {
+                    continue;
+                }
+                *per_type.entry(entry.resource_type.as_str()).or_default() += 1;
+            }
+        }
+
+        // "The total number of resources that are present in an aggregator with the
+        // filters that you provide" — every counted resource, not just the ones this
+        // page reports, and whatever the request asks them to be grouped by.
+        let total_discovered_resources: i64 = per_type.values().sum();
+
+        // The groups the request asked for. The group key names the identity each group
+        // is named by, and a group exists only where resources were counted for it: this
+        // store's own account and Region each name ONE group, while grouping by resource
+        // type names one group per counted type.
+        let mut groups: Vec<(&str, i64)> = match group_by_key.as_deref() {
+            None => Vec::new(),
+            Some(crate::state::RESOURCE_COUNT_GROUP_BY_RESOURCE_TYPE) => per_type
+                .iter()
+                .map(|(resource_type, count)| (*resource_type, *count))
+                .collect(),
+            Some(crate::state::RESOURCE_COUNT_GROUP_BY_ACCOUNT_ID) => {
+                (total_discovered_resources > 0)
+                    .then_some((account_id, total_discovered_resources))
+                    .into_iter()
+                    .collect()
+            }
+            Some(crate::state::RESOURCE_COUNT_GROUP_BY_AWS_REGION) => {
+                (total_discovered_resources > 0)
+                    .then_some((region.as_str(), total_discovered_resources))
+                    .into_iter()
+                    .collect()
+            }
+            Some(unknown) => {
+                // Defensive, and unreachable over the wire: the modelled enum is refused
+                // before this handler runs. A key this operation cannot group by is a
+                // bad request, never a group.
+                return Err(
+                    GetAggregateDiscoveredResourceCountsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "'{unknown}' is not a valid value for GroupByKey; the valid \
+                                 values are {}, {}, {}.",
+                                crate::state::RESOURCE_COUNT_GROUP_BY_RESOURCE_TYPE,
+                                crate::state::RESOURCE_COUNT_GROUP_BY_ACCOUNT_ID,
+                                crate::state::RESOURCE_COUNT_GROUP_BY_AWS_REGION,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+        // The biggest group is reported first, and the group name decides among groups
+        // holding equally many, so the ordering — and therefore a page token — is total.
+        groups.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+
+        // A token carries that whole sort key, so a page resumes at the first group that
+        // does not sort ahead of it.
+        let sorts_ahead_of_resume = |count: i64, group_name: &str| match resume_at.as_ref() {
+            None => false,
+            Some((resume_count, resume_name)) => {
+                count > *resume_count
+                    || (count == *resume_count && group_name < resume_name.as_str())
+            }
+        };
+
+        let mut grouped_resource_counts = Vec::new();
+        let mut next_token = None;
+        for (group_name, count) in groups {
+            if sorts_ahead_of_resume(count, group_name) {
+                continue;
+            }
+            if grouped_resource_counts.len() == page_size {
+                next_token = Some(crate::state::encode_grouped_count_token(count, group_name));
+                break;
+            }
+            grouped_resource_counts.push(GroupedResourceCount {
+                group_name: group_name.to_string(),
+                resource_count: count,
+            });
+        }
+
+        Ok(GetAggregateDiscoveredResourceCountsOutput {
+            total_discovered_resources,
+            group_by_key,
+            grouped_resource_counts: Some(grouped_resource_counts),
+            next_token,
+        })
     }
 }

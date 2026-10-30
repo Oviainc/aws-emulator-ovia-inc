@@ -168,6 +168,11 @@ mod recorded_inventory_drives_the_read_surface;
 mod recorded_resource_config_history;
 #[path = "all/aggregate_discovered_resources.rs"]
 mod aggregate_discovered_resources;
+// Declared beside the suite it is the counting half of, rather than appended at the
+// tail: every suite that lands appends there, so a declaration added there conflicts
+// with the next one that lands.
+#[path = "all/aggregate_discovered_resource_counts.rs"]
+mod aggregate_discovered_resource_counts;
 #[path = "all/recorded_configuration_item_capture_time.rs"]
 mod recorded_configuration_item_capture_time;
 #[path = "all/unrecorded_resource_keys.rs"]
