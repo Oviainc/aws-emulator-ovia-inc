@@ -32,7 +32,10 @@ use crate::keyspace_table_lifecycle::{
 
 /// A schema whose partition key is a `text` column and whose one regular column declares
 /// `column_type`.
-fn schema_with_type(column_type: &str) -> Value {
+///
+/// Shared with `tests/all/restore_table_type_resolution.rs`, so there is ONE schema
+/// builder for the suites that drive a declared column type rather than a copy per file.
+pub(crate) fn schema_with_type(column_type: &str) -> Value {
     json!({
         "allColumns": [
             {"name": "pk", "type": "text"},

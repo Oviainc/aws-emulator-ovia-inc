@@ -36,6 +36,13 @@
 //! the settings this operation's documentation says a restore reproduces, and the request
 //! models no member to set it, so the restored table starts with none.
 //!
+//! The schema the restore reproduces is resolved against the TARGET keyspace before it is
+//! stored, exactly as `CreateTable` resolves the schema it is handed: a column type may
+//! name only user-defined types "contained in the same keyspace", so a reference the
+//! target keyspace cannot resolve is the modelled `ResourceNotFoundException` and the
+//! restore stores nothing — a schema read out of one keyspace is not a schema the next one
+//! can hold.
+//!
 //! The paragraphs below are the scaffold's own notes on how an operation is shaped and
 //! how it reaches state; they still describe this file.
 //!
@@ -558,6 +565,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The schema this restore is about to store is a schema of the TARGET keyspace,
+        // and a column's type may name "other user-defined types that are contained in the
+        // same keyspace" (`FieldDefinition$type`, the same rule for a column) — so every
+        // reference in it that is neither a native type nor a type constructor has to name
+        // a type of THAT keyspace, in status ACTIVE, whichever keyspace the schema was
+        // read out of. A reference the target keyspace cannot resolve is a type "that
+        // doesn't exist. The resource might not be specified correctly, or its status
+        // might not be ACTIVE" (`ResourceNotFoundException`), and nothing is stored: the
+        // same answer `CreateTable` gives for that very schema and the same one
+        // `UpdateTable` gives for that very column, so no schema in state holds a column
+        // of a type the keyspace holding it does not have. Graded here, after the name and
+        // the table cap — the refusals that settle whether the restored table can exist at
+        // all, which is the order `CreateTable` grades them in — and before the account's
+        // concurrency, so a request with a fault of its own is told about that fault.
+        let usable_type_names = target_keyspace.usable_type_names();
+        for column in restored
+            .schema_definition
+            .iter()
+            .flat_map(|schema| &schema.all_columns)
+        {
+            if let Some(referenced) =
+                crate::state::unresolvable_type_reference(&column.r#type, &usable_type_names)
+            {
+                return Err(RestoreTableErrorModeled::ResourceNotFoundException(
+                    crate::state::type_not_found(
+                        &region,
+                        &input.target_keyspace_name,
+                        &referenced,
+                    ),
+                )
+                .into());
+            }
+        }
+
         // Everything about this request is restorable, so the only thing that can still
         // refuse it is the account's concurrency (counted above).
         if in_progress >= crate::state::MAX_CONCURRENT_RESTORES {

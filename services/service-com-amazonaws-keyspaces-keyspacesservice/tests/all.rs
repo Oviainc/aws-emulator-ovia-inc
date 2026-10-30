@@ -81,6 +81,8 @@ mod restore_table;
 mod restore_table_auto_scaling_as_of_now;
 #[path = "all/restore_table_restoring_status.rs"]
 mod restore_table_restoring_status;
+#[path = "all/restore_table_type_resolution.rs"]
+mod restore_table_type_resolution;
 #[path = "all/service_managed_catalog.rs"]
 mod service_managed_catalog;
 #[path = "all/single_region_replication.rs"]
