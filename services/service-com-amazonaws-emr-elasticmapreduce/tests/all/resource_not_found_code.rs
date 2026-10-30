@@ -16,9 +16,9 @@
 //!
 //! The last table asserts that ABSENCE for the classes Amazon EMR words as rejecting the
 //! value rather than reporting an absent resource ("… is not valid."), because the
-//! boundary is what gives `ResourceNotFound` its meaning: were AWS later found to publish
-//! a code for one of those classes, that row is where it moves to rather than the absence
-//! quietly covering it.
+//! boundary is what gives `ResourceNotFound` its meaning. A class AWS IS known to publish
+//! its own code for is asserted in the suite that owns that code: an unresolvable cluster
+//! id in `tests/all/cluster_id_refusal_code.rs`.
 
 use serde_json::{json, Value};
 
@@ -238,12 +238,12 @@ async fn an_absent_studio_or_session_mapping_is_refused_with_the_not_found_code(
     );
 }
 
-/// THE OTHER HALF of the rule: a refusal that is NOT about an absent resource carries no
-/// discriminator, so `ResourceNotFound` means exactly one thing. Rows span the other
-/// refusal classes this service answers — a malformed document, a name already taken, a
-/// marker naming no held row, a mutually exclusive pair of members and an identifier
-/// Amazon EMR rejects as not valid — across the modelled `InvalidRequestException`
-/// channel and the `ValidationException` one.
+/// THE OTHER HALF of the rule: a refusal that is NOT about an absent resource and that
+/// Amazon EMR publishes no code of its own for carries no discriminator, so
+/// `ResourceNotFound` means exactly one thing. Rows span those classes — a malformed
+/// document, a name already taken, a marker naming no held row, a mutually exclusive pair
+/// of members and a step id Amazon EMR rejects as not valid — across the modelled
+/// `InvalidRequestException` channel and the `ValidationException` one.
 #[tokio::test]
 async fn a_refusal_of_another_class_carries_no_discriminator() {
     let emr = Emr::new();
@@ -292,11 +292,6 @@ async fn a_refusal_of_another_class_carries_no_discriminator() {
                 "IdentityName": "analyst",
                 "IdentityType": "USER",
             }),
-        ),
-        (
-            "a cluster id Amazon EMR rejects as not valid",
-            "DescribeCluster",
-            json!({ "ClusterId": "j-ZZZZZZZZZZZZZ" }),
         ),
         (
             "a step id Amazon EMR rejects as not valid",

@@ -160,10 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and the fleets of a cluster whose termination came due have TERMINATED.
         let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
             return Err(ListInstanceFleetsErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    error_code: None,
-                    message: Some(crate::state::unknown_cluster_message(&input.cluster_id)),
-                },
+                crate::state::unknown_cluster(&input.cluster_id),
             )
             .into());
         };

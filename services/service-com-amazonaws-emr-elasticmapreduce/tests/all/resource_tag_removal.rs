@@ -450,9 +450,10 @@ async fn an_unresolvable_resource_id_is_refused() {
             "case {case:?}: unexpected message in {payload}"
         );
         assert_eq!(
-            error_code(&payload),
-            None,
-            "case {case:?}: a rejected identifier carries no ErrorCode, got {payload}"
+            error_code(&payload).as_deref(),
+            Some("MalformedClusterId"),
+            "case {case:?}: a cluster id resolving to no cluster carries the cluster \
+             surface's discriminator, got {payload}"
         );
     }
 

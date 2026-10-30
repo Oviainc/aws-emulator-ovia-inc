@@ -15,6 +15,8 @@
 mod auto_scaling_policy;
 #[path = "all/block_public_access.rs"]
 mod block_public_access;
+#[path = "all/cluster_id_refusal_code.rs"]
+mod cluster_id_refusal_code;
 #[path = "all/cluster_placement.rs"]
 mod cluster_placement;
 #[path = "all/emr_control_plane.rs"]

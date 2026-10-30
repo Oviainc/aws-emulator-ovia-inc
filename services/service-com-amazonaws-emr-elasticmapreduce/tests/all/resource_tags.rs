@@ -552,9 +552,10 @@ pub(crate) fn error_code(payload: &Value) -> Option<String> {
 }
 
 /// THE OTHER HALF of the rule: a `ResourceId` naming no resource this account holds is
-/// refused — with the sentence the surface that owns an id of that form answers — and
-/// nothing is stored. Rows span the id forms a caller sends, including a Studio-shaped
-/// id, and both a never-created and a never-creatable id.
+/// refused — with the sentence the surface that owns an id of that form answers, and
+/// that surface's discriminator — and nothing is stored. Rows span the id forms a caller
+/// sends, including a Studio-shaped id, and both a never-created and a never-creatable
+/// id.
 #[tokio::test]
 async fn an_unresolvable_resource_id_is_refused() {
     let emr = Emr::new();
@@ -588,9 +589,10 @@ async fn an_unresolvable_resource_id_is_refused() {
             "case {case:?}: unexpected message in {payload}"
         );
         assert_eq!(
-            error_code(&payload),
-            None,
-            "case {case:?}: a rejected identifier carries no ErrorCode, got {payload}"
+            error_code(&payload).as_deref(),
+            Some("MalformedClusterId"),
+            "case {case:?}: a cluster id resolving to no cluster carries the cluster \
+             surface's discriminator, got {payload}"
         );
     }
 

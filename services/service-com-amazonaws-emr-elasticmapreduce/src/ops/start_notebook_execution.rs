@@ -204,10 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let engine_id = input.execution_engine.id.clone();
         if !store.clusters.contains_key(&engine_id) {
             return Err(StartNotebookExecutionErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    error_code: None,
-                    message: Some(crate::state::unknown_cluster_message(&engine_id)),
-                },
+                crate::state::unknown_cluster(&engine_id),
             )
             .into());
         }

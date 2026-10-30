@@ -167,13 +167,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `AddInstanceFleet` reaches the cluster as a JOB FLOW — "The unique identifier
         // of the cluster", which `AddInstanceGroups` and the other legacy operations
         // call a job flow id — and that surface words its unknown-id refusal without
-        // naming the id.
+        // naming the id, under its own discriminator.
         let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
             return Err(AddInstanceFleetErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    error_code: None,
-                    message: Some(crate::state::unknown_job_flow_message()),
-                },
+                crate::state::unknown_job_flow(),
             )
             .into());
         };

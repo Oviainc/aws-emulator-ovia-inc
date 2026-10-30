@@ -218,6 +218,18 @@ pub mod error_code {
     /// what lets a caller tell "gone" from "malformed" — an idempotent teardown that
     /// swallows exactly this code and re-raises every other refusal.
     pub const RESOURCE_NOT_FOUND: &str = "ResourceNotFound";
+
+    /// The code for a cluster id the service resolves no cluster for, as the CLUSTER
+    /// surface reports it — the surface that words that refusal as a cluster id it does
+    /// not accept ([`super::unknown_cluster_message`],
+    /// [`super::unknown_cluster_without_id_message`]).
+    pub const MALFORMED_CLUSTER_ID: &str = "MalformedClusterId";
+
+    /// The same class on the LEGACY job-flow surface, which reaches a cluster as a job
+    /// flow and words the refusal that way ([`super::unknown_job_flow_message`]): one
+    /// exception shape, one status, but its own discriminator — so a client branching on
+    /// the code learns which surface refused it.
+    pub const INVALID_JOB_ID_MALFORMED: &str = "INVALID_JOB_ID_MALFORMED";
 }
 
 /// The refusal for a request that names a resource this service holds none of: the
@@ -226,9 +238,10 @@ pub mod error_code {
 ///
 /// Every operation that reports a named resource as absent refuses it through here, so
 /// the discriminator is the same whichever resource and whichever operation the caller
-/// asked about. A refusal of another class — an identifier Amazon EMR rejects as not
-/// valid, a quota, a conflict, a state — is built at its own call site and carries no
-/// code.
+/// asked about. A refusal of a class Amazon EMR publishes its own code for carries THAT
+/// code, built where its wording is ([`unknown_cluster`], [`unknown_job_flow`]); a class
+/// it publishes none for — a quota, a conflict, a state, another identifier it rejects
+/// as not valid — is built at its own call site and carries no code at all.
 pub fn resource_not_found(message: String) -> InvalidRequestException {
     InvalidRequestException {
         error_code: Some(error_code::RESOURCE_NOT_FOUND.to_string()),
@@ -249,6 +262,19 @@ pub fn unknown_cluster_message(cluster_id: &str) -> String {
     format!("Cluster id {}", not_valid_message(cluster_id))
 }
 
+/// The refusal a CLUSTER-surface operation answers a `ClusterId` it resolves no cluster
+/// for with: the cluster-id sentence and, beside it, the discriminator that surface
+/// publishes for the class ([`error_code::MALFORMED_CLUSTER_ID`]).
+///
+/// The code is paired with the wording HERE, in the one place the wording is built, so
+/// an operation cannot answer one surface's sentence under another surface's code.
+pub fn unknown_cluster(cluster_id: &str) -> InvalidRequestException {
+    InvalidRequestException {
+        error_code: Some(error_code::MALFORMED_CLUSTER_ID.to_string()),
+        message: Some(unknown_cluster_message(cluster_id)),
+    }
+}
+
 /// How the LEGACY job-flow surface refuses a cluster id it holds no cluster for: the
 /// operations that reach a cluster as a "job flow" answer one fixed sentence, naming
 /// neither the id nor the `ClusterId` member.
@@ -256,10 +282,30 @@ pub fn unknown_job_flow_message() -> String {
     "Specified job flow ID not valid.".to_string()
 }
 
+/// The refusal a LEGACY job-flow-surface operation that models the client error answers
+/// an id it resolves no cluster for with: that surface's sentence
+/// ([`unknown_job_flow_message`]) under that surface's discriminator
+/// ([`error_code::INVALID_JOB_ID_MALFORMED`]).
+pub fn unknown_job_flow() -> InvalidRequestException {
+    InvalidRequestException {
+        error_code: Some(error_code::INVALID_JOB_ID_MALFORMED.to_string()),
+        message: Some(unknown_job_flow_message()),
+    }
+}
+
 /// How `GetClusterSessionCredentials` refuses a cluster id it holds no cluster for: the
 /// same statement as [`unknown_cluster_message`] with no id in it.
 pub fn unknown_cluster_without_id_message() -> String {
     "Cluster id is not valid.".to_string()
+}
+
+/// The same refusal as [`unknown_cluster`] for the operation that states it without the
+/// id: same surface, so the same discriminator.
+pub fn unknown_cluster_without_id() -> InvalidRequestException {
+    InvalidRequestException {
+        error_code: Some(error_code::MALFORMED_CLUSTER_ID.to_string()),
+        message: Some(unknown_cluster_without_id_message()),
+    }
 }
 
 /// How `GetClusterSessionCredentials` refuses a cluster whose security configuration
@@ -625,6 +671,10 @@ impl TagSetMut<'_> {
 /// ([`TagTargetRefusal::into_invalid_request`]).
 #[derive(Debug)]
 pub enum TagTargetRefusal {
+    /// A cluster id this service resolves no cluster for, which the cluster surface
+    /// refuses under its own discriminator ([`unknown_cluster`]) whichever operation
+    /// asked.
+    MalformedClusterId(String),
     /// A value naming no resource this service holds, worded the way the surface that
     /// owns an id of that form words it: a rejected identifier, which carries no
     /// discriminator.
@@ -638,6 +688,7 @@ impl TagTargetRefusal {
     /// This refusal as the client error every tag operation models.
     pub fn into_invalid_request(self) -> InvalidRequestException {
         match self {
+            Self::MalformedClusterId(cluster_id) => unknown_cluster(&cluster_id),
             Self::NotValid(message) => InvalidRequestException {
                 error_code: None,
                 message: Some(message),
@@ -1135,9 +1186,9 @@ impl ComAmazonawsEmrElasticmapreduceState {
     ) -> Result<TagSetMut<'_>, TagTargetRefusal> {
         if let Some(cluster_id) = cluster_id.filter(|id| !id.is_empty()) {
             let Some(cluster) = self.clusters.get_mut(cluster_id) else {
-                return Err(TagTargetRefusal::NotValid(unknown_cluster_message(
-                    cluster_id,
-                )));
+                return Err(TagTargetRefusal::MalformedClusterId(
+                    cluster_id.to_string(),
+                ));
             };
             // Materialises the transitions the clock already made due, which were owed
             // at this instant whether or not anybody asked about a tag.
@@ -1168,9 +1219,9 @@ impl ComAmazonawsEmrElasticmapreduceState {
         if resource_id.starts_with(STUDIO_ID_PREFIX) {
             return Err(TagTargetRefusal::Absent(unknown_studio_message()));
         }
-        Err(TagTargetRefusal::NotValid(unknown_cluster_message(
-            resource_id,
-        )))
+        Err(TagTargetRefusal::MalformedClusterId(
+            resource_id.to_string(),
+        ))
     }
 
     /// Apply the clock to every cluster. Called by the listings, which filter on state.

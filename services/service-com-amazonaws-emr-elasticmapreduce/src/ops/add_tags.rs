@@ -185,9 +185,10 @@ fn unresolved(refusal: crate::state::TagTargetRefusal) -> AddTagsError {
 /// Refuse the request with the client error this operation models: HTTP 400
 /// `InvalidRequestException` carrying `message`.
 ///
-/// No `ErrorCode`: the classes refused through here reject what the request carried
-/// rather than reporting a named resource as absent, and that discriminator belongs to
-/// the absent-resource class alone ([`crate::state::resource_not_found`]).
+/// No `ErrorCode`: the classes refused through here reject a submitted TAG, a class
+/// Amazon EMR publishes no discriminator for. The classes it does publish one for are
+/// built where their wording is, and reach this handler through
+/// [`crate::state::TagTargetRefusal`].
 fn refuse(message: String) -> AddTagsError {
     AddTagsErrorModeled::InvalidRequestException(InvalidRequestException {
         error_code: None,

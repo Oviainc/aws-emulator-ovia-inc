@@ -169,14 +169,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The cluster is resolved first, so an id no cluster carries is refused as the
         // client error it is rather than as a missing capability. This operation words
-        // that refusal without naming the id.
+        // that refusal without naming the id, under the cluster surface's own code.
         if store.cluster_mut(&input.cluster_id, now).is_none() {
             return Err(
                 GetClusterSessionCredentialsErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        error_code: None,
-                        message: Some(crate::state::unknown_cluster_without_id_message()),
-                    },
+                    crate::state::unknown_cluster_without_id(),
                 )
                 .into(),
             );
