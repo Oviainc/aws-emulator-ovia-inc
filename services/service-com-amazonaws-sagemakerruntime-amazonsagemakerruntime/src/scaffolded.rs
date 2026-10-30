@@ -177,6 +177,67 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The value the endpoint lookup's refusal carries in [`ERROR_CODE_MEMBER`]: the account
+/// hosts no endpoint of the name the request addressed.
+///
+/// FIXED text, not a per-run value: it is the discriminator a client branches on to tell
+/// "this endpoint does not exist" from every other refusal of the same shape and status,
+/// which is otherwise only readable out of the English `Message`.
+pub const NO_SUCH_ENDPOINT: &str = "NO_SUCH_ENDPOINT";
+
+/// The member the real service's endpoint-lookup refusal carries BESIDE the modelled
+/// `Message`.
+///
+/// `ValidationError` models `Message` alone (`smithy_query(query="shape",
+/// shape="ValidationError")`), so this member is described here rather than generated;
+/// the wire of every invocation route carries it on that one refusal. Its index follows
+/// the modelled member, and the name is what the JSON codec writes the key from.
+static ERROR_CODE_MEMBER: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.sagemakerruntime#ValidationError$ErrorCode",
+        "com.amazonaws.sagemakerruntime",
+        "ErrorCode",
+    ),
+    ShapeType::String,
+    "ErrorCode",
+    1,
+);
+
+/// The modelled `ValidationError` as a refusal that has a machine-readable discriminator
+/// answers it: the shape's own `Message`, plus the `ErrorCode` the wire carries beside it.
+///
+/// The modelled half IS the generated shape, serialized by its own generated
+/// implementation against the generated schema, so `Message` is spelled as the model
+/// spells it and no modelled member is re-described here.
+#[derive(Debug, Clone)]
+pub struct DiscriminatedValidationError {
+    /// The modelled client error, carrying the sentence the caller reads.
+    pub modelled: crate::ops::types::ValidationError,
+    /// The refusal's discriminator — one of the fixed codes above.
+    pub error_code: &'static str,
+}
+
+impl std::fmt::Display for DiscriminatedValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ValidationError ({}): {}",
+            self.error_code,
+            self.modelled.message.as_deref().unwrap_or_default()
+        )
+    }
+}
+
+impl std::error::Error for DiscriminatedValidationError {}
+
+impl SerializableStruct for DiscriminatedValidationError {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        SerializableStruct::serialize_members(&self.modelled, s)?;
+        s.write_string(&ERROR_CODE_MEMBER, self.error_code)?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -185,6 +246,10 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// The modeled `ValidationError` with the discriminator the wire carries beside its
+    /// `Message`. Renders with that shape's own name and status, so a client resolves the
+    /// same error class it resolves for every other refusal of this service.
+    Discriminated(DiscriminatedValidationError),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -221,6 +286,24 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// The refusal every invocation route of this data plane answers an endpoint the
+    /// account does not host with: the modelled client error naming the endpoint and the
+    /// account, carrying the endpoint-lookup discriminator the wire puts beside it.
+    ///
+    /// Built HERE rather than per operation so the three routes answer one envelope and
+    /// one sentence for one condition.
+    pub fn no_such_endpoint(endpoint_name: &str) -> Self {
+        Self::Discriminated(DiscriminatedValidationError {
+            modelled: crate::ops::types::ValidationError {
+                message: Some(format!(
+                    "Endpoint {endpoint_name} of account {} not found.",
+                    ::engine::EMULATOR_ACCOUNT_ID
+                )),
+            },
+            error_code: NO_SUCH_ENDPOINT,
+        })
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -228,6 +311,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::Discriminated(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +324,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::Discriminated(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,6 +339,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::Discriminated(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -262,6 +348,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            // The MODELLED shape's own schema: the discriminator rides beside its
+            // members, it does not replace the shape.
+            Self::Discriminated(_) => &crate::ops::types::SCHEMA_VALIDATION_ERROR,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -274,6 +363,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            Self::Discriminated(_) => crate::service::error_envelope::VALIDATION_ERROR,
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,6 +376,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            // `ValidationError`'s own `@httpError`.
+            Self::Discriminated(_) => 400,
             Self::ValidationException(_) => 400,
         }
     }
@@ -297,6 +389,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
+            // This service is restJson1 and `ValidationError` carries no `awsQueryError`
+            // trait, so there is no legacy query code to honour.
+            Self::Discriminated(_) => None,
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
         }

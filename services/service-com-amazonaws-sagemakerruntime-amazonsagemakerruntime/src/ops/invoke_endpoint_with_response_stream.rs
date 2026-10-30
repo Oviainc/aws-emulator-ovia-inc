@@ -24,7 +24,10 @@
 //! share ([`crate::state::resolve_endpoint`]) and applies the same rules `InvokeEndpoint`
 //! does — the account must host the endpoint, a deployment must be behind it, a
 //! `TargetVariant` must name a variant it hosts, and a `SessionId` must name a stateful
-//! session — then answers the modelled 424 `ModelError`, because a SageMaker model is
+//! session, and only then is the payload examined against the maximum the model declares
+//! for it ([`crate::service::error_envelope`] states that order, and renders this route's
+//! refusals in the same envelope the other two answer in) — then answers the modelled 424
+//! `ModelError`, because a SageMaker model is
 //! customer-provided code in a container image and this emulator runs none. Every call is
 //! logged in [`crate::state`] beside the real-time invocations.
 //!
@@ -168,16 +171,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ResponseStreamInv
     fn serve(&self, svc: &dyn Service, req: &RtRequest, ctx: &OperationContext<'_>) -> RtResponse {
         let protocol = svc.definition().protocol();
 
-        let input: InvokeEndpointWithResponseStreamInput = match event_stream::deserialize_request(
-            protocol,
-            req,
-            INVOKE_ENDPOINT_WITH_RESPONSE_STREAM_INPUT_SCHEMA,
-        ) {
-            Ok(input) => input,
-            // A request the model refuses is answered with the modelled client error
-            // carrying the refusal sentence the shared reader produced.
-            Err(message) => return self.validation(svc, message),
-        };
+        let input: InvokeEndpointWithResponseStreamInput =
+            match crate::service::error_envelope::read_addressed_request(
+                protocol,
+                req,
+                INVOKE_ENDPOINT_WITH_RESPONSE_STREAM_INPUT_SCHEMA,
+            ) {
+                Ok(input) => input,
+                // A request the model refuses is answered with the modelled client error
+                // carrying the refusal sentence the shared reader produced. A payload
+                // outside its modelled bound is NOT refused here: this service resolves
+                // the endpoint a request addressed before it examines the payload, which
+                // is checked below.
+                Err(message) => return self.validation(svc, message),
+            };
 
         let Some(log) = crate::state::service_state(&*self.engine) else {
             return self.internal_failure(svc, crate::state::NO_STATE.to_string());
@@ -230,13 +237,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ResponseStreamInv
                     .internal_failure(svc, crate::state::NO_CONTROL_PLANE_STATE.to_string())
             }
             crate::state::EndpointLookup::NotFound => {
+                // The one refusal the three routes state identically, discriminator and
+                // all (`crate::scaffolded::Scaffolded::no_such_endpoint`).
                 record(crate::state::InvocationOutcome::EndpointNotFound);
-                return self.validation(
+                return self.refusal(
                     svc,
-                    format!(
-                        "Endpoint {} of account {account} not found.",
-                        input.endpoint_name
-                    ),
+                    &crate::scaffolded::Scaffolded::<
+                        InvokeEndpointWithResponseStreamErrorModeled,
+                    >::no_such_endpoint(&input.endpoint_name),
                 );
             }
             crate::state::EndpointLookup::Found(facts) => facts,
@@ -282,6 +290,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ResponseStreamInv
             crate::state::NewSessionConstant::NotModelled,
         ) {
             record(outcome);
+            return self.validation(svc, message);
+        }
+
+        // The payload is examined HERE, after everything the request's addressing
+        // resolved — the same order the other two routes answer in, stated once in
+        // `crate::service::error_envelope::payload_over_maximum`.
+        if let Some(message) = crate::service::error_envelope::payload_over_maximum(
+            INVOKE_ENDPOINT_WITH_RESPONSE_STREAM_INPUT_SCHEMA,
+            input.body.len(),
+        ) {
+            record(crate::state::InvocationOutcome::PayloadOverMaximum);
             return self.validation(svc, message);
         }
 
@@ -345,7 +364,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ResponseStreamInv
         svc: &dyn Service,
         error: InvokeEndpointWithResponseStreamErrorModeled,
     ) -> RtResponse {
-        event_stream::error_response(svc.definition().protocol(), &error)
+        self.refusal(svc, &crate::scaffolded::Scaffolded::Modeled(error))
+    }
+
+    /// Render anything on this operation's error channel, then name the error shape the
+    /// way this service names it (`crate::service::error_envelope`), so this route's
+    /// refusals read exactly as the other two routes' do.
+    fn refusal(
+        &self,
+        svc: &dyn Service,
+        error: &crate::scaffolded::Scaffolded<InvokeEndpointWithResponseStreamErrorModeled>,
+    ) -> RtResponse {
+        crate::service::error_envelope::with_error_type_locator(event_stream::error_response(
+            svc.definition().protocol(),
+            error,
+        ))
     }
 }
 

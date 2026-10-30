@@ -5,11 +5,22 @@
 //! PLANE's store (through the one shared engine), refuses a request that names no
 //! endpoint, an endpoint that is not yet `InService`, a `TargetVariant` the endpoint
 //! does not host, `EnableExplanations` on an endpoint with no explainer configuration or
-//! a `SessionId` naming no stateful session — and answers an otherwise valid invocation
-//! with the modelled 424 `ModelError`, because a model container is customer-provided
-//! code in a container image and this emulator runs none, so no inference is performed.
+//! a `SessionId` naming no stateful session — then, once that addressing has resolved,
+//! a `Body` past the maximum the model declares for it — and answers an otherwise valid
+//! invocation with the modelled 424 `ModelError`, because a model container is
+//! customer-provided code in a container image and this emulator runs none, so no
+//! inference is performed.
 //! Every call is logged in [`crate::state`]. This is the ONLY file to touch for this
 //! operation.
+//!
+//! ## Why the payload is examined here and not at the boundary
+//!
+//! The invocation is ADDRESSED to an endpoint by the `@httpLabel` in its URI, and the
+//! service resolves that endpoint before it looks at what the request carries — so a
+//! request naming an endpoint the account does not host is refused for that whatever its
+//! payload is. That order is stated once for the whole service in
+//! [`crate::service::error_envelope`], which also renders every refusal raised before
+//! this handler runs.
 //!
 //! ## Why the answer to a resolved invocation is `ModelError`
 //!
@@ -334,13 +345,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(internal_failure(crate::state::NO_CONTROL_PLANE_STATE))
             }
             crate::state::EndpointLookup::NotFound => {
-                return Err(refuse(
-                    crate::state::InvocationOutcome::EndpointNotFound,
-                    format!(
-                        "Endpoint {} of account {account} not found.",
-                        input.endpoint_name
-                    ),
-                ))
+                // The one refusal the three routes state identically, discriminator and
+                // all (`crate::scaffolded::Scaffolded::no_such_endpoint`).
+                record(crate::state::InvocationOutcome::EndpointNotFound);
+                return Err(crate::scaffolded::Scaffolded::no_such_endpoint(
+                    &input.endpoint_name,
+                ));
             }
             crate::state::EndpointLookup::Found(facts) => facts,
         };
@@ -405,6 +415,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::NewSessionConstant::Admitted,
         ) {
             return Err(refuse(outcome, message));
+        }
+
+        // The payload is examined HERE, after everything the request's addressing resolved:
+        // the endpoint a request names is resolved from the URI before its body is looked
+        // at, so a request naming no hosted endpoint is refused for that whatever it
+        // carries. The bound and the sentence are the model's and the framework's
+        // (`crate::service::error_envelope::payload_over_maximum`).
+        if let Some(message) =
+            crate::service::error_envelope::payload_over_maximum(Self::INPUT_SCHEMA, input.body.len())
+        {
+            return Err(refuse(
+                crate::state::InvocationOutcome::PayloadOverMaximum,
+                message,
+            ));
         }
 
         // Everything the control plane owns resolved; what is left is the inference

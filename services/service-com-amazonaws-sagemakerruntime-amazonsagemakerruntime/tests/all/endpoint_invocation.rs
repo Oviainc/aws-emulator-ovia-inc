@@ -60,17 +60,32 @@ impl Call {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
 
-    /// The wire error code: the `x-amzn-errortype` header restJson1 sets, or the body's
-    /// `__type` when no header carried it.
+    /// The wire error SHAPE the answer names: the `x-amzn-errortype` header restJson1
+    /// sets, or the body's `__type` when no header carried it.
+    ///
+    /// This service names the shape in that header with the service stack's own locator
+    /// appended (`<shape>:<locator>`, see this crate's `service::error_envelope`), and a
+    /// client resolves the shape from the text BEFORE the separator — so that is what this
+    /// reports. [`Call::error_type`] is the whole header value.
     pub(crate) fn error_code(&self) -> String {
-        if let Some(value) = self.headers.get("x-amzn-errortype") {
-            return value.to_str().unwrap_or_default().to_string();
-        }
-        self.json()
-            .get("__type")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
+        let named = match self.headers.get("x-amzn-errortype") {
+            Some(value) => value.to_str().unwrap_or_default().to_string(),
+            None => self
+                .json()
+                .get("__type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        };
+        named.split(':').next().unwrap_or_default().to_string()
+    }
+
+    /// The `x-amzn-errortype` header exactly as the answer carried it, or `None` when the
+    /// answer carried none.
+    pub(crate) fn error_type(&self) -> Option<String> {
+        self.headers
+            .get("x-amzn-errortype")
+            .map(|value| value.to_str().unwrap_or_default().to_string())
     }
 
     pub(crate) fn message(&self) -> String {

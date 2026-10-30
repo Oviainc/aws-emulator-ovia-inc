@@ -130,6 +130,10 @@ pub enum InvocationOutcome {
     /// `S3OutputPathExtension` is always usable: its own pattern admits every segment it
     /// can carry, and the spliced key is never resolved here.)
     OutputLocationInvalid,
+    /// The request's payload is past the maximum its member's modelled `@length` declares.
+    /// Reached only once the request's addressing resolved: the endpoint a request names is
+    /// resolved before its payload is examined.
+    PayloadOverMaximum,
     /// Everything about the request resolved; the submission was queued.
     Queued,
     /// Everything about the request resolved; no container ran the inference.
@@ -149,6 +153,7 @@ impl InvocationOutcome {
             Self::NoInput => "NoInput",
             Self::InputAmbiguous => "InputAmbiguous",
             Self::OutputLocationInvalid => "OutputLocationInvalid",
+            Self::PayloadOverMaximum => "PayloadOverMaximum",
             Self::Queued => "Queued",
             Self::NoInferenceContainer => "NoInferenceContainer",
         }

@@ -10,7 +10,11 @@
 //! `S3OutputPathExtension`/`Filename` and the inference id, so resubmitting one id yields
 //! the same strings by construction. A submission naming no endpoint, an endpoint with no
 //! deployment behind it, or an endpoint whose configuration carries no
-//! `AsyncInferenceConfig` is refused with the modelled `ValidationError` (HTTP 400). This
+//! `AsyncInferenceConfig` is refused with the modelled `ValidationError` (HTTP 400) — as
+//! is an inline `Body` past the maximum the model declares for it, examined once that
+//! addressing has resolved, because the service resolves the endpoint a submission is
+//! addressed to before it looks at what the submission carries (the order
+//! [`crate::service::error_envelope`] states for the whole service). This
 //! is the ONLY file to touch for this operation.
 //!
 //! ## What becomes of a queued submission
@@ -281,13 +285,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(internal_failure(crate::state::NO_CONTROL_PLANE_STATE))
             }
             crate::state::EndpointLookup::NotFound => {
-                return Err(refuse(
+                // The one refusal the three routes state identically, discriminator and
+                // all (`crate::scaffolded::Scaffolded::no_such_endpoint`). A refusal
+                // reports no id of its own, so the log keeps the caller's, if it sent one.
+                record(
                     crate::state::InvocationOutcome::EndpointNotFound,
-                    format!(
-                        "Endpoint {} of account {account} not found.",
-                        input.endpoint_name
-                    ),
-                ))
+                    input.inference_id.clone(),
+                );
+                return Err(crate::scaffolded::Scaffolded::no_such_endpoint(
+                    &input.endpoint_name,
+                ));
             }
             crate::state::EndpointLookup::Found(facts) => facts,
         };
@@ -307,6 +314,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "Endpoint {} of account {account} is not in service: its status is {}.",
                     input.endpoint_name, facts.status
                 ),
+            ));
+        }
+
+        // The inline payload is examined HERE, after everything the submission's addressing
+        // resolved: the endpoint a request names is resolved from the URI before its body
+        // is looked at, so a submission naming no hosted endpoint is refused for that
+        // whatever it carries. The bound and the sentence are the model's and the
+        // framework's (`crate::service::error_envelope::payload_over_maximum`).
+        if let Some(message) = crate::service::error_envelope::payload_over_maximum(
+            Self::INPUT_SCHEMA,
+            input.body.as_deref().map_or(0, <[u8]>::len),
+        ) {
+            return Err(refuse(
+                crate::state::InvocationOutcome::PayloadOverMaximum,
+                message,
             ));
         }
 

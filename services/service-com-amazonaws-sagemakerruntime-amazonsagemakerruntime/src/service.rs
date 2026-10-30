@@ -39,9 +39,21 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! # How this service states a refused invocation
+//!
+//! Both halves of that answer — the error SHAPE a failure names in `x-amzn-errortype`,
+//! and the envelope a request refused before any handler ran is stated in — are the same
+//! for every route this service serves, so they live in one place,
+//! [`error_envelope`]. Every modelled operation is served wrapped in that module's
+//! [`error_envelope::InModelledEnvelope`], and the hand-authored streaming route states
+//! its own errors through the same module, so the three routes cannot drift apart in how
+//! they word a refusal.
+
+pub mod error_envelope;
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -52,6 +64,12 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The same modelled operations the generated table holds, each wrapped in
+    /// [`error_envelope::InModelledEnvelope`] so a request refused before its handler runs
+    /// is refused in this service's own modelled `ValidationError`. Keyed by the routing
+    /// key the protocol resolves — the key the generated table uses — and built from the
+    /// SAME shared engine, so a wrapped operation reads and writes the one store.
+    in_modelled_envelope: OperationRoutingTable,
     /// The hand-authored `InvokeEndpointWithResponseStream` implementation, wrapped in the
     /// shared `EventStreamRoute` adapter: the generated routing table holds a declining
     /// entry for that operation (the scaffold generator does not serve a `@streaming`
@@ -67,8 +85,26 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        // The two operations the generated table serves, each keyed by its operation shape
+        // name — the routing key `ServerHttpProtocol::routing_key` resolves for a restJson1
+        // request, which is what the generated table is keyed by. The third route
+        // (`InvokeEndpointWithResponseStream`) is hand-authored below.
+        let mut in_modelled_envelope = OperationRoutingTable::new();
+        in_modelled_envelope.add_operation(
+            "InvokeEndpoint",
+            Box::new(error_envelope::InModelledEnvelope::new(
+                crate::ops::invoke_endpoint::InvokeEndpoint::new(Arc::clone(&engine)),
+            )) as Box<dyn ErasedOperation>,
+        );
+        in_modelled_envelope.add_operation(
+            "InvokeEndpointAsync",
+            Box::new(error_envelope::InModelledEnvelope::new(
+                crate::ops::invoke_endpoint_async::InvokeEndpointAsync::new(Arc::clone(&engine)),
+            )) as Box<dyn ErasedOperation>,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine.clone()),
+            in_modelled_envelope,
             response_stream: service_common::event_stream::EventStreamRoute(
                 crate::ops::invoke_endpoint_with_response_stream::ResponseStreamInvocation::new(
                     engine,
@@ -136,18 +172,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if ResponseStreamInvocation::<Eng>::claims(req) {
             return Some(&self.response_stream);
         }
-        None
+        // NOT a re-route for the other two: the key is the one the generated table's own
+        // protocol resolves, and the operation it names is the one served — wrapped in
+        // `error_envelope::InModelledEnvelope` so a request refused before the handler runs
+        // is refused in this service's modelled `ValidationError` rather than in the
+        // framework's pre-dispatch envelope, which names a shape this model does not
+        // declare and carries no `Message`. A key the model does not name resolves to
+        // `None` here exactly as it does in the generated table, so the router's
+        // routing-error path is unchanged.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.in_modelled_envelope.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) so this service can
-        // state it its own way. AWS states it as the `ValidationException` envelope the
-        // framework already renders, except that it quotes a `@pattern` requirement
-        // WITHOUT the `^`/`$` anchors the Smithy pattern carries. That wording is shared
-        // by every service on a JSON protocol, so it lives in `service-common`; the
-        // check itself still uses the model's pattern as written.
-        service_common::aws_validation_refusal(refusal)
+        // `InModelledEnvelope` refuses a constraint violation itself, in the modelled
+        // envelope, so this seam words any refusal the FRAMEWORK still renders — a refusal
+        // raised before an operation is named at all, and the fallback in that module.
+        // Wording it from the same violations keeps the two paths from disagreeing: a value
+        // outside a declared bound is this service's `ValidationError` either way.
+        error_envelope::stated_refusal(refusal)
     }
 
     fn override_routing_error(
