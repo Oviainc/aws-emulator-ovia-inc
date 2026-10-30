@@ -1334,6 +1334,52 @@ pub fn rule_time_range_error(rules: &[Rule]) -> Option<String> {
     })
 }
 
+/// The refusal for a start whose channel definitions do not each name a different
+/// audio channel and a different participant, or `None` when they do.
+///
+/// A channel definition "makes it possible to specify which speaker is on which
+/// channel", one definition per channel and one participant per definition: "if your
+/// agent is the first participant to speak, you would set `ChannelId` to 0 (to indicate
+/// the first channel) and `ParticipantRole` to `AGENT`", and for the Medical Scribe
+/// family "set `ChannelId` of the first `ChannelDefinition` in the list to 0 ... and
+/// `ParticipantRole` to `CLINICIAN` ... the `ChannelId` of the second ... to 1 ... and
+/// `ParticipantRole` to `PATIENT`" (`smithy_query(query="shape",
+/// shape="ChannelDefinition,MedicalScribeChannelDefinition")`). A list naming one
+/// channel twice, or one participant twice, says nothing about which speaker is where,
+/// so it is refused rather than stored. The modelled list length and the `ChannelId`
+/// range are `@length` and `@range` constraints the request boundary already refuses,
+/// so distinctness is all that is left to decide.
+///
+/// Single-homed here for the reason [`co_required_pair_error`] is: every family whose
+/// start accepts channel definitions applies this same rule and is refused with this
+/// same sentence, and Smithy has no constraint trait for distinctness over a member of
+/// a structure in a list, so no boundary validation can refuse one. Each definition is
+/// read as its channel id and the participant it NAMES, `None` for a definition that
+/// names none: `ChannelDefinition$ParticipantRole` is optional ("Omitting this
+/// parameter is equivalent to specifying both participants") while the Medical Scribe
+/// family models it `@required`, so only the roles a request actually named are
+/// compared and a definition that omits the role names no participant to clash with.
+pub fn channel_definition_distinctness_error<'a>(
+    definitions: impl IntoIterator<Item = (i32, Option<&'a str>)>,
+) -> Option<String> {
+    let mut channels = ::std::collections::BTreeSet::new();
+    let mut roles = ::std::collections::BTreeSet::new();
+    let (mut defined, mut named_roles) = (0usize, 0usize);
+    for (channel_id, role) in definitions {
+        defined += 1;
+        channels.insert(channel_id);
+        if let Some(role) = role {
+            named_roles += 1;
+            roles.insert(role);
+        }
+    }
+    (channels.len() != defined || roles.len() != named_roles).then(|| {
+        "Each ChannelDefinition must name a different ChannelId and a different \
+         ParticipantRole. Correct your request and try again."
+            .to_string()
+    })
+}
+
 /// The references a request's settings name, as
 /// [`ComAmazonawsTranscribeTranscribeState::unheld_reference_error`] reads them: the
 /// custom vocabulary, custom vocabulary filter and custom language model a settings

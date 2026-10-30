@@ -304,31 +304,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  is true. Correct your request and try again.",
             ));
         }
-        // One definition per channel, each naming a different participant: "set
-        // ChannelId of the first ChannelDefinition in the list to 0 ... and
-        // ParticipantRole to CLINICIAN ... the ChannelId of the second
-        // ChannelDefinition in the list to 1 ... and ParticipantRole to PATIENT"
-        // (model doc for `StartMedicalScribeJobRequest$ChannelDefinitions`). The
-        // boundary validator has already refused a list that is not exactly two long
-        // and a `ChannelId` outside `@range(min: 0, max: 1)`, so what is left to
-        // refuse is two definitions that name the same channel or the same role.
-        if let Some(definitions) = input.channel_definitions.as_deref() {
-            let distinct_channels = definitions
+        // One definition per channel, each naming a different participant, read through
+        // the one [`crate::state::channel_definition_distinctness_error`] both starts
+        // that accept channel definitions share. This family models
+        // `ParticipantRole` `@required`, so every definition names a participant.
+        if let Some(message) = crate::state::channel_definition_distinctness_error(
+            input
+                .channel_definitions
+                .as_deref()
+                .unwrap_or_default()
                 .iter()
-                .map(|definition| definition.channel_id)
-                .collect::<std::collections::BTreeSet<_>>()
-                .len();
-            let distinct_roles = definitions
-                .iter()
-                .map(|definition| definition.participant_role.as_str())
-                .collect::<std::collections::BTreeSet<_>>()
-                .len();
-            if distinct_channels != definitions.len() || distinct_roles != definitions.len() {
-                return Err(bad_request(
-                    "Each ChannelDefinition must name a different ChannelId and a different \
-                     ParticipantRole. Correct your request and try again.",
-                ));
-            }
+                .map(|definition| {
+                    (
+                        definition.channel_id,
+                        Some(definition.participant_role.as_str()),
+                    )
+                }),
+        ) {
+            return Err(bad_request(&message));
         }
 
         // "VocabularyFilterMethod must be specified if VocabularyFilterName is set."

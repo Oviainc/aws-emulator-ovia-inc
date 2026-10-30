@@ -307,37 +307,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(&message));
         }
 
-        // One definition per channel, each naming a different participant: "if your
-        // agent is the first participant to speak, you would set ChannelId to 0 (to
-        // indicate the first channel) and ParticipantRole to AGENT" (model doc for
-        // `ChannelDefinition`). The boundary validator has already refused a list that
-        // is not exactly two long and a `ChannelId` outside `@range(min: 0, max: 1)`,
-        // so what is left to refuse is two definitions that name the same channel or
-        // the same role — the rule `StartMedicalScribeJob` applies to its own channel
-        // definitions. `ParticipantRole` is OPTIONAL here ("Omitting this parameter is
-        // equivalent to specifying both participants"), so only roles the request
-        // actually named are compared: a definition that omits the role names no role
-        // to clash with.
-        if let Some(definitions) = input.channel_definitions.as_deref() {
-            let distinct_channels = definitions
+        // One definition per channel, each naming a different participant — the rule
+        // `StartMedicalScribeJob` applies to its own channel definitions, read through
+        // the one [`crate::state::channel_definition_distinctness_error`] both starts
+        // share. `ParticipantRole` is OPTIONAL here ("Omitting this parameter is
+        // equivalent to specifying both participants"), so the role is passed as the
+        // request spelled it and a definition that omits it names no role to clash
+        // with.
+        if let Some(message) = crate::state::channel_definition_distinctness_error(
+            input
+                .channel_definitions
+                .as_deref()
+                .unwrap_or_default()
                 .iter()
-                .map(|definition| definition.channel_id)
-                .collect::<std::collections::BTreeSet<_>>()
-                .len();
-            let named_roles: Vec<&str> = definitions
-                .iter()
-                .filter_map(|definition| definition.participant_role.as_deref())
-                .collect();
-            let distinct_roles = named_roles
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len();
-            if distinct_channels != definitions.len() || distinct_roles != named_roles.len() {
-                return Err(bad_request(
-                    "Each ChannelDefinition must name a different ChannelId and a different \
-                     ParticipantRole. Correct your request and try again.",
-                ));
-            }
+                .map(|definition| {
+                    (
+                        definition.channel_id,
+                        definition.participant_role.as_deref(),
+                    )
+                }),
+        ) {
+            return Err(bad_request(&message));
         }
 
         let now = ::std::time::SystemTime::now();

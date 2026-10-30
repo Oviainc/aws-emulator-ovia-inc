@@ -39,6 +39,8 @@ mod call_analytics_job_tagging;
 mod call_analytics_jobs;
 #[path = "all/call_analytics_rule_time_ranges.rs"]
 mod call_analytics_rule_time_ranges;
+#[path = "all/channel_definition_distinctness.rs"]
+mod channel_definition_distinctness;
 #[path = "all/client_error_wire_status.rs"]
 mod client_error_wire_status;
 #[path = "all/clock_owed_record_access.rs"]
