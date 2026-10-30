@@ -378,11 +378,46 @@ written to the output S3 location.";
 pub const PROCESSING_JOB_ENDS_AFTER: Duration = Duration::from_millis(400);
 
 /// `ProcessingJobStatus`'s members this emulator moves a processing job through (the
-/// modelled enum also carries `Completed`, `Stopping` and `Stopped`, which this slice
-/// does not reach). Named once here so no handler compares a bare string literal.
+/// modelled enum also carries `Completed`, which this slice does not reach because
+/// nothing runs the job's container image). Named once here so no handler compares a
+/// bare string literal.
 pub const PROCESSING_STATUS_IN_PROGRESS: &str = "InProgress";
 /// See [`PROCESSING_STATUS_IN_PROGRESS`].
 pub const PROCESSING_STATUS_FAILED: &str = "Failed";
+/// See [`PROCESSING_STATUS_IN_PROGRESS`]: the transient status a job carries from the
+/// `StopProcessingJob` call until the clock owes it [`PROCESSING_STATUS_STOPPED`].
+pub const PROCESSING_STATUS_STOPPING: &str = "Stopping";
+/// See [`PROCESSING_STATUS_STOPPING`]: the terminal status of a job the caller stopped.
+pub const PROCESSING_STATUS_STOPPED: &str = "Stopped";
+
+/// How long after `StopProcessingJob` the clock owes the job's `Stopping` -> `Stopped`
+/// move.
+///
+/// Chosen on the same terms as [`PROCESSING_JOB_ENDS_AFTER`] (AWS documents no duration
+/// for the stop either) and inside the same band: never zero, so a caller that describes
+/// the job straight after asking it to stop still observes the transient `Stopping`, and
+/// one that waits observes `Stopped`, so a waiter terminates.
+pub const PROCESSING_JOB_STOPS_AFTER: Duration = Duration::from_millis(300);
+
+/// Why a reader or the stop could not resolve a processing job, named once here so
+/// `DescribeProcessingJob` and `StopProcessingJob` refuse an unknown name with the same
+/// sentence, quoting the name the request presented.
+pub fn processing_job_not_found(name: &str) -> String {
+    format!("Could not find processing job \"{name}\".")
+}
+
+/// Why stopping a job whose run is already over is refused, naming the job and the status
+/// it had already reached.
+///
+/// A job in a status nothing leaves on its own has no run left to stop.
+/// `StopProcessingJob` models only `ResourceNotFound` and the job IS found, so the
+/// refusal is a 400 `ValidationException` carrying this sentence.
+pub fn processing_job_not_running(name: &str, status: &str) -> String {
+    format!(
+        "The processing job \"{name}\" is {status} and is not running, so there is \
+         nothing to stop."
+    )
+}
 
 /// `FailureReason` of a processing job whose container image could not be run here.
 ///
@@ -1628,9 +1663,10 @@ pub struct Trial {
 /// A processing job created by `CreateProcessingJob`, as `DescribeProcessingJob`
 /// replays it.
 ///
-/// `ends_at` is the instant the clock owes the move out of `InProgress`; it is stored,
-/// never slept on, and materialised by whichever reporting call first runs at or after
-/// it (see [`ProcessingJob::settle_status`]).
+/// `ends_at` is the instant the clock owes the move out of the job's current
+/// non-terminal status (`InProgress` from the create, `Stopping` from a stop); it is
+/// stored, never slept on, and materialised by whichever reporting call first runs at or
+/// after it (see [`ProcessingJob::settle_status`]).
 #[derive(Debug, Clone)]
 pub struct ProcessingJob {
     pub name: String,
@@ -1657,29 +1693,70 @@ pub struct ProcessingJob {
 }
 
 impl ProcessingJob {
-    /// Materialise the move out of `InProgress` the clock already owes.
+    /// Materialise the move out of a non-terminal status the clock already owes.
     ///
     /// This is the one write a reporting operation may make: the move was due at
     /// `ends_at` whether or not anybody described the job, so the observer makes no
     /// difference to the result. `LastModifiedTime` and `ProcessingEndTime` take the
     /// instant the move was due, not "now", so both are stable across later reads.
     ///
-    /// The terminal status is [`PROCESSING_STATUS_FAILED`] with
+    /// A job left to run ends in [`PROCESSING_STATUS_FAILED`] with
     /// [`NO_CONTAINER_RUNTIME_REASON`]: nothing ran the job's container image, so no
-    /// `Completed` status, `ProcessingStartTime` or `ExitMessage` is invented for it.
+    /// `Completed` status, `ProcessingStartTime` or `ExitMessage` is invented for it. A
+    /// job the caller asked to stop ends in [`PROCESSING_STATUS_STOPPED`] with no failure
+    /// reason instead: stopping is what the caller asked for, not a failure.
     ///
     /// Answers whether the transition happened on this call, so the caller can record it.
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
-        if self.status == PROCESSING_STATUS_IN_PROGRESS && now >= self.ends_at {
-            self.status = PROCESSING_STATUS_FAILED.to_string();
-            self.failure_reason = Some(NO_CONTAINER_RUNTIME_REASON.to_string());
-            // The instant the service gave up on the run, which is when the job
-            // ended. No start time is recorded beside it: the container never started.
-            self.processing_end_time = Some(self.ends_at);
-            self.last_modified_time = self.ends_at;
-            return true;
+        if now < self.ends_at {
+            return false;
         }
-        false
+        match self.status.as_str() {
+            PROCESSING_STATUS_IN_PROGRESS => {
+                self.status = PROCESSING_STATUS_FAILED.to_string();
+                self.failure_reason = Some(NO_CONTAINER_RUNTIME_REASON.to_string());
+            }
+            PROCESSING_STATUS_STOPPING => {
+                self.status = PROCESSING_STATUS_STOPPED.to_string();
+            }
+            // Already terminal: nothing is owed and nothing moves.
+            _ => return false,
+        }
+        // The instant the run ended, which is when the move was due rather than "now", so
+        // both are stable across later reads. No start time is recorded beside it: the
+        // container never started.
+        self.processing_end_time = Some(self.ends_at);
+        self.last_modified_time = self.ends_at;
+        true
+    }
+
+    /// Whether the job has reached a status nothing leaves on its own, i.e. one of
+    /// `ProcessingJobStatus`'s terminal members.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            PROCESSING_STATUS_FAILED | PROCESSING_STATUS_STOPPED | STATUS_COMPLETED
+        )
+    }
+
+    /// Whether a stop the caller already asked for is still in flight, i.e. the job sits
+    /// in the transient `Stopping` status.
+    pub fn is_stopping(&self) -> bool {
+        self.status == PROCESSING_STATUS_STOPPING
+    }
+
+    /// Record that the caller asked this job to stop: it moves to the transient
+    /// `Stopping` now, and the clock owes it `Stopped` at
+    /// [`PROCESSING_JOB_STOPS_AFTER`]. The span is never zero, so the transient status is
+    /// observable.
+    pub fn request_stop(&mut self, now: SystemTime) {
+        self.status = PROCESSING_STATUS_STOPPING.to_string();
+        // The run is being abandoned on request, not failing, so nothing is reported
+        // beside `Stopping` or the `Stopped` that follows it.
+        self.failure_reason = None;
+        self.processing_end_time = None;
+        self.last_modified_time = now;
+        self.ends_at = now + PROCESSING_JOB_STOPS_AFTER;
     }
 }
 
