@@ -19,9 +19,9 @@ use sha2::{Digest, Sha256};
 use ::aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 
 use crate::ops::types::{
-    Action, ApiGatewayApiAsset, AssetConfiguration, ConflictException, Event,
+    Action, ApiGatewayApiAsset, AssetConfiguration, AssetDetails, ConflictException, Event,
     InternalServerException, JobError, OriginDetails, ResourceNotFoundException, ResponseDetails,
-    ServiceLimitExceededException, ValidationException,
+    S3SnapshotAsset, ServiceLimitExceededException, ValidationException,
 };
 
 /// The service's SigV4 signing name, and so the ARN service segment.
@@ -37,6 +37,17 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// `ENTITLED`, the other, describes a subscriber's copy of someone else's data
 /// set, which only a data grant or a Marketplace subscription mints.
 pub const ORIGIN_OWNED: &str = "OWNED";
+
+/// `AssetType` for an asset that IS a data object — one of the model's `AssetType`
+/// values, enumerated by `crate::ops::types::ASSET_TYPE_VALUES` (the test suite pins
+/// that this constant is still a member of that set, so the two cannot drift). Its
+/// details are the object's own ([`AssetDetails::s3_snapshot_asset`]).
+pub const ASSET_TYPE_S3_SNAPSHOT: &str = "S3_SNAPSHOT";
+
+/// `AssetType` for an asset that IS an Amazon API Gateway API — another of the
+/// model's `AssetType` values (see [`ASSET_TYPE_S3_SNAPSHOT`]). Its details are that
+/// API's ([`AssetDetails::api_gateway_api_asset`]).
+pub const ASSET_TYPE_API_GATEWAY_API: &str = "API_GATEWAY_API";
 
 /// `Origin` for a subscriber's copy of someone else's data set — the other of the
 /// model's `Origin` values (see [`ORIGIN_OWNED`]), which a data grant or an AWS
@@ -148,6 +159,36 @@ pub struct Asset {
     pub api: Option<ApiGatewayApiAsset>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+}
+
+impl Asset {
+    /// The modelled `AssetDetails` of this asset: the ONE detail member its
+    /// `AssetType` names, filled from what the import that created it recorded.
+    ///
+    /// The model pairs each `AssetType` with the `AssetDetails` member that describes
+    /// an asset of that type (`smithy_query(query="shape",
+    /// shape="AssetType,AssetDetails")`), so the type decides which member an asset's
+    /// details carry: a data object is described by its size, and an API asset by the
+    /// API it fulfils. A type whose source this emulator cannot read \u2014 so no import
+    /// of it ever completes, and no asset of it is ever stored \u2014 has nothing recorded
+    /// to describe, and its details are empty rather than invented.
+    pub fn details(&self) -> AssetDetails {
+        match self.asset_type.as_str() {
+            ASSET_TYPE_S3_SNAPSHOT => AssetDetails {
+                s3_snapshot_asset: Some(S3SnapshotAsset {
+                    // The size of the object the asset is, which is how many bytes of
+                    // it this store holds.
+                    size: self.content.len() as f64,
+                }),
+                ..AssetDetails::default()
+            },
+            ASSET_TYPE_API_GATEWAY_API => AssetDetails {
+                api_gateway_api_asset: self.api.clone(),
+                ..AssetDetails::default()
+            },
+            _ => AssetDetails::default(),
+        }
+    }
 }
 
 /// One stored revision of a data set.

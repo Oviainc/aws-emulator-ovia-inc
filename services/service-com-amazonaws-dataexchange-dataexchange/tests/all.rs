@@ -29,6 +29,8 @@ mod not_found_message;
 mod optional_page_size;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/revision_assets.rs"]
+mod revision_assets;
 #[path = "all/revision_finalization.rs"]
 mod revision_finalization;
 #[path = "all/revisions.rs"]

@@ -66,8 +66,22 @@ struct RawAnswer {
 
 /// The Base64 MD5 of `content`, in the encoding the model's `Md5Hash` and HTTP's
 /// `Content-MD5` both carry.
-fn base64_md5(content: &[u8]) -> String {
+pub(crate) fn base64_md5(content: &[u8]) -> String {
     aws_smithy_types::base64::encode(Md5::digest(content))
+}
+
+/// PUT `content` to an upload URL this service announced, declaring the digest the
+/// job was created with, and answer the HTTP status — the one step of an import that
+/// is not a modelled call. It lives here, beside the rules about those URLs, so a
+/// suite that needs an IMPORTED asset drives the same upload a client drives.
+pub(crate) async fn put_upload(
+    router: &MultiServiceRouter,
+    url: &str,
+    content: &[u8],
+) -> u16 {
+    raw(router, "PUT", url, content, Some(&base64_md5(content)))
+        .await
+        .status
 }
 
 /// The entity tag an upload of `content` answers with: its MD5 as quoted hex.
@@ -129,7 +143,7 @@ async fn raw(
 
 /// A data set of `asset_type` holding one revision — every job under test names one,
 /// and a revision's assets carry the `AssetType` of the data set they belong to.
-async fn data_set_with_revision(
+pub(crate) async fn data_set_with_revision(
     router: &MultiServiceRouter,
     name: &str,
     asset_type: &str,

@@ -177,6 +177,22 @@ fn lookups(how: &str, absent: &str, data_set_id: &str) -> Vec<Lookup> {
             resource_type: Some(REVISION),
         },
         Lookup {
+            label: format!("ListRevisionAssets under {how}"),
+            method: "GET",
+            uri: format!("/v1/data-sets/{absent}/revisions/{absent}/assets"),
+            body: None,
+            resource_id: absent.to_string(),
+            resource_type: Some(DATA_SET),
+        },
+        Lookup {
+            label: format!("ListRevisionAssets under {how} of a stored data set"),
+            method: "GET",
+            uri: format!("/v1/data-sets/{data_set_id}/revisions/{absent}/assets"),
+            body: None,
+            resource_id: absent.to_string(),
+            resource_type: Some(REVISION),
+        },
+        Lookup {
             label: format!("CreateJob whose details name {how} of a stored data set"),
             method: "POST",
             uri: "/v1/jobs".to_string(),

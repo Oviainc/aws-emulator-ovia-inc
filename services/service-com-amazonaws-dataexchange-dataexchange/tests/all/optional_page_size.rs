@@ -84,8 +84,8 @@ async fn list_operations(router: &MultiServiceRouter) -> Vec<ListOperation> {
         ListOperation {
             case: "ListRevisionAssets",
             path: format!("/v1/data-sets/{data_set_id}/revisions/{revision_id}/assets"),
-            served: 501,
-            enforces_range: false,
+            served: 200,
+            enforces_range: true,
         },
     ]
 }
