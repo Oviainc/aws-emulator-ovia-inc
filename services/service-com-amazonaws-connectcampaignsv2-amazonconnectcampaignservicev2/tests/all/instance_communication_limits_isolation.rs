@@ -25,7 +25,7 @@ use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::ops
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::ONBOARDING_JOB_DURATION;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, router, Harness};
+use super::common::{call, router, stored_config, Harness};
 
 /// One `CommunicationLimit` entry.
 fn limit(max_count_per_recipient: i64, frequency: i64, unit: &str) -> Value {
@@ -397,9 +397,10 @@ async fn a_campaign_override_write_leaves_the_instance_limits_alone() {
             .get("communicationLimitsOverride")
             .cloned()
             .unwrap_or(Value::Null);
+        let expected = stored_config(override_config);
         assert_eq!(
-            &projected, override_config,
-            "case {case:?}: expected the campaign to hold {override_config}, got {projected}"
+            projected, expected,
+            "case {case:?}: expected the campaign to hold {expected}, got {projected}"
         );
 
         let stored = instance_limits(&router, region, instance, case).await;
@@ -410,10 +411,11 @@ async fn a_campaign_override_write_leaves_the_instance_limits_alone() {
     }
 
     // And the instance-wide write still only writes its own member: the campaign keeps
-    // the override the last update gave it.
+    // the override the last update gave it — which, for an override naming no member at
+    // all, is no override on the record.
     let last = cases
         .last()
-        .map(|(_case, config)| config.clone())
+        .map(|(_case, config)| stored_config(config))
         .expect("the table has at least one row");
     let replacement = json!({
         "allChannelSubtypes": {"communicationLimitsList": [limit(9, 14, unit)]}

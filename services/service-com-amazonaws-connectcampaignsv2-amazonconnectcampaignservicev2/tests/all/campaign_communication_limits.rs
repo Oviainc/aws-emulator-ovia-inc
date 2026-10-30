@@ -30,7 +30,7 @@ use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::sta
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, error_code, router, Harness};
+use super::common::{call, error_code, router, stored_config, Harness};
 
 /// A minimal telephony `channelSubtypeConfig`: `outboundMode` and
 /// `defaultOutboundConfig` are both required by the model.
@@ -219,7 +219,7 @@ async fn a_communication_limits_config_is_stored_and_every_read_projects_it() {
             ],
         ),
         (
-            "an empty config: the shape has no required member",
+            "an empty config: the shape has no required member, so it overrides nothing",
             Some(json!({
                 "allChannelSubtypes": {"communicationLimitsList": [limit(6, 6, day)]}
             })),
@@ -261,8 +261,10 @@ async fn a_communication_limits_config_is_stored_and_every_read_projects_it() {
 
             let campaign = describe(&router, region, &id, case).await;
             assert_eq!(
-                &campaign["communicationLimitsOverride"], config,
-                "case {case:?}: expected the stored override {config}, got {}",
+                campaign["communicationLimitsOverride"],
+                stored_config(config),
+                "case {case:?}: expected the stored override {}, got {}",
+                stored_config(config),
                 campaign["communicationLimitsOverride"]
             );
         }
@@ -284,8 +286,10 @@ async fn a_communication_limits_config_is_stored_and_every_read_projects_it() {
 
         let after = describe(&router, region, &id, case).await;
         assert_eq!(
-            &after["communicationLimitsOverride"], last,
-            "case {case:?}: expected the repeat to leave {last} stored, got {}",
+            after["communicationLimitsOverride"],
+            stored_config(last),
+            "case {case:?}: expected the repeat to leave {}, got {}",
+            stored_config(last),
             after["communicationLimitsOverride"]
         );
 

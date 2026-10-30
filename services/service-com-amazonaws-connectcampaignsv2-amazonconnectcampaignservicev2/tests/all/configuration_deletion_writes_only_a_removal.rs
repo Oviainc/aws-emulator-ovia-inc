@@ -6,8 +6,10 @@
 //! One rule, over every campaign deletion that takes ONE optional block out of an
 //! optional container the record holds: the container is dropped only when the call
 //! actually removed the last block it held. A container that held no block for the
-//! config the request named — an EMPTY container included — is left exactly as it was,
-//! which is what makes these operations idempotent, as the model declares.
+//! config the request named is left exactly as it was, which is what makes these
+//! operations idempotent, as the model declares. A container holding no block AT ALL
+//! holds nothing, so no writer puts one on the record: a request carrying one leaves the
+//! record with no container, and the deletion then has nothing to remove either.
 //!
 //! Both halves are asserted through `DescribeCampaign`, the projection of the stored
 //! record, and over both paths a container reaches the record by (`CreateCampaign` and
@@ -23,7 +25,7 @@ use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::ops
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, create_campaign_with, describe_campaign, router};
+use super::common::{call, create_campaign_with, describe_campaign, router, stored_config};
 
 /// One `CommunicationLimit` entry: every member of the shape is `@required`.
 fn limit(max_count_per_recipient: i64, frequency: i64, unit: &str) -> Value {
@@ -153,8 +155,9 @@ async fn a_limits_deletion_collapses_the_override_only_when_it_removed_a_block()
     // (case, the override stored before the deletion, what the record must hold after
     // the named config type is deleted — `Value::Null` for an absent member)
     let rows: Vec<(&str, Value, Value)> = vec![
-        // Nothing to remove: the record is left exactly as it was.
-        ("an override with no member at all", json!({}), json!({})),
+        // Nothing to remove: the record is left exactly as it was — and an override
+        // holding no member at all was never put on it, so it holds none.
+        ("an override with no member at all", json!({}), Value::Null),
         (
             "instanceLimitsHandling alone",
             json!({"instanceLimitsHandling": opt_in}),
@@ -225,10 +228,16 @@ async fn a_limits_deletion_collapses_the_override_only_when_it_removed_a_block()
                     );
                 }
 
-                // The override really is on the record before the deletion, empty or
-                // not — the round trip the rule is about.
+                // The override really is on the record before the deletion, in the one
+                // representation the record holds it in — the round trip the rule is
+                // about.
                 let before = describe_campaign(&router, region, &id, &case).await;
-                assert_member(&before, "communicationLimitsOverride", stored, &case);
+                assert_member(
+                    &before,
+                    "communicationLimitsOverride",
+                    &stored_config(stored),
+                    &case,
+                );
 
                 // The same deletion twice: idempotent, and the second call sees the
                 // record the first one left.
@@ -281,7 +290,7 @@ async fn a_channel_subtype_deletion_drops_the_config_only_when_it_removed_a_bloc
             "a config with no channel block at all",
             json!({}),
             telephony,
-            json!({}),
+            Value::Null,
         ),
         (
             "a config holding another channel's block",
@@ -316,7 +325,7 @@ async fn a_channel_subtype_deletion_drops_the_config_only_when_it_removed_a_bloc
         .await;
 
         let before = describe_campaign(&router, region, &id, &case).await;
-        assert_member(&before, "channelSubtypeConfig", stored, &case);
+        assert_member(&before, "channelSubtypeConfig", &stored_config(stored), &case);
 
         for attempt in ["the deletion", "a repeated deletion"] {
             let (status, body) = delete_subtype(&router, region, &id, target).await;

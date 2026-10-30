@@ -31,7 +31,7 @@ use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::sta
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, error_code, router, Harness};
+use super::common::{call, error_code, router, stored_config, Harness};
 
 /// The `ChannelSubtypeConfig` member that carries the block of one `ChannelSubtype`
 /// value.
@@ -221,18 +221,18 @@ async fn describe(router: &MultiServiceRouter, region: &str, id: &str, case: &st
 }
 
 /// What the campaign SHOULD now project for `channelSubtypeConfig`: the created
-/// config minus the deleted channel's block, and nothing at all once no block is
-/// left.
+/// config minus the deleted channels' blocks, and nothing at all once no block is
+/// left — a config holding no channel configures nothing, so no writer puts one on the
+/// record and no deletion leaves one behind.
 fn expected_config(created: &Value, deleted: &[&str]) -> Value {
     let mut expected = created.clone();
     let members = expected
         .as_object_mut()
         .expect("a channel subtype config is an object");
-    let mut removed_any = false;
     for channel in deleted {
-        removed_any |= members.remove(member_of(channel)).is_some();
+        members.remove(member_of(channel));
     }
-    if removed_any && members.is_empty() {
+    if members.is_empty() {
         Value::Null
     } else {
         expected
@@ -292,11 +292,7 @@ async fn deleting_one_channel_subtype_leaves_every_other_part_of_the_campaign() 
             )
             .await;
             let before = describe(&router, region, &id, &case).await;
-            assert_eq!(
-                before["channelSubtypeConfig"], created,
-                "case {case:?}: expected the created config stored, got {}",
-                before["channelSubtypeConfig"]
-            );
+            assert_config(&before, &stored_config(&created), &case);
 
             let (status, body) = delete_subtype(&router, region, &id, target).await;
             assert_eq!(

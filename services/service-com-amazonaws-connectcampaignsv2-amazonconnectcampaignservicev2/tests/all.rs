@@ -27,6 +27,8 @@ mod campaign_communication_limits_deletion;
 mod campaign_communication_time_deletion;
 #[path = "all/campaign_communication_time_update.rs"]
 mod campaign_communication_time_update;
+#[path = "all/campaign_config_configuring_nothing.rs"]
+mod campaign_config_configuring_nothing;
 #[path = "all/campaign_configuration_is_one_rule.rs"]
 mod campaign_configuration_is_one_rule;
 #[path = "all/campaign_entry_limits.rs"]

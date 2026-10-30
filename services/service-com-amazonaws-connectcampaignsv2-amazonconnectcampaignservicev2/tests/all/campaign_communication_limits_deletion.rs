@@ -154,25 +154,23 @@ async fn describe(router: &MultiServiceRouter, region: &str, id: &str, case: &st
 
 /// The override the store should hold after deleting `config_type` from `created`:
 /// `created` minus that config's own member, and absent (`Value::Null`, the shape the
-/// projection carries for a member it does not hold) once a REMOVAL left no member
-/// behind. A delete that found no block for `config_type` removed nothing, so it writes
-/// nothing and `created` stays exactly as it was — an override carrying no block at all
-/// included.
+/// projection carries for a member it does not hold) once no member is left behind. A
+/// delete that found no block for `config_type` removed nothing, so it writes nothing
+/// and `created` stays exactly as it was — but an override holding no member at all
+/// overrides nothing, so a campaign created with one never carried it to begin with.
 fn expected_override(created: Option<&Value>, config_type: &str) -> Value {
     let Some(created) = created else {
         return Value::Null;
     };
     let mut expected = created.clone();
-    let removed = expected
+    expected
         .as_object_mut()
         .expect("a communication limits config is an object")
-        .remove(member_of(config_type))
-        .is_some();
-    if removed
-        && expected
-            .as_object()
-            .expect("a communication limits config is an object")
-            .is_empty()
+        .remove(member_of(config_type));
+    if expected
+        .as_object()
+        .expect("a communication limits config is an object")
+        .is_empty()
     {
         return Value::Null;
     }

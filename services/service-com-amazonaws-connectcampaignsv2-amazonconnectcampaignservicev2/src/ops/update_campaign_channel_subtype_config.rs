@@ -14,6 +14,11 @@
 //! Idempotent, as the model declares: the same config sent twice leaves the campaign
 //! exactly as the first call left it.
 //!
+//! Every member of `ChannelSubtypeConfig` is optional, so a config configuring no
+//! channel at all is a legal body: the campaign is then configured for no channel, which
+//! the record carries as no `channelSubtypeConfig` at all — the same state
+//! `DeleteCampaignChannelSubtypeConfig` leaves behind when the last channel block goes.
+//!
 //! The campaign's lifecycle state is not consulted: unlike the sibling configuration
 //! updates (`UpdateCampaignCommunicationTime`, `UpdateCampaignCommunicationLimits`),
 //! this operation models no `InvalidCampaignStateException`, so the update turns on the
@@ -214,8 +219,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one structure, so this is a replacement and not a merge: a channel the new
         // config leaves out is a channel the campaign is no longer configured for,
         // which is what `DescribeCampaign` and `ListCampaigns`' derived
-        // `channelSubtypes` report from then on.
-        campaign.channel_subtype_config = Some(input.channel_subtype_config);
+        // `channelSubtypes` report from then on. Every member of the config is
+        // optional, so the request can carry one configuring no channel at all; the
+        // record's one representation of that belongs to the store, which is why the
+        // write goes through it rather than assigning the member here.
+        campaign.set_channel_subtype_config(input.channel_subtype_config);
 
         Ok(UpdateCampaignChannelSubtypeConfigOutput)
     }

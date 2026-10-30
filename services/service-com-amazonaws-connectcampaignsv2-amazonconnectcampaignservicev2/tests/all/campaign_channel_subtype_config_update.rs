@@ -12,6 +12,9 @@
 //!   configured for — which is what every later read projects (`DescribeCampaign`, and
 //!   `ListCampaigns`' derived `channelSubtypes`), while every other member of the
 //!   campaign stays as it was;
+//! * every member of the config is optional, so a config configuring NO channel is a
+//!   legal body: the campaign then holds no `channelSubtypeConfig` at all, the one
+//!   representation of "configured for no channel" the removal path leaves behind too;
 //! * the operation is idempotent (`@idempotent` in the model, "This API is idempotent"
 //!   in its documentation): the same config sent twice leaves the campaign exactly as
 //!   the first call left it;
@@ -29,7 +32,7 @@ use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::sta
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, error_code, router, Harness};
+use super::common::{call, error_code, router, stored_config, Harness};
 
 // The fixtures below are this suite's own, as every suite in this crate keeps its own
 // (`campaign_communication_time_update`, `campaign_communication_limits`,
@@ -390,10 +393,10 @@ async fn an_update_replaces_the_whole_channel_subtype_config() {
         )
         .await;
         let before = describe(&router, region, &id, case).await;
+        let expected_created = created.as_ref().map_or(Value::Null, stored_config);
         assert_eq!(
-            before.get("channelSubtypeConfig"),
-            created.as_ref(),
-            "case {case:?}: expected the created config stored, got {:?}",
+            before["channelSubtypeConfig"], expected_created,
+            "case {case:?}: expected the created config stored as {expected_created}, got {:?}",
             before.get("channelSubtypeConfig")
         );
 
@@ -405,11 +408,14 @@ async fn an_update_replaces_the_whole_channel_subtype_config() {
         );
 
         // The stored config is the one the request carried, and nothing of the old one
-        // survives: a channel the update left out holds no block.
+        // survives: a channel the update left out holds no block. A config configuring
+        // no channel at all configures nothing, so the record then carries no
+        // `channelSubtypeConfig` rather than an empty one.
         let after = describe(&router, region, &id, case).await;
+        let expected = stored_config(&updated);
         assert_eq!(
-            after["channelSubtypeConfig"], updated,
-            "case {case:?}: expected {updated}, got {:?}",
+            after["channelSubtypeConfig"], expected,
+            "case {case:?}: expected {expected}, got {:?}",
             after["channelSubtypeConfig"]
         );
         for channel in CHANNEL_SUBTYPE_VALUES {
@@ -440,8 +446,8 @@ async fn an_update_replaces_the_whole_channel_subtype_config() {
         );
         let repeated = describe(&router, region, &id, case).await;
         assert_eq!(
-            repeated["channelSubtypeConfig"], updated,
-            "case {case:?}: expected the repeat to leave {updated}, got {:?}",
+            repeated["channelSubtypeConfig"], expected,
+            "case {case:?}: expected the repeat to leave {expected}, got {:?}",
             repeated["channelSubtypeConfig"]
         );
 

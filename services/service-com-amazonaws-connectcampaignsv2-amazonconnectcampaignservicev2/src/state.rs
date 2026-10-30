@@ -1146,6 +1146,52 @@ impl CampaignAction {
     }
 }
 
+/// A configuration structure every one of whose modelled members is optional, so a
+/// request can carry one that configures nothing at all.
+///
+/// The campaign record represents "configured for nothing" by the ABSENCE of the
+/// member it would hold, so one such structure is never stored: every writer asks
+/// [`configured`] what to store, and no reader has to tell a structure holding no
+/// member from a missing one.
+pub trait OptionalMembersOnly {
+    /// Whether this structure holds none of its modelled members.
+    fn holds_no_member(&self) -> bool;
+}
+
+impl OptionalMembersOnly for ChannelSubtypeConfig {
+    /// Every member of `ChannelSubtypeConfig` is a channel block, and the model marks
+    /// none of them `@required`, so a config holding no block is configured for no
+    /// channel.
+    fn holds_no_member(&self) -> bool {
+        self.email.is_none()
+            && self.sms.is_none()
+            && self.telephony.is_none()
+            && self.whats_app.is_none()
+    }
+}
+
+impl OptionalMembersOnly for CommunicationLimitsConfig {
+    /// `allChannelSubtypes` and `instanceLimitsHandling` are the whole of
+    /// `CommunicationLimitsConfig`, and the model marks neither `@required`, so an
+    /// override holding neither limits nothing.
+    fn holds_no_member(&self) -> bool {
+        self.all_channel_subtypes.is_none() && self.instance_limits_handling.is_none()
+    }
+}
+
+/// `config` as a record holds it: a structure holding no member at all holds nothing,
+/// so the record carries no member rather than an empty structure.
+///
+/// The one representation of "configured for nothing" on this service's records, so the
+/// write paths and the removal paths of one member cannot disagree about it.
+pub fn configured<C: OptionalMembersOnly>(config: C) -> Option<C> {
+    if config.holds_no_member() {
+        None
+    } else {
+        Some(config)
+    }
+}
+
 /// A campaign as stored: everything `CreateCampaign` was given, plus the server's
 /// own id, ARN, lifecycle state and creation instant.
 #[derive(Debug, Clone)]
@@ -1154,6 +1200,8 @@ pub struct StoredCampaign {
     pub arn: String,
     pub name: String,
     pub connect_instance_id: String,
+    /// Absent when the campaign is configured for no channel at all — the record's one
+    /// representation of that, which [`configured`] is what every writer gets it from.
     pub channel_subtype_config: Option<ChannelSubtypeConfig>,
     /// The modelled `type` member (`ExternalCampaignType`); `type` is a keyword.
     pub campaign_type: Option<String>,
@@ -1162,6 +1210,8 @@ pub struct StoredCampaign {
     pub schedule: Option<Schedule>,
     pub entry_limits_config: Option<EntryLimitsConfig>,
     pub communication_time_config: Option<CommunicationTimeConfig>,
+    /// Absent when the campaign overrides no communication limit at all — the same
+    /// representation [`Self::channel_subtype_config`] carries, from [`configured`].
     pub communication_limits_override: Option<CommunicationLimitsConfig>,
     /// Ordered so the tag map a response carries is built deterministically.
     pub tags: BTreeMap<String, String>,
@@ -1425,6 +1475,30 @@ impl StoredCampaign {
             .collect()
     }
 
+    /// Replace this campaign's channel subtype config with `config`.
+    ///
+    /// The config is ONE structure, so this is a replacement and not a merge: a channel
+    /// `config` leaves out is a channel the campaign is no longer configured for. A
+    /// config holding no channel block at all configures no channel, which the record
+    /// carries as no `channelSubtypeConfig` rather than as an empty one — the same
+    /// representation [`Self::clear_channel_subtype_config`] leaves behind when the last
+    /// block goes, so neither writer of the member can leave a state the other never
+    /// would.
+    pub fn set_channel_subtype_config(&mut self, config: ChannelSubtypeConfig) {
+        self.channel_subtype_config = configured(config);
+    }
+
+    /// Replace this campaign's communication limits override with `config`.
+    ///
+    /// The same replacement-and-not-merge rule as [`Self::set_channel_subtype_config`],
+    /// in the same one representation: an override holding neither of its members
+    /// overrides nothing, so the record carries no `communicationLimitsOverride` rather
+    /// than an empty one — what [`Self::clear_communication_limits`] leaves behind when
+    /// the last member goes.
+    pub fn set_communication_limits_override(&mut self, config: CommunicationLimitsConfig) {
+        self.communication_limits_override = configured(config);
+    }
+
     /// Remove the channel-subtype config block this campaign holds for the channel
     /// `channel_subtype` names.
     ///
@@ -1455,14 +1529,10 @@ impl StoredCampaign {
             _ => false,
         };
         // Only a removal collapses the config: a call that removed nothing writes
-        // nothing at all, so a campaign carrying a config with no channel in it keeps
-        // that config rather than losing it to a deletion that found nothing.
-        if removed
-            && config.email.is_none()
-            && config.sms.is_none()
-            && config.telephony.is_none()
-            && config.whats_app.is_none()
-        {
+        // nothing at all. The emptiness test is the one every writer of the member
+        // decides by ([`OptionalMembersOnly`]), so the record is left in the same one
+        // representation of "configured for no channel" whichever path wrote it.
+        if removed && config.holds_no_member() {
             self.channel_subtype_config = None;
         }
     }
@@ -1523,13 +1593,9 @@ impl StoredCampaign {
             _ => false,
         };
         // Only a removal collapses the override: a call that removed nothing writes
-        // nothing at all, so a campaign carrying an override with no block in it keeps
-        // that override rather than losing it to a deletion that found nothing — the
-        // same guard the sibling `clear_channel_subtype_config` collapses behind.
-        if removed
-            && config.all_channel_subtypes.is_none()
-            && config.instance_limits_handling.is_none()
-        {
+        // nothing at all — and the emptiness test is the shared one the sibling
+        // `clear_channel_subtype_config` and both update paths decide by.
+        if removed && config.holds_no_member() {
             self.communication_limits_override = None;
         }
     }
@@ -2408,11 +2474,27 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// already taken (see [`InsertRejected`]). The checks and the insert happen
     /// under the one lock the caller holds, so concurrent creates cannot both pass
     /// them — of two creates racing on one name, exactly one stores a campaign.
+    ///
+    /// The configuration the record carries is stored the way every other writer of it
+    /// stores it: see [`configured`].
     pub fn insert_new_campaign(
         &mut self,
         region: &str,
         campaign: StoredCampaign,
     ) -> Result<StoredCampaign, InsertRejected> {
+        // A record enters the store in the one representation of "configured for
+        // nothing" every other writer of these members uses: a config the create was
+        // given that holds no member at all configures nothing, so the record carries
+        // no member rather than an empty structure. This is the one place that holds
+        // for every create, so a campaign cannot be born carrying a config state the
+        // update and removal paths would never leave behind.
+        let mut campaign = campaign;
+        if let Some(config) = campaign.channel_subtype_config.take() {
+            campaign.set_channel_subtype_config(config);
+        }
+        if let Some(config) = campaign.communication_limits_override.take() {
+            campaign.set_communication_limits_override(config);
+        }
         // A campaign name identifies a campaign within its Connect instance, so a
         // record whose (instance, name) pair is already held is refused before any
         // capacity question: the resource it names exists, and taking a second one

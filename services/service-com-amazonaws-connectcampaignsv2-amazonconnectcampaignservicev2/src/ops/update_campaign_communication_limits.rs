@@ -7,6 +7,11 @@
 //! Writing the same config again is the same write, which is what makes the operation
 //! idempotent, as the model declares.
 //!
+//! Both members of `CommunicationLimitsConfig` are optional, so a config overriding
+//! nothing at all is a legal body: the campaign then overrides no limit, which the
+//! record carries as no `communicationLimitsOverride` at all — the same state
+//! `DeleteCampaignCommunicationLimits` leaves behind when the last member goes.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -250,7 +255,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The whole of the operation's effect: the campaign's communication limits
         // override is now the config the request carried, replacing whatever it held.
-        campaign.communication_limits_override = Some(input.communication_limits_override);
+        // Both members of the config are optional, so the request can carry one that
+        // overrides nothing at all; the record's one representation of that belongs to
+        // the store, which is why the write goes through it rather than assigning the
+        // member here.
+        campaign.set_communication_limits_override(input.communication_limits_override);
 
         Ok(UpdateCampaignCommunicationLimitsOutput)
     }

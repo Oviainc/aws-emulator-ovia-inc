@@ -280,6 +280,26 @@ pub async fn create_campaign_with(
         .to_string()
 }
 
+/// What a campaign record holds once `config` has been written to one of its optional
+/// configuration members (`channelSubtypeConfig`, `communicationLimitsOverride`): every
+/// member of those structures is optional, and a structure holding none of them
+/// configures nothing, so the record carries no member rather than an empty structure.
+/// `Value::Null` is what a projection reads as for a member it does not hold, so this is
+/// also what a suite compares a projection against.
+///
+/// The one place a suite normalises a configuration it sent, so the suites of the write
+/// paths and of the removal paths cannot disagree about that representation.
+pub fn stored_config(config: &Value) -> Value {
+    if config
+        .as_object()
+        .is_some_and(|members| members.is_empty())
+    {
+        Value::Null
+    } else {
+        config.clone()
+    }
+}
+
 /// The state `GetCampaignState` reports for `id`, asserting the read succeeded.
 pub async fn campaign_state(
     router: &MultiServiceRouter,
