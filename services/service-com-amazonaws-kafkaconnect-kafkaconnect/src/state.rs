@@ -1986,6 +1986,11 @@ fn settling_due(pending: Option<PendingChange>, now: Instant) -> bool {
 /// and the type its ARN reports it as, so the two can never name it differently.
 const CONNECTOR_OPERATION_KIND: &str = "connector-operation";
 
+/// The resource type a connector itself is named under: the kind its minted id
+/// is seeded with and the type its ARN's resource field opens with, so the mint
+/// and the ARN can never name it differently.
+pub const CONNECTOR_KIND: &str = "connector";
+
 /// The ARN of an operation against the connector `connector_arn` names, or
 /// `None` when that value is not a connector ARN this service minted.
 ///
@@ -1995,10 +2000,23 @@ const CONNECTOR_OPERATION_KIND: &str = "connector-operation";
 /// scope — with the `connector/<name>/<id>` resource re-typed
 /// `connector-operation/<name>/<id>` and the operation's own minted id
 /// appended.
+///
+/// The five fields come from the ONE shared ARN parse
+/// (`service_common::arn`), which ends the scope at the ARN's own field
+/// boundaries and the resource TYPE at the first separator of the resource
+/// field. A resource name is caller-supplied text — `connectorName` carries a
+/// `@length` and no `@pattern`, so a name may hold `:` and `/`, including the
+/// very `:connector/` this re-typing looks for — and text inside the name can
+/// never be read as a field boundary.
 pub fn connector_operation_arn(connector_arn: &str, operation_id: &str) -> Option<String> {
-    let (scope, resource) = connector_arn.rsplit_once(":connector/")?;
-    (!resource.is_empty())
-        .then(|| format!("{scope}:{CONNECTOR_OPERATION_KIND}/{resource}/{operation_id}"))
+    let arn = ::service_common::arn::parse_of(connector_arn, ARN_SERVICE)?;
+    let named = ::service_common::arn::resource_id_of_type(connector_arn, CONNECTOR_KIND)?;
+    (!named.is_empty()).then(|| {
+        format!(
+            "arn:{}:{}:{}:{}:{CONNECTOR_OPERATION_KIND}/{named}/{operation_id}",
+            arn.partition, arn.vendor, arn.region, arn.account
+        )
+    })
 }
 
 /// `at` as the `__timestampIso8601` the read operations carry.

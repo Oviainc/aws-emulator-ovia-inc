@@ -23,7 +23,10 @@
 //! pins that the two paths mint for one store alike.
 //!
 //! The sibling suites' request helpers are private to their own modules, so this
-//! one carries its own copies of the few it needs.
+//! one carries its own copies of the few it needs. The ARN the rule states is
+//! the exception: it comes from this crate's one grammar-derived statement of it
+//! (`super::connector_operation_arn_rule`), shared with the suite that spans the
+//! connector names a name may carry an ARN separator in.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -37,6 +40,8 @@ use service_com_amazonaws_kafkaconnect_kafkaconnect::state::{
     CONNECTOR_OPERATION_UPDATE_WORKER_SETTING, RESTART_PROGRESSION, TRANSITION_SPAN,
 };
 use service_com_amazonaws_kafkaconnect_kafkaconnect::EmulatedService;
+
+use super::connector_operation_arn_rule::{derived_operation_arn, last_segment};
 
 /// A SigV4 credential scope naming this service and the region every minted ARN
 /// carries. No authenticator is registered, so the signature is never checked.
@@ -137,22 +142,6 @@ fn is_uuid(value: &str) -> bool {
         })
         && groups[2].starts_with('4')
         && matches!(groups[3].as_bytes().first(), Some(b'8' | b'9' | b'a' | b'b'))
-}
-
-/// The ARN an operation of id `operation_id` against `connector_arn` must be
-/// reported under: the connector's own scope and resource, re-typed. The rule
-/// stated once, so every case is checked against it rather than against a
-/// literal.
-fn derived_operation_arn(connector_arn: &str, operation_id: &str) -> String {
-    let (scope, resource) = connector_arn.rsplit_once(":connector/").unwrap_or_else(|| {
-        panic!("a connector ARN carrying a connector/ resource, got {connector_arn:?}")
-    });
-    format!("{scope}:connector-operation/{resource}/{operation_id}")
-}
-
-/// The last `/`-separated segment of `arn`: the operation's own minted id.
-fn last_segment(arn: &str) -> &str {
-    arn.rsplit('/').next().unwrap_or_default()
 }
 
 /// The `CreateCustomPlugin` body for `name`.
@@ -336,7 +325,7 @@ async fn minted_operation_arn(
     );
     assert_eq!(
         operation_arn,
-        derived_operation_arn(connector_arn, &id),
+        derived_operation_arn(case, connector_arn, &id),
         "case {case:?}: expected the operation ARN derived from {connector_arn:?}, got \
          {operation_arn:?}"
     );

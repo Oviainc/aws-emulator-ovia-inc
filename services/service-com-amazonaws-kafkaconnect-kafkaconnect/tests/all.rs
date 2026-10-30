@@ -23,6 +23,10 @@ mod connector_capacity_and_worker_configuration;
 mod connector_dependency_deletes;
 #[path = "all/connector_not_running_is_one_rule.rs"]
 mod connector_not_running_is_one_rule;
+#[path = "all/connector_operation_arn_rule.rs"]
+mod connector_operation_arn_rule;
+#[path = "all/connector_operation_arn_spans_connector_names.rs"]
+mod connector_operation_arn_spans_connector_names;
 #[path = "all/connector_operation_minting_is_one_rule.rs"]
 mod connector_operation_minting_is_one_rule;
 #[path = "all/connector_operation_window.rs"]

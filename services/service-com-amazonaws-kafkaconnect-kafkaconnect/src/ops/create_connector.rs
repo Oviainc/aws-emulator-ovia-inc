@@ -424,11 +424,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let id = state.mint_resource_id("connector", &input.connector_name);
+        let id = state.mint_resource_id(crate::state::CONNECTOR_KIND, &input.connector_name);
         let arn = ::engine::emulator_arn(
             crate::state::ARN_SERVICE,
             &region,
-            &format!("connector/{}/{}", input.connector_name, id),
+            &format!(
+                "{}/{}/{}",
+                crate::state::CONNECTOR_KIND,
+                input.connector_name,
+                id
+            ),
         );
         let connector = crate::state::ConnectorRecord {
             arn: arn.clone(),
