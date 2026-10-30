@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutVectorBucketDefaultIndexMode
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutVectorBucketDefaultIndexMode`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutVectorBucketDefaultIndexMode::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -87,9 +77,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3vectors-s3vectors.jso
 // here — hence the `PutVectorBucketDefaultIndexModeError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3vectors#PutVectorBucketDefaultIndexMode")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3vectors#PutVectorBucketDefaultIndexMode",
+    extra_errors = ["ValidationException", "AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum PutVectorBucketDefaultIndexModeErrorModeled {
+    ValidationException(ValidationException),
+    AccessDeniedException(AccessDeniedException),
     NotFoundException(NotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
@@ -145,18 +140,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutVectorBucketDefaultIndexMode` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutVectorBucketDefaultIndexModeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutVectorBucketDefaultIndexMode"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutVectorBucketDefaultIndexModeErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let bucket_name = crate::state::resolve_bucket_name(
+            input.vector_bucket_name.as_deref(),
+            input.vector_bucket_arn.as_deref(),
+        )
+        .map_err(refusal)?;
+
+        // Who the request speaks for, resolved before this service's own store is
+        // locked, so only one store is ever held at a time.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
+        let mut store = state.lock();
+
+        // The vector bucket's own resource policy decides this call before it changes
+        // anything: an explicit Deny of the action refuses it. Resolving the target is
+        // also what refuses a bucket this account does not hold.
+        if let Some(message) = store
+            .authorization_target(&bucket_name, None)
+            .map_err(refusal)?
+            .refusal(&caller, &[Self::NAME])
+        {
+            return Err(PutVectorBucketDefaultIndexModeErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
+
+        // The mode REPLACES the bucket's default and nothing else: "the updated default
+        // applies to vector indexes that you create after the request succeeds. The
+        // operation doesn't change existing vector indexes" — so every index the bucket
+        // already holds keeps the mode it was created with. The model marks this
+        // operation `@idempotent`, and a put of the mode the bucket already carries is
+        // exactly that: the same state, answered the same way.
+        store
+            .bucket_mut(&bucket_name)
+            .map_err(refusal)?
+            .default_index_mode = input.default_index_mode;
+
+        Ok(PutVectorBucketDefaultIndexModeOutput {})
+    }
+}
+
+/// Lift a refusal from `crate::state` into this operation's modelled error channel.
+fn refusal(error: crate::state::LookupError) -> PutVectorBucketDefaultIndexModeError {
+    if error.is_not_found() {
+        PutVectorBucketDefaultIndexModeErrorModeled::NotFoundException(error.not_found_exception())
+            .into()
+    } else {
+        PutVectorBucketDefaultIndexModeErrorModeled::ValidationException(
+            error.validation_exception(),
+        )
+        .into()
     }
 }

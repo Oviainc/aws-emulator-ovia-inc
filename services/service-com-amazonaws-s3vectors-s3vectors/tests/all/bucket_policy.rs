@@ -5,14 +5,18 @@
 //! `restJson1` wire through the router production uses.
 //!
 //! The rule under test: a vector bucket holds AT MOST ONE policy document, which a
-//! put stores verbatim (replacing any earlier one) once it is a policy document by
-//! the IAM policy grammar, a get reports verbatim, and a delete removes — and a get
-//! of a bucket that carries no policy is the modelled 404, not an empty success.
+//! put stores (replacing any earlier one) once it is a policy document by the IAM
+//! policy grammar, a get reports, and a delete removes — and a get of a bucket that
+//! carries no policy is the modelled 404, not an empty success. The document the
+//! service reports is its own rendering of the submitted one (see
+//! `policy_document_bytes.rs`), which `service_common::iam_policy_rendering::rendered`
+//! states once for every service that reports a policy.
 //! Each table row states the case it covers and every assertion reports the actual
 //! value.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_s3vectors_s3vectors::state::MAX_POLICY_BYTES;
+use service_common::iam_policy_rendering::rendered;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::vector_lifecycle::{call, error_code, expected_bucket_arn, ok, router};
@@ -74,7 +78,8 @@ fn policy_of_size(bytes: usize) -> String {
     policy
 }
 
-/// Policy documents a put must accept and a get must report back unchanged.
+/// Policy documents a put must accept and a get must report back in the service's own
+/// rendering of them.
 ///
 /// Every row is a policy document by the AWS IAM JSON policy grammar (the IAM
 /// reference's "Grammar of the IAM JSON policy language": a `Version`/`Id`/
@@ -190,18 +195,19 @@ fn accepted_policies() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Every accepted policy document round-trips verbatim through put and get, and the
-/// bucket keeps exactly the last one put.
+/// Every accepted policy document round-trips through put and get as the service
+/// renders it, and the bucket keeps exactly the last one put.
 #[tokio::test]
-async fn every_accepted_policy_document_round_trips_verbatim() {
+async fn every_accepted_policy_document_round_trips_as_the_service_renders_it() {
     let router = with_bucket("policy-roundtrip").await;
 
     for (case, policy) in accepted_policies() {
         put_policy(&router, "policy-roundtrip", &policy).await;
         let reported = get_policy(&router, "policy-roundtrip").await;
+        let expected = rendered(&policy);
         assert_eq!(
-            reported, policy,
-            "case {case:?}: the policy must be reported exactly as it was put, got {reported:?}"
+            reported, expected,
+            "case {case:?}: expected {expected:?}, got {reported:?}"
         );
     }
 }
@@ -422,13 +428,15 @@ async fn a_policy_belongs_to_exactly_one_bucket() {
     let policies = accepted_policies();
     let (_, one) = policies[0].clone();
     let (_, two) = policies[3].clone();
+    let one_reported = rendered(&one);
+    let two_reported = rendered(&two);
     put_policy(&router, "policy-bucket-one", &one).await;
     put_policy(&router, "policy-bucket-two", &two).await;
     put_policy(&router, "policy-bucket-gone", &one).await;
 
     for (case, bucket, expected) in [
-        ("first bucket", "policy-bucket-one", &one),
-        ("second bucket", "policy-bucket-two", &two),
+        ("first bucket", "policy-bucket-one", &one_reported),
+        ("second bucket", "policy-bucket-two", &two_reported),
     ] {
         let reported = get_policy(&router, bucket).await;
         assert_eq!(
@@ -446,7 +454,7 @@ async fn a_policy_belongs_to_exactly_one_bucket() {
     .await;
     let reported = get_policy(&router, "policy-bucket-two").await;
     assert_eq!(
-        &reported, &two,
+        &reported, &two_reported,
         "deleting one bucket's policy must not touch another's, got {reported:?}"
     );
 

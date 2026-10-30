@@ -269,6 +269,11 @@ pub mod iam_client;
 /// API takes one as a string and has to decide whether to accept it — so two services
 /// handed the same document cannot disagree about whether it is a policy at all.
 pub mod iam_policy;
+/// The ONE rendering of an IAM resource-based policy document a service stores and reports
+/// back — the whitespace between its JSON tokens dropped and a one-element string array
+/// written as the string it names — so no two services report one policy's bytes
+/// differently.
+pub mod iam_policy_rendering;
 /// The ONE resolution of an identity a resource-based policy grants to against this
 /// account's IAM, for every service that resolves a policy document's principals before it
 /// stores it.

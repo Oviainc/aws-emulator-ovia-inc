@@ -154,12 +154,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(refusal)?;
         crate::state::validate_bucket_policy(&input.policy).map_err(refusal)?;
 
+        // The document is stored as the service reports it back: the service's own
+        // rendering of the policy it was handed, not the bytes the request happened to
+        // spell it in, so the bytes a later read answers are decided once, here.
+        let policy = ::service_common::iam_policy_rendering::rendered(&input.policy);
+
         // The policy REPLACES whatever the bucket carried: this operation "creates a
         // bucket policy for a vector bucket", a bucket has at most one policy, and
         // nothing in the request names a statement to merge into an existing one.
         let mut store = state.lock();
         let bucket = store.bucket_mut(&bucket_name).map_err(refusal)?;
-        bucket.policy = Some(input.policy);
+        bucket.policy = Some(policy);
 
         Ok(PutVectorBucketPolicyOutput {})
     }

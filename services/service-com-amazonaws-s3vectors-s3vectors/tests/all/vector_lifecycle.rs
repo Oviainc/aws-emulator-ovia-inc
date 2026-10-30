@@ -1814,17 +1814,11 @@ async fn a_target_must_be_named_by_exactly_one_accepted_form() {
 async fn the_operations_outside_this_slice_still_answer_501() {
     let router = with_index("stub-bucket", "stub-index", 2, "cosine").await;
 
-    let cases: Vec<(&str, Value)> = vec![
-        (
-            "UpdateIndexMode",
-            json!({ "vectorBucketName": "stub-bucket", "indexName": "stub-index",
-                    "indexMode": "ENHANCED" }),
-        ),
-        (
-            "PutVectorBucketDefaultIndexMode",
-            json!({ "vectorBucketName": "stub-bucket", "defaultIndexMode": "ENHANCED" }),
-        ),
-    ];
+    let cases: Vec<(&str, Value)> = vec![(
+        "UpdateIndexMode",
+        json!({ "vectorBucketName": "stub-bucket", "indexName": "stub-index",
+                "indexMode": "ENHANCED" }),
+    )];
 
     for (operation, request) in cases {
         let (status, body) = call(&router, operation, &request).await;

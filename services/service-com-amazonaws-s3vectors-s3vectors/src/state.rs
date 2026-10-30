@@ -59,6 +59,17 @@ pub const KMS_KEY_ARN_REQUIRED: &str =
 pub const KMS_KEY_ARN_NOT_ALLOWED: &str =
     "kmsKeyArn is not allowed when sseType is not set to aws:kms";
 
+/// The `IndexMode` a vector bucket's default carries from the moment it is created,
+/// and so the mode every vector index created in that bucket inherits.
+///
+/// `VectorBucket$defaultIndexMode` is "the mode that is automatically assigned to new
+/// vector indexes in the vector bucket": the assignment is the SERVICE's, not the
+/// caller's — neither CreateVectorBucket nor CreateIndex takes a mode — so a bucket
+/// that has never been handed one still has this default, and reports it. The model's
+/// `IndexMode` enum holds `CLASSIC` and `ENHANCED`; this is the one the real service
+/// answered for a freshly created vector bucket in the recorded response.
+pub const DEFAULT_INDEX_MODE: &str = "ENHANCED";
+
 /// `DistanceMetric` values, from the model's enum (`cosine`, `euclidean`).
 pub const DISTANCE_METRIC_COSINE: &str = "cosine";
 /// See [`DISTANCE_METRIC_COSINE`].
@@ -166,11 +177,14 @@ pub struct VectorBucketRecord {
     pub arn: String,
     pub creation_time: SystemTime,
     pub encryption: EncryptionRecord,
-    /// `None` until PutVectorBucketDefaultIndexMode sets one; a new index
-    /// inherits it.
-    pub default_index_mode: Option<String>,
-    /// The bucket policy document, exactly as PutVectorBucketPolicy was given
-    /// it. `None` until a policy is put, and `None` again once
+    /// The mode new vector indexes in this bucket are assigned, which every read of
+    /// the bucket reports. [`DEFAULT_INDEX_MODE`] from the moment the bucket is
+    /// created, until PutVectorBucketDefaultIndexMode replaces it.
+    pub default_index_mode: String,
+    /// The bucket policy document as PutVectorBucketPolicy was given it, in the form
+    /// the service renders a policy it reports back
+    /// ([`::service_common::iam_policy_rendering::rendered`]). `None` until a policy is
+    /// put, and `None` again once
     /// DeleteVectorBucketPolicy removes it; GetVectorBucketPolicy answers
     /// `NotFoundException` while it is `None`.
     pub policy: Option<String>,
@@ -191,7 +205,10 @@ pub struct VectorIndexRecord {
     /// Metadata keys that may be read back but not filtered on.
     pub non_filterable_metadata_keys: Option<Vec<String>>,
     pub encryption: EncryptionRecord,
-    pub index_mode: Option<String>,
+    /// The mode this index processes queries in, which every read of the index
+    /// reports. Inherited from the bucket's [`VectorBucketRecord::default_index_mode`]
+    /// when the index is created, since CreateIndex takes no mode of its own.
+    pub index_mode: String,
     /// Vectors by key. A `BTreeMap` so ListVectors order, its `nextToken`
     /// cursor and its segment partition are deterministic.
     pub vectors: BTreeMap<String, StoredVector>,
@@ -926,13 +943,16 @@ pub fn encryption_view(record: &EncryptionRecord) -> EncryptionConfiguration {
 }
 
 /// The stored bucket as the modelled `VectorBucket` shape GetVectorBucket returns.
+///
+/// `defaultIndexMode` is reported by every read: the service assigns it when the
+/// bucket is created, so there is no state of a bucket in which it is absent.
 pub fn bucket_view(record: &VectorBucketRecord) -> VectorBucket {
     VectorBucket {
         vector_bucket_name: record.name.clone(),
         vector_bucket_arn: record.arn.clone(),
         creation_time: ::aws_smithy_types::DateTime::from(record.creation_time),
         encryption_configuration: Some(encryption_view(&record.encryption)),
-        default_index_mode: record.default_index_mode.clone(),
+        default_index_mode: Some(record.default_index_mode.clone()),
     }
 }
 
@@ -946,6 +966,9 @@ pub fn bucket_summary_view(record: &VectorBucketRecord) -> VectorBucketSummary {
 }
 
 /// The stored index as the modelled `Index` shape GetIndex returns.
+///
+/// `indexMode` is reported by every read, for the same reason `defaultIndexMode` is
+/// (see [`bucket_view`]): the index is assigned one when it is created.
 pub fn index_view(record: &VectorIndexRecord) -> Index {
     Index {
         vector_bucket_name: record.bucket_name.clone(),
@@ -961,7 +984,7 @@ pub fn index_view(record: &VectorIndexRecord) -> Index {
             }
         }),
         encryption_configuration: Some(encryption_view(&record.encryption)),
-        index_mode: record.index_mode.clone(),
+        index_mode: Some(record.index_mode.clone()),
     }
 }
 

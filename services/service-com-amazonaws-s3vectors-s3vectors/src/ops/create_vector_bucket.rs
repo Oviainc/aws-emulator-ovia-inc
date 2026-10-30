@@ -210,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn: arn.clone(),
                 creation_time: ::std::time::SystemTime::now(),
                 encryption,
-                default_index_mode: None,
+                default_index_mode: crate::state::DEFAULT_INDEX_MODE.to_string(),
                 policy: None,
                 indexes: ::std::collections::BTreeMap::new(),
             },

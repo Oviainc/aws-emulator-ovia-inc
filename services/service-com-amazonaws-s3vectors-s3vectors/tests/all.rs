@@ -15,8 +15,12 @@
 mod bucket_policy;
 #[path = "all/bucket_policy_enforcement.rs"]
 mod bucket_policy_enforcement;
+#[path = "all/index_mode.rs"]
+mod index_mode;
 #[path = "all/modelled_input_validation.rs"]
 mod modelled_input_validation;
+#[path = "all/policy_document_bytes.rs"]
+mod policy_document_bytes;
 #[path = "all/policy_not_found_message.rs"]
 mod policy_not_found_message;
 #[path = "all/query_candidate_slots.rs"]
