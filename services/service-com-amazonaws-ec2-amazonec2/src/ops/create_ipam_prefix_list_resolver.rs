@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIpamPrefixListResolver
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIpamPrefixListResolver`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIpamPrefixListResolver::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an IPAM prefix list resolver and STORES it: the IPAM it selects CIDRs from is
+//! resolved in this service's state
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::ipams`]), the resolver and the CIDR
+//! selection rules it was created with are written through the one writer of that store, and
+//! `CreateIpamPrefixListResolverTarget` resolves its `IpamPrefixListResolverId` against it.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +156,336 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIpamPrefixListResolver` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIpamPrefixListResolverErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIpamPrefixListResolver"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — a resolver
+        // belongs to its IPAM, so "the Amazon Web Services Region where the associated IPAM is
+        // located" (`IpamPrefixListResolver$IpamRegion`) comes from the stored IPAM rather than
+        // from the Region this call was signed for. The store is reached through the engine
+        // held on `self`.
+        let _ = ctx;
+
+        // The request's own FORM first, before anything is resolved and before the DryRun arm
+        // below: "not an IPAM id at all" is a malformed request rather than an IPAM that does
+        // not exist, which is the order every resource of this crate asks the two questions in
+        // (`crate::state::require_well_formed_id`).
+        let ipam_id = input.ipam_id.as_str();
+        state::require_well_formed_id(
+            state::IPAM_ID_PREFIX,
+            ipam_id,
+            state::INVALID_IPAM_ID_MALFORMED,
+        )?;
+
+        // "A unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`CreateIpamPrefixListResolverRequest$ClientToken`): the token map keeps
+        // whatever it is given for the process's lifetime, so its length is bounded the way
+        // every other create in this crate bounds it.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        // "The CIDR selection rules for the resolver … You can create a prefix list resolver
+        // without any CIDR selection rules" (`CreateIpamPrefixListResolverRequest$Rules`): the
+        // rules are optional, and the ones a request names are kept for the resolver's
+        // lifetime, so their COUNT is bounded before any work proportional to it.
+        let requested_rules: &[IpamPrefixListResolverRuleRequest] =
+            input.rules.as_deref().unwrap_or_default();
+        if requested_rules.len() > state::MAX_IPAM_PREFIX_LIST_RESOLVER_RULES {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {} CIDR selection rules, above the maximum of {max}",
+                requested_rules.len(),
+                max = state::MAX_IPAM_PREFIX_LIST_RESOLVER_RULES,
+            )));
+        }
+        let rules: Vec<IpamPrefixListResolverRule> = requested_rules
+            .iter()
+            .map(read_rule)
+            .collect::<Result<_, _>>()?;
+
+        // "The tags to apply to the IPAM prefix list resolver during creation"
+        // (`CreateIpamPrefixListResolverRequest$TagSpecifications`): the resolver is the only
+        // resource this call creates, so a specification naming any other resource type is
+        // refused rather than accepted and discarded — by the one helper every create in this
+        // crate bounds its tag payload with.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_IPAM_PREFIX_LIST_RESOLVER,
+            Self::NAME,
+        )?;
+
+        // The caller-chosen bytes this create would retain for the process's lifetime, asked of
+        // the store below: a COUNT ceiling admits megabytes on its own, because each record
+        // holds strings the caller chose the length of.
+        let payload_bytes = state::STORED_RECORD_OVERHEAD_BYTES
+            + state::tag_list_bytes(&tags)
+            + input.description.as_deref().unwrap_or_default().len()
+            + input.client_token.as_deref().unwrap_or_default().len()
+            + state::ipam_prefix_list_resolver_rule_bytes(&rules);
+
+        // "A check for whether you have the required permissions for the action WITHOUT
+        // ACTUALLY MAKING THE REQUEST" (`CreateIpamPrefixListResolverRequest$DryRun`): the flag
+        // asks about PERMISSION, not about the resources the request names, so it is answered
+        // once the request's own form has been checked and before anything is resolved — the
+        // same place the IPAM creates beside this one answer it. Every caller of this emulator
+        // is permitted, and nothing is stored.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first, the way every other state-touching handler in this crate starts: a
+        // resolver whose `create-complete` move has fallen due is already in that state, so a
+        // `ClientToken` replay below answers the resolver as it ACTUALLY stands rather than as
+        // the create left it.
+        store.materialize_due_transitions();
+
+        // "The ID of the IPAM that will serve as the source of the IP address database for
+        // CIDR selection" (`CreateIpamPrefixListResolverRequest$IpamId`): an IPAM this account
+        // holds none of is refused with the IPAM's own `NotFound` code, and the resolver's IPAM
+        // ARN and Region are then taken from that IPAM rather than from the request — a
+        // resolver cannot report an IPAM the store does not hold.
+        let ipam = store
+            .ipams
+            .get(ipam_id)
+            .cloned()
+            .ok_or_else(|| state::invalid_ipam_id_not_found(ipam_id))?;
+
+        // "The ID of the IPAM scope from which to select CIDRs"
+        // (`IpamPrefixListResolverRuleRequest$IpamScopeId`): a rule selecting from a scope the
+        // account holds none of selects from nothing, so it is refused with the scope's own
+        // `NotFound` code rather than stored.
+        if let Some(unknown) = rules
+            .iter()
+            .filter_map(|rule| rule.ipam_scope_id.as_deref())
+            .find(|scope_id| !store.ipam_scopes.contains_key(*scope_id))
+        {
+            return Err(state::invalid_ipam_scope_id_not_found(unknown));
+        }
+
+        // Idempotency: one token names the one resolver it minted, so a replay reports that
+        // resolver and creates nothing.
+        if let Some(resolver_id) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.ipam_prefix_list_resolver_client_tokens.get(token).cloned())
+        {
+            let resolver = store
+                .ipam_prefix_list_resolvers
+                .get(&resolver_id)
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "a client token names IPAM prefix list resolver '{resolver_id}', which \
+                         is not stored"
+                    ))
+                })?;
+            let stored_rules = store
+                .ipam_prefix_list_resolver_rules
+                .get(&resolver_id)
+                .cloned()
+                .unwrap_or_default();
+            // A token is only idempotent for the REQUEST it was first given with: replayed
+            // with different parameters it names a resolver the caller did not ask for, which
+            // EC2 refuses rather than answers.
+            if !same_request(
+                resolver,
+                &stored_rules,
+                &ipam,
+                input.description.as_deref(),
+                input.address_family.as_str(),
+                &tags,
+                &rules,
+            ) {
+                return Err(state::idempotent_parameter_mismatch());
+            }
+            return Ok(CreateIpamPrefixListResolverOutput {
+                ipam_prefix_list_resolver: Some(resolver.clone()),
+            });
+        }
+
+        // The store's ceilings, asked before the first write: nothing in this emulator reclaims
+        // a resolver, so both the COUNT of records and the caller-chosen BYTES they retain are
+        // bounded.
+        if !store.has_ipam_prefix_list_resolver_capacity() {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {max} IPAM prefix list resolvers, which is as many as it \
+                 stores",
+                max = state::MAX_STORED_RECORDS_PER_STORE,
+            )));
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, so \
+                 it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        let view = IpamPrefixListResolver {
+            // Taken from the IPAM the resolver selects CIDRs from: "the Amazon Resource Name
+            // (ARN) of the IPAM associated with this resolver"
+            // (`IpamPrefixListResolver$IpamArn`) and "the Amazon Web Services Region where the
+            // associated IPAM is located" (`IpamPrefixListResolver$IpamRegion`), which is that
+            // IPAM's home Region.
+            ipam_arn: ipam.ipam_arn.clone(),
+            ipam_region: ipam.ipam_region.clone(),
+            // What the request decided: "the address family for the IPAM prefix list resolver"
+            // (`CreateIpamPrefixListResolverRequest$AddressFamily`, the modelled `AddressFamily`
+            // enum, so a spelling outside it was refused before this handler ran) and "a
+            // description for the IPAM prefix list resolver"
+            // (`CreateIpamPrefixListResolverRequest$Description`).
+            address_family: Some(input.address_family.clone()),
+            description: input.description.clone(),
+            tags: Some(tags),
+            // "The status for the last time a version was created"
+            // (`IpamPrefixListResolver$LastVersionCreationStatus`) and its message: no version
+            // has been created for a resolver this call is still creating, so there is no last
+            // time to report.
+            last_version_creation_status: None,
+            last_version_creation_status_message: None,
+            // Derived by the store's one writer: the id, the ARN, the owning account and the
+            // `create-in-progress` state the resolver starts in.
+            ipam_prefix_list_resolver_id: None,
+            ipam_prefix_list_resolver_arn: None,
+            owner_id: None,
+            state: None,
+        };
+
+        let resolver_id = store
+            .insert_creating_ipam_prefix_list_resolver(
+                input.client_token.as_deref(),
+                rules,
+                view,
+            )
+            .ok_or_else(|| {
+                state::resource_limit_exceeded(format!(
+                    "This emulator holds {max} IPAM prefix list resolvers, which is as many as \
+                     it stores",
+                    max = state::MAX_STORED_RECORDS_PER_STORE,
+                ))
+            })?;
+
+        // Read the answer back OUT of the store, so the caller sees the resolver a later reader
+        // will see rather than the request object.
+        store
+            .ipam_prefix_list_resolvers
+            .get(&resolver_id)
+            .cloned()
+            .map(|resolver| CreateIpamPrefixListResolverOutput {
+                ipam_prefix_list_resolver: Some(resolver),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly created IPAM prefix list resolver '{resolver_id}' could not be \
+                     read back"
+                ))
+            })
     }
+}
+
+/// One requested CIDR selection rule as the resolver reports it, with every value the request
+/// may not name checked first.
+///
+/// "CIDR selection rules define the business logic for selecting CIDRs from IPAM. If a CIDR
+/// matches any of the rules, it will be included. If a rule has multiple conditions, the CIDR
+/// has to match every condition of that rule"
+/// (`CreateIpamPrefixListResolverRequest$Rules`) — so a rule is STORED as given once its own
+/// values are values: a `StaticCidr` is "a fixed list of CIDRs"
+/// (`IpamPrefixListResolverRuleRequest$StaticCidr`) and a condition's `Cidr` is an address
+/// prefix too, both read by the one CIDR reader this crate keeps
+/// (`crate::state::cidr_block_is_well_formed`). The rule type, the resource type and a
+/// condition's operation are modelled enums, so a spelling outside them was refused before
+/// this handler ran, and the IPAM scope a rule names is resolved against the store by the
+/// caller.
+fn read_rule(
+    requested: &IpamPrefixListResolverRuleRequest,
+) -> Result<IpamPrefixListResolverRule, CreateIpamPrefixListResolverError> {
+    if let Some(cidr) = requested
+        .static_cidr
+        .as_deref()
+        .filter(|cidr| !crate::state::cidr_block_is_well_formed(cidr))
+    {
+        return Err(crate::state::invalid_parameter_value(format!(
+            "Invalid value '{cidr}' for StaticCidr. It must be an address prefix in CIDR \
+             notation"
+        )));
+    }
+    let mut conditions: Vec<IpamPrefixListResolverRuleCondition> = Vec::new();
+    for condition in requested.conditions.iter().flatten() {
+        if let Some(cidr) = condition
+            .cidr
+            .as_deref()
+            .filter(|cidr| !crate::state::cidr_block_is_well_formed(cidr))
+        {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "Invalid value '{cidr}' for Cidr. It must be an address prefix in CIDR notation"
+            )));
+        }
+        conditions.push(IpamPrefixListResolverRuleCondition {
+            operation: Some(condition.operation.clone()),
+            ipam_pool_id: condition.ipam_pool_id.clone(),
+            resource_id: condition.resource_id.clone(),
+            resource_owner: condition.resource_owner.clone(),
+            resource_region: condition.resource_region.clone(),
+            resource_tag: condition.resource_tag.as_ref().map(|tag| IpamResourceTag {
+                key: tag.key.clone(),
+                value: tag.value.clone(),
+            }),
+            cidr: condition.cidr.clone(),
+        });
+    }
+    Ok(IpamPrefixListResolverRule {
+        rule_type: Some(requested.rule_type.clone()),
+        static_cidr: requested.static_cidr.clone(),
+        ipam_scope_id: requested.ipam_scope_id.clone(),
+        resource_type: requested.resource_type.clone(),
+        conditions: Some(conditions),
+    })
+}
+
+/// Does `resolver`, with the `stored_rules` it was created with — the resolver a replayed
+/// `ClientToken` names — hold what THIS request asks for?
+///
+/// Every member the request decides is compared, so a token replayed with any different
+/// parameter is refused with `IdempotentParameterMismatch` rather than answered with a resolver
+/// the caller did not ask for; the same contract `create_ipam_scope`'s `same_request` has for a
+/// scope. The members this service derives (the id, the ARN, the owner, the state and the
+/// version creation status) are not compared: they follow from the ones that are.
+fn same_request(
+    resolver: &IpamPrefixListResolver,
+    stored_rules: &[IpamPrefixListResolverRule],
+    ipam: &Ipam,
+    description: Option<&str>,
+    address_family: &str,
+    tags: &[Tag],
+    rules: &[IpamPrefixListResolverRule],
+) -> bool {
+    let tag_pairs = |tags: &[Tag]| {
+        let mut pairs: Vec<(Option<String>, Option<String>)> = tags
+            .iter()
+            .map(|tag| (tag.key.clone(), tag.value.clone()))
+            .collect();
+        pairs.sort();
+        pairs
+    };
+    // A rule is compared by the values it carries, in the order the request named them: the
+    // order decides nothing about which CIDRs are selected, but two requests naming different
+    // orders are still different requests.
+    let rule_values = |rules: &[IpamPrefixListResolverRule]| -> Vec<String> {
+        rules.iter().map(|rule| format!("{rule:?}")).collect()
+    };
+    resolver.ipam_arn == ipam.ipam_arn
+        && resolver.description.as_deref() == description
+        && resolver.address_family.as_deref() == Some(address_family)
+        && tag_pairs(resolver.tags.as_deref().unwrap_or_default()) == tag_pairs(tags)
+        && rule_values(stored_rules) == rule_values(rules)
 }

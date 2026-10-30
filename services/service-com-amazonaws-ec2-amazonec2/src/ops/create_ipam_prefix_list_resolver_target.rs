@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIpamPrefixListResolverTarget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIpamPrefixListResolverTarget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIpamPrefixListResolverTarget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the association between a customer-managed prefix list and an IPAM prefix list
+//! resolver, and STORES it: the resolver and the prefix list are resolved in this service's
+//! state ([`crate::state::ComAmazonawsEc2Amazonec2State::ipam_prefix_list_resolvers`],
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::managed_prefix_lists`]), the target is
+//! written through the one writer of that store, and
+//! `DescribeIpamPrefixListResolverTargets` reads it back.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +162,278 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIpamPrefixListResolverTarget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIpamPrefixListResolverTargetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIpamPrefixListResolverTarget"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — a target
+        // names the Region its prefix list is in itself ("The Amazon Web Services Region
+        // where the prefix list is located. This is required when referencing a prefix list in
+        // a different Region", `CreateIpamPrefixListResolverTargetRequest$PrefixListRegion`),
+        // so nothing here follows the Region this call was signed for. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+
+        // The request's own FORM first, before anything is resolved and before the DryRun arm
+        // below: "not an id of this kind at all" is a fact about the request, while "no such
+        // resource" is a fact about the account — the order every resource of this crate asks
+        // the two questions in (`crate::state::require_well_formed_id`). Only the PREFIX LIST
+        // id can be asked that first question: `pl-` and 8 or 17 hexadecimal digits are the
+        // forms AWS's own prefix list ids take (`crate::state::PREFIX_LIST_ID_PREFIX`), while
+        // the model publishes no pattern for `IpamPrefixListResolverId` (a plain `String`) and
+        // the form this emulator mints one in is its OWN — so holding a caller's resolver id to
+        // it would refuse an id the real service resolves. The only honest question about a
+        // resolver id is therefore whether the account holds that resolver, which the store
+        // answers below.
+        let resolver_id = input.ipam_prefix_list_resolver_id.as_str();
+        let prefix_list_id = input.prefix_list_id.as_str();
+        state::require_well_formed_id(
+            state::PREFIX_LIST_ID_PREFIX,
+            prefix_list_id,
+            state::INVALID_PREFIX_LIST_ID_MALFORMED,
+        )?;
+
+        // "The Amazon Web Services Region where the prefix list is located"
+        // (`CreateIpamPrefixListResolverTargetRequest$PrefixListRegion`): a value that is not
+        // a Region code at all names no Region a prefix list could be in, read by the one
+        // grammar this crate holds Region codes to (`crate::state::region_name_is_well_formed`,
+        // which `CreateIpamPool` holds its own `Locale` to).
+        let prefix_list_region = input.prefix_list_region.as_str();
+        if !state::region_name_is_well_formed(prefix_list_region) {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{prefix_list_region}' for PrefixListRegion. It must be an \
+                 Amazon Web Services Region"
+            )));
+        }
+
+        // "A unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`CreateIpamPrefixListResolverTargetRequest$ClientToken`): the token map
+        // keeps whatever it is given for the process's lifetime, so its length is bounded the
+        // way every other create in this crate bounds it.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        // "The tags to apply to the IPAM prefix list resolver target during creation"
+        // (`CreateIpamPrefixListResolverTargetRequest$TagSpecifications`): the target is the
+        // only resource this call creates, so a specification naming any other resource type is
+        // refused rather than accepted and discarded — by the one helper every create in this
+        // crate bounds its tag payload with.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_IPAM_PREFIX_LIST_RESOLVER_TARGET,
+            Self::NAME,
+        )?;
+
+        // The caller-chosen bytes this create would retain for the process's lifetime, asked
+        // of the store below: a COUNT ceiling admits megabytes on its own, because each record
+        // holds strings the caller chose the length of.
+        let payload_bytes = state::ipam_prefix_list_resolver_target_payload_bytes(
+            prefix_list_id,
+            prefix_list_region,
+            &tags,
+            input.client_token.as_deref(),
+        );
+
+        // "A check for whether you have the required permissions for the action WITHOUT
+        // ACTUALLY MAKING THE REQUEST and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation"
+        // (`CreateIpamPrefixListResolverTargetRequest$DryRun`): the flag asks about
+        // PERMISSION, not about the resources the request names, so it is answered once the
+        // request's own form has been checked and before anything is resolved — the same place
+        // the IPAM creates beside this one answer it. Every caller of this emulator is
+        // permitted, and nothing is stored.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first, the way every other state-touching handler in this crate starts: a
+        // target whose `create-complete` move has fallen due is already in that state, so a
+        // `ClientToken` replay below answers the target as it ACTUALLY stands rather than as
+        // the create left it.
+        store.materialize_due_transitions();
+
+        // "The ID of the IPAM prefix list resolver that will manage the synchronization of
+        // CIDRs to the target prefix list"
+        // (`CreateIpamPrefixListResolverTargetRequest$IpamPrefixListResolverId`): a resolver
+        // this account holds none of is refused with that resource's own `NotFound` code, so a
+        // target can never name a resolver the store does not hold.
+        if !store.ipam_prefix_list_resolvers.contains_key(resolver_id) {
+            return Err(state::invalid_ipam_prefix_list_resolver_id_not_found(
+                resolver_id,
+            ));
+        }
+
+        // "The ID of the managed prefix list that will be synchronized with CIDRs selected by
+        // the IPAM prefix list resolver. This prefix list becomes an IPAM managed prefix list.
+        // An IPAM-managed prefix list is a CUSTOMER-MANAGED prefix list that has been
+        // associated with an IPAM prefix list resolver target"
+        // (`CreateIpamPrefixListResolverTargetRequest$PrefixListId`): the lists a caller
+        // manages are the ones the account created and this store holds, so an id naming none
+        // of them — including a prefix list Amazon Web Services publishes for its own services,
+        // which no account manages — is refused with the prefix list's own `NotFound` code.
+        if !store.managed_prefix_lists.contains_key(prefix_list_id) {
+            return Err(state::invalid_prefix_list_id_not_found(prefix_list_id));
+        }
+
+        // Idempotency: one token names the one target it minted, so a replay reports that
+        // target and creates nothing.
+        if let Some(target_id) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| {
+                store
+                    .ipam_prefix_list_resolver_target_client_tokens
+                    .get(token)
+                    .cloned()
+            })
+        {
+            let target = store
+                .ipam_prefix_list_resolver_targets
+                .get(&target_id)
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "a client token names IPAM prefix list resolver target '{target_id}', \
+                         which is not stored"
+                    ))
+                })?;
+            // A token is only idempotent for the REQUEST it was first given with: replayed
+            // with different parameters it names a target the caller did not ask for, which
+            // EC2 refuses rather than answers.
+            if !same_request(target, &input) {
+                return Err(state::idempotent_parameter_mismatch());
+            }
+            return Ok(CreateIpamPrefixListResolverTargetOutput {
+                ipam_prefix_list_resolver_target: Some(target.clone()),
+            });
+        }
+
+        // "The ID of the IPAM prefix list resolver target associated with this managed prefix
+        // list. When set, this prefix list becomes an IPAM managed prefix list"
+        // (`ManagedPrefixList$IpamPrefixListResolverTargetId`) is ONE id, so a prefix list is
+        // the target of at most one resolver: a list that already has a target is refused
+        // rather than silently re-pointed at this resolver.
+        if let Some(existing) = store.ipam_prefix_list_resolver_target_of_prefix_list(prefix_list_id)
+        {
+            return Err(state::resource_already_associated(format!(
+                "The prefix list '{prefix_list_id}' is already the target of IPAM prefix list \
+                 resolver target '{existing}'"
+            )));
+        }
+
+        // The store's ceilings, asked before the first write: nothing in this emulator reclaims
+        // a target, so both the COUNT of records and the caller-chosen BYTES they retain are
+        // bounded.
+        if !store.has_ipam_prefix_list_resolver_target_capacity() {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {max} IPAM prefix list resolver targets, which is as many \
+                 as it stores",
+                max = state::MAX_STORED_RECORDS_PER_STORE,
+            )));
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, so \
+                 it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        let view = IpamPrefixListResolverTarget {
+            // What the request decided: the resolver this target belongs to, the prefix list it
+            // synchronizes and the Region that list is in, whether the target follows the
+            // list's latest version, and "the specific version of the prefix list to target. If
+            // not specified, the resolver will target the latest version"
+            // (`CreateIpamPrefixListResolverTargetRequest$DesiredVersion`) — so a request that
+            // names no version pins none.
+            ipam_prefix_list_resolver_id: Some(resolver_id.to_string()),
+            prefix_list_id: Some(prefix_list_id.to_string()),
+            prefix_list_region: Some(prefix_list_region.to_string()),
+            desired_version: input.desired_version,
+            track_latest_version: Some(input.track_latest_version),
+            tags: Some(tags),
+            // Derived by the store's one writer: the id, the ARN, the owning account, the
+            // `create-in-progress` state the target starts in, and the absence of a synced
+            // version and of a state message on a target nothing has synchronized yet.
+            ipam_prefix_list_resolver_target_id: None,
+            ipam_prefix_list_resolver_target_arn: None,
+            owner_id: None,
+            last_synced_version: None,
+            state_message: None,
+            state: None,
+        };
+
+        let target_id = store
+            .insert_creating_ipam_prefix_list_resolver_target(
+                prefix_list_id,
+                input.client_token.as_deref(),
+                view,
+            )
+            .ok_or_else(|| {
+                state::resource_limit_exceeded(format!(
+                    "This emulator holds {max} IPAM prefix list resolver targets, which is as \
+                     many as it stores",
+                    max = state::MAX_STORED_RECORDS_PER_STORE,
+                ))
+            })?;
+
+        // Read the answer back OUT of the store, so the caller sees the target a later reader
+        // will see rather than the request object.
+        store
+            .ipam_prefix_list_resolver_targets
+            .get(&target_id)
+            .cloned()
+            .map(|target| CreateIpamPrefixListResolverTargetOutput {
+                ipam_prefix_list_resolver_target: Some(target),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly created IPAM prefix list resolver target '{target_id}' could not \
+                     be read back"
+                ))
+            })
     }
+}
+
+/// Does `target` — the target a replayed `ClientToken` names — hold what THIS request asks
+/// for?
+///
+/// Every member the request decides is compared, so a token replayed with any different
+/// parameter is refused with `IdempotentParameterMismatch` rather than answered with a target
+/// the caller did not ask for; the same contract `create_ipam_scope`'s `same_request` has for a
+/// scope. The members this service derives (the id, the ARN, the owner, the state, the synced
+/// version and the state message) are not compared: they follow from the ones that are.
+fn same_request(
+    target: &IpamPrefixListResolverTarget,
+    input: &CreateIpamPrefixListResolverTargetInput,
+) -> bool {
+    let tag_pairs = |tags: &[Tag]| {
+        let mut pairs: Vec<(Option<String>, Option<String>)> = tags
+            .iter()
+            .map(|tag| (tag.key.clone(), tag.value.clone()))
+            .collect();
+        pairs.sort();
+        pairs
+    };
+    let requested_tags: Vec<Tag> = input
+        .tag_specifications
+        .iter()
+        .flatten()
+        .flat_map(|specification| specification.tags.clone().unwrap_or_default())
+        .collect();
+    target.ipam_prefix_list_resolver_id.as_deref() == Some(input.ipam_prefix_list_resolver_id.as_str())
+        && target.prefix_list_id.as_deref() == Some(input.prefix_list_id.as_str())
+        && target.prefix_list_region.as_deref() == Some(input.prefix_list_region.as_str())
+        && target.desired_version == input.desired_version
+        && target.track_latest_version == Some(input.track_latest_version)
+        && tag_pairs(target.tags.as_deref().unwrap_or_default()) == tag_pairs(&requested_tags)
 }

@@ -1150,6 +1150,35 @@
 //! [`ComAmazonawsEc2Amazonec2State::ipam_resource_discovery_association_complete_at`] — the
 //! IPAM's entry above covers only the default association that came up with it.
 //!
+//! ## IPAM prefix list resolvers and the targets created against them
+//!
+//! [`ComAmazonawsEc2Amazonec2State::ipam_prefix_list_resolvers`] holds the account's prefix
+//! list resolvers as the modelled [`IpamPrefixListResolver`] shape itself, keyed by
+//! `IpamPrefixListResolverId`, beside the
+//! [`ComAmazonawsEc2Amazonec2State::ipam_prefix_list_resolver_targets`] created against them:
+//! "an IPAM prefix list resolver target is an association between a specific
+//! customer-managed prefix list and an IPAM prefix list resolver"
+//! ([`IpamPrefixListResolverTarget`]), so `CreateIpamPrefixListResolverTarget` resolves BOTH
+//! ends in this store — the resolver here and the prefix list in
+//! [`ComAmazonawsEc2Amazonec2State::managed_prefix_lists`] — and refuses an id either store
+//! does not hold ([`invalid_ipam_prefix_list_resolver_id_not_found`],
+//! [`invalid_prefix_list_id_not_found`]). The association is recorded on the prefix list as
+//! well as on the target, because "when set, this prefix list becomes an IPAM managed prefix
+//! list" ([`crate::ops::types::ManagedPrefixList`]`$IpamPrefixListResolverTargetId`) is a
+//! SINGLE id: one prefix list is the target of at most one resolver, which
+//! [`ComAmazonawsEc2Amazonec2State::ipam_prefix_list_resolver_target_of_prefix_list`] reads
+//! back.
+//!
+//! A target that create answers with is `create-in-progress`, a non-terminal
+//! `IpamPrefixListResolverTargetState`, so the clock owes it `create-complete` one
+//! [`TRANSITION_DELAY`] later; that due instant is a fact the modelled shape carries no member
+//! for, so it lives in
+//! [`ComAmazonawsEc2Amazonec2State::ipam_prefix_list_resolver_target_create_complete_at`], the
+//! way an IPAM scope's does, and
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies it — and the
+//! resolver a create answers is owed the same move through
+//! [`ComAmazonawsEc2Amazonec2State::ipam_prefix_list_resolver_create_complete_at`].
+//!
 //! ## Capacity Reservations
 //!
 //! [`ComAmazonawsEc2Amazonec2State::capacity_reservations`] holds the account's Capacity
@@ -1527,6 +1556,7 @@ use crate::ops::types::{
     InstanceIpv6Prefix, InstanceNetworkInterface, InstanceNetworkInterfaceAttachment,
     InstancePrivateIpAddress,
     Ipam, IpamInternetRegistryAssociation, IpamOperatingRegion, IpamPolicy, IpamPool,
+    IpamPrefixListResolver, IpamPrefixListResolverRule, IpamPrefixListResolverTarget,
     IpamResourceDiscovery, IpamResourceDiscoveryAssociation, IpamResourceTag,
     IpamRoutingPolicyRegistration, IpamRoutingPolicyRegistrationDelta, IpamScope,
     MemoryInfo, NetworkInfo, NitroTpmInfo, PlacementGroupInfo, ProcessorInfo, VCpuInfo,
@@ -3848,6 +3878,54 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// unique, case-sensitive identifier that you provide to ensure the idempotency of the
     /// request" (`CreateIpamPoolRequest$ClientToken`).
     pub ipam_pool_client_tokens: HashMap<String, String>,
+    /// Every IPAM prefix list resolver the account holds, by `IpamPrefixListResolverId`, as
+    /// the modelled [`IpamPrefixListResolver`] shape itself — the container a prefix list
+    /// resolver TARGET belongs to, which is what `CreateIpamPrefixListResolverTarget`
+    /// resolves its `IpamPrefixListResolverId` against. Ordered by id, the stable order every
+    /// reader of them reports in.
+    ///
+    /// A fresh account holds none: `CreateIpamPrefixListResolver` is the operation that adds
+    /// one ([`Self::insert_creating_ipam_prefix_list_resolver`]), so until it is called every
+    /// resolver id a request names answers
+    /// [`INVALID_IPAM_PREFIX_LIST_RESOLVER_ID_NOT_FOUND`] — exactly what the real service does
+    /// for a resolver that was never created.
+    pub ipam_prefix_list_resolvers: BTreeMap<String, IpamPrefixListResolver>,
+    /// The CIDR selection rules of each resolver, by `IpamPrefixListResolverId` — "CIDR
+    /// selection rules define the business logic for selecting CIDRs from IPAM"
+    /// ([`crate::ops::types::IpamPrefixListResolverRule`]), which the modelled
+    /// [`IpamPrefixListResolver`] shape carries no member for: they are reported by
+    /// `GetIpamPrefixListResolverRules` (still a scaffold stub with its own open issue), so a
+    /// create keeps the rules it accepted here rather than dropping them.
+    pub ipam_prefix_list_resolver_rules: BTreeMap<String, Vec<IpamPrefixListResolverRule>>,
+    /// When a `create-in-progress` resolver's move to `create-complete` falls due, by
+    /// `IpamPrefixListResolverId` — the resolver counterpart of
+    /// [`Self::ipam_scope_create_complete_at`], on the same monotonic clock and the same
+    /// [`TRANSITION_DELAY`], applied by [`Self::materialize_due_transitions`].
+    pub ipam_prefix_list_resolver_create_complete_at: BTreeMap<String, Instant>,
+    /// A `CreateIpamPrefixListResolver` `ClientToken` and the `IpamPrefixListResolverId` that
+    /// call minted, so a replay of the same request answers with that resolver instead of
+    /// creating a second one.
+    pub ipam_prefix_list_resolver_client_tokens: HashMap<String, String>,
+    /// Every IPAM prefix list resolver target the account holds, by
+    /// `IpamPrefixListResolverTargetId`, as the modelled [`IpamPrefixListResolverTarget`]
+    /// shape itself, for the same reason the scope store holds [`IpamScope`]s:
+    /// `CreateIpamPrefixListResolverTarget` and `DescribeIpamPrefixListResolverTargets`
+    /// cannot report one target differently, and the map's order is the one order the
+    /// describe reports and pages over.
+    pub ipam_prefix_list_resolver_targets: BTreeMap<String, IpamPrefixListResolverTarget>,
+    /// When a `create-in-progress` resolver target's move to `create-complete` falls due, by
+    /// `IpamPrefixListResolverTargetId` — the fact the modelled
+    /// [`IpamPrefixListResolverTarget`] shape carries no member for, stored beside the target
+    /// under the same id the way [`Self::ipam_scope_create_complete_at`] holds a scope's, on
+    /// the same monotonic clock and the same [`TRANSITION_DELAY`].
+    /// [`Self::materialize_due_transitions`] applies it.
+    pub ipam_prefix_list_resolver_target_create_complete_at: BTreeMap<String, Instant>,
+    /// A `CreateIpamPrefixListResolverTarget` `ClientToken` and the
+    /// `IpamPrefixListResolverTargetId` that call minted, so a replay of the same request
+    /// answers with that target instead of creating a second one: "a unique, case-sensitive
+    /// identifier that you provide to ensure the idempotency of the request"
+    /// (`CreateIpamPrefixListResolverTargetRequest$ClientToken`).
+    pub ipam_prefix_list_resolver_target_client_tokens: HashMap<String, String>,
     /// Every IPAM internet registry association the account holds, by
     /// `IpamInternetRegistryAssociationId`, each with the routing policy registrations
     /// (ROAs) made under it — see [`IpamInternetRegistryAssociationRecord`]. Ordered by id,
@@ -4295,6 +4373,14 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             ipam_pool_create_complete_at: BTreeMap::new(),
             ipam_pool_delete_complete_at: BTreeMap::new(),
             ipam_pool_client_tokens: HashMap::new(),
+            // Nothing has created a prefix list resolver or a target against one yet.
+            ipam_prefix_list_resolvers: BTreeMap::new(),
+            ipam_prefix_list_resolver_rules: BTreeMap::new(),
+            ipam_prefix_list_resolver_create_complete_at: BTreeMap::new(),
+            ipam_prefix_list_resolver_client_tokens: HashMap::new(),
+            ipam_prefix_list_resolver_targets: BTreeMap::new(),
+            ipam_prefix_list_resolver_target_create_complete_at: BTreeMap::new(),
+            ipam_prefix_list_resolver_target_client_tokens: HashMap::new(),
             ipam_internet_registry_associations: BTreeMap::new(),
             ipam_routing_policy_registration_deltas: BTreeMap::new(),
             ipam_routing_policy_registration_delta_client_tokens: HashMap::new(),
@@ -7585,6 +7671,46 @@ impl ComAmazonawsEc2Amazonec2State {
             // The transition is applied once; nothing is owed on this scope any more.
             false
         });
+        // An IPAM prefix list resolver `CreateIpamPrefixListResolver` answered as
+        // `create-in-progress` reaches `create-complete` once its due instant has passed,
+        // whether or not anybody called — the same contract as the IPAM scope above; the
+        // `IpamPrefixListResolverState` enum carries those two members under the same spellings.
+        let resolvers = &mut self.ipam_prefix_list_resolvers;
+        self.ipam_prefix_list_resolver_create_complete_at
+            .retain(|resolver_id, due_at| {
+                if now < *due_at {
+                    return true;
+                }
+                if let Some(resolver) = resolvers.get_mut(resolver_id) {
+                    if resolver.state.as_deref() == Some(IPAM_STATE_CREATE_IN_PROGRESS) {
+                        resolver.state = Some(IPAM_STATE_CREATE_COMPLETE.to_string());
+                    }
+                }
+                // The transition is applied once; nothing is owed on this resolver any more.
+                false
+            });
+        // An IPAM prefix list resolver target `CreateIpamPrefixListResolverTarget` answered as
+        // `create-in-progress` reaches `create-complete` once its due instant has passed,
+        // whether or not anybody called — the same contract as the scope above, and the reason
+        // the target's due instant is kept beside the target rather than on the modelled shape.
+        let resolver_targets = &mut self.ipam_prefix_list_resolver_targets;
+        self.ipam_prefix_list_resolver_target_create_complete_at
+            .retain(|target_id, due_at| {
+                if now < *due_at {
+                    return true;
+                }
+                if let Some(target) = resolver_targets.get_mut(target_id) {
+                    if target.state.as_deref()
+                        == Some(IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_CREATE_IN_PROGRESS)
+                    {
+                        target.state = Some(
+                            IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_CREATE_COMPLETE.to_string(),
+                        );
+                    }
+                }
+                // The transition is applied once; nothing is owed on this target any more.
+                false
+            });
         // A resource discovery association `AssociateIpamResourceDiscovery` answered as
         // `associate-in-progress` reaches `associate-complete` once its due instant has
         // passed, whether or not anybody called — the same contract as the scope above. The
@@ -32698,6 +32824,340 @@ pub fn require_well_formed_ipam_resource_discovery_id<E>(id: &str) -> Result<(),
         return Ok(());
     }
     Err(invalid_ipam_resource_discovery_id_malformed(id))
+}
+
+// =============================================================================
+// IPAM prefix list resolvers and the targets created against them
+// =============================================================================
+
+/// The ARN resource type of an IPAM prefix list resolver, which is also the `ResourceType` a
+/// `TagSpecification` names to tag one — from the modelled catalog
+/// (`crate::ops::types::RESOURCE_TYPE_VALUES` carries `ipam-prefix-list-resolver`).
+pub const RESOURCE_TYPE_IPAM_PREFIX_LIST_RESOLVER: &str = "ipam-prefix-list-resolver";
+
+/// The ARN resource type of an IPAM prefix list resolver TARGET, from that same catalog.
+pub const RESOURCE_TYPE_IPAM_PREFIX_LIST_RESOLVER_TARGET: &str =
+    "ipam-prefix-list-resolver-target";
+
+/// The id prefix a stored IPAM prefix list resolver is minted with.
+///
+/// The model publishes no pattern for `IpamPrefixListResolverId`
+/// (`smithy_query(query="shape",shape="IpamPrefixListResolverId")` is a plain `String`), so
+/// the id takes EC2's own `<prefix>-<hex>` form through
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] with the prefix AWS gives the resource:
+/// `ipam-plr-<hex>`, as the ids in the wire corpus's prefix list resolver calls read. The
+/// resource's full modelled type is what its ARN carries
+/// ([`RESOURCE_TYPE_IPAM_PREFIX_LIST_RESOLVER`]), exactly as an IPAM resource discovery's
+/// `ipam-res-disco-` id sits beside its `ipam-resource-discovery` ARN type.
+pub const IPAM_PREFIX_LIST_RESOLVER_ID_PREFIX: &str = "ipam-plr";
+
+/// The id prefix a stored IPAM prefix list resolver TARGET is minted with: `ipam-plrt-<hex>`,
+/// from the same source as [`IPAM_PREFIX_LIST_RESOLVER_ID_PREFIX`].
+pub const IPAM_PREFIX_LIST_RESOLVER_TARGET_ID_PREFIX: &str = "ipam-plrt";
+
+/// How many rules one IPAM prefix list resolver may carry.
+///
+/// A ceiling of this store, not a published AWS quota: the rules a create names are kept for
+/// the resolver's lifetime, so their COUNT is bounded the way every other list this store
+/// retains is, and the caller-chosen bytes within them are charged beside it.
+pub const MAX_IPAM_PREFIX_LIST_RESOLVER_RULES: usize = 50;
+
+/// A resolver target whose creation has been asked for and has not settled yet: the
+/// `IpamPrefixListResolverTargetState` enum's `create-in-progress` member
+/// (`smithy_query(query="shape",shape="IpamPrefixListResolverTargetState")`), which is what
+/// `CreateIpamPrefixListResolverTarget` answers with.
+pub const IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_CREATE_IN_PROGRESS: &str = "create-in-progress";
+
+/// The state that enum reaches once the creation has settled: `create-complete`, which the
+/// clock owes a [`IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_CREATE_IN_PROGRESS`] target one
+/// [`TRANSITION_DELAY`] after the call that created it.
+pub const IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_CREATE_COMPLETE: &str = "create-complete";
+
+/// `InvalidIpamPrefixListResolverId.NotFound` (HTTP 400): the request named a prefix list
+/// resolver id this account holds no resolver for.
+pub const INVALID_IPAM_PREFIX_LIST_RESOLVER_ID_NOT_FOUND: &str =
+    "InvalidIpamPrefixListResolverId.NotFound";
+
+/// `InvalidIpamPrefixListResolverTargetId.NotFound` (HTTP 400): the request named a resolver
+/// target id this account holds no target for.
+///
+/// There is no `.Malformed` counterpart for either of these two id kinds: the model publishes
+/// no pattern for `IpamPrefixListResolverId` or `IpamPrefixListResolverTargetId` (both are
+/// plain `String`s) and the `<prefix>-<hex>` form this module mints them in is its own, so an
+/// id a request names is answered on whether the account HOLDS that resource and nothing else.
+pub const INVALID_IPAM_PREFIX_LIST_RESOLVER_TARGET_ID_NOT_FOUND: &str =
+    "InvalidIpamPrefixListResolverTargetId.NotFound";
+
+/// The sentence this family's `NotFound` refusal is worded with: the resource as the API
+/// documents it, the id from the REQUEST IN PARENTHESES, and `does not exist.`
+///
+/// That is how the IPAM family of resources words this refusal — "The IPAM (…) does not
+/// exist." ([`invalid_ipam_id_not_found`]) and "The IPAM scope (…) does not exist."
+/// ([`invalid_ipam_scope_id_not_found`]), the two sentences the wire corpus records for it —
+/// rather than the quoted `The <kind> '<id>' does not exist` the rest of EC2 answers
+/// ([`id_not_found`]). Only the resource's name differs between the two refusals below, so the
+/// template lives here once.
+fn ipam_prefix_list_resolver_family_not_found<E>(
+    code: &'static str,
+    resource: &str,
+    id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        code,
+        400,
+        format!("The {resource} ({}) does not exist.", echoed_resource_id(id)),
+    )
+}
+
+/// Refuse a prefix list resolver id this account holds no resolver for: HTTP 400
+/// [`INVALID_IPAM_PREFIX_LIST_RESOLVER_ID_NOT_FOUND`], worded by the template above.
+pub fn invalid_ipam_prefix_list_resolver_id_not_found<E>(resolver_id: &str) -> Scaffolded<E> {
+    ipam_prefix_list_resolver_family_not_found(
+        INVALID_IPAM_PREFIX_LIST_RESOLVER_ID_NOT_FOUND,
+        "IPAM prefix list resolver",
+        resolver_id,
+    )
+}
+
+/// Refuse a resolver target id this account holds no target for: HTTP 400
+/// [`INVALID_IPAM_PREFIX_LIST_RESOLVER_TARGET_ID_NOT_FOUND`], worded by that same template with
+/// the target's own name.
+pub fn invalid_ipam_prefix_list_resolver_target_id_not_found<E>(target_id: &str) -> Scaffolded<E> {
+    ipam_prefix_list_resolver_family_not_found(
+        INVALID_IPAM_PREFIX_LIST_RESOLVER_TARGET_ID_NOT_FOUND,
+        "IPAM prefix list resolver target",
+        target_id,
+    )
+}
+
+/// The caller-chosen bytes one resolver's CIDR selection rules hold for the process's
+/// lifetime: every string a rule and its conditions carry. The rule and condition types
+/// themselves are fixed-size enums the model publishes, so only the text counts.
+///
+/// The ONE definition of that charge, asked by
+/// [`ComAmazonawsEc2Amazonec2State::insert_creating_ipam_prefix_list_resolver`] and by the
+/// create that calls it.
+pub fn ipam_prefix_list_resolver_rule_bytes(rules: &[IpamPrefixListResolverRule]) -> usize {
+    let text = |value: &Option<String>| value.as_ref().map_or(0, String::len);
+    rules
+        .iter()
+        .map(|rule| {
+            text(&rule.rule_type)
+                + text(&rule.static_cidr)
+                + text(&rule.ipam_scope_id)
+                + text(&rule.resource_type)
+                + rule
+                    .conditions
+                    .iter()
+                    .flatten()
+                    .map(|condition| {
+                        text(&condition.operation)
+                            + text(&condition.ipam_pool_id)
+                            + text(&condition.resource_id)
+                            + text(&condition.resource_owner)
+                            + text(&condition.resource_region)
+                            + text(&condition.cidr)
+                            + condition.resource_tag.as_ref().map_or(0, |tag| {
+                                tag.key.as_ref().map_or(0, String::len)
+                                    + tag.value.as_ref().map_or(0, String::len)
+                            })
+                    })
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+/// The bytes one stored resolver target holds for the process's lifetime: the caller-chosen
+/// ones — the prefix list it names, the Region that list is in, its tags and the client token
+/// the token map keeps — plus the fixed [`STORED_RECORD_OVERHEAD_BYTES`] the record itself
+/// costs. Its id, its ARN, the owning account, its state and its versions are derived or
+/// numeric, so they are bounded already and not counted here.
+///
+/// The ONE definition of that charge: the create asks it before the write, off the values it
+/// has in hand, and [`ComAmazonawsEc2Amazonec2State::insert_creating_ipam_prefix_list_resolver_target`]
+/// charges exactly it.
+pub fn ipam_prefix_list_resolver_target_payload_bytes(
+    prefix_list_id: &str,
+    prefix_list_region: &str,
+    tags: &[Tag],
+    client_token: Option<&str>,
+) -> usize {
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(prefix_list_id.len())
+        .saturating_add(prefix_list_region.len())
+        .saturating_add(tag_list_bytes(tags))
+        .saturating_add(client_token.map_or(0, str::len))
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another IPAM prefix list resolver fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]) — the same contract as
+    /// [`Self::has_ipam_scope_capacity`].
+    pub fn has_ipam_prefix_list_resolver_capacity(&self) -> bool {
+        self.ipam_prefix_list_resolvers.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Store an IPAM prefix list resolver and answer the `IpamPrefixListResolverId` it was
+    /// given — or `None` when the store is at its ceiling and nothing was stored.
+    ///
+    /// The ONE way a resolver is stored, so the members the SERVICE owns cannot be built two
+    /// ways: the id, the ARN it reports and the account that owns it are derived here rather
+    /// than taken from a caller, exactly as [`Self::insert_ipam_scope`] derives a scope's.
+    /// [`Self::insert_creating_ipam_prefix_list_resolver`] is what `CreateIpamPrefixListResolver`
+    /// reaches it through.
+    pub fn insert_ipam_prefix_list_resolver(
+        &mut self,
+        mut view: IpamPrefixListResolver,
+    ) -> Option<String> {
+        if !self.has_ipam_prefix_list_resolver_capacity() {
+            return None;
+        }
+        let resolver_id = self.next_id(IPAM_PREFIX_LIST_RESOLVER_ID_PREFIX);
+        view.ipam_prefix_list_resolver_id = Some(resolver_id.clone());
+        // "The Amazon Resource Name (ARN) of the IPAM prefix list resolver"
+        // (`IpamPrefixListResolver$IpamPrefixListResolverArn`): an EC2 IPAM-family ARN under
+        // this resource's modelled type, whose Region segment is empty for the reason
+        // [`ipam_resource_arn`] records — the resolver's Region is reported in
+        // `IpamPrefixListResolver$IpamRegion` instead.
+        view.ipam_prefix_list_resolver_arn = Some(ipam_resource_arn(
+            RESOURCE_TYPE_IPAM_PREFIX_LIST_RESOLVER,
+            &resolver_id,
+        ));
+        // "The ID of the Amazon Web Services account that owns the IPAM prefix list resolver"
+        // (`IpamPrefixListResolver$OwnerId`): this emulator serves one account.
+        view.owner_id = Some(::engine::emulator_account_id().to_string());
+        self.add_stored_bytes(
+            STORED_RECORD_OVERHEAD_BYTES
+                + tag_list_bytes(view.tags.as_deref().unwrap_or_default())
+                + view.description.as_deref().unwrap_or_default().len(),
+        );
+        self.ipam_prefix_list_resolvers
+            .insert(resolver_id.clone(), view);
+        Some(resolver_id)
+    }
+
+    /// Store a resolver a create has just made, and answer the `IpamPrefixListResolverId` it
+    /// was given — or `None` when the store is at its ceiling and nothing was stored.
+    ///
+    /// The ONE way a CREATED resolver is stored, the counterpart of
+    /// [`Self::insert_created_ipam_scope`]: the resolver is answered in the non-terminal
+    /// `create-in-progress` state, so the clock owes it [`IPAM_STATE_CREATE_COMPLETE`] one
+    /// [`TRANSITION_DELAY`] later ([`Self::ipam_prefix_list_resolver_create_complete_at`],
+    /// applied by [`Self::materialize_due_transitions`]); the CIDR selection `rules` the create
+    /// accepted are kept beside it, with the caller-chosen bytes they and the token retain
+    /// charged to the store's budget; and `client_token` names the resolver from here on so a
+    /// replay of the same request answers it instead of creating a second one.
+    pub fn insert_creating_ipam_prefix_list_resolver(
+        &mut self,
+        client_token: Option<&str>,
+        rules: Vec<IpamPrefixListResolverRule>,
+        mut view: IpamPrefixListResolver,
+    ) -> Option<String> {
+        view.state = Some(IPAM_STATE_CREATE_IN_PROGRESS.to_string());
+        let retained = client_token.unwrap_or_default().len()
+            + ipam_prefix_list_resolver_rule_bytes(&rules);
+        let resolver_id = self.insert_ipam_prefix_list_resolver(view)?;
+        self.add_stored_bytes(retained);
+        self.ipam_prefix_list_resolver_create_complete_at
+            .insert(resolver_id.clone(), Instant::now() + TRANSITION_DELAY);
+        if let Some(token) = client_token {
+            self.ipam_prefix_list_resolver_client_tokens
+                .insert(token.to_string(), resolver_id.clone());
+        }
+        self.ipam_prefix_list_resolver_rules
+            .insert(resolver_id.clone(), rules);
+        Some(resolver_id)
+    }
+
+    /// Whether another resolver target fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]).
+    pub fn has_ipam_prefix_list_resolver_target_capacity(&self) -> bool {
+        self.ipam_prefix_list_resolver_targets.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// The resolver target the prefix list `prefix_list_id` names is already associated with,
+    /// if it has one.
+    ///
+    /// "The ID of the IPAM prefix list resolver target associated with this managed prefix
+    /// list" (`ManagedPrefixList$IpamPrefixListResolverTargetId`) is a SINGLE id, so a prefix
+    /// list is the target of at most one resolver — and the list itself is where that fact
+    /// lives, rather than in a second index beside it.
+    pub fn ipam_prefix_list_resolver_target_of_prefix_list(
+        &self,
+        prefix_list_id: &str,
+    ) -> Option<String> {
+        self.managed_prefix_lists
+            .get(prefix_list_id)?
+            .view
+            .ipam_prefix_list_resolver_target_id
+            .clone()
+    }
+
+    /// Store a resolver target a create has just made against the prefix list
+    /// `prefix_list_id` names, and answer the `IpamPrefixListResolverTargetId` it was given —
+    /// or `None` when the store is at its ceiling and nothing was stored.
+    ///
+    /// The ONE way a CREATED target is stored, the counterpart of
+    /// [`Self::insert_created_ipam_scope`]: the id, the ARN and the owning account are derived
+    /// here; the target is answered in the non-terminal
+    /// [`IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_CREATE_IN_PROGRESS`] state, so the clock owes
+    /// it [`IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_CREATE_COMPLETE`] one [`TRANSITION_DELAY`]
+    /// later ([`Self::ipam_prefix_list_resolver_target_create_complete_at`], applied by
+    /// [`Self::materialize_due_transitions`]); nothing has synchronized a version of the
+    /// prefix list yet, so the target reports no last synced version and no state message;
+    /// `client_token` names the target from here on so a replay of the same request answers it
+    /// instead of creating a second one; and the prefix list becomes IPAM managed, which is
+    /// the list's own record of this association.
+    pub fn insert_creating_ipam_prefix_list_resolver_target(
+        &mut self,
+        prefix_list_id: &str,
+        client_token: Option<&str>,
+        mut view: IpamPrefixListResolverTarget,
+    ) -> Option<String> {
+        if !self.has_ipam_prefix_list_resolver_target_capacity() {
+            return None;
+        }
+        let target_id = self.next_id(IPAM_PREFIX_LIST_RESOLVER_TARGET_ID_PREFIX);
+        view.ipam_prefix_list_resolver_target_id = Some(target_id.clone());
+        view.ipam_prefix_list_resolver_target_arn = Some(ipam_resource_arn(
+            RESOURCE_TYPE_IPAM_PREFIX_LIST_RESOLVER_TARGET,
+            &target_id,
+        ));
+        view.owner_id = Some(::engine::emulator_account_id().to_string());
+        view.state = Some(IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_CREATE_IN_PROGRESS.to_string());
+        // "The version of the prefix list that was last successfully synchronized by this
+        // target" (`IpamPrefixListResolverTarget$LastSyncedVersion`) and "a message describing
+        // the current state … including any error information"
+        // (`IpamPrefixListResolverTarget$StateMessage`): no synchronization has run on a
+        // target this call is still creating, so it reports neither.
+        view.last_synced_version = None;
+        view.state_message = None;
+        self.add_stored_bytes(ipam_prefix_list_resolver_target_payload_bytes(
+            view.prefix_list_id.as_deref().unwrap_or_default(),
+            view.prefix_list_region.as_deref().unwrap_or_default(),
+            view.tags.as_deref().unwrap_or_default(),
+            client_token,
+        ));
+        self.ipam_prefix_list_resolver_target_create_complete_at
+            .insert(target_id.clone(), Instant::now() + TRANSITION_DELAY);
+        if let Some(token) = client_token {
+            self.ipam_prefix_list_resolver_target_client_tokens
+                .insert(token.to_string(), target_id.clone());
+        }
+        // "The ID of the IPAM prefix list resolver target associated with this managed prefix
+        // list. When set, this prefix list becomes an IPAM managed prefix list … its CIDRs are
+        // automatically synchronized based on the IPAM prefix list resolver's CIDR selection
+        // rules" (`ManagedPrefixList$IpamPrefixListResolverTargetId`), which is what the list's
+        // own `IpamPrefixListResolverSyncEnabled` reports — so the list the target names
+        // records the association rather than only the target knowing about it.
+        if let Some(record) = self.managed_prefix_lists.get_mut(prefix_list_id) {
+            record.view.ipam_prefix_list_resolver_target_id = Some(target_id.clone());
+            record.view.ipam_prefix_list_resolver_sync_enabled = Some(true);
+        }
+        self.ipam_prefix_list_resolver_targets
+            .insert(target_id.clone(), view);
+        Some(target_id)
+    }
 }
 
 // =============================================================================

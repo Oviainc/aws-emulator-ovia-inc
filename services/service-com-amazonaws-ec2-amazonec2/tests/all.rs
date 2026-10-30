@@ -614,6 +614,13 @@ mod ipam_pool_deletion;
 // Creating one further IPAM scope in an IPAM, and reading the account's scopes back.
 #[path = "all/ipam_scopes.rs"]
 mod ipam_scopes;
+// Creating an IPAM prefix list resolver and reading the account's resolvers back.
+#[path = "all/ipam_prefix_list_resolvers.rs"]
+mod ipam_prefix_list_resolvers;
+// Associating a customer-managed prefix list with an IPAM prefix list resolver, and reading
+// the account's resolver targets back.
+#[path = "all/ipam_prefix_list_resolver_targets.rs"]
+mod ipam_prefix_list_resolver_targets;
 #[path = "all/ipam_routing_policy_registrations.rs"]
 mod ipam_routing_policy_registrations;
 #[path = "all/launch_templates.rs"]
