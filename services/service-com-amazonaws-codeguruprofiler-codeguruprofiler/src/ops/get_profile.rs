@@ -824,17 +824,27 @@ fn stated_number(name: Option<&str>, into: &Element, from: &Element) -> Option<E
 /// same way.
 pub(crate) fn document_number(element: &Element) -> Option<f64> {
     let number = match element.value() {
-        IonValue::Int(integer) => integer.expect_i64().ok().map(|value| value as f64)?,
+        // A magnitude an `i64` does not hold is still the number the document states, so
+        // an integer beyond one is read through its own notation — the way a decimal of
+        // any magnitude is, and the way the JSON down-conversion of the same value carries
+        // it over ([`json_number`]) — rather than read as no number at all.
+        IonValue::Int(integer) => match integer.expect_i64() {
+            Ok(value) => value as f64,
+            Err(_) => stated_in_notation(&integer.to_string())?,
+        },
         IonValue::Float(float) => *float,
-        // Ion writes a decimal exponent with `d`, where Rust writes it with `e`.
-        IonValue::Decimal(decimal) => decimal
-            .to_string()
-            .replace(['d', 'D'], "e")
-            .parse::<f64>()
-            .ok()?,
+        IonValue::Decimal(decimal) => stated_in_notation(&decimal.to_string())?,
         _ => return None,
     };
     number.is_finite().then_some(number)
+}
+
+/// The number `text` — an Ion integer or decimal written out in Ion's own notation —
+/// states, or `None` when that notation states no number Rust reads.
+///
+/// Ion writes a decimal exponent with `d`, where Rust writes it with `e`.
+fn stated_in_notation(text: &str) -> Option<f64> {
+    text.replace(['d', 'D'], "e").parse::<f64>().ok()
 }
 
 /// `bytes` read as a document in the representation `from`, or `None` when they are not
@@ -1090,14 +1100,12 @@ fn json_from_ion(element: &Element, budget: u32) -> Option<::serde_json::Value> 
 /// `text` — an Ion integer or decimal written out in Ion's own notation — as a JSON
 /// number, or as the text itself when JSON cannot hold that number (a magnitude or a
 /// precision beyond a JSON number is information a string keeps and a number loses).
-///
-/// Ion writes a decimal exponent with `d`, where JSON (and Rust) write it with `e`.
 fn json_number(text: String) -> ::serde_json::Value {
-    match text.replace(['d', 'D'], "e").parse::<f64>() {
-        Ok(number) => ::serde_json::Number::from_f64(number)
+    match stated_in_notation(&text) {
+        Some(number) => ::serde_json::Number::from_f64(number)
             .map(::serde_json::Value::Number)
             .unwrap_or(::serde_json::Value::String(text)),
-        Err(_) => ::serde_json::Value::String(text),
+        None => ::serde_json::Value::String(text),
     }
 }
 
