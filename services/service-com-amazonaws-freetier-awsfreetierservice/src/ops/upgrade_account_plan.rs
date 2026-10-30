@@ -215,10 +215,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// Refuse the request with this operation's own modelled `ValidationException`
-/// (HTTP 400).
-fn validation(message: impl Into<String>) -> UpgradeAccountPlanError {
+/// (HTTP 400), stating `message` in the envelope this service's validation
+/// front door states a refusal in ([`crate::state::stated_validation`]).
+fn validation(message: impl AsRef<str>) -> UpgradeAccountPlanError {
     UpgradeAccountPlanErrorModeled::ValidationException(ValidationException {
-        message: message.into(),
+        message: crate::state::stated_validation(message.as_ref()),
     })
     .into()
 }

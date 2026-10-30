@@ -162,11 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
             Some(token) => match crate::state::decode_page_token(PAGE_KIND, token) {
                 Some(offset) => offset,
-                None => {
-                    return Err(validation(
-                        "nextToken: the pagination token is not one GetFreeTierUsage issued",
-                    ))
-                }
+                None => return Err(validation(crate::state::INVALID_NEXT_TOKEN)),
             },
         };
 
@@ -230,12 +226,25 @@ const DIMENSION_USAGE_PERCENTAGE: &str = "USAGE_PERCENTAGE";
 const ROOT_OR: &str = "Or";
 /// See [`ROOT_OR`].
 const ROOT_AND: &str = "And";
-/// See [`ROOT_OR`].
-const ROOT_NOT: &str = "Not";
-/// See [`ROOT_OR`].
-const ROOT_DIMENSIONS: &str = "Dimensions";
-/// Every root operator, in the order the model declares the members.
-const ROOT_OPERATORS: [&str; 4] = [ROOT_OR, ROOT_AND, ROOT_NOT, ROOT_DIMENSIONS];
+
+/// What the service states when an `Expression` does not set exactly one root
+/// operator — none of them, or more than one, whichever ones they are.
+///
+/// ONE sentence for the whole condition, with nothing taken from the request:
+/// the caller is told the rule it broke (`Expression`: "you must specify exactly
+/// one of the following root operators"), which is the same rule whatever the
+/// request set, so naming the members it happened to set would make the reason a
+/// client reads vary with an input the rule does not distinguish. It lists the
+/// operators in the order the sentence states them, which is not the order the
+/// model declares the members in.
+const ONE_ROOT_OPERATOR: &str =
+    "Only one root operator is allowed for each expression: And, Or, Not, Dimensions";
+
+/// What the service states when `MatchOptions` does not carry exactly one option
+/// (`DimensionValues$MatchOptions`: "You can specify only one of these values in
+/// the array"). As fixed as [`ONE_ROOT_OPERATOR`], and for the same reason: the
+/// count submitted is not part of the rule.
+const ONE_MATCH_OPTION: &str = "Exactly one match option must be provided";
 
 /// `MatchOption` values, from the model's enum of the same name
 /// (`shared_types::MATCH_OPTION_VALUES`).
@@ -276,18 +285,6 @@ enum Root<'a> {
     Not(&'a Expression),
     /// `Dimensions`, over the one comparison it states.
     Dimensions(&'a DimensionValues),
-}
-
-impl Root<'_> {
-    /// The member name the model gives this root operator.
-    fn name(self) -> &'static str {
-        match self {
-            Self::Or(_) => ROOT_OR,
-            Self::And(_) => ROOT_AND,
-            Self::Not(_) => ROOT_NOT,
-            Self::Dimensions(_) => ROOT_DIMENSIONS,
-        }
-    }
 }
 
 /// A `filter` the service can evaluate, as [`check_expression`] decoded it:
@@ -372,19 +369,7 @@ fn check_expression(
     }
 
     let [root] = roots.as_slice() else {
-        let set = if roots.is_empty() {
-            "none".to_string()
-        } else {
-            roots
-                .iter()
-                .map(|root| root.name())
-                .collect::<Vec<&str>>()
-                .join(", ")
-        };
-        return Err(validation(format!(
-            "filter: an expression must set exactly one of {}, but this one sets {set}",
-            ROOT_OPERATORS.join(", ")
-        )));
+        return Err(validation(ONE_ROOT_OPERATOR));
     };
 
     Ok(match *root {
@@ -442,10 +427,7 @@ fn check_dimension(
     }
 
     let [option] = dimensions.match_options.as_slice() else {
-        return Err(validation(format!(
-            "filter.Dimensions.MatchOptions: exactly one match option is allowed, got {}",
-            dimensions.match_options.len()
-        )));
+        return Err(validation(ONE_MATCH_OPTION));
     };
     let option = option.as_str();
     if !MATCH_OPTION_VALUES.contains(&option) {
@@ -587,10 +569,11 @@ fn matches_text(value: &str, wanted: &str, option: &str) -> bool {
 }
 
 /// Refuse the request with this operation's own modelled `ValidationException`
-/// (HTTP 400).
-fn validation(message: impl Into<String>) -> GetFreeTierUsageError {
+/// (HTTP 400), stating `message` in the envelope this service's validation
+/// front door states a refusal in ([`crate::state::stated_validation`]).
+fn validation(message: impl AsRef<str>) -> GetFreeTierUsageError {
     GetFreeTierUsageErrorModeled::ValidationException(ValidationException {
-        message: message.into(),
+        message: crate::state::stated_validation(message.as_ref()),
     })
     .into()
 }

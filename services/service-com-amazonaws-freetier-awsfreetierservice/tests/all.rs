@@ -31,5 +31,7 @@ mod resource_not_found_status;
 mod shared_rules;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_message_rules.rs"]
+mod validation_message_rules;
 #[path = "all/wire_contract.rs"]
 mod wire_contract;

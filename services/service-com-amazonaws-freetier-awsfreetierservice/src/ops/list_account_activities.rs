@@ -196,11 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
             Some(token) => match crate::state::decode_page_token(PAGE_KIND, token) {
                 Some(offset) => offset,
-                None => {
-                    return Err(validation(
-                        "nextToken: the pagination token is not one ListAccountActivities issued",
-                    ))
-                }
+                None => return Err(validation(crate::state::INVALID_NEXT_TOKEN)),
             },
         };
 
@@ -251,10 +247,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 const PAGE_KIND: &str = "activities";
 
 /// Refuse the request with this operation's own modelled `ValidationException`
-/// (HTTP 400).
-fn validation(message: impl Into<String>) -> ListAccountActivitiesError {
+/// (HTTP 400), stating `message` in the envelope this service's validation
+/// front door states a refusal in ([`crate::state::stated_validation`]).
+fn validation(message: impl AsRef<str>) -> ListAccountActivitiesError {
     ListAccountActivitiesErrorModeled::ValidationException(ValidationException {
-        message: message.into(),
+        message: crate::state::stated_validation(message.as_ref()),
     })
     .into()
 }

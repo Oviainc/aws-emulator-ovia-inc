@@ -524,6 +524,39 @@ pub fn cut_page<'rows, T>(
     (page, next_token)
 }
 
+/// What the service states for a `nextToken` it did not issue — a token of the
+/// other listing, of an older encoding, or one that was
+/// never a token at all.
+///
+/// The fourth part of the pagination rule, beside
+/// [`encode_page_token`]/[`decode_page_token`], [`page_size`] and [`cut_page`],
+/// so both paginated operations refuse a token they did not issue in ONE
+/// wording: the condition is "this is not a token of mine", which is the same
+/// condition whichever listing was asked and whatever the token held, so the
+/// sentence names neither the operation nor the token.
+pub const INVALID_NEXT_TOKEN: &str = "The next token is invalid.";
+
+/// The `message` a `ValidationException` this service's OWN validation layer
+/// raises carries: the sentence stating the condition, in the envelope that
+/// layer states every one of them in.
+///
+/// The envelope is the layer's rather than any one condition's — a refusal of a
+/// filter's root-operator arity, of a match-option count and of a pagination
+/// token the service did not issue are all recorded carrying it — so it is
+/// written ONCE here and every handler that refuses a request itself states its
+/// sentence through this. It is NOT the envelope of the refusal the framework
+/// renders in front of a handler for a constraint the model declares: that one
+/// is the per-member validation envelope
+/// (`crate::service::validation`), which this service's recordings show
+/// unwrapped.
+///
+/// `sentence` states the condition and nothing of the request: a reason string
+/// that varied with the input would make a client's branch on it depend on
+/// something the rule does not distinguish.
+pub fn stated_validation(sentence: &str) -> String {
+    format!("[Message = {sentence}]")
+}
+
 /// Whether a request's `languageCode` names a language an activity reader can
 /// answer in, and the message refusing it when it does not.
 ///
