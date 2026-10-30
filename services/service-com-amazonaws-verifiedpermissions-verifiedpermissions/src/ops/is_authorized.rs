@@ -15,10 +15,13 @@
 //! it at) is dropped from the decision — it determines nothing, so the decision
 //! fails closed — and its description is reported in `errors` on the 200.
 //! `ValidationException` is for a request that breaks this operation's own input
-//! contract: an absent member of the triple, or a `context`/`entities` payload
-//! that is unparseable or past a bound. The policy store the request names is
-//! resolved BEFORE any of that is read, so a call against a store that does not
-//! exist is the 404 whatever else the request got wrong.
+//! contract: an absent member of the triple, a `context`/`entities` payload
+//! that is unparseable or past a bound, or an `entities` slice carrying an action
+//! entity — the member takes principal and resource entities only, so the actions
+//! an evaluation knows stay the ones the store's schema specifies
+//! ([`crate::state::cedar::check_request_entities`]).
+//! The policy store the request names is resolved BEFORE any of that is read, so a call
+//! against a store that does not exist is the 404 whatever else the request got wrong.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -208,6 +211,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::cedar::MAX_ENTITIES_PER_REQUEST,
         )
         .map_err(invalid)?;
+        // The slice carries principal and resource entities only: this call names its
+        // own action, and which actions exist and which groups they belong to is what
+        // the store's schema says, so an action entity in the slice is refused instead
+        // of letting caller-supplied data stand in for the schema.
+        crate::state::cedar::check_request_entities(&entities).map_err(invalid)?;
 
         let verdict = crate::state::cedar::authorize(
             store,

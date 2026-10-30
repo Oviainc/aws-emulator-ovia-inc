@@ -25,6 +25,8 @@ mod date_time_wire_format;
 mod delete_policy_idempotency;
 #[path = "all/delete_policy_template.rs"]
 mod delete_policy_template;
+#[path = "all/entities_exclude_action_entities.rs"]
+mod entities_exclude_action_entities;
 #[path = "all/error_messages.rs"]
 mod error_messages;
 #[path = "all/evaluation_errors.rs"]

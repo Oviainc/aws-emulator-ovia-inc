@@ -24,7 +24,10 @@
 //! its `entities` carries at most
 //! [`crate::state::cedar::MAX_ENTITIES_PER_BATCH`] entities — the batch's own
 //! capacity, which is larger than one request's — and either the principal or the
-//! resource must be identical across all of its requests.
+//! resource must be identical across all of its requests. Its `entities` also
+//! takes principal and resource entities only, the rule
+//! [`crate::state::cedar::check_request_entities`] applies for every
+//! authorization call that names its own action.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -254,6 +257,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::cedar::MAX_ENTITIES_PER_BATCH,
         )
         .map_err(invalid)?;
+        // The slice carries principal and resource entities only, for the reason
+        // [`crate::ops::is_authorized`] states: every request of the batch names its own
+        // action, and the actions one evaluation knows are the store's schema's.
+        crate::state::cedar::check_request_entities(&entities).map_err(invalid)?;
 
         // Every policy of the store, parsed ONCE for the whole batch: a static
         // policy's own Cedar text and a template-linked one's link of its

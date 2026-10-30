@@ -1619,6 +1619,44 @@ pub fn is_action_entity_type(entity_type: &str) -> bool {
     }
 }
 
+/// Check the `entities` slice of an authorization request that names its ACTION itself,
+/// over the Cedar JSON [`entities_to_cedar_json`] built.
+///
+/// Such a call's `entities` member carries principal and resource entities only — "You can
+/// include only principal and resource entities in this parameter; you can't include
+/// actions. You must specify actions in the schema."
+/// (`smithy_query(query="doc", shape="IsAuthorizedInput", member="entities")`, worded
+/// identically on `BatchIsAuthorizedInput$entities`) — so an action entity
+/// ([`is_action_entity_type`]) is refused rather than loaded into the entity store: the
+/// actions one evaluation knows, and the hierarchy they sit in, are the ones the policy
+/// store's schema declares and not ones a request describes. Both arms of
+/// `EntitiesDefinition` are covered, because this reads the Cedar JSON they are both
+/// converted into.
+///
+/// A payload that is no entity LIST at all carries no entity to inspect; it is refused by
+/// [`build_entities`], where what counts as a Cedar entity store is decided.
+pub fn check_request_entities(entities: &serde_json::Value) -> Result<(), InvalidInput> {
+    let Some(supplied) = entities.as_array() else {
+        return Ok(());
+    };
+    for entity in supplied {
+        let Some(entity_type) = entity_uid_type(entity) else {
+            continue;
+        };
+        if is_action_entity_type(entity_type) {
+            return Err(InvalidInput::new(
+                paths::ENTITIES,
+                format!(
+                    "it carries an entity of type {entity_type}, which is an action entity \
+                     type, and an authorization request carries only principal and resource \
+                     entities: the actions are the ones the policy store's schema specifies"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// One entity type a policy store knows as a PRINCIPAL type, and where it says so — which
 /// is what a refusal naming the type reports.
 #[derive(Debug, Clone)]
