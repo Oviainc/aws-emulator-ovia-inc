@@ -223,7 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the ids this service hands out count the submissions it applied. One
         // applied submission opens exactly one case, whatever number of accounts
         // it wrote for, because it submits one certificate.
-        store
+        let accounts = store
             .store_exemptions(
                 &input.account_ids,
                 &input.exemption_type,
@@ -232,19 +232,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .map_err(PutTaxExemptionErrorModeled::CaseCreationLimitExceededException)?;
         let case_id = store.mint_exemption_case_id();
-        let accounts = input.account_ids.len();
         drop(store);
 
         // The access record for a state-changing call: which operation ran, what
         // it changed and how it ended. The certificate's bytes are never logged,
-        // and neither is any credential.
+        // and neither is any credential. The accounts it reports are the ones the
+        // write ANSWERED it addressed, not the entries the request listed: an id
+        // named twice names one account ([`crate::state::distinct_account_ids`]),
+        // so a count taken from the request would say this call changed accounts
+        // the store never saw.
         ::tracing::info!(
             operation = "PutTaxExemption",
             outcome = "recorded",
             accounts,
             exemption_type = %input.exemption_type,
             case_id = %case_id,
-            "recorded a tax exemption for the accounts a submission named"
+            "recorded a tax exemption for the accounts a submission addressed"
         );
 
         Ok(PutTaxExemptionOutput {

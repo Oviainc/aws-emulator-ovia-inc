@@ -1060,7 +1060,8 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     }
 
     /// Record the exemption `exemption_type` and `authority` identify for every
-    /// account of `account_ids`, as submitted at `recorded_at`.
+    /// account of `account_ids`, as submitted at `recorded_at`, answering how
+    /// many accounts the write addressed.
     ///
     /// The one place an exemption becomes a stored record. `exemption_type` is
     /// the token the submission named its type by, recorded as
@@ -1081,7 +1082,11 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     ///
     /// The accounts the submission addresses are the ids it names, each once
     /// ([`distinct_account_ids`]): one record per addressed account, whatever
-    /// number of times the list repeats its id.
+    /// number of times the list repeats its id. That count — how many accounts
+    /// the write addressed, not how many entries the list carried — is what an
+    /// applied write ANSWERS, so a caller reporting on the write it just
+    /// performed reports the store's own number rather than recomputing one from
+    /// the request.
     ///
     /// `accountIds` is caller-supplied (up to 550 ids per call), so a submission
     /// that would ADD records past [`MAX_STORED_EXEMPTIONS`] is refused whole,
@@ -1099,7 +1104,7 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
         exemption_type: &str,
         authority: &Authority,
         recorded_at: SystemTime,
-    ) -> Result<(), CaseCreationLimitExceededException> {
+    ) -> Result<usize, CaseCreationLimitExceededException> {
         // The type the record is held under — the published entry the token
         // names, or the token as submitted ([`submitted_exemption_type`]) — and
         // its `description`, which with the jurisdiction is the exemption's
@@ -1129,6 +1134,7 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
             system_effective_date: Some(recorded_at),
             status: EXEMPTION_STATUS_PENDING.to_string(),
         };
+        let addressed = distinct.len();
         for account_id in distinct {
             let held = self.exemptions.entry(account_id.to_string()).or_default();
             match held
@@ -1139,7 +1145,7 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
                 None => held.push(submitted.clone()),
             }
         }
-        Ok(())
+        Ok(addressed)
     }
 }
 
