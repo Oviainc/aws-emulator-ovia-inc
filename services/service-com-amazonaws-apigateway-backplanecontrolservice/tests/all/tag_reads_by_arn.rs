@@ -29,7 +29,7 @@
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
-    MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS,
+    INVALID_ARN, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS,
 };
 
 use crate::rest_api_lifecycle::{assert_failure, string_member, Answer, Gateway};
@@ -343,10 +343,14 @@ async fn get_tags_refuses_a_resource_arn_it_cannot_read_as_a_taggable_resource()
     for (case, arn) in &cases {
         let answer = get_tags(&gateway, arn).await;
         assert_failure(&answer, 400, "BadRequestException", case);
-        let message = answer.body["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains(arn.as_str()),
-            "case {case}: expected the refusal to name the rejected {arn:?}, got {message:?}"
+        // ONE sentence for every value this service could not read as the ARN of a
+        // taggable resource, and it is entirely FIXED text: the rejected value is not
+        // quoted back, so no row's message differs from another's.
+        assert_eq!(
+            answer.body["message"].as_str(),
+            Some(INVALID_ARN),
+            "case {case}: expected the unreadable-ARN sentence, got {:?}",
+            answer.body["message"]
         );
     }
 }

@@ -363,7 +363,7 @@ fn apigateway<Eng: Send + Sync + 'static>(
         return if owner_apigateway::state::tag_index::addresses_own_resource(&arn.arn) {
             absent(
                 "BadRequestException",
-                owner_apigateway::state::invalid_arn(&arn.arn),
+                owner_apigateway::state::INVALID_ARN.to_string(),
             )
         } else {
             Resolution::Unowned

@@ -30,6 +30,9 @@
 //!   addressed the way a top-level member is, and which a `remove` of the structure
 //!   itself turns off.
 //!
+//! A `copy` is the canary PROMOTION rather than a patch of a member, so its legal
+//! `(path, from)` pairs are a grammar of their own — see [`CANARY_PROMOTIONS`].
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -129,6 +132,44 @@ use crate::state::{
 /// "from":"/canarySettings/deploymentId" and "path":"/deploymentId""
 /// (`PatchOperation$from`).
 const CANARY_DEPLOYMENT_POINTER: &str = "/canarySettings/deploymentId";
+
+/// The pointer a canary promotion copies the stage variable overrides FROM: the canary's
+/// own `stageVariableOverrides`, "the stage variable overrides used for the canary release
+/// deployment" (`CanarySettings$stageVariableOverrides`), which promoting the canary makes
+/// the stage's own variables.
+const CANARY_OVERRIDES_POINTER: &str = "/canarySettings/stageVariableOverrides";
+
+/// The `copy` grammar of a stage: each pair is a `path` a `copy` may name beside the ONE
+/// pointer that `copy`'s `from` may read it out of.
+///
+/// A `copy` on a stage is the canary promotion — the canary's deployment becomes the
+/// stage's, and the canary's stage variable overrides become the stage's variables — so
+/// the two sides are a PAIR rather than two independent sets: a `copy` whose path, whose
+/// `from`, or whose combination of the two is not one of these pairs applies nothing, and
+/// is refused with the sentence [`invalid_copy_operation`] states, which enumerates each
+/// side of this table.
+const CANARY_PROMOTIONS: &[(&str, &str)] = &[
+    ("/deploymentId", CANARY_DEPLOYMENT_POINTER),
+    ("/variables", CANARY_OVERRIDES_POINTER),
+];
+
+/// The `BadRequestException` message for a `copy` outside the stage's copy grammar.
+///
+/// Fixed text states the two legal sets — the paths a `copy` may name and the pointers one
+/// may read from, both constants of the grammar [`CANARY_PROMOTIONS`] holds, listed from
+/// that one table so the sentence cannot offer a pair the stage would refuse — and the only
+/// variable parts are the rejected operation's own `path` and `from`, quoted back exactly
+/// as the request spelled them.
+fn invalid_copy_operation(path: &str, from: &str) -> String {
+    let paths: Vec<&str> = CANARY_PROMOTIONS.iter().map(|(path, _)| *path).collect();
+    let sources: Vec<&str> = CANARY_PROMOTIONS.iter().map(|(_, from)| *from).collect();
+    format!(
+        "Invalid copy operation with path: {path} and from {from}. Valid copy:path are \
+         [{}] and valid copy:from are [{}]",
+        paths.join(", "),
+        sources.join(", ")
+    )
+}
 
 /// The values `MethodSetting$loggingLevel` documents: "Valid values are OFF, ERROR, and
 /// INFO." The member is a plain string on the wire, so its value set is checked here.
@@ -247,6 +288,12 @@ fn apply_patch(
     patch: &Patch,
     deployments: &BTreeSet<String>,
 ) -> Result<(), PatchFailure> {
+    // A `copy` is the canary promotion, whose legal (path, from) pairs are the stage's
+    // copy grammar — judged for the op as a whole rather than per member, because the
+    // refusal names both sides of the pair the request sent.
+    if matches!(patch.op, PatchOpKind::Copy) {
+        return apply_canary_promotion(entry, patch, deployments);
+    }
     match patch.member() {
         "deploymentId" => apply_deployment_id(entry, patch, deployments),
         "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
@@ -278,8 +325,48 @@ fn apply_patch(
     }
 }
 
-/// Point the stage at another deployment, either from the op's `value` or — for a canary
-/// promotion — from the canary's own deployment id (see [`CANARY_DEPLOYMENT_POINTER`]).
+/// Promote the canary: apply the one `copy` of the stage's copy grammar
+/// ([`CANARY_PROMOTIONS`]) the request sent, or refuse a `copy` outside it.
+fn apply_canary_promotion(
+    entry: &mut StageEntry,
+    patch: &Patch,
+    deployments: &BTreeSet<String>,
+) -> Result<(), PatchFailure> {
+    let from = patch.from.as_deref().unwrap_or_default();
+    let promoted = CANARY_PROMOTIONS
+        .iter()
+        .find(|(path, source)| *path == patch.path && *source == from)
+        .map(|(path, _)| *path)
+        .ok_or_else(|| PatchFailure::BadRequest(invalid_copy_operation(&patch.path, from)))?;
+    let canary = entry.canary_settings.clone().unwrap_or_default();
+    if promoted == "/deploymentId" {
+        // The deployment the canary serves becomes the one the stage serves, so it has to
+        // be a deployment of this API, exactly as a `replace` of the member does.
+        let deployment_id = canary.deployment_id.ok_or_else(|| {
+            PatchFailure::BadRequest(format!(
+                "{CANARY_DEPLOYMENT_POINTER} names no deployment on this stage, so there is \
+                 nothing to copy to {}",
+                patch.path
+            ))
+        })?;
+        require_deployment(deployments, &deployment_id)?;
+        entry.deployment_id = deployment_id;
+        return Ok(());
+    }
+    // `/variables`: the overrides the canary served are promoted ONTO the stage's own
+    // variables — an overridden name takes the canary's value and a name the canary did
+    // not override keeps the stage's — so a canary that overrode nothing promotes nothing.
+    // The result is bounded like every other caller-driven collection.
+    let mut variables = entry.variables.clone();
+    variables.extend(canary.stage_variable_overrides.unwrap_or_default());
+    crate::state::bound_entries("variables", variables.len(), MAX_COLLECTION_ENTRIES)
+        .map_err(PatchFailure::BadRequest)?;
+    entry.variables = variables;
+    Ok(())
+}
+
+/// Point the stage at another deployment from the op's `value`. A canary promotion reads
+/// the canary's own deployment id instead and is applied by [`apply_canary_promotion`].
 fn apply_deployment_id(
     entry: &mut StageEntry,
     patch: &Patch,
@@ -288,26 +375,6 @@ fn apply_deployment_id(
     patch.require_single_valued()?;
     let deployment_id = match patch.op {
         PatchOpKind::Add | PatchOpKind::Replace => patch.require_value()?.to_string(),
-        PatchOpKind::Copy => {
-            let from = patch.from.as_deref().unwrap_or_default();
-            if from != CANARY_DEPLOYMENT_POINTER {
-                return Err(PatchFailure::BadRequest(format!(
-                    "a copy of {} takes from {CANARY_DEPLOYMENT_POINTER}, got {from:?}",
-                    patch.path
-                )));
-            }
-            entry
-                .canary_settings
-                .as_ref()
-                .and_then(|canary| canary.deployment_id.clone())
-                .ok_or_else(|| {
-                    PatchFailure::BadRequest(format!(
-                        "{CANARY_DEPLOYMENT_POINTER} names no deployment on this stage, so there \
-                         is nothing to copy to {}",
-                        patch.path
-                    ))
-                })?
-        }
         // A stage always points at a deployment, so the member cannot be removed.
         _ => return Err(patch.unsupported_op()),
     };

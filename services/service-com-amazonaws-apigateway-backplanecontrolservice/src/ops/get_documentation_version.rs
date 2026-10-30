@@ -142,17 +142,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pure read: it reports the stored snapshot and writes nothing, so a later
         // caller sees exactly what this one saw.
         let store = state.lock();
-        let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
-            GetDocumentationVersionErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
-            })
-        })?;
-        let entry = api
-            .documentation_versions
-            .get(&input.documentation_version)
-            .ok_or_else(|| {
+        // The pair is resolved for the SNAPSHOT the URI addresses, so an unresolvable
+        // identifier is reported as the documentation version rather than as the API that
+        // would hold it — see
+        // [`crate::state::ComAmazonawsApigatewayBackplanecontrolserviceState::documentation_version`].
+        let entry = store
+            .documentation_version(&input.rest_api_id, &input.documentation_version)
+            .map_err(|message| {
                 GetDocumentationVersionErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::NO_SUCH_DOCUMENTATION_VERSION.to_string()),
+                    message: Some(message),
                 })
             })?;
         let body = super::create_documentation_version::documentation_version_body(entry);

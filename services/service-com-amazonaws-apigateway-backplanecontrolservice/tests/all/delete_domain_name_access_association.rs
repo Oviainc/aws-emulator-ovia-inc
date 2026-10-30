@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
-    invalid_arn, NO_SUCH_ACCESS_ASSOCIATION,
+    INVALID_ARN, NO_SUCH_ACCESS_ASSOCIATION,
 };
 
 use crate::domain_name_access_associations::{
@@ -319,11 +319,11 @@ async fn an_arn_this_service_cannot_read_is_the_modelled_bad_request() {
     for (case, arn) in &rows {
         let answer = delete_association(&gateway, arn).await;
         assert_failure(&answer, 400, BAD_REQUEST, case);
-        // ONE sentence for a value this service could not read as an ARN, naming the value
-        // the caller must fix.
+        // ONE sentence for a value this service could not read as an ARN, and it carries
+        // none of that value: the same fixed text whichever member took it.
         assert_eq!(
             answer.body["message"].as_str(),
-            Some(invalid_arn(arn).as_str()),
+            Some(INVALID_ARN),
             "case {case}: expected the unreadable-ARN sentence, got {:?}",
             answer.body["message"]
         );

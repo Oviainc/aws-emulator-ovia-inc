@@ -170,13 +170,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service reads a `resourceArn`.
         let resource = crate::state::parse_tagged_resource(&input.resource_arn).ok_or_else(|| {
             UntagResourceErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::invalid_arn(&input.resource_arn)),
+                message: Some(crate::state::INVALID_ARN.to_string()),
             })
         })?;
         crate::state::bound_entries("tagKeys", input.tag_keys.len(), crate::state::MAX_TAGS)
             .and_then(|()| {
+                // A key past the bound a tag key may take breaks the one tag contract this
+                // service states, so it earns that contract's own sentence — the same one a
+                // key or a value past its bound earns on the way IN
+                // ([`crate::state::bound_tag`]).
                 input.tag_keys.iter().try_for_each(|key| {
-                    crate::state::bound_chars("a tag key", key, crate::state::MAX_TAG_KEY_CHARS)
+                    if key.chars().count() > crate::state::MAX_TAG_KEY_CHARS {
+                        return Err(crate::state::invalid_tag());
+                    }
+                    Ok(())
                 })
             })
             .map_err(|message| {

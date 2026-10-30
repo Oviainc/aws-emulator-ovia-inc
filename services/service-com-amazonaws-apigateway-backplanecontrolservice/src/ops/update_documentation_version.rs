@@ -230,21 +230,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(patch_failure)?;
 
         let mut store = state.lock();
-        let api = store
-            .rest_apis
-            .get_mut(&input.rest_api_id)
-            .ok_or_else(|| not_found(crate::state::no_such_rest_api(&input.rest_api_id)))?;
-
         // Patched on a COPY of the record: a list whose later op is refused leaves the
-        // stored snapshot untouched, rather than keeping the ops before it.
-        let mut updated = api
-            .documentation_versions
-            .get(&input.documentation_version)
-            .ok_or_else(|| not_found(crate::state::NO_SUCH_DOCUMENTATION_VERSION.to_string()))?
+        // stored snapshot untouched, rather than keeping the ops before it. The pair is
+        // resolved as ONE lookup for the snapshot the URI addresses, so an unresolvable
+        // identifier is reported as the documentation version rather than as the API that
+        // would hold it — see
+        // [`crate::state::ComAmazonawsApigatewayBackplanecontrolserviceState::documentation_version`].
+        let mut updated = store
+            .documentation_version(&input.rest_api_id, &input.documentation_version)
+            .map_err(not_found)?
             .clone();
         for patch in &patches {
             apply_patch(&mut updated, patch).map_err(patch_failure)?;
         }
+        // Resolved a statement ago, so the API is stored: a miss here would mean the store
+        // did not keep it, which is the server-side failure it would be.
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(crate::state::state_unavailable)?;
         api.documentation_versions
             .insert(input.documentation_version.clone(), updated);
         // Rendered from the STORED record through the one `DocumentationVersion` body this

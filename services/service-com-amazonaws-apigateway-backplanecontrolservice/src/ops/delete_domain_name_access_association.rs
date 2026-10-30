@@ -204,9 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             || {
                 DeleteDomainNameAccessAssociationErrorModeled::BadRequestException(
                     BadRequestException {
-                        message: Some(crate::state::invalid_arn(
-                            &input.domain_name_access_association_arn,
-                        )),
+                        message: Some(crate::state::INVALID_ARN.to_string()),
                     },
                 )
             },

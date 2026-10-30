@@ -171,30 +171,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // Both identifiers the request carries are resolved against stored state before
-        // anything is removed, each naming its own record so the refusal says which one
-        // was not found.
-        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
-            DeleteDocumentationVersionErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
-            })
-        })?;
+        // anything is removed, as ONE lookup for the snapshot the URI addresses: a
+        // snapshot cannot exist without its API, so an unresolvable identifier is reported
+        // as the documentation version rather than as the API — see
+        // [`crate::state::ComAmazonawsApigatewayBackplanecontrolserviceState::documentation_version`].
+        store
+            .documentation_version(&input.rest_api_id, &input.documentation_version)
+            .map_err(|message| {
+                DeleteDocumentationVersionErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(message),
+                })
+            })?;
+        // Resolved a statement ago, so the API is stored: a miss here would mean the store
+        // did not keep it, which is the server-side failure it would be.
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(crate::state::state_unavailable)?;
         // A snapshot is keyed by the version identifier it was created under, so removing
         // that one entry is what makes a later `GetDocumentationVersion` answer
         // `NotFoundException`, drops it from `GetDocumentationVersions` and frees the
         // identifier for a new snapshot — while the API's documentation parts, and every
         // other snapshot of them, stay exactly as they were.
-        if api
-            .documentation_versions
-            .remove(&input.documentation_version)
-            .is_none()
-        {
-            return Err(DeleteDocumentationVersionErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(crate::state::NO_SUCH_DOCUMENTATION_VERSION.to_string()),
-                },
-            )
-            .into());
-        }
+        api.documentation_versions
+            .remove(&input.documentation_version);
         // Everything below is owned, so the store lock is released before the access
         // record is emitted: the critical section covers the state change only.
         drop(store);

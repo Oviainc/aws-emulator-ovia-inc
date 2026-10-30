@@ -312,3 +312,7 @@ mod stage_response_cache;
 // identifiers are resolved in.
 #[path = "all/usage_plan_api_stage_resolution.rs"]
 mod usage_plan_api_stage_resolution;
+// Appended for the reason the note above gives: WHICH record, condition and contract this
+// control plane's 400 and 404 refusals name, and the sentences it names them in.
+#[path = "all/refusal_sentence_targets.rs"]
+mod refusal_sentence_targets;

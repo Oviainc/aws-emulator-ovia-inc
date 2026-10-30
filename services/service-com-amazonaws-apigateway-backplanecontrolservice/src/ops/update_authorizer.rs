@@ -130,28 +130,36 @@ use crate::state::{
     MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
 };
 
-/// The paths an `Authorizer` publishes, in the order API Gateway enumerates them when it
-/// refuses one it cannot apply.
+/// The paths an `Authorizer` publishes, per `op`, in the order API Gateway enumerates them
+/// when it refuses one it cannot apply.
 ///
-/// The order is the `Authorizer` shape's own member order
+/// A `replace` names one of the authorizer's updateable SINGLE-VALUED members, in the
+/// `Authorizer` shape's own member order
 /// (`smithy_query(query="shape", shape="com.amazonaws.apigateway#Authorizer")`: id, name,
 /// type, providerARNs, authType, authorizerUri, authorizerCredentials, identitySource,
-/// identityValidationExpression, authorizerResultTtlInSeconds), with the members this
-/// resource does not publish dropped: `id` is the URI label addressing this very record,
-/// and `providerARNs` is the one multi-valued member, which `apply_patch` below applies but
-/// the published list does not carry — so the arms remain the authority on what is applied
-/// and this list on what the refusal offers. Published for a `replace`: see
-/// [`SupportedPatchPaths::replace_only`].
-const PATCH_PATHS: SupportedPatchPaths = SupportedPatchPaths::replace_only(&[
-    "/name",
-    "/type",
-    "/authType",
-    "/authorizerUri",
-    "/authorizerCredentials",
-    "/identitySource",
-    "/identityValidationExpression",
-    "/authorizerResultTtlInSeconds",
-]);
+/// identityValidationExpression, authorizerResultTtlInSeconds), with `id` dropped — it is
+/// the URI label addressing this very record.
+///
+/// An `add` names a MULTI-VALUED member instead — the pool ARNs of a user-pool authorizer
+/// and the identity sources it reads, each of which an element is added to — so that op
+/// enumerates its own set, as a recorded refusal of a path under an `add` shows. A
+/// `remove` publishes no path: nothing records a set for it, and the two ops' sets need not
+/// coincide, so an unapplicable path under a `remove` is answered as an op the resource
+/// publishes no path for.
+const PATCH_PATHS: SupportedPatchPaths = SupportedPatchPaths {
+    add: &["/providerARNs", "/identitySource"],
+    remove: &[],
+    replace: &[
+        "/name",
+        "/type",
+        "/authType",
+        "/authorizerUri",
+        "/authorizerCredentials",
+        "/identitySource",
+        "/identityValidationExpression",
+        "/authorizerResultTtlInSeconds",
+    ],
+};
 
 /// How this operation words a refusal of a patch `path` it cannot apply: the path quoted,
 /// the `op` that named it and the paths this resource publishes. Reaches every path

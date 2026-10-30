@@ -246,7 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this handler runs.
         bound_input(&input).map_err(bad_request)?;
         let domain_name_key = domain_name_key_of(&input.domain_name_arn)
-            .ok_or_else(|| bad_request(crate::state::invalid_arn(&input.domain_name_arn)))?;
+            .ok_or_else(|| bad_request(crate::state::INVALID_ARN.to_string()))?;
 
         let region = crate::state::request_region(ctx.parts());
 

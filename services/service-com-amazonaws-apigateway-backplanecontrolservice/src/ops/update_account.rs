@@ -83,16 +83,22 @@
 use super::types::*;
 
 use crate::state::{
-    patch_optional_string, InvalidPathRefusal, Patch, PatchFailure, SupportedPatchPaths,
+    patch_optional_string, InvalidPathRefusal, Patch, PatchFailure, PatchOpKind,
+    SupportedPatchPaths,
 };
 
 /// The paths an `Account` can be addressed by, in the order API Gateway enumerates them
 /// when it refuses one it cannot apply: the account's CloudWatch role
 /// ([`crate::state::ACCOUNT_CLOUDWATCH_ROLE_PATH`], as a pointer from the record root) is
-/// the one member a caller sets, which is the one arm `apply_patch` below has. Published
-/// for a `replace`: see [`SupportedPatchPaths::replace_only`].
+/// the one member a caller sets, which is the one arm `apply_patch` below has.
+///
+/// PUBLISHED FOR EVERY OP the account takes a path for: a recorded refusal of that very
+/// path under an `add` enumerates it, so the account's one published path is what the
+/// refusal offers whichever of `add`, `remove` and `replace` named the rejected path —
+/// which is not the same thing as the ops the member ACCEPTS (see `apply_patch`), the
+/// asymmetry [`SupportedPatchPaths`] exists to carry.
 const PATCH_PATHS: SupportedPatchPaths =
-    SupportedPatchPaths::replace_only(&["/cloudwatchRoleArn"]);
+    SupportedPatchPaths::for_every_op(&["/cloudwatchRoleArn"]);
 
 /// How this operation words a refusal of a patch `path` it cannot apply: the path quoted,
 /// the `op` that named it and the paths this resource publishes. Reaches every path
@@ -110,25 +116,33 @@ const IAM_VENDOR: &str = "iam";
 /// See [`IAM_VENDOR`].
 const ROLE_RESOURCE_TYPE: &str = "role";
 
-/// Refuse a `cloudwatchRoleArn` that is not an IAM role ARN.
+/// Refuse a `cloudwatchRoleArn` this service cannot read as an ARN AT ALL.
 ///
-/// Only the ARN's SHAPE is judged, which is what this emulator can know without IAM:
-/// whether the role exists and whether API Gateway may assume it is a separate check
-/// that belongs to whatever resolves the role against IAM.
-/// The one sentence API Gateway refuses a `cloudwatchRoleArn` that is not an ARN it can
-/// read with: entirely fixed text, naming neither the rejected value nor the member that
-/// carried it, as a recorded refusal of such a value shows.
-const INVALID_ARN: &str = "Invalid ARN specified in the request";
+/// The member is "the ARN of an Amazon CloudWatch role for the current Account", so a
+/// value it carries has to be an ARN whatever the patch means to do with it: this is the
+/// check the VALUE earns before the op/path grammar is judged, and a recorded refusal of
+/// this path under an op it does not take shows AWS answering the unreadable-ARN sentence
+/// there rather than the grammar one. An EMPTY value carries no ARN to read — it names no
+/// role rather than misnaming one — so it is not refused here, which is what the recorded
+/// refusal of this path carrying one shows: that request earns the grammar refusal. Which
+/// RESOURCE the ARN must name is the member's own, narrower rule
+/// ([`role_arn_violation`]), applied where the op is one the path takes.
+fn unreadable_arn(value: &str) -> Option<String> {
+    let unreadable = !value.is_empty() && ::service_common::arn::parse(value).is_none();
+    unreadable.then(|| crate::state::INVALID_ARN.to_string())
+}
 
 /// Refuse a `cloudwatchRoleArn` that is not an IAM role ARN.
 ///
 /// Only the ARN's SHAPE is judged, which is what this emulator can know without IAM:
 /// whether the role exists and whether API Gateway may assume it is a separate check
-/// that belongs to whatever resolves the role against IAM.
+/// that belongs to whatever resolves the role against IAM. The refusal is this service's
+/// one unreadable-ARN sentence ([`crate::state::INVALID_ARN`]), shared with every other
+/// member an ARN rides on.
 fn role_arn_violation(role_arn: &str) -> Option<String> {
     let names_a_role = ::service_common::arn::parse_of(role_arn, IAM_VENDOR)
         .is_some_and(|arn| arn.resource_type() == ROLE_RESOURCE_TYPE);
-    (!names_a_role).then(|| INVALID_ARN.to_string())
+    (!names_a_role).then(|| crate::state::INVALID_ARN.to_string())
 }
 
 /// Apply one patch to a COPY of the stored account record.
@@ -138,6 +152,11 @@ fn role_arn_violation(role_arn: &str) -> Option<String> {
 /// naming one of them is refused with the path, the `op` that named it and the paths the
 /// account does publish ([`PATCH_PATHS`]), the way every unsupported path on this resource
 /// is refused.
+///
+/// The VALUE an op carries is read as an ARN before the op/path grammar is judged, as a
+/// recorded refusal of this path carrying an unreadable ARN under an op the path does not
+/// take shows: the unreadable-ARN sentence is the answer there, while a value that IS an
+/// ARN gets past it and earns the grammar refusal.
 fn apply_patch(account: &mut crate::state::AccountEntry, patch: &Patch) -> Result<(), PatchFailure> {
     match patch.member() {
         crate::state::ACCOUNT_CLOUDWATCH_ROLE_PATH => {
@@ -145,10 +164,37 @@ fn apply_patch(account: &mut crate::state::AccountEntry, patch: &Patch) -> Resul
             // single-valued member names nothing the account has, so it is refused as a
             // path whatever value rode in on it.
             patch.require_single_valued()?;
-            if let Some(role_arn) = patch.value.as_deref() {
-                if let Some(violation) = role_arn_violation(role_arn) {
+            if let Some(value) = patch.value.as_deref() {
+                if let Some(violation) = unreadable_arn(value) {
                     return Err(PatchFailure::BadRequest(violation));
                 }
+            }
+            // The account's one patchable member is SINGLE-VALUED, and the op that sets a
+            // single-valued member is a `replace`: an `add` inserts an element where there
+            // is none and a `remove` drops one, which is what a multi-valued member takes,
+            // so the account publishes neither op's path for it. Either is refused on the
+            // grammar — the path, the op and the paths the account publishes for that op —
+            // as a recorded refusal of this very path under each of them shows.
+            if !matches!(patch.op, PatchOpKind::Replace) {
+                return Err(patch.unsupported_path());
+            }
+            // The member's own rule, applied where the op is one this path takes: a value
+            // that names a role has to name an IAM one, the role API Gateway assumes to
+            // write logs. An EMPTY value names no role at all: it CLEARS the member, which
+            // is how a caller takes the account's CloudWatch role off a path that takes no
+            // `remove`, and the account then reports none — as the recorded answer to such
+            // a patch, a 200 carrying no `cloudwatchRoleArn`, shows.
+            match patch.value.as_deref() {
+                Some("") => {
+                    account.cloudwatch_role_arn = None;
+                    return Ok(());
+                }
+                Some(role_arn) => {
+                    if let Some(violation) = role_arn_violation(role_arn) {
+                        return Err(PatchFailure::BadRequest(violation));
+                    }
+                }
+                None => {}
             }
             patch_optional_string(
                 &mut account.cloudwatch_role_arn,

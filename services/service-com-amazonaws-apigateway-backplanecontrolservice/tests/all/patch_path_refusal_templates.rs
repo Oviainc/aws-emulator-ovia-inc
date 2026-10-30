@@ -185,8 +185,12 @@ async fn targets(gateway: &Gateway) -> Vec<Target> {
             operation: "UpdateAccount",
             uri: "/account".to_string(),
             replace_paths: vec!["/cloudwatchRoleArn"],
-            add_paths: vec![],
-            remove_paths: vec![],
+            // The account publishes its one patchable path whichever of the three ops
+            // named the rejected one, as a recorded refusal of that path under an `add`
+            // shows: the enumeration is what the resource PUBLISHES, not the set of ops
+            // the member accepts.
+            add_paths: vec!["/cloudwatchRoleArn"],
+            remove_paths: vec!["/cloudwatchRoleArn"],
             invalid_op: INVALID_OP,
             accepted: ("/cloudwatchRoleArn", CLOUDWATCH_ROLE_ARN, "cloudwatchRoleArn"),
         },
@@ -252,7 +256,10 @@ async fn targets(gateway: &Gateway) -> Vec<Target> {
                 "/identityValidationExpression",
                 "/authorizerResultTtlInSeconds",
             ],
-            add_paths: vec![],
+            // An `add` names a MULTI-VALUED member of the authorizer — the user-pool ARNs
+            // and the identity sources, each of which an element is added to — so that op
+            // enumerates its own set. A `remove` publishes none.
+            add_paths: vec!["/providerARNs", "/identitySource"],
             remove_paths: vec![],
             invalid_op: INVALID_OP,
             accepted: ("/name", "renamed-authorizer", "name"),
@@ -557,9 +564,12 @@ async fn a_pointer_into_access_log_settings_is_refused_by_the_structure_not_the_
         }
     }
 
-    // An op the structure takes no pointer for is refused as an op, with the stage's own
-    // enumeration of the ops it does take.
-    for kind in OP_ONLY_REFUSALS {
+    // An op the STAGE takes no path for is refused as an op, with the stage's own
+    // enumeration of the ops it does take. A `copy` is not one of them: a stage does take a
+    // `copy` (the canary promotion), so a `copy` naming a pointer outside its copy grammar
+    // is refused by that grammar instead, and the sibling `update_stage_copy_grammar`
+    // suite pins that sentence.
+    for kind in OP_ONLY_REFUSALS.iter().filter(|kind| **kind != "copy") {
         let case = format!("UpdateStage({kind} /accessLogSettings)");
         let answer = patch(
             &gateway,

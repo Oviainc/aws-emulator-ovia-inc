@@ -102,7 +102,7 @@ fn arn_of_kind(
 ) -> Result<TaggedResource, RejectDomainNameAccessAssociationError> {
     crate::state::parse_tagged_resource(value)
         .filter(|resource| resource.kind() == kind)
-        .ok_or_else(|| bad_request(crate::state::invalid_arn(value)))
+        .ok_or_else(|| bad_request(crate::state::INVALID_ARN.to_string()))
 }
 
 /// A request this service cannot read: the bad request it is.

@@ -9,9 +9,9 @@
 //! The RULE under test: `GetAccount` reports the account record, and the only member of
 //! it a caller sets is the CloudWatch role, which `UpdateAccount`'s `patchOperations`
 //! write and a later `GetAccount` reads back unchanged. The rows span what that
-//! generalises over: each patch op the member takes (`replace`, `add`, `remove`), a
-//! sequence of them, the members no patch may name, the values that are not an IAM role
-//! ARN, and the read before anything was ever written.
+//! generalises over: the role the one op the member takes (`replace`) sets, a sequence of
+//! them, the ops it does not take, the members no patch may name, the values that are not
+//! an IAM role ARN, and the read before anything was ever written.
 //!
 //! `GetAccount` is also a REPORTING operation, so the invariant
 //! [`a_read_of_the_account_reports_the_stored_record_and_changes_nothing`] pins holds
@@ -106,7 +106,9 @@ async fn the_account_settings_a_patch_writes_are_what_a_read_reports() {
 
     // Each patch op the member takes, in sequence: every row asserts the value the
     // UPDATE reported and the value a following READ reports, so nothing is echoed from
-    // the request alone.
+    // the request alone. The one op the member takes is a `replace` — it is single-valued,
+    // and the sibling `refusal_sentence_targets` suite pins the grammar refusal an `add`
+    // or a `remove` of it earns — so the rows vary the ROLE instead.
     // (case, op, value, the role the account then has)
     let rows: &[(&str, &str, Option<&str>, Option<&str>)] = &[
         (
@@ -122,17 +124,16 @@ async fn the_account_settings_a_patch_writes_are_what_a_read_reports() {
             Some("second"),
         ),
         (
-            "add sets the single-valued member too",
-            "add",
-            Some("third"),
-            Some("third"),
-        ),
-        ("remove clears it", "remove", None, None),
-        (
-            "replace sets it again after a remove",
+            "replace points it back at the first role",
             "replace",
-            Some("fourth"),
-            Some("fourth"),
+            Some("first"),
+            Some("first"),
+        ),
+        (
+            "replace sets a role whose name is a single character",
+            "replace",
+            Some("r"),
+            Some("r"),
         ),
     ];
     for (case, op, value, expected) in rows {
@@ -165,9 +166,74 @@ async fn the_account_settings_a_patch_writes_are_what_a_read_reports() {
     }
 }
 
-/// One patch of the account's CloudWatch role: the `op` and the value it carries
-/// (absent for `remove`, which takes none).
+/// One patch of the account's CloudWatch role: the `op` and the value it carries.
 type RolePatch<'a> = (&'a str, Option<&'a str>);
+
+#[tokio::test]
+async fn a_replace_carrying_an_empty_value_clears_the_one_member_a_caller_owns() {
+    // The path takes no `remove` (the sibling `refusal_sentence_targets` suite pins that
+    // refusal), so an EMPTY value is how a caller takes the account's CloudWatch role off:
+    // it names no role, so the account reports none afterwards — and it does so from
+    // whatever state the record was in, which is what the rows span.
+    let states: &[(&str, &[RolePatch<'_>])] = &[
+        ("an account nobody has configured", &[]),
+        ("an account configured once", &[("replace", Some("logging"))]),
+        (
+            "an account pointed at another role",
+            &[("replace", Some("first")), ("replace", Some("second"))],
+        ),
+        (
+            "an account already cleared once",
+            &[("replace", Some("first")), ("replace", Some(""))],
+        ),
+    ];
+
+    for (case, patches) in states {
+        let gateway = Gateway::new();
+        for (op, value) in *patches {
+            // An empty value is sent VERBATIM; every other row names a role ARN.
+            let value = value.map(|value| {
+                if value.is_empty() {
+                    String::new()
+                } else {
+                    role_arn(value)
+                }
+            });
+            patch_account(&gateway, op, "/cloudwatchRoleArn", value.as_deref()).await;
+        }
+        let cleared = patch_account(&gateway, "replace", "/cloudwatchRoleArn", Some("")).await;
+        assert_eq!(
+            cleared["cloudwatchRoleArn"],
+            Value::Null,
+            "case {case:?}: expected UpdateAccount to report no cloudwatchRoleArn, got {cleared:?}"
+        );
+        let read = get_account(&gateway).await;
+        assert_eq!(
+            read["cloudwatchRoleArn"],
+            Value::Null,
+            "case {case:?}: expected GetAccount to read back no cloudwatchRoleArn, got {read:?}"
+        );
+        // Clearing the caller's member leaves the service's own values alone.
+        assert_eq!(
+            read["apiKeyVersion"],
+            json!(API_KEY_VERSION),
+            "case {case:?}: expected the API key version to be unchanged, got {read:?}"
+        );
+        // And the role can be set again afterwards, so clearing it is not a terminal state.
+        let again = patch_account(
+            &gateway,
+            "replace",
+            "/cloudwatchRoleArn",
+            Some(&role_arn("after-clearing")),
+        )
+        .await;
+        assert_eq!(
+            again["cloudwatchRoleArn"],
+            json!(role_arn("after-clearing")),
+            "case {case:?}: expected the role to be settable again, got {again:?}"
+        );
+    }
+}
 
 /// One state of the account record: the case name, the patch sequence that puts the
 /// record in it, and the CloudWatch role the record then carries.
@@ -190,20 +256,10 @@ async fn a_read_of_the_account_reports_the_stored_record_and_changes_nothing() {
             Some("second"),
         ),
         (
-            "an account whose role was added",
-            &[("add", Some("added"))],
-            Some("added"),
-        ),
-        (
-            "an account whose role was removed",
-            &[("replace", Some("first")), ("remove", None)],
-            None,
-        ),
-        (
-            "an account reconfigured after a remove",
+            "an account reconfigured three times over",
             &[
                 ("replace", Some("first")),
-                ("remove", None),
+                ("replace", Some("second")),
                 ("replace", Some("again")),
             ],
             Some("again"),
@@ -302,6 +358,11 @@ async fn a_patch_of_a_member_the_caller_does_not_own_is_refused_and_writes_nothi
     )
     .await;
 
+    // An `add` of the account's one patchable path, carrying a value the member WOULD
+    // take: the op/path grammar is judged before the value, so the row is refused for the
+    // op it used and not for what it carried.
+    let takeable = role_arn("grammar-before-value");
+
     // Every other member of `Account` is API Gateway's own, so no patch may name it;
     // neither may an op the surface does not support, nor a path that names nothing.
     // (case, op, path, value)
@@ -311,6 +372,18 @@ async fn a_patch_of_a_member_the_caller_does_not_own_is_refused_and_writes_nothi
         ("the account's API key version", "replace", "/apiKeyVersion", Some("5")),
         ("a member no shape declares", "replace", "/notAMember", Some("x")),
         ("an unsupported op", "copy", "/cloudwatchRoleArn", Some("x")),
+        (
+            "an add of the account's one patchable path",
+            "add",
+            "/cloudwatchRoleArn",
+            Some(takeable.as_str()),
+        ),
+        (
+            "a remove of the account's one patchable path",
+            "remove",
+            "/cloudwatchRoleArn",
+            None,
+        ),
         (
             // The member names the IAM role API Gateway assumes, so a value that is not
             // one is refused rather than stored.

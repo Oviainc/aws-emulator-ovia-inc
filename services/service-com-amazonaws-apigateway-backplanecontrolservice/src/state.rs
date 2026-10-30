@@ -3333,6 +3333,27 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
             .admits(limits, now)
     }
 
+    /// The documentation version a `(restApiId, documentationVersion)` pair addresses, or
+    /// the message that pair is refused with.
+    ///
+    /// The pair is resolved as ONE lookup for the snapshot the request addresses, so the
+    /// refusal reports the DOCUMENTATION VERSION — the record the URI's leaf label names —
+    /// whether the snapshot is missing from a stored API or the API that would hold it is
+    /// not stored either: a snapshot cannot exist without its API, so an unresolvable
+    /// `restApiId` leaves the addressed version unresolvable too and is not reported as an
+    /// API identifier failure. One copy for every operation addressed by that label, so the
+    /// read, the update and the delete say the same thing about the same pair.
+    pub fn documentation_version(
+        &self,
+        rest_api_id: &str,
+        documentation_version: &str,
+    ) -> Result<&DocumentationVersionEntry, String> {
+        self.rest_apis
+            .get(rest_api_id)
+            .and_then(|api| api.documentation_versions.get(documentation_version))
+            .ok_or_else(|| NO_SUCH_DOCUMENTATION_VERSION.to_string())
+    }
+
     /// The `UsagePlanKey` a `(usagePlanId, keyId)` pair addresses: the association held
     /// on the plan, paired with the API key record whose name and value the
     /// `UsagePlanKey` body reports.
@@ -3608,23 +3629,44 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
 /// documentation: a tag key "must not start with aws:".
 pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
+/// The `BadRequestException` message for a tag whose key or value is outside the tag
+/// contract.
+///
+/// ONE sentence for every violation of that contract — a key longer than a key may be, a
+/// value longer than a value may be, a character outside the published set — and it is
+/// ENTIRELY FIXED TEXT: it states the contract (the permitted characters and the two
+/// length bounds) and names neither the offending key, nor its length, nor which of the
+/// rules it broke, so a caller cannot tell the three apart from the message and treats
+/// them as the one tag-contract refusal AWS defines. The bounds are spelled from
+/// [`MAX_TAG_KEY_CHARS`] / [`MAX_TAG_VALUE_CHARS`], so the sentence and the check it
+/// answers for cannot disagree.
+pub fn invalid_tag() -> String {
+    format!(
+        "Invalid tag key/value. Valid characters are letters, numbers, spaces, and the \
+         following: _ . : / = + - @. Tag key can be up to {MAX_TAG_KEY_CHARS} characters. \
+         Tag value can be up to {MAX_TAG_VALUE_CHARS} characters."
+    )
+}
+
 /// Refuse one caller-supplied tag this service will not store.
 ///
 /// Every bound comes from the `tags` member's own documentation — "The tag key can be
 /// up to 128 characters and must not start with aws:. The tag value can be up to 256
 /// characters." — so the one check serves every operation that takes tags, whether the
 /// tags ride on a create (`CreateRestApi`, `CreateStage`, `CreateApiKey`) or on
-/// `TagResource`. The member's documented "valid character set is [a-zA-Z+-=._:/]" is
-/// NOT enforced: AWS accepts a key and a value outside it (the recorded units
-/// `apigateway.tag-resource-unicode-key-value-round-trip` and
-/// `apigateway.tag-value-unicode-round-trip` round-trip non-ASCII tags), so refusing
+/// `TagResource`. A key or a value past its bound earns the one tag-contract sentence
+/// [`invalid_tag`] states, whichever of the two it was. The member's documented "valid
+/// character set is [a-zA-Z+-=._:/]" is NOT enforced: AWS accepts a key and a value
+/// outside it (the recorded units `apigateway.tag-resource-unicode-key-value-round-trip`
+/// and `apigateway.tag-value-unicode-round-trip` round-trip non-ASCII tags), so refusing
 /// them would be stricter than the service.
 pub fn bound_tag(key: &str, value: &str) -> Result<(), String> {
     if key.is_empty() {
         return Err("a tag key may not be empty".to_string());
     }
-    bound_chars("a tag key", key, MAX_TAG_KEY_CHARS)?;
-    bound_chars("a tag value", value, MAX_TAG_VALUE_CHARS)?;
+    if key.chars().count() > MAX_TAG_KEY_CHARS || value.chars().count() > MAX_TAG_VALUE_CHARS {
+        return Err(invalid_tag());
+    }
     // The reserved namespace is AWS's own, and a prefix is a prefix whatever its case.
     if key
         .to_ascii_lowercase()
@@ -3939,14 +3981,15 @@ pub fn no_such_tagged_resource(kind: &str, id: &str) -> String {
 
 /// The `BadRequestException` message for ANY caller-supplied value this service could
 /// not read as an ARN — a `resourceArn` the tag operations take (the refusal
-/// [`parse_tagged_resource`]'s `None` earns), a `targetArns` entry, a domain name or
-/// access-association ARN. ONE sentence and one spelling of it, BUILT FROM THE REQUEST:
-/// it names the value that could not be read, so the caller can see which argument to
-/// fix, and the same malformed value is refused the same way whichever member carried
-/// it.
-pub fn invalid_arn(value: &str) -> String {
-    format!("Invalid ARN specified in the request {value}")
-}
+/// [`parse_tagged_resource`]'s `None` earns), a `targetArns` entry, a domain name or an
+/// access-association ARN, and the `cloudwatchRoleArn` an account's patch carries.
+///
+/// ONE sentence and one spelling of it, and ENTIRELY FIXED TEXT: it states that the
+/// request carried a value this API could not read as an ARN and quotes NEITHER the value
+/// nor the member that carried it, as a recorded refusal of an unreadable `resourceArn`
+/// shows. One copy for every member an ARN rides on, so the same unreadable value is
+/// refused the same way whichever one carried it.
+pub const INVALID_ARN: &str = "Invalid ARN specified in the request";
 
 /// The `NotFoundException` message for a `documentationPartId` that names no stored
 /// documentation part of the API.
