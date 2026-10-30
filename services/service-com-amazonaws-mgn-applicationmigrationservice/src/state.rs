@@ -12,10 +12,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use crate::ops::types::{
     ApplicationAggregatedStatus, CidrMapping, ConflictException, CreateApplicationOutput,
     CreateNetworkMigrationDefinitionOutput, DataReplicationInfo, InternalServerException,
-    LaunchedInstance, LifeCycle, ResourceNotFoundException, ServiceQuotaExceededException,
-    SourceConfiguration, SourceProperties, SourceServerConnectorAction, TargetNetwork,
-    TargetS3Configuration, UninitializedAccountException, UpdateSourceServerOutput,
-    ValidationException, ValidationExceptionField,
+    LaunchedInstance, LifeCycle, NetworkMigrationExecution as NetworkMigrationExecutionShape,
+    ResourceNotFoundException, ServiceQuotaExceededException, SourceConfiguration,
+    SourceProperties, SourceServerConnectorAction, TargetNetwork, TargetS3Configuration,
+    UninitializedAccountException, UpdateSourceServerOutput, ValidationException,
+    ValidationExceptionField,
 };
 
 /// The region an ARN carries when the request names none: the emulator's default.
@@ -94,6 +95,27 @@ pub const ACCOUNT_QUOTA: usize = 16;
 /// `ServiceQuotaExceededException`, so the record count cannot be grown past the bound.
 pub const NETWORK_MIGRATION_DEFINITION_QUOTA: usize = 1_000;
 
+/// The `ExecutionStatus` value an execution carries before anything has started it:
+/// the status a definition's staged execution waits in (the model's `ExecutionStatus`
+/// values are `PENDING`, `STARTED`, `SUCCEEDED`, `FAILED`).
+pub const EXECUTION_STATUS_PENDING: &str = "PENDING";
+
+/// The `ExecutionStage` value a staged execution waits at: the first stage of the
+/// network migration pipeline, which a definition's execution is staged for (the
+/// model's `ExecutionStage` values are `MAPPING`, `CODE_GENERATION`, `DEPLOY`,
+/// `DEPLOYED_STACKS_DELETION`, `ANALYZE`).
+pub const EXECUTION_STAGE_MAPPING: &str = "MAPPING";
+
+/// The most network migration executions this store holds at a time — per account AND
+/// in total.
+///
+/// The emulator's own bound on the execution growth site, not a claim about any AWS
+/// quota: the same reasoning as [`APPLICATION_QUOTA`]. Whatever records an execution
+/// goes through
+/// [`ComAmazonawsMgnApplicationmigrationserviceState::insert_network_migration_execution`],
+/// which refuses past the bound rather than growing the heap without end.
+pub const NETWORK_MIGRATION_EXECUTION_QUOTA: usize = 1_000;
+
 /// Per-service state for com-amazonaws-mgn-applicationmigrationservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMgnApplicationmigrationserviceState {
@@ -114,6 +136,11 @@ pub struct ComAmazonawsMgnApplicationmigrationserviceState {
     /// The `networkMigrationDefinitionID`s in creation order, so a listing pages in a
     /// stable order and a `nextToken` resumes where the previous page stopped.
     pub network_migration_definition_order: Vec<String>,
+    /// Every network migration execution, by `networkMigrationExecutionID`.
+    pub network_migration_executions: HashMap<String, NetworkMigrationExecution>,
+    /// The `networkMigrationExecutionID`s in creation order, so a listing pages in a
+    /// stable order and a `nextToken` resumes where the previous page stopped.
+    pub network_migration_execution_order: Vec<String>,
 }
 
 impl ComAmazonawsMgnApplicationmigrationserviceState {
@@ -345,6 +372,151 @@ impl ComAmazonawsMgnApplicationmigrationserviceState {
             definition,
         );
         true
+    }
+
+    /// Every execution recorded under the definition `definition_id` names within
+    /// `account_id`, in creation order. An execution of another account, or of another
+    /// definition, is not part of this selection.
+    pub fn network_migration_executions_of(
+        &self,
+        account_id: &str,
+        definition_id: &str,
+    ) -> Vec<&NetworkMigrationExecution> {
+        self.network_migration_execution_order
+            .iter()
+            .filter_map(|id| self.network_migration_executions.get(id))
+            .filter(|execution| {
+                execution.account_id == account_id
+                    && execution.network_migration_definition_id == definition_id
+            })
+            .collect()
+    }
+
+    /// A fresh `networkMigrationExecutionID` no stored execution holds: 32 `[0-9a-f]`
+    /// characters grouped 8-4-4-4-12, as the model's `NetworkMigrationExecutionID`
+    /// pattern requires.
+    pub fn mint_network_migration_execution_id(&self) -> String {
+        loop {
+            let candidate = mint_execution_id();
+            if !self.network_migration_executions.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// Whether the network-migration-execution store is full: either the account
+    /// already holds [`NETWORK_MIGRATION_EXECUTION_QUOTA`] executions, or the whole
+    /// store does. Checked before anything mints an execution, so neither the
+    /// per-account count nor the total can be grown past the bound.
+    pub fn network_migration_execution_store_is_full(&self, account_id: &str) -> bool {
+        self.network_migration_executions.len() >= NETWORK_MIGRATION_EXECUTION_QUOTA
+            || self
+                .network_migration_executions
+                .values()
+                .filter(|execution| execution.account_id == account_id)
+                .count()
+                >= NETWORK_MIGRATION_EXECUTION_QUOTA
+    }
+
+    /// Store a network migration execution, remembering its place in creation order.
+    ///
+    /// Answers whether it was stored, exactly as [`Self::insert_application`] does: a
+    /// store already at [`NETWORK_MIGRATION_EXECUTION_QUOTA`] refuses rather than
+    /// growing past the bound, and re-storing a known id keeps its place in the creation
+    /// order rather than duplicating it.
+    pub fn insert_network_migration_execution(
+        &mut self,
+        execution: NetworkMigrationExecution,
+    ) -> bool {
+        let known = self
+            .network_migration_executions
+            .contains_key(&execution.network_migration_execution_id);
+        if !known && self.network_migration_executions.len() >= NETWORK_MIGRATION_EXECUTION_QUOTA {
+            return false;
+        }
+        if !known {
+            self.network_migration_execution_order
+                .push(execution.network_migration_execution_id.clone());
+        }
+        self.network_migration_executions.insert(
+            execution.network_migration_execution_id.clone(),
+            execution,
+        );
+        true
+    }
+}
+
+/// One stored network migration execution: the run of a network migration definition
+/// through the mapping, code-generation, deployment and analysis stages, as whatever
+/// started it recorded it. `ListNetworkMigrationExecutions` reports these members and
+/// NOTHING it computes per read, so two reads of an unchanged execution answer the same
+/// record.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkMigrationExecution {
+    pub network_migration_execution_id: String,
+    /// The definition this execution runs: the `networkMigrationDefinitionID` a listing
+    /// selects executions by.
+    pub network_migration_definition_id: String,
+    /// The account the execution lives in, so one account's executions are never
+    /// another's to read.
+    pub account_id: String,
+    /// One of the model's `ExecutionStatus` values (`PENDING`, `STARTED`, `SUCCEEDED`,
+    /// `FAILED`), or absent while nothing has set one.
+    pub status: Option<String>,
+    /// One of the model's `ExecutionStage` values, or absent while nothing has set one.
+    pub stage: Option<String>,
+    /// One of the model's `ExecutionStageActivity` values, or absent while nothing has
+    /// set one.
+    pub activity: Option<String>,
+    pub created_at: Option<::std::time::SystemTime>,
+    pub updated_at: Option<::std::time::SystemTime>,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl NetworkMigrationExecution {
+    /// The execution a definition is staged with: minted under `definition_id` in
+    /// `account_id`, waiting in [`EXECUTION_STATUS_PENDING`] at the pipeline's first
+    /// stage ([`EXECUTION_STAGE_MAPPING`]) with no activity, because nothing has run
+    /// for it yet.
+    pub fn staged(
+        execution_id: String,
+        definition_id: &str,
+        account_id: &str,
+        at: ::std::time::SystemTime,
+    ) -> Self {
+        Self {
+            network_migration_execution_id: execution_id,
+            network_migration_definition_id: definition_id.to_string(),
+            account_id: account_id.to_string(),
+            status: Some(EXECUTION_STATUS_PENDING.to_string()),
+            stage: Some(EXECUTION_STAGE_MAPPING.to_string()),
+            activity: None,
+            // One instant for both: nothing has moved the execution on since it was
+            // staged.
+            created_at: Some(at),
+            updated_at: Some(at),
+            tags: BTreeMap::new(),
+        }
+    }
+
+    /// The `tags` member: the stored tags, or absent when the execution carries none.
+    pub fn tags_shape(&self) -> Option<std::collections::HashMap<String, String>> {
+        map_shape(&self.tags)
+    }
+
+    /// This execution as the model's `NetworkMigrationExecution` structure — the shape
+    /// `ListNetworkMigrationExecutions` lists.
+    pub fn to_shape(&self) -> NetworkMigrationExecutionShape {
+        NetworkMigrationExecutionShape {
+            network_migration_definition_id: Some(self.network_migration_definition_id.clone()),
+            network_migration_execution_id: Some(self.network_migration_execution_id.clone()),
+            status: self.status.clone(),
+            stage: self.stage.clone(),
+            activity: self.activity.clone(),
+            created_at: self.created_at.map(to_date_time),
+            updated_at: self.updated_at.map(to_date_time),
+            tags: self.tags_shape(),
+        }
     }
 }
 
@@ -772,6 +944,21 @@ fn mint_id(prefix: &str, body_len: usize) -> String {
     format!("{prefix}{body}")
 }
 
+/// A fresh `NetworkMigrationExecutionID`: [`mint_id`]'s hex body, grouped 8-4-4-4-12 to
+/// match the model's pattern
+/// `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`.
+fn mint_execution_id() -> String {
+    let hex = mint_id("", 32);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 /// The modelled refusal every operation but `InitializeService` answers until that
 /// operation has run for the account.
 ///
@@ -908,6 +1095,26 @@ pub fn network_migration_definition_quota_exceeded(
 /// resource shape `com.amazonaws.mgn#NetworkMigrationDefinitionResource` without the
 /// `Resource` suffix, as the API spells the kind.
 const NETWORK_MIGRATION_DEFINITION_RESOURCE_TYPE: &str = "NetworkMigrationDefinition";
+
+/// The modelled refusal for an account already holding
+/// [`NETWORK_MIGRATION_EXECUTION_QUOTA`] network migration executions, so no further
+/// definition can be staged one.
+pub fn network_migration_execution_quota_exceeded(
+    account_id: &str,
+) -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: Some(format!(
+            "Account {account_id} already holds the maximum of \
+             {NETWORK_MIGRATION_EXECUTION_QUOTA} network migration executions."
+        )),
+        code: None,
+        resource_id: None,
+        resource_type: Some(NETWORK_MIGRATION_DEFINITION_RESOURCE_TYPE.to_string()),
+        service_code: Some(ARN_NAMESPACE.to_string()),
+        quota_code: None,
+        quota_value: i32::try_from(NETWORK_MIGRATION_EXECUTION_QUOTA).ok(),
+    }
+}
 
 /// The modelled refusal for `cidrMappings` on a definition that is not migrating into
 /// VPCs that already exist.

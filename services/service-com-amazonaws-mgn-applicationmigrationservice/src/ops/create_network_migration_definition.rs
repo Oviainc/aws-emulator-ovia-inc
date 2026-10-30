@@ -264,8 +264,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(replayed);
         }
 
-        // The store is bounded per account AND in total: see
-        // `crate::state::NETWORK_MIGRATION_DEFINITION_QUOTA`.
+        // Both stores are bounded per account AND in total: see
+        // `crate::state::NETWORK_MIGRATION_DEFINITION_QUOTA` and
+        // `crate::state::NETWORK_MIGRATION_EXECUTION_QUOTA`. A definition is staged one
+        // execution below, so a full execution store refuses the create here rather than
+        // leaving a definition without the execution it is staged with.
+        if store.network_migration_execution_store_is_full(&account) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &configuration.name,
+                "refused: ServiceQuotaExceededException",
+            );
+            return Err(
+                CreateNetworkMigrationDefinitionErrorModeled::ServiceQuotaExceededException(
+                    crate::state::network_migration_execution_quota_exceeded(&account),
+                )
+                .into(),
+            );
+        }
         if store.network_migration_definition_store_is_full(&account) {
             crate::state::audit(
                 ctx.parts(),
@@ -288,7 +306,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let definition_id = store.mint_network_migration_definition_id();
         let definition = crate::state::NetworkMigrationDefinition {
             arn: crate::state::network_migration_definition_arn(&region, &definition_id),
-            network_migration_definition_id: definition_id,
+            network_migration_definition_id: definition_id.clone(),
             account_id: account.clone(),
             created_at: now,
             updated_at: now,
@@ -298,6 +316,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let created = definition.to_shape();
         let stored = store.insert_network_migration_definition(definition);
         debug_assert!(stored, "the store bound is checked above this insert");
+        // A new definition is staged one execution: the run a caller then names in
+        // `StartNetworkMigrationMapping` and the other network-migration `Start`
+        // operations, each of which acts on an execution that already exists rather than
+        // creating one. It is staged at the definition's own instant and waits in
+        // `PENDING` at the pipeline's first stage until something starts it, so
+        // `ListNetworkMigrationExecutions` reports exactly this one execution for a
+        // definition nothing has run yet.
+        let execution_id = store.mint_network_migration_execution_id();
+        let execution_stored = store.insert_network_migration_execution(
+            crate::state::NetworkMigrationExecution::staged(
+                execution_id,
+                &definition_id,
+                &account,
+                now,
+            ),
+        );
+        debug_assert!(
+            execution_stored,
+            "the execution store bound is checked above this insert"
+        );
         crate::state::audit(
             ctx.parts(),
             Self::NAME,
