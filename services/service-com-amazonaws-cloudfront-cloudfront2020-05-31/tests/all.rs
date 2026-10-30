@@ -167,6 +167,8 @@ mod key_value_store_update;
 mod lambda_edge_association;
 #[path = "all/lambda_edge_association_message.rs"]
 mod lambda_edge_association_message;
+#[path = "all/lambda_edge_config_round_trip.rs"]
+mod lambda_edge_config_round_trip;
 #[path = "all/managed_cache_policy_catalog.rs"]
 mod managed_cache_policy_catalog;
 #[path = "all/managed_cache_policy_delete_gate.rs"]
