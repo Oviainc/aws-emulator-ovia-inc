@@ -193,8 +193,8 @@ fn touches_transport(input: &UpdateFlowOutputInput) -> bool {
         || input.ndi_audio_reference_level.is_some()
 }
 
-/// The transport the output holds after this request is applied to `stored`, or `None`
-/// when the request would leave a transport with no protocol.
+/// The transport the output named `output_name` holds after this request is applied to
+/// `stored`, or `None` when the request would leave a transport with no protocol.
 ///
 /// The transport members are individually optional on the request, so this is a
 /// member-wise merge like UpdateFlow's: a member the request carries replaces its
@@ -202,7 +202,17 @@ fn touches_transport(input: &UpdateFlowOutputInput) -> bool {
 /// (`smithy_query(query="shape",shape="Transport")`), so an output that holds no transport
 /// yet can only be given one by a request that names the protocol — hence the `None`,
 /// which the caller refuses with the operation's own client error.
-fn merged_transport(stored: Option<&Transport>, input: &UpdateFlowOutputInput) -> Option<Transport> {
+///
+/// A request can move an output ONTO the NDI transport without naming the NDI sender
+/// settings, so the merged transport goes through the one place this crate materialises the
+/// settings the documentation names a service value for
+/// ([`crate::state::apply_ndi_output_defaults`]) — the same place the add path goes
+/// through, so an NDI output's stored record carries them however it got there.
+fn merged_transport(
+    stored: Option<&Transport>,
+    input: &UpdateFlowOutputInput,
+    output_name: &str,
+) -> Option<Transport> {
     let protocol = input
         .protocol
         .clone()
@@ -245,6 +255,7 @@ fn merged_transport(stored: Option<&Transport>, input: &UpdateFlowOutputInput) -
     if let Some(reference_level) = input.ndi_audio_reference_level {
         merged.ndi_audio_reference_level = Some(reference_level);
     }
+    crate::state::apply_ndi_output_defaults(&mut merged, output_name);
     Some(merged)
 }
 
@@ -445,7 +456,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated.encryption = Some(encryption);
         }
         if touches_transport(&input) {
-            let Some(transport) = merged_transport(updated.transport.as_ref(), &input) else {
+            let Some(transport) =
+                merged_transport(updated.transport.as_ref(), &input, &updated.name)
+            else {
                 return Err(bad_request(
                     "Protocol is required to give an output a transport: an output that has no \
                      transport yet cannot be given transport settings without one.",

@@ -1100,6 +1100,62 @@ pub fn output_request_uses_ndi(request: &AddOutputRequest) -> bool {
     uses_ndi_transport(request.protocol.as_deref(), false)
 }
 
+/// `NdiOutputTimecodeSource`'s documented default: "controls how MediaConnect generates
+/// timecodes for NDI output frames. If you don't specify this field, MediaConnect uses
+/// EMBEDDED_TIMECODE" (`smithy_query(query="doc",shape="AddOutputRequest",
+/// member="NdiOutputTimecodeSource")`), which the reported shape states as a presence rule:
+/// "for NDI outputs, this field is always present and defaults to EMBEDDED_TIMECODE"
+/// (`Transport$NdiOutputTimecodeSource`).
+pub const NDI_OUTPUT_TIMECODE_SOURCE_EMBEDDED: &str = "EMBEDDED_TIMECODE";
+
+/// `NdiAudioReferenceLevel`'s documented default, in decibels relative to full scale:
+/// "the audio reference level of the NDI receiver… If you don't specify this field,
+/// MediaConnect uses -20" (`smithy_query(query="doc",shape="AddOutputRequest",
+/// member="NdiAudioReferenceLevel")`), which the reported shape states as a presence rule:
+/// "for NDI outputs, this field is always present and defaults to -20"
+/// (`Transport$NdiAudioReferenceLevel`). It sits inside the member's modelled range
+/// (-40..=0).
+pub const DEFAULT_NDI_AUDIO_REFERENCE_LEVEL_DBFS: i32 = -20;
+
+/// Materialise, on the transport of an output named `output_name`, the NDI® sender
+/// settings whose documentation names the value the service uses when the request carries
+/// none — the same way a request that names no `OutputStatus` gets the documented
+/// [`STATUS_ENABLED`].
+///
+/// The three members are the NDI sender's, so the condition the documentation attaches
+/// them to is the one that makes an OUTPUT an NDI output ([`uses_ndi_transport`] on the
+/// output's protocol, with the source marker excluded exactly as
+/// [`stored_output_uses_ndi`] excludes it: `NdiSourceSettings` is a source's member, which
+/// no output carries): a transport on any other protocol is left exactly as the request
+/// described it. Each documented value fills only a member the request left unset, so a
+/// value the caller named is never overwritten:
+///
+/// * `NdiOutputTimecodeSource` → [`NDI_OUTPUT_TIMECODE_SOURCE_EMBEDDED`];
+/// * `NdiAudioReferenceLevel` → [`DEFAULT_NDI_AUDIO_REFERENCE_LEVEL_DBFS`];
+/// * `NdiProgramName` → the output's own name, because it is "a suffix for the name of the
+///   NDI® sender that the flow creates. If a custom name isn't specified, MediaConnect uses
+///   the output name".
+///
+/// Every path that writes an output's transport applies it HERE — the add/create path
+/// ([`StoredOutput::from_add_request`]) and the update path, which can move an output onto
+/// the NDI transport without naming these members — so the stored record an NDI output is
+/// read back from always carries them.
+pub fn apply_ndi_output_defaults(transport: &mut Transport, output_name: &str) {
+    if !uses_ndi_transport(Some(transport.protocol.as_str()), false) {
+        return;
+    }
+    if transport.ndi_output_timecode_source.is_none() {
+        transport.ndi_output_timecode_source =
+            Some(NDI_OUTPUT_TIMECODE_SOURCE_EMBEDDED.to_string());
+    }
+    if transport.ndi_audio_reference_level.is_none() {
+        transport.ndi_audio_reference_level = Some(DEFAULT_NDI_AUDIO_REFERENCE_LEVEL_DBFS);
+    }
+    if transport.ndi_program_name.is_none() {
+        transport.ndi_program_name = Some(output_name.to_string());
+    }
+}
+
 /// Whether a stored output is an NDI® output: the same single marker
 /// [`output_request_uses_ndi`] reads — the protocol that carries it — on the record the
 /// request was materialised into, so the stored output and the request it came from are
@@ -1888,7 +1944,9 @@ impl StoredOutput {
     /// AddFlowOutputs) materialises it HERE, so one request shape always becomes the
     /// same stored record: the service mints the `OutputArn`, resolves `OutputStatus`
     /// to the documented `ENABLED` default, folds the request's transport members
-    /// into `Output.Transport`, and keeps `AddOutputRequest$OutputTags` — "the key-value
+    /// into `Output.Transport` — materialising the NDI sender settings the documentation
+    /// names a service value for ([`apply_ndi_output_defaults`]) — and keeps
+    /// `AddOutputRequest$OutputTags` — "the key-value
     /// pairs that can be used to tag and organize the output" — on the record, because the
     /// output's ARN is a `ResourceArn` the tag operations resolve.
     pub fn from_add_request(
@@ -1897,6 +1955,29 @@ impl StoredOutput {
         region: &str,
         suffix: u64,
     ) -> Self {
+        // `Transport.Protocol` is required, so an output that names no protocol
+        // carries no transport rather than an empty one.
+        let transport = request.protocol.clone().map(|protocol| {
+            let mut transport = Transport {
+                protocol,
+                cidr_allow_list: request.cidr_allow_list.clone(),
+                max_latency: request.max_latency,
+                min_latency: request.min_latency,
+                smoothing_latency: request.smoothing_latency,
+                remote_id: request.remote_id.clone(),
+                sender_control_port: request.sender_control_port,
+                stream_id: request.stream_id.clone(),
+                ndi_speed_hq_quality: request.ndi_speed_hq_quality,
+                ndi_program_name: request.ndi_program_name.clone(),
+                ndi_output_timecode_source: request.ndi_output_timecode_source.clone(),
+                ndi_audio_reference_level: request.ndi_audio_reference_level,
+                ..Transport::default()
+            };
+            // The NDI sender settings the documentation names a service value for are
+            // materialised on the record, so a read of an NDI output reports them.
+            apply_ndi_output_defaults(&mut transport, &name);
+            transport
+        });
         StoredOutput {
             output_arn: ::engine::emulator_arn(
                 SERVICE_NAMESPACE,
@@ -1929,23 +2010,7 @@ impl StoredOutput {
             // "The key-value pairs that can be used to tag and organize the output":
             // stored on the output, which is the resource its own ARN addresses.
             tags: tag_map_of(request.output_tags.as_ref()),
-            // `Transport.Protocol` is required, so an output that names no protocol
-            // carries no transport rather than an empty one.
-            transport: request.protocol.clone().map(|protocol| Transport {
-                protocol,
-                cidr_allow_list: request.cidr_allow_list.clone(),
-                max_latency: request.max_latency,
-                min_latency: request.min_latency,
-                smoothing_latency: request.smoothing_latency,
-                remote_id: request.remote_id.clone(),
-                sender_control_port: request.sender_control_port,
-                stream_id: request.stream_id.clone(),
-                ndi_speed_hq_quality: request.ndi_speed_hq_quality,
-                ndi_program_name: request.ndi_program_name.clone(),
-                ndi_output_timecode_source: request.ndi_output_timecode_source.clone(),
-                ndi_audio_reference_level: request.ndi_audio_reference_level,
-                ..Transport::default()
-            }),
+            transport,
         }
     }
 

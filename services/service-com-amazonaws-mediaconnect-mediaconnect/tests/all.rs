@@ -53,6 +53,8 @@ mod flow_name_references;
 mod flow_ndi_resize;
 #[path = "all/flow_ndi_sizing.rs"]
 mod flow_ndi_sizing;
+#[path = "all/flow_output_ndi_defaults.rs"]
+mod flow_output_ndi_defaults;
 #[path = "all/flow_outputs.rs"]
 mod flow_outputs;
 #[path = "all/flow_projection.rs"]
