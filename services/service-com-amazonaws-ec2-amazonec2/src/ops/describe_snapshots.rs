@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSnapshots
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSnapshots`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the EBS snapshots `crate::state` holds, narrowed by `SnapshotIds`,
+//! `OwnerIds`, `RestorableByUserIds` and the documented filters, and paged by
+//! `MaxResults`/`NextToken`. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSnapshots::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A snapshot's `State`, `Progress` and `CompletionTime` are facts of its AGE, derived by
+//! [`crate::state::SnapshotRecord::view_at`] off the instant the clock owes the `pending`
+//! to `completed` move: this read observes that move without writing anything, so two calls
+//! one after the other cannot disagree and a read never changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +113,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// A snapshot is stored as the modelled `Snapshot` shape itself, under the name the crate
+// reads it by; a boolean, an integer and a timestamp attribute each render as a filter value
+// the same way in every describe of this crate, so those renderings live in `crate::state`
+// rather than once per operation.
+use crate::state::{
+    SnapshotView, boolean_filter_values, integer_filter_values, timestamp_filter_values,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -181,18 +188,404 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSnapshots` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSnapshotsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MAX_PAGE_SIZE, MAX_RESOURCE_IDS, MatchBudget, decode_page_token,
+            invalid_pagination_token_for, invalid_user_id_malformed, require_service_state,
+            unresolvable_snapshot_id,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let requested_ids: &[String] = input.snapshot_ids.as_deref().unwrap_or_default();
+        let owner_ids: &[String] = input.owner_ids.as_deref().unwrap_or_default();
+        let restorable_by: &[String] = input.restorable_by_user_ids.as_deref().unwrap_or_default();
+
+        // None of these lists is bounded by the model, and each one costs a comparison per
+        // stored snapshot, so the request-controlled factors are capped before any work
+        // proportional to them is done.
+        for (member, values) in [
+            ("SnapshotIds", requested_ids),
+            ("OwnerIds", owner_ids),
+            ("RestorableByUserIds", restorable_by),
+        ] {
+            if values.len() > MAX_RESOURCE_IDS {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "{member} carries {} values, above the maximum of {MAX_RESOURCE_IDS}",
+                    values.len()
+                )));
+            }
+        }
+
+        // The model declares no `@range` on `MaxResults`, so the only bound on the page
+        // size is the largest page this operation serves: a value above it is not refused,
+        // it is served as that page with a `NextToken` for the rest (the clamp below). A
+        // page of NONE is not a page, so zero and below is still refused.
+        if let Some(max_results) = input.max_results {
+            if max_results < 1 {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{max_results}' for maxResults. It must be at least 1"
+                )));
+            }
+        }
+
+        // An `OwnerIds` or `RestorableByUserIds` term that names neither an account nor one
+        // of the words the member documents is refused before anything is looked up: EC2
+        // answers `InvalidUserID.Malformed` for it, not an empty result set.
+        for owner in owner_ids {
+            if !is_owner_term(owner) {
+                return Err(invalid_user_id_malformed(owner));
+            }
+        }
+        for user in restorable_by {
+            if !is_restorable_by_term(user) {
+                return Err(invalid_user_id_malformed(user));
+            }
+        }
+
+        // Matching cost is filters x values x held values x stored snapshots and the model
+        // bounds none of them, so the request-controlled factors are capped here, before
+        // any work proportional to them is done — and their PRODUCT is charged to one
+        // [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any
+        // snapshot would have matched it, so an unsupported filter can never read as "no
+        // results".
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let canonical = canonical_filter_name(name).ok_or_else(|| {
+                Scaffolded::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(canonical.to_string(), values.to_vec()));
+        }
+
+        // "The token returned from a previous paginated request" — anything else is refused
+        // rather than read as an id, and it is refused before any other member is looked
+        // at, so whether a bogus token is caught never depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+        let account = ::engine::emulator_account_id();
+
+        // "If you specify an invalid snapshot ID, an error is returned": a value that is
+        // not a snapshot id at all and a well-formed one the account holds no snapshot for
+        // are different causes, and the crate's one classification of an unresolvable
+        // snapshot id words each as EC2 does.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSnapshots"))
+        // "If you specify a snapshot ID for which you do not have access, it is not
+        // included in the returned results" is the OTHER answer, and it needs no branch
+        // here: every snapshot this store holds is owned by the calling account, which has
+        // implicit create volume permissions for the snapshots it owns, so a stored
+        // snapshot is always one the caller may see.
+        if let Some(unresolvable) = requested_ids
+            .iter()
+            .find(|snapshot_id| !store.snapshots.contains_key(snapshot_id.as_str()))
+        {
+            return Err(unresolvable_snapshot_id(unresolvable));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named snapshot
+        // resolved: the flag asks whether the request WOULD have succeeded, so one that
+        // would have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The `pending` to `completed` move the clock already owed each snapshot is
+        // observed here, not written: `view_at` derives the state, the progress and the
+        // completion time from the stored due instant, so this read changes nothing a later
+        // caller sees — and the `status` and `progress` filters therefore compare against
+        // the words the caller is shown.
+        //
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored snapshots,
+        // filters, values, held values and value length is bounded however the caller
+        // combines them — which is also what bounds how long this holds the state lock.
+        let now = ::std::time::Instant::now();
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<SnapshotView> = Vec::new();
+        for record in store.snapshots.values() {
+            if budget.exhausted() {
+                break;
+            }
+            // The id and owner narrowings are read off the stored record, so a snapshot the
+            // request did not ask about costs no projection and no comparison at all.
+            if !requested_ids.is_empty()
+                && !requested_ids
+                    .iter()
+                    .any(|id| record.view.snapshot_id.as_deref() == Some(id.as_str()))
+            {
+                continue;
+            }
+            // "If you specify one or more snapshot owners using the OwnerIds option, only
+            // snapshots from the specified owners and for which you have access are
+            // returned", and "if you specify a list of restorable users, only snapshots
+            // with create snapshot permissions for those users are returned" — each list
+            // joined with an OR inside itself and with an AND against the other members.
+            if !owner_ids.is_empty()
+                && !owner_ids
+                    .iter()
+                    .any(|owner| owner_matches(&record.view, owner, account))
+            {
+                continue;
+            }
+            if !restorable_by.is_empty()
+                && !restorable_by
+                    .iter()
+                    .any(|user| restorable_by_matches(&record.view, user, account))
+            {
+                continue;
+            }
+            let snapshot = record.view_at(now);
+            // The AND/OR evaluation of EC2's `Filters`, through the one definition the crate
+            // holds ([`crate::state::matches_every_filter`]); only the per-attribute lookup
+            // is this operation's, so it is what gets passed in.
+            let selected_by_filters = crate::state::matches_every_filter(
+                &selectors,
+                &mut budget,
+                &|name| filter_values(&snapshot, name),
+            );
+            if selected_by_filters {
+                selected.push(snapshot);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `SnapshotId` order, which the cursor below names a position in. The store
+        // is an ordered map, so its iteration order already satisfies this sort; doing it
+        // here establishes the invariant the cursor depends on at the point of use.
+        selected.sort_by(|left, right| left.snapshot_id.cmp(&right.snapshot_id));
+
+        // A request that names no page size gets the largest page this service serves, so
+        // the `NextToken` path behaves the same whether or not a page size was asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // The page and the token that follows it, through the one definition of EC2 paging
+        // ([`crate::state::page_from_cursor`]): the cursor names the snapshot this page
+        // ends at, and "this value is null when there are no more items to return"
+        // (`DescribeSnapshotsResult$NextToken`) is a token only while a further snapshot
+        // follows the page.
+        let (page, next_token) = crate::state::page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            crate::state::PageTokenRule::WhenAnotherItemFollows,
+            |snapshot| snapshot.snapshot_id.as_deref().unwrap_or_default(),
+        );
+
+        Ok(DescribeSnapshotsOutput {
+            snapshots: Some(page.to_vec()),
+            next_token,
+        })
+    }
+}
+
+/// The owner alias an Amazon-published snapshot carries: "the Amazon Web Services owner
+/// alias, from an Amazon-maintained list (`amazon`)" (`Snapshot$OwnerAlias`), which is also
+/// the one alias `OwnerIds` accepts beside an account id and `self` ("you can specify a
+/// combination of Amazon Web Services account IDs, self, and amazon",
+/// `DescribeSnapshotsRequest$OwnerIds`).
+const SNAPSHOT_OWNER_ALIAS_AMAZON: &str = "amazon";
+
+/// The `RestorableByUserIds` term that names every account: "or `all` for public snapshots"
+/// (`DescribeSnapshots`).
+const RESTORABLE_BY_ALL: &str = "all";
+
+/// Is `term` something `OwnerIds` may carry — "a combination of Amazon Web Services account
+/// IDs, self, and amazon" (`DescribeSnapshotsRequest$OwnerIds`)?
+fn is_owner_term(term: &str) -> bool {
+    term == crate::state::OWNER_SELF
+        || term == SNAPSHOT_OWNER_ALIAS_AMAZON
+        || crate::state::aws_account_id_is_well_formed(term)
+}
+
+/// Is `term` something `RestorableByUserIds` may carry — "Amazon Web Services account IDs
+/// (if you own the snapshots), self for snapshots for which you own or have explicit
+/// permissions, or all for public snapshots" (`DescribeSnapshots`)?
+fn is_restorable_by_term(term: &str) -> bool {
+    term == crate::state::OWNER_SELF
+        || term == RESTORABLE_BY_ALL
+        || crate::state::aws_account_id_is_well_formed(term)
+}
+
+/// Does `snapshot` belong to the owner `term` names — the calling account for `self`, the
+/// aliased publisher for the alias, and that account for an account id?
+fn owner_matches(snapshot: &SnapshotView, term: &str, account: &str) -> bool {
+    if term == crate::state::OWNER_SELF {
+        return snapshot.owner_id.as_deref() == Some(account);
+    }
+    if term == SNAPSHOT_OWNER_ALIAS_AMAZON {
+        return snapshot.owner_alias.as_deref() == Some(term);
+    }
+    snapshot.owner_id.as_deref() == Some(term)
+}
+
+/// May the user `term` names create a volume from `snapshot`?
+///
+/// "all for public snapshots" selects the snapshots whose create volume permissions were
+/// granted to the all group. For an account — `self` being the calling one — the only
+/// permission this slice models is the owner's own implicit one ("an Amazon Web Services
+/// account has implicit create volume permissions for all snapshots it owns"): public and
+/// explicit permissions are granted through `ModifySnapshotAttribute`, which is still a
+/// scaffold, so no stored snapshot carries one and none can be reported for one.
+fn restorable_by_matches(snapshot: &SnapshotView, term: &str, account: &str) -> bool {
+    if term == RESTORABLE_BY_ALL {
+        return false;
+    }
+    let user = if term == crate::state::OWNER_SELF {
+        account
+    } else {
+        term
+    };
+    snapshot.owner_id.as_deref() == Some(user)
+}
+
+/// The filter names this operation documents, from `DescribeSnapshotsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeSnapshotsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather than
+/// listed here. Every entry must be answered by [`filter_values`].
+const SNAPSHOT_FILTERS: [&str; 13] = [
+    "description",
+    "encrypted",
+    "owner-alias",
+    "owner-id",
+    "progress",
+    "snapshot-id",
+    "start-time",
+    "status",
+    "storage-tier",
+    "tag-key",
+    "transfer-type",
+    "volume-id",
+    "volume-size",
+];
+
+/// The prefix of the tag filter: "Use the tag key in the filter name and the tag value as
+/// the filter value" (`DescribeSnapshotsRequest$Filters`). The one definition is
+/// [`crate::state::TAG_FILTER_PREFIX`], aliased here under the name this file reads it by,
+/// the way the sibling describes do.
+const TAG_FILTER_PREFIX: &str = crate::state::TAG_FILTER_PREFIX;
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None`
+/// when this operation documents no such filter.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact — and a
+/// `tag:` prefix with no key names no tag, so it is as undocumented as any other
+/// misspelling. The `tag:<key>` family keeps its whole name, the key being part of what it
+/// selects on.
+fn canonical_filter_name(name: &str) -> Option<&str> {
+    if name
+        .strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return Some(name);
+    }
+    SNAPSHOT_FILTERS.contains(&name).then_some(name)
+}
+
+/// The values the EC2 filter `name` compares against this snapshot.
+///
+/// The per-attribute half of [`crate::state::matches_every_filter`], which holds EC2's
+/// AND/OR evaluation itself: a filter naming an attribute this snapshot does not carry
+/// compares against NO values, so it selects nothing — which is the answer for `owner-alias`
+/// on a snapshot the account created (only an Amazon-published one carries an alias) and for
+/// `transfer-type`, which is "only for snapshot copies". `name` is a name
+/// [`canonical_filter_name`] resolved.
+fn filter_values<'a>(snapshot: &'a SnapshotView, name: &str) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return snapshot
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "description" => text(snapshot.description.as_deref()),
+        "encrypted" => boolean_filter_values(snapshot.encrypted),
+        "owner-alias" => text(snapshot.owner_alias.as_deref()),
+        "owner-id" => text(snapshot.owner_id.as_deref()),
+        "progress" => text(snapshot.progress.as_deref()),
+        "snapshot-id" => text(snapshot.snapshot_id.as_deref()),
+        // Rendered the way every describe of this crate renders a timestamp filter value,
+        // which is the wire format the caller was shown it in.
+        "start-time" => timestamp_filter_values(snapshot.start_time),
+        // "`status` - The status of the snapshot (`pending` | `completed` | `error`)"
+        // (`DescribeSnapshotsRequest$Filters`): the member the model calls `State` and the
+        // wire calls `status`.
+        "status" => text(snapshot.state.as_deref()),
+        "storage-tier" => text(snapshot.storage_tier.as_deref()),
+        "tag-key" => snapshot
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "transfer-type" => text(snapshot.transfer_type.as_deref()),
+        "volume-id" => text(snapshot.volume_id.as_deref()),
+        "volume-size" => integer_filter_values(snapshot.volume_size),
+        // Unreachable: `canonical_filter_name` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even
+        // if that check were bypassed.
+        _ => Vec::new(),
     }
 }

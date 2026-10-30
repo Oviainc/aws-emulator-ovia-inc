@@ -410,6 +410,12 @@ mod delete_vpn_connection;
 // insert their two lines, and these two lost three serialized squash merges at the tail.
 #[path = "all/create_snapshots.rs"]
 mod create_snapshots;
+// What `DescribeSnapshots` reports of the snapshots the account holds — the members, the
+// narrowings, the paging, the refusals and the clock-owed completion. Declared in the MIDDLE
+// of the list for the reason the suite above gives: the head and the tail are both where
+// concurrent ec2 landings insert their two lines.
+#[path = "all/describe_snapshots.rs"]
+mod describe_snapshots;
 // Which other VPCs `DescribeSecurityGroupReferences` reports as referencing one of the
 // account's security groups, and what it refuses. Declared in the MIDDLE of the list for the
 // reason the suites above give: the head and the tail are both where concurrent ec2 landings
