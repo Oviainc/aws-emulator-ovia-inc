@@ -17,5 +17,7 @@ mod batch_get_job;
 mod budget;
 #[path = "all/farm_queue_job.rs"]
 mod farm_queue_job;
+#[path = "all/fleet.rs"]
+mod fleet;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

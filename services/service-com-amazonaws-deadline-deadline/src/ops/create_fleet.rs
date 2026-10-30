@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFleet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFleet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a fleet under a farm and persists it there under the `fleetId` it mints.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFleet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A new fleet is `CREATE_IN_PROGRESS`: the service stands the fleet up after answering,
+//! so `ACTIVE` is owed by the clock (see [`crate::state::FLEET_ACTIVE_AFTER`]) and is
+//! materialised the next time the fleet is read.
 //!
 //! ## Shape of an operation
 //!
@@ -164,6 +160,89 @@ impl<Eng> CreateFleet<Eng> {
     }
 }
 
+/// Every lower/upper capability pair the fleet's configuration declares, as
+/// `(member, min, max)`, where `member` is the pair's own path in the request.
+///
+/// The model declares one `min`/`max` structure per capability range
+/// (`smithy_query(query="closure", operation="CreateFleet")`: `VCpuCountRange`,
+/// `MemoryMiBRange`, `AcceleratorCountRange`, `AcceleratorTotalMemoryMiBRange`), plus the
+/// same pair on every `FleetAmountCapability` the configuration's custom amounts carry.
+/// Only `min` is required in each, so a pair with no upper bound is open-ended rather than
+/// inverted. The bounds are reported as `f64` because an amount capability's are floats
+/// while the counts are integers.
+fn capability_ranges(configuration: &FleetConfiguration) -> Vec<(String, f64, Option<f64>)> {
+    let mut ranges: Vec<(String, f64, Option<f64>)> = Vec::new();
+    // The path the request nests these capabilities under, so a refusal names the member
+    // the caller sent rather than a bare structure name.
+    let capabilities_path = match configuration {
+        FleetConfiguration::customerManaged(_) => {
+            "configuration.customerManaged.workerCapabilities"
+        }
+        FleetConfiguration::serviceManagedEc2(_) => {
+            "configuration.serviceManagedEc2.instanceCapabilities"
+        }
+    };
+    let mut push_count = |member: &str, min: i32, max: Option<i32>| {
+        ranges.push((
+            format!("{capabilities_path}.{member}"),
+            f64::from(min),
+            max.map(f64::from),
+        ));
+    };
+    let custom_amounts = match configuration {
+        FleetConfiguration::customerManaged(managed) => {
+            let capabilities = &managed.worker_capabilities;
+            push_count(
+                "vCpuCount",
+                capabilities.v_cpu_count.min,
+                capabilities.v_cpu_count.max,
+            );
+            push_count(
+                "memoryMiB",
+                capabilities.memory_mi_b.min,
+                capabilities.memory_mi_b.max,
+            );
+            if let Some(count) = &capabilities.accelerator_count {
+                push_count("acceleratorCount", count.min, count.max);
+            }
+            if let Some(memory) = &capabilities.accelerator_total_memory_mi_b {
+                push_count("acceleratorTotalMemoryMiB", memory.min, memory.max);
+            }
+            capabilities.custom_amounts.as_deref()
+        }
+        FleetConfiguration::serviceManagedEc2(managed) => {
+            let capabilities = &managed.instance_capabilities;
+            push_count(
+                "vCpuCount",
+                capabilities.v_cpu_count.min,
+                capabilities.v_cpu_count.max,
+            );
+            push_count(
+                "memoryMiB",
+                capabilities.memory_mi_b.min,
+                capabilities.memory_mi_b.max,
+            );
+            if let Some(count) = capabilities
+                .accelerator_capabilities
+                .as_ref()
+                .and_then(|accelerators| accelerators.count.as_ref())
+            {
+                push_count("acceleratorCount", count.min, count.max);
+            }
+            capabilities.custom_amounts.as_deref()
+        }
+    };
+    // A custom amount is one entry of a list, so its path carries that entry's index.
+    for (index, amount) in custom_amounts.unwrap_or_default().iter().enumerate() {
+        ranges.push((
+            format!("{capabilities_path}.customAmounts[{index}]"),
+            f64::from(amount.min),
+            amount.max.map(f64::from),
+        ));
+    }
+    ranges
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateFleet<Eng>
 {
@@ -181,18 +260,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFleet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFleetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFleet"))
+        // A worker-count window has to be a window: the fleet's minimum is the floor the
+        // service scales it to and its maximum the ceiling it never passes, so a minimum
+        // above the maximum describes no fleet and the request is refused. Each bound on
+        // its own satisfies `MinZeroMaxInteger` (`range 0..2147483647`), so the boundary
+        // validator cannot catch this: it is a relation between two members.
+        if input.min_worker_count > input.max_worker_count {
+            return Err(CreateFleetErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    "minWorkerCount",
+                    // Both bounds come from the request, so the message names the window
+                    // the caller actually asked for.
+                    &format!(
+                        "minWorkerCount ({}) must be less than or equal to maxWorkerCount ({})",
+                        input.min_worker_count, input.max_worker_count
+                    ),
+                ),
+            )
+            .into());
+        }
+        // The same relation holds for every other lower/upper pair the request carries:
+        // the capability ranges the fleet's configuration declares, including the custom
+        // amounts it names. Each bound satisfies its own modeled range, so a pair whose
+        // lower bound exceeds its upper bound is refused here too, naming the pair at
+        // fault.
+        for (member, min, max) in capability_ranges(&input.configuration) {
+            if let Some(max) = max {
+                if min > max {
+                    return Err(CreateFleetErrorModeled::ValidationException(
+                        crate::state::field_validation_failed(
+                            &member,
+                            &format!(
+                                "{member}.min ({min}) must be less than or equal to \
+                                 {member}.max ({max})"
+                            ),
+                        ),
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFleetErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // `clientToken` is `@idempotencyToken`: a retry of the same create must answer
+        // with the resource the first call made, not make a second one.
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, &input.farm_id, token));
+        if let Some(key) = token.as_deref() {
+            if let Some(fleet_id) = store.remembered_resource(key).map(str::to_string) {
+                if store.fleet(&input.farm_id, &fleet_id).is_some() {
+                    return Ok(CreateFleetOutput { fleet_id });
+                }
+            }
+        }
+
+        // The id and the principal are taken before the farm is borrowed, so the farm
+        // this fleet is stored under is reached exactly once.
+        let fleet_id = store.mint_id("fleet");
+        let created_by = crate::state::caller_principal(ctx);
+
+        // A fleet lives under its farm, so an unknown farm is a 404 and nothing is
+        // created.
+        let Some(farm) = store.farms.get_mut(&input.farm_id) else {
+            return Err(CreateFleetErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        };
+
+        // A farm holds at most this many fleets: each one is a caller-driven insert that
+        // only a delete releases.
+        if farm.fleets.len() >= crate::state::MAX_FLEETS_PER_FARM {
+            return Err(CreateFleetErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded(
+                    crate::state::RESOURCE_TYPE_FLEET,
+                    "You exceeded the number of fleets this emulator stores for one farm. \
+                     Delete a fleet and try again.",
+                ),
+            )
+            .into());
+        }
+
+        farm.fleets.insert(
+            fleet_id.clone(),
+            crate::state::Fleet {
+                fleet_id: fleet_id.clone(),
+                farm_id: input.farm_id.clone(),
+                display_name: input.display_name,
+                description: input.description,
+                role_arn: input.role_arn,
+                min_worker_count: input.min_worker_count,
+                max_worker_count: input.max_worker_count,
+                configuration: input.configuration,
+                host_configuration: input.host_configuration,
+                // The service stands the fleet up after answering, so it starts in the
+                // non-terminal status and the move to ACTIVE is owed by the clock.
+                status: crate::state::FLEET_STATUS_CREATE_IN_PROGRESS.to_string(),
+                // Nothing has registered a worker with a fleet this call has just made.
+                worker_count: 0,
+                tags: input.tags.unwrap_or_default(),
+                created_at: ::std::time::SystemTime::now(),
+                created_by,
+                updated_at: None,
+                updated_by: None,
+                active_due_at: Some(::std::time::Instant::now() + crate::state::FLEET_ACTIVE_AFTER),
+            },
+        );
+        if let Some(key) = token {
+            store.remember_resource(key, &fleet_id);
+        }
+
+        Ok(CreateFleetOutput { fleet_id })
     }
 }

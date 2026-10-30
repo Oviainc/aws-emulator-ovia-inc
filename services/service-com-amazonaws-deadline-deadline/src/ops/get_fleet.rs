@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFleet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFleet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFleet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the fleet `CreateFleet` persisted under its farm, with any clock-owed status
+//! transition already materialised.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +172,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFleet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFleetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFleet"))
+        // A read: the only write below is the one the clock already made due, so a later
+        // caller sees exactly what it would have seen had this call never happened.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetFleetErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        if store.farm(&input.farm_id).is_none() {
+            return Err(GetFleetErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+        let Some(fleet) = store.settled_fleet(&input.farm_id, &input.fleet_id) else {
+            return Err(GetFleetErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FLEET, &input.fleet_id),
+            )
+            .into());
+        };
+
+        Ok(GetFleetOutput {
+            fleet_id: fleet.fleet_id.clone(),
+            farm_id: fleet.farm_id.clone(),
+            display_name: fleet.display_name.clone(),
+            status: fleet.status.clone(),
+            // `statusMessage` communicates a SUSPENDED fleet's reason
+            // (`smithy_query(query="shape", shape="FleetSummary", member="statusMessage")`),
+            // so a fleet nothing has suspended carries none.
+            status_message: None,
+            auto_scaling_status: Some(fleet.auto_scaling_status().to_string()),
+            target_worker_count: Some(fleet.target_worker_count()),
+            worker_count: fleet.worker_count,
+            min_worker_count: fleet.min_worker_count,
+            max_worker_count: fleet.max_worker_count,
+            configuration: fleet.configuration.clone(),
+            created_at: crate::state::timestamp(fleet.created_at),
+            created_by: fleet.created_by.clone(),
+            updated_at: fleet.updated_at.map(crate::state::timestamp),
+            updated_by: fleet.updated_by.clone(),
+            // `description` is optional on the response: a fleet created without one has
+            // nothing to report, so the member is left out rather than reported empty.
+            description: (!fleet.description.is_empty()).then(|| fleet.description.clone()),
+            host_configuration: fleet.host_configuration.clone(),
+            capabilities: fleet.capabilities(),
+            role_arn: fleet.role_arn.clone(),
+        })
     }
 }

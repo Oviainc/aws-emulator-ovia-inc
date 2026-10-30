@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFleets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFleets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFleets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one page of the fleets held under a farm, oldest first, with any clock-owed
+//! status transition already materialised.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +156,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFleets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFleetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFleets"))
+        // A read: the only write below is the one the clock already made due.
+        let _ = ctx;
+        // `principalId` asks for the fleets one Identity Center principal is a member of.
+        // Fleet memberships are not persisted yet (AssociateMemberToFleet /
+        // ListFleetMembers are still scaffolded), so that filter cannot be answered from
+        // state — and answering it with the unfiltered list would be a wrong answer, not
+        // a missing one.
+        if input.principal_id.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListFleets with a principalId filter (fleet memberships are not persisted yet)",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListFleetsErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        let Some(fleets) = store.settled_fleets(&input.farm_id) else {
+            return Err(ListFleetsErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        };
+
+        // The two filters select by an exact value of the member they name: a fleet is
+        // reported only when it matches every filter the request carries.
+        let matching: Vec<crate::state::Fleet> = fleets
+            .into_iter()
+            .filter(|fleet| {
+                input
+                    .display_name
+                    .as_deref()
+                    .is_none_or(|wanted| fleet.display_name == wanted)
+                    && input
+                        .status
+                        .as_deref()
+                        .is_none_or(|wanted| fleet.status == wanted)
+            })
+            .collect();
+
+        let ids: Vec<String> = matching
+            .iter()
+            .map(|fleet| fleet.fleet_id.clone())
+            .collect();
+        let (page, next_token) =
+            crate::state::page_keys(&ids, input.next_token.as_deref(), input.max_results).map_err(
+                |message| {
+                    ListFleetsError::from(ListFleetsErrorModeled::ValidationException(
+                        crate::state::field_validation_failed("nextToken", &message),
+                    ))
+                },
+            )?;
+
+        let fleets = page
+            .first()
+            // `page` is a contiguous run of `matching`, in the same order, so the
+            // summaries come from that run rather than from an id lookup per row.
+            .and_then(|first| matching.iter().position(|fleet| &fleet.fleet_id == first))
+            .map(|start| matching.iter().skip(start).take(page.len()))
+            .into_iter()
+            .flatten()
+            .map(|fleet| FleetSummary {
+                fleet_id: fleet.fleet_id.clone(),
+                farm_id: fleet.farm_id.clone(),
+                display_name: fleet.display_name.clone(),
+                status: fleet.status.clone(),
+                // `statusMessage` communicates a SUSPENDED fleet's reason, so a fleet
+                // nothing has suspended carries none.
+                status_message: None,
+                auto_scaling_status: Some(fleet.auto_scaling_status().to_string()),
+                target_worker_count: Some(fleet.target_worker_count()),
+                worker_count: fleet.worker_count,
+                min_worker_count: fleet.min_worker_count,
+                max_worker_count: fleet.max_worker_count,
+                configuration: fleet.configuration.clone(),
+                created_at: crate::state::timestamp(fleet.created_at),
+                created_by: fleet.created_by.clone(),
+                updated_at: fleet.updated_at.map(crate::state::timestamp),
+                updated_by: fleet.updated_by.clone(),
+            })
+            .collect();
+
+        Ok(ListFleetsOutput { fleets, next_token })
     }
 }

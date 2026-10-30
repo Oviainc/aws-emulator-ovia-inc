@@ -181,11 +181,23 @@ pub(crate) fn error_code(body: &Value) -> String {
 }
 
 /// Does `id` satisfy the modeled label pattern `^<prefix>-[0-9a-f]{32}$`?
-fn is_resource_id(id: &str, prefix: &str) -> bool {
+///
+/// `pub(crate)` so every suite in this test target checks a minted id the same way.
+pub(crate) fn is_resource_id(id: &str, prefix: &str) -> bool {
     let Some(suffix) = id.strip_prefix(&format!("{prefix}-")) else {
         return false;
     };
     suffix.len() == 32 && suffix.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+}
+
+/// A well-formed id no test ever created: `<prefix>-` followed by the 32 hex characters
+/// of `suffix`, as the modeled `^<prefix>-[0-9a-f]{32}$` label patterns require, so the
+/// request passes the boundary validator and the handler is what decides the outcome.
+///
+/// `pub(crate)` so every suite in this test target names an absent resource the same way.
+pub(crate) fn absent_id(prefix: &str, suffix: &str) -> String {
+    assert_eq!(suffix.len(), 32, "an id suffix is 32 hex characters");
+    format!("{prefix}-{suffix}")
 }
 
 #[tokio::test]

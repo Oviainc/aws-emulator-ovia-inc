@@ -21,6 +21,36 @@ use sha2::{Digest, Sha256};
 /// so it stays `IDLE` until something schedules on it.
 pub const QUEUE_STATUS_IDLE: &str = "IDLE";
 
+/// `FleetStatus` a fleet carries while the service is still standing it up.
+///
+/// From `smithy_query(query="shape", shape="FleetStatus")`: `ACTIVE`,
+/// `CREATE_IN_PROGRESS`, `UPDATE_IN_PROGRESS`, `CREATE_FAILED`, `UPDATE_FAILED`,
+/// `SUSPENDED`.
+pub const FLEET_STATUS_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
+
+/// `FleetStatus` a fleet reaches once the service has stood it up.
+pub const FLEET_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// How long after `CreateFleet` the fleet's `CREATE_IN_PROGRESS -> ACTIVE` transition
+/// comes due.
+///
+/// `CreateFleet` answers with a fleet in a NON-TERMINAL status, so reaching `ACTIVE` is
+/// owed by the clock rather than by any later call. AWS documents no duration for it, so
+/// this is the emulator's chosen span: a caller that reads the fleet straight back still
+/// observes `CREATE_IN_PROGRESS`, and nothing ever sleeps for it — the due instant is
+/// stored and compared on read.
+pub const FLEET_ACTIVE_AFTER: Duration = Duration::from_secs(3);
+
+/// `AutoScalingStatus` a fleet carries while it is below its target worker count.
+///
+/// From `smithy_query(query="shape", shape="AutoScalingStatus")`: `GROWING`, `STEADY`,
+/// `SHRINKING`.
+pub const AUTO_SCALING_STATUS_GROWING: &str = "GROWING";
+/// `AutoScalingStatus` a fleet carries while it holds exactly its target worker count.
+pub const AUTO_SCALING_STATUS_STEADY: &str = "STEADY";
+/// `AutoScalingStatus` a fleet carries while it holds more workers than its target.
+pub const AUTO_SCALING_STATUS_SHRINKING: &str = "SHRINKING";
+
 /// `JobLifecycleStatus` a job carries while the service is still assembling it.
 ///
 /// From `smithy_query(query="shape", shape="JobLifecycleStatus")`.
@@ -57,6 +87,8 @@ pub const BUDGET_STATUS_INACTIVE: &str = "INACTIVE";
 pub const RESOURCE_TYPE_FARM: &str = "farm";
 /// `resourceType` this service reports for a queue in `ResourceNotFoundException`.
 pub const RESOURCE_TYPE_QUEUE: &str = "queue";
+/// `resourceType` this service reports for a fleet in `ResourceNotFoundException`.
+pub const RESOURCE_TYPE_FLEET: &str = "fleet";
 /// `resourceType` this service reports for a job in `ResourceNotFoundException`.
 pub const RESOURCE_TYPE_JOB: &str = "job";
 /// `resourceType` this service reports for a budget in `ResourceNotFoundException`.
@@ -85,6 +117,9 @@ pub const MAX_QUEUES_PER_FARM: usize = 500;
 
 /// How many jobs one queue holds at once. See [`MAX_FARMS`].
 pub const MAX_JOBS_PER_QUEUE: usize = 1000;
+
+/// How many fleets one farm holds at once. See [`MAX_FARMS`].
+pub const MAX_FLEETS_PER_FARM: usize = 500;
 
 /// How many budgets one farm holds at once. See [`MAX_FARMS`].
 pub const MAX_BUDGETS_PER_FARM: usize = 500;
@@ -120,10 +155,106 @@ pub struct Farm {
     pub updated_at: Option<SystemTime>,
     pub updated_by: Option<String>,
     pub queues: HashMap<String, Queue>,
+    pub fleets: HashMap<String, Fleet>,
     /// Every budget of this farm, keyed by `budgetId`. A budget is reached only through
     /// its farm's path (`/2023-10-12/farms/{farmId}/budgets/{budgetId}`), so it hangs off
     /// the farm exactly as a queue does.
     pub budgets: HashMap<String, Budget>,
+}
+
+/// A persisted fleet, as `CreateFleet` stored it under its farm.
+#[derive(Debug, Clone)]
+pub struct Fleet {
+    pub fleet_id: String,
+    pub farm_id: String,
+    pub display_name: String,
+    pub description: String,
+    pub role_arn: String,
+    pub min_worker_count: i32,
+    pub max_worker_count: i32,
+    pub configuration: crate::ops::types::FleetConfiguration,
+    pub host_configuration: Option<crate::ops::types::HostConfiguration>,
+    pub status: String,
+    /// How many workers this emulator holds for the fleet.
+    ///
+    /// A fleet is created holding none, and it stays at none until the worker operations
+    /// (`CreateWorker` / `DeleteWorker`, still scaffolds) are implemented and keep it in
+    /// step as they register and remove workers.
+    pub worker_count: i32,
+    pub tags: HashMap<String, String>,
+    pub created_at: SystemTime,
+    pub created_by: String,
+    pub updated_at: Option<SystemTime>,
+    pub updated_by: Option<String>,
+    /// When the clock-owed `CREATE_IN_PROGRESS -> ACTIVE` move comes due; `None` once it
+    /// has been materialised. See [`FLEET_ACTIVE_AFTER`].
+    pub active_due_at: Option<Instant>,
+}
+
+impl Fleet {
+    /// Materialise the status transition the clock already made due.
+    ///
+    /// A read calls this before answering: the move was owed at this instant whether or
+    /// not anybody called, so applying it on read is reporting, not mutating.
+    pub fn settle_status(&mut self) {
+        if let Some(due) = self.active_due_at {
+            if Instant::now() >= due {
+                self.status = FLEET_STATUS_ACTIVE.to_string();
+                self.active_due_at = None;
+            }
+        }
+    }
+
+    /// How many workers the fleet is scaling towards.
+    ///
+    /// Nothing schedules work onto a fleet in this emulator, so the only pull on its
+    /// worker count is the floor its own configuration sets: the target is the fleet's
+    /// minimum, never above its maximum.
+    pub fn target_worker_count(&self) -> i32 {
+        self.min_worker_count.min(self.max_worker_count)
+    }
+
+    /// Where the fleet's worker count stands relative to [`target_worker_count`].
+    ///
+    /// [`target_worker_count`]: Self::target_worker_count
+    pub fn auto_scaling_status(&self) -> &'static str {
+        match self.worker_count.cmp(&self.target_worker_count()) {
+            ::std::cmp::Ordering::Less => AUTO_SCALING_STATUS_GROWING,
+            ::std::cmp::Ordering::Equal => AUTO_SCALING_STATUS_STEADY,
+            ::std::cmp::Ordering::Greater => AUTO_SCALING_STATUS_SHRINKING,
+        }
+    }
+
+    /// What the fleet is capable of, as its configuration declares it.
+    ///
+    /// Only the capabilities the configuration NAMES are reported: the custom amounts and
+    /// attributes the fleet's worker capabilities carry. The model defines no names for
+    /// the built-in vCPU, memory, OS and architecture capabilities, so a fleet whose
+    /// configuration declares no custom capability reports none rather than a name this
+    /// emulator made up; `configuration` reports those built-in ranges verbatim.
+    /// `FleetAmountCapabilities`/`FleetAttributeCapabilities` are `len 1..25`, so an empty
+    /// list is left out instead of sent empty.
+    pub fn capabilities(&self) -> Option<crate::ops::types::FleetCapabilities> {
+        let (amounts, attributes) = match &self.configuration {
+            crate::ops::types::FleetConfiguration::customerManaged(managed) => (
+                managed.worker_capabilities.custom_amounts.clone(),
+                managed.worker_capabilities.custom_attributes.clone(),
+            ),
+            crate::ops::types::FleetConfiguration::serviceManagedEc2(managed) => (
+                managed.instance_capabilities.custom_amounts.clone(),
+                managed.instance_capabilities.custom_attributes.clone(),
+            ),
+        };
+        let amounts = amounts.filter(|amounts| !amounts.is_empty());
+        let attributes = attributes.filter(|attributes| !attributes.is_empty());
+        if amounts.is_none() && attributes.is_none() {
+            return None;
+        }
+        Some(crate::ops::types::FleetCapabilities {
+            amounts,
+            attributes,
+        })
+    }
 }
 
 /// A persisted budget, as `CreateBudget` stored it under its farm.
@@ -354,9 +485,42 @@ impl ComAmazonawsDeadlineDeadlineState {
         self.farms.get(farm_id)?.queues.get(queue_id)
     }
 
+    /// The fleet `fleet_id` names UNDER `farm_id`, exactly as stored.
+    pub fn fleet(&self, farm_id: &str, fleet_id: &str) -> Option<&Fleet> {
+        self.farms.get(farm_id)?.fleets.get(fleet_id)
+    }
+
     /// Mutable form of [`queue`](Self::queue).
     pub fn queue_mut(&mut self, farm_id: &str, queue_id: &str) -> Option<&mut Queue> {
         self.farms.get_mut(farm_id)?.queues.get_mut(queue_id)
+    }
+
+    /// The fleet `fleet_id` names UNDER `farm_id`, with any clock-owed status transition
+    /// already materialised: a fleet of another farm is not found here, because the model
+    /// reaches a fleet only through its own farm's path.
+    pub fn settled_fleet(&mut self, farm_id: &str, fleet_id: &str) -> Option<&Fleet> {
+        let fleet = self.farms.get_mut(farm_id)?.fleets.get_mut(fleet_id)?;
+        fleet.settle_status();
+        Some(fleet)
+    }
+
+    /// Every fleet of `farm_id`, each with any clock-owed status transition already
+    /// materialised, oldest first with the id breaking a tie so paging over them is
+    /// stable. `None` when this emulator holds no such farm.
+    pub fn settled_fleets(&mut self, farm_id: &str) -> Option<Vec<Fleet>> {
+        let farm = self.farms.get_mut(farm_id)?;
+        let mut fleets: Vec<Fleet> = farm
+            .fleets
+            .values_mut()
+            .map(|fleet| {
+                fleet.settle_status();
+                fleet.clone()
+            })
+            .collect();
+        fleets.sort_by(|left, right| {
+            (left.created_at, &left.fleet_id).cmp(&(right.created_at, &right.fleet_id))
+        });
+        Some(fleets)
     }
 
     /// The budget `budget_id` names UNDER `farm_id`: a budget of another farm is not

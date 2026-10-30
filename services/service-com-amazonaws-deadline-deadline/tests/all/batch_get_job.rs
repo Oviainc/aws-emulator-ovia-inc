@@ -16,19 +16,11 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::farm_queue_job::{error_code, string_at, Emulator};
+use crate::farm_queue_job::{absent_id, error_code, string_at, Emulator};
 
 /// The path `BatchGetJob` is bound to, from
 /// `smithy_query(query="operation", operation="BatchGetJob")`: `POST /2023-10-12/batch-get-job`.
 const BATCH_GET_JOB: &str = "/2023-10-12/batch-get-job";
-
-/// A well-formed id this test never created: 32 hex characters, as the modeled
-/// `^farm-[0-9a-f]{32}$` / `^queue-…$` / `^job-…$` label patterns require, so the request
-/// passes the boundary validator and the handler is what decides the outcome.
-fn absent_id(prefix: &str, suffix: &str) -> String {
-    assert_eq!(suffix.len(), 32, "an id suffix is 32 hex characters");
-    format!("{prefix}-{suffix}")
-}
 
 /// What the service is expected to report for one requested identifier.
 #[derive(Debug, Clone)]
