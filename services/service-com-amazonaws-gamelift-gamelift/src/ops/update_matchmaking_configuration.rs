@@ -211,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{BACKFILL_MODE_AUTOMATIC, FLEX_MATCH_MODE_STANDALONE};
+        use crate::state::FLEX_MATCH_MODE_STANDALONE;
 
         let invalid = |message: String| -> Self::Error {
             UpdateMatchmakingConfigurationErrorModeled::InvalidRequestException(
@@ -325,14 +325,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  starting a game session."
             )));
         }
-        // `BackfillMode`'s doc: "Automatic backfill is not available when FlexMatchMode is
-        // set to STANDALONE."
-        if standalone && backfill_mode.as_deref() == Some(BACKFILL_MODE_AUTOMATIC) {
-            return Err(invalid(format!(
-                "BackfillMode {BACKFILL_MODE_AUTOMATIC} is not available when FlexMatchMode is \
-                 {FLEX_MATCH_MODE_STANDALONE}."
-            )));
-        }
+        // `BackfillMode` is NOT checked against the mode: its doc note — "Automatic
+        // backfill is not available when FlexMatchMode is set to STANDALONE" — says what
+        // the backfill feature does in that mode, not that the request fails. The member
+        // carries no constraint and the operation documents no error for the pair, so the
+        // supplied method is stored and reported like any other setting. Contrast
+        // `GameSessionQueueArns` above, whose doc does state that the request fails with an
+        // `InvalidRequestException`.
 
         let Some(configuration) = state.matchmaking_configurations.get_mut(&name) else {
             return Err(

@@ -78,7 +78,7 @@ fn zip_file_member(bytes: &[u8]) -> Value {
 /// `before` with each member of `changes` replaced by the value the update supplied: what
 /// the resource must read back as when the update changed exactly those members and
 /// nothing else.
-fn only_changed(before: &Value, changes: &[(&str, Value)]) -> Value {
+pub(crate) fn only_changed(before: &Value, changes: &[(&str, Value)]) -> Value {
     let mut expected = before.clone();
     for (member, value) in changes {
         expected[*member] = value.clone();
@@ -117,7 +117,7 @@ async fn described_script(gamelift: &GameLift, selector: &str) -> Value {
 
 /// The ONE matchmaking configuration `DescribeMatchmakingConfigurations` reports for
 /// `selector`, a configuration name or a configuration ARN.
-async fn described_configuration(gamelift: &GameLift, selector: &str) -> Value {
+pub(crate) async fn described_configuration(gamelift: &GameLift, selector: &str) -> Value {
     let described = gamelift
         .ok(
             "DescribeMatchmakingConfigurations",
@@ -196,7 +196,7 @@ async fn create_script(gamelift: &GameLift, name: &str) -> String {
 
 /// A rule set named `name` and a matchmaking configuration on it, matching the one the
 /// updates below change. Answers the configuration's name.
-async fn create_matchmaker(gamelift: &GameLift, name: &str) -> String {
+pub(crate) async fn create_matchmaker(gamelift: &GameLift, name: &str) -> String {
     let body = json!({
         "name": "solo-duel",
         "ruleLanguageVersion": "1.0",
@@ -714,10 +714,6 @@ async fn update_matchmaking_configuration_refuses_a_combination_the_service_docu
                     "arn:aws:gamelift:us-west-2:123456789012:gamesessionqueue/one",
                 ],
             }),
-        },
-        Case {
-            label: "automatic backfill on a configuration that stays standalone",
-            update: json!({"BackfillMode": "AUTOMATIC"}),
         },
         Case {
             label: "standalone mode turned on for a queue the update itself supplies",

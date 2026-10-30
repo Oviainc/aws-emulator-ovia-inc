@@ -69,8 +69,9 @@ pub const PLAYER_SESSION_STATUS_RESERVED: &str = "RESERVED";
 pub const FLEX_MATCH_MODE_STANDALONE: &str = "STANDALONE";
 
 /// The `BackfillMode` that has Amazon GameLift Servers create backfill requests itself
-/// (`smithy_query shape=BackfillMode`), which the STANDALONE mode cannot combine with:
-/// "Automatic backfill is not available when FlexMatchMode is set to STANDALONE."
+/// (`smithy_query shape=BackfillMode`): that member's own doc — "Specify AUTOMATIC to have
+/// GameLift create a match backfill request whenever a game session has one or more open
+/// slots."
 pub const BACKFILL_MODE_AUTOMATIC: &str = "AUTOMATIC";
 
 /// The `BackfillMode` a configuration created without one carries: that member's own doc —
