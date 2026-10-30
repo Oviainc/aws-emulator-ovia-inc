@@ -238,14 +238,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy_arn: Some(policy_arn.clone()),
             policy_name: Some(input.policy_name),
             policy_description: input.policy_description,
-            data_location_constraint: input.data_location_constraint,
+            // A policy that states no geographical constraint is stored with the
+            // constraint that constrains nothing, so the member is answered on
+            // every policy.
+            data_location_constraint: Some(
+                input
+                    .data_location_constraint
+                    .unwrap_or_else(|| crate::state::DEFAULT_DATA_LOCATION_CONSTRAINT.to_string()),
+            ),
             tier: Some(input.tier),
-            // AWS derives `estimatedCostTier` from a cost model it does not publish;
-            // the member is optional, so it is left absent rather than invented.
-            estimated_cost_tier: None,
+            // The service computes the cost tier from the policy itself.
+            estimated_cost_tier: Some(crate::state::estimated_cost_tier(&input.policy)),
             policy: Some(input.policy),
             creation_time: Some(crate::state::now()),
-            tags: input.tags,
+            // An untagged policy answers `tags` as an empty map, not as an absent
+            // member.
+            tags: crate::state::reported_tags(input.tags),
         };
 
         store.policies.insert(policy_arn.clone(), policy.clone());
@@ -308,9 +316,15 @@ fn conflict(message: impl Into<String>, policy_arn: String) -> CreateResiliencyP
 fn describes_same_policy(stored: &ResiliencyPolicy, request: &CreateResiliencyPolicyInput) -> bool {
     stored.policy_name.as_deref() == Some(request.policy_name.as_str())
         && stored.policy_description == request.policy_description
-        && stored.data_location_constraint == request.data_location_constraint
+        && stored.data_location_constraint.as_deref()
+            == Some(
+                request
+                    .data_location_constraint
+                    .as_deref()
+                    .unwrap_or(crate::state::DEFAULT_DATA_LOCATION_CONSTRAINT),
+            )
         && stored.tier.as_deref() == Some(request.tier.as_str())
-        && stored.tags == request.tags
+        && stored.tags == crate::state::reported_tags(request.tags.clone())
         && stored.policy.as_ref().is_some_and(|stored_policy| {
             stored_policy.len() == request.policy.len()
                 && request.policy.iter().all(|(disruption, failure)| {

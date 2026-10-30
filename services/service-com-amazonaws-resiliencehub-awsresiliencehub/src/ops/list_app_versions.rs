@@ -237,16 +237,18 @@ const MAX_PAGE_SIZE: i32 = 100;
 /// the same rule
 /// [`crate::state::ComAmazonawsResiliencehubAwsresiliencehubState::app_version_exists`]
 /// answers with — and it carries the application's own `creationTime`, because the
-/// draft comes into being with the application. Only a PUBLISHED version has an
-/// `identifier` (its publish sequence number), a `versionName` and a creation
-/// instant of its own.
+/// draft comes into being with the application. EVERY listed version answers
+/// `identifier`: the draft's is
+/// [`crate::state::DRAFT_APP_VERSION_IDENTIFIER`], and a published version's is the
+/// publish sequence number it was minted with. Only a published version has a
+/// `versionName` and a creation instant of its own.
 fn summarise_versions(
     store: &crate::state::ComAmazonawsResiliencehubAwsresiliencehubState,
     app: &App,
 ) -> Vec<AppVersionSummary> {
     let mut summaries = vec![AppVersionSummary {
         app_version: crate::state::DRAFT_APP_VERSION.to_string(),
-        identifier: None,
+        identifier: Some(crate::state::DRAFT_APP_VERSION_IDENTIFIER),
         creation_time: Some(app.creation_time),
         version_name: None,
     }];

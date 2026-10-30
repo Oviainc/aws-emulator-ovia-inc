@@ -27,6 +27,8 @@ mod application_lifecycle;
 mod list_app_versions;
 #[path = "all/publish_app_version.rs"]
 mod publish_app_version;
+#[path = "all/reported_output_members.rs"]
+mod reported_output_members;
 #[path = "all/resiliency_policy_deletion.rs"]
 mod resiliency_policy_deletion;
 #[path = "all/state_roundtrip.rs"]

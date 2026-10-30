@@ -2,7 +2,10 @@
 
 //! Engine state for the com-amazonaws-resiliencehub-awsresiliencehub service.
 
-use crate::ops::types::{App, AppComponent, LogicalResourceId, PhysicalResource, ResiliencyPolicy};
+use crate::ops::types::{
+    App, AppComponent, FailurePolicy, LogicalResourceId, PhysicalResource, ResiliencyPolicy,
+    ESTIMATED_COST_TIER_VALUES,
+};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// The region every minted ARN falls back to when the request carries no usable
@@ -14,6 +17,14 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// operations write to (`PublishAppVersion` is what freezes a snapshot of it as
 /// the current release).
 pub const DRAFT_APP_VERSION: &str = "draft";
+
+/// The `AppVersionSummary$identifier` of an application's DRAFT version: 0.
+///
+/// Every listed application version answers `identifier` — it is the only ordering
+/// key a client has over versions, the `appVersion` label being an opaque string —
+/// and the draft is the version every application starts from, so it sits below
+/// every publish sequence number.
+pub const DRAFT_APP_VERSION_IDENTIFIER: i64 = 0;
 
 /// The `appVersion` that addresses an application's CURRENT RELEASE — the newest
 /// snapshot `PublishAppVersion` froze from the draft.
@@ -582,6 +593,64 @@ pub fn reported_app_component(component: &AppComponent) -> AppComponent {
         id: component.id.clone(),
         additional_info: Some(component.additional_info.clone().unwrap_or_default()),
     }
+}
+
+/// The `tags` a resource is persisted with: the tag map the request carried, or an
+/// EMPTY map when it carried none.
+///
+/// `tags` is how a client reads a resource's tag state, and a resource this service
+/// returns always answers it: an untagged resource carries an empty map rather than
+/// dropping the member, so a client can read the map unconditionally and diff it
+/// against a later read without seeing a type change. Normalising on the WRITE is
+/// what makes every later read agree, because a read of an application or a
+/// resiliency policy is a clone of the stored record.
+pub fn reported_tags(tags: Option<HashMap<String, String>>) -> Option<HashMap<String, String>> {
+    Some(tags.unwrap_or_default())
+}
+
+/// The `DataLocationConstraint` a resiliency policy that names none is stored with.
+///
+/// The member reports the geographical constraint on where the policy's data may be
+/// held, and the service resolves it on every policy rather than leaving it
+/// unanswered; a caller that states no constraint has asked for none, which is what
+/// this value says (one of `DATA_LOCATION_CONSTRAINT_VALUES`, the enum the model
+/// gives `ResiliencyPolicy$dataLocationConstraint`).
+pub const DEFAULT_DATA_LOCATION_CONSTRAINT: &str = "AnyLocation";
+
+/// The disruption scopes a resiliency policy can state an objective for, ordered by
+/// how costly an architecture recovering from that scope needs: recovering a
+/// software fault needs no second copy of anything, a hardware fault a second host,
+/// an Availability Zone a second zone, and a Region a second region.
+///
+/// Transcribed in the order the model DECLARES the values in (`smithy_query
+/// query="shape" shape="DisruptionType"`: Software, Hardware, AZ, Region), which is
+/// that same ascending order. The generated `DISRUPTION_TYPE_VALUES` is sorted
+/// alphabetically instead, so it is not this ladder.
+const DISRUPTION_SCOPE_LADDER: [&str; 4] = ["Software", "Hardware", "AZ", "Region"];
+
+/// The `estimatedCostTier` of a resiliency policy — the member the service computes
+/// itself from the policy's content, so it is answered on every policy.
+///
+/// What a policy costs to meet is set by the BROADEST disruption it demands recovery
+/// from rather than by how tight the per-type objectives are, so the tier is the
+/// cost tier sitting at the position of the policy's broadest scope in
+/// [`DISRUPTION_SCOPE_LADDER`]: both ladders have four rungs, `EstimatedCostTier`'s
+/// (`ESTIMATED_COST_TIER_VALUES`, L1 to L4) ascending in cost just as the scope
+/// ladder ascends in the redundancy it requires.
+///
+/// Derived from what is stored, never remembered from a request, so a policy whose
+/// disruption set changes reports the tier its current content earns.
+pub fn estimated_cost_tier(policy: &HashMap<String, FailurePolicy>) -> String {
+    let broadest = policy
+        .keys()
+        .filter_map(|disruption| {
+            DISRUPTION_SCOPE_LADDER
+                .iter()
+                .position(|scope| scope == disruption)
+        })
+        .max()
+        .unwrap_or(0);
+    ESTIMATED_COST_TIER_VALUES[broadest.min(ESTIMATED_COST_TIER_VALUES.len() - 1)].to_string()
 }
 
 /// The key [`AppVersionContents::resources`] stores a physical resource under: its

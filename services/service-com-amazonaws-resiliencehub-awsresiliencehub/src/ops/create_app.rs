@@ -257,7 +257,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_app_compliance_evaluation_time: None,
             resiliency_score: 0.0,
             last_resiliency_score_evaluation_time: None,
-            tags: input.tags,
+            // An untagged application answers `tags` as an empty map, not as an
+            // absent member.
+            tags: crate::state::reported_tags(input.tags),
             // `AppAssessmentScheduleType` is `Daily | Disabled`; an application the
             // caller did not schedule is not scheduled.
             assessment_schedule: Some(
@@ -338,7 +340,7 @@ fn describes_same_app(stored: &App, request: &CreateAppInput) -> bool {
     stored.name == request.name
         && stored.description == request.description
         && stored.policy_arn == request.policy_arn
-        && stored.tags == request.tags
+        && stored.tags == crate::state::reported_tags(request.tags.clone())
         && stored.aws_application_arn == request.aws_application_arn
         && stored.assessment_schedule.as_deref()
             == Some(request.assessment_schedule.as_deref().unwrap_or("Disabled"))

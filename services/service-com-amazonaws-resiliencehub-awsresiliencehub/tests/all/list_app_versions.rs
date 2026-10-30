@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_resiliencehub_awsresiliencehub::state::{
-    DRAFT_APP_VERSION, RELEASE_APP_VERSION,
+    DRAFT_APP_VERSION, DRAFT_APP_VERSION_IDENTIFIER, RELEASE_APP_VERSION,
 };
 use service_com_amazonaws_resiliencehub_awsresiliencehub::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -259,17 +259,19 @@ async fn lists_the_draft_and_then_every_published_version() {
     let (app_arn, app_created_at) = create_an_app(&router, "list-versions-sequence").await;
 
     // Before anything is published: the draft alone, carrying the application's own
-    // creation time and neither an identifier nor a version name.
+    // creation time, the draft identifier and no version name.
     let listed = list_versions(&router, &app_arn, &json!({})).await;
     let page = summaries(&listed, "a freshly created application");
     assert_eq!(
         page,
         vec![json!({
             "appVersion": DRAFT_APP_VERSION,
+            "identifier": DRAFT_APP_VERSION_IDENTIFIER,
             "creationTime": app_created_at,
         })],
         "case \"a freshly created application\": expected only the {DRAFT_APP_VERSION} \
-         version with the application's creationTime {app_created_at:?}, got {page:?}"
+         version with identifier {DRAFT_APP_VERSION_IDENTIFIER} and the application's \
+         creationTime {app_created_at:?}, got {page:?}"
     );
     assert_eq!(
         listed.body["nextToken"],
@@ -319,10 +321,10 @@ async fn lists_the_draft_and_then_every_published_version() {
             page[0]["creationTime"]
         );
         assert_eq!(
-            page[0].get("identifier"),
-            None,
-            "case {case:?}: the draft is not a published version, so it has no \
-             identifier, got {:?}",
+            page[0]["identifier"],
+            json!(DRAFT_APP_VERSION_IDENTIFIER),
+            "case {case:?}: the draft keeps identifier {DRAFT_APP_VERSION_IDENTIFIER}, \
+             below every published version's, got {:?}",
             page[0]["identifier"]
         );
 
