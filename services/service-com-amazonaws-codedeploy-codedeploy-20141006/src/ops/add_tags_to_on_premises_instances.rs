@@ -8,7 +8,9 @@
 //! modelled `InstanceNotRegisteredException`, and no instance in the call is
 //! tagged, so a partially applied call cannot be observed. A tag whose key an
 //! instance already carries REPLACES that key's value rather than adding a
-//! second entry for it.
+//! second entry for it. A request carrying no `tags` member at all names no tag,
+//! which is `TagRequiredException`; a list it DOES carry is applied as given, so
+//! an empty one adds no tag and the call succeeds.
 //!
 //! ## Shape of an operation
 //!
@@ -229,14 +231,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        if input.tags.is_empty() {
-            return Err(AddTagsToOnPremisesInstancesErrorModeled::TagRequiredException(
-                TagRequiredException {
-                    message: Some("tags must carry at least one tag".to_string()),
-                },
-            )
-            .into());
-        }
+        // `tags` is @required, so a request that carries NO tag member was
+        // already refused at the boundary in `TagRequiredException`'s words; a
+        // member the request DID carry is the list of tag changes to apply, and
+        // an EMPTY one applies none to any of the named instances.
+        //
         // Cap the request's OWN tag list before any per-instance work: an
         // instance can hold no more tags than this, so a longer list can never
         // be applied, and refusing it here bounds the work this call does to at

@@ -222,6 +222,24 @@ const REFUSAL_CODES: &[(&str, AbsentAnswer, InvalidAnswer)] = &[
         Some(("RevisionRequiredException", crate::state::REVISION_MISSING)),
         Some(("InvalidRevisionException", None)),
     ),
+    // The tag members of the tagging operations: `tags` on `TagResource` (the
+    // framework reports the model's capitalised `Tags` as `tags`, as it does
+    // `ResourceArn` above) and on the two on-premises tag operations, and
+    // `tagKeys` on `UntagResource`. A request that carries no such member names
+    // no tag at all, which is `TagRequiredException`; a member the request DOES
+    // carry is a list of tag changes the handler applies, empty included, so it
+    // never arrives here. `tags` is OPTIONAL on `CreateApplication` and
+    // `CreateDeploymentGroup`, so its absence is no refusal there.
+    (
+        "tags",
+        Some(("TagRequiredException", crate::state::TAG_MISSING)),
+        None,
+    ),
+    (
+        "tagKeys",
+        Some(("TagRequiredException", crate::state::TAG_MISSING)),
+        None,
+    ),
     (
         "revisions",
         Some(("RevisionRequiredException", crate::state::REVISION_MISSING)),

@@ -11,8 +11,8 @@
 //! removal idempotent. `ListTagsForResource` afterwards reports exactly the tags
 //! that are left (`[]` once none are). An ARN the service cannot resolve is
 //! refused with the modelled error for THAT failure, and a `TagKeys` list it
-//! will not act on with `TagRequiredException` (no key at all) or
-//! `InvalidTagsToAddException` (an empty key) — each before anything is removed.
+//! will not act on with `InvalidTagsToAddException` (an empty key) — each before
+//! anything is removed.
 //!
 //! Every case goes through the same front door a client uses — the shared
 //! [`Emulator`] harness of `codedeploy_lifecycle` — so the boundary validator,
@@ -411,10 +411,12 @@ async fn an_unresolvable_resource_arn_removes_nothing() {
 }
 
 /// RULE: a `TagKeys` list the service will not act on is refused with the
-/// modelled error for that failure — no key at all is `TagRequiredException` and
-/// an empty key is `InvalidTagsToAddException` — and the resource keeps every
+/// modelled error for that failure — an empty key is
+/// `InvalidTagsToAddException` — and the resource keeps every
 /// tag it held; a list merely LONGER than what a resource may carry is not a
-/// failure, because a key the resource does not hold removes nothing.
+/// failure, because a key the resource does not hold removes nothing; and a
+/// request carrying no `TagKeys` member at all names no tag, which is
+/// `TagRequiredException`.
 #[tokio::test]
 async fn a_tag_keys_list_is_refused_by_what_is_wrong_with_it() {
     let emulator = Emulator::new();
@@ -430,7 +432,6 @@ async fn a_tag_keys_list_is_refused_by_what_is_wrong_with_it() {
     .await;
 
     let cases: Vec<(&str, Value, &str)> = vec![
-        ("no keys at all", json!([]), "TagRequiredException"),
         ("an empty key", json!([""]), "InvalidTagsToAddException"),
         (
             "an empty key beside a carried one",
@@ -462,6 +463,28 @@ async fn a_tag_keys_list_is_refused_by_what_is_wrong_with_it() {
             "case {case:?}: a refused call removes nothing, got {reported:?}"
         );
     }
+
+    // The one tag refusal this operation answers is a request that carries no
+    // `TagKeys` member AT ALL; a member it does carry is acted on as given, an
+    // empty list included (`aws_refusal_sentences`).
+    let (status, body) = emulator
+        .call("UntagResource", json!({"ResourceArn": resource_arn}))
+        .await;
+    assert_eq!(
+        status, 400,
+        "case \"no TagKeys member\": a request naming no tag is a client error, got {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "TagRequiredException",
+        "case \"no TagKeys member\": expected TagRequiredException, got {body:?}"
+    );
+    let reported = tags_of(&emulator, &resource_arn).await;
+    assert_eq!(
+        reported,
+        owned(&[("Env", "prod"), ("Owner", "ana")]),
+        "case \"no TagKeys member\": a refused call removes nothing, got {reported:?}"
+    );
 
     // A list naming far MORE keys than a resource may carry is served: the keys
     // the resource holds go, the rest name no tag of it. The length compared

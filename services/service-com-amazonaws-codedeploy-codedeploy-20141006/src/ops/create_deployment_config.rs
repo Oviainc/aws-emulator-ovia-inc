@@ -160,11 +160,35 @@ const TIME_BASED_LINEAR: &str = "TimeBasedLinear";
 /// See [`TIME_BASED_CANARY`].
 const ALL_AT_ONCE: &str = "AllAtOnce";
 
+/// The sentence a minimum-healthy-hosts VALUE outside what its type can mean is
+/// refused with: fixed text whose variable part is the type the request named,
+/// after which the rejected value does not appear.
+///
+/// The refusal states the rule the pair broke, not the number that broke it —
+/// the caller sent that number — so one sentence serves every value of a type,
+/// and `noun` is how the sentence names the member it is about (the
+/// configuration's own minimum, or the per-Availability-Zone one).
+///
+/// The upper bound belongs to the type that HAS one: `FLEET_PERCENT` is a
+/// percentage of the fleet, so its sentence states both ends of the range it
+/// broke, while `HOST_COUNT` is an unbounded count of instances and its sentence
+/// states only the end there is.
+fn healthy_hosts_out_of_range(noun: &str, kind: &str) -> String {
+    let upper_bound = if kind == FLEET_PERCENT {
+        " and less than 100"
+    } else {
+        ""
+    };
+    format!("The value for the {noun} with type of {kind} should be positive{upper_bound}")
+}
+
 /// Why a `minimumHealthyHosts`-shaped pair is not one CodeDeploy accepts, or
 /// `None` when it is.
 ///
 /// Both `minimumHealthyHosts` and `zonalConfig.minimumHealthyHostsPerZone` are a
-/// (type, value) pair over the same two types, so both are checked here. The
+/// (type, value) pair over the same two types, so both are checked here — the
+/// first by `member`, the name a sentence about the MEMBER uses, and the second
+/// by `noun`, how a sentence about the VALUE names what it counts. The
 /// operation documents that "there are two parameters expected in the input: type
 /// and value" — the generated shape carries `value` as a plain `i32`, so an
 /// omitted one is indistinguishable from the modelled default of 0 and only the
@@ -172,20 +196,21 @@ const ALL_AT_ONCE: &str = "AllAtOnce";
 /// `HOST_COUNT` an absolute number of instances, which cannot be negative, and
 /// `FLEET_PERCENT` "a percentage of the total number of instances in the
 /// deployment", which cannot fall outside 0–100.
-fn healthy_hosts_fault(member: &str, kind: Option<&str>, value: i32) -> Option<String> {
+fn healthy_hosts_fault(
+    member: &str,
+    noun: &str,
+    kind: Option<&str>,
+    value: i32,
+) -> Option<String> {
     match kind {
         None => Some(format!(
             "{member} requires a type: one of {}",
             MINIMUM_HEALTHY_HOSTS_TYPE_VALUES.join(", ")
         )),
-        Some(FLEET_PERCENT) if !(0..=100).contains(&value) => Some(format!(
-            "{member} value {value} is not a percentage: a {FLEET_PERCENT} value must be between \
-             0 and 100"
-        )),
-        Some(HOST_COUNT) if value < 0 => Some(format!(
-            "{member} value {value} is not a number of instances: a {HOST_COUNT} value cannot be \
-             negative"
-        )),
+        Some(FLEET_PERCENT) if !(0..=100).contains(&value) => {
+            Some(healthy_hosts_out_of_range(noun, FLEET_PERCENT))
+        }
+        Some(HOST_COUNT) if value < 0 => Some(healthy_hosts_out_of_range(noun, HOST_COUNT)),
         Some(HOST_COUNT | FLEET_PERCENT) => None,
         // Unreachable through the boundary, which refuses a type outside the
         // modelled value set. Stated rather than accepted so a value the enum
@@ -306,6 +331,7 @@ fn zonal_config_fault(config: &ZonalConfig) -> Option<String> {
     config.minimum_healthy_hosts_per_zone.as_ref().and_then(|per_zone| {
         healthy_hosts_fault(
             "minimumHealthyHostsPerZone",
+            "minimum healthy hosts per zone",
             per_zone.r#type.as_deref(),
             per_zone.value,
         )
@@ -365,7 +391,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused request mints nothing and persists nothing.
         if let Some(hosts) = &input.minimum_healthy_hosts {
             let fault = if on_instance_fleet {
-                healthy_hosts_fault("minimumHealthyHosts", hosts.r#type.as_deref(), hosts.value)
+                healthy_hosts_fault(
+                    "minimumHealthyHosts",
+                    "minimum healthy hosts",
+                    hosts.r#type.as_deref(),
+                    hosts.value,
+                )
             } else {
                 Some(format!(
                     "minimumHealthyHosts counts healthy instances, so it does not apply to a \

@@ -11,7 +11,9 @@
 //! is that resource kind's own DoesNotExist error. A tag whose key the resource
 //! already carries REPLACES that key's value rather than adding a second entry
 //! for it, so the tags are merged onto the resource's own record and read back
-//! through `ListTagsForResource`.
+//! through `ListTagsForResource`. A request carrying no `Tags` member at all
+//! names no tag, which is `TagRequiredException`; a `Tags` list it DOES carry is
+//! applied as given, so an empty one applies no tag and the call succeeds.
 //!
 //! ## Shape of an operation
 //!
@@ -212,12 +214,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource = crate::state::parse_tagged_resource_arn(&resource_arn)
             .map_err(|refusal| arn_refused(&resource_arn, refusal))?;
 
-        if input.tags.is_empty() {
-            return Err(TagResourceErrorModeled::TagRequiredException(TagRequiredException {
-                message: Some(crate::state::TAG_MISSING.to_string()),
-            })
-            .into());
-        }
+        // `Tags` is @required, so a request that carries NO tag member was
+        // already refused at the boundary in `TagRequiredException`'s words. A
+        // member the request DID carry is a list of tag changes to apply, and an
+        // EMPTY one applies none: the resource is left as it is and the call
+        // succeeds, the same way a tag already carrying its value does nothing.
+        //
         // Cap the request's OWN tag list before any lookup: a resource can hold
         // no more tags than this, so a longer list can never be applied.
         if input.tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {

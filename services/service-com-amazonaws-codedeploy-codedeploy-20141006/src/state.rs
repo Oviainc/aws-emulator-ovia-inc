@@ -336,16 +336,16 @@ pub fn deployment_config_already_exists(deployment_config_name: &str) -> String 
     format!("{deployment_config_name} already exists.")
 }
 
-/// `InvalidOperationException` (HTTP 400): the name of the deployment
-/// configuration a request asked to delete, where that configuration is one
-/// CodeDeploy itself ships — "Predefined configurations cannot be deleted"
+/// `InvalidOperationException` (HTTP 400): the fixed sentence for a deletion
+/// aimed at a deployment configuration CodeDeploy itself ships — "Predefined
+/// configurations cannot be deleted"
 /// (`smithy_query(query="doc",shape="DeleteDeploymentConfig")`).
-pub fn predefined_deployment_config_undeletable(deployment_config_name: &str) -> String {
-    format!(
-        "The deployment configuration {deployment_config_name} is a predefined deployment \
-         configuration and cannot be deleted"
-    )
-}
+///
+/// The refusal is about the shipped CATALOG rather than about the name the
+/// request carried — every member of that catalog is refused the same way — so
+/// it interpolates nothing.
+pub const PREDEFINED_DEPLOYMENT_CONFIG_UNDELETABLE: &str =
+    "Can not delete a predefined deployment configuration";
 
 /// `DeploymentConfigInUseException` (HTTP 400): the name of the deployment
 /// configuration something still uses — "A deployment configuration cannot be
@@ -427,11 +427,15 @@ pub const RESOURCE_ARN_MISSING: &str = "Resource ARN is missing";
 /// `RevisionRequiredException` (HTTP 400). See [`APPLICATION_NAME_MISSING`].
 pub const REVISION_MISSING: &str = "Revision is missing";
 
-/// `InvalidArnException` (HTTP 400): the ARN the caller sent, which is the one
-/// thing they have to change, quoted whole — `ResourceArn` carries a modelled
-/// maximum length, so what a refusal quotes back is already bounded.
+/// `InvalidArnException` (HTTP 400): this error class's fixed prefix followed by
+/// the ARN the caller sent, which is the one thing they have to change, quoted
+/// whole — `ResourceArn` carries a modelled maximum length, so what a refusal
+/// quotes back is already bounded.
+///
+/// Every operation that reads a `ResourceArn` answers an unparseable one from
+/// here, so the prefix a client matches on is the same whichever it called.
 pub fn malformed_resource_arn_message(resource_arn: &str) -> String {
-    format!("The ARN {resource_arn} is not in a valid format")
+    format!("Invalid ARN: {resource_arn}")
 }
 
 /// `ArnNotSupportedException` (HTTP 400) as the tag-WRITING operations word it:
@@ -447,7 +451,13 @@ pub fn resource_arn_not_a_codedeploy_arn_message(resource_arn: &str) -> String {
     format!("Not a CodeDeploy ARN: {resource_arn}")
 }
 
-/// `TagRequiredException` (HTTP 400): a tagging call that named no tag at all.
+/// `TagRequiredException` (HTTP 400): a tagging call whose request carries no
+/// tag member AT ALL.
+///
+/// It answers an ABSENT member, which is why the boundary
+/// ([`crate::service`]'s refusal table) is where it is chosen: a member the
+/// request DID carry is a value the call applies, and a list of no tag changes
+/// is a call that changes nothing rather than a call that named nothing.
 pub const TAG_MISSING: &str = "A tag was not specified";
 
 /// `InvalidTagsToAddException` (HTTP 400): the shape every tag of a tagging
@@ -499,6 +509,18 @@ pub fn host_not_registered(instance_name: &str) -> String {
 pub const IAM_ARN_MISSING: &str = "The on-premises instance could not be registered because no \
      IAM ARN was included in the request. Include either an IAM session ARN or IAM user ARN in \
      the request, and then try again.";
+
+/// `MultipleIamArnsProvidedException` (HTTP 400): the fixed sentence for a
+/// registration that named BOTH an IAM user ARN and an IAM session ARN, where
+/// exactly one identifies the instance.
+///
+/// The sibling of [`IAM_ARN_MISSING`], and worded the same way: the REFUSED
+/// ACTION, then what to put in the request to make it. Neither ARN nor the
+/// instance name is interpolated — the fault is that two were given, not what
+/// either of them was.
+pub const MULTIPLE_IAM_ARNS_PROVIDED: &str = "The on-premises instance could not be registered \
+     because both an IAM session ARN and an IAM user ARN were included in the request. Include \
+     only one IAM ARN in the request, and then try again.";
 
 /// `InstanceNameAlreadyRegisteredException` (HTTP 400): the fixed sentence for a
 /// host name a registration already holds, interpolating nothing — the name is

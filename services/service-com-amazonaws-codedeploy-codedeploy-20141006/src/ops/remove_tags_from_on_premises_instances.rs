@@ -8,7 +8,10 @@
 //! before anything is written, so a partially applied call cannot be observed. A
 //! tag is identified by the key-value PAIR the request names, so a pair the
 //! instance does not carry removes nothing and the call still succeeds — the
-//! instance is already in the state the caller asked for.
+//! instance is already in the state the caller asked for. A request carrying no
+//! `tags` member at all names no tag, which is `TagRequiredException`; a list it
+//! DOES carry is acted on as given, so an empty one removes no tag and the call
+//! succeeds.
 //!
 //! ## Shape of an operation
 //!
@@ -229,16 +232,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        if input.tags.is_empty() {
-            return Err(
-                RemoveTagsFromOnPremisesInstancesErrorModeled::TagRequiredException(
-                    TagRequiredException {
-                        message: Some("tags must carry at least one tag".to_string()),
-                    },
-                )
-                .into(),
-            );
-        }
+        // `tags` is @required, so a request that carries NO tag member was
+        // already refused at the boundary in `TagRequiredException`'s words; a
+        // member the request DID carry names the tags to remove, and an EMPTY
+        // one names none, so no instance loses a tag.
+        //
         // The request's OWN tag list is capped at what one instance can hold, as
         // it is when tags are added: a longer list names more tags than any
         // instance carries, and refusing it here bounds this call's work to at

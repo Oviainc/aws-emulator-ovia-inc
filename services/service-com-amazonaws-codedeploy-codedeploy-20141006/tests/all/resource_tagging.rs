@@ -11,7 +11,7 @@
 //! ARN format is refused with `InvalidArnException`, a well-formed ARN naming
 //! anything else with `ArnNotSupportedException`, an ARN whose resource the
 //! account does not hold with that resource kind's own `…DoesNotExistException`,
-//! and a `Tags` list the service will not apply with `TagRequiredException` or
+//! and a `Tags` list the service will not apply with
 //! `InvalidTagsToAddException` — each BEFORE anything is written.
 //!
 //! Every case goes through the same front door a client uses — the shared
@@ -431,9 +431,11 @@ async fn a_resource_arn_is_refused_by_what_is_wrong_with_it() {
 }
 
 /// RULE: a `Tags` list the service will not apply is refused with the modelled
-/// error for that failure — no tag at all is `TagRequiredException`, a tag
+/// error for that failure — a tag
 /// missing a key or a value and a list that would take the resource past the tag
-/// bound are `InvalidTagsToAddException` — and the resource is left as it was.
+/// bound are `InvalidTagsToAddException` — and the resource is left as it was;
+/// a request carrying no `Tags` member at all names no tag and is
+/// `TagRequiredException`.
 #[tokio::test]
 async fn a_tags_list_is_refused_by_what_is_wrong_with_it() {
     let emulator = Emulator::new();
@@ -450,7 +452,6 @@ async fn a_tags_list_is_refused_by_what_is_wrong_with_it() {
         .collect();
 
     let cases: Vec<(&str, Value, &str)> = vec![
-        ("no tags", json!([]), "TagRequiredException"),
         (
             "a tag with neither key nor value",
             json!([{}]),
@@ -500,6 +501,22 @@ async fn a_tags_list_is_refused_by_what_is_wrong_with_it() {
             "case {case:?}: a refused call tags nothing, got {reported:?}"
         );
     }
+
+    // The one tag refusal this operation answers is a request that carries no
+    // `Tags` member AT ALL; a member it does carry is applied as given, an
+    // empty list included (`aws_refusal_sentences`).
+    let (status, body) = emulator
+        .call("TagResource", json!({"ResourceArn": resource_arn}))
+        .await;
+    assert_eq!(
+        status, 400,
+        "case \"no Tags member\": a request naming no tag is a client error, got {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "TagRequiredException",
+        "case \"no Tags member\": expected TagRequiredException, got {body:?}"
+    );
 
     // AT the bound the call is accepted, and the resource carries every tag.
     let at_bound: Vec<Value> = (0..bound)

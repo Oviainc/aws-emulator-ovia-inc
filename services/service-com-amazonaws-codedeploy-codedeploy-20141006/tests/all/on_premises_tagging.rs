@@ -311,8 +311,11 @@ async fn a_tagging_request_is_refused_per_member() {
             "InstanceLimitExceededException",
         ),
         (
-            "no tags",
-            json!({"instanceNames": ["tagme"], "tags": []}),
+            // No tag member at all, which is the one way a request names no
+            // tag: a member it DOES carry is a list of changes to apply, so an
+            // empty one is served (see `aws_refusal_sentences`).
+            "no tag member",
+            json!({"instanceNames": ["tagme"]}),
             "TagRequiredException",
         ),
         (

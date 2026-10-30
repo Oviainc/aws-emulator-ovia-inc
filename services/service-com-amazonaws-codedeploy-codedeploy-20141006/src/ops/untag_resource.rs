@@ -12,7 +12,10 @@
 //! is that resource kind's own DoesNotExist error. Each `TagKeys` entry
 //! identifies a tag of that resource by its KEY alone, so the tag goes whatever
 //! value it holds, and a key the resource does not carry removes nothing —
-//! disassociating a tag is idempotent. What is left is the list
+//! disassociating a tag is idempotent. A request carrying no `TagKeys` member at
+//! all names no tag, which is `TagRequiredException`; a list it DOES carry is
+//! acted on as given, so an empty one removes nothing and the call succeeds.
+//! What is left is the list
 //! `ListTagsForResource` reports.
 //!
 //! ## Shape of an operation
@@ -218,15 +221,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource = crate::state::parse_tagged_resource_arn(&resource_arn)
             .map_err(|refusal| arn_refused(&resource_arn, refusal))?;
 
-        // `TagKeys` is modelled required but carries no `@length`, so an EMPTY
-        // list reaches here: it names no tag to disassociate, which is this
-        // service's `TagRequiredException`.
-        if input.tag_keys.is_empty() {
-            return Err(UntagResourceErrorModeled::TagRequiredException(TagRequiredException {
-                message: Some(crate::state::TAG_MISSING.to_string()),
-            })
-            .into());
-        }
+        // `TagKeys` is @required, so a request that carries NO key member was
+        // already refused at the boundary in `TagRequiredException`'s words. A
+        // member the request DID carry names the keys to disassociate, and an
+        // EMPTY list names none: nothing is removed and the call succeeds, the
+        // same way a key the resource does not carry removes nothing.
+        //
         // The per-resource tag bound is NOT a bound on this list: naming a key
         // the resource does not carry removes nothing, so a list longer than
         // what any resource holds is served rather than refused.

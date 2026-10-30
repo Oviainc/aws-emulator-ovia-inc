@@ -329,8 +329,11 @@ async fn a_tag_removal_request_is_refused_per_member() {
             "InstanceNotRegisteredException",
         ),
         (
-            "no tags",
-            json!({"instanceNames": ["tagged"], "tags": []}),
+            // No tag member at all, which is the one way a request names no
+            // tag: a member it DOES carry is a list of changes to apply, so an
+            // empty one is served (see `aws_refusal_sentences`).
+            "no tag member",
+            json!({"instanceNames": ["tagged"]}),
             "TagRequiredException",
         ),
         (

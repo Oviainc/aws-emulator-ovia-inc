@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/application_revisions.rs"]
 mod application_revisions;
+#[path = "all/aws_refusal_sentences.rs"]
+mod aws_refusal_sentences;
 #[path = "all/batch_get_application_revisions.rs"]
 mod batch_get_application_revisions;
 #[path = "all/batch_get_applications.rs"]

@@ -209,11 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (Some(_), Some(_)) => {
                 return Err(RegisterOnPremisesInstanceErrorModeled::MultipleIamArnsProvidedException(
                     MultipleIamArnsProvidedException {
-                        message: Some(
-                            "Both an user ARN and an IAM session ARN were included in the \
-                             request. Use only one ARN type"
-                                .to_string(),
-                        ),
+                        message: Some(crate::state::MULTIPLE_IAM_ARNS_PROVIDED.to_string()),
                     },
                 )
                 .into())

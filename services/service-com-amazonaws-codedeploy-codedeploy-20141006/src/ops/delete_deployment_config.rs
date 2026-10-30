@@ -173,9 +173,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if crate::state::is_predefined_deployment_config(&name) {
                 return Err(DeleteDeploymentConfigErrorModeled::InvalidOperationException(
                     InvalidOperationException {
-                        message: Some(crate::state::predefined_deployment_config_undeletable(
-                            &name,
-                        )),
+                        message: Some(
+                            crate::state::PREDEFINED_DEPLOYMENT_CONFIG_UNDELETABLE.to_string(),
+                        ),
                     },
                 ));
             }
