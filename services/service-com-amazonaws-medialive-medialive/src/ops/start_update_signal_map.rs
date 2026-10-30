@@ -231,7 +231,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// modelled 404 for an identifier (of the signal map, of an entry point or of a
 /// template group) that resolves to nothing, the modelled 400 for a value that
 /// is not an ARN at all, and the modelled 409 for a name another signal map
-/// holds or for a signal map whose own work is still in flight.
+/// holds or for a signal map whose own work is still in flight — its own
+/// lifecycle action, or a monitor deployment of it.
 fn refused(
     identifier: &str,
     refusal: crate::state::SignalMapUpdateRefusal,
@@ -248,6 +249,14 @@ fn refused(
                 message: Some(format!(
                     "Signal map {id} is in state {status} and can only be updated once that \
                      action has completed"
+                )),
+            })
+        }
+        Refusal::DeploymentRunning { id, status } => {
+            StartUpdateSignalMapErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Signal map {id} has a monitor deployment in progress ({status}) and can \
+                     only be updated once that deployment has completed"
                 )),
             })
         }

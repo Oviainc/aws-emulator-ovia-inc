@@ -389,6 +389,9 @@ mod shared_request_rules;
 #[path = "all/signal_map_deletion.rs"]
 mod signal_map_deletion;
 
+#[path = "all/signal_map_deployment_window.rs"]
+mod signal_map_deployment_window;
+
 #[path = "all/signal_map_listing.rs"]
 mod signal_map_listing;
 

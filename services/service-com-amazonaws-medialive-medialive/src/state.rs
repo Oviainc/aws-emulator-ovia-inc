@@ -2379,6 +2379,11 @@ pub enum SignalMapUpdateRefusal {
     /// signal map is not in a state a further update may take it out of.
     /// Carries the id and the status it is in.
     LifecycleRunning { id: String, status: String },
+    /// A monitor deployment of the signal map is still running — the same
+    /// in-flight deployment `DeleteSignalMap`, `StartMonitorDeployment` and
+    /// `StartDeleteMonitorDeployment` refuse over. Carries the id and the
+    /// deployment status it is in.
+    DeploymentRunning { id: String, status: String },
     /// Another signal map already carries the name asked for, which `Name` is
     /// documented to make unique within the resource type in a region.
     NameTaken,
@@ -4176,6 +4181,11 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// update completes. Every other member is a partial update: one the request
     /// carried replaces what is stored, one it omitted leaves it alone.
     ///
+    /// Like every other mutation of a signal map, an update needs the signal map
+    /// to have no asynchronous work of its own in flight: neither its own
+    /// lifecycle action nor a monitor deployment of it, which deploys the very
+    /// monitor contents an update rewrites.
+    ///
     /// The resolution, the preconditions, the rediscovery and the write live
     /// together here, so a handler cannot check one of them and write past
     /// another; the handler's job is only to turn a [`SignalMapUpdateRefusal`]
@@ -4202,6 +4212,16 @@ impl ComAmazonawsMedialiveMedialiveState {
             return Err(SignalMapUpdateRefusal::LifecycleRunning {
                 id,
                 status: map.status().to_string(),
+            });
+        }
+        // A monitor deployment is asynchronous too, and it deploys the monitor
+        // this update would replace — the graph the signal map maps and the
+        // template groups it is associated with — so one still in flight is
+        // already working on what this call would change.
+        if map.monitor_deployment_in_progress() {
+            return Err(SignalMapUpdateRefusal::DeploymentRunning {
+                id,
+                status: map.monitor_deployment_status().to_string(),
             });
         }
         let stored_entry_point = map.discovery_entry_point_arn.clone();
