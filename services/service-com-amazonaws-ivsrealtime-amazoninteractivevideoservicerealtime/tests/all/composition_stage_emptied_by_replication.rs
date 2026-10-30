@@ -11,11 +11,12 @@
 //! suites beside this one join through.
 //!
 //! The rule under test: whenever the stage a composition composites comes to hold no
-//! connected participant, every composition of that stage is owed its stop one published
-//! `state::COMPOSITION_EMPTY_STAGE_TIMEOUT` after THAT instant — whichever call left it
+//! connected participant, every composition of that stage is owed its stop one
+//! `state::COMPOSITION_EMPTY_STAGE_STOP_SPAN` after THAT instant — whichever call left it
 //! empty, a departure of a participant that joined the stage or of a replica a replication
-//! put into it — and when the timeout runs out the composition stops and the ephemeral
-//! resource is deleted. While the stage still holds one, nothing is owed, and a stage
+//! put into it — and when that deadline runs out the composition stops and, one
+//! `state::COMPOSITION_RETENTION_SPAN` later, the ephemeral resource is deleted. While the
+//! stage still holds one, nothing is owed, and a stage
 //! somebody is still publishing in is not emptied by a replication out of it ending.
 //!
 //! Read as three cases:
@@ -54,12 +55,19 @@ const ACCOUNT: &str = "000000000000";
 /// The region every case in this suite signs for.
 const REGION: &str = "us-east-1";
 
-/// The timeout the model publishes for a composition whose stage holds nobody, read from the
-/// crate so this suite cannot drift from the span the service enforces.
-const TIMEOUT: Duration = state::COMPOSITION_EMPTY_STAGE_TIMEOUT;
+/// How long after its stage was left empty a composition is owed its stop, read from the
+/// crate so this suite cannot drift from the span the service enforces. It is one whole end
+/// — the stop and the retention of the stopped record — inside the minute the model
+/// publishes (`state::COMPOSITION_EMPTY_STAGE_TIMEOUT`).
+const STOP_DUE_AFTER: Duration = state::COMPOSITION_EMPTY_STAGE_STOP_SPAN;
 
-/// The span the service gives each step of a stop, read from the crate for the same reason.
+/// The span the service gives the `STOPPING` -> `STOPPED` step of a stop, read from the
+/// crate for the same reason.
 const STOP_SPAN: Duration = state::COMPOSITION_STOP_SPAN;
+
+/// How long the service goes on reporting a stopped composition before the ephemeral
+/// resource is deleted, read from the crate for the same reason.
+const RETENTION: Duration = state::COMPOSITION_RETENTION_SPAN;
 
 /// Added to every sleep, so a span this suite waits out has certainly elapsed whatever
 /// scheduling delay the test host adds.
@@ -304,6 +312,36 @@ impl RealTime {
         composition.empty_stage_stop_at = Some(SystemTime::now());
         Instant::now()
     }
+
+    /// Move the end the service recorded for `arn` one whole [`RETENTION`] into the past, so
+    /// what the service does when a stopped composition's record expires is observable
+    /// without waiting that span out.
+    ///
+    /// Refuses to invent one: the composition's end has to have begun already, by the
+    /// deadline the clock ran out or by a caller's stop.
+    fn run_out_the_retention(&self, case: &str, arn: &str) {
+        let handle = state::service_state(&*self.engine).expect("this service's store");
+        let mut store = handle.lock();
+        let composition = store
+            .compositions
+            .get_mut(arn)
+            .unwrap_or_else(|| panic!("case {case:?}: the store must hold {arn}"));
+        let begun = composition.ended_at.is_some()
+            || composition
+                .empty_stage_stop_at
+                .is_some_and(|due| due <= SystemTime::now());
+        assert!(
+            begun,
+            "case {case:?}: {arn} must already be ending for its record to expire, \
+             got ended_at {:?} and deadline {:?}",
+            composition.ended_at, composition.empty_stage_stop_at
+        );
+        let shift = RETENTION + STOP_SPAN + SLACK;
+        composition.ended_at = composition.ended_at.map(|ended| ended - shift);
+        composition.empty_stage_stop_at = composition
+            .empty_stage_stop_at
+            .map(|deadline| deadline - shift);
+    }
 }
 
 /// The wire error code of a failed call (`__type` in a restJson1 error body).
@@ -512,11 +550,12 @@ async fn a_stage_a_replication_left_empty_owes_its_compositions_a_stop_one_timeo
 
         let deadline = emulator.deadline(case, &composition);
         assert!(
-            deadline.is_some_and(|due| due >= before + TIMEOUT && due <= after + TIMEOUT),
-            "case {case:?}: the stop must be owed one {TIMEOUT:?} after the stage was left \
-             empty (between {:?} and {:?}), got {deadline:?}",
-            before + TIMEOUT,
-            after + TIMEOUT
+            deadline.is_some_and(|due| due >= before + STOP_DUE_AFTER
+                && due <= after + STOP_DUE_AFTER),
+            "case {case:?}: the stop must be owed one {STOP_DUE_AFTER:?} after the stage was \
+             left empty (between {:?} and {:?}), got {deadline:?}",
+            before + STOP_DUE_AFTER,
+            after + STOP_DUE_AFTER
         );
 
         // Nothing is owed YET: inside the published timeout the composition is still
@@ -571,8 +610,9 @@ async fn a_composition_of_a_stage_a_replication_emptied_stops_and_is_deleted() {
         // Straight after the timeout the broadcast is ending: a stopping composition with an
         // end time, or — for a read the span boundary overtook — one that has stopped. The
         // ending state is asserted of every read that found the composition at all; only a
-        // host slow enough to spend both stop spans getting here may find the ephemeral
-        // resource already reclaimed, and that is the one reading admitted without it.
+        // host slow enough to spend the whole stop and the retention of the stopped record
+        // getting here may find the ephemeral resource already reclaimed, and that is the one
+        // reading admitted without it.
         let (status, response) = emulator.read(&composition).await;
         if status == 200 {
             let stopping = response["composition"].clone();
@@ -590,16 +630,16 @@ async fn a_composition_of_a_stage_a_replication_emptied_stops_and_is_deleted() {
         } else {
             let elapsed = ran_out.elapsed();
             assert!(
-                elapsed >= STOP_SPAN * 2,
-                "case {case:?}: {elapsed:?} after the timeout ran out is less than the two \
-                 spans the stop takes, so the composition must still be reported, \
-                 got {status} {response}"
+                elapsed >= STOP_SPAN + RETENTION,
+                "case {case:?}: {elapsed:?} after the timeout ran out is less than the stop \
+                 and the retention of the stopped record together, so the composition must \
+                 still be reported, got {status} {response}"
             );
         }
 
-        // Two spans on, the ephemeral resource is gone: the read is the modelled 404 and the
-        // listing no longer carries it.
-        tokio::time::sleep(STOP_SPAN * 2 + SLACK).await;
+        // Once the retention span is over, the ephemeral resource is gone: the read is the
+        // modelled 404 and the listing no longer carries it.
+        emulator.run_out_the_retention(case, &composition);
         let (status, response) = emulator.read(&composition).await;
         assert_eq!(
             status, 404,

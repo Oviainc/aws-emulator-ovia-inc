@@ -5,7 +5,9 @@
 //! Stops a composition `StartComposition` started: the composition moves to `STOPPING`
 //! and records when its broadcast ended, every destination with it, and the clock owes it
 //! `STOPPED` one [`crate::state::COMPOSITION_STOP_SPAN`] later and the deletion of the
-//! ephemeral resource one span after that. A composition that is no longer composing
+//! ephemeral resource one [`crate::state::COMPOSITION_RETENTION_SPAN`] after that — so the
+//! caller that waits for the stop reads the terminal state and its end time back. A
+//! composition that is no longer composing
 //! cannot be stopped again (the modelled `ConflictException`, HTTP 409), and an ARN this
 //! store holds no composition for is the modelled `ResourceNotFoundException` (HTTP 404).
 //!
@@ -183,7 +185,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The stop begins now: the composition and every destination it broadcasts to
         // enter their stopping state and record when the broadcast ended. The clock owes
         // the rest — `STOPPED` one `crate::state::COMPOSITION_STOP_SPAN` later, and the
-        // deletion of the ephemeral resource one span after that, both materialised by
+        // deletion of the ephemeral resource one
+        // `crate::state::COMPOSITION_RETENTION_SPAN` after that, both materialised by
         // `crate::state::CompositionRecord::materialize_due` and neither slept on.
         composition.begin_stop(now);
 

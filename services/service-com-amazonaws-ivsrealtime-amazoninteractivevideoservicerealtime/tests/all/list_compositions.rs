@@ -66,9 +66,11 @@ fn past(span: Duration) -> Duration {
 const WITHIN_THE_ACTIVATION_SPAN: Duration = Duration::from_millis(1);
 
 /// One IVS RealTime emulator over one shared engine, reached the way the router reaches
-/// it.
+/// it, plus the engine handle the clock-driven expiry of a stopped record is run out
+/// through.
 struct RealTime {
     router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl RealTime {
@@ -77,8 +79,25 @@ impl RealTime {
         let mut router = MultiServiceRouter::new();
         // Pin authentication off so the suite does not depend on the process setting.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// Move the end the service recorded for `composition_arn` one whole
+    /// `state::COMPOSITION_RETENTION_SPAN` into the past, so what a listing reports once a
+    /// stopped composition's record expires is observable without waiting that span out.
+    fn run_out_the_retention(&self, case: &str, composition_arn: &str) {
+        let handle = state::service_state(&*self.engine).expect("this service's store");
+        let mut store = handle.lock();
+        let composition = store
+            .compositions
+            .get_mut(composition_arn)
+            .unwrap_or_else(|| panic!("case {case:?}: the store must hold {composition_arn}"));
+        let ended_at = composition.ended_at.unwrap_or_else(|| {
+            panic!("case {case:?}: {composition_arn} must already carry the end its stop recorded")
+        });
+        composition.ended_at =
+            Some(ended_at - past(state::COMPOSITION_RETENTION_SPAN + state::COMPOSITION_STOP_SPAN));
     }
 
     /// Call `operation` as an SDK would: `POST /<operation>` with a SigV4 credential
@@ -708,8 +727,8 @@ async fn a_page_reports_the_state_the_clock_owes_and_drops_a_reclaimed_compositi
          {STATE_STOPPING}, got {summary}"
     );
 
-    // Two stop spans after the stop began, the record is reclaimed.
-    tokio::time::sleep(past(state::COMPOSITION_STOP_SPAN * 2)).await;
+    // Once the retention of the stopped record is over, it is reclaimed.
+    service.run_out_the_retention(stopped_case, &stopped_arn);
     let reclaimed = summaries(&service.list("past the reclamation", &json!({})).await);
     assert!(
         summary_of(&reclaimed, &stopped_arn).is_none(),

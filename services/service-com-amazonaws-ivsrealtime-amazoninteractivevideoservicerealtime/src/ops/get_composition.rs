@@ -145,8 +145,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A REPORT of one composition. The only write it performs is the transition the
         // clock had ALREADY made due — `STARTING` -> `ACTIVE`, owed
         // `crate::state::COMPOSITION_ACTIVATION_SPAN` after the start, and after a stop
-        // `STOPPING` -> `STOPPED` and the deletion of the ephemeral resource, owed
-        // `crate::state::COMPOSITION_STOP_SPAN` apart — each whether or not anybody
+        // `STOPPING` -> `STOPPED` one `crate::state::COMPOSITION_STOP_SPAN` later and the
+        // deletion of the ephemeral resource one
+        // `crate::state::COMPOSITION_RETENTION_SPAN` after THAT — each whether or not
+        // anybody
         // called, so two reads at the same instant answer alike and a later caller sees
         // exactly what this one saw. The operation is `@readonly` in the model and
         // nothing else here changes state. The composition is read from this request's

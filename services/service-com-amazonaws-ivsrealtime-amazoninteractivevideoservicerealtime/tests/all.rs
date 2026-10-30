@@ -25,6 +25,8 @@ mod composition_stage_emptied_by_replication;
 mod composition_stop;
 #[path = "all/composition_tag_lifetime.rs"]
 mod composition_tag_lifetime;
+#[path = "all/composition_terminal_state_retention.rs"]
+mod composition_terminal_state_retention;
 #[path = "all/compositions.rs"]
 mod compositions;
 #[path = "all/create_ingest_configuration_inputs.rs"]

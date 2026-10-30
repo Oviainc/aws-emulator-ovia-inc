@@ -17,9 +17,9 @@
 //! the same request is repeated.
 //!
 //! The rows differ along what the rule generalises over: HOW LONG after the stop the read
-//! is made (inside the stop span, between the two spans, past both of them, and long past
-//! them), WHETHER an unrelated call ran in between, WHICH reader is asked first, and the
-//! tag map the composition carries.
+//! is made (inside the stop span, once the stop has finished, past the retention of the
+//! stopped record, and long past it), WHETHER an unrelated call ran in between, WHICH
+//! reader is asked first, and the tag map the composition carries.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,9 +39,13 @@ const ACCOUNT: &str = "000000000000";
 /// The region every test in this suite signs for.
 const REGION: &str = "us-east-1";
 
-/// The span the service gives each step of a stop, read from the crate so this suite
-/// cannot drift from the span the service actually enforces.
+/// The span the service gives the `STOPPING` -> `STOPPED` step of a stop, read from the
+/// crate so this suite cannot drift from the span the service actually enforces.
 const STOP_SPAN: Duration = state::COMPOSITION_STOP_SPAN;
+
+/// How long the service goes on reporting a stopped composition before the ephemeral
+/// resource is deleted, read from the crate for the same reason.
+const RETENTION: Duration = state::COMPOSITION_RETENTION_SPAN;
 
 // The `CompositionState` values this suite asserts, from
 // `smithy_query(query="shape",shape="CompositionState")`:
@@ -53,17 +57,19 @@ const STATE_STOPPED: &str = "STOPPED";
 const NOT_FOUND: &str = "ResourceNotFoundException";
 
 /// One IVS RealTime emulator over one shared engine, reached the way the router reaches
-/// it.
+/// it, plus the engine handle the clock-driven expiry of a stopped record is run out
+/// through.
 struct RealTime {
     router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl RealTime {
     fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
     }
 
     /// An operation bound to `POST /<Operation>`, which is every operation of this service
@@ -169,6 +175,26 @@ impl RealTime {
         self.call("GetComposition", &json!({ "arn": composition_arn }))
             .await
     }
+
+    /// Move the end the service recorded for `composition_arn` one whole [`RETENTION`] into
+    /// the past, so what the service does when a stopped composition's record expires is
+    /// observable without waiting that span out.
+    ///
+    /// Written straight onto the store rather than through an operation, so no call of this
+    /// service has touched it: whichever reader is asked first is still the one that has to
+    /// answer for the reclaim.
+    fn run_out_the_retention(&self, case: &str, composition_arn: &str) {
+        let handle = state::service_state(&*self.engine).expect("this service's store");
+        let mut store = handle.lock();
+        let composition = store
+            .compositions
+            .get_mut(composition_arn)
+            .unwrap_or_else(|| panic!("case {case:?}: the store must hold {composition_arn}"));
+        let ended_at = composition.ended_at.unwrap_or_else(|| {
+            panic!("case {case:?}: {composition_arn} must already carry the end its stop recorded")
+        });
+        composition.ended_at = Some(ended_at - (RETENTION + STOP_SPAN));
+    }
 }
 
 /// The wire error code of a failed call (`__type` in a restJson1 error body).
@@ -221,6 +247,9 @@ struct Row {
     case: &'static str,
     /// How long after the stop the reads are made.
     waited: Duration,
+    /// Whether the retention of the stopped record is run out before the reads, so the
+    /// clock has reclaimed the ephemeral resource by the time either reader is asked.
+    retention_run_out: bool,
     /// Whether an unrelated call — one that holds the store mutably, and so materialises
     /// everything the clock owes — runs between the stop and the reads.
     unrelated_call_in_between: bool,
@@ -241,6 +270,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "inside the stop span, nothing called in between, tags read first",
             waited: Duration::from_millis(1),
+            retention_run_out: false,
             unrelated_call_in_between: false,
             tagging_first: true,
             tags: one.clone(),
@@ -249,42 +279,51 @@ fn rows() -> Vec<Row> {
             case: "inside the stop span, an unrelated call in between, composition read \
                    first",
             waited: Duration::from_millis(1),
+            retention_run_out: false,
             unrelated_call_in_between: true,
             tagging_first: false,
             tags: several.clone(),
         },
         Row {
-            case: "between the two spans, nothing called in between, tags read first",
+            case: "once the stop has finished, nothing called in between, tags read first",
             waited: STOP_SPAN + Duration::from_millis(200),
+            retention_run_out: false,
             unrelated_call_in_between: false,
             tagging_first: true,
             tags: several,
         },
         Row {
-            case: "between the two spans, an unrelated call in between, composition read \
-                   first",
+            case: "once the stop has finished, an unrelated call in between, composition \
+                   read first",
             waited: STOP_SPAN + Duration::from_millis(200),
+            retention_run_out: false,
             unrelated_call_in_between: true,
             tagging_first: false,
             tags: plain,
         },
         Row {
-            case: "past both spans, nothing called in between, tags read first",
-            waited: STOP_SPAN * 2 + Duration::from_millis(400),
+            case: "past the retention of the stopped record, nothing called in between, \
+                   tags read first",
+            waited: STOP_SPAN + Duration::from_millis(200),
+            retention_run_out: true,
             unrelated_call_in_between: false,
             tagging_first: true,
             tags: one.clone(),
         },
         Row {
-            case: "past both spans, an unrelated call in between, composition read first",
-            waited: STOP_SPAN * 2 + Duration::from_millis(400),
+            case: "past the retention of the stopped record, an unrelated call in between, \
+                   composition read first",
+            waited: STOP_SPAN + Duration::from_millis(200),
+            retention_run_out: true,
             unrelated_call_in_between: true,
             tagging_first: false,
             tags: one.clone(),
         },
         Row {
-            case: "long past both spans, nothing called in between, tags read first",
+            case: "long past the retention of the stopped record, nothing called in \
+                   between, tags read first",
             waited: STOP_SPAN * 4,
+            retention_run_out: true,
             unrelated_call_in_between: false,
             tagging_first: true,
             tags: one,
@@ -304,6 +343,7 @@ async fn the_tagging_surface_and_get_composition_agree_over_a_compositions_whole
         let Row {
             case,
             waited,
+            retention_run_out,
             unrelated_call_in_between,
             tagging_first,
             tags,
@@ -317,6 +357,9 @@ async fn the_tagging_surface_and_get_composition_agree_over_a_compositions_whole
         let stopped = service.stop(case, &composition_arn).await;
 
         tokio::time::sleep(waited).await;
+        if retention_run_out {
+            service.run_out_the_retention(case, &composition_arn);
+        }
         if unrelated_call_in_between {
             let (status, response) = service.read(&bystander).await;
             assert_eq!(
@@ -356,7 +399,7 @@ async fn the_tagging_surface_and_get_composition_agree_over_a_compositions_whole
             );
         }
 
-        if after < STOP_SPAN * 2 {
+        if !retention_run_out {
             // The clock has not reclaimed the resource yet, so every reader serves it and
             // the tags are the ones the start persisted.
             for (what, (status, response)) in [
@@ -404,7 +447,7 @@ async fn the_tagging_surface_and_get_composition_agree_over_a_compositions_whole
                  must be in one of {admissible:?}, got {}",
                 read.1
             );
-        } else if before >= STOP_SPAN * 2 {
+        } else {
             // The clock reclaimed the ephemeral resource before either reader was asked:
             // both must answer the modelled not-found, and the repeat of the listing must
             // answer it too rather than changing its mind because another call ran.
@@ -467,15 +510,16 @@ async fn no_tagging_operation_serves_a_composition_the_clock_has_reclaimed() {
             .start(case, &stage, &json!({ "env": "test" }))
             .await;
         let stopped = service.stop(case, &composition_arn).await;
-        tokio::time::sleep(STOP_SPAN * 2 + Duration::from_millis(400)).await;
+        tokio::time::sleep(STOP_SPAN + Duration::from_millis(400)).await;
+        service.run_out_the_retention(case, &composition_arn);
 
         // The first call since the stop is the one under test, so nothing else can have
         // written the reclaim down for it.
         let before = stopped.elapsed();
         let (status, response) = service.tagging(method, &composition_arn, query, body).await;
         assert!(
-            before >= STOP_SPAN * 2,
-            "case {case:?}: the call must be made past the reclaim deadline, \
+            before >= STOP_SPAN,
+            "case {case:?}: the call must be made once the stop has finished, \
              made {before:?} after the stop"
         );
         assert_eq!(

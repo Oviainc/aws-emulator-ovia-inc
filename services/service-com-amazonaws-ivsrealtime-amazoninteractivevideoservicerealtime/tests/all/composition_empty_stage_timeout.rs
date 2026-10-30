@@ -15,16 +15,18 @@
 //! 1. A STAGE LEFT WITHOUT PARTICIPANTS PUTS ITS COMPOSITIONS ON A DEADLINE. Whenever the
 //!    stage a composition composites comes to hold no participant — the start finding it
 //!    empty, the last participant disconnecting, the publisher of an ingest configuration
-//!    removed with it — every composition of that stage is owed its stop one published
-//!    `state::COMPOSITION_EMPTY_STAGE_TIMEOUT` after THAT instant.
+//!    removed with it — every composition of that stage is owed its stop one
+//!    `state::COMPOSITION_EMPTY_STAGE_STOP_SPAN` after THAT instant, which is one whole end
+//!    inside the published `state::COMPOSITION_EMPTY_STAGE_TIMEOUT` measured from it.
 //! 2. A PARTICIPANT IN THE STAGE OWES NOTHING. A composition whose stage still holds one
 //!    goes on composing, and a participant joining before the timeout has run out takes
 //!    the deadline away again.
-//! 3. WHEN THE TIMEOUT RUNS OUT the composition ends exactly as a caller's
+//! 3. WHEN THE DEADLINE RUNS OUT the composition ends exactly as a caller's
 //!    `StopComposition` ends it: `STOPPING` with an end time and every destination with
 //!    it, `STOPPED` one `state::COMPOSITION_STOP_SPAN` later, and the ephemeral resource
-//!    deleted one span after that — the model says the "Composition stops and the resource
-//!    is deleted", so the read that follows is the modelled 404.
+//!    deleted one `state::COMPOSITION_RETENTION_SPAN` after that — the model says the
+//!    "Composition stops and the resource is deleted", so the read that follows is the
+//!    modelled 404.
 //! 4. WHAT THAT RELEASES. While the composition is composing, the encoder configuration its
 //!    destination names cannot be deleted (the modelled `ConflictException`, HTTP 409);
 //!    once the clock has reclaimed the composition the delete succeeds and the composition
@@ -52,12 +54,22 @@ const ACCOUNT: &str = "000000000000";
 /// The region every case in this suite signs for.
 const REGION: &str = "us-east-1";
 
-/// The timeout the model publishes for a composition whose stage holds nobody, read from
-/// the crate so this suite cannot drift from the span the service enforces.
+/// How long after its stage was left empty a composition is owed its stop, read from the
+/// crate so this suite cannot drift from the span the service enforces.
+const STOP_DUE_AFTER: Duration = state::COMPOSITION_EMPTY_STAGE_STOP_SPAN;
+
+/// The timeout the model publishes for a composition whose stage holds nobody: the whole
+/// end — [`STOP_DUE_AFTER`], the stop and the retention of the stopped record — fits inside
+/// it, which is what [`STOP_DUE_AFTER`] is derived from.
 const TIMEOUT: Duration = state::COMPOSITION_EMPTY_STAGE_TIMEOUT;
 
-/// The span the service gives each step of a stop, read from the crate for the same reason.
+/// The span the service gives the `STOPPING` -> `STOPPED` step of a stop, read from the
+/// crate for the same reason.
 const STOP_SPAN: Duration = state::COMPOSITION_STOP_SPAN;
+
+/// How long the service goes on reporting a stopped composition before the ephemeral
+/// resource is deleted, read from the crate for the same reason.
+const RETENTION: Duration = state::COMPOSITION_RETENTION_SPAN;
 
 /// Added to every sleep, so a span this suite waits out has certainly elapsed whatever
 /// scheduling delay the test host adds.
@@ -73,15 +85,15 @@ const STATE_STOPPING: &str = "STOPPING";
 const STATE_STOPPED: &str = "STOPPED";
 
 /// The states a composition the clock stopped passes through, in order: `STOPPING` until
-/// one [`STOP_SPAN`] has elapsed, `STOPPED` until a second one has, and then no state at
-/// all — the resource is deleted, so the read is a 404.
+/// one [`STOP_SPAN`] has elapsed, `STOPPED` for the whole [`RETENTION`] after that, and then
+/// no state at all — the resource is deleted, so the read is a 404.
 const STOP_PHASES: [Option<&str>; 3] = [Some(STATE_STOPPING), Some(STATE_STOPPED), None];
 
 /// Which of [`STOP_PHASES`] a composition whose stop began `elapsed` ago is in.
 fn stop_phase(elapsed: Duration) -> usize {
     if elapsed < STOP_SPAN {
         0
-    } else if elapsed < STOP_SPAN * 2 {
+    } else if elapsed < STOP_SPAN + RETENTION {
         1
     } else {
         2
@@ -338,6 +350,36 @@ impl RealTime {
         composition.empty_stage_stop_at = Some(SystemTime::now());
         Instant::now()
     }
+
+    /// Move the end the service recorded for `arn` one whole [`RETENTION`] into the past, so
+    /// what the service does when a stopped composition's record expires is observable
+    /// without waiting that span out.
+    ///
+    /// Refuses to invent one: the composition's end has to have begun already, by a caller's
+    /// stop or by the deadline the clock ran out.
+    fn run_out_the_retention(&self, case: &str, arn: &str) {
+        let handle = state::service_state(&*self.engine).expect("this service's store");
+        let mut store = handle.lock();
+        let composition = store
+            .compositions
+            .get_mut(arn)
+            .unwrap_or_else(|| panic!("case {case:?}: the store must hold {arn}"));
+        let begun = composition.ended_at.is_some()
+            || composition
+                .empty_stage_stop_at
+                .is_some_and(|due| due <= SystemTime::now());
+        assert!(
+            begun,
+            "case {case:?}: {arn} must already be ending for its record to expire, \
+             got ended_at {:?} and deadline {:?}",
+            composition.ended_at, composition.empty_stage_stop_at
+        );
+        let shift = RETENTION + STOP_SPAN + SLACK;
+        composition.ended_at = composition.ended_at.map(|ended| ended - shift);
+        composition.empty_stage_stop_at = composition
+            .empty_stage_stop_at
+            .map(|deadline| deadline - shift);
+    }
 }
 
 /// The wire error code of a failed call (`__type` in a restJson1 error body).
@@ -488,11 +530,13 @@ async fn a_stage_left_without_participants_owes_its_compositions_a_stop_one_time
 
         let deadline = emulator.deadline(case, &composition);
         assert!(
-            deadline.is_some_and(|due| due >= before + TIMEOUT && due <= after + TIMEOUT),
-            "case {case:?}: the stop must be owed one {TIMEOUT:?} after the stage was left \
-             empty (between {:?} and {:?}), got {deadline:?}",
-            before + TIMEOUT,
-            after + TIMEOUT
+            deadline.is_some_and(|due| due >= before + STOP_DUE_AFTER
+                && due <= after + STOP_DUE_AFTER),
+            "case {case:?}: the stop must be owed one {STOP_DUE_AFTER:?} after the stage was \
+             left empty (between {:?} and {:?}), so that the whole end is over one {TIMEOUT:?} \
+             after it, got {deadline:?}",
+            before + STOP_DUE_AFTER,
+            after + STOP_DUE_AFTER
         );
 
         // Nothing is owed YET: the composition is still composing, with no end time, and
@@ -678,9 +722,9 @@ async fn a_composition_of_an_empty_stage_stops_and_is_deleted_when_the_timeout_r
             (status, &response),
         );
 
-        // One span after that the ephemeral resource is gone, so the read is the modelled
-        // 404 and the listing no longer carries it.
-        tokio::time::sleep(STOP_SPAN + SLACK).await;
+        // Once the retention span is over the ephemeral resource is gone, so the read is the
+        // modelled 404 and the listing no longer carries it.
+        emulator.run_out_the_retention(case, &composition);
         let (status, response) = emulator.read(&composition).await;
         assert_eq!(
             status, 404,
@@ -737,7 +781,8 @@ async fn a_join_after_the_timeout_ran_out_does_not_revive_the_composition() {
     );
 
     // And it goes the rest of the way: the ephemeral resource is deleted all the same.
-    tokio::time::sleep(STOP_SPAN * 2 + SLACK).await;
+    tokio::time::sleep(STOP_SPAN + SLACK).await;
+    emulator.run_out_the_retention(case, &composition);
     let (status, response) = emulator.read(&composition).await;
     assert_eq!(
         status, 404,

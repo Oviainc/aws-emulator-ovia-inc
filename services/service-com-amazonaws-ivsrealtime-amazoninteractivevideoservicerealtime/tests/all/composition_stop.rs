@@ -14,7 +14,8 @@
 //!    `STOPPING` with an end time, leaving `startTime` where it was.
 //! 2. THE REST IS OWED BY THE CLOCK, at a span that is not zero: the composition is
 //!    `STOPPED` once `crate::state::COMPOSITION_STOP_SPAN` has passed, and the ephemeral
-//!    resource is gone one span after that — the model's `StartComposition` doc says a
+//!    resource is gone one `crate::state::COMPOSITION_RETENTION_SPAN` after that — the
+//!    model's `StartComposition` doc says a
 //!    "Composition stops and the resource is deleted … When StopComposition is called",
 //!    so the read that follows is the modelled 404 and not an empty composition.
 //! 3. A STOP CHANGES NOTHING ELSE: another composition of the same stage keeps composing,
@@ -43,9 +44,13 @@ const ACCOUNT: &str = "000000000000";
 /// The region every test in this suite signs for.
 const REGION: &str = "us-east-1";
 
-/// The span the service gives each step of a stop, read from the crate so this suite
-/// cannot drift from the span the service actually enforces.
+/// The span the service gives the `STOPPING` -> `STOPPED` step of a stop, read from the
+/// crate so this suite cannot drift from the span the service actually enforces.
 const STOP_SPAN: Duration = state::COMPOSITION_STOP_SPAN;
+
+/// How long the service goes on reporting a stopped composition before the ephemeral
+/// resource is deleted, read from the crate for the same reason.
+const RETENTION: Duration = state::COMPOSITION_RETENTION_SPAN;
 
 /// Added to every sleep, so a span this suite waits out has certainly elapsed whatever
 /// scheduling delay the test host adds.
@@ -64,15 +69,15 @@ const STATE_STOPPING: &str = "STOPPING";
 const STATE_STOPPED: &str = "STOPPED";
 
 /// The states a stopped composition passes through, in order: `STOPPING` until one
-/// [`STOP_SPAN`] has elapsed, `STOPPED` until a second one has, and then no state at all
-/// — the resource is deleted, so the read is a 404.
+/// [`STOP_SPAN`] has elapsed, `STOPPED` for the whole [`RETENTION`] after that, and then no
+/// state at all — the resource is deleted, so the read is a 404.
 const STOP_PHASES: [Option<&str>; 3] = [Some(STATE_STOPPING), Some(STATE_STOPPED), None];
 
 /// Which of [`STOP_PHASES`] a composition stopped `elapsed` ago is in.
 fn stop_phase(elapsed: Duration) -> usize {
     if elapsed < STOP_SPAN {
         0
-    } else if elapsed < STOP_SPAN * 2 {
+    } else if elapsed < STOP_SPAN + RETENTION {
         1
     } else {
         2
@@ -80,17 +85,19 @@ fn stop_phase(elapsed: Duration) -> usize {
 }
 
 /// One IVS RealTime emulator over one shared engine, reached the way the router reaches
-/// it.
+/// it, plus the engine handle the clock-driven expiry of a stopped record is run out
+/// through.
 struct RealTime {
     router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl RealTime {
     fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
     }
 
     /// Call `operation` as an SDK would: `POST /<operation>` with a SigV4 credential
@@ -203,6 +210,24 @@ impl RealTime {
              must carry none, got {response}"
         );
         made
+    }
+
+    /// Move the end the service recorded for `arn` one whole [`RETENTION`] into the past, so
+    /// what the service does when a stopped composition's record expires is observable
+    /// without waiting that span out.
+    ///
+    /// Refuses to invent one: the stop has to have been made already, which is rule 1.
+    fn run_out_the_retention(&self, case: &str, arn: &str) {
+        let handle = state::service_state(&*self.engine).expect("this service's store");
+        let mut store = handle.lock();
+        let composition = store
+            .compositions
+            .get_mut(arn)
+            .unwrap_or_else(|| panic!("case {case:?}: the store must hold {arn}"));
+        let ended_at = composition.ended_at.unwrap_or_else(|| {
+            panic!("case {case:?}: {arn} must already carry the end its stop recorded")
+        });
+        composition.ended_at = Some(ended_at - (RETENTION + STOP_SPAN + SLACK));
     }
 }
 
@@ -378,10 +403,10 @@ async fn a_stop_walks_the_composition_it_names_through_the_states_the_clock_owes
             }
         }
 
-        // One span after that the ephemeral resource is gone: the model says the
+        // Once the retention span is over the ephemeral resource is gone: the model says the
         // composition "stops and the resource is deleted", so the read is the modelled
         // 404 rather than an empty composition.
-        tokio::time::sleep(STOP_SPAN + SLACK).await;
+        service.run_out_the_retention(case, &composition_arn);
         let (status, response) = service.read(&composition_arn).await;
         assert_eq!(
             status, 404,
@@ -510,18 +535,18 @@ async fn a_stop_is_refused_when_the_composition_cannot_be_stopped() {
         "once the stop has finished",
     ] {
         // The call is bracketed the way every clock assertion in this suite is: a call
-        // that straddles the two-span boundary admits either refusal, and one wholly
-        // inside a window admits only that window's.
+        // that straddles the boundary where the stopped record expires admits either
+        // refusal, and one wholly inside a window admits only that window's.
         let before = stopped.elapsed();
         let (status, response) = service
             .call("StopComposition", &json!({ "arn": composition_arn }))
             .await;
         let after = stopped.elapsed();
-        // Inside two spans the composition is still there to be refused as a conflict;
-        // past them the clock has reclaimed the ephemeral resource and the honest answer
-        // is the not-found one.
-        let conflict_admitted = before < STOP_SPAN * 2;
-        let not_found_admitted = after >= STOP_SPAN * 2;
+        // Inside the stop and the retention of the stopped record the composition is still
+        // there to be refused as a conflict; past them the clock has reclaimed the ephemeral
+        // resource and the honest answer is the not-found one.
+        let conflict_admitted = before < STOP_SPAN + RETENTION;
+        let not_found_admitted = after >= STOP_SPAN + RETENTION;
         assert!(
             (status == 409 && conflict_admitted) || (status == 404 && not_found_admitted),
             "case {case:?}: a second stop between {before:?} and {after:?} after the \
