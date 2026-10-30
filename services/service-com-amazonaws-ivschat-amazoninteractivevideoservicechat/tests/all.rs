@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/date_time_members_wire_form.rs"]
 mod date_time_members_wire_form;
+#[path = "all/empty_success_answers.rs"]
+mod empty_success_answers;
 #[path = "all/logging_configuration_lifecycle.rs"]
 mod logging_configuration_lifecycle;
 #[path = "all/room_lifecycle.rs"]

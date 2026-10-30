@@ -2,7 +2,8 @@
 
 //! @op TagResource
 //! IMPLEMENTED: attaches the request's tags to the stored resource the ARN names — a key
-//! the resource already carries is updated, the rest are added — and answers an empty 200.
+//! the resource already carries is updated, the rest are added — and answers
+//! `204 No Content` with no body (see [`crate::state::NO_CONTENT_SUCCESS_STATUS`]).
 //! The tags are read back by `ListTagsForResource`, `GetRoom` and `ListRooms`, because
 //! they are the one tag set held in [`crate::state`]. An ARN naming no stored resource
 //! answers `ResourceNotFoundException` (404); an ARN outside the member's length bound or
@@ -134,7 +135,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // The recorded success status, which the model leaves defaulted; see
+    // [`crate::state::NO_CONTENT_SUCCESS_STATUS`] for why 200 is not this operation's
+    // answer.
+    const SUCCESS_STATUS: u16 = crate::state::NO_CONTENT_SUCCESS_STATUS;
 
     async fn handle(
         &self,
@@ -186,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         room.tags = tags;
 
-        // The modelled output carries no members: an empty 200.
+        // The modelled output carries no members: the empty body the 204 answers with.
         Ok(TagResourceOutput {})
     }
 }

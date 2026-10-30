@@ -27,18 +27,28 @@ use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_ivschat_amazoninteractivevideoservicechat::state::NO_CONTENT_SUCCESS_STATUS;
+
 /// The account every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT: &str = "000000000000";
 /// The region this suite signs for.
 const REGION: &str = "us-west-2";
+/// The status a successful tag mutation answers: it conveys nothing but the status, so it
+/// is `204 No Content` with no body, which `empty_success_answers.rs` pins as the rule.
+/// Read off the service crate, so the status has one home here too.
+const NO_CONTENT_STATUS: u16 = NO_CONTENT_SUCCESS_STATUS;
 
 /// One emulator, one shared engine: exactly what the router hands every handler.
-struct Emulator {
+///
+/// `pub(crate)` because `empty_success_answers.rs` drives the same router through the same
+/// front door: one harness and one encoder for both suites, rather than a second copy that
+/// has to be kept in step.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Pin authentication off so the suite does not depend on the process setting.
@@ -51,9 +61,10 @@ impl Emulator {
         Self { router }
     }
 
-    /// One request over the wire. `uri` is a path (plus query), so the REST-bound tagging
-    /// operations are reachable beside the RPC-style ones.
-    async fn call(&self, method: &str, uri: &str, body: &str) -> (u16, Value) {
+    /// One request over the wire, answered as the status, the RAW body bytes and the length
+    /// the answer states — raw, because whether a body is there at all, and how it is
+    /// framed, is what `empty_success_answers.rs` asserts.
+    pub(crate) async fn call_raw(&self, method: &str, uri: &str, body: &str) -> Answer {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=AKIDTESTIVSCHAT/20260101/{REGION}/ivschat/aws4_request, \
              SignedHeaders=host;x-amz-date, Signature=deadbeef"
@@ -67,22 +78,37 @@ impl Emulator {
             .expect("a valid request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
-        let bytes = response.into_body();
-        let parsed = if bytes.is_empty() {
+        let content_length = response
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        Answer {
+            status,
+            body: response.into_body().to_vec(),
+            content_length,
+        }
+    }
+
+    /// One request over the wire. `uri` is a path (plus query), so the REST-bound tagging
+    /// operations are reachable beside the RPC-style ones.
+    pub(crate) async fn call(&self, method: &str, uri: &str, body: &str) -> (u16, Value) {
+        let answer = self.call_raw(method, uri, body).await;
+        let parsed = if answer.body.is_empty() {
             Value::Null
         } else {
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+            serde_json::from_slice(&answer.body).unwrap_or(Value::Null)
         };
-        (status, parsed)
+        (answer.status, parsed)
     }
 
     /// One of the operations the model binds to `POST /<Operation>`.
-    async fn post(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn post(&self, operation: &str, body: &Value) -> (u16, Value) {
         self.call("POST", &format!("/{operation}"), &body.to_string())
             .await
     }
 
-    async fn create_room(&self, body: &Value) -> Value {
+    pub(crate) async fn create_room(&self, body: &Value) -> Value {
         let (status, created) = self.post("CreateRoom", body).await;
         assert_eq!(
             status, 200,
@@ -122,10 +148,25 @@ impl Emulator {
     }
 }
 
+/// One answer as a suite that cares about FRAMING reads it: the status, the raw body bytes
+/// and the length the answer states.
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Vec<u8>,
+    pub(crate) content_length: Option<String>,
+}
+
+impl Answer {
+    /// The body as text, for an assertion message.
+    pub(crate) fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).to_string()
+    }
+}
+
 /// Percent-encode one URI path segment or query value the way an SDK does: an ARN carries
 /// `:` and `/`, and `/tags/{resourceArn}` is a single (non-greedy) label, so everything
 /// outside RFC 3986's unreserved set is encoded and survives the server's decode.
-fn encode_label(value: &str) -> String {
+pub(crate) fn encode_label(value: &str) -> String {
     value
         .chars()
         .map(|c| match c {
@@ -656,8 +697,9 @@ async fn tags_attach_to_a_room_arn_and_read_back_through_every_reporting_operati
 
         let (status, body) = emulator.tag(&arn, &tags).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: TagResource on an ARN CreateRoom minted must answer 200, got {status} {body}"
+            status, NO_CONTENT_STATUS,
+            "case {case:?}: TagResource on an ARN CreateRoom minted must answer \
+             {NO_CONTENT_STATUS}, got {status} {body}"
         );
 
         let (status, listed) = emulator.list_tags(&arn).await;
@@ -745,8 +787,8 @@ async fn untag_resource_removes_exactly_the_keys_it_names() {
 
         let (status, body) = emulator.untag(&arn, &keys).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: UntagResource must answer 200, got {status} {body}"
+            status, NO_CONTENT_STATUS,
+            "case {case:?}: UntagResource must answer {NO_CONTENT_STATUS}, got {status} {body}"
         );
         let (_, listed) = emulator.list_tags(&arn).await;
         let actual = tags_of(&listed, "tags");
@@ -758,8 +800,9 @@ async fn untag_resource_removes_exactly_the_keys_it_names() {
         // Removing the same keys again removes nothing more: the call is `@idempotent`.
         let (status, body) = emulator.untag(&arn, &keys).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: a repeated UntagResource must answer 200, got {status} {body}"
+            status, NO_CONTENT_STATUS,
+            "case {case:?}: a repeated UntagResource must answer {NO_CONTENT_STATUS}, got \
+             {status} {body}"
         );
         let (_, listed) = emulator.list_tags(&arn).await;
         let actual = tags_of(&listed, "tags");
@@ -787,8 +830,12 @@ async fn a_resource_is_not_left_holding_more_tags_than_the_modelled_set_can_repo
     // Rows differ in how many keys past the ceiling the request would add, and in whether
     // the keys it names are new or already there.
     for (case, tags, expected_status) in [
-        ("one key the resource already carries", json!({ "key00": "updated" }), 200_u16),
-        ("every key it already carries", full.clone(), 200),
+        (
+            "one key the resource already carries",
+            json!({ "key00": "updated" }),
+            NO_CONTENT_STATUS,
+        ),
+        ("every key it already carries", full.clone(), NO_CONTENT_STATUS),
         ("one new key past the ceiling", json!({ "key50": "one too many" }), 400),
         (
             "several new keys past the ceiling",
@@ -827,29 +874,37 @@ async fn the_tagging_operations_accept_an_ivschat_resource_arn_and_refuse_a_malf
     // ACCEPTED: an ARN whose resource-type segment is a real ivschat resource type. The
     // published `@pattern` admits only a ONE-character type, which neither of these is, so
     // a boundary that enforced it verbatim would answer 400 for both. A room ARN resolves,
-    // so it answers 200; a logging-configuration ARN is well-formed but names nothing this
-    // store holds, so it answers the modelled 404 — never a 400.
+    // so each operation answers its own success status — the two tag MUTATIONS the
+    // no-content 204, the report that carries the `tags` map a 200; a
+    // logging-configuration ARN is well-formed but names nothing this store holds, so it
+    // answers the modelled 404 — never a 400.
     let logging_arn = format!("arn:aws:ivschat:{REGION}:{ACCOUNT}:logging-configuration/abc123ABC456");
-    for (case, resource_arn, expected) in [
-        ("a room ARN CreateRoom minted", arn.clone(), 200_u16),
-        ("a logging-configuration ARN", logging_arn, 404),
+    for (case, resource_arn, expected_write, expected_report) in [
+        (
+            "a room ARN CreateRoom minted",
+            arn.clone(),
+            NO_CONTENT_STATUS,
+            200_u16,
+        ),
+        ("a logging-configuration ARN", logging_arn, 404, 404),
     ] {
         let (status, body) = emulator
             .tag(&resource_arn, &json!({ "env": "sim2real" }))
             .await;
         assert_eq!(
-            status, expected,
-            "case {case:?}: expected HTTP {expected} from TagResource, got {status} {body}"
+            status, expected_write,
+            "case {case:?}: expected HTTP {expected_write} from TagResource, got {status} {body}"
         );
         let (status, body) = emulator.list_tags(&resource_arn).await;
         assert_eq!(
-            status, expected,
-            "case {case:?}: expected HTTP {expected} from ListTagsForResource, got {status} {body}"
+            status, expected_report,
+            "case {case:?}: expected HTTP {expected_report} from ListTagsForResource, got \
+             {status} {body}"
         );
         let (status, body) = emulator.untag(&resource_arn, &["env"]).await;
         assert_eq!(
-            status, expected,
-            "case {case:?}: expected HTTP {expected} from UntagResource, got {status} {body}"
+            status, expected_write,
+            "case {case:?}: expected HTTP {expected_write} from UntagResource, got {status} {body}"
         );
     }
 

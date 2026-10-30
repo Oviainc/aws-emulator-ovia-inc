@@ -86,6 +86,22 @@ pub const ROOM_MAX_MESSAGE_LENGTH_RANGE: ModelledRange = ModelledRange::new(1, 5
 /// store: `TagResource` can be called repeatedly with fresh keys.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The HTTP status a successful tag mutation answers with.
+///
+/// `TagResource` and `UntagResource` are the two operations of this service that CHANGE a
+/// resource's tags, and both declare an output structure with no members
+/// (`TagResourceResponse` / `UntagResourceResponse`), so their answer conveys nothing but
+/// its status. Both leave the status itself defaulted in the model (`@http` carries no
+/// `code:`, i.e. `codeDefaulted`), so Smithy's fallback of 200 is not a statement about
+/// this service; the recorded AWS responses are, and they answer `204 No Content` with no
+/// body — the same status the two operations this model DOES pin explicitly carry
+/// (`DeleteRoom` and `DeleteLoggingConfiguration`, `@http code 204`, equally empty-bodied).
+/// A 200 there promises a document the response does not carry, so a client that branches
+/// on the status parses a body that is not there.
+///
+/// `ListTagsForResource` keeps the defaulted 200: it HAS content, the `tags` map.
+pub const NO_CONTENT_SUCCESS_STATUS: u16 = 204;
+
 /// The number of rooms one account may hold in one Region: Amazon IVS Chat publishes a
 /// rooms-per-account-per-Region service quota (50,000), and `ServiceQuotaExceededException`
 /// (HTTP 402) is `CreateRoom`'s modelled refusal past it. This emulator serves one

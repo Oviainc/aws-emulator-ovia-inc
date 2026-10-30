@@ -53,3 +53,22 @@ Model basis (Smithy, query='operation'): TagResource http = {method POST, uri /t
 3. Cause 1 — ivschat.tag_resource(resourceArn=<room arn>, tags={<key>: <value>}) and inspect the HTTP status line. Expected 204 with an empty body; the emulator returns 200. (step task#3)
 4. Confirm the write landed with ivschat.list_tags_for_resource(resourceArn=<room arn>) — the tags are present, so only the status is wrong.
 5. Cause 2 — ivschat.untag_resource(resourceArn=<room arn>, tagKeys=[<key>]) and inspect the HTTP status line. Expected 204 with an empty body; the emulator returns 200. (step task#5)
+
+## Resolution
+
+Both causes were one fault and have one fix: a successful call of this service whose answer
+conveys nothing but its status is answered `204 No Content` with no body. The status itself is
+single-homed on `crate::state::NO_CONTENT_SUCCESS_STATUS` and read by both tag mutations'
+`Operation::SUCCESS_STATUS`; the framing is stated at the one place every response of this
+service is serialized (`Service::override_protocol` in `src/service.rs` serves the model's own
+protocol with a `204` emptied of the `{}` its member-less output structure renders, framed
+`content-length: 0`), so it holds for every operation of this model — the explicitly modelled
+204s of `DeleteRoom` and `DeleteLoggingConfiguration` included — and not only for the two that
+prompted it. `ListTagsForResource` keeps its 200: it reports the `tags` map.
+
+CAVEAT: a client reached over HTTP/1.1 still does not see `content-length: 0`, because the HTTP
+writer the vendored transport serves with removes that header from a 204. That writer is under
+the read-only vendored tree, so the wire-level half of the framing is a platform limitation
+rather than something this service can state its way out of; the serializer seam it does own is
+pinned by `tests/all/empty_success_answers.rs`.
+

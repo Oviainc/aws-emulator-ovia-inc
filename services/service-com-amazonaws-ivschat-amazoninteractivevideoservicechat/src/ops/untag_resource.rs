@@ -2,7 +2,8 @@
 
 //! @op UntagResource
 //! IMPLEMENTED: removes exactly the keys the request names from the stored resource's tag
-//! set, leaving every other key in place, and answers an empty 200. A key the resource
+//! set, leaving every other key in place, and answers `204 No Content` with no body (see
+//! [`crate::state::NO_CONTENT_SUCCESS_STATUS`]). A key the resource
 //! does not carry removes nothing, so a repeated call answers the same thing. An ARN
 //! naming no stored resource answers `ResourceNotFoundException` (404); an ARN outside the
 //! member's length bound or its (corrected) pattern answers `ValidationException` (400).
@@ -133,7 +134,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // The recorded success status, which the model leaves defaulted; see
+    // [`crate::state::NO_CONTENT_SUCCESS_STATUS`] for why 200 is not this operation's
+    // answer.
+    const SUCCESS_STATUS: u16 = crate::state::NO_CONTENT_SUCCESS_STATUS;
 
     async fn handle(
         &self,
@@ -171,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             room.tags.remove(key);
         }
 
-        // The modelled output carries no members: an empty 200.
+        // The modelled output carries no members: the empty body the 204 answers with.
         Ok(UntagResourceOutput {})
     }
 }
