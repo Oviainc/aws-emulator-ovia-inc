@@ -36,12 +36,15 @@ struct EnumCase {
     rejected: String,
 }
 
-/// The admissible set of a managed-policy listing's `Scope` (`iam#policyScopeType`), in
-/// the order this service states it.
+/// The admissible set of a managed-policy listing's `Scope` (`iam#policyScopeType`), and
+/// of the account's global-endpoint token version
+/// (`iam#globalEndpointTokenVersion`), in the order this service states each.
 ///
-/// This is the one enum of this service whose published order is not the order the model
-/// declares the values in; the renderer's order is replaced by it in `src/service.rs`.
+/// These are the enums of this service whose published order is not the order the model
+/// declares the values in (`All, AWS, Local` and `v1Token, v2Token` respectively); the
+/// renderer's order is replaced by them in `src/service.rs`.
 const POLICY_SCOPE: &[&str] = &["All", "Local", "AWS"];
+const GLOBAL_ENDPOINT_TOKEN_VERSION: &[&str] = &["v2Token", "v1Token"];
 
 /// The admissible sets of the other enums under test, each in the model's declaration
 /// order (`smithy_query(query="shape",
@@ -76,8 +79,8 @@ fn expected_message(member: &str, admissible: &[&str]) -> String {
     )
 }
 
-/// The rows: every enum-bearing member of this service's policy, MFA, access-key and
-/// SSH-key surface, refused with a value outside its set.
+/// The rows: every enum-bearing member of this service's policy, MFA, access-key, SSH-key
+/// and account-setting surface, refused with a value outside its set.
 fn enum_cases() -> Vec<EnumCase> {
     let policy_arn = format!("arn:aws:iam::{}:policy/a-policy-not-held", account_id());
     vec![
@@ -175,6 +178,17 @@ fn enum_cases() -> Vec<EnumCase> {
             member: "encoding",
             admissible: KEY_ENCODING,
             rejected: "OpenSSH".to_string(),
+        },
+        // A two-value set whose PUBLISHED order is not the model's declaration order, on
+        // the one required member of an account-wide setting: the set is stated in the
+        // order AWS states it, which is what a client matching the clause reads.
+        EnumCase {
+            case: "a global endpoint token version outside its set".to_string(),
+            action: "SetSecurityTokenServicePreferences",
+            params: vec![param("GlobalEndpointTokenVersion", "v3Token")],
+            member: "globalEndpointTokenVersion",
+            admissible: GLOBAL_ENDPOINT_TOKEN_VERSION,
+            rejected: "v3Token".to_string(),
         },
     ]
 }
@@ -289,12 +303,16 @@ async fn every_admissible_value_of_each_set_is_accepted() {
 #[tokio::test]
 async fn a_mixed_refusal_states_each_class_its_own_way() {
     let router = router();
-    // `policyPathType` is pattern ^((/[A-Za-z0-9\.,\+@=_-]+)*)/$, so a prefix that does
-    // not end with a slash is the second violation.
+    // `userNameType` is pattern ^[\w+=,.@-]+$, so a name carrying a slash is the second
+    // violation.
     let (status, body) = call(
         &router,
-        "ListPolicies",
-        &[("Scope", "Local-ish"), ("PathPrefix", "/eng")],
+        "UpdateAccessKey",
+        &[
+            ("UserName", "has/slash"),
+            ("AccessKeyId", ACCESS_KEY_ID),
+            ("Status", "Disabled"),
+        ],
     )
     .await;
     assert_eq!(status, 400, "expected HTTP 400, got {status}: {body}");
@@ -305,14 +323,14 @@ async fn a_mixed_refusal_states_each_class_its_own_way() {
     );
     assert!(
         message.contains(&format!(
-            "Value at 'scope' failed to satisfy constraint: Member must satisfy enum value \
+            "Value at 'status' failed to satisfy constraint: Member must satisfy enum value \
              set: [{}]",
-            POLICY_SCOPE.join(", ")
+            ACCESS_KEY_STATUS.join(", ")
         )),
         "expected the enum clause to be stated without the value, got {message:?}"
     );
     assert!(
-        message.contains("Value '/eng' at 'pathPrefix'"),
+        message.contains("Value 'has/slash' at 'userName'"),
         "expected the pattern clause to keep the framework's sentence, got {message:?}"
     );
 }

@@ -13,6 +13,11 @@
 //! rejected value in it. A value outside an enumerated set is stated value-free too, and
 //! is read back by `tests/all/enum_refusal_wording.rs`.
 //!
+//! The members whose WHOLE form AWS states one fixed sentence for are refused by IAM
+//! itself rather than by this layer, so neither their bound nor their pattern is ever
+//! stated as a clause here; that rule, and what a request breaking one of those members
+//! AND a bound is answered with, is `tests/all/member_format_refusal_wording.rs`.
+//!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: which
 //! member carries the bound and which operation takes it, whether the bound is a `@range`
 //! on a number or a `@length` on a string or a list, which end of the bound is broken and
@@ -405,11 +410,13 @@ async fn another_constraint_class_keeps_the_frameworks_own_sentence() {
             value: "has/slash",
         },
         EchoedCase {
-            case: "a path prefix outside its pattern",
+            case: "a pagination marker outside its pattern",
             action: "ListRoles",
-            params: vec![("PathPrefix", "eng")],
-            member: "pathPrefix",
-            value: "eng",
+            // `markerType` is pattern ^[\u0020-\u00FF]+$, so a token carrying a character
+            // above that range is outside it.
+            params: vec![("Marker", "page\u{20AC}")],
+            member: "marker",
+            value: "page\u{20AC}",
         },
     ];
 
@@ -448,12 +455,12 @@ async fn another_constraint_class_keeps_the_frameworks_own_sentence() {
 #[tokio::test]
 async fn a_mixed_refusal_states_each_class_its_own_way() {
     let router = router();
-    // `pathPrefixType` is pattern ^\u002F[\u0021-\u007F]*$, so a prefix that does not
-    // begin with a slash is the second violation.
+    // `roleNameType` is pattern ^[\w+=,.@-]+$, so a name carrying a space is the second
+    // violation beside the session duration's broken `@range`.
     let (status, body) = call(
         &router,
-        "ListRoles",
-        &[("PathPrefix", "eng"), ("MaxItems", "0")],
+        "UpdateRole",
+        &[("RoleName", "has space"), ("MaxSessionDuration", "0")],
     )
     .await;
     assert_eq!(status, 400, "expected HTTP 400, got {status}: {body}");
@@ -464,13 +471,13 @@ async fn a_mixed_refusal_states_each_class_its_own_way() {
     );
     assert!(
         message.contains(
-            "Value at 'maxItems' failed to satisfy constraint: Member must have value \
-             greater than or equal to 1"
+            "Value at 'maxSessionDuration' failed to satisfy constraint: Member must have \
+             value greater than or equal to 3600"
         ),
-        "expected the page-size clause to be stated without the number, got {message:?}"
+        "expected the session clause to be stated without the number, got {message:?}"
     );
     assert!(
-        message.contains("Value 'eng' at 'pathPrefix'"),
+        message.contains("Value 'has space' at 'roleName'"),
         "expected the pattern clause to keep the framework's sentence, got {message:?}"
     );
 }

@@ -57,6 +57,8 @@ mod delegation_request_updates;
 mod entities_for_policy;
 #[path = "all/enum_refusal_wording.rs"]
 mod enum_refusal_wording;
+#[path = "all/error_envelope_request_id.rs"]
+mod error_envelope_request_id;
 #[path = "all/fixed_refusal_wording.rs"]
 mod fixed_refusal_wording;
 #[path = "all/group_attached_policies.rs"]
@@ -123,6 +125,8 @@ mod login_profile_updates;
 mod login_profiles;
 #[path = "all/managed_policies.rs"]
 mod managed_policies;
+#[path = "all/member_format_refusal_wording.rs"]
+mod member_format_refusal_wording;
 #[path = "all/mfa_device_reads.rs"]
 mod mfa_device_reads;
 #[path = "all/open_id_connect_client_id_registration.rs"]

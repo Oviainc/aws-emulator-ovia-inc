@@ -167,6 +167,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The alias's declared LENGTH has already been taken against this request; the
+        // rest of its published form — "lowercase letters, digits, and dashes", with no
+        // leading, trailing or doubled dash — reaches no model-level check (see
+        // [`crate::state::is_account_alias_shape`]), so it is taken here. It is the SAME
+        // validator as the length, so it answers the same single message and answers it in
+        // the same place: before the store is reached at all, so an alias IAM cannot
+        // accept never replaces the one the account holds.
+        if !crate::state::is_account_alias_shape(&input.account_alias) {
+            return Err(crate::state::invalid_account_alias());
+        }
+
         let mut store = state.lock();
 
         // IAM authorizes its own API: the signing principal's identity-based policies

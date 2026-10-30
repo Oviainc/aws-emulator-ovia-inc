@@ -4916,6 +4916,108 @@ pub fn must_specify_user_name<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::validation_error(MUST_SPECIFY_USER_NAME)
 }
 
+/// AWS's sentence for a `pathPrefix` whose form is wrong — the one message it answers for
+/// the whole published form of that member, naming no submitted value.
+pub const INVALID_PATH_PREFIX: &str = "The specified value for pathPrefix is invalid. It must \
+                                       begin with the / character and contain only \
+                                       alphanumeric characters and/or / characters.";
+
+/// AWS's sentence for an `accountAlias` whose form is wrong, which states that member's
+/// whole published form — its length AND its alphabet — in one message, again naming no
+/// submitted value.
+pub const INVALID_ACCOUNT_ALIAS: &str =
+    "The specified value for accountAlias is invalid. It must be a minimum length of 3 \
+     characters and maximum length of 63 characters, contain only digits, lowercase letters, \
+     and hyphens (-), but cannot begin or end with a hyphen.";
+
+/// The input members whose WHOLE format rule IAM states as ONE fixed sentence, each with
+/// that sentence: `(the member path a refusal names, AWS's sentence for it)`.
+///
+/// IAM takes these members itself rather than through the model-level constraint walk, and
+/// the recorded refusals are what show it: a `pathPrefix` outside its declared pattern and
+/// an `accountAlias` under its declared minimum length are both answered with a single
+/// sentence stating the member's whole form, where the model-level walk states one clause
+/// per broken constraint inside `N validation error(s) detected: …` and echoes the
+/// submitted value. Both of those constraints belong to the member's own shape, so what
+/// the two recordings show is one validator for the member rather than one per constraint:
+/// a value refused for a member named here is refused with that sentence whichever of the
+/// member's declared constraints it broke, and the member's constraints are never stated as
+/// a clause.
+///
+/// SOURCE, for adding a member: AWS's own sentence for that member — the recorded refusal,
+/// or the format statement for it in the IAM API Reference — which reads `The specified
+/// value for <member> is invalid. It must <the published form>`. An entry is added only
+/// when such a statement is in hand; a member nobody has one for keeps the model-level
+/// clause, which is what the framework already states.
+///
+/// The member is named by the path a refusal names it by (lowerCamel, as
+/// `aws_smithy_schema_server::constraints::path::member` builds it), so ONE entry answers
+/// for every operation that carries that member — `pathPrefix` on each of this service's
+/// listings, `accountAlias` on the create and the delete alike — whatever shape the member
+/// targets there, because AWS's sentence names the member and not the shape. The recordings
+/// in hand are of `pathPrefix` on the listings targeting `pathPrefixType`, so its sentence
+/// is carried to the listings whose `pathPrefix` targets `policyPathType` and `pathType` on
+/// that reading alone: if a recording of one of those ever shows AWS wording it by the
+/// SHAPE's own form rather than by the member, this entry is what splits.
+pub const MEMBER_FORMAT_REFUSALS: &[(&str, &str)] = &[
+    ("pathPrefix", INVALID_PATH_PREFIX),
+    ("accountAlias", INVALID_ACCOUNT_ALIAS),
+];
+
+/// AWS's sentence for the member `path` names, or `None` for a member whose form IAM states
+/// no sentence of its own for (see [`MEMBER_FORMAT_REFUSALS`]).
+///
+/// The LAST path segment decides, so a member reached inside a nested structure is the same
+/// member as one reached at the top of an operation's input.
+pub fn member_format_refusal(path: &str) -> Option<&'static str> {
+    let member = path.split('.').next_back()?;
+    MEMBER_FORMAT_REFUSALS
+        .iter()
+        .find_map(|(named, sentence)| (*named == member).then_some(*sentence))
+}
+
+/// The shortest account alias, from `accountAliasType`'s published length
+/// (`smithy_query(query="shape", shape="accountAliasType")`: length 3..63) — the first of
+/// the two numbers [`INVALID_ACCOUNT_ALIAS`] states.
+pub const MIN_ACCOUNT_ALIAS_CHARACTERS: usize = 3;
+
+/// The longest account alias, from that same published length — the second of them.
+pub const MAX_ACCOUNT_ALIAS_CHARACTERS: usize = 63;
+
+/// Whether `alias` is in the published form of `accountAliasType`: 3..63 characters of
+/// "lowercase letters, digits, and dashes", where "you cannot start or finish with a dash,
+/// nor can you have two dashes in a row" (`CreateAccountAlias$AccountAlias`, which is the
+/// prose of that shape's pattern `^[a-z0-9]([a-z0-9]|-(?!-)){1,61}[a-z0-9]$`).
+///
+/// Read HERE rather than by the constraint walk because that pattern's "not followed by a
+/// dash" is a lookahead, which the walk's regex engine does not compile — and a pattern it
+/// cannot compile is treated as satisfied (`vendor/smithy-schema-server/src/constraints.rs`
+/// says so in as many words), so the alphabet half of this rule reaches no model-level
+/// check at all and an alias outside it would otherwise be stored.
+pub fn is_account_alias_shape(alias: &str) -> bool {
+    let letter_or_digit =
+        |character: char| character.is_ascii_lowercase() || character.is_ascii_digit();
+    // The length is restated so this predicate reads the WHOLE published form in one
+    // place; the model-level walk already refuses a value outside it (and renders the same
+    // sentence for it), so that branch is not what enforces the bound.
+    (MIN_ACCOUNT_ALIAS_CHARACTERS..=MAX_ACCOUNT_ALIAS_CHARACTERS).contains(&alias.chars().count())
+        && alias.starts_with(letter_or_digit)
+        && alias.ends_with(letter_or_digit)
+        && alias
+            .chars()
+            .all(|character| letter_or_digit(character) || character == '-')
+        && !alias.contains("--")
+}
+
+/// How this service refuses an `accountAlias` whose form is wrong: AWS's one sentence for
+/// that member ([`INVALID_ACCOUNT_ALIAS`]), under the code IAM answers a value it cannot
+/// accept with — the same code and sentence the refusal seam answers when the same member
+/// breaks a constraint the model-level walk DOES take, so one logical failure has one
+/// answer however it was reached.
+pub fn invalid_account_alias<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::validation_error(INVALID_ACCOUNT_ALIAS)
+}
+
 /// Encode a state map key as the opaque pagination `Marker` a client echoes back.
 ///
 /// The codec is `aws_smithy_types::base64` — already in this crate's dependency

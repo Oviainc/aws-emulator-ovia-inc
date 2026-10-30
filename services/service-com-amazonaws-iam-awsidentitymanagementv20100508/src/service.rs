@@ -40,6 +40,19 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
+//! ## The awsQuery error document
+//!
+//! IAM speaks `awsQuery`, whose error document is
+//! `<ErrorResponse><Error>…</Error><RequestId>…</RequestId></ErrorResponse>`: the
+//! `<RequestId>` is a SIBLING of `<Error>`, so no error shape's members can carry it and
+//! the framework's error serializers — which write the error shape's own members, inside
+//! `<Error>` — do not. It is a property of the RESPONSE, the counterpart of the
+//! `ResponseMetadata/RequestId` the success renderer already writes, so it is added where
+//! every response of this service passes: the shared
+//! [`::service_common::query_error_envelope`], through its operation wrapper for a
+//! modelled error (and a refusal raised while an operation was being served) and its
+//! definition wrapper for the failures rendered outside the dispatch path.
+//!
 //! ## Credentials the account has deactivated
 //!
 //! An access key this account holds authenticates a request only while its stored
@@ -59,8 +72,12 @@
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::{envelope, ProtocolError, Violation, ViolationKind};
+use service_common::query_error_envelope::{
+    RequestIdEnvelopeDefinition, RequestIdEnvelopeOperation,
+};
 use smithy_server_runtime::{
-    http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, ErasedServiceDefinition, OperationContext, Refusal, Refused,
+    Service,
 };
 use std::sync::Arc;
 
@@ -153,6 +170,9 @@ const PUBLISHED_ENUM_ORDERS: &[&[&str]] = &[
     // The scope of a managed-policy listing (`iam#policyScopeType`, declared by the model
     // as `All, AWS, Local`).
     &["All", "Local", "AWS"],
+    // The token version the account's global STS endpoint issues
+    // (`iam#globalEndpointTokenVersion`, declared by the model as `v1Token, v2Token`).
+    &["v2Token", "v1Token"],
 ];
 
 /// The order this service states the admissible set `allowed` in, or `None` when the
@@ -238,6 +258,58 @@ fn without_refused_value_echo(violations: &[Violation]) -> Option<Refused> {
     })
 }
 
+/// A refusal stated as IAM states it, or `None` when the framework's own wording stands.
+///
+/// IAM takes a request's values in TWO layers, and the recorded refusals show both: the
+/// members [`crate::state::MEMBER_FORMAT_REFUSALS`] names are taken by IAM itself, which
+/// answers one fixed sentence for the member's whole form and no envelope at all, while
+/// every other member is taken by the model-level walk, whose envelope states one clause
+/// per constraint the request broke. So a refusal is stated by whichever layer the request
+/// reached:
+///
+/// - a request whose only broken members are the ones IAM takes itself is answered with
+///   that member's sentence, and with nothing else — no envelope, no clause and no value;
+/// - a request that ALSO broke a member the model-level walk takes is answered by that
+///   walk, over its own members' clauses alone, because the self-taken members' constraints
+///   are never stated as a clause in any refusal;
+/// - a request that broke none of them keeps [`without_refused_value_echo`]'s wording,
+///   which is the framework's with the value and the enum order restated.
+fn stated_refusal(violations: &[Violation]) -> Option<Refused> {
+    // An absent required member renders under a DIFFERENT code than a failed value, so a
+    // refusal carrying one is left to the framework whole — exactly as
+    // [`without_refused_value_echo`] leaves it, and for the same reason.
+    if violations
+        .iter()
+        .any(|violation| matches!(violation.kind, ViolationKind::MissingRequiredMember))
+    {
+        return None;
+    }
+    let (self_taken, modeled): (Vec<Violation>, Vec<Violation>) = violations
+        .iter()
+        .cloned()
+        .partition(|violation| crate::state::member_format_refusal(&violation.path).is_some());
+    if self_taken.is_empty() {
+        return without_refused_value_echo(violations);
+    }
+    if modeled.is_empty() {
+        // One sentence, so a request that broke two self-taken members is answered with
+        // the first of them in the order the walk reported them.
+        let stated = self_taken
+            .iter()
+            .find_map(|violation| crate::state::member_format_refusal(&violation.path))?;
+        return Some(Refused {
+            code: VALUE_REFUSAL_CODE.to_string(),
+            message: stated.to_string(),
+        });
+    }
+    without_refused_value_echo(&modeled).or_else(|| {
+        Some(Refused {
+            code: VALUE_REFUSAL_CODE.to_string(),
+            message: envelope(&modeled)?,
+        })
+    })
+}
+
 /// The error code AWS answers a signed request whose credential it will not accept
 /// with: a key id that was never issued, one that has been deleted, and one whose
 /// `Status` the account has moved off `Active`. It is an AUTHENTICATION failure — no
@@ -305,7 +377,12 @@ fn presented_access_key_id(req: &RtRequest) -> Option<String> {
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, behind the `awsQuery` error-envelope wrapper: every error this
+    /// service answers carries the `<RequestId>` that envelope has beside its `<Error>`
+    /// (see `service_common::query_error_envelope`), whichever layer rendered it — a
+    /// routing failure, a transport failure and the pre-dispatch refusal below included.
+    /// Identity, the protocol and the routing table are the generated entry's untouched.
+    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
     /// The SAME shared engine the generated entry threaded into every operation, kept
     /// here too because the pre-dispatch credential check below has to read the access
     /// keys this service's own operations wrote. Never a store of its own: it is the
@@ -313,6 +390,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     engine: Arc<Eng>,
     /// Answers a request presenting a credential this account will not accept.
     unusable_credential: UnusableCredential,
+    /// The envelope wrapper every modelled operation of this service is served through, so
+    /// a modelled error and a refusal the centralized walk raised while an operation was
+    /// being served name the request they answer too. Held in a field, not built per
+    /// request: `override_operation` hands back a reference borrowed from `&self`.
+    envelope: RequestIdEnvelopeOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -321,9 +403,12 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            entry: RequestIdEnvelopeDefinition::new(crate::ServiceDefinition::new(Arc::clone(
+                &engine,
+            ))),
             engine,
             unusable_credential: UnusableCredential,
+            envelope: RequestIdEnvelopeOperation,
         }
     }
 
@@ -354,6 +439,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
         // The router reads it through this one accessor. Do not edit the entry.
+        //
+        // It is reached through the `awsQuery` envelope wrapper, which leaves identity,
+        // the protocol and the routing table exactly as the entry carries them and adds
+        // the `<RequestId>` element to the framework-level error envelopes it renders — a
+        // routing failure, a transport failure and a pre-dispatch refusal — so each
+        // carries what a modelled error served through [`RequestIdEnvelopeOperation`]
+        // carries.
         &self.entry
     }
 
@@ -397,21 +489,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The request's auth schemes are unaffected: the router reads them off the
         // MODELLED operation the routing key names, so this changes nothing about which
         // requests must be signed.
-        self.presents_an_unusable_credential(req)
-            .then_some(&self.unusable_credential as &dyn ErasedOperation)
+        if self.presents_an_unusable_credential(req) {
+            return Some(&self.unusable_credential);
+        }
+        // Every other request this model serves goes through the `awsQuery` envelope
+        // wrapper, which resolves the operation from the SAME generated routing table the
+        // router would have, delegates the whole deserialize → validate → handle →
+        // serialize walk to it, and adds the `<RequestId>` the envelope carries beside
+        // `<Error>`. A request the routing table does not answer is declined here, so it
+        // stays the router's own routing failure (itself stated through the wrapped
+        // definition, which names the request too).
+        self.entry
+            .routes(req)
+            .then_some(&self.envelope as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound or an enumerated
-        // set) to let this service reword it. Returning `None` keeps the
-        // framework's default wording; the classes this service words differently
-        // are a value outside a bound its member declares and a value outside an
-        // enumerated set, both of which it states without echoing the value (see
-        // [`without_refused_value_echo`], which answers with the code the framework
-        // would have chosen).
+        // required member, or a value outside a declared bound, a pattern or an
+        // enumerated set) to let this service state it. Returning `None` keeps the
+        // framework's default wording; which refusals this service states differently,
+        // and how, is [`stated_refusal`] — the member whose whole form AWS answers one
+        // fixed sentence for, and the value-free clause a declared bound and an
+        // enumerated set are stated with.
         match refusal {
-            Refusal::Invalid(violations) => without_refused_value_echo(violations),
+            Refusal::Invalid(violations) => stated_refusal(violations),
             _ => None,
         }
     }
