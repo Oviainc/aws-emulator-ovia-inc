@@ -130,6 +130,15 @@ impl From<GetQuantumTaskErrorModeled> for GetQuantumTaskError {
 /// The `additionalAttributeNames` value that asks for `queueInfo`.
 const ATTRIBUTE_QUEUE_INFO: &str = "QueueInfo";
 
+/// The input member this operation refuses a value for when it is not a quantum-task
+/// ARN, named in the refusal as the model spells it
+/// (`smithy_query(query="operation",operation="GetQuantumTask")`).
+///
+/// The sentence is `crate::state::member_is_invalid` — THIS operation's wording for the
+/// class, and deliberately not the one `CancelQuantumTask` answers for the identical
+/// input: Amazon Braket words this refusal per operation.
+const INVALID_ARN_MEMBER: &str = "quantumTaskArn";
+
 /// The `position` a task that has left the queue reports: the one sentinel this
 /// service reports for a resource that is no longer waiting in its queue, shared with
 /// the hybrid-job queue info in `crate::state`.
@@ -225,17 +234,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         // Input validation comes before any state access: a label that is not an ARN
-        // names no resource at all, so it is never looked up.
+        // names no resource at all, so it is never looked up. The sentence is THIS
+        // operation's (see [`INVALID_ARN_MEMBER`]).
         if !crate::state::is_braket_arn(
             &input.quantum_task_arn,
             crate::state::ARN_RESOURCE_QUANTUM_TASK,
         ) {
             return Err(GetQuantumTaskErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::invalid_arn_message(
-                    "quantumTaskArn",
-                    crate::state::ARN_RESOURCE_QUANTUM_TASK,
-                    &input.quantum_task_arn,
-                )),
+                message: Some(crate::state::member_is_invalid(INVALID_ARN_MEMBER)),
                 reason: None,
                 program_set_validation_failures: None,
             })

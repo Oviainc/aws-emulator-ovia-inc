@@ -1519,15 +1519,65 @@ pub fn is_braket_arn(value: &str, resource_type: &str) -> bool {
         && resource_id.is_some_and(|id| !id.is_empty())
 }
 
-/// Why a member outside [`is_braket_arn`] is refused: the member's name, the syntax
-/// it must satisfy and the value that missed it.
+// ---------------------------------------------------------------------------
+// The sentences this service's client errors are worded with.
+//
+// Amazon Braket words a client error PER OPERATION, and the recordings show it: the
+// identical malformed-ARN input is answered "quantumTaskArn is invalid." by one
+// operation and "quantumTaskArn is not valid." by another, and a refusal that names a
+// resource the caller cannot resolve carries the recovery pointer that operation gives.
+// So what lives here is the VOCABULARY — one function per form the service words, with
+// the member, the value and the region taken from the request — and each operation names
+// the form IT words, in its own module. Nothing derives one sentence for the whole
+// service: a single-homed sentence cannot satisfy two operations that word the same
+// class differently.
+// ---------------------------------------------------------------------------
+
+/// `"<member> is not valid."`
 ///
-/// Built from the request, so the wording follows the rule rather than any one
-/// recorded message.
-pub fn invalid_arn_message(member: &str, resource_type: &str, value: &str) -> String {
+/// `CancelQuantumTask`, `DeleteSpendingLimit` and `UpdateSpendingLimit` word an
+/// ARN-shaped member whose value is not an ARN of the resource it names this way, and it
+/// is the form an operation takes when the service's own sentence for it is not recorded:
+/// the member, the fixed clause, no grammar description and no echo of the value.
+pub fn member_is_not_valid(member: &str) -> String {
+    format!("{member} is not valid.")
+}
+
+/// `"<member> is invalid."` — the same class, as `GetQuantumTask` words it.
+pub fn member_is_invalid(member: &str) -> String {
+    format!("{member} is invalid.")
+}
+
+/// `"<member> parameter is not valid."` — the same class, as `GetJob` words it.
+pub fn member_parameter_is_not_valid(member: &str) -> String {
+    format!("{member} parameter is not valid.")
+}
+
+/// `"<member> <value> is not a valid ARN."` — the same class, as `CancelJob` words it:
+/// the one form that states the rejected value, taken from the request.
+pub fn member_value_is_not_a_valid_arn(member: &str, value: &str) -> String {
+    format!("{member} {value} is not a valid ARN.")
+}
+
+/// How an operation that resolves a device ARN against the published inventory and models
+/// no not-found error refuses an ARN naming no published device.
+///
+/// Fixed text interpolating nothing — not even the ARN that failed to resolve — and it
+/// points at the operation that enumerates the inventory, which is the only recovery a
+/// caller has for a device ARN the service does not publish.
+pub const DEVICE_ARN_NOT_FOUND: &str =
+    "Device ARN not found. Please use SearchDevices operation to get a list of supported \
+     devices.";
+
+/// How `GetDevice`, which does model a not-found error, reports an ARN the inventory does
+/// not publish: the ARN the request named and the region the request was signed for, which
+/// is how a caller learns a device it cannot see here may be published in another region,
+/// then the developer guide's device list.
+pub fn device_not_found_in_region(device_arn: &str, region: &str) -> String {
     format!(
-        "{member} is invalid: expected an Amazon Braket {resource_type} ARN of the form \
-         arn:aws:{ARN_SERVICE}:<region>:<account>:{resource_type}/<id>, got {value:?}"
+        "Braket device '{device_arn}' not found in {region}. You can find a list of all \
+         supported device ARNs and the regions in which they are available in the \
+         documentation: {DOCUMENTATION_BASE}/braket-devices.html"
     )
 }
 

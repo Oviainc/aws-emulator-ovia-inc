@@ -107,6 +107,19 @@ impl From<GetDeviceErrorModeled> for GetDeviceError {
     }
 }
 
+/// The input member this operation refuses a value for when it is not a device ARN,
+/// named in the refusal as the model spells it
+/// (`smithy_query(query="operation",operation="GetDevice")`).
+///
+/// A value that is not an ARN at all is invalid INPUT, which this operation models
+/// (`ValidationException`, 400) separately from the device ARN that is well formed and
+/// names nothing (`ResourceNotFoundException`, 404, worded by
+/// `crate::state::device_not_found_in_region`). The service's own sentence for a
+/// malformed label on THIS operation is not recorded, so it takes the form the class
+/// takes elsewhere in this service — `crate::state::member_is_not_valid`, the member and
+/// the fixed clause, with no grammar description and no echo of the value.
+const INVALID_ARN_MEMBER: &str = "deviceArn";
+
 /// The queues of one device, with the depth of each counted from the stored tasks.
 ///
 /// Both quantum-task queues are reported, as AWS reports a device's queues whether or
@@ -177,16 +190,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // Input validation comes before any state access: a label that is not an ARN
         // names no device at all, so it is never looked up.
         if !crate::state::is_braket_arn(&input.device_arn, crate::state::ARN_RESOURCE_DEVICE) {
             return Err(GetDeviceErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::invalid_arn_message(
-                    "deviceArn",
-                    crate::state::ARN_RESOURCE_DEVICE,
-                    &input.device_arn,
-                )),
+                message: Some(crate::state::member_is_not_valid(INVALID_ARN_MEMBER)),
                 reason: None,
                 program_set_validation_failures: None,
             })
@@ -207,9 +215,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.apply_due_transitions(::std::time::SystemTime::now());
 
         let Some(device) = guard.devices.get(&input.device_arn).cloned() else {
+            // Device availability is REGION-SCOPED: the inventory this request reaches is
+            // the one published in the region the request was signed for, so the refusal
+            // states that region beside the ARN it could not resolve.
             return Err(GetDeviceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Device {} not found", input.device_arn)),
+                    message: Some(crate::state::device_not_found_in_region(
+                        &input.device_arn,
+                        &crate::state::request_region(ctx),
+                    )),
                 },
             )
             .into());

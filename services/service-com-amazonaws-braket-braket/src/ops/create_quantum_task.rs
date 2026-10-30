@@ -161,6 +161,18 @@ fn request_digest(input: &CreateQuantumTaskInput) -> String {
     ])
 }
 
+/// The input member this operation refuses a value for when it is not a device ARN,
+/// named in the refusal as the model spells it
+/// (`smithy_query(query="operation",operation="CreateQuantumTask")`).
+///
+/// This operation models no not-found error, so BOTH refusals its `deviceArn` can earn
+/// are the modelled `ValidationException`, and they say different things: a value that is
+/// not an ARN at all is invalid input naming the member
+/// (`crate::state::member_is_not_valid`), while a well-formed ARN the inventory does not
+/// publish is the device the service cannot resolve
+/// (`crate::state::DEVICE_ARN_NOT_FOUND`, which names no member and echoes nothing).
+const INVALID_ARN_MEMBER: &str = "deviceArn";
+
 /// The `CreateQuantumTask` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -200,10 +212,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Input validation comes before any state access: a value that is not an ARN
         // names no device at all, so it is never looked up.
         if !crate::state::is_braket_arn(&input.device_arn, crate::state::ARN_RESOURCE_DEVICE) {
-            return Err(refuse(crate::state::invalid_arn_message(
-                "deviceArn",
-                crate::state::ARN_RESOURCE_DEVICE,
-                &input.device_arn,
+            return Err(refuse(crate::state::member_is_not_valid(
+                INVALID_ARN_MEMBER,
             )));
         }
 
@@ -241,11 +251,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(device) = guard.devices.get(&input.device_arn).cloned() else {
             // `CreateQuantumTask` models no `ResourceNotFoundException`, so an unknown
-            // device is refused as an invalid `deviceArn`.
-            return Err(refuse(format!(
-                "Device {} not found",
-                input.device_arn
-            )));
+            // device is refused as an invalid `deviceArn` — in the service's own fixed
+            // sentence, which points the caller at the operation that enumerates the
+            // inventory instead of echoing the ARN that did not resolve.
+            return Err(refuse(crate::state::DEVICE_ARN_NOT_FOUND.to_string()));
         };
         if device.device_status == crate::state::DEVICE_RETIRED {
             return Err(CreateQuantumTaskErrorModeled::DeviceRetiredException(

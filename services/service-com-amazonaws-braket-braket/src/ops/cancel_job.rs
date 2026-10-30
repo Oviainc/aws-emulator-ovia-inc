@@ -114,6 +114,24 @@ impl From<CancelJobErrorModeled> for CancelJobError {
     }
 }
 
+/// How `CancelJob` words a `jobArn` whose value is not a hybrid-job ARN: the member, the
+/// value the request sent and the fixed clause.
+///
+/// `JobArn` carries a `@pattern`
+/// (`smithy_query(query="shape",shape="JobArn")`), so this refusal is raised by the
+/// boundary before [`CancelJob::handle`] runs; the sentence lives HERE because it is this
+/// operation's own, and `crate::service` is where the class of refusal that reaches it is
+/// recognised. `GetJob` takes the same member and words it differently — Amazon Braket
+/// words this refusal per operation — which is why neither sentence is derived from the
+/// other.
+///
+/// This sentence STATES the rejected value, so it is answered only when the request's
+/// value can be stated; without it the framework's own wording, which states the
+/// constraint the value broke, is the better answer.
+pub(crate) fn invalid_arn_refusal(member: &str, value: Option<&str>) -> Option<String> {
+    Some(crate::state::member_value_is_not_a_valid_arn(member, value?))
+}
+
 /// The `CancelJob` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements

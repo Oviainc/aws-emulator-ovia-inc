@@ -49,6 +49,16 @@ impl Reply {
             .unwrap_or_else(|| panic!("response has no string member {name}: {}", self.body))
             .to_string()
     }
+
+    /// The error body's `message` member, or the empty string when it carries none — so
+    /// a refusal with no message fails the assertion that reads it rather than panicking
+    /// inside the harness.
+    pub(crate) fn message(&self) -> &str {
+        self.body
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    }
 }
 
 /// A Braket emulator behind the production router.
@@ -70,6 +80,19 @@ impl Braket {
     }
 
     pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
+        self.call_in_region(REGION, method, path, body).await
+    }
+
+    /// As [`Braket::call`], with the request signed for `region` instead of this
+    /// harness's own: a response that states the region the request was signed for can
+    /// then be asserted over more than one region.
+    pub(crate) async fn call_in_region(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Reply {
         let payload = body.map_or_else(Bytes::new, |value| Bytes::from(value.to_string()));
         let request = http::Request::builder()
             .method(method)
@@ -78,7 +101,7 @@ impl Braket {
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/braket/aws4_request, \
+                    "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{region}/braket/aws4_request, \
                      SignedHeaders=host, Signature=00"
                 ),
             )

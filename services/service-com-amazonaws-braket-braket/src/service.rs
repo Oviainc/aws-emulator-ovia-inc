@@ -61,20 +61,31 @@
 //! each modelled operation is served wrapped in it, and the wrapper reads the HTTP
 //! BINDING of the violated member off THAT operation's own input schema.
 //!
-//! ## And its one reworded refusal: an invalid ARN parameter
+//! ## And the refusal its operations word for themselves: an invalid ARN parameter
 //!
-//! What DOES key on the violation alone is the prose Braket gives one class of
-//! refusal: a parameter naming a resource by ARN whose value is not a valid ARN is
-//! refused as the modelled `ValidationException` worded `"<parameter> parameter is not
-//! valid."` — the parameter the caller got wrong, rather than the regular expression
-//! the framework walked. That is what the `GetJob` recording asserts (see
-//! [`invalid_arn_parameter`] for the citation), and the suite in
-//! `tests/all/request_body_rejection.rs` pins it over every ARN parameter the model
-//! gives a `@pattern` outside the body (`jobArn`, `spendingLimitArn`).
+//! One class of refusal Braket words itself: a parameter naming a resource by ARN whose
+//! value is not a valid ARN is refused as the modelled `ValidationException`, in a
+//! sentence the SERVING OPERATION chooses — `GetJob` says `"jobArn parameter is not
+//! valid."` where `CancelJob`, handed the same member, states the rejected value and says
+//! `"jobArn <value> is not a valid ARN."`, and the two spending-limit doors word it a
+//! third way. Amazon Braket words a client error per operation, so no one sentence can
+//! serve them all.
+//!
+//! That makes [`Service::override_refusal`] the wrong seam for it: the centralized walk
+//! hands it the violations ALONE, with no operation, so two doors refusing the same
+//! member name are indistinguishable there. The sentence therefore travels with the
+//! operation — each one's wording lives in its own module (`crate::ops::<op>`), and the
+//! door it is served behind carries it ([`FrontDoor::wording_uri`]). What stays here is
+//! the RULE for recognising the class at all ([`invalid_arn_parameter`]) and the table of
+//! which door words which sentence; the suite in
+//! `tests/all/client_error_wording.rs` pins both over every ARN parameter the model gives
+//! a `@pattern` outside the body (`jobArn`, `spendingLimitArn`).
 
 use service_common::front_door::FrontDoor;
+use service_common::validation::SubmittedEcho;
 use smithy_server_runtime::{
-    http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service, ViolationKind,
+    http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service, Violation,
+    ViolationKind,
 };
 use std::sync::Arc;
 
@@ -87,28 +98,26 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// `spendingLimitArn`, `deviceArn`, `resourceArn`).
 const ARN_MEMBER_SUFFIX: &str = "Arn";
 
-/// Braket's wording for an ARN-shaped parameter whose value is not a valid ARN: the
-/// parameter's own name, then a fixed clause — `"<parameter> parameter is not valid."`.
-///
-/// RECORDED: the behavioural recording behind
-/// `issues/things-that-now-work/20261022T134201Z-braket-getjob-stub.md`
-/// (`braket.braket-malformed-job-arn-returns-validation-not-not-found`) asserts exactly
-/// this message for `GetJob` with a `jobArn` that is not a hybrid-job ARN —
-/// `Message == "jobArn parameter is not valid."` — where the framework's own wording
-/// quotes the regular expression it walked instead. The parameter NAME is the only part
-/// that varies, and it comes from the request, so this generalises to the class rather
-/// than fitting the recorded value.
+/// Whether `refused` is the class of refusal an operation words itself — an ARN-shaped
+/// PARAMETER whose value is not a valid ARN — worded by `wording`, the serving
+/// operation's own sentence for it.
 ///
 /// Narrow on purpose: ONE violation, of `@pattern`, on a TOP-LEVEL member named as an
 /// ARN. A member that fails some other constraint (a label longer than its `@length`
 /// bound, an absent member) failed something else and keeps the framework's wording,
 /// which states the constraint it broke; a body member's violation never reaches this
 /// seam, because [`FrontDoor`] answers that as a body rejection first.
-fn invalid_arn_parameter(refusal: &Refusal) -> Option<Refused> {
-    let Refusal::Invalid(violations) = refusal else {
-        return None;
-    };
-    let [violation] = violations.as_slice() else {
+///
+/// The parameter NAME comes from the request, and so does the rejected VALUE where the
+/// operation's sentence states one — passed as `None` when the walk could not state it
+/// (a value past the bounds `service_common::validation` publishes), which only a wording
+/// that quotes it has to decline for. So a sentence built here follows the class rather
+/// than fitting one recorded call.
+fn invalid_arn_parameter(
+    refused: &[(Violation, SubmittedEcho)],
+    wording: fn(&str, Option<&str>) -> Option<String>,
+) -> Option<Refused> {
+    let [(violation, echo)] = refused else {
         return None;
     };
     if !matches!(violation.kind, ViolationKind::Pattern(_)) {
@@ -118,11 +127,39 @@ fn invalid_arn_parameter(refusal: &Refusal) -> Option<Refused> {
     if parameter.contains('.') || !parameter.ends_with(ARN_MEMBER_SUFFIX) {
         return None;
     }
+    let value = match echo {
+        SubmittedEcho::Rendered(value) => Some(value.as_str()),
+        SubmittedEcho::Absent | SubmittedEcho::Unrendered => None,
+    };
     Some(Refused {
         code: VALIDATION_EXCEPTION.to_string(),
-        message: format!("{parameter} parameter is not valid."),
+        message: wording(parameter, value)?,
     })
 }
+
+/// The wording each door carries for [`invalid_arn_parameter`]: one function per
+/// operation that takes an ARN-shaped parameter the model gives a `@pattern`, naming the
+/// sentence that operation words the refusal in.
+///
+/// The sentences themselves are in the operations' own modules, so adding one is a change
+/// to that operation's file; this is only the wiring, because a `FrontDoor`'s wording is a
+/// function it holds.
+macro_rules! arn_parameter_wordings {
+    ($($door:ident => $module:ident),+ $(,)?) => {
+        $(
+            fn $door(refused: &[(Violation, SubmittedEcho)]) -> Option<Refused> {
+                invalid_arn_parameter(refused, crate::ops::$module::invalid_arn_refusal)
+            }
+        )+
+    };
+}
+
+arn_parameter_wordings!(
+    cancel_job_wording => cancel_job,
+    get_job_wording => get_job,
+    delete_spending_limit_wording => delete_spending_limit,
+    update_spending_limit_wording => update_spending_limit,
+);
 
 /// The `com-amazonaws-braket-braket` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -142,14 +179,22 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
 /// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
 /// [`FrontDoor`] and keyed by its operation shape name — the routing key
 /// `ServerProtocol::routing_key` resolves and the generated table is keyed by.
+///
+/// A line carrying `=> <wording>` serves that operation behind a door that words a
+/// refused ARN PARAMETER in that operation's own sentence
+/// ([`arn_parameter_wordings`]); every other line leaves such a refusal to the
+/// framework's wording, which states the constraint the value broke.
 macro_rules! wrap_operations {
-    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident $(=> $wording:path)?),+ $(,)?) => {
         $(
             $table.add_operation(
                 stringify!($operation),
-                ::std::boxed::Box::new(FrontDoor::new(
-                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
-                )) as ::std::boxed::Box<dyn ErasedOperation>,
+                ::std::boxed::Box::new(
+                    FrontDoor::new(
+                        crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                    )
+                    $(.wording_uri($wording))?
+                ) as ::std::boxed::Box<dyn ErasedOperation>,
             );
         )+
     };
@@ -168,14 +213,14 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         wrap_operations!(
             front_door,
             engine,
-            cancel_job::CancelJob,
+            cancel_job::CancelJob => cancel_job_wording,
             cancel_quantum_task::CancelQuantumTask,
             create_job::CreateJob,
             create_quantum_task::CreateQuantumTask,
             create_spending_limit::CreateSpendingLimit,
-            delete_spending_limit::DeleteSpendingLimit,
+            delete_spending_limit::DeleteSpendingLimit => delete_spending_limit_wording,
             get_device::GetDevice,
-            get_job::GetJob,
+            get_job::GetJob => get_job_wording,
             get_quantum_task::GetQuantumTask,
             list_tags_for_resource::ListTagsForResource,
             search_devices::SearchDevices,
@@ -184,7 +229,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             search_spending_limits::SearchSpendingLimits,
             tag_resource::TagResource,
             untag_resource::UntagResource,
-            update_spending_limit::UpdateSpendingLimit,
+            update_spending_limit::UpdateSpendingLimit => update_spending_limit_wording,
         );
         Self {
             entry: crate::ServiceDefinition::new(engine),
@@ -236,15 +281,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // malformed ARN, `DELETE /tags/{resourceArn}` with no `tagKeys`) and for a
         // body the codec cannot read at all. The recordings confirm it: a malformed
         // `spendingLimitArn` or `jobArn` URI LABEL is answered `ValidationException`.
-        // The one refusal this service words differently is a BODY that breaks a
-        // modelled constraint, which `FrontDoor` answers before this walk is reached.
         //
-        // The code stays the modelled one in every case; what [`invalid_arn_parameter`]
-        // changes is the PROSE for the one class Braket words itself: an ARN-shaped
-        // parameter whose value is not a valid ARN is refused by naming that parameter
-        // (`"jobArn parameter is not valid."`) rather than by quoting the regular
-        // expression the framework walked.
-        invalid_arn_parameter(refusal)
+        // Nothing is reworded HERE, because nothing this service words differently can be
+        // placed from the violations alone: a BODY that breaks a modelled constraint is
+        // answered by `FrontDoor` before this walk is reached, and the sentence for an
+        // ARN-shaped PARAMETER outside its pattern belongs to the operation that was
+        // addressed (see the module docs), which this seam is not told. What reaches here
+        // is every refusal neither of those words — a label past its `@length` bound, an
+        // absent member — and the framework's own wording, which states the constraint
+        // the value broke, is the right answer for it.
+        let _ = refusal;
+        None
     }
 
     fn override_routing_error(

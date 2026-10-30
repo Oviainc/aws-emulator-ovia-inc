@@ -30,10 +30,6 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-// The one percent-encoder in this test target: an `@httpLabel` ARN carries `:` and
-// `/`, so an unencoded one would be read as several path segments.
-use crate::quantum_task_loop::encode;
-
 /// The sentence the body-rejection layer answers with. A fixed constant of that layer:
 /// it names neither the member nor the value.
 const INVALID_BODY: &str = "Invalid request body";
@@ -447,74 +443,36 @@ async fn a_body_the_model_accepts_is_never_rejected_as_a_bad_request() {
     }
 }
 
-/// An ARN-shaped PARAMETER whose value is not a valid ARN is refused by naming THAT
-/// PARAMETER: `"<parameter> parameter is not valid."`, as the modelled
-/// `ValidationException`.
-///
-/// The class is every member bound outside the body whose target carries an ARN
-/// `@pattern` — `jobArn` on `GetJob` and `CancelJob`, `spendingLimitArn` on
-/// `DeleteSpendingLimit` and `UpdateSpendingLimit`
-/// (`smithy_query(query="operation",operation="GetJob,CancelJob,DeleteSpendingLimit,UpdateSpendingLimit")`).
-/// Rows differ in the operation, the method, the parameter and the way the value misses
-/// the pattern.
+/// An ARN-shaped PARAMETER whose value is not a valid ARN is refused as the modelled
+/// `ValidationException`, in the sentence the SERVING OPERATION words it in — which is
+/// pinned, over every such parameter and every form a value can miss its `@pattern` by,
+/// in `client_error_wording.rs`: the message belongs to the operation, so it is asserted
+/// beside this service's other per-operation wording rather than here, where the subject
+/// is which LAYER answers.
 #[tokio::test]
-async fn an_invalid_arn_parameter_is_refused_by_naming_the_parameter() {
+async fn an_invalid_arn_parameter_is_not_answered_as_a_body_rejection() {
     let braket = Braket::new();
 
-    // (case, parameter, method, path, body)
-    let rows: Vec<(&str, &str, &str, String, Option<Value>)> = vec![
+    // (case, method, path, body) — every door of the class, one row each.
+    let rows: Vec<(&str, &str, &str, Option<Value>)> = vec![
+        ("GetJob", "GET", "/job/not-an-arn", None),
+        ("CancelJob", "PUT", "/job/not-an-arn/cancel", None),
         (
-            "GetJob, a value that is not an ARN at all",
-            "jobArn",
-            "GET",
-            "/job/not-an-arn".to_string(),
-            None,
-        ),
-        (
-            "GetJob, an ARN naming another resource type",
-            "jobArn",
-            "GET",
-            format!(
-                "/job/{}",
-                encode("arn:aws:braket:us-west-2:000000000000:not-a-job-resource")
-            ),
-            None,
-        ),
-        (
-            "GetJob, an ARN of another service",
-            "jobArn",
-            "GET",
-            format!(
-                "/job/{}",
-                encode("arn:aws:sagemaker:us-west-2:000000000000:job/j1")
-            ),
-            None,
-        ),
-        (
-            "CancelJob, the same parameter on another operation",
-            "jobArn",
-            "PUT",
-            "/job/not-an-arn/cancel".to_string(),
-            None,
-        ),
-        (
-            "DeleteSpendingLimit, another ARN parameter",
-            "spendingLimitArn",
+            "DeleteSpendingLimit",
             "DELETE",
-            "/spending-limit/not-an-arn/delete".to_string(),
+            "/spending-limit/not-an-arn/delete",
             None,
         ),
         (
-            "UpdateSpendingLimit, another ARN parameter with a body the model accepts",
-            "spendingLimitArn",
+            "UpdateSpendingLimit",
             "PATCH",
-            "/spending-limit/not-an-arn/update".to_string(),
+            "/spending-limit/not-an-arn/update",
             Some(json!({ "clientToken": "tok-update" })),
         ),
     ];
 
-    for (case, parameter, method, path, body) in rows {
-        let reply = braket.call(method, &path, body).await;
+    for (case, method, path, body) in rows {
+        let reply = braket.call(method, path, body).await;
         assert_eq!(
             reply.status, 400,
             "case {case:?}: expected 400, got {} {}",
@@ -527,30 +485,12 @@ async fn an_invalid_arn_parameter_is_refused_by_naming_the_parameter() {
             reply.error,
             reply.body
         );
-        assert_eq!(
-            reply.message.as_deref(),
-            Some(format!("{parameter} parameter is not valid.").as_str()),
-            "case {case:?}: expected the refusal to name the parameter, got {:?}",
-            reply.message
+        let message = reply.message.unwrap_or_default();
+        assert!(
+            !message.is_empty() && message != INVALID_BODY,
+            "case {case:?}: expected the operation's own refusal rather than the front \
+             door's body sentence, got {message:?}"
         );
     }
-
-    // The control: a parameter that breaks some OTHER constraint failed something else,
-    // and keeps the framework's wording, which states the constraint it broke.
-    let long = "a".repeat(300);
-    let reply = braket.call("GET", &format!("/device/{long}"), None).await;
-    assert_eq!(
-        reply.error.as_deref(),
-        Some("ValidationException"),
-        "case a label past its @length bound: expected ValidationException, got {:?} in {}",
-        reply.error,
-        reply.body
-    );
-    let message = reply.message.unwrap_or_default();
-    assert!(
-        message.contains("failed to satisfy constraint") && message.contains("deviceArn"),
-        "case a label past its @length bound: expected the constraint wording naming the \
-         member, got {message:?}"
-    );
 }
 

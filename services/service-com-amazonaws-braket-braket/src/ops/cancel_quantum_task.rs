@@ -100,6 +100,16 @@ impl From<CancelQuantumTaskErrorModeled> for CancelQuantumTaskError {
     }
 }
 
+/// The input member this operation refuses a value for when it is not a quantum-task
+/// ARN, named in the refusal as the model spells it
+/// (`smithy_query(query="operation",operation="CancelQuantumTask")`).
+///
+/// The sentence is `crate::state::member_is_not_valid` — THIS operation's wording for
+/// the class. `GetQuantumTask` refuses the identical input in a different sentence,
+/// because Amazon Braket words this refusal per operation; neither is derived from the
+/// other.
+const INVALID_ARN_MEMBER: &str = "quantumTaskArn";
+
 /// The `CancelQuantumTask` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -141,18 +151,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // repeated call needs no stored token to be idempotent.
         let _ = (ctx, &input.client_token);
         // Input validation comes before any state access: a label that is not an ARN
-        // names no resource at all, so it is never looked up.
+        // names no resource at all, so it is never looked up. The sentence is THIS
+        // operation's (see [`INVALID_ARN_MEMBER`]).
         if !crate::state::is_braket_arn(
             &input.quantum_task_arn,
             crate::state::ARN_RESOURCE_QUANTUM_TASK,
         ) {
             return Err(CancelQuantumTaskErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(crate::state::invalid_arn_message(
-                        "quantumTaskArn",
-                        crate::state::ARN_RESOURCE_QUANTUM_TASK,
-                        &input.quantum_task_arn,
-                    )),
+                    message: Some(crate::state::member_is_not_valid(INVALID_ARN_MEMBER)),
                     reason: None,
                     program_set_validation_failures: None,
                 },

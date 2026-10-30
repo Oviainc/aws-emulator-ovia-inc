@@ -108,6 +108,22 @@ impl From<DeleteSpendingLimitErrorModeled> for DeleteSpendingLimitError {
     }
 }
 
+/// How `DeleteSpendingLimit` words a `spendingLimitArn` whose value is not a
+/// spending-limit ARN: the member and the fixed clause, with no echo of the value and
+/// none of the framework's constraint prose.
+///
+/// `SpendingLimitArn` carries a `@pattern`
+/// (`smithy_query(query="shape",shape="SpendingLimitArn")`), so this refusal is raised by
+/// the boundary before [`DeleteSpendingLimit::handle`] runs; the sentence lives HERE
+/// because it is this operation's own, and `crate::service` is where the class of refusal
+/// that reaches it is recognised.
+///
+/// The sentence states no value, so it is answered whether or not the request's value can
+/// be stated.
+pub(crate) fn invalid_arn_refusal(member: &str, _value: Option<&str>) -> Option<String> {
+    Some(crate::state::member_is_not_valid(member))
+}
+
 /// The `DeleteSpendingLimit` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements

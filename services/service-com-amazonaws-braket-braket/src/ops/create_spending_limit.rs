@@ -122,6 +122,16 @@ fn refuse(message: String) -> CreateSpendingLimitError {
     .into()
 }
 
+/// The input member this operation refuses a value for when it is not a device ARN,
+/// named in the refusal as the model spells it
+/// (`smithy_query(query="operation",operation="CreateSpendingLimit")`).
+///
+/// As on the other creates, this operation models no not-found error, so a value that is
+/// not an ARN at all is invalid input naming the member
+/// (`crate::state::member_is_not_valid`) and a well-formed ARN the inventory does not
+/// publish is the device the service cannot resolve (`crate::state::DEVICE_ARN_NOT_FOUND`).
+const INVALID_ARN_MEMBER: &str = "deviceArn";
+
 /// The digest that decides whether a repeated `clientToken` is a replay of the same
 /// request (same ARN comes back) or a reuse of the token for a different one (refused).
 /// Every member that lands in the stored record takes part.
@@ -188,10 +198,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Input validation comes before any state access: a value that is not an ARN
         // names no device at all, so it is never looked up.
         if !crate::state::is_braket_arn(&input.device_arn, crate::state::ARN_RESOURCE_DEVICE) {
-            return Err(refuse(crate::state::invalid_arn_message(
-                "deviceArn",
-                crate::state::ARN_RESOURCE_DEVICE,
-                &input.device_arn,
+            return Err(refuse(crate::state::member_is_not_valid(
+                INVALID_ARN_MEMBER,
             )));
         }
         // A period whose end does not follow its start covers no time at all, so there
@@ -240,8 +248,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(device) = guard.devices.get(&input.device_arn).cloned() else {
             // `CreateSpendingLimit` models no `ResourceNotFoundException`, so an unknown
-            // device is refused as an invalid `deviceArn`.
-            return Err(refuse(format!("Device {} not found", input.device_arn)));
+            // device is refused as invalid input — in the service's own fixed sentence for
+            // a device ARN it cannot resolve, which points the caller at the operation
+            // that enumerates the inventory.
+            return Err(refuse(crate::state::DEVICE_ARN_NOT_FOUND.to_string()));
         };
         if device.device_status == crate::state::DEVICE_RETIRED {
             return Err(CreateSpendingLimitErrorModeled::DeviceRetiredException(

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_syntax.rs"]
 mod arn_syntax;
+#[path = "all/client_error_wording.rs"]
+mod client_error_wording;
 #[path = "all/device_capabilities.rs"]
 mod device_capabilities;
 #[path = "all/hybrid_job_loop.rs"]

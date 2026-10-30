@@ -46,6 +46,18 @@
 //! a service chooses here: [`FrontDoor::worded`] takes a [`BodyWording`] built from the
 //! sentences in [`crate::validation_message`], so the sentences themselves still cannot
 //! drift per crate.
+//!
+//! # The other half: a value bound to the URI
+//!
+//! A constraint broken by a value the request carries OUTSIDE its body is not a body
+//! rejection, so a front door leaves it to the layers behind the door by default — the
+//! framework's walk, worded through `Service::override_refusal`. A service that words
+//! such a refusal PER OPERATION cannot word it there either, and for the same reason the
+//! body half cannot: a service-level seam is handed the violations alone, so two
+//! operations refusing the same member name are indistinguishable to it — and AWS does
+//! word them differently, one operation to the next. [`FrontDoor::wording_uri`] is where
+//! that choice lives: the wording is attached to ONE wrapped operation, so the sentence
+//! belongs to the operation that raised the refusal.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::Schema;
@@ -81,6 +93,24 @@ pub const INVALID_REQUEST_BODY: &str = "Invalid request body";
 /// or `None` to leave the request to the layers behind the door.
 pub type BodyWording = fn(&[(Violation, SubmittedEcho)]) -> Option<Refused>;
 
+/// How ONE operation words a refusal of a value its request carries outside the body (an
+/// `@httpLabel` path segment, an `@httpQuery` parameter).
+///
+/// Handed every violation of such a value, each with the value the caller submitted
+/// ([`SubmittedEcho`]) — a sentence that states the rejected value needs it, because the
+/// framework's own echo elides a long one — and answers the code and the message
+/// together, or `None` to leave the request to the layers behind the door, which refuse
+/// it in the service's own modelled wording.
+///
+/// The same signature as [`BodyWording`] and a distinct name, because the two are chosen
+/// for different halves of one request: a service attaches a [`BodyWording`] to its whole
+/// front door and a [`UriWording`] to the single operation whose sentence it is.
+pub type UriWording = fn(&[(Violation, SubmittedEcho)]) -> Option<Refused>;
+
+/// The violations of one request a wording is handed: each one with the value the caller
+/// submitted, as both [`BodyWording`] and [`UriWording`] take them.
+pub type RefusedWithEchoes = Vec<(Violation, SubmittedEcho)>;
+
 /// One modelled operation, served behind its service's front door.
 ///
 /// Wrap every modelled operation of a service that has one, so the rule is applied by
@@ -106,6 +136,9 @@ pub struct FrontDoor<O> {
     /// How this service's front door words a refused body, or `None` for the fixed
     /// sentence [`INVALID_REQUEST_BODY`].
     wording: Option<BodyWording>,
+    /// How THIS operation words a refused value bound to the request URI, or `None` to
+    /// leave such a refusal to the layers behind the door.
+    uri_wording: Option<UriWording>,
 }
 
 impl<O> FrontDoor<O> {
@@ -115,6 +148,7 @@ impl<O> FrontDoor<O> {
         Self {
             operation,
             wording: None,
+            uri_wording: None,
         }
     }
 
@@ -124,7 +158,20 @@ impl<O> FrontDoor<O> {
         Self {
             operation,
             wording: Some(wording),
+            uri_wording: None,
         }
+    }
+
+    /// Word a refusal of a value THIS operation carries outside its body with `wording`
+    /// ([`UriWording`]), rather than leaving it to the layers behind the door.
+    ///
+    /// A body this door refuses still wins: the body is what the door is in front of, and
+    /// a request that breaks a rule in both halves is refused as the body rejection it
+    /// already was.
+    #[must_use]
+    pub fn wording_uri(mut self, wording: UriWording) -> Self {
+        self.uri_wording = Some(wording);
+        self
     }
 }
 
@@ -158,25 +205,40 @@ where
 }
 
 impl<O: Operation> FrontDoor<O> {
-    /// This door's answer to `req`, or `None` when its body breaks nothing the door
-    /// refuses — in which case the operation behind it is served.
+    /// This door's answer to `req`, or `None` when it breaks nothing the door refuses —
+    /// in which case the operation behind it is served.
+    ///
+    /// The body comes first, because that is what a front door stands in front of; a
+    /// value bound to the URI is answered only by the wording the wrapped operation
+    /// carries for it, and otherwise left to the layers behind the door.
     ///
     /// The protocol is read, used and dropped inside this one function, so nothing
     /// borrowed from the service definition is held across the caller's await.
     fn refusal(&self, svc: &dyn Service, req: &RtRequest) -> Option<RtResponse> {
         let protocol = svc.definition().protocol();
-        match self.wording {
-            None => {
-                let refused = body_violations::<O>(protocol, req);
-                (!refused.is_empty()).then(|| rejection(svc, refused))
-            }
-            Some(wording) => {
-                let refused = body_violations_with_echoes::<O>(protocol, req);
-                let chosen = wording(&refused)?;
-                let violations = refused.into_iter().map(|(violation, _)| violation).collect();
-                Some(worded_rejection(svc, violations, chosen))
-            }
+        // A door that quotes no value at all reads the cheaper walk: the fixed sentence
+        // names neither the member nor the value, so no echo has to be restored.
+        if self.wording.is_none() && self.uri_wording.is_none() {
+            let refused = body_violations::<O>(protocol, req);
+            return (!refused.is_empty()).then(|| rejection(svc, refused));
         }
+        let (body, uri) = violations_by_binding::<O>(protocol, req);
+        if !body.is_empty() {
+            let violations: Vec<Violation> = match self.wording {
+                // A service that words its own body rejection is asked first, and leaves
+                // the request to the layers behind the door when it has no wording for it.
+                Some(wording) => {
+                    let chosen = wording(&body)?;
+                    let violations = body.into_iter().map(|(violation, _)| violation).collect();
+                    return Some(worded_rejection(svc, violations, chosen));
+                }
+                None => body.into_iter().map(|(violation, _)| violation).collect(),
+            };
+            return Some(rejection(svc, violations));
+        }
+        let chosen = self.uri_wording?(&uri)?;
+        let violations = uri.into_iter().map(|(violation, _)| violation).collect();
+        Some(worded_rejection(svc, violations, chosen))
     }
 }
 
@@ -211,21 +273,22 @@ pub fn body_violations<O: Operation>(
         .collect()
 }
 
-/// As [`body_violations`], with each violation paired with how a clause can state the
-/// value it is about ([`SubmittedEcho`]).
+/// Every modelled constraint `req` breaks, each violation paired with how a clause can
+/// state the value it is about ([`SubmittedEcho`]), split into the ones its BODY broke
+/// and the ones a value it carries OUTSIDE the body broke.
 ///
-/// For a front door that QUOTES the submitted value: the framework's own echo elides a
-/// long one, so a clause built from it would state text the caller never sent. The
-/// violation set is the same one [`body_violations`] finds — the same collecting walk,
-/// narrowed by the same binding rule.
-pub fn body_violations_with_echoes<O: Operation>(
+/// The split is [`binds_to_body`]'s, read off `O`'s own input schema, and the violations
+/// are the shared collecting walk's, so a front door cannot find a different set from the
+/// framework's own. The echo is restored to the bytes the caller sent, which a clause that
+/// QUOTES the value needs: the framework's own echo elides a long one, so a clause built
+/// from it would state text the caller never sent.
+pub fn violations_by_binding<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
-) -> Vec<(Violation, SubmittedEcho)> {
+) -> (RefusedWithEchoes, RefusedWithEchoes) {
     crate::validation::refusing_violations_with_echoes::<O>(protocol, req)
         .into_iter()
-        .filter(|(violation, _)| binds_to_body(O::INPUT_SCHEMA, &violation.path))
-        .collect()
+        .partition(|(violation, _)| binds_to_body(O::INPUT_SCHEMA, &violation.path))
 }
 
 /// Whether `violation_path` names a member `input_schema` carries in the request BODY.

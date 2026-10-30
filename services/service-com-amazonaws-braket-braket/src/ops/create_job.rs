@@ -166,6 +166,16 @@ fn refuse(message: String) -> CreateJobError {
     .into()
 }
 
+/// The input member this operation refuses a value for when it is not a device ARN,
+/// named in the refusal by the path the model gives it
+/// (`smithy_query(query="operation",operation="CreateJob")`: `deviceConfig`'s `device`).
+///
+/// As on the other creates, this operation models no not-found error, so a value that is
+/// not an ARN at all is invalid input naming the member
+/// (`crate::state::member_is_not_valid`) and a well-formed ARN the inventory does not
+/// publish is the device the service cannot resolve (`crate::state::DEVICE_ARN_NOT_FOUND`).
+const INVALID_ARN_MEMBER: &str = "deviceConfig.device";
+
 /// The digest that decides whether a repeated `clientToken` is a replay of the same
 /// request (the same ARN comes back) or a reuse of the token for a different one
 /// (refused). Every member that lands in the stored record takes part.
@@ -255,10 +265,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.device_config.device,
             crate::state::ARN_RESOURCE_DEVICE,
         ) {
-            return Err(refuse(crate::state::invalid_arn_message(
-                "deviceConfig.device",
-                crate::state::ARN_RESOURCE_DEVICE,
-                &input.device_config.device,
+            return Err(refuse(crate::state::member_is_not_valid(
+                INVALID_ARN_MEMBER,
             )));
         }
 
@@ -294,11 +302,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(device) = guard.devices.get(&input.device_config.device).cloned() else {
             // `CreateJob` models no `ResourceNotFoundException`, so a device the
-            // inventory does not publish is refused as an invalid `deviceConfig`.
-            return Err(refuse(format!(
-                "Device {} not found",
-                input.device_config.device
-            )));
+            // inventory does not publish is refused as invalid input — in the service's
+            // own fixed sentence for a device ARN it cannot resolve, which points the
+            // caller at the operation that enumerates the inventory.
+            return Err(refuse(crate::state::DEVICE_ARN_NOT_FOUND.to_string()));
         };
         if device.device_status == crate::state::DEVICE_RETIRED {
             return Err(CreateJobErrorModeled::DeviceRetiredException(
