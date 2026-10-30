@@ -3344,6 +3344,19 @@ impl UserPoolReplica {
 /// service's model), so the cap is the API's rather than this emulator's.
 pub const MAX_CLIENT_SECRETS_PER_CLIENT: usize = 2;
 
+/// The message a `ResourceNotFoundException` carries when the `ClientSecretId` a
+/// request names is not one the named app client currently holds a secret for.
+///
+/// Amazon Cognito answers the same sentence for every secret id — it reports
+/// that the secret lookup resolved nothing and quotes neither the id, the app
+/// client nor the pool, exactly as [`USER_NOT_FOUND_MESSAGE`] and
+/// [`TERMS_NOT_FOUND_MESSAGE`] report their own unresolved lookups, and unlike
+/// those two it carries no trailing period. So an id no add ever minted, an id
+/// another app client holds and an id an earlier delete already took away are
+/// all reported identically, and the refusal never echoes the caller's secret
+/// identifier back to it.
+pub const CLIENT_SECRET_NOT_FOUND_MESSAGE: &str = "Client secret does not exist";
+
 /// One active client secret of an app client: the credential a confidential app
 /// client authenticates itself with, beside the id and creation time a listing
 /// reports it by.

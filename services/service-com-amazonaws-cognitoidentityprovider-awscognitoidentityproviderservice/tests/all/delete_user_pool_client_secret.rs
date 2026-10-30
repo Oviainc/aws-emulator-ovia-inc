@@ -81,6 +81,11 @@ const UNKNOWN_CLIENT_ID: &str = "nosuchappclient0000";
 /// A `ClientSecretIdType`-shaped id (length 1..128) no add minted.
 const UNKNOWN_SECRET_ID: &str = "nosuchappclient0000--1700000000000";
 
+/// The one sentence a `ClientSecretId` lookup that resolves nothing answers: fixed
+/// text, quoting neither the id asked for nor the app client, and with no trailing
+/// period.
+const SECRET_NOT_FOUND_MESSAGE: &str = "Client secret does not exist";
+
 /// One emulator with just this service mounted.
 fn router() -> MultiServiceRouter {
     let engine = Arc::new(engine::InMemoryEngine::new());
@@ -526,11 +531,16 @@ async fn a_deleted_client_secret_is_dropped_and_every_other_one_stays_active() {
             "ResourceNotFoundException",
         )
         .await;
-        let expected = format!("Client secret {deleted_id} does not exist.");
         assert_eq!(
             error_message(&repeated),
-            expected,
-            "case {case:?}: expected {expected:?}, got {:?}",
+            SECRET_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected {SECRET_NOT_FOUND_MESSAGE:?}, got {:?}",
+            error_message(&repeated)
+        );
+        assert!(
+            !error_message(&repeated).contains(deleted_id.as_str()),
+            "case {case:?}: the refusal must not quote the id the request asked for, \
+             got {:?}",
             error_message(&repeated)
         );
 
@@ -757,19 +767,19 @@ async fn a_delete_for_a_resource_no_app_client_holds_is_refused() {
                 named.user_pool_id.clone(),
                 named.client_id.clone(),
                 UNKNOWN_SECRET_ID.to_string(),
-                format!("Client secret {UNKNOWN_SECRET_ID} does not exist."),
+                SECRET_NOT_FOUND_MESSAGE.to_string(),
             ),
             Absent::ClientSecretOfAnotherClient => (
                 named.user_pool_id.clone(),
                 named.client_id.clone(),
                 elsewhere_ids[0].clone(),
-                format!("Client secret {} does not exist.", elsewhere_ids[0]),
+                SECRET_NOT_FOUND_MESSAGE.to_string(),
             ),
             Absent::ClientSecretOfAPublicClient => (
                 public.user_pool_id.clone(),
                 public.client_id.clone(),
                 UNKNOWN_SECRET_ID.to_string(),
-                format!("Client secret {UNKNOWN_SECRET_ID} does not exist."),
+                SECRET_NOT_FOUND_MESSAGE.to_string(),
             ),
         };
 

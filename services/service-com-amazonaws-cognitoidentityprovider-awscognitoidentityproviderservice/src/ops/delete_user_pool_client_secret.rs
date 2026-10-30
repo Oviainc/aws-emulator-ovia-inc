@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .client_secrets
             .iter()
             .position(|held| held.id == input.client_secret_id)
-            .ok_or_else(|| client_secret_not_found(&input.client_secret_id))?;
+            .ok_or_else(client_secret_not_found)?;
 
         // "You cannot delete the last remaining secret for an app client" (this
         // operation's own doc), so a confidential app client never loses the
@@ -205,10 +205,12 @@ fn client_not_found(client_id: &str) -> DeleteUserPoolClientSecretError {
 }
 
 /// This operation's `ResourceNotFoundException` for a `ClientSecretId` the named
-/// app client holds no secret for.
-fn client_secret_not_found(client_secret_id: &str) -> DeleteUserPoolClientSecretError {
+/// app client holds no secret for, worded as
+/// [`crate::state::CLIENT_SECRET_NOT_FOUND_MESSAGE`] — the one sentence the
+/// secret lookup answers whatever id was asked for, quoting none of it.
+fn client_secret_not_found() -> DeleteUserPoolClientSecretError {
     DeleteUserPoolClientSecretErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("Client secret {client_secret_id} does not exist.")),
+        message: Some(crate::state::CLIENT_SECRET_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }
