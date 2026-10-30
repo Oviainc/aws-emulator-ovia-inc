@@ -24,11 +24,10 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::error_with_message;
+use crate::harness::{error_with_message, PULL_REQUEST_DOES_NOT_EXIST};
 use crate::pull_request_title_update::{
-    already_closed_message, apart_from, assert_refused, does_not_exist_message, events, member,
-    opened, stored, Opened, Refusal, Text, ACCEPTED_TEXT, CLIENT_ERROR_STATUS, ID_REFUSALS,
-    STATUS_CLOSED,
+    already_closed_message, apart_from, assert_refused, events, member, opened, stored, Opened,
+    Refusal, Text, ACCEPTED_TEXT, CLIENT_ERROR_STATUS, ID_REFUSALS, STATUS_CLOSED,
 };
 use crate::repository_lifecycle::ok;
 
@@ -304,7 +303,7 @@ async fn a_refused_description_update_names_the_member_at_fault_and_persists_not
 }
 
 #[tokio::test]
-async fn an_id_naming_no_pull_request_is_refused_with_that_id() {
+async fn an_id_naming_no_pull_request_is_refused_with_the_fixed_message() {
     let opened = opened("description-unknown-id").await;
     // An id no pull request was ever minted as, built from the stored one so it is
     // addressable yet names nothing.
@@ -324,9 +323,8 @@ async fn an_id_naming_no_pull_request_is_refused_with_that_id() {
              {message:?}"
         );
         assert_eq!(
-            message,
-            does_not_exist_message(&unknown),
-            "case {case:?}: expected the documented message naming the requested id, got \
+            message, PULL_REQUEST_DOES_NOT_EXIST,
+            "case {case:?}: expected the message CodeCommit words that code with, got \
              {message:?}"
         );
     }

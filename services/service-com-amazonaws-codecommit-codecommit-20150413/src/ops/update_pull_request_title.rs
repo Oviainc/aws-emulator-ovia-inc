@@ -150,28 +150,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request metadata, so `ctx` carries nothing it reads.
         let _ = ctx;
         // Which ids address a pull request is `crate::state`'s rule, so every
-        // operation taking a `pullRequestId` agrees about it; this only maps each
-        // outcome onto the error THIS operation models for it.
+        // operation taking a `pullRequestId` agrees about it; a value the request
+        // CARRIED that addresses none is no valid id whatever it holds, so both
+        // outcomes are this operation's invalid-id error, worded around that value.
         let pull_request_id = crate::state::normalize_pull_request_id(&input.pull_request_id)
-            .map_err(|problem| match problem {
-                crate::state::PullRequestIdProblem::Missing => {
-                    UpdatePullRequestTitleErrorModeled::PullRequestIdRequiredException(
-                        PullRequestIdRequiredException {
-                            message: Some(
-                                crate::state::PULL_REQUEST_ID_REQUIRED_MESSAGE.to_string(),
-                            ),
-                        },
-                    )
-                }
-                crate::state::PullRequestIdProblem::Invalid => {
-                    UpdatePullRequestTitleErrorModeled::InvalidPullRequestIdException(
-                        InvalidPullRequestIdException {
-                            message: Some(
-                                crate::state::INVALID_PULL_REQUEST_ID_MESSAGE.to_string(),
-                            ),
-                        },
-                    )
-                }
+            .map_err(|problem| {
+                UpdatePullRequestTitleErrorModeled::InvalidPullRequestIdException(
+                    InvalidPullRequestIdException {
+                        message: Some(crate::state::invalid_pull_request_id_message(
+                            &input.pull_request_id,
+                            problem,
+                        )),
+                    },
+                )
             })?;
 
         // "A pull request title is required. It cannot be empty or null." `Title`'s
@@ -198,9 +189,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let pull_request = store.pull_request_mut(pull_request_id).ok_or_else(|| {
             UpdatePullRequestTitleErrorModeled::PullRequestDoesNotExistException(
                 PullRequestDoesNotExistException {
-                    message: Some(crate::state::pull_request_does_not_exist_message(
-                        &pull_request_id.to_string(),
-                    )),
+                    message: Some(
+                        crate::state::PULL_REQUEST_DOES_NOT_EXIST_MESSAGE.to_string(),
+                    ),
                 },
             )
         })?;

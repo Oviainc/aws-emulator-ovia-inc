@@ -445,7 +445,7 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         ),
         ("approvalRuleTemplateContent", _) => (
             "InvalidApprovalRuleTemplateContentException",
-            crate::state::INVALID_APPROVAL_RULE_CONTENT_MESSAGE,
+            crate::state::INVALID_APPROVAL_RULE_TEMPLATE_CONTENT_MESSAGE,
         ),
         ("approvalRuleTemplateDescription", _) => (
             "InvalidApprovalRuleTemplateDescriptionException",

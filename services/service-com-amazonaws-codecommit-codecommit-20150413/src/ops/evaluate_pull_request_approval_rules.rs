@@ -170,48 +170,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         // Which ids address a pull request is `crate::state`'s rule, so every
-        // operation taking a `pullRequestId` agrees about it; this only maps each
-        // outcome onto the error THIS operation models for it.
+        // operation taking a `pullRequestId` agrees about it; a value the request
+        // CARRIED that addresses none is no valid id whatever it holds, so both
+        // outcomes are this operation's invalid-id error, worded around that value.
         let pull_request_id = crate::state::normalize_pull_request_id(&input.pull_request_id)
-            .map_err(|problem| match problem {
-                crate::state::PullRequestIdProblem::Missing => {
-                    EvaluatePullRequestApprovalRulesErrorModeled::PullRequestIdRequiredException(
-                        PullRequestIdRequiredException {
-                            message: Some(
-                                crate::state::PULL_REQUEST_ID_REQUIRED_MESSAGE.to_string(),
-                            ),
-                        },
-                    )
-                }
-                crate::state::PullRequestIdProblem::Invalid => {
-                    EvaluatePullRequestApprovalRulesErrorModeled::InvalidPullRequestIdException(
-                        InvalidPullRequestIdException {
-                            message: Some(
-                                crate::state::INVALID_PULL_REQUEST_ID_MESSAGE.to_string(),
-                            ),
-                        },
-                    )
-                }
+            .map_err(|problem| {
+                EvaluatePullRequestApprovalRulesErrorModeled::InvalidPullRequestIdException(
+                    InvalidPullRequestIdException {
+                        message: Some(crate::state::invalid_pull_request_id_message(
+                            &input.pull_request_id,
+                            problem,
+                        )),
+                    },
+                )
             })?;
 
         // Which values can name a revision of a pull request is likewise
         // `crate::state`'s rule.
         let revision_id = crate::state::normalize_revision_id(&input.revision_id).map_err(
-            |problem| match problem {
-                crate::state::RevisionIdProblem::Missing => {
-                    EvaluatePullRequestApprovalRulesErrorModeled::RevisionIdRequiredException(
-                        RevisionIdRequiredException {
-                            message: Some(crate::state::REVISION_ID_REQUIRED_MESSAGE.to_string()),
-                        },
-                    )
-                }
-                crate::state::RevisionIdProblem::Invalid => {
-                    EvaluatePullRequestApprovalRulesErrorModeled::InvalidRevisionIdException(
-                        InvalidRevisionIdException {
-                            message: Some(crate::state::INVALID_REVISION_ID_MESSAGE.to_string()),
-                        },
-                    )
-                }
+            |problem| {
+                EvaluatePullRequestApprovalRulesErrorModeled::InvalidRevisionIdException(
+                    InvalidRevisionIdException {
+                        message: Some(
+                            crate::state::invalid_revision_id_message(problem).to_string(),
+                        ),
+                    },
+                )
             },
         )?;
 
@@ -226,9 +210,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let pull_request = store.pull_request(pull_request_id).ok_or_else(|| {
             EvaluatePullRequestApprovalRulesErrorModeled::PullRequestDoesNotExistException(
                 PullRequestDoesNotExistException {
-                    message: Some(crate::state::pull_request_does_not_exist_message(
-                        &pull_request_id.to_string(),
-                    )),
+                    message: Some(
+                        crate::state::PULL_REQUEST_DOES_NOT_EXIST_MESSAGE.to_string(),
+                    ),
                 },
             )
         })?;

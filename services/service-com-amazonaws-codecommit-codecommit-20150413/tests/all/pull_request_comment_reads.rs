@@ -633,9 +633,9 @@ async fn a_read_the_service_cannot_serve_is_refused_with_the_modeled_error() {
             "PullRequestDoesNotExistException",
         ),
         (
-            "blank pull request id",
+            "empty pull request id",
             read_body(""),
-            "PullRequestIdRequiredException",
+            "InvalidPullRequestIdException",
         ),
         (
             "malformed pull request id",

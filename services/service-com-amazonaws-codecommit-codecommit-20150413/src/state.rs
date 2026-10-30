@@ -633,18 +633,29 @@ pub fn invalid_approval_rule_template_name_message(name: &str) -> String {
     format!("the approval rule template name {name} is not valid")
 }
 
-/// `InvalidApprovalRuleTemplateContentException`'s (and
-/// `InvalidApprovalRuleContentException`'s) message: a FIXED sentence pair carrying
-/// nothing from the request and no diagnostic from whichever JSON reader rejected
-/// the document.
+/// `InvalidApprovalRuleTemplateContentException`'s message: the sentence pair
+/// CodeCommit answers that class with, carrying nothing from the request and no
+/// diagnostic from whichever JSON reader rejected the document.
 ///
 /// A parser's own complaint ("key must be a string at line 1 column 3") is an
 /// implementation detail of the deserializer this emulator links, so it is never
 /// what the caller is told: [`is_approval_rule_template_content`] answers whether
 /// the document is one, and this constant is what the refusal says.
-pub const INVALID_APPROVAL_RULE_CONTENT_MESSAGE: &str =
+///
+/// `InvalidApprovalRuleContentException` — the code for a document submitted as a
+/// pull request's OWN approval rule rather than as a template — is worded for the
+/// rule, in [`INVALID_APPROVAL_RULE_CONTENT_MESSAGE`]: each sentence names the thing
+/// the caller submitted.
+pub const INVALID_APPROVAL_RULE_TEMPLATE_CONTENT_MESSAGE: &str =
     "The JSON in the approval rule template is not valid. Review the JSON and make sure it is \
      valid, and then try again.";
+
+/// `InvalidApprovalRuleContentException`'s message: the same sentence pair as
+/// [`INVALID_APPROVAL_RULE_TEMPLATE_CONTENT_MESSAGE`] worded for an approval rule,
+/// which is what the caller submitted when this code is raised.
+pub const INVALID_APPROVAL_RULE_CONTENT_MESSAGE: &str =
+    "The JSON in the approval rule is not valid. Review the JSON and make sure it is valid, and \
+     then try again.";
 
 /// `InvalidResourceArnException`'s message: a FIXED sentence that echoes no ARN.
 ///
@@ -893,11 +904,12 @@ pub fn invalid_continuation_token_message(token: &str) -> String {
     format!("Error parsing next token: {token}")
 }
 
-/// `CommitIdRequiredException`'s message: the sentence the model documents for the
-/// shape, naming nothing from the request. The one place this crate words that code,
-/// for the request boundary (`crate::service`) and for the handlers that check a
-/// commit id the model leaves unconstrained alike.
-pub const COMMIT_ID_REQUIRED_MESSAGE: &str = "A commit ID was not specified.";
+/// `CommitIdRequiredException`'s message: the sentence CodeCommit answers that class
+/// with — the requirement, then that nothing satisfied it. The one place this crate
+/// words that code, for the request boundary (`crate::service`) and for the handlers
+/// that check a commit id the model leaves unconstrained alike.
+pub const COMMIT_ID_REQUIRED_MESSAGE: &str =
+    "A commit ID is required, but no commit ID was specified.";
 
 /// `InvalidCommitIdException`'s message: likewise the shape's own documented
 /// sentence, worded here once for every operation that raises the code.
@@ -3458,11 +3470,11 @@ pub const OVERRIDE_STATUS_REQUIRED_MESSAGE: &str = "An override status is requir
                                                     was provided. Valid values include OVERRIDE \
                                                     and REVOKE.";
 
-/// `InvalidOverrideStatusException`'s message: the sentence pair the model documents
-/// for the shape — the failure, then the values that are accepted — echoing nothing
+/// `InvalidOverrideStatusException`'s message: the sentence CodeCommit answers that
+/// class with — the failure, then the values that are accepted — echoing nothing
 /// from the request.
 pub const INVALID_OVERRIDE_STATUS_MESSAGE: &str =
-    "The override status is not valid. Valid statuses are OVERRIDE and REVOKE.";
+    "The provided override status value is not valid. Valid values are: [OVERRIDE, REVOKE].";
 
 /// `OverrideAlreadySetException`'s message: a FIXED sentence, the one the model
 /// documents for the shape, echoing nothing from the request.
@@ -3475,11 +3487,12 @@ pub const OVERRIDE_ALREADY_SET_MESSAGE: &str =
 pub const APPROVAL_STATE_REQUIRED_MESSAGE: &str =
     "An approval state is required, but was not specified.";
 
-/// `InvalidApprovalStateException`'s message: the sentence pair the model documents
-/// for the shape — the failure, then the values that are accepted — echoing nothing
+/// `InvalidApprovalStateException`'s message: the sentence CodeCommit answers that
+/// class with — the requirement, then the values that are accepted — echoing nothing
 /// from the request.
 pub const INVALID_APPROVAL_STATE_MESSAGE: &str =
-    "The state for the approval is not valid. Valid values include APPROVE and REVOKE.";
+    "An approval state is required, but the supplied value is not valid. Valid values for \
+     approval states are: [APPROVE, REVOKE].";
 
 /// `PullRequestCannotBeApprovedByAuthorException`'s message: the sentence pair the
 /// model documents for the shape, echoing nothing from the request.
@@ -3487,14 +3500,20 @@ pub const PULL_REQUEST_CANNOT_BE_APPROVED_BY_AUTHOR_MESSAGE: &str =
     "The approval cannot be applied because the user approving the pull request matches the user \
      who created the pull request. You cannot approve a pull request that you created.";
 
-/// `RevisionIdRequiredException`'s message: a FIXED sentence, worded here once for
-/// every operation that takes a `revisionId`.
+/// `RevisionIdRequiredException`'s message: a FIXED sentence, for a request that
+/// carried no `revisionId` member at all — the case the request boundary
+/// (`crate::service`) refuses before any handler reads it. A member that IS carried
+/// but names no revision is `InvalidRevisionIdException`
+/// ([`invalid_revision_id_message`]).
 pub const REVISION_ID_REQUIRED_MESSAGE: &str = "A revision ID is required, but was not provided.";
 
-/// `InvalidRevisionIdException`'s message: the sentence pair the model documents for
-/// the shape — the failure, then where the value is read from.
+/// `InvalidRevisionIdException`'s message for a value that is not the FORM a
+/// revision id takes: the requirement, then the length a revision id holds — the 64
+/// hex characters `REVISION_ID_CHARACTERS` enforces — and then where the current one
+/// is read from. It names no value, which a revision id's wording leaves out.
 pub const INVALID_REVISION_ID_MESSAGE: &str =
-    "The revision ID is not valid. Use GetPullRequest to determine the value.";
+    "A revision ID is required, but the value is not valid. Revision IDs are 64 characters in \
+     length. To retrieve a valid revision ID, use GetPullRequest.";
 
 /// `RevisionNotCurrentException`'s message: the sentence pair the model documents
 /// for the shape, echoing nothing from the request. Worded here once for every
@@ -3504,15 +3523,33 @@ pub const REVISION_NOT_CURRENT_MESSAGE: &str =
     "The revision ID provided in the request does not match the current revision ID. Use \
      GetPullRequest to retrieve the current revision ID.";
 
-/// Why a `revisionId` cannot name a revision of a pull request.
+/// `InvalidRevisionIdException`'s message for a `revisionId` that was CARRIED but
+/// holds no characters at all: a value that is empty names no revision, so it is
+/// refused as a revision id that is not valid, with the sentence CodeCommit words
+/// for an empty or null one.
+pub const EMPTY_REVISION_ID_MESSAGE: &str =
+    "A revision ID is required, but the value is either empty or null.";
+
+/// Why a `revisionId` cannot name a revision of a pull request. Both outcomes are
+/// `InvalidRevisionIdException` — a carried value that addresses no revision is not
+/// valid, whether it is empty or of the wrong form — and they differ only in the
+/// sentence that error carries ([`invalid_revision_id_message`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevisionIdProblem {
-    /// The id is absent or blank: the operations model
-    /// `RevisionIdRequiredException` for this.
-    Missing,
-    /// The id is not the form a revision id takes:
-    /// `InvalidRevisionIdException`.
+    /// The id was carried but holds no characters.
+    Empty,
+    /// The id is not the form a revision id takes.
     Invalid,
+}
+
+/// The sentence `InvalidRevisionIdException` carries for a value naming no
+/// revision: the empty case states that the value is empty or null, every other
+/// case states that it is not valid and where the current one is read from.
+pub fn invalid_revision_id_message(problem: RevisionIdProblem) -> &'static str {
+    match problem {
+        RevisionIdProblem::Empty => EMPTY_REVISION_ID_MESSAGE,
+        RevisionIdProblem::Invalid => INVALID_REVISION_ID_MESSAGE,
+    }
 }
 
 /// The revision a `revisionId` names, in the form a stored revision id is reported
@@ -3522,14 +3559,15 @@ pub enum RevisionIdProblem {
 /// revision ([`PullRequestRecord::revision_id`]), so a value that is not a digest of
 /// that form names no revision of any pull request in any account and is refused as
 /// invalid rather than reported as not current. Hex is case insensitive, so an id
-/// handed back in either case names the same revision. Every operation that takes a
-/// `revisionId` classifies it here, so they cannot disagree about which ids are
-/// addressable.
+/// handed back in either case names the same revision. A value that holds no
+/// characters names none either, and is reported apart only so the refusal can say
+/// so ([`invalid_revision_id_message`]). Every operation that takes a `revisionId`
+/// classifies it here, so they cannot disagree about which ids are addressable.
 pub fn normalize_revision_id(raw: &str) -> Result<String, RevisionIdProblem> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(RevisionIdProblem::Missing);
+    if raw.is_empty() {
+        return Err(RevisionIdProblem::Empty);
     }
+    let trimmed = raw.trim();
     if trimmed.len() != REVISION_ID_CHARACTERS
         || !trimmed.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
@@ -3661,29 +3699,30 @@ pub fn template_applies_to_destination(content: &str, destination_reference: &st
     })
 }
 
-/// Why a `pullRequestId` cannot name a pull request.
+/// Why a `pullRequestId` cannot name a pull request. Both outcomes are
+/// `InvalidPullRequestIdException` — a carried value that addresses no pull request
+/// is not valid, whether it is empty or of the wrong form — and they differ only in
+/// the sentence that error carries ([`invalid_pull_request_id_message`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PullRequestIdProblem {
-    /// The id is absent or blank: the operations model
-    /// `PullRequestIdRequiredException` for this.
-    Missing,
-    /// The id is not the form a pull request id takes:
-    /// `InvalidPullRequestIdException`.
+    /// The id was carried but holds no characters.
+    Empty,
+    /// The id is not the form a pull request id takes.
     Invalid,
 }
 
-/// The pull request a `pullRequestId` names, with surrounding space removed, or
-/// why it names none.
+/// The pull request a `pullRequestId` names, or why it names none.
 ///
 /// CodeCommit ids a pull request with a decimal integer, so a value that is not
-/// one addresses no pull request in any account and is refused as invalid rather
-/// than reported as missing: a sign, a fractional part or surrounding space all
-/// make it a value no id was ever minted as. Every operation that takes a
-/// `pullRequestId` classifies it here, so they cannot disagree about which ids
-/// are addressable.
+/// one addresses no pull request in any account: a sign, a fractional part or
+/// surrounding space all make it a value no id was ever minted as. A value that
+/// holds no characters names none either, and is reported apart only so the
+/// refusal can say so ([`invalid_pull_request_id_message`]). Every operation that
+/// takes a `pullRequestId` classifies it here, so they cannot disagree about which
+/// ids are addressable.
 pub fn normalize_pull_request_id(raw: &str) -> Result<u64, PullRequestIdProblem> {
-    if raw.trim().is_empty() {
-        return Err(PullRequestIdProblem::Missing);
+    if raw.is_empty() {
+        return Err(PullRequestIdProblem::Empty);
     }
     if !raw.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(PullRequestIdProblem::Invalid);
@@ -3692,23 +3731,51 @@ pub fn normalize_pull_request_id(raw: &str) -> Result<u64, PullRequestIdProblem>
         .map_err(|_| PullRequestIdProblem::Invalid)
 }
 
-/// `PullRequestDoesNotExistException`'s message, built from the id the request
-/// asked for — the one place this crate words that code, for the same reason
+/// `PullRequestDoesNotExistException`'s message: a FIXED sentence pair that states
+/// the failure and then where a caller reads the ids that do exist. It names NO
+/// value — not the id the request asked for, and not the repository — so a caller
+/// learns which ids are addressable only by listing them.
+///
+/// The one place this crate words that code, for the same reason
 /// [`repository_does_not_exist_message`] is the one place it words its own.
-pub fn pull_request_does_not_exist_message(pull_request_id: &str) -> String {
+pub const PULL_REQUEST_DOES_NOT_EXIST_MESSAGE: &str =
+    "The pull request ID does not exist. Verify that you provided a valid pull request ID, and \
+     then try your operation again. To get a list of pull request IDs, use ListPullRequests.";
+
+/// `InvalidPullRequestIdException`'s message, worded around the value the request
+/// carried: the refusal names the offending id — the one piece of the failure a
+/// caller cannot already see — and then where the valid ones are listed. A value
+/// holding no characters is named the same way, with the clause that states it was
+/// empty or null.
+///
+/// The one place this crate words that code, for the same reason
+/// [`pull_request_does_not_exist_message`] is the one place it words its own: every
+/// operation taking a `pullRequestId` refuses a value addressing no pull request
+/// identically.
+pub fn invalid_pull_request_id_message(raw: &str, problem: PullRequestIdProblem) -> String {
+    let fault = match problem {
+        PullRequestIdProblem::Empty => "is empty or null and therefore not valid",
+        PullRequestIdProblem::Invalid => "is not valid",
+    };
     format!(
-        "The pull request ID {pull_request_id} could not be found. Make sure that you have \
-         specified the correct repository name and pull request ID, and then try again."
+        "The following pull request ID {fault}: {raw}. To view a list of valid pull request IDs \
+         for this repository, use ListPullRequests."
     )
 }
 
-/// `InvalidPullRequestIdException`'s message: a FIXED sentence pair that states
-/// the failure and then the rule, echoing nothing from the request.
+/// `InvalidPullRequestIdException`'s message where the request carried no
+/// `pullRequestId` VALUE to name — a member that is not a string at all, refused at
+/// the request boundary before any handler reads it: a FIXED sentence pair that
+/// states the failure and then the rule.
 pub const INVALID_PULL_REQUEST_ID_MESSAGE: &str =
     "The pull request ID is not valid. Make sure that you have provided the full ID and that the \
      pull request is in the specified repository, and then try again.";
 
-/// `PullRequestIdRequiredException`'s message: a FIXED sentence.
+/// `PullRequestIdRequiredException`'s message: a FIXED sentence, for a request that
+/// carried no `pullRequestId` member at all — the case the request boundary
+/// (`crate::service`) refuses before any handler reads it. A member that IS carried
+/// but names no pull request is `InvalidPullRequestIdException`
+/// ([`invalid_pull_request_id_message`]).
 pub const PULL_REQUEST_ID_REQUIRED_MESSAGE: &str =
     "A pull request ID is required, but none was provided.";
 
@@ -4690,7 +4757,9 @@ pub const APPROVAL_RULE_STATEMENT_TYPE: &str = "Approvers";
 /// Guide documents for an approval rule template).
 ///
 /// The answer is a BOOLEAN, not a reason: the operations that report a rejected
-/// document answer [`INVALID_APPROVAL_RULE_CONTENT_MESSAGE`], and the one diagnostic
+/// document answer the fixed sentence for the thing the caller submitted
+/// ([`INVALID_APPROVAL_RULE_CONTENT_MESSAGE`] or
+/// [`INVALID_APPROVAL_RULE_TEMPLATE_CONTENT_MESSAGE`]), and the one diagnostic
 /// a caller must never be handed is the JSON reader's own ("key must be a string at
 /// line 1 column 3"), whose offsets belong to whichever deserializer this emulator
 /// links. Returning nothing to interpolate is what keeps it out of the wire.

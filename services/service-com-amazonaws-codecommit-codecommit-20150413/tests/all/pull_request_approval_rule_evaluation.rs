@@ -31,7 +31,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_codecommit_codecommit_20150413::state::ComAmazonawsCodecommitCodecommit20150413State as CodeCommitState;
 
-use crate::harness::error_with_message;
+use crate::harness::{
+    empty_pull_request_id, error_with_message, invalid_pull_request_id, EMPTY_REVISION_ID,
+    INVALID_REVISION_ID, PULL_REQUEST_DOES_NOT_EXIST,
+};
 use crate::repository_lifecycle::{base64, ok, string_at};
 use crate::wire::{caller_arn, emulator_with_callers, ok_as};
 
@@ -68,25 +71,11 @@ const THREE: &str = "AKIDTHREE";
 /// The sentences the refused calls carry, written out here rather than read from the
 /// service, so each refusal is checked against the words CodeCommit answers that
 /// error class with.
-const PULL_REQUEST_ID_REQUIRED: &str = "A pull request ID is required, but none was provided.";
-const INVALID_PULL_REQUEST_ID: &str = "The pull request ID is not valid. Make sure that you have \
-                                       provided the full ID and that the pull request is in the \
-                                       specified repository, and then try again.";
-const REVISION_ID_REQUIRED: &str = "A revision ID is required, but was not provided.";
-const INVALID_REVISION_ID: &str =
-    "The revision ID is not valid. Use GetPullRequest to determine the value.";
+/// The wording for a `pullRequestId` or a `revisionId` naming nothing is
+/// `crate::harness`'s, so every suite checks the same words.
 const REVISION_NOT_CURRENT: &str = "The revision ID provided in the request does not match the \
                                     current revision ID. Use GetPullRequest to retrieve the \
                                     current revision ID.";
-
-/// `PullRequestDoesNotExistException`'s sentence pair, built from the id the refused
-/// request named.
-fn does_not_exist(pull_request_id: &str) -> String {
-    format!(
-        "The pull request ID {pull_request_id} could not be found. Make sure that you have \
-         specified the correct repository name and pull request ID, and then try again."
-    )
-}
 
 /// One `Approvers` statement: how many approvals it asks for and, where it names
 /// one, the pool the approvals must come from.
@@ -597,32 +586,46 @@ async fn a_request_naming_no_pull_request_or_no_current_revision_is_refused() {
 
     let refusals = vec![
         Refusal {
-            label: "a blank pull request id",
+            label: "an empty pull request id",
+            pull_request_id: Some(""),
+            revision_id: None,
+            code: "InvalidPullRequestIdException",
+            message: empty_pull_request_id(""),
+        },
+        Refusal {
+            label: "a pull request id of nothing but a space",
             pull_request_id: Some(" "),
             revision_id: None,
-            code: "PullRequestIdRequiredException",
-            message: PULL_REQUEST_ID_REQUIRED.to_string(),
+            code: "InvalidPullRequestIdException",
+            message: invalid_pull_request_id(" "),
         },
         Refusal {
             label: "a pull request id that is not a pull request id",
             pull_request_id: Some("not-an-id"),
             revision_id: None,
             code: "InvalidPullRequestIdException",
-            message: INVALID_PULL_REQUEST_ID.to_string(),
+            message: invalid_pull_request_id("not-an-id"),
         },
         Refusal {
             label: "a well-formed pull request id no pull request holds",
             pull_request_id: Some(unknown_pull_request),
             revision_id: None,
             code: "PullRequestDoesNotExistException",
-            message: does_not_exist(unknown_pull_request),
+            message: PULL_REQUEST_DOES_NOT_EXIST.to_string(),
         },
         Refusal {
-            label: "a blank revision id",
+            label: "an empty revision id",
+            pull_request_id: None,
+            revision_id: Some(""),
+            code: "InvalidRevisionIdException",
+            message: EMPTY_REVISION_ID.to_string(),
+        },
+        Refusal {
+            label: "a revision id of nothing but spaces",
             pull_request_id: None,
             revision_id: Some("   "),
-            code: "RevisionIdRequiredException",
-            message: REVISION_ID_REQUIRED.to_string(),
+            code: "InvalidRevisionIdException",
+            message: INVALID_REVISION_ID.to_string(),
         },
         Refusal {
             label: "a revision id that is not a revision id",

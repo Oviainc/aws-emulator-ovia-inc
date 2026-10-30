@@ -605,12 +605,13 @@ async fn pull_request_ids_are_consecutive_per_account_and_only_address_stored_pu
         );
     }
 
-    // Rows differ along WHY an id addresses no pull request: blank, not a decimal
-    // integer at all, a signed or fractional spelling, surrounding space, and a
-    // well-formed id nothing was minted for.
+    // Rows differ along WHY an id addresses no pull request: empty, nothing but
+    // space, not a decimal integer at all, a signed or fractional spelling,
+    // surrounding space, and a well-formed id nothing was minted for. A value that
+    // was CARRIED and names no pull request is not a valid id, whatever it holds.
     let refusals = [
-        ("", "PullRequestIdRequiredException"),
-        ("   ", "PullRequestIdRequiredException"),
+        ("", "InvalidPullRequestIdException"),
+        ("   ", "InvalidPullRequestIdException"),
         ("not-an-id", "InvalidPullRequestIdException"),
         ("12.5", "InvalidPullRequestIdException"),
         ("-1", "InvalidPullRequestIdException"),

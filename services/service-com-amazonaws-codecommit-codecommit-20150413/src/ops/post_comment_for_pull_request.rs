@@ -303,27 +303,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // Which ids address a pull request is likewise `crate::state`'s rule, so
-        // every operation taking a `pullRequestId` agrees about it.
+        // every operation taking a `pullRequestId` agrees about it; a value the
+        // request CARRIED that addresses none is no valid id whatever it holds, so
+        // both outcomes are this operation's invalid-id error, worded around that
+        // value.
         let pull_request_id = crate::state::normalize_pull_request_id(&input.pull_request_id)
-            .map_err(|problem| match problem {
-                crate::state::PullRequestIdProblem::Missing => {
-                    PostCommentForPullRequestErrorModeled::PullRequestIdRequiredException(
-                        PullRequestIdRequiredException {
-                            message: Some(
-                                crate::state::PULL_REQUEST_ID_REQUIRED_MESSAGE.to_string(),
-                            ),
-                        },
-                    )
-                }
-                crate::state::PullRequestIdProblem::Invalid => {
-                    PostCommentForPullRequestErrorModeled::InvalidPullRequestIdException(
-                        InvalidPullRequestIdException {
-                            message: Some(
-                                crate::state::INVALID_PULL_REQUEST_ID_MESSAGE.to_string(),
-                            ),
-                        },
-                    )
-                }
+            .map_err(|problem| {
+                PostCommentForPullRequestErrorModeled::InvalidPullRequestIdException(
+                    InvalidPullRequestIdException {
+                        message: Some(crate::state::invalid_pull_request_id_message(
+                            &input.pull_request_id,
+                            problem,
+                        )),
+                    },
+                )
             })?;
 
         // Both sides of the comparison the comment is posted on are required
@@ -411,9 +404,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // Whether the id names a pull request AT ALL is a question about the whole
         // store, because a pull request id is unique per account; it is answered
-        // before one repository is borrowed to write, so the two refusals below can
-        // be told apart.
-        let pull_request_exists = store.pull_request(pull_request_id).is_some();
+        // BEFORE the repository the request names is resolved, so an id naming no
+        // pull request is reported as naming none even when the repository named is
+        // not one either.
+        if store.pull_request(pull_request_id).is_none() {
+            return Err(
+                PostCommentForPullRequestErrorModeled::PullRequestDoesNotExistException(
+                    PullRequestDoesNotExistException {
+                        message: Some(
+                            crate::state::PULL_REQUEST_DOES_NOT_EXIST_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
         let repository = store
             .repositories
             .get_mut(&input.repository_name)
@@ -427,10 +432,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
         if !repository.pull_requests.contains_key(&pull_request_id) {
-            // A pull request this repository does not hold: one that exists
-            // elsewhere is refused as not associated with this repository, and one
-            // no repository holds as not existing at all.
-            return Err(if pull_request_exists {
+            // The pull request exists — answered above — so another repository holds
+            // it, which is the refusal for a request naming this one.
+            return Err(
                 PostCommentForPullRequestErrorModeled::RepositoryNotAssociatedWithPullRequestException(
                     RepositoryNotAssociatedWithPullRequestException {
                         message: Some(
@@ -439,17 +443,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ),
                     },
                 )
-                .into()
-            } else {
-                PostCommentForPullRequestErrorModeled::PullRequestDoesNotExistException(
-                    PullRequestDoesNotExistException {
-                        message: Some(crate::state::pull_request_does_not_exist_message(
-                            &pull_request_id.to_string(),
-                        )),
-                    },
-                )
-                .into()
-            });
+                .into(),
+            );
         }
 
         // Both sides of the comparison have to be commits this repository holds: a

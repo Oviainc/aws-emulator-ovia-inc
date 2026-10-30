@@ -27,6 +27,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_codecommit_codecommit_20150413::state::MAX_APPROVALS_PER_PULL_REQUEST;
 
+use crate::harness::{
+    empty_pull_request_id, invalid_pull_request_id, EMPTY_REVISION_ID, INVALID_REVISION_ID,
+    PULL_REQUEST_DOES_NOT_EXIST,
+};
 use crate::repository_lifecycle::{base64, ok, string_at};
 use crate::wire::{caller_arn, emulator_with_callers, hold_long_term_key, ok_as, refusal_as};
 
@@ -77,18 +81,14 @@ const RULE: &str = "needs-review";
 /// service, so each refusal is checked against the words CodeCommit answers that
 /// error class with.
 const PULL_REQUEST_ID_REQUIRED: &str = "A pull request ID is required, but none was provided.";
-const INVALID_PULL_REQUEST_ID: &str = "The pull request ID is not valid. Make sure that you have \
-                                       provided the full ID and that the pull request is in the \
-                                       specified repository, and then try again.";
 const REVISION_ID_REQUIRED: &str = "A revision ID is required, but was not provided.";
-const INVALID_REVISION_ID: &str =
-    "The revision ID is not valid. Use GetPullRequest to determine the value.";
 const REVISION_NOT_CURRENT: &str = "The revision ID provided in the request does not match the \
                                     current revision ID. Use GetPullRequest to retrieve the \
                                     current revision ID.";
 const APPROVAL_STATE_REQUIRED: &str = "An approval state is required, but was not specified.";
 const INVALID_APPROVAL_STATE: &str =
-    "The state for the approval is not valid. Valid values include APPROVE and REVOKE.";
+    "An approval state is required, but the supplied value is not valid. Valid values for \
+     approval states are: [APPROVE, REVOKE].";
 const CANNOT_BE_APPROVED_BY_AUTHOR: &str =
     "The approval cannot be applied because the user approving the pull request matches the user \
      who created the pull request. You cannot approve a pull request that you created.";
@@ -104,15 +104,6 @@ const RULES_NOT_SATISFIED: &str = "You cannot merge the pull request because the
 /// which is what the refusal states before naming the bound.
 const APPROVALS_EXCEEDED_SENTENCE: &str = "The number of approvals required for the approval rule \
                                            exceeds the maximum number allowed.";
-
-/// `PullRequestDoesNotExistException`'s sentence pair, built from the id the refused
-/// request named.
-fn does_not_exist(pull_request_id: &str) -> String {
-    format!(
-        "The pull request ID {pull_request_id} could not be found. Make sure that you have \
-         specified the correct repository name and pull request ID, and then try again."
-    )
-}
 
 /// An approval rule document asking for `approvals` approvals, from `pool` where it
 /// names one, as compact JSON text.
@@ -644,8 +635,8 @@ async fn a_request_naming_no_pull_request_revision_or_state_records_nothing() {
             pull_request_id: Some(""),
             revision_id: Some("{revision}"),
             approval_state: Some(APPROVE),
-            code: "PullRequestIdRequiredException",
-            message: PULL_REQUEST_ID_REQUIRED.to_string(),
+            code: "InvalidPullRequestIdException",
+            message: empty_pull_request_id(""),
         },
         Refusal {
             case: "a pullRequestId that is not a decimal integer",
@@ -654,7 +645,7 @@ async fn a_request_naming_no_pull_request_revision_or_state_records_nothing() {
             revision_id: Some("{revision}"),
             approval_state: Some(APPROVE),
             code: "InvalidPullRequestIdException",
-            message: INVALID_PULL_REQUEST_ID.to_string(),
+            message: invalid_pull_request_id("not-an-id"),
         },
         Refusal {
             case: "a well-formed id nothing was minted for",
@@ -663,7 +654,7 @@ async fn a_request_naming_no_pull_request_revision_or_state_records_nothing() {
             revision_id: Some("{revision}"),
             approval_state: Some(APPROVE),
             code: "PullRequestDoesNotExistException",
-            message: does_not_exist("99999"),
+            message: PULL_REQUEST_DOES_NOT_EXIST.to_string(),
         },
         Refusal {
             case: "no revisionId at all",
@@ -680,8 +671,8 @@ async fn a_request_naming_no_pull_request_revision_or_state_records_nothing() {
             pull_request_id: Some("{id}"),
             revision_id: Some(""),
             approval_state: Some(APPROVE),
-            code: "RevisionIdRequiredException",
-            message: REVISION_ID_REQUIRED.to_string(),
+            code: "InvalidRevisionIdException",
+            message: EMPTY_REVISION_ID.to_string(),
         },
         Refusal {
             case: "a revisionId that is not a digest at all",

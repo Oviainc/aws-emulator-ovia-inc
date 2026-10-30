@@ -23,7 +23,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::error_with_message;
+use crate::harness::{error_with_message, PULL_REQUEST_DOES_NOT_EXIST};
 use crate::repository_lifecycle::{base64, ok, string_at};
 use crate::wire::{caller_arn, emulator_with_callers, ok_as, refusal_as};
 
@@ -65,13 +65,22 @@ const INVALID_STATUS_MESSAGE: &str =
 /// The message `PullRequestStatusRequiredException` carries.
 const STATUS_REQUIRED_MESSAGE: &str = "A pull request status is required, but none was provided.";
 
-/// The message `PullRequestIdRequiredException` carries.
+/// The message `PullRequestIdRequiredException` carries, for a request that named
+/// no `pullRequestId` member at all.
 const ID_REQUIRED_MESSAGE: &str = "A pull request ID is required, but none was provided.";
 
-/// The message `InvalidPullRequestIdException` carries.
+/// The message `InvalidPullRequestIdException` carries for each id the rows below
+/// name: the value the request carried, in the sentence CodeCommit words that error
+/// with, and the clause that says so where the value holds no characters.
+const EMPTY_ID_MESSAGE: &str =
+    "The following pull request ID is empty or null and therefore not valid: . To view a list of \
+     valid pull request IDs for this repository, use ListPullRequests.";
 const INVALID_ID_MESSAGE: &str =
-    "The pull request ID is not valid. Make sure that you have provided the full ID and that the \
-     pull request is in the specified repository, and then try again.";
+    "The following pull request ID is not valid: not-an-id. To view a list of valid pull request \
+     IDs for this repository, use ListPullRequests.";
+const SPACED_ID_MESSAGE: &str =
+    "The following pull request ID is not valid:  1 . To view a list of valid pull request IDs \
+     for this repository, use ListPullRequests.";
 
 /// One stored pull request, and the router that serves it.
 struct Opened {
@@ -507,8 +516,8 @@ async fn a_refused_request_names_the_member_at_fault_and_persists_nothing() {
             case: "an empty pullRequestId",
             pull_request_id: Some(""),
             status: Some(STATUS_CLOSED),
-            code: "PullRequestIdRequiredException",
-            message: ID_REQUIRED_MESSAGE,
+            code: "InvalidPullRequestIdException",
+            message: EMPTY_ID_MESSAGE,
         },
         Refusal {
             case: "a pullRequestId that is not a decimal id",
@@ -522,7 +531,7 @@ async fn a_refused_request_names_the_member_at_fault_and_persists_nothing() {
             pull_request_id: Some(" 1 "),
             status: Some(STATUS_CLOSED),
             code: "InvalidPullRequestIdException",
-            message: INVALID_ID_MESSAGE,
+            message: SPACED_ID_MESSAGE,
         },
         Refusal {
             case: "no pullRequestStatus at all",
@@ -595,7 +604,7 @@ async fn a_refused_request_names_the_member_at_fault_and_persists_nothing() {
 }
 
 #[tokio::test]
-async fn an_id_naming_no_pull_request_is_refused_with_that_id() {
+async fn an_id_naming_no_pull_request_is_refused_with_the_fixed_message() {
     let opened = opened("status-unknown-id").await;
     // An id no pull request was ever minted as, built from the stored one so it is
     // addressable yet names nothing.
@@ -614,12 +623,8 @@ async fn an_id_naming_no_pull_request_is_refused_with_that_id() {
              {message:?}"
         );
         assert_eq!(
-            message,
-            format!(
-                "The pull request ID {unknown} could not be found. Make sure that you have \
-                 specified the correct repository name and pull request ID, and then try again."
-            ),
-            "case {status:?}: expected the documented message naming the requested id, got \
+            message, PULL_REQUEST_DOES_NOT_EXIST,
+            "case {status:?}: expected the message CodeCommit words that code with, got \
              {message:?}"
         );
     }

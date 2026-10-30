@@ -665,12 +665,12 @@ async fn a_fast_forward_merge_that_names_no_mergeable_pull_request_is_refused_an
             code: "InvalidPullRequestIdException",
         },
         Refusal {
-            case: "a blank pull request id",
+            case: "a pull request id of nothing but spaces",
             repository: None,
             pull_request_id: Some("   "),
             source_commit_id: None,
             prepare: Prepare::Nothing,
-            code: "PullRequestIdRequiredException",
+            code: "InvalidPullRequestIdException",
         },
         Refusal {
             case: "a pull request id no pull request was minted as",

@@ -145,6 +145,8 @@ mod pull_request_comments;
 mod pull_request_creation;
 #[path = "all/pull_request_events.rs"]
 mod pull_request_events;
+#[path = "all/pull_request_identifier_refusals.rs"]
+mod pull_request_identifier_refusals;
 #[path = "all/pull_request_listing.rs"]
 mod pull_request_listing;
 #[path = "all/pull_request_override_state_read.rs"]

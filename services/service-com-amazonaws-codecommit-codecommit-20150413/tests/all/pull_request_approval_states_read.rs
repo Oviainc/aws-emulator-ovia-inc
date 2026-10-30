@@ -24,6 +24,10 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::harness::{
+    empty_pull_request_id, invalid_pull_request_id, EMPTY_REVISION_ID, INVALID_REVISION_ID,
+    PULL_REQUEST_DOES_NOT_EXIST,
+};
 use crate::repository_lifecycle::{base64, ok, string_at};
 use crate::wire::{caller_arn, emulator_with_callers, ok_as, refusal_as};
 
@@ -64,21 +68,7 @@ const SECOND_SOURCE: &str = "second-feature";
 /// service, so each refusal is checked against the words CodeCommit answers that
 /// error class with.
 const PULL_REQUEST_ID_REQUIRED: &str = "A pull request ID is required, but none was provided.";
-const INVALID_PULL_REQUEST_ID: &str = "The pull request ID is not valid. Make sure that you have \
-                                       provided the full ID and that the pull request is in the \
-                                       specified repository, and then try again.";
 const REVISION_ID_REQUIRED: &str = "A revision ID is required, but was not provided.";
-const INVALID_REVISION_ID: &str =
-    "The revision ID is not valid. Use GetPullRequest to determine the value.";
-
-/// `PullRequestDoesNotExistException`'s sentence pair, built from the id the refused
-/// request named.
-fn does_not_exist(pull_request_id: &str) -> String {
-    format!(
-        "The pull request ID {pull_request_id} could not be found. Make sure that you have \
-         specified the correct repository name and pull request ID, and then try again."
-    )
-}
 
 /// An emulator holding one repository with two diverged branches and one open pull
 /// request between them, opened by [`AUTHOR`].
@@ -479,22 +469,29 @@ async fn a_request_naming_no_pull_request_or_revision_reports_no_approvals() {
             case: "an empty pullRequestId",
             pull_request_id: Some(""),
             revision_id: Some("{revision}"),
-            code: "PullRequestIdRequiredException",
-            message: PULL_REQUEST_ID_REQUIRED.to_string(),
+            code: "InvalidPullRequestIdException",
+            message: empty_pull_request_id(""),
         },
         Refusal {
             case: "a pullRequestId that is not a decimal integer",
             pull_request_id: Some("not-an-id"),
             revision_id: Some("{revision}"),
             code: "InvalidPullRequestIdException",
-            message: INVALID_PULL_REQUEST_ID.to_string(),
+            message: invalid_pull_request_id("not-an-id"),
+        },
+        Refusal {
+            case: "a pullRequestId holding punctuation",
+            pull_request_id: Some("not-a-valid-id!!"),
+            revision_id: Some("{revision}"),
+            code: "InvalidPullRequestIdException",
+            message: invalid_pull_request_id("not-a-valid-id!!"),
         },
         Refusal {
             case: "a well-formed id nothing was minted for",
             pull_request_id: Some("99999"),
             revision_id: Some("{revision}"),
             code: "PullRequestDoesNotExistException",
-            message: does_not_exist("99999"),
+            message: PULL_REQUEST_DOES_NOT_EXIST.to_string(),
         },
         Refusal {
             case: "no revisionId at all",
@@ -507,8 +504,8 @@ async fn a_request_naming_no_pull_request_or_revision_reports_no_approvals() {
             case: "an empty revisionId",
             pull_request_id: Some("{id}"),
             revision_id: Some(""),
-            code: "RevisionIdRequiredException",
-            message: REVISION_ID_REQUIRED.to_string(),
+            code: "InvalidRevisionIdException",
+            message: EMPTY_REVISION_ID.to_string(),
         },
         Refusal {
             case: "a revisionId that is not a digest at all",

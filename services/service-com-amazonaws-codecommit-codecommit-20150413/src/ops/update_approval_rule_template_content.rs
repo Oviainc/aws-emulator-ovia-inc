@@ -210,7 +210,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 UpdateApprovalRuleTemplateContentErrorModeled::InvalidApprovalRuleTemplateContentException(
                     InvalidApprovalRuleTemplateContentException {
                         message: Some(
-                            crate::state::INVALID_APPROVAL_RULE_CONTENT_MESSAGE.to_string(),
+                            crate::state::INVALID_APPROVAL_RULE_TEMPLATE_CONTENT_MESSAGE
+                                .to_string(),
                         ),
                     },
                 )

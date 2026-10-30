@@ -545,10 +545,10 @@ async fn a_request_naming_no_rule_the_pull_request_can_take_is_refused() {
     // document.
     let refusals = vec![
         Refusal {
-            label: "a blank pull request id",
+            label: "an empty pull request id",
             operation: "DeletePullRequestApprovalRule",
             body: json!({ "pullRequestId": "", "approvalRuleName": "already-here" }),
-            code: "PullRequestIdRequiredException",
+            code: "InvalidPullRequestIdException",
         },
         Refusal {
             label: "a pull request id that is not a decimal integer",
@@ -569,14 +569,14 @@ async fn a_request_naming_no_rule_the_pull_request_can_take_is_refused() {
             code: "ApprovalRuleNameRequiredException",
         },
         Refusal {
-            label: "a blank pull request id on the create",
+            label: "an empty pull request id on the create",
             operation: "CreatePullRequestApprovalRule",
             body: json!({
                 "pullRequestId": "",
                 "approvalRuleName": "another",
                 "approvalRuleContent": valid,
             }),
-            code: "PullRequestIdRequiredException",
+            code: "InvalidPullRequestIdException",
         },
         Refusal {
             label: "a well-formed id nothing was minted for, on the create",

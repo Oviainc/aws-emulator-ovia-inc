@@ -284,7 +284,7 @@ fn invalid_documents() -> Vec<(&'static str, String)> {
 /// approval rule document — and it carries no parser diagnostic, which is why no
 /// row's message may differ from another's even though their offsets do.
 #[tokio::test]
-async fn invalid_approval_rule_content_message_is_a_constant() {
+async fn invalid_approval_rule_template_content_message_is_a_constant() {
     let router = emulator();
     const EXPECTED: &str = "The JSON in the approval rule template is not valid. Review the JSON \
                             and make sure it is valid, and then try again.";
@@ -355,6 +355,46 @@ async fn invalid_approval_rule_content_message_is_a_constant() {
         document(1),
         "a refused content update must leave the stored document alone, got {read_back}"
     );
+}
+
+/// The same document rule refused on a pull request's OWN approval rule carries the
+/// sentence pair for an approval RULE, not for a template: each error class states
+/// the thing the caller submitted, and `InvalidApprovalRuleContentException` is the
+/// class for a rule.
+#[tokio::test]
+async fn invalid_approval_rule_content_message_names_the_rule_not_the_template() {
+    let router = emulator();
+    const EXPECTED: &str = "The JSON in the approval rule is not valid. Review the JSON and make \
+                            sure it is valid, and then try again.";
+    let pr = crate::pull_request_comments::pull_request_on(&router, "rule-content-messages").await;
+
+    for (label, content) in invalid_documents() {
+        let (code, message) = error_with_message(
+            &router,
+            "CreatePullRequestApprovalRule",
+            &json!({
+                "pullRequestId": pr.pull_request_id,
+                "approvalRuleName": format!("rule-{}", content.len()),
+                "approvalRuleContent": content,
+            }),
+            CLIENT_ERROR_STATUS,
+        )
+        .await;
+        assert_eq!(
+            code, "InvalidApprovalRuleContentException",
+            "case {label:?}: expected InvalidApprovalRuleContentException, got {code:?}"
+        );
+        assert_eq!(
+            message, EXPECTED,
+            "case {label:?}: expected message {EXPECTED:?}, got {message:?}"
+        );
+        // The parser's own diagnostic reports a position, so a message carrying a
+        // digit is one that leaked an offset.
+        assert!(
+            !message.bytes().any(|byte| byte.is_ascii_digit()),
+            "case {label:?}: the message must carry no parser offset, got {message:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

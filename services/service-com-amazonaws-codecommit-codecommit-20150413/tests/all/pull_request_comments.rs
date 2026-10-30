@@ -632,9 +632,9 @@ async fn a_comment_the_pull_request_cannot_carry_is_refused_with_the_modeled_err
             "PullRequestDoesNotExistException",
         ),
         (
-            "blank pull request id",
+            "empty pull request id",
             fixture.post_body(json!({ "pullRequestId": "" })),
-            "PullRequestIdRequiredException",
+            "InvalidPullRequestIdException",
         ),
         (
             "malformed pull request id",

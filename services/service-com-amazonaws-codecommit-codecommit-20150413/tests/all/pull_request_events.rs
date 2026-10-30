@@ -650,23 +650,31 @@ async fn a_request_the_log_cannot_be_read_for_is_refused_with_the_modeled_error(
             case: "a pull request id that is no id at all",
             body: json!({ "pullRequestId": "not-an-id" }),
             code: "InvalidPullRequestIdException",
-            message: "The pull request ID is not valid. Make sure that you have provided the full \
-                      ID and that the pull request is in the specified repository, and then try \
-                      again.",
+            message: "The following pull request ID is not valid: not-an-id. To view a list of \
+                      valid pull request IDs for this repository, use ListPullRequests.",
         },
         Refusal {
-            case: "a blank pull request id",
+            case: "an empty pull request id",
+            body: json!({ "pullRequestId": "" }),
+            code: "InvalidPullRequestIdException",
+            message: "The following pull request ID is empty or null and therefore not valid: . \
+                      To view a list of valid pull request IDs for this repository, use \
+                      ListPullRequests.",
+        },
+        Refusal {
+            case: "a pull request id of nothing but spaces",
             body: json!({ "pullRequestId": "   " }),
-            code: "PullRequestIdRequiredException",
-            message: "A pull request ID is required, but none was provided.",
+            code: "InvalidPullRequestIdException",
+            message: "The following pull request ID is not valid:    . To view a list of valid \
+                      pull request IDs for this repository, use ListPullRequests.",
         },
         Refusal {
             case: "a well-formed id no pull request holds",
             body: json!({ "pullRequestId": "987654" }),
             code: "PullRequestDoesNotExistException",
-            message: "The pull request ID 987654 could not be found. Make sure that you have \
-                      specified the correct repository name and pull request ID, and then try \
-                      again.",
+            message: "The pull request ID does not exist. Verify that you provided a valid pull \
+                      request ID, and then try your operation again. To get a list of pull \
+                      request IDs, use ListPullRequests.",
         },
         Refusal {
             case: "an event type the model does not declare",

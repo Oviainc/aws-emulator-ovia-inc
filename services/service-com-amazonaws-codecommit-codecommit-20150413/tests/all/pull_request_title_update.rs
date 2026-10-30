@@ -28,7 +28,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::error_with_message;
+use crate::harness::{error_with_message, PULL_REQUEST_DOES_NOT_EXIST};
 use crate::pull_request_comments::pull_request_on;
 use crate::repository_lifecycle::{emulator, ok};
 
@@ -60,14 +60,23 @@ const TITLE_REQUIRED_MESSAGE: &str = "A pull request title is required.";
 /// the member does not admit.
 const INVALID_TITLE_MESSAGE: &str = "The title of the pull request is not valid.";
 
-/// The message `PullRequestIdRequiredException` carries.
+/// The message `PullRequestIdRequiredException` carries, for a request that named
+/// no `pullRequestId` member at all.
 pub(crate) const ID_REQUIRED_MESSAGE: &str =
     "A pull request ID is required, but none was provided.";
 
-/// The message `InvalidPullRequestIdException` carries.
+/// The message `InvalidPullRequestIdException` carries for each id the rows below
+/// name: the value the request carried, in the sentence CodeCommit words that error
+/// with, and the clause that says so where the value holds no characters.
+pub(crate) const EMPTY_ID_MESSAGE: &str =
+    "The following pull request ID is empty or null and therefore not valid: . To view a list of \
+     valid pull request IDs for this repository, use ListPullRequests.";
 pub(crate) const INVALID_ID_MESSAGE: &str =
-    "The pull request ID is not valid. Make sure that you have provided the full ID and that the \
-     pull request is in the specified repository, and then try again.";
+    "The following pull request ID is not valid: not-an-id. To view a list of valid pull request \
+     IDs for this repository, use ListPullRequests.";
+pub(crate) const SPACED_ID_MESSAGE: &str =
+    "The following pull request ID is not valid:  1 . To view a list of valid pull request IDs \
+     for this repository, use ListPullRequests.";
 
 /// The message `PullRequestAlreadyClosedException` carries for an update of a pull
 /// request's text: the sentence pair names the state the pull request is IN — a
@@ -408,8 +417,8 @@ pub(crate) const ID_REFUSALS: &[Refusal] = &[
         pull_request_id: Some(""),
         value: Some("new text"),
         repeat: 1,
-        code: "PullRequestIdRequiredException",
-        message: ID_REQUIRED_MESSAGE,
+        code: "InvalidPullRequestIdException",
+        message: EMPTY_ID_MESSAGE,
     },
     Refusal {
         case: "a pullRequestId that is not a decimal id",
@@ -425,7 +434,7 @@ pub(crate) const ID_REFUSALS: &[Refusal] = &[
         value: Some("new text"),
         repeat: 1,
         code: "InvalidPullRequestIdException",
-        message: INVALID_ID_MESSAGE,
+        message: SPACED_ID_MESSAGE,
     },
 ];
 
@@ -483,15 +492,6 @@ pub(crate) async fn assert_refused(
     );
 }
 
-/// The message `PullRequestDoesNotExistException` carries, naming the id the
-/// request asked for.
-pub(crate) fn does_not_exist_message(pull_request_id: &str) -> String {
-    format!(
-        "The pull request ID {pull_request_id} could not be found. Make sure that you have \
-         specified the correct repository name and pull request ID, and then try again."
-    )
-}
-
 #[tokio::test]
 async fn a_refused_retitle_names_the_member_at_fault_and_persists_nothing() {
     let opened = opened("title-refusals").await;
@@ -541,7 +541,7 @@ async fn a_refused_retitle_names_the_member_at_fault_and_persists_nothing() {
 }
 
 #[tokio::test]
-async fn an_id_naming_no_pull_request_is_refused_with_that_id() {
+async fn an_id_naming_no_pull_request_is_refused_with_the_fixed_message() {
     let opened = opened("title-unknown-id").await;
     // An id no pull request was ever minted as, built from the stored one so it is
     // addressable yet names nothing.
@@ -561,9 +561,8 @@ async fn an_id_naming_no_pull_request_is_refused_with_that_id() {
              {message:?}"
         );
         assert_eq!(
-            message,
-            does_not_exist_message(&unknown),
-            "case {case:?}: expected the documented message naming the requested id, got \
+            message, PULL_REQUEST_DOES_NOT_EXIST,
+            "case {case:?}: expected the message CodeCommit words that code with, got \
              {message:?}"
         );
     }
