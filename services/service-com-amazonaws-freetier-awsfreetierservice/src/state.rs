@@ -470,13 +470,42 @@ pub fn encode_page_token(kind: &str, offset: usize) -> String {
     ::hex::encode(format!("{PAGE_TOKEN_VERSION}:{kind}:{offset}"))
 }
 
-/// The offset a `nextToken` resumes at, or `None` when the token was not issued
-/// by [`encode_page_token`] for this `kind`.
-pub fn decode_page_token(kind: &str, token: &str) -> Option<usize> {
+/// The offset a `nextToken` carries, or `None` when the token does not even
+/// have the FORM [`encode_page_token`] gives a token of this `kind`.
+///
+/// The form is only half of "was this token issued": the offset it carries has
+/// to be one the issuer could have produced too, which is what
+/// [`page_offset`] decides. Handlers go through that one, never through this.
+fn decode_page_token(kind: &str, token: &str) -> Option<usize> {
     let decoded = ::hex::decode(token).ok()?;
     let text = String::from_utf8(decoded).ok()?;
     let offset = text.strip_prefix(&format!("{PAGE_TOKEN_VERSION}:{kind}:"))?;
     offset.parse::<usize>().ok()
+}
+
+/// The stored-collection offset a request resumes its listing at: `0` when it
+/// carried no `nextToken`, the token's offset when the token is one this
+/// service issued for `kind`, and `None` when it is not — which is what the
+/// caller refuses with [`INVALID_NEXT_TOKEN`].
+///
+/// A token is one this service issued only when BOTH halves hold: its form is
+/// the form [`encode_page_token`] gives a token of this listing, and the offset
+/// it carries is one [`cut_page`] — the only issuer — could have encoded over
+/// the `stored_rows` rows the offset indexes into. `cut_page` encodes
+/// `position + 1` for a row it has just reported while a further selected row
+/// is still unreported, so the offsets it can hand out are exactly
+/// `1..stored_rows`: zero (a listing starts there with no token at all) and any
+/// offset at or past the end of the stored collection are offsets no page ever
+/// issued, and a token carrying one is as unissued as a token of the other
+/// listing or of no listing at all. The bound is the STORED collection's, not
+/// the filtered view's, because a token stays usable when the caller changes
+/// the filter between pages.
+pub fn page_offset(kind: &str, token: Option<&str>, stored_rows: usize) -> Option<usize> {
+    let Some(token) = token else {
+        return Some(0);
+    };
+    let offset = decode_page_token(kind, token)?;
+    (1..stored_rows).contains(&offset).then_some(offset)
 }
 
 /// The page size one request asks for: its `maxResults`, or the modelled
@@ -496,7 +525,7 @@ pub fn page_size(max_results: i32) -> usize {
 /// that resumes the listing after it.
 ///
 /// The third part of the pagination rule whose other two parts are
-/// [`encode_page_token`]/[`decode_page_token`] and [`page_size`], stated here
+/// [`encode_page_token`]/[`page_offset`] and [`page_size`], stated here
 /// ONCE so both paginated operations page by the same rule: a page reports at
 /// most `page_size` of the selected rows, in the order they were selected, and
 /// a token is issued only while a selected row is still unreported — the
@@ -525,11 +554,11 @@ pub fn cut_page<'rows, T>(
 }
 
 /// What the service states for a `nextToken` it did not issue — a token of the
-/// other listing, of an older encoding, or one that was
-/// never a token at all.
+/// other listing, of an older encoding, one carrying an offset no page could
+/// have stopped at, or one that was never a token at all.
 ///
 /// The fourth part of the pagination rule, beside
-/// [`encode_page_token`]/[`decode_page_token`], [`page_size`] and [`cut_page`],
+/// [`encode_page_token`]/[`page_offset`], [`page_size`] and [`cut_page`],
 /// so both paginated operations refuse a token they did not issue in ONE
 /// wording: the condition is "this is not a token of mine", which is the same
 /// condition whichever listing was asked and whatever the token held, so the

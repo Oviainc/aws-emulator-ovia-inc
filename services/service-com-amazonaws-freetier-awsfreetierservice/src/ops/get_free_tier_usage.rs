@@ -157,15 +157,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The token names the position the next page begins at, so a page
-        // resumes exactly where its predecessor stopped.
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => match crate::state::decode_page_token(PAGE_KIND, token) {
-                Some(offset) => offset,
-                None => return Err(validation(crate::state::INVALID_NEXT_TOKEN)),
-            },
-        };
-
+        // resumes exactly where its predecessor stopped. Checked against the
+        // records the offset indexes into, below, where they are in hand.
         let page_size = crate::state::page_size(input.max_results);
 
         // The filter is checked ONCE, before any record is read: whether an
@@ -182,6 +175,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let records = store.usages_for(crate::state::caller_account_id());
+
+        // A token whose form or whose offset is not one a page of this listing
+        // could have issued is a token this operation never issued.
+        let offset = match crate::state::page_offset(
+            PAGE_KIND,
+            input.next_token.as_deref(),
+            records.len(),
+        ) {
+            Some(offset) => offset,
+            None => return Err(validation(crate::state::INVALID_NEXT_TOKEN)),
+        };
 
         // Position in the stored order kept beside each selected row, so the
         // token is an offset into the records and not into the filtered view.

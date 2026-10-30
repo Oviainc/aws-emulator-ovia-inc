@@ -190,24 +190,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(validation(message));
         }
 
-        // The token names the catalog position the next page begins at
-        // (inclusive), so a page resumes exactly where its predecessor stopped.
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => match crate::state::decode_page_token(PAGE_KIND, token) {
-                Some(offset) => offset,
-                None => return Err(validation(crate::state::INVALID_NEXT_TOKEN)),
-            },
-        };
-
         let page_size = crate::state::page_size(input.max_results);
         let store = state.lock();
+        let catalog = store.activities_for(crate::state::caller_account_id());
+
+        // The token names the catalog position the next page begins at
+        // (inclusive), so a page resumes exactly where its predecessor stopped
+        // — and a token carrying anything else, in form or in offset, is one
+        // this listing never issued.
+        let offset = match crate::state::page_offset(
+            PAGE_KIND,
+            input.next_token.as_deref(),
+            catalog.len(),
+        ) {
+            Some(offset) => offset,
+            None => return Err(validation(crate::state::INVALID_NEXT_TOKEN)),
+        };
+
         // Catalog position kept beside each row: the token is an offset into the
         // catalog, not into the filtered view, so changing the filter between
         // pages cannot make a page resume in the middle of a row it already
         // reported.
-        let selected: Vec<(usize, ActivitySummary)> = store
-            .activities_for(crate::state::caller_account_id())
+        let selected: Vec<(usize, ActivitySummary)> = catalog
             .iter()
             .enumerate()
             .skip(offset)
