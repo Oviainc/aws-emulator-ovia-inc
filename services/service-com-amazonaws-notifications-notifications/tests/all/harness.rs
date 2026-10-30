@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use serde_json::Value;
+use service_com_amazonaws_notifications_notifications::ComAmazonawsNotificationsNotificationsState;
 use service_com_amazonaws_notifications_notifications::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -68,6 +69,23 @@ impl Emulator {
         };
         (status, parsed)
     }
+}
+
+/// `GetEventRule` for one rule arn — the reader every EventRule suite reads a
+/// stored rule back through, so the suites share one spelling of it.
+pub(crate) async fn get_event_rule(emulator: &Emulator, arn: &str) -> (u16, Value) {
+    let uri = format!("/event-rules/{}", encode_path_label(arn));
+    emulator.send("GET", &uri, None).await
+}
+
+/// How many EventRules the store holds, read straight out of it — what a refused
+/// create or update must not have changed.
+pub(crate) fn stored_event_rule_count(emulator: &Emulator) -> usize {
+    let state = emulator
+        .engine
+        .state::<ComAmazonawsNotificationsNotificationsState>();
+    let store = state.lock();
+    store.event_rules.len()
 }
 
 /// Percent-encode one URI path segment, the way an SDK encodes a non-greedy

@@ -24,11 +24,14 @@ use service_com_amazonaws_notifications_notifications::state::{
     EVENT_RULE_STATUS_CREATING, EVENT_RULE_TRANSITION_SPAN, MAX_EVENT_RULES_PER_CONFIGURATION,
     MAX_REGIONS_PER_EVENT_RULE,
 };
-use service_com_amazonaws_notifications_notifications::ComAmazonawsNotificationsNotificationsState;
 
 // The HTTP harness this suite drives the service through, shared with every
-// other suite in this crate.
-use crate::harness::{encode_path_label, error_code, is_an_instant, is_event_rule_arn, Emulator};
+// other suite in this crate — including the `GetEventRule` reader and the
+// store-depth probe both EventRule suites use.
+use crate::harness::{
+    encode_path_label, error_code, get_event_rule, is_an_instant, is_event_rule_arn,
+    stored_event_rule_count, Emulator,
+};
 
 /// Long enough that the settling the create made due has certainly fallen due,
 /// without depending on how slow the machine is.
@@ -187,11 +190,6 @@ impl Emulator {
         self.send("POST", "/event-rules", Some(body)).await
     }
 
-    async fn get_event_rule(&self, arn: &str) -> (u16, Value) {
-        let uri = format!("/event-rules/{}", encode_path_label(arn));
-        self.send("GET", &uri, None).await
-    }
-
     async fn delete_configuration_by_arn(&self, arn: &str) -> (u16, Value) {
         let uri = format!("/notification-configurations/{}", encode_path_label(arn));
         self.send("DELETE", &uri, None).await
@@ -214,16 +212,6 @@ impl Emulator {
             uri.push_str(extra);
         }
         self.send("GET", &uri, None).await
-    }
-
-    /// How many EventRules the store holds, read straight out of it — what a
-    /// refused create must not have changed.
-    fn stored_event_rule_count(&self) -> usize {
-        let state = self
-            .engine
-            .state::<ComAmazonawsNotificationsNotificationsState>();
-        let store = state.lock();
-        store.event_rules.len()
     }
 }
 
@@ -341,7 +329,7 @@ async fn create_persists_an_event_rule_the_get_reports_and_the_clock_settles() {
         // The Get reports the stored record: the transitional status is
         // observable to a caller reading straight after the create, and every
         // member the create was given round-trips.
-        let (status, fetched) = emulator.get_event_rule(&arn).await;
+        let (status, fetched) = get_event_rule(&emulator, &arn).await;
         assert_eq!(
             status, 200,
             "case {label:?}: a Get of a created rule answers 200, got {fetched:?}"
@@ -393,7 +381,7 @@ async fn create_persists_an_event_rule_the_get_reports_and_the_clock_settles() {
 
         // Only the clock moves the rule on.
         tokio::time::sleep(PAST_THE_TRANSITION).await;
-        let (status, settled) = emulator.get_event_rule(&arn).await;
+        let (status, settled) = get_event_rule(&emulator, &arn).await;
         assert_eq!(
             status, 200,
             "case {label:?}: a Get of a settled rule answers 200, got {settled:?}"
@@ -414,13 +402,13 @@ async fn create_persists_an_event_rule_the_get_reports_and_the_clock_settles() {
         );
 
         // A read changes nothing a later reader sees.
-        let (_, again) = emulator.get_event_rule(&arn).await;
+        let (_, again) = get_event_rule(&emulator, &arn).await;
         assert_eq!(
             again, settled,
             "case {label:?}: a Get must not change what the next Get reports, got {again:?}"
         );
         assert_eq!(
-            emulator.stored_event_rule_count(),
+            stored_event_rule_count(&emulator),
             1,
             "case {label:?}: one create makes exactly one rule"
         );
@@ -458,7 +446,7 @@ async fn creating_a_rule_for_a_configuration_that_does_not_exist_is_not_found() 
             "case {label:?}: that refusal is a ResourceNotFoundException, got {refused:?}"
         );
         assert_eq!(
-            emulator.stored_event_rule_count(),
+            stored_event_rule_count(&emulator),
             0,
             "case {label:?}: a refused create persists nothing"
         );
@@ -488,7 +476,7 @@ async fn a_repeated_create_reports_the_same_rule_and_a_changed_one_makes_another
             "case {label:?}: a repeated create reports the rule it already made, got {repeated:?}"
         );
         assert_eq!(
-            emulator.stored_event_rule_count(),
+            stored_event_rule_count(&emulator),
             1,
             "case {label:?}: a repeated create does not mint a second rule"
         );
@@ -509,7 +497,7 @@ async fn a_repeated_create_reports_the_same_rule_and_a_changed_one_makes_another
             "case {label:?}: Region order is not part of the request, got {same:?}"
         );
         assert_eq!(
-            emulator.stored_event_rule_count(),
+            stored_event_rule_count(&emulator),
             1,
             "case {label:?}: reordering the Regions does not mint a second rule"
         );
@@ -549,7 +537,7 @@ async fn a_repeated_create_reports_the_same_rule_and_a_changed_one_makes_another
             );
             expected += 1;
             assert_eq!(
-                emulator.stored_event_rule_count(),
+                stored_event_rule_count(&emulator),
                 expected,
                 "case {label:?}: a create differing in {member} adds one rule"
             );
@@ -619,7 +607,7 @@ async fn a_created_rule_joins_its_configuration_and_goes_when_that_configuration
     // configuration's alone.
     let (status, deleted) = emulator.delete_configuration_by_arn(&first).await;
     assert_eq!(status, 200, "the delete must succeed, got {deleted:?}");
-    let (status, gone) = emulator.get_event_rule(&arns[0]).await;
+    let (status, gone) = get_event_rule(&emulator, &arns[0]).await;
     assert_eq!(
         status, 404,
         "a rule whose configuration was deleted is reported by nobody, got {gone:?}"
@@ -628,13 +616,13 @@ async fn a_created_rule_joins_its_configuration_and_goes_when_that_configuration
         error_code(&gone).contains("ResourceNotFoundException"),
         "that refusal is a ResourceNotFoundException, got {gone:?}"
     );
-    let (status, kept) = emulator.get_event_rule(&arns[1]).await;
+    let (status, kept) = get_event_rule(&emulator, &arns[1]).await;
     assert_eq!(
         status, 200,
         "another configuration's rule is untouched, got {kept:?}"
     );
     assert_eq!(
-        emulator.stored_event_rule_count(),
+        stored_event_rule_count(&emulator),
         1,
         "exactly the deleted configuration's rules are gone"
     );
@@ -668,7 +656,7 @@ async fn a_get_of_an_arn_no_rule_is_stored_under_is_not_found() {
             is_event_rule_arn(&arn),
             "case {label:?}: the arn under test must be well formed, got {arn:?}"
         );
-        let (status, refused) = emulator.get_event_rule(&arn).await;
+        let (status, refused) = get_event_rule(&emulator, &arn).await;
         assert_eq!(
             status, 404,
             "case {label:?}: a Get of an unknown arn answers the modelled 404, got {refused:?}"
@@ -680,7 +668,7 @@ async fn a_get_of_an_arn_no_rule_is_stored_under_is_not_found() {
     }
 
     // The rule that does exist is still readable afterwards.
-    let (status, kept) = emulator.get_event_rule(&created_arn).await;
+    let (status, kept) = get_event_rule(&emulator, &created_arn).await;
     assert_eq!(status, 200, "a refused Get changes nothing, got {kept:?}");
 }
 
@@ -722,7 +710,7 @@ async fn a_create_past_the_cap_is_refused_with_the_quota_error() {
         "case {past}: a create past the cap is a ServiceQuotaExceededException, got {refused:?}"
     );
     assert_eq!(
-        emulator.stored_event_rule_count(),
+        stored_event_rule_count(&emulator),
         MAX_EVENT_RULES_PER_CONFIGURATION,
         "a refused create does not grow the store"
     );
@@ -801,7 +789,7 @@ async fn a_create_naming_more_regions_than_one_rule_covers_is_refused() {
             "case {over}: the refusal names the member that is out of bounds, got {refused:?}"
         );
         assert_eq!(
-            emulator.stored_event_rule_count(),
+            stored_event_rule_count(&emulator),
             1,
             "case {over}: a refused create persists nothing"
         );
@@ -914,7 +902,7 @@ async fn the_listing_reports_a_configurations_own_rules_newest_first() {
                     "case maxResults={page_size}: a listed entry names the configuration it belongs to, got {entry:?}"
                 );
                 // The listing reports the same record the Get reports.
-                let (status, got) = emulator.get_event_rule(&arn).await;
+                let (status, got) = get_event_rule(&emulator, &arn).await;
                 assert_eq!(
                     status, 200,
                     "case maxResults={page_size}: a listed rule is readable, got {got:?}"

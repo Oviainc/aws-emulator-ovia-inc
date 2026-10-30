@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEventRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEventRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEventRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the members the request carries onto the stored EventRule the arn
+//! names — an absent member leaves that member as it is — and answers
+//! `{arn, notificationConfigurationArn, statusSummaryByRegion}` read back out of
+//! that record. An update that changes the rule moves every Region it now covers
+//! into the transitional `UPDATING` status the model documents; the clock, not a
+//! read, settles those Regions to `ACTIVE`. A 404 when the store holds no rule
+//! under that arn.
+//!
+//! An update that arrives while the rule is still settling is APPLIED rather than
+//! refused with the `ConflictException` this operation also declares. The
+//! `EventRuleStatus` documentation ("Only GET/LIST calls can be executed") says
+//! what a caller may expect of a rule in a transitional status, but neither the
+//! model nor the operation's documentation states that a second update is
+//! refused, and the settling window itself is this emulator's (the clock makes it
+//! due a fixed span after the call, a span AWS does not publish). Refusing inside
+//! a window AWS never published would invent a refusal rather than reproduce one,
+//! so such an update is written and the rule re-enters the transitional status
+//! with its settling made due again.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +172,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEventRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEventRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEventRule"))
+        let _ = ctx;
+
+        // Refuse an over-long `regions` list BEFORE anything is locked or looked
+        // up: the modelled `Regions` declares `@length(1..)` with no ceiling, so
+        // this is the only thing standing between a caller-chosen list length
+        // and the size of the stored rule, of its per-Region status map and of
+        // every response that reports them. The message names the member and the
+        // bound it exceeded, which is what the modelled `ValidationException`
+        // carries in its `fieldList`.
+        if let Some(regions) = &input.regions {
+            if regions.len() > crate::state::MAX_REGIONS_PER_EVENT_RULE {
+                return Err(UpdateEventRuleErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::regions_bound_message(regions.len()),
+                        reason: Some("fieldValidationFailed".to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "regions".to_string(),
+                            message: crate::state::regions_bound_field_message(),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The store is the only place an EventRule exists; without it there is
+        // nothing to update, which is a server fault, not a client error.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateEventRuleErrorModeled::InternalServerException(InternalServerException {
+                message: "the notifications store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+
+        // Materialise the transitions the clock already owed at this instant, so
+        // an update that asks for what the rule already says reports its settled
+        // status rather than the one it was minted with.
+        let now = ::std::time::SystemTime::now();
+        store.settle_due_event_rules(now);
+
+        // The arn is the only key: an arn no EventRule is stored under does not
+        // exist, whatever its shape, so there is nothing to update.
+        let updated = store
+            .update_event_rule(
+                &input.arn,
+                input.event_pattern,
+                input.regions.as_deref(),
+                now,
+            )
+            .ok_or_else(|| {
+                UpdateEventRuleErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::not_found_message(
+                        crate::state::EVENT_RULE_RESOURCE_LABEL,
+                        crate::state::ARN_IDENTIFIER_LABEL,
+                        &input.arn,
+                    ),
+                    resource_id: input.arn.clone(),
+                })
+            })?;
+
+        // Read the response back out of the stored record rather than echoing
+        // the values just written, so this response can only report what a later
+        // Get does.
+        Ok(UpdateEventRuleOutput {
+            arn: updated.arn.clone(),
+            notification_configuration_arn: updated.notification_configuration_arn.clone(),
+            status_summary_by_region: updated.status_summary_by_region(),
+        })
     }
 }

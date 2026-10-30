@@ -185,18 +185,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.regions.len() > crate::state::MAX_REGIONS_PER_EVENT_RULE {
             return Err(CreateEventRuleErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
-                        "regions must name at most {} Regions, got {}",
-                        crate::state::MAX_REGIONS_PER_EVENT_RULE,
-                        input.regions.len()
-                    ),
+                    message: crate::state::regions_bound_message(input.regions.len()),
                     reason: Some("fieldValidationFailed".to_string()),
                     field_list: Some(vec![ValidationExceptionField {
                         name: "regions".to_string(),
-                        message: format!(
-                            "the list names more than the {} Regions an EventRule covers",
-                            crate::state::MAX_REGIONS_PER_EVENT_RULE
-                        ),
+                        message: crate::state::regions_bound_field_message(),
                     }]),
                 },
             )

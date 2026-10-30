@@ -15,6 +15,8 @@
 mod channel_associations;
 #[path = "all/configuration_status.rs"]
 mod configuration_status;
+#[path = "all/event_rule_updates.rs"]
+mod event_rule_updates;
 #[path = "all/event_rules.rs"]
 mod event_rules;
 #[path = "all/harness.rs"]

@@ -151,10 +151,21 @@ async fn a_polling_client_never_sees_the_new_alias_on_a_non_active_workspace() {
 
         // Poll exactly as a client waiting for the rename does: until the new alias shows
         // up, bounded so a workspace that never settles fails instead of hanging.
+        //
+        // Each probe reads the LISTING FIRST and the describe second, because the two
+        // reads are two calls at two instants and the settling can fall due between them.
+        // Publication is monotone — once a reader reports the new alias the workspace is
+        // settled and stays settled — so a listing that reported the new alias would be
+        // followed by a describe reporting `ACTIVE`. Reading in this order therefore lets
+        // the probe that finds a transient status hold BOTH readers to the published
+        // alias with no instant in between: the opposite order asserts about a listing
+        // taken after the status was read, which the settling may legitimately have
+        // overtaken.
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut probes = 0_u32;
         let mut saw_transient = false;
         loop {
+            let listed_before_describe = listed_alias(&amp, case.region, &workspace_id).await;
             let (status, alias) = described_pair(&amp, case.region, &workspace_id).await;
             probes += 1;
             if status == STATUS_ACTIVE {
@@ -163,11 +174,14 @@ async fn a_polling_client_never_sees_the_new_alias_on_a_non_active_workspace() {
                     "case {name:?}: a settled workspace must report the renamed alias \
                      (probe {probes}), got {alias:?}"
                 );
-                // The same record a listing reads, so the pair it reports agrees.
-                let listed = listed_alias(&amp, case.region, &workspace_id).await;
+                // The same record a listing reads, so the pair it reports agrees. Read
+                // again here, AFTER the settled describe, rather than reusing the read
+                // taken before it.
+                let listed_after_active = listed_alias(&amp, case.region, &workspace_id).await;
                 assert_eq!(
-                    listed, case.renamed_to,
-                    "case {name:?}: the listing must report the renamed alias, got {listed:?}"
+                    listed_after_active, case.renamed_to,
+                    "case {name:?}: the listing must report the renamed alias, got \
+                     {listed_after_active:?}"
                 );
                 break;
             }
@@ -179,12 +193,11 @@ async fn a_polling_client_never_sees_the_new_alias_on_a_non_active_workspace() {
                  still report the published alias {:?} (probe {probes}), got {alias:?}",
                 case.published
             );
-            let listed = listed_alias(&amp, case.region, &workspace_id).await;
             assert_eq!(
-                listed,
+                listed_before_describe,
                 Some(case.published.to_string()),
                 "case {name:?}: while the workspace reports {status:?} the listing must \
-                 still report the published alias, got {listed:?}"
+                 still report the published alias, got {listed_before_describe:?}"
             );
             assert!(
                 Instant::now() < deadline,

@@ -179,6 +179,15 @@ pub const EVENT_RULE_STATUS_CREATING: &str = "CREATING";
 /// out of it but a caller.
 pub const EVENT_RULE_STATUS_ACTIVE: &str = "ACTIVE";
 
+/// `UPDATING`, the per-Region status an `EventRule` carries while an update of
+/// it is being applied.
+///
+/// Another of `EventRuleStatus`'s five modelled values, documented in the model
+/// as "This EventRule is being updated. Only GET/LIST calls can be executed." —
+/// transitional in exactly the way [`EVENT_RULE_STATUS_CREATING`] is, so the
+/// clock owes it [`EVENT_RULE_TRANSITION_SPAN`] later.
+pub const EVENT_RULE_STATUS_UPDATING: &str = "UPDATING";
+
 /// The `reason` reported beside a `CREATING` Region of an `EventRule`.
 ///
 /// `EventRuleStatusReason` is an unconstrained string for which the model
@@ -191,8 +200,13 @@ pub const EVENT_RULE_REASON_CREATING: &str = "The EventRule is being created.";
 /// [`EVENT_RULE_REASON_CREATING`].
 pub const EVENT_RULE_REASON_ACTIVE: &str = "The EventRule can process events.";
 
-/// How long an `EventRule`'s Regions stay [`EVENT_RULE_STATUS_CREATING`] before
-/// the clock makes [`EVENT_RULE_STATUS_ACTIVE`] due.
+/// The `reason` reported beside an `UPDATING` Region of an `EventRule`. See
+/// [`EVENT_RULE_REASON_CREATING`].
+pub const EVENT_RULE_REASON_UPDATING: &str = "The EventRule is being updated.";
+
+/// How long an `EventRule`'s Regions stay in a transitional status
+/// ([`EVENT_RULE_STATUS_CREATING`] after a create, [`EVENT_RULE_STATUS_UPDATING`]
+/// after an update) before the clock makes [`EVENT_RULE_STATUS_ACTIVE`] due.
 ///
 /// AWS publishes no duration for the step, so this span is the EMULATOR's own
 /// choice; what matters is that it is never zero — a caller reading straight
@@ -243,6 +257,47 @@ pub const MAX_CHANNELS_PER_CONFIGURATION: usize = 100;
 /// it produces names the member and its bound, which is what the modelled
 /// `ValidationException` (HTTP 400) carries in its `fieldList`.
 pub const MAX_REGIONS_PER_EVENT_RULE: usize = 50;
+
+/// How this service states a `regions` list longer than
+/// [`MAX_REGIONS_PER_EVENT_RULE`]: the `message` of the `ValidationException`
+/// (HTTP 400) that refuses it, naming the bound and the length the request
+/// asked for.
+///
+/// Spelled once, beside the bound it states, so every operation taking
+/// `regions` refuses an over-long list in the same words rather than one
+/// sentence per handler.
+pub fn regions_bound_message(asked_for: usize) -> String {
+    format!("regions must name at most {MAX_REGIONS_PER_EVENT_RULE} Regions, got {asked_for}")
+}
+
+/// What that same refusal states about the `regions` member itself, in the
+/// `ValidationExceptionField` the modelled `ValidationException` carries in its
+/// `fieldList`. See [`regions_bound_message`].
+pub fn regions_bound_field_message() -> String {
+    format!("the list names more than the {MAX_REGIONS_PER_EVENT_RULE} Regions an EventRule covers")
+}
+
+/// The Regions one `EventRule` covers, out of the list a request asked for: the
+/// Regions in the order they were named, without repeats.
+///
+/// `statusSummaryByRegion` is keyed by Region, so a Region named twice in one
+/// request is one Region: keep the first mention and drop the repeat rather than
+/// reporting one Region twice in `regions` and once in the status map. Shared by
+/// the create and the update path, so both store a rule's Regions the same way.
+/// The allocation is clamped to [`MAX_REGIONS_PER_EVENT_RULE`] and the
+/// already-seen test is a set lookup, so neither the allocation nor the work is
+/// sized by a caller-chosen list length (a caller that asks for a longer list is
+/// refused outright, before this runs).
+fn distinct_regions(regions: &[String]) -> Vec<String> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut ordered: Vec<String> = Vec::with_capacity(regions.len().min(MAX_REGIONS_PER_EVENT_RULE));
+    for region in regions.iter().take(MAX_REGIONS_PER_EVENT_RULE) {
+        if seen.insert(region.as_str()) {
+            ordered.push(region.clone());
+        }
+    }
+    ordered
+}
 
 /// One persisted `EventRule`.
 ///
@@ -962,21 +1017,7 @@ impl ComAmazonawsNotificationsNotificationsState {
         regions: &[String],
         now: SystemTime,
     ) -> String {
-        // `statusSummaryByRegion` is keyed by Region, so a Region named twice in
-        // one request is one Region: keep the first mention and drop the repeat
-        // rather than reporting one Region twice in `regions` and once in the
-        // status map. The capacity is clamped to
-        // [`MAX_REGIONS_PER_EVENT_RULE`] and the already-seen test is a set
-        // lookup, so neither the allocation nor the work is sized by a
-        // caller-chosen list length (the caller refuses a longer list outright).
-        let mut seen: BTreeSet<&str> = BTreeSet::new();
-        let mut ordered: Vec<String> =
-            Vec::with_capacity(regions.len().min(MAX_REGIONS_PER_EVENT_RULE));
-        for region in regions.iter().take(MAX_REGIONS_PER_EVENT_RULE) {
-            if seen.insert(region.as_str()) {
-                ordered.push(region.clone());
-            }
-        }
+        let ordered = distinct_regions(regions);
         let creating = crate::ops::types::EventRuleStatusSummary {
             status: EVENT_RULE_STATUS_CREATING.to_string(),
             reason: EVENT_RULE_REASON_CREATING.to_string(),
@@ -1002,6 +1043,68 @@ impl ComAmazonawsNotificationsNotificationsState {
         self.event_rules.insert(arn.clone(), record);
         self.refresh_event_rule_sources(configuration_arn);
         arn
+    }
+
+    /// Apply an `UpdateEventRule` request to the stored rule `arn` and report
+    /// the record it leaves, or `None` when the store holds no rule under that
+    /// arn.
+    ///
+    /// An absent member is "leave this as it is", not "clear it": only the
+    /// members the request carries are written, and `source`, `eventType`,
+    /// `creationTime` and the configuration the rule belongs to are not members
+    /// of this operation at all, so they keep the values the record holds. A
+    /// request that asks for what the rule already says changes nothing, which
+    /// is what the operation's `@idempotent` trait requires; one that does
+    /// change the rule moves every Region it now covers into the transitional
+    /// [`EVENT_RULE_STATUS_UPDATING`] the model documents for an update, with
+    /// its settling due [`EVENT_RULE_TRANSITION_SPAN`] after `now` — the clock,
+    /// not a later read, makes it `ACTIVE`.
+    ///
+    /// The caller has already established that `regions` is within
+    /// [`MAX_REGIONS_PER_EVENT_RULE`]; a longer list is truncated by
+    /// [`distinct_regions`] rather than trusted, so no allocation is sized by an
+    /// unbounded request field.
+    pub fn update_event_rule(
+        &mut self,
+        arn: &str,
+        event_pattern: Option<String>,
+        regions: Option<&[String]>,
+        now: SystemTime,
+    ) -> Option<&EventRuleRecord> {
+        let rule = self.event_rules.get_mut(arn)?;
+        let mut changed = false;
+
+        if let Some(event_pattern) = event_pattern {
+            if rule.event_pattern.as_deref() != Some(event_pattern.as_str()) {
+                rule.event_pattern = Some(event_pattern);
+                changed = true;
+            }
+        }
+        if let Some(regions) = regions {
+            let ordered = distinct_regions(regions);
+            if ordered != rule.regions {
+                rule.regions = ordered;
+                changed = true;
+            }
+        }
+
+        if changed {
+            let updating = crate::ops::types::EventRuleStatusSummary {
+                status: EVENT_RULE_STATUS_UPDATING.to_string(),
+                reason: EVENT_RULE_REASON_UPDATING.to_string(),
+            };
+            // One entry per Region the rule now covers: a Region the update
+            // dropped is no longer sending events to this rule, so it has no
+            // status to report, and a Region it added does.
+            rule.status_by_region = rule
+                .regions
+                .iter()
+                .map(|region| (region.clone(), updating.clone()))
+                .collect();
+            rule.due_at = Some(now + EVENT_RULE_TRANSITION_SPAN);
+        }
+
+        Some(rule)
     }
 
     /// Drop every `EventRule` of `configuration_arn` — what deleting the
@@ -1032,7 +1135,8 @@ impl ComAmazonawsNotificationsNotificationsState {
     }
 
     /// Materialise every `EventRule` transition the clock has already made due,
-    /// as of `now`: a Region in `CREATING` becomes `ACTIVE`.
+    /// as of `now`: a Region in a transitional status (`CREATING` after a
+    /// create, `UPDATING` after an update) becomes `ACTIVE`.
     ///
     /// Every EventRule operation calls this first, including the reporting ones:
     /// the step was owed at that instant whether or not anybody called, so
@@ -1048,7 +1152,9 @@ impl ComAmazonawsNotificationsNotificationsState {
             }
             rule.due_at = None;
             for summary in rule.status_by_region.values_mut() {
-                if summary.status == EVENT_RULE_STATUS_CREATING {
+                if summary.status == EVENT_RULE_STATUS_CREATING
+                    || summary.status == EVENT_RULE_STATUS_UPDATING
+                {
                     summary.status = EVENT_RULE_STATUS_ACTIVE.to_string();
                     summary.reason = EVENT_RULE_REASON_ACTIVE.to_string();
                 }
