@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-inspector2-inspector2 service.
 //!
-//! Two resources live here, and every implemented operation computes its answer from
+//! Three resources live here, and every implemented operation computes its answer from
 //! them:
 //!
 //! * `accounts` — per-account Amazon Inspector enablement, written by `Enable` and read
@@ -10,6 +10,8 @@
 //! * `filters` — the suppression/other findings filters, keyed by their own ARN so a
 //!   record and its ARN can never diverge. `BTreeMap` iteration is stable, which is what
 //!   makes a `ListFilters` page token meaningful across calls.
+//! * `encryption_keys` — the customer managed KMS key in force per resource type and scan
+//!   type, written by `UpdateEncryptionKey` and read back by `GetEncryptionKey`.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::SystemTime;
@@ -149,9 +151,50 @@ pub struct ComAmazonawsInspector2Inspector2State {
     pub accounts: BTreeMap<String, AccountEnablement>,
     /// Monotonic source for the id segment of a minted filter ARN.
     pub next_filter_id: u64,
+    /// The customer managed KMS key in force for one `ResourceType` / `ScanType` pair —
+    /// the scope Amazon Inspector configures an encryption key at, for the single account
+    /// this emulator presents (neither encryption-key operation carries an account
+    /// member). An absent entry means that pair is encrypted with an Amazon Web Services
+    /// owned key, which is a different answer from a configured key rather than a missing
+    /// value, so the absence is kept out of the `KmsKeyArn` value space.
+    ///
+    /// BOUNDED without a cap of its own: both halves of the key are modelled enum tokens,
+    /// and a token outside those enums is refused at the boundary before any handler runs,
+    /// so the map holds at most `ResourceType` × `ScanType` entries however many requests
+    /// arrive. No request-supplied string ever becomes a key here.
+    pub encryption_keys: BTreeMap<EncryptionKeyScope, String>,
 }
 
+/// The scope one encryption-key setting belongs to: a `ResourceType` token and a
+/// `ScanType` token, in that order, so iteration groups a resource type's settings
+/// together.
+pub type EncryptionKeyScope = (String, String);
+
 impl ComAmazonawsInspector2Inspector2State {
+    /// The customer managed KMS key ARN configured for the `resource_type` /
+    /// `scan_type` pair, or `None` when that pair is encrypted with an Amazon Web
+    /// Services owned key.
+    pub fn encryption_key(&self, resource_type: &str, scan_type: &str) -> Option<&str> {
+        self.encryption_keys
+            .get(&(resource_type.to_string(), scan_type.to_string()))
+            .map(String::as_str)
+    }
+
+    /// Put `kms_key_id` in force for the `resource_type` / `scan_type` pair, replacing
+    /// whatever key that pair used before. Writes at most one entry per modelled pair, so
+    /// repeating the call cannot grow the map.
+    pub fn set_encryption_key(
+        &mut self,
+        resource_type: &str,
+        scan_type: &str,
+        kms_key_id: String,
+    ) {
+        self.encryption_keys.insert(
+            (resource_type.to_string(), scan_type.to_string()),
+            kms_key_id,
+        );
+    }
+
     /// Mint the ARN for a new filter:
     /// `arn:aws:inspector2:<region>:<account>:owner/<owner>/filter/<id>`.
     ///

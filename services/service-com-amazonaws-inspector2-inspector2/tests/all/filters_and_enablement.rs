@@ -46,16 +46,21 @@ pub(crate) fn router() -> MultiServiceRouter {
     router
 }
 
-/// POST a restJson1 request, signed for `region` so the service claims it and can read
-/// the region out of the SigV4 credential scope.
-pub(crate) async fn post_in(
+/// Send a restJson1 request with `method`, signed for `region` so the service claims it
+/// and can read the region out of the SigV4 credential scope. `body` is `None` for a
+/// request with no payload, such as a GET whose members are bound to the query string.
+pub(crate) async fn send_in(
     router: &MultiServiceRouter,
+    method: &str,
     region: &str,
     uri: &str,
-    body: &Value,
+    body: Option<&Value>,
 ) -> (u16, Option<String>, Value) {
+    let payload = body.map_or_else(bytes::Bytes::new, |body| {
+        bytes::Bytes::from(serde_json::to_vec(body).expect("a serializable request body"))
+    });
     let request = http::Request::builder()
-        .method("POST")
+        .method(method)
         .uri(format!("http://localhost{uri}"))
         .header("content-type", "application/json")
         .header(
@@ -65,9 +70,7 @@ pub(crate) async fn post_in(
                  SignedHeaders=host, Signature=abc"
             ),
         )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("a serializable request body"),
-        ))
+        .body(payload)
         .expect("a well-formed request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
@@ -82,6 +85,17 @@ pub(crate) async fn post_in(
         serde_json::from_slice(response.body()).unwrap_or(Value::Null)
     };
     (status, error_type, parsed)
+}
+
+/// POST a restJson1 request, signed for `region` so the service claims it and can read
+/// the region out of the SigV4 credential scope.
+pub(crate) async fn post_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    uri: &str,
+    body: &Value,
+) -> (u16, Option<String>, Value) {
+    send_in(router, "POST", region, uri, Some(body)).await
 }
 
 async fn post(router: &MultiServiceRouter, uri: &str, body: &Value) -> (u16, Value) {
