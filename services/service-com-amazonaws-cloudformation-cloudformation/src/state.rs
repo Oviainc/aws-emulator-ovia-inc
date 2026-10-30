@@ -190,6 +190,14 @@
 //! `DescribeType` reports `IN_PROGRESS` to a caller reading straight after the call and the
 //! conclusion to one reading after that instant (see [`registry::PendingTypeTests`]).
 //!
+//! It also holds the REGISTRATION REQUESTS of that registry
+//! ([`registry::StoredTypeRegistration`]): starting one is answered with the registration
+//! token it is addressable by, so the request is a record beside the version it registers —
+//! `ListTypeRegistrations` lists those tokens and `DescribeTypeRegistration` reads one
+//! request back. A request rides a clock of its own too, answered `IN_PROGRESS` and
+//! concluded [`STATUS_TRANSITION_DELAY`] later, and the set is bounded at
+//! [`registry::MAX_TYPE_REGISTRATIONS`], oldest reclaimed first.
+//!
 //! ## The publisher registration
 //!
 //! Beside the registry it holds this ACCOUNT's extension-publisher registration
@@ -4583,6 +4591,13 @@ pub struct ComAmazonawsCloudformationCloudformationState {
     /// reclaimed with one; it is bounded at [`handler_progress::MAX_HANDLER_INVOCATIONS`],
     /// oldest reclaimed first.
     pub handler_invocations: Vec<handler_progress::StoredHandlerInvocation>,
+    /// Every extension REGISTRATION REQUEST this account and Region holds, in the order the
+    /// requests were started, so `ListTypeRegistrations` pages over them deterministically
+    /// (see [`registry::StoredTypeRegistration`]). A registration belongs to the registry
+    /// rather than to a stack, so it is never reclaimed with one; the one transition the
+    /// clock owes it is its own conclusion, which [`Self::settle`] materialises, and it is
+    /// bounded at [`registry::MAX_TYPE_REGISTRATIONS`], oldest reclaimed first.
+    pub type_registrations: Vec<registry::StoredTypeRegistration>,
 }
 
 impl ComAmazonawsCloudformationCloudformationState {
@@ -4623,6 +4638,13 @@ impl ComAmazonawsCloudformationCloudformationState {
         }
         for extension in &mut self.extensions {
             extension.settle(now);
+        }
+        // A registration request is the registry's other asynchronous operation: the call
+        // that starts one is answered with a token while the registration is still running,
+        // so the conclusion the clock has made due is installed here rather than invented by
+        // the read that reports it.
+        for registration in &mut self.type_registrations {
+            registration.settle(now);
         }
         for scan in &mut self.resource_scans {
             scan.settle(now);
@@ -5490,6 +5512,46 @@ impl ComAmazonawsCloudformationCloudformationState {
         self.extensions
             .iter_mut()
             .find(|extension| extension.region == region && extension.arn == arn)
+    }
+
+    /// Record one extension REGISTRATION REQUEST. The oldest record is reclaimed past
+    /// [`registry::MAX_TYPE_REGISTRATIONS`], so the store cannot grow without limit.
+    ///
+    /// This is the ONLY way a registration enters the store: starting a registration is what
+    /// issues the token one is addressed by, and `RegisterType` — the registry writer that
+    /// does so, still a scaffold stub with an issue of its own — writes through here rather
+    /// than reaching into the vector, so every reader sees the same records.
+    pub fn record_type_registration(&mut self, registration: registry::StoredTypeRegistration) {
+        while self.type_registrations.len() >= registry::MAX_TYPE_REGISTRATIONS {
+            self.type_registrations.remove(0);
+        }
+        self.type_registrations.push(registration);
+    }
+
+    /// Every registration request of ONE Region, in the order the requests were started.
+    ///
+    /// `ListTypeRegistrations` reports the registrations of the account and Region its
+    /// request was signed for, the way every other registry read is namespaced: a request
+    /// another Region holds is not among them.
+    pub fn type_registrations_in<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a registry::StoredTypeRegistration> {
+        self.type_registrations
+            .iter()
+            .filter(move |registration| registration.region == region)
+    }
+
+    /// The ONE registration request this Region holds under `registration_token`, or `None`
+    /// when no record of it carries that token.
+    pub fn type_registration(
+        &self,
+        region: &str,
+        registration_token: &str,
+    ) -> Option<&registry::StoredTypeRegistration> {
+        self.type_registrations
+            .iter()
+            .find(|registration| registration.is_addressed_by(region, registration_token))
     }
 
     /// The PUBLIC extension record this Region's registry holds for this extension, if a
@@ -6427,6 +6489,8 @@ pub enum PageOf {
     AccountLimits,
     /// `ListTypes`'s `TypeSummaries`.
     TypeSummaries,
+    /// `ListTypeRegistrations`'s `RegistrationTokenList`.
+    RegistrationTokens,
     /// `ListStackInstances`'s `Summaries`.
     StackInstanceSummaries,
     /// `ListStackSets`'s `Summaries`.
@@ -6467,6 +6531,7 @@ impl PageOf {
             Self::Exports => "exports",
             Self::AccountLimits => "account-limits",
             Self::TypeSummaries => "type-summaries",
+            Self::RegistrationTokens => "registration-tokens",
             Self::StackInstanceSummaries => "stack-instance-summaries",
             Self::StackSetSummaries => "stack-set-summaries",
             Self::StackSetOperationSummaries => "stack-set-operation-summaries",

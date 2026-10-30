@@ -100,7 +100,11 @@ const VALIDATION_REFUSAL_CODE: &str = "ValidationError";
 /// declares the enum in (`smithy_query(query="shape", shape="RegistrationStatus")` gives
 /// `[COMPLETE, IN_PROGRESS, FAILED]`) — so the refusal is stated from this order rather than
 /// from the declaration.
-const REGISTRATION_STATUS_VALUE_SET: &[&str] = &["IN_PROGRESS", "COMPLETE", "FAILED"];
+const REGISTRATION_STATUS_VALUE_SET: &[&str] = &[
+    registry::registration_status::IN_PROGRESS,
+    registry::registration_status::COMPLETE,
+    registry::registration_status::FAILED,
+];
 
 /// Every enum of this service whose value set its own refusals state in an order other than
 /// the model's declaration order.

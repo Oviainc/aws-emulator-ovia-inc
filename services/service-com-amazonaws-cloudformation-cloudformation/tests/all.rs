@@ -295,6 +295,8 @@ mod type_deactivation;
 mod type_default_version;
 #[path = "all/type_deregistration.rs"]
 mod type_deregistration;
+#[path = "all/type_registrations.rs"]
+mod type_registrations;
 #[path = "all/type_testing.rs"]
 mod type_testing;
 #[path = "all/unimported_exports.rs"]

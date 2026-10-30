@@ -37,7 +37,7 @@
 //! versions registered at a time" belongs). The record shape below is what those writers
 //! fill in and what every registry READ is served from.
 //!
-//! ## The one status transition the clock owes here
+//! ## The status transitions the clock owes here
 //!
 //! Contract testing is the registry's own asynchronous operation: `TestType` answers while
 //! the tests are still running, and "an extension must have a test status of PASSED before
@@ -46,6 +46,11 @@
 //! ([`PendingTypeTests`]) until the due instant passes. [`StoredExtension::settle`] is what
 //! installs it, from the same `settle` walk every operation makes first, so a caller that
 //! reads straight after the call still sees `IN_PROGRESS` and nothing sleeps.
+//!
+//! Registering a version is the other one: `RegisterType` is answered with a registration
+//! token rather than with a registered version, so the REQUEST is a record of its own
+//! ([`StoredTypeRegistration`]) holding `IN_PROGRESS` until its own conclusion is due, which
+//! [`StoredTypeRegistration::settle`] installs from that same walk.
 //!
 //! ## Visibility is what gates a reported member
 //!
@@ -90,6 +95,20 @@ pub mod provisioning_type {
     pub const FULLY_MUTABLE: &str = "FULLY_MUTABLE";
     pub const IMMUTABLE: &str = "IMMUTABLE";
     pub const NON_PROVISIONABLE: &str = "NON_PROVISIONABLE";
+}
+
+/// The model's `RegistrationStatus` enum, "the current status of the extension registration
+/// request" (`smithy_query(query="shape", shape="RegistrationStatus")`: `COMPLETE | FAILED |
+/// IN_PROGRESS`).
+pub mod registration_status {
+    /// The status a registration request still running holds, and the one a listing of
+    /// registration requests narrows to when the request names no other
+    /// (`ListTypeRegistrationsInput$RegistrationStatusFilter`: "the default is IN_PROGRESS").
+    pub const IN_PROGRESS: &str = "IN_PROGRESS";
+    /// The status a registration request that finished registering the version holds.
+    pub const COMPLETE: &str = "COMPLETE";
+    /// The status a registration request that could not register the version holds.
+    pub const FAILED: &str = "FAILED";
 }
 
 /// The model's `TypeTestsStatus` enum, the contract-test status of a registered private
@@ -212,6 +231,106 @@ pub struct StoredTypeConfiguration {
     pub last_updated: SystemTime,
 }
 
+
+/// How many REGISTRATION REQUESTS this account and Region's registry keeps, oldest reclaimed
+/// first.
+///
+/// A caller chooses how many registrations it starts, so the set of requests is a
+/// caller-counted growth site of its own: a request is a record beside the extension version
+/// it registers, addressable by its own registration token for as long as the registry keeps
+/// it. The model documents no retention for one, so this is a COUNT rather than an age — a
+/// bound on the store, not a claim about how long the real service keeps a token
+/// addressable — and it is well past the 50 resource extension versions one account and
+/// Region may have registered at a time.
+pub const MAX_TYPE_REGISTRATIONS: usize = 500;
+
+/// ONE registration request of this account and Region: the record `RegisterType` writes for
+/// the version it registers, addressable by the registration token that call answers with.
+///
+/// "Once you have initiated a registration request using RegisterType, you can use
+/// DescribeTypeRegistration to monitor the progress of the registration request" and
+/// `ListTypeRegistrations` "returns a list of registration tokens for the specified
+/// extension(s)" — so both of those reads are served from these records, and the request's
+/// own status is what they report rather than the extension's.
+#[derive(Debug, Clone)]
+pub struct StoredTypeRegistration {
+    /// The Region this registration belongs to. The registry is regional, so a token issued
+    /// in one Region names no registration in another — the same gate every other registry
+    /// read goes through.
+    pub region: String,
+    /// `RegistrationToken`, "the identifier for this registration request"
+    /// (`@length(1..128)`, `@pattern("^[a-zA-Z0-9][-a-zA-Z0-9]*$")`), which is the only thing
+    /// a read names the request by.
+    pub registration_token: String,
+    /// [`registry_type`]: "the kind of extension" being registered.
+    pub type_kind: String,
+    /// `TypeName`, "the name of the extension being registered".
+    pub type_name: String,
+    /// The ARN of the extension being registered ([`type_arn`]): what a request narrowing a
+    /// listing by `TypeArn` resolves against.
+    pub type_arn: String,
+    /// [`registration_status`], "the current status of the extension registration request".
+    pub status: String,
+    /// The instant this request's conclusion becomes due, while it is still running: a
+    /// registration is asynchronous — `RegisterType` is answered with a token to monitor it
+    /// by — so the request holds `IN_PROGRESS` until the clock has made the conclusion due
+    /// and [`Self::settle`] is what installs it. Nothing sleeps for it and no read invents a
+    /// conclusion the clock had not already made due.
+    pub concluded_at: SystemTime,
+}
+
+impl StoredTypeRegistration {
+    /// A registration request that has just started: `IN_PROGRESS`, concluding at
+    /// `concluded_at`.
+    pub fn started(
+        region: impl Into<String>,
+        type_kind: impl Into<String>,
+        type_name: impl Into<String>,
+        registration_token: impl Into<String>,
+        concluded_at: SystemTime,
+    ) -> Self {
+        let region = region.into();
+        let type_kind = type_kind.into();
+        let type_name = type_name.into();
+        Self {
+            type_arn: type_arn(&region, &type_kind, &type_name),
+            region,
+            type_kind,
+            type_name,
+            registration_token: registration_token.into(),
+            status: registration_status::IN_PROGRESS.to_string(),
+            concluded_at,
+        }
+    }
+
+    /// Materialise the conclusion the clock has already made due: a request still running
+    /// past [`Self::concluded_at`] has finished registering its version, which is
+    /// `COMPLETE`. A request that already concluded is left exactly as it is — a conclusion
+    /// is a request's last status.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.status == registration_status::IN_PROGRESS && now >= self.concluded_at {
+            self.status = registration_status::COMPLETE.to_string();
+        }
+    }
+
+    /// Whether this is the registration a read signed for `region` and carrying
+    /// `registration_token` names.
+    pub fn is_addressed_by(&self, region: &str, registration_token: &str) -> bool {
+        self.region == region && self.registration_token == registration_token
+    }
+
+    /// Whether this registration is OF the extension `type_arn` names. An extension-version
+    /// ARN names the extension it is a version of ([`split_version_arn`]), since a
+    /// registration belongs to the extension rather than to one version of it.
+    pub fn is_of_extension_arn(&self, arn: &str) -> bool {
+        self.type_arn == split_version_arn(arn).0
+    }
+
+    /// Whether this registration is OF the extension a `Type`-and-`TypeName` request names.
+    pub fn is_of_extension_named(&self, type_kind: &str, type_name: &str) -> bool {
+        self.type_kind == type_kind && self.type_name == type_name
+    }
+}
 
 /// The ARN of a PUBLIC extension: `arn:aws:cloudformation:<region>::type/<kind>/<Name>`.
 ///
