@@ -223,7 +223,7 @@ async fn create_keyspace_mints_an_arn_per_name_and_refuses_a_name_already_taken(
         assert_failure(
             name,
             emulator.call("CreateKeyspace", json!({"keyspaceName": name})).await,
-            409,
+            400,
             "ConflictException",
         );
     }
@@ -546,7 +546,7 @@ async fn reading_an_absent_resource_is_a_modelled_not_found() {
 
     for (case, operation, request, expected_arn) in cases {
         let (status, body) = emulator.call(operation, request).await;
-        assert_failure(case, (status, body.clone()), 404, "ResourceNotFoundException");
+        assert_failure(case, (status, body.clone()), 400, "ResourceNotFoundException");
         assert_eq!(
             body["resourceArn"], json!(expected_arn),
             "case {case:?}: the exception must name the resource that was looked for: {body}"
@@ -808,7 +808,7 @@ async fn deleting_a_table_and_its_keyspace_is_observable_by_the_next_call() {
                 json!({"keyspaceName": keyspace, "tableName": "doomed_tbl"}),
             )
             .await,
-        404,
+        400,
         "ResourceNotFoundException",
     );
     let listed = assert_ok(
@@ -833,7 +833,7 @@ async fn deleting_a_table_and_its_keyspace_is_observable_by_the_next_call() {
                 json!({"keyspaceName": keyspace, "tableName": "never_existed"}),
             )
             .await,
-        404,
+        400,
         "ResourceNotFoundException",
     );
 
@@ -861,7 +861,7 @@ async fn deleting_a_table_and_its_keyspace_is_observable_by_the_next_call() {
     assert_failure(
         "DeleteKeyspace repeated while the deletion is in flight",
         emulator.call("DeleteKeyspace", json!({"keyspaceName": keyspace})).await,
-        409,
+        400,
         "ConflictException",
     );
 
@@ -889,7 +889,7 @@ async fn deleting_a_table_and_its_keyspace_is_observable_by_the_next_call() {
         assert_failure(
             case,
             emulator.call(operation, request).await,
-            404,
+            400,
             "ResourceNotFoundException",
         );
     }
@@ -952,7 +952,7 @@ async fn creating_past_the_store_cap_answers_the_modelled_quota_error() {
                 }),
             )
             .await,
-        402,
+        400,
         "ServiceQuotaExceededException",
     );
 
@@ -972,7 +972,7 @@ async fn creating_past_the_store_cap_answers_the_modelled_quota_error() {
         emulator
             .call("CreateKeyspace", json!({"keyspaceName": "one_too_many_ks"}))
             .await,
-        402,
+        400,
         "ServiceQuotaExceededException",
     );
 
@@ -981,7 +981,7 @@ async fn creating_past_the_store_cap_answers_the_modelled_quota_error() {
     assert_failure(
         "a name already taken, with the store full",
         emulator.call("CreateKeyspace", json!({"keyspaceName": keyspace})).await,
-        409,
+        400,
         "ConflictException",
     );
     assert_failure(
@@ -996,7 +996,7 @@ async fn creating_past_the_store_cap_answers_the_modelled_quota_error() {
                 }),
             )
             .await,
-        409,
+        400,
         "ConflictException",
     );
 
@@ -1022,7 +1022,7 @@ async fn creating_past_the_store_cap_answers_the_modelled_quota_error() {
                 json!({"keyspaceName": keyspace, "tableName": "one_too_many"}),
             )
             .await,
-        404,
+        400,
         "ResourceNotFoundException",
     );
     assert_failure(
@@ -1030,7 +1030,7 @@ async fn creating_past_the_store_cap_answers_the_modelled_quota_error() {
         emulator
             .call("ListTables", json!({"keyspaceName": "one_too_many_ks"}))
             .await,
-        404,
+        400,
         "ResourceNotFoundException",
     );
 }
@@ -1334,7 +1334,7 @@ async fn requests_that_break_an_unmodelled_rule_are_refused_and_the_rest_accepte
                 emulator
                     .call("GetTable", json!({"keyspaceName": keyspace, "tableName": case}))
                     .await,
-                404,
+                400,
                 "ResourceNotFoundException",
             );
         }
@@ -1353,7 +1353,7 @@ async fn requests_that_break_an_unmodelled_rule_are_refused_and_the_rest_accepte
                 }),
             )
             .await,
-        404,
+        400,
         "ResourceNotFoundException",
     );
 
@@ -1450,7 +1450,7 @@ async fn requests_that_break_an_unmodelled_rule_are_refused_and_the_rest_accepte
             assert_failure(
                 case,
                 emulator.call("ListTables", json!({"keyspaceName": case})).await,
-                404,
+                400,
                 "ResourceNotFoundException",
             );
         }

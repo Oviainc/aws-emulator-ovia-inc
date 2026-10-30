@@ -176,9 +176,15 @@ impl Emulator {
         let (status, body) = self
             .keyspaces("CreateKeyspace", json!({"keyspaceName": keyspace}))
             .await;
+        // A keyspace a previous case already created answers the modelled conflict, which
+        // this seed tolerates; what it does not tolerate is any OTHER answer.
+        let conflicted = body["__type"]
+            .as_str()
+            .is_some_and(|wire_type| wire_type.ends_with("ConflictException"));
         assert!(
-            status == 200 || status == 409,
-            "case {case:?}: expected CreateKeyspace to answer 200 or 409, got {status} {body}"
+            status == 200 || conflicted,
+            "case {case:?}: expected CreateKeyspace to answer 200 or the modelled \
+             ConflictException, got {status} {body}"
         );
         let mut request = json!({
             "keyspaceName": keyspace,

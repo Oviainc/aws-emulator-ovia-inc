@@ -208,10 +208,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is what refuses a create of one. Checked BEFORE the caps below (as
         // `create_table` checks its own duplicate first), because a name that is already
         // taken adds no entry, so no cap is what refuses it.
+        //
+        // The sentence is the service's own Cassandra-derived template for a keyspace
+        // that cannot be added because one of that name is there: fixed text, then the
+        // `keyspaceName` exactly as the request supplied it — unquoted, unqualified, with
+        // no trailing period and no Region clause, which is the form every refusal of
+        // this service carries (`crate::state::keyspace_not_found`,
+        // `crate::state::type_not_found`).
         if store.holds_keyspace(&region, &input.keyspace_name) {
             return Err(CreateKeyspaceErrorModeled::ConflictException(ConflictException {
                 message: Some(format!(
-                    "Keyspace '{}' already exists in Region '{region}'.",
+                    "Cannot add existing keyspace {}",
                     input.keyspace_name
                 )),
             })

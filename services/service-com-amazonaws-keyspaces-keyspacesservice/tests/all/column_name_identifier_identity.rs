@@ -299,7 +299,7 @@ async fn create_table_compares_column_names_as_cql_identifiers() {
                 assert_failure(
                     case,
                     get_table(&emulator, keyspace, case).await,
-                    404,
+                    400,
                     "ResourceNotFoundException",
                 );
             }

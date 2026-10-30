@@ -284,8 +284,8 @@ async fn a_table_whose_restore_is_in_flight_takes_no_change_and_blocks_its_keysp
         .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (409, "ConflictException"),
-        "case {:?}: expected 409 ConflictException, got {status} {body}",
+        (400, "ConflictException"),
+        "case {:?}: expected 400 ConflictException, got {status} {body}",
         "update a table whose restore is in flight"
     );
     let message = body
@@ -312,7 +312,7 @@ async fn a_table_whose_restore_is_in_flight_takes_no_change_and_blocks_its_keysp
                 }),
             )
             .await,
-        409,
+        400,
         "ConflictException",
     );
 
@@ -323,7 +323,7 @@ async fn a_table_whose_restore_is_in_flight_takes_no_change_and_blocks_its_keysp
         emulator
             .call("DeleteKeyspace", json!({"keyspaceName": TARGET_KEYSPACE}))
             .await,
-        409,
+        400,
         "ConflictException",
     );
 

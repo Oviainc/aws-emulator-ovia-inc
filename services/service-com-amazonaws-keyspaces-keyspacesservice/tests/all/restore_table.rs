@@ -759,13 +759,13 @@ async fn restore_refuses_what_the_contract_does_not_allow() {
                 "targetKeyspaceName": TARGET_KEYSPACE,
                 "targetTableName": "refused_1",
             }),
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
         },
         Row {
             name: "source_table_missing",
             request: restore_request("no_such_table", "refused_2", json!({})),
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
         },
         Row {
@@ -776,13 +776,13 @@ async fn restore_refuses_what_the_contract_does_not_allow() {
                 "targetKeyspaceName": "no_such_keyspace",
                 "targetTableName": "refused_3",
             }),
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
         },
         Row {
             name: "target_table_already_exists",
             request: restore_request("restorable", "already_there", json!({})),
-            status: 409,
+            status: 400,
             code: "ConflictException",
         },
         Row {
@@ -933,7 +933,7 @@ async fn restore_refuses_what_the_contract_does_not_allow() {
                         json!({"keyspaceName": TARGET_KEYSPACE, "tableName": target_table}),
                     )
                     .await,
-                404,
+                400,
                 "ResourceNotFoundException",
             );
         }
@@ -963,7 +963,7 @@ async fn restore_refuses_what_the_contract_does_not_allow() {
                 restore_request("still_creating", "refused_14", json!({})),
             )
             .await,
-        409,
+        400,
         "ConflictException",
     );
 
@@ -1159,7 +1159,7 @@ async fn restores_past_the_concurrent_limit_are_the_modelled_quota_failure() {
                 restore_request("busy", "tgt_over_limit", json!({})),
             )
             .await,
-        402,
+        400,
         "ServiceQuotaExceededException",
     );
 

@@ -186,7 +186,7 @@ async fn create_keyspace_refuses_a_region_list_entry_that_names_no_region() {
             emulator
                 .call("GetKeyspace", json!({"keyspaceName": keyspace}))
                 .await,
-            404,
+            400,
             "ResourceNotFoundException",
         );
 

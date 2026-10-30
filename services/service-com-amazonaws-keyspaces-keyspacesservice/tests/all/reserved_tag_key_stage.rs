@@ -11,8 +11,8 @@
 //! stored state, so one and the same key is refused with the same 400 `ValidationException`
 //! whatever the store holds: whether the resource the request names exists, is in a status
 //! that takes no change, or is one of the service's own. The rows therefore span the
-//! state-dependent answer the request would have got with an ordinary key (a 200, a 404
-//! `ResourceNotFoundException`, a 409 `ConflictException`, a 400 of another kind), and the
+//! state-dependent answer the request would have got with an ordinary key (a 200, a
+//! `ResourceNotFoundException`, a `ConflictException`, a refusal of another kind), and the
 //! same rows are driven with ordinary and with merely reserved-LOOKING keys, which must
 //! still get that state-dependent answer.
 //!
@@ -172,22 +172,22 @@ async fn tagging_refuses_a_reserved_key_before_it_resolves_the_arn() {
         ArnRow {
             name: "an unknown keyspace",
             resource_arn: keyspace_arn("no_such_ks"),
-            without_reserved: Expected::Failure(404, "ResourceNotFoundException"),
+            without_reserved: Expected::Failure(400, "ResourceNotFoundException"),
         },
         ArnRow {
             name: "an unknown table in a keyspace that exists",
             resource_arn: table_arn(KEYSPACE, "no_such_tbl"),
-            without_reserved: Expected::Failure(404, "ResourceNotFoundException"),
+            without_reserved: Expected::Failure(400, "ResourceNotFoundException"),
         },
         ArnRow {
             name: "the keyspace that exists, in another Region",
             resource_arn: format!("arn:aws:cassandra:eu-central-1:{account}:/keyspace/{KEYSPACE}/"),
-            without_reserved: Expected::Failure(404, "ResourceNotFoundException"),
+            without_reserved: Expected::Failure(400, "ResourceNotFoundException"),
         },
         ArnRow {
             name: "a resource form this service does not mint",
             resource_arn: format!("arn:aws:cassandra:{REGION}:{account}:/cluster/{KEYSPACE}/"),
-            without_reserved: Expected::Failure(404, "ResourceNotFoundException"),
+            without_reserved: Expected::Failure(400, "ResourceNotFoundException"),
         },
         ArnRow {
             name: "a service-managed keyspace, which takes no change from a caller",
@@ -320,21 +320,21 @@ async fn update_table_refuses_a_reserved_stream_tag_key_before_it_resolves_the_t
             keyspace: "no_such_ks".to_string(),
             table: TABLE.to_string(),
             fresh: false,
-            without_reserved: Expected::Failure(404, "ResourceNotFoundException"),
+            without_reserved: Expected::Failure(400, "ResourceNotFoundException"),
         },
         UpdateRow {
             name: "an unknown table in a keyspace that exists",
             keyspace: KEYSPACE.to_string(),
             table: "no_such_tbl".to_string(),
             fresh: false,
-            without_reserved: Expected::Failure(404, "ResourceNotFoundException"),
+            without_reserved: Expected::Failure(400, "ResourceNotFoundException"),
         },
         UpdateRow {
             name: "a table still CREATING, which takes no update yet",
             keyspace: KEYSPACE.to_string(),
             table: "fresh_tbl".to_string(),
             fresh: true,
-            without_reserved: Expected::Failure(409, "ConflictException"),
+            without_reserved: Expected::Failure(400, "ConflictException"),
         },
         UpdateRow {
             name: "a system table of a service-managed keyspace",
@@ -466,13 +466,13 @@ async fn restore_table_refuses_a_reserved_tags_override_key_before_it_resolves_t
             name: "an unknown source keyspace",
             source_keyspace: "no_such_ks".to_string(),
             source_table: "restorable".to_string(),
-            without_reserved: Expected::Failure(404, "ResourceNotFoundException"),
+            without_reserved: Expected::Failure(400, "ResourceNotFoundException"),
         },
         RestoreRow {
             name: "an unknown source table in a keyspace that exists",
             source_keyspace: source_keyspace.to_string(),
             source_table: "no_such_tbl".to_string(),
-            without_reserved: Expected::Failure(404, "ResourceNotFoundException"),
+            without_reserved: Expected::Failure(400, "ResourceNotFoundException"),
         },
         RestoreRow {
             name: "a source table with no restorable point in time",
@@ -524,7 +524,7 @@ async fn restore_table_refuses_a_reserved_tags_override_key_before_it_resolves_t
                                 }),
                             )
                             .await,
-                        404,
+                        400,
                         "ResourceNotFoundException",
                     );
                 }

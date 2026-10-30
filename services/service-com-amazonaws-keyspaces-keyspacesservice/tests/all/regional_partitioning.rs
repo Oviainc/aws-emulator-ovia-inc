@@ -15,9 +15,9 @@
 //! 1. The same `keyspaceName` is created once per Region, each time minting that Region's
 //!    ARN, while a second create in the SAME Region is still the modelled conflict.
 //! 2. `ListKeyspaces` reports exactly what the asking Region holds, and `GetKeyspace`
-//!    answers the modelled 404 for a keyspace only another Region holds.
+//!    answers the modelled not-found for a keyspace only another Region holds.
 //! 3. A keyspace's tables, types and tags go with it: every operation that reads or writes
-//!    one answers the modelled 404 when asked from another Region, and the same names
+//!    one answers the modelled not-found when asked from another Region, and the same names
 //!    created in two Regions are two resources with two ARNs and two tag sets.
 //! 4. The service-managed catalog is reported to EVERY Region, including one nothing was
 //!    created in, with that Region's keyspace and table ARNs — whichever Region called
@@ -190,7 +190,7 @@ async fn a_keyspace_name_names_one_keyspace_per_region() {
             emulator
                 .call(region, "CreateKeyspace", json!({"keyspaceName": shared}))
                 .await,
-            409,
+            400,
             "ConflictException",
         );
 
@@ -263,7 +263,7 @@ async fn a_keyspace_name_names_one_keyspace_per_region() {
                 emulator
                     .call(region, "GetKeyspace", json!({"keyspaceName": elsewhere}))
                     .await,
-                404,
+                400,
                 "ResourceNotFoundException",
             );
             assert_failure(
@@ -271,7 +271,7 @@ async fn a_keyspace_name_names_one_keyspace_per_region() {
                 emulator
                     .call(region, "ListTables", json!({"keyspaceName": elsewhere}))
                     .await,
-                404,
+                400,
                 "ResourceNotFoundException",
             );
         }
@@ -343,7 +343,7 @@ async fn a_keyspaces_tables_types_and_tags_belong_to_its_region() {
     );
 
     // Every operation that reads or writes something INSIDE that keyspace answers the
-    // modelled 404 when it is asked from another Region, because the keyspace is not a
+    // modelled not-found when it is asked from another Region, because the keyspace is not a
     // resource of that Region at all.
     let inside: Vec<(&str, Value)> = vec![
         ("ListTables", json!({"keyspaceName": keyspace})),
@@ -408,7 +408,7 @@ async fn a_keyspaces_tables_types_and_tags_belong_to_its_region() {
             assert_failure(
                 &format!("{operation} on {home}'s keyspace, signed for {away}"),
                 emulator.call(away, operation, request.clone()).await,
-                404,
+                400,
                 "ResourceNotFoundException",
             );
         }
@@ -439,7 +439,7 @@ async fn a_keyspaces_tables_types_and_tags_belong_to_its_region() {
             assert_failure(
                 &format!("{operation} on {home}'s table ARN, signed for {away}"),
                 emulator.call(away, operation, request).await,
-                404,
+                400,
                 "ResourceNotFoundException",
             );
         }
@@ -664,7 +664,7 @@ async fn a_delete_in_one_region_leaves_the_other_regions_keyspace() {
         emulator
             .call(dropped, "GetKeyspace", json!({"keyspaceName": keyspace}))
             .await,
-        404,
+        400,
         "ResourceNotFoundException",
     );
     let survivor = assert_ok(
@@ -705,7 +705,7 @@ async fn a_delete_in_one_region_leaves_the_other_regions_keyspace() {
         emulator
             .call(kept, "CreateKeyspace", json!({"keyspaceName": keyspace}))
             .await,
-        409,
+        400,
         "ConflictException",
     );
 }

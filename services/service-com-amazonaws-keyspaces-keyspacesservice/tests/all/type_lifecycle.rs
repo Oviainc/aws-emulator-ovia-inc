@@ -235,7 +235,7 @@ async fn create_type_formats_the_name_and_round_trips_through_get_type() {
                     }),
                 )
                 .await,
-            409,
+            400,
             "ConflictException",
         );
     }
@@ -413,7 +413,7 @@ async fn a_type_name_in_neither_documented_form_is_a_modelled_validation_failure
         emulator
             .call("GetType", json!({"keyspaceName": ks, "typeName": "twice"}))
             .await,
-        404,
+        400,
         "ResourceNotFoundException",
     );
 
@@ -435,7 +435,7 @@ async fn a_type_name_in_neither_documented_form_is_a_modelled_validation_failure
                 }),
             )
             .await,
-        402,
+        400,
         "ServiceQuotaExceededException",
     );
     assert_failure(
@@ -446,7 +446,7 @@ async fn a_type_name_in_neither_documented_form_is_a_modelled_validation_failure
                 json!({"keyspaceName": ks, "typeName": "too_many_fields"}),
             )
             .await,
-        404,
+        400,
         "ResourceNotFoundException",
     );
     // Exactly at the cap is accepted, so the bound is the published one and not one off.
@@ -682,7 +682,7 @@ async fn referring_to_a_type_that_is_not_usable_is_a_modelled_not_found() {
                 }),
             )
             .await;
-        assert_failure(case, (status, body.clone()), 404, "ResourceNotFoundException");
+        assert_failure(case, (status, body.clone()), 400, "ResourceNotFoundException");
         assert_eq!(
             body["resourceArn"],
             json!(type_arn(ks, missing)),
@@ -704,7 +704,7 @@ async fn referring_to_a_type_that_is_not_usable_is_a_modelled_not_found() {
                     json!({"keyspaceName": ks, "typeName": "refers_to_the_unusable"}),
                 )
                 .await,
-            404,
+            400,
             "ResourceNotFoundException",
         );
     }
@@ -752,7 +752,7 @@ async fn referring_to_a_type_that_is_not_usable_is_a_modelled_not_found() {
         ),
     ] {
         let (status, body) = emulator.call(operation, request).await;
-        assert_failure(case, (status, body.clone()), 404, "ResourceNotFoundException");
+        assert_failure(case, (status, body.clone()), 400, "ResourceNotFoundException");
         assert_eq!(
             body["resourceArn"],
             json!(expected_arn),
@@ -795,7 +795,7 @@ async fn creating_types_past_the_store_cap_answers_the_modelled_quota_error() {
                 }),
             )
             .await,
-        402,
+        400,
         "ServiceQuotaExceededException",
     );
     assert_failure(
@@ -806,7 +806,7 @@ async fn creating_types_past_the_store_cap_answers_the_modelled_quota_error() {
                 json!({"keyspaceName": ks, "typeName": "one_too_many"}),
             )
             .await,
-        404,
+        400,
         "ResourceNotFoundException",
     );
     // A full keyspace does not change what a name already taken answers.
@@ -822,7 +822,7 @@ async fn creating_types_past_the_store_cap_answers_the_modelled_quota_error() {
                 }),
             )
             .await,
-        409,
+        400,
         "ConflictException",
     );
 }

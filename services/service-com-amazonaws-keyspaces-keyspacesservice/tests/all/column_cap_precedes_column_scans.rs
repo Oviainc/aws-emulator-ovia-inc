@@ -10,7 +10,7 @@
 //! table's schema holding, against the per-table column cap — is decided before any
 //! per-column scan over that same list and before every refusal that depends on what the
 //! store holds. So an oversized column list answers the modelled
-//! `ServiceQuotaExceededException` (402) whatever ELSE is wrong with the columns in it or
+//! `ServiceQuotaExceededException` whatever ELSE is wrong with the columns in it or
 //! with the resources the request names, and the two operations that carry a column list,
 //! `CreateTable` and `UpdateTable`, grade the same pair of faults in the same order.
 //!
@@ -31,8 +31,10 @@ use crate::keyspace_table_lifecycle::{
 /// `len 1..` with NO maximum.
 const CAP: usize = keyspaces::MAX_COLUMNS_PER_TABLE;
 
-/// The modelled quota refusal an oversized column list earns.
-const QUOTA: (u16, &str) = (402, "ServiceQuotaExceededException");
+/// The modelled quota refusal an oversized column list earns, on the client-error status
+/// every refusal of this RPC service travels with
+/// (`service_..._keyspacesservice::scaffolded::CLIENT_ERROR_STATUS`).
+const QUOTA: (u16, &str) = (400, "ServiceQuotaExceededException");
 
 /// The resulting column counts every case is run at: a small list, the cap exactly, one
 /// past the cap, and well past it.
@@ -71,7 +73,7 @@ fn faults() -> Vec<Fault> {
         Fault {
             name: "unresolvable_type_first",
             plant: |columns| columns[0]["type"] = json!("nosuchtype"),
-            alone: Some((404, "ResourceNotFoundException")),
+            alone: Some((400, "ResourceNotFoundException")),
         },
         Fault {
             name: "unresolvable_type_last",
@@ -79,12 +81,12 @@ fn faults() -> Vec<Fault> {
                 let last = columns.len() - 1;
                 columns[last]["type"] = json!("nosuchtype");
             },
-            alone: Some((404, "ResourceNotFoundException")),
+            alone: Some((400, "ResourceNotFoundException")),
         },
         Fault {
             name: "unresolvable_type_in_constructor",
             plant: |columns| columns[0]["type"] = json!("frozen<nosuchtype>"),
-            alone: Some((404, "ResourceNotFoundException")),
+            alone: Some((400, "ResourceNotFoundException")),
         },
         Fault {
             name: "duplicate_column_name",
@@ -199,7 +201,7 @@ async fn an_oversized_column_list_is_the_quota_error_whatever_else_is_wrong_with
                     let (read_status, read_body) = get_table(&emulator, keyspace, &table).await;
                     assert_eq!(
                         (read_status, error_code(&read_body).as_str()),
-                        (404, "ResourceNotFoundException"),
+                        (400, "ResourceNotFoundException"),
                         "case {case:?}: a refused create must store no table, got \
                          {read_status} {read_body}"
                     );
@@ -324,13 +326,13 @@ async fn the_column_cap_is_graded_ahead_of_the_refusals_that_depend_on_stored_st
             name: "keyspace_that_does_not_exist",
             keyspace_name: "col_cap_no_such_ks",
             table_name: "any_tbl",
-            within_cap: (404, "ResourceNotFoundException"),
+            within_cap: (400, "ResourceNotFoundException"),
         },
         Row {
             name: "table_name_already_taken",
             keyspace_name: keyspace,
             table_name: taken,
-            within_cap: (409, "ConflictException"),
+            within_cap: (400, "ConflictException"),
         },
     ];
 

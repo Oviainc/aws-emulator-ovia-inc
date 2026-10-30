@@ -426,15 +426,19 @@ async fn getting_a_keyspace_that_is_not_stored_is_the_modelled_error() {
     tokio::time::sleep(settle_wait()).await;
 
     // (case, requested name, expected status, expected error code)
+    //
+    // Every row is refused on the one client-error status this RPC service answers with
+    // (`service_..._keyspacesservice::scaffolded::CLIENT_ERROR_STATUS`); what tells the
+    // two refusals apart is the error CODE in the body.
     let rows: Vec<(&str, String, u16, &str)> = vec![
-        ("never_created", "no_such_keyspace".to_string(), 404, "ResourceNotFoundException"),
-        ("deleted", "orders_old".to_string(), 404, "ResourceNotFoundException"),
+        ("never_created", "no_such_keyspace".to_string(), 400, "ResourceNotFoundException"),
+        ("deleted", "orders_old".to_string(), 400, "ResourceNotFoundException"),
         // A prefix of a stored name is a different name.
-        ("prefix_of_a_stored_name", "orders".to_string(), 404, "ResourceNotFoundException"),
+        ("prefix_of_a_stored_name", "orders".to_string(), 400, "ResourceNotFoundException"),
         // The bottom of the modelled length range, well formed and absent.
-        ("shortest_absent", "z".to_string(), 404, "ResourceNotFoundException"),
+        ("shortest_absent", "z".to_string(), 400, "ResourceNotFoundException"),
         // The top of it, likewise.
-        ("longest_absent", longest_name("absent_"), 404, "ResourceNotFoundException"),
+        ("longest_absent", longest_name("absent_"), 400, "ResourceNotFoundException"),
         // One past the top.
         ("one_past_the_longest", format!("{}y", longest_name("absent_")), 400, "ValidationException"),
         // One below the bottom.
@@ -450,12 +454,19 @@ async fn getting_a_keyspace_that_is_not_stored_is_the_modelled_error() {
             .await;
         let body = answer.1.clone();
         assert_failure(case, answer, *expected_status, expected_code);
-        if *expected_status == 404 {
+        if *expected_code == "ResourceNotFoundException" {
             // Which resource was missing: the modelled member a client reads to find out.
             assert_eq!(
                 body["resourceArn"],
                 json!(keyspace_arn(name)),
                 "case {case:?}: the not-found names the keyspace that was looked for, got {body}"
+            );
+            // And the sentence the service words that refusal with, which carries the
+            // requested name and nothing else.
+            assert_eq!(
+                body["message"],
+                json!(format!("Keyspace {name} does not exist")),
+                "case {case:?}: unexpected not-found message, got {body}"
             );
         }
     }
@@ -468,8 +479,8 @@ async fn getting_a_keyspace_that_is_not_stored_is_the_modelled_error() {
         json!(keyspace_arn("orders_live")),
         "case \"stored_keyspace_survives\": the stored keyspace is untouched, got {got}"
     );
-    for (case, name, expected_status, _) in &rows {
-        if *expected_status != 404 {
+    for (case, name, _, expected_code) in &rows {
+        if *expected_code != "ResourceNotFoundException" {
             continue;
         }
         assert_failure(
@@ -477,7 +488,7 @@ async fn getting_a_keyspace_that_is_not_stored_is_the_modelled_error() {
             emulator
                 .call("GetKeyspace", json!({"keyspaceName": name}))
                 .await,
-            404,
+            400,
             "ResourceNotFoundException",
         );
     }

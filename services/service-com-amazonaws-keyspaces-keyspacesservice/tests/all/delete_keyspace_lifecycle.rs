@@ -33,9 +33,11 @@ use super::keyspace_table_lifecycle::{
     REGION,
 };
 
-/// The wire status and code the model declares for an action that cannot be completed
-/// because another one is already in progress (`ConflictException`, HTTP 409).
-const CONFLICT_STATUS: u16 = 409;
+/// The wire status and code this service answers an action that cannot be completed
+/// because another one is already in progress with: the modelled `ConflictException`, on
+/// the client-error status every refusal of this RPC service travels with
+/// (`service_..._keyspacesservice::scaffolded::CLIENT_ERROR_STATUS`).
+const CONFLICT_STATUS: u16 = 400;
 const CONFLICT_CODE: &str = "ConflictException";
 
 /// Regions other than the request's own ([`REGION`]), each within `RegionList`'s member
@@ -329,7 +331,7 @@ async fn delete_keyspace_settles_every_keyspace_shape_into_absence() {
         // The deletion the clock owed has completed: the keyspace, its tables and its
         // types are gone from every reader.
         let (status, body) = get_keyspace(&emulator, case).await;
-        assert_failure(case, (status, body.clone()), 404, "ResourceNotFoundException");
+        assert_failure(case, (status, body.clone()), 400, "ResourceNotFoundException");
         assert_eq!(
             body["resourceArn"],
             json!(keyspace_arn(case)),
@@ -343,7 +345,7 @@ async fn delete_keyspace_settles_every_keyspace_shape_into_absence() {
             assert_failure(
                 case,
                 get_table(&emulator, case, table).await,
-                404,
+                400,
                 "ResourceNotFoundException",
             );
         }
@@ -351,7 +353,7 @@ async fn delete_keyspace_settles_every_keyspace_shape_into_absence() {
             assert_failure(
                 case,
                 get_type(&emulator, case, udt).await,
-                404,
+                400,
                 "ResourceNotFoundException",
             );
         }
@@ -360,7 +362,7 @@ async fn delete_keyspace_settles_every_keyspace_shape_into_absence() {
             emulator
                 .call("DeleteKeyspace", json!({"keyspaceName": case}))
                 .await,
-            404,
+            400,
             "ResourceNotFoundException",
         );
 
@@ -664,7 +666,7 @@ async fn a_resource_already_deleting_does_not_block_the_keyspace_delete() {
     assert_failure(
         keyspace,
         get_keyspace(&emulator, keyspace).await,
-        404,
+        400,
         "ResourceNotFoundException",
     );
 }
@@ -790,14 +792,14 @@ async fn a_keyspace_being_deleted_takes_no_new_resource() {
         assert_failure(
             case,
             emulator.call(operation, request.clone()).await,
-            404,
+            400,
             "ResourceNotFoundException",
         );
     }
     assert_failure(
         "the table a refused create would have added",
         get_table(&emulator, doomed, "late_tbl").await,
-        404,
+        400,
         "ResourceNotFoundException",
     );
 }

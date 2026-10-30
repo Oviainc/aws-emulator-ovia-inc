@@ -19,6 +19,8 @@ mod cdc_specification_tags_on_update;
 mod cdc_stream_tag_lifetime;
 #[path = "all/cdc_streams.rs"]
 mod cdc_streams;
+#[path = "all/client_error_status.rs"]
+mod client_error_status;
 #[path = "all/column_cap_precedes_column_scans.rs"]
 mod column_cap_precedes_column_scans;
 #[path = "all/column_name_identifier_identity.rs"]

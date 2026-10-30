@@ -11,9 +11,9 @@
 //! 1. Every optional member `CreateTableRequest` models is ordinary input: a well-formed
 //!    create that carries it answers HTTP 200 with the table's `resourceArn` and stores the
 //!    table, whichever subset of those members it names. `CreateTable` models exactly
-//!    `AccessDeniedException` (403), `ConflictException` (409), `InternalServerException`
-//!    (500), `ResourceNotFoundException` (404), `ServiceQuotaExceededException` (402) and
-//!    `ValidationException` (400) — no not-implemented error of any status — so naming a
+//!    `AccessDeniedException`, `ConflictException`, `InternalServerException`,
+//!    `ResourceNotFoundException`, `ServiceQuotaExceededException` and
+//!    `ValidationException` — no not-implemented error of any status — so naming a
 //!    modelled member is never itself a reason to refuse the create.
 //! 2. What a create stores, a read reports. `replicaSpecifications` configures "the table's
 //!    read capacity differently per Amazon Web Services Region": a Region an entry gives

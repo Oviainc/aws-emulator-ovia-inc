@@ -22,7 +22,7 @@
 //!    by the keyspace's ARN, `DeleteKeyspace` addressed by a table ARN of that keyspace,
 //!    and `DeleteTable` addressed by the table's ARN while its keyspace stays `ACTIVE` —
 //!    refuses `TagResource` and `UntagResource` alike, leaves the tag set exactly as it
-//!    was, and settles into absence, where the same calls answer the 404 instead.
+//!    was, and settles into absence, where the same calls answer the not-found instead.
 //! 2. Every other status these resources can be observed in — `CREATING`, `ACTIVE` and,
 //!    for a table, `UPDATING` — still takes a tagging write, which the reader reports
 //!    back. The statuses are the model's own `KeyspaceStatus` / `TableStatus` value sets.
@@ -38,8 +38,11 @@ use super::keyspace_table_lifecycle::{
     REGION,
 };
 
-/// The wire answer the model declares for a resource that is already on its way out.
-const CONFLICT_STATUS: u16 = 409;
+/// The wire answer this service gives for a resource that is already on its way out: the
+/// modelled `ConflictException`, on the client-error status every refusal of this RPC
+/// service travels with
+/// (`service_..._keyspacesservice::scaffolded::CLIENT_ERROR_STATUS`).
+const CONFLICT_STATUS: u16 = 400;
 const CONFLICT_CODE: &str = "ConflictException";
 
 /// The tag every row seeds while its resource is still settled, so a refused `TagResource`
@@ -137,7 +140,7 @@ async fn reported_tags(
 }
 
 /// RULE 1: a tagging write against a resource whose deletion is in progress is the modelled
-/// conflict, changes nothing, and becomes the 404 once the deletion completes.
+/// conflict, changes nothing, and becomes the not-found once the deletion completes.
 #[tokio::test]
 async fn a_tagging_write_against_a_deleting_resource_is_refused_and_stores_nothing() {
     for row in rows() {
@@ -264,7 +267,7 @@ async fn a_tagging_write_against_a_deleting_resource_is_refused_and_stores_nothi
         );
 
         // Once the clock settles the deletion the resource is gone, so the SAME calls now
-        // answer the 404 rather than the conflict — which is what makes the conflict the
+        // answer the not-found rather than the conflict — which is what makes the conflict the
         // answer for the window, not a second spelling of absence.
         tokio::time::sleep(settle_wait()).await;
         for (operation, request_tags) in [
@@ -279,14 +282,14 @@ async fn a_tagging_write_against_a_deleting_resource_is_refused_and_stores_nothi
                         json!({"resourceArn": resource_arn, "tags": request_tags}),
                     )
                     .await,
-                404,
+                400,
                 "ResourceNotFoundException",
             );
         }
         assert_failure(
             &format!("ListTagsForResource {case} after the deletion completed"),
             list_tags(&emulator, &resource_arn).await,
-            404,
+            400,
             "ResourceNotFoundException",
         );
     }

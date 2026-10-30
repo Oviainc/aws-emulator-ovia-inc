@@ -12,7 +12,7 @@
 //!    usable, exactly as a UDT field's type may: every identifier in it that names neither
 //!    a CQL native type nor a type constructor must be a type of that keyspace in status
 //!    `ACTIVE`, and a reference to an absent or not-yet-`ACTIVE` type is the modelled
-//!    `ResourceNotFoundException` (404) naming it, with no table stored.
+//!    `ResourceNotFoundException` naming it, with no table stored.
 //! 2. `autoScalingSpecification` is a modelled, optional input of a table in provisioned
 //!    capacity mode: it is stored as given and reported back by
 //!    `GetTableAutoScalingSettings`, and a request that breaks one of the documented
@@ -152,7 +152,7 @@ async fn create_table_resolves_a_native_column_type_and_refuses_an_unresolvable_
             }
             Some(unresolved) => {
                 let (status, body) = answer;
-                assert_failure(&case, (status, body.clone()), 404, "ResourceNotFoundException");
+                assert_failure(&case, (status, body.clone()), 400, "ResourceNotFoundException");
                 assert_member(
                     &case,
                     &body,
@@ -163,7 +163,7 @@ async fn create_table_resolves_a_native_column_type_and_refuses_an_unresolvable_
                 assert_failure(
                     &case,
                     emulator.call("GetTable", read_back).await,
-                    404,
+                    400,
                     "ResourceNotFoundException",
                 );
             }
@@ -220,7 +220,7 @@ async fn a_column_type_resolves_against_the_user_defined_types_of_its_own_keyspa
     assert_failure(
         "a type that is still CREATING",
         (status, body.clone()),
-        404,
+        400,
         "ResourceNotFoundException",
     );
     assert_member(
@@ -289,7 +289,7 @@ async fn a_column_type_resolves_against_the_user_defined_types_of_its_own_keyspa
                 }),
             )
             .await;
-        assert_failure(&case, (status, body.clone()), 404, "ResourceNotFoundException");
+        assert_failure(&case, (status, body.clone()), 400, "ResourceNotFoundException");
         assert_member(
             &case,
             &body,
@@ -704,7 +704,7 @@ async fn auto_scaling_requests_that_break_a_documented_rule_are_refused() {
                         json!({"keyspaceName": keyspace, "tableName": case}),
                     )
                     .await,
-                404,
+                400,
                 "ResourceNotFoundException",
             );
         }
@@ -755,7 +755,7 @@ async fn auto_scaling_requests_that_break_a_documented_rule_are_refused() {
     assert_failure(
         "unknown keyspace",
         (status, body.clone()),
-        404,
+        400,
         "ResourceNotFoundException",
     );
     assert_member(
@@ -795,7 +795,7 @@ async fn a_table_that_is_not_in_state_carries_the_request_derived_message() {
                     json!({"keyspaceName": keyspace, "tableName": name}),
                 )
                 .await;
-            assert_failure(&case, (status, body.clone()), 404, "ResourceNotFoundException");
+            assert_failure(&case, (status, body.clone()), 400, "ResourceNotFoundException");
             assert_member(
                 &case,
                 &body,
@@ -849,7 +849,7 @@ async fn a_table_that_is_not_in_state_carries_the_request_derived_message() {
     assert_failure(
         "DeleteTable on an already-deleted table",
         (status, body.clone()),
-        404,
+        400,
         "ResourceNotFoundException",
     );
     assert_member(
@@ -870,7 +870,7 @@ async fn a_table_that_is_not_in_state_carries_the_request_derived_message() {
     assert_failure(
         "unknown keyspace",
         (status, body.clone()),
-        404,
+        400,
         "ResourceNotFoundException",
     );
     let message = body["message"].as_str().unwrap_or_default().to_string();

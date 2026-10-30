@@ -262,7 +262,7 @@ async fn a_static_column_requires_at_least_one_clustering_column() {
                         json!({"keyspaceName": keyspace, "tableName": case}),
                     )
                     .await,
-                404,
+                400,
                 "ResourceNotFoundException",
             );
         }

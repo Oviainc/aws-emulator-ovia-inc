@@ -9,7 +9,7 @@
 //! added to a table that already exists declares its type under exactly the rule a created
 //! column does — every identifier in the type that names neither a CQL native type nor a
 //! type constructor must name a user-defined type of the SAME keyspace in status `ACTIVE`,
-//! and any other reference is the modelled `ResourceNotFoundException` (404) naming that
+//! and any other reference is the modelled `ResourceNotFoundException` naming that
 //! type, with nothing added to the stored schema.
 //!
 //! Its consequences, also pinned here: a refused update leaves the table exactly as it was
@@ -212,7 +212,7 @@ async fn adding_columns_resolves_every_published_type_and_refuses_an_unresolvabl
         let (status, body) =
             add_columns(&emulator, keyspace, table, json!([{"name": "junk", "type": declared}]))
                 .await;
-        assert_failure(&case, (status, body.clone()), 404, "ResourceNotFoundException");
+        assert_failure(&case, (status, body.clone()), 400, "ResourceNotFoundException");
         assert_eq!(
             body["message"],
             json!(format!("UDT {unresolved} does not exist")),
@@ -235,7 +235,7 @@ async fn adding_columns_resolves_every_published_type_and_refuses_an_unresolvabl
         ]),
     )
     .await;
-    assert_failure(case, (status, body.clone()), 404, "ResourceNotFoundException");
+    assert_failure(case, (status, body.clone()), 400, "ResourceNotFoundException");
     assert_eq!(
         body["message"],
         json!("UDT ghost_udt does not exist"),
@@ -285,7 +285,7 @@ async fn an_added_column_resolves_against_the_user_defined_types_of_its_own_keys
         json!([{"name": "home", "type": "frozen<address>"}]),
     )
     .await;
-    assert_failure(case, (status, body.clone()), 404, "ResourceNotFoundException");
+    assert_failure(case, (status, body.clone()), 400, "ResourceNotFoundException");
     assert_eq!(
         body["message"],
         json!("UDT address does not exist"),
@@ -355,7 +355,7 @@ async fn an_added_column_resolves_against_the_user_defined_types_of_its_own_keys
             json!([{"name": "home", "type": declared}]),
         )
         .await;
-        assert_failure(&case, (status, body.clone()), 404, "ResourceNotFoundException");
+        assert_failure(&case, (status, body.clone()), 400, "ResourceNotFoundException");
         assert_eq!(
             body["message"],
             json!("UDT address does not exist"),
@@ -384,7 +384,7 @@ async fn a_refused_column_leaves_no_phantom_reference_for_a_type_created_later()
             json!([{"name": "home", "type": "frozen<later_udt>"}]),
         )
         .await,
-        404,
+        400,
         "ResourceNotFoundException",
     );
 

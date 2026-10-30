@@ -611,7 +611,7 @@ async fn update_keyspace_refuses_a_request_no_rule_allows() {
                 "keyspaceName": "never_created",
                 "replicationSpecification": multi_region(&[REGION, OTHER_REGIONS[0]]),
             }),
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
         },
         RefusalCase {
@@ -816,7 +816,7 @@ async fn update_keyspace_conflicts_while_a_resource_is_still_settling() {
     assert_failure(
         "keyspace still CREATING",
         emulator.call("UpdateKeyspace", request()).await,
-        409,
+        400,
         "ConflictException",
     );
     tokio::time::sleep(settle_wait()).await;
@@ -839,7 +839,7 @@ async fn update_keyspace_conflicts_while_a_resource_is_still_settling() {
     assert_failure(
         "table still CREATING",
         emulator.call("UpdateKeyspace", request()).await,
-        409,
+        400,
         "ConflictException",
     );
     tokio::time::sleep(settle_wait()).await;
@@ -865,7 +865,7 @@ async fn update_keyspace_conflicts_while_a_resource_is_still_settling() {
                 }),
             )
             .await,
-        409,
+        400,
         "ConflictException",
     );
 

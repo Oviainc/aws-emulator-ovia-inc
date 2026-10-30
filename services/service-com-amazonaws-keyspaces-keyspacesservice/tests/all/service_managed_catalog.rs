@@ -10,7 +10,7 @@
 //! reporting operation resolves and reports them exactly as it does a created resource —
 //! and, because they are the SERVICE's resources, every operation that would create,
 //! change or delete one inside them is refused with the modelled `ValidationException`
-//! rather than a 404 or a silent mutation.
+//! rather than a not-found or a silent mutation.
 //!
 //! Concretely:
 //!
@@ -26,10 +26,10 @@
 //!    read leaves the catalog exactly as it was.
 //! 5. Every write against a service-managed keyspace — `CreateTable`, `UpdateTable`,
 //!    `DeleteTable`, `CreateType`, `DeleteKeyspace`, `TagResource`, `UntagResource` — is
-//!    the modelled 400 `ValidationException`, and `CreateKeyspace` of one of their names
-//!    is the modelled 409 `ConflictException` because the name is already taken.
-//! 6. A keyspace that is NOT service-managed still 404s, so (5) and (2) are rules about
-//!    the catalog rather than a blanket answer.
+//!    the modelled `ValidationException`, and `CreateKeyspace` of one of their names
+//!    is the modelled `ConflictException` because the name is already taken.
+//! 6. A keyspace that is NOT service-managed is still the modelled not-found, so (5) and
+//!    (2) are rules about the catalog rather than a blanket answer.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_keyspaces_keyspacesservice::state as keyspaces;
@@ -151,7 +151,7 @@ async fn the_service_managed_catalog_is_present_before_any_call() {
             "case {keyspace:?}: a single-Region keyspace reports no replicationRegions: {got}"
         );
 
-        // ... and ListTables answers 200 with its system tables, not a 404.
+        // ... and ListTables answers 200 with its system tables, not a not-found.
         let mut expected: Vec<String> =
             system_tables.iter().map(|name| (*name).to_string()).collect();
         expected.sort();
@@ -189,14 +189,14 @@ async fn the_service_managed_catalog_is_present_before_any_call() {
     }
 
     // RULE 6: the answers above are about the catalog, not a blanket 200 — a keyspace
-    // nothing holds is still the modelled 404.
+    // nothing holds is still the modelled not-found.
     for absent in ["system_absent", "systemish", "not_a_system_ks"] {
         assert_failure(
             absent,
             emulator
                 .call("ListTables", json!({"keyspaceName": absent}))
                 .await,
-            404,
+            400,
             "ResourceNotFoundException",
         );
         assert_failure(
@@ -204,7 +204,7 @@ async fn the_service_managed_catalog_is_present_before_any_call() {
             emulator
                 .call("GetKeyspace", json!({"keyspaceName": absent}))
                 .await,
-            404,
+            400,
             "ResourceNotFoundException",
         );
     }
@@ -264,7 +264,7 @@ async fn every_system_table_reads_back_through_get_table() {
                 );
             }
 
-            // A table of the catalog that does not exist is still the modelled 404, so
+            // A table of the catalog that does not exist is still the modelled not-found, so
             // the answer above is the stored table rather than any name in a system
             // keyspace.
             assert_failure(
@@ -275,7 +275,7 @@ async fn every_system_table_reads_back_through_get_table() {
                         json!({"keyspaceName": keyspace, "tableName": format!("{table}_absent")}),
                     )
                     .await,
-                404,
+                400,
                 "ResourceNotFoundException",
             );
         }
@@ -355,7 +355,7 @@ async fn a_service_managed_keyspace_refuses_every_write() {
             emulator
                 .call("CreateKeyspace", json!({"keyspaceName": keyspace}))
                 .await,
-            409,
+            400,
             "ConflictException",
         );
 
@@ -374,7 +374,7 @@ async fn a_service_managed_keyspace_refuses_every_write() {
             expected,
             "case {keyspace:?}: a refused write must leave the catalog alone, got {listed}"
         );
-        // Reading the tags of a resource the service manages is a report, not a 404: it
+        // Reading the tags of a resource the service manages is a report, not a not-found: it
         // holds none, and the modelled `TagList` cannot carry an empty list, so the
         // member is absent.
         let tags = assert_ok(

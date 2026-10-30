@@ -7,7 +7,7 @@
 //! ("The DeleteKeyspace operation deletes a keyspace and all of its tables"), so it is
 //! refused — with the `ConflictException` the model declares on this operation, "you try
 //! to perform an action and the same or a different action is already in progress"
-//! (HTTP 409) — for as long as ANY resource it would drop still owes the clock a
+//! — for as long as ANY resource it would drop still owes the clock a
 //! transition towards a usable status, which is exactly the state in which dropping that
 //! resource on its own is refused; and a refused delete writes nothing, in this service's
 //! state or in the Application Auto Scaling resources the accepted one retires.
@@ -42,9 +42,11 @@ use super::keyspace_table_lifecycle::{
     assert_failure, assert_ok, minimal_schema, settle_wait, Emulator,
 };
 
-/// The wire status and code the model declares for an action that cannot be completed
-/// because another one is already in progress (`ConflictException`).
-const CONFLICT_STATUS: u16 = 409;
+/// The wire status and code this service answers an action that cannot be completed
+/// because another one is already in progress with: the modelled `ConflictException`, on
+/// this RPC service's client-error status
+/// (`service_..._keyspacesservice::scaffolded::CLIENT_ERROR_STATUS`).
+const CONFLICT_STATUS: u16 = 400;
 const CONFLICT_CODE: &str = "ConflictException";
 
 /// The wire status and code `DeleteTable`'s own documentation names for a table that is

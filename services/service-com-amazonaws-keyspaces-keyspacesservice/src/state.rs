@@ -2146,12 +2146,16 @@ pub fn type_arn(region: &str, keyspace_name: &str, type_name: &str) -> String {
 
 /// The `ResourceNotFoundException` payload for a keyspace that is not in state.
 ///
+/// The message is the Cassandra-style form Amazon Keyspaces builds from the request for
+/// a keyspace lookup — the bare `keyspaceName`, unquoted and with no trailing period —
+/// the same shape of sentence a missing type takes ([`type_not_found`]).
+///
 /// The ARN of the resource that was looked for goes in the modelled
 /// `resourceArn` member, which is what a client reads to learn WHICH resource
 /// was missing.
 pub fn keyspace_not_found(region: &str, keyspace_name: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("Keyspace '{keyspace_name}' was not found.")),
+        message: Some(format!("Keyspace {keyspace_name} does not exist")),
         resource_arn: Some(keyspace_arn(region, keyspace_name)),
     }
 }

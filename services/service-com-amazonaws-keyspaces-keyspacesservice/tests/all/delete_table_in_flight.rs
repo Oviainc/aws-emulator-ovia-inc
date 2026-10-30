@@ -348,7 +348,7 @@ async fn delete_table_answers_one_outcome_per_observed_table_status() {
                 json!({"keyspaceName": keyspace, "tableName": "absent_tbl"}),
             )
             .await,
-        404,
+        400,
         "ResourceNotFoundException",
     );
 

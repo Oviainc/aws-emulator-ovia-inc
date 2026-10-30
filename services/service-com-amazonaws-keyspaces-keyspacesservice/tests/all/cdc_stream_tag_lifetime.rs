@@ -5,10 +5,10 @@
 //! The rule under test: a stream's tags belong to the stream, so the call that forgets a
 //! stream in the CDC stream store drops that stream's tags in the same call — whichever
 //! control-plane call forgets it, and however many streams it forgets at once. From that
-//! instant on, every operation that addresses the stream by ARN answers the modelled 404
-//! for it: `GetStream` on the KeyspacesStreams surface and `ListTagsForResource` /
-//! `TagResource` / `UntagResource` on the Keyspaces surface alike. A stream the call did
-//! NOT forget keeps its tags.
+//! instant on, every operation that addresses the stream by ARN answers the modelled
+//! not-found for it: `GetStream` on the KeyspacesStreams surface and
+//! `ListTagsForResource` / `TagResource` / `UntagResource` on the Keyspaces surface
+//! alike. A stream the call did NOT forget keeps its tags.
 //!
 //! The assertions are made IMMEDIATELY after the forgetting call, which is inside the
 //! transient `DELETING` span the keyspace and its tables are reported in — the span in
@@ -174,7 +174,7 @@ async fn assert_nothing_answers(emulator: &Cdc, case: &str, stream_arn: &str) {
         emulator
             .keyspaces("ListTagsForResource", json!({"resourceArn": stream_arn}))
             .await,
-        404,
+        400,
         "ResourceNotFoundException",
     );
     assert_failure(
@@ -188,7 +188,7 @@ async fn assert_nothing_answers(emulator: &Cdc, case: &str, stream_arn: &str) {
                 }),
             )
             .await,
-        404,
+        400,
         "ResourceNotFoundException",
     );
     assert_failure(
@@ -202,7 +202,7 @@ async fn assert_nothing_answers(emulator: &Cdc, case: &str, stream_arn: &str) {
                 }),
             )
             .await,
-        404,
+        400,
         "ResourceNotFoundException",
     );
 }

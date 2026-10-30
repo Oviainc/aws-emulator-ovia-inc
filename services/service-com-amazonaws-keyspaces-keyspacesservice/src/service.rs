@@ -40,6 +40,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_schema_server::{Violation, ViolationKind};
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
@@ -104,16 +105,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. Amazon Keyspaces answers such a request as AWS's own boundary
+        // validator does — `400 ValidationException` with the
+        // `N validation error(s) detected: Value '<value>' at '<member>' failed to
+        // satisfy constraint: <requirement>` envelope, and a `@pattern` requirement
+        // quoted without the anchors a whole-value pattern wraps it in — which
+        // `service_common::validation_message` states, so neither the envelope nor a
+        // clause is written here.
+        //
+        // What is left to this service is the ORDER of the clauses about ONE member; see
+        // [`stated_order`].
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        let reported = Refusal::Invalid(stated_order(violations));
+        service_common::validation_message::aws_validation_refusal(&reported)
     }
 
     fn override_routing_error(
@@ -142,6 +149,69 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+/// The violations of a boundary refusal, in the order this service states them as
+/// clauses.
+///
+/// The MEMBERS keep the order the validating walk found them in — the walk visits a given
+/// input in one order, so that is a total, deterministic order. What this chooses is the
+/// order of the several clauses about ONE member, which is a property of that member: a
+/// recorded refusal of a `keyspaceName` that breaks BOTH constraints `KeyspaceName`
+/// declares states the `@pattern` clause before the `@length` one, while the recorded
+/// refusal of a `tableName` that breaks the identical pair on `TableName` states them in
+/// the walk's own order (length, then pattern) — two shapes with the same `@length` and
+/// the same `@pattern`, so nothing in the model tells the two orders apart and the order
+/// is read off the member rather than normalised across them. A member
+/// [`PATTERN_FIRST_MEMBERS`] does not name keeps the walk's order.
+///
+/// `services/service-com-amazonaws-acmpca-acmprivateca/src/service.rs` orders the clauses
+/// of one member the same way, with the `@pattern` clause first for EVERY member, which is
+/// what that service's recordings show. The two differ only in that per-member choice, so
+/// a third service that needs either would be the point at which the member-grouped
+/// ordering moves into `service_common::validation_message` (which already owns the
+/// envelope, the clauses and the `@pattern` rendering) with the rank as its caller's
+/// argument.
+fn stated_order(violations: &[Violation]) -> Vec<Violation> {
+    // The paths in the order the walk reported them, each once: a member states its
+    // clauses together, where that member's own clauses were first reported.
+    let mut members: Vec<&str> = Vec::new();
+    for violation in violations {
+        if !members.contains(&violation.path.as_str()) {
+            members.push(violation.path.as_str());
+        }
+    }
+    let mut ordered = violations.to_vec();
+    // Stable, so two clauses of equal rank about one member stay in the walk's order.
+    ordered.sort_by_key(|violation| {
+        let member = members
+            .iter()
+            .position(|path| *path == violation.path.as_str())
+            .unwrap_or(0);
+        (member, clause_rank(violation))
+    });
+    ordered
+}
+
+/// The members whose recorded refusal states the `@pattern` clause before the rest of
+/// that member's clauses.
+///
+/// Every entry is read off a recorded refusal of this service and nothing else, so the
+/// list grows only when another member's multi-violation refusal is recorded; a member
+/// that is not recorded is not guessed at, and keeps the walk's order.
+const PATTERN_FIRST_MEMBERS: [&str; 1] = ["keyspaceName"];
+
+/// Where a clause sits among the clauses about its own member: the `@pattern` clause of a
+/// [`PATTERN_FIRST_MEMBERS`] member goes first, and everything else keeps the walk's
+/// order.
+fn clause_rank(violation: &Violation) -> u8 {
+    if !PATTERN_FIRST_MEMBERS.contains(&violation.path.as_str()) {
+        return 0;
+    }
+    match matches!(violation.kind, ViolationKind::Pattern(_)) {
+        true => 0,
+        false => 1,
     }
 }
 

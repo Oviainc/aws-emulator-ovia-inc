@@ -409,7 +409,7 @@ async fn update_table_applies_the_one_named_setting_and_leaves_the_rest() {
         assert_failure(
             case.name,
             emulator.call("UpdateTable", again).await,
-            409,
+            400,
             "ConflictException",
         );
 
@@ -514,7 +514,7 @@ async fn updating_a_table_that_is_not_active_is_the_modelled_conflict() {
                 }),
             )
             .await,
-        409,
+        400,
         "ConflictException",
     );
     let refused = get_table(&emulator, keyspace, "creating_tbl").await;
@@ -568,7 +568,7 @@ async fn updating_a_table_that_is_not_active_is_the_modelled_conflict() {
                 }),
             )
             .await,
-        409,
+        400,
         "ConflictException",
     );
 }
@@ -752,7 +752,7 @@ async fn a_refused_update_answers_the_modelled_error_and_changes_nothing() {
                     }),
                 )
                 .await,
-            404,
+            400,
             "ResourceNotFoundException",
         );
     }
@@ -801,7 +801,7 @@ async fn growing_a_schema_past_the_column_cap_is_the_modelled_quota_error() {
                 }),
             )
             .await,
-        402,
+        400,
         "ServiceQuotaExceededException",
     );
     let refused = get_table(&emulator, keyspace, table).await;
@@ -852,7 +852,7 @@ async fn growing_a_schema_past_the_column_cap_is_the_modelled_quota_error() {
                 }),
             )
             .await,
-        402,
+        400,
         "ServiceQuotaExceededException",
     );
 
@@ -875,7 +875,7 @@ async fn growing_a_schema_past_the_column_cap_is_the_modelled_quota_error() {
                 }),
             )
             .await,
-        402,
+        400,
         "ServiceQuotaExceededException",
     );
 }

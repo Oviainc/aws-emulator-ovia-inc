@@ -59,10 +59,12 @@ fn keyspaces_and_keyspaces_streams_route_apart_under_one_signing_name() {
                     "a keyspaces operation that reads an absent table",
                     "KeyspacesService.GetTable",
                     br#"{"keyspaceName":"routing_probe","tableName":"absent"}"#,
-                    // Keyspaces models `ResourceNotFoundException` with HTTP 404, so
-                    // this row's 404 is the OWNING service answering, not a routing
-                    // failure — which is why the blanket 404 check below skips it.
-                    Some(404),
+                    // Keyspaces answers every client-side exception on its awsJson1_0
+                    // wire with the protocol's own 400 (the error TYPE in the body is
+                    // what names the failure), so this row's 400 is the OWNING service
+                    // answering a modelled `ResourceNotFoundException` rather than a
+                    // routing failure.
+                    Some(400),
                 ),
                 (
                     "a keyspaces operation that reads the keyspace just created",

@@ -18,7 +18,7 @@
 //!    started, or a deletion this operation started — is refused with the modelled
 //!    `ConflictException`, and the action in flight is not disturbed.
 //! 4. A name that addresses no type is refused with the error the model declares for it:
-//!    404 `ResourceNotFoundException` for an absent keyspace or type, 400
+//!    `ResourceNotFoundException` for an absent keyspace or type,
 //!    `ValidationException` for a name that is neither form a `typeName` may take, and
 //!    for a service-managed keyspace, which holds none of the caller's types.
 
@@ -192,7 +192,7 @@ async fn delete_type_settles_every_name_form_into_absence() {
         assert_failure(
             &case.submitted,
             (status, body.clone()),
-            404,
+            400,
             "ResourceNotFoundException",
         );
         assert_eq!(
@@ -321,7 +321,7 @@ async fn delete_type_refuses_a_type_a_table_or_another_type_uses() {
                     json!({"keyspaceName": ks, "typeName": case.used}),
                 )
                 .await,
-            409,
+            400,
             "ConflictException",
         );
         // The refused delete wrote nothing: the type is still there and still usable.
@@ -361,7 +361,7 @@ async fn delete_type_refuses_a_type_a_table_or_another_type_uses() {
                     json!({"keyspaceName": ks, "typeName": case.used}),
                 )
                 .await,
-            409,
+            400,
             "ConflictException",
         );
     }
@@ -405,7 +405,7 @@ async fn delete_type_refuses_a_type_whose_own_action_is_in_progress() {
                 json!({"keyspaceName": ks, "typeName": "still_creating"}),
             )
             .await,
-        409,
+        400,
         "ConflictException",
     );
     let reported = assert_ok(
@@ -441,18 +441,18 @@ async fn delete_type_refuses_a_type_whose_own_action_is_in_progress() {
                 json!({"keyspaceName": ks, "typeName": "still_creating"}),
             )
             .await,
-        409,
+        400,
         "ConflictException",
     );
     tokio::time::sleep(settle_wait()).await;
     assert_failure(
         "the deletion has completed",
         get_type(&emulator, ks, "still_creating").await,
-        404,
+        400,
         "ResourceNotFoundException",
     );
-    // And a type that is gone is gone: the delete that answered 409 while the removal was
-    // in flight does not become a success later.
+    // And a type that is gone is gone: the delete that answered the conflict while the
+    // removal was in flight does not become a success later.
     assert_failure(
         "a type the deletion already removed",
         emulator
@@ -461,7 +461,7 @@ async fn delete_type_refuses_a_type_whose_own_action_is_in_progress() {
                 json!({"keyspaceName": ks, "typeName": "still_creating"}),
             )
             .await,
-        404,
+        400,
         "ResourceNotFoundException",
     );
 }
@@ -497,7 +497,7 @@ async fn delete_type_refuses_a_name_that_addresses_no_type() {
         ),
     ] {
         let (status, body) = emulator.call("DeleteType", request).await;
-        assert_failure(case, (status, body.clone()), 404, "ResourceNotFoundException");
+        assert_failure(case, (status, body.clone()), 400, "ResourceNotFoundException");
         assert_eq!(
             body["resourceArn"],
             json!(expected_arn),
@@ -544,7 +544,7 @@ async fn delete_type_refuses_a_name_that_addresses_no_type() {
     }
 
     // A service-managed keyspace holds none of the caller's types and is not DDL-able:
-    // every one of them is refused the same way, and none of them is a 404.
+    // every one of them is refused the same way, and none of them is a not-found.
     for (keyspace_name, _tables) in keyspaces::SERVICE_MANAGED_KEYSPACES {
         assert_failure(
             keyspace_name,

@@ -268,10 +268,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A type name is taken once per keyspace: creating "a resource that already
         // exists" is the `ConflictException` this operation models. Checked before the
         // cap below, because a name already taken adds no entry.
+        //
+        // The sentence is the service's own Cassandra-derived template for a UDT that
+        // cannot be added because one of that name is there: fixed text, then the type's
+        // formatted name (the identifier the keyspace holds it under, which is what the
+        // request named) and the `keyspaceName` the request supplied — each unquoted,
+        // neither keyspace-qualified, and no trailing period.
         if keyspace.types.contains_key(&type_name) {
             return Err(CreateTypeErrorModeled::ConflictException(ConflictException {
                 message: Some(format!(
-                    "Type '{}.{type_name}' already exists.",
+                    "Cannot add already existing UDT {type_name} to keyspace {}",
                     input.keyspace_name
                 )),
             })

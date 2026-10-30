@@ -455,7 +455,7 @@ async fn the_quota_counts_a_disabling_specifications_tags_against_the_streams_ow
                 );
             }
             false => {
-                assert_failure(case, got, 402, "ServiceQuotaExceededException");
+                assert_failure(case, got, 400, "ServiceQuotaExceededException");
                 // Refused before anything was written: the stream is untouched, so it is
                 // still the capturing stream it was and still holds just its own tag.
                 let tags = listed_tags(&emulator, case, &stream_arn).await;

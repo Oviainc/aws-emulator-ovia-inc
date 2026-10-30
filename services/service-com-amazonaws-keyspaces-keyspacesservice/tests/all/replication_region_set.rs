@@ -147,7 +147,7 @@ async fn a_region_list_denoting_one_region_is_refused_by_both_operations() {
             emulator
                 .call("GetKeyspace", json!({"keyspaceName": keyspace}))
                 .await,
-            404,
+            400,
             "ResourceNotFoundException",
         );
         // The same list through the sibling operation draws the same refusal, and the

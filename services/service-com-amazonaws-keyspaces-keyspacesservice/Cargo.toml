@@ -8,6 +8,9 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# AWS's own wording for a boundary (constraint) refusal, so this service does not carry a
+# copy of the envelope, the clauses or the `@pattern` rendering.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

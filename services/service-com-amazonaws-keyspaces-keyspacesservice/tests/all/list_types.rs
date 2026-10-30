@@ -384,7 +384,7 @@ async fn listing_the_types_of_an_absent_keyspace_is_a_modelled_not_found() {
         assert_failure(
             case,
             (status, body.clone()),
-            404,
+            400,
             "ResourceNotFoundException",
         );
         assert_eq!(

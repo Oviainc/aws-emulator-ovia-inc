@@ -12,14 +12,15 @@
 //! taken, its stored status one that accepts the change — is settled BEFORE the type
 //! expressions of the definition that request carries are resolved, because a request
 //! that defines no resource has no definition to resolve. So a create whose name is
-//! already taken answers the modelled `ConflictException` (409) whatever its type
+//! already taken answers the modelled `ConflictException` (HTTP 400, this RPC
+//! service's client-error status) whatever its type
 //! expressions say, and every operation that carries a type expression grades the pair
 //! the same way: `CreateType` for a field's type, `CreateTable` for a column's, and
 //! `UpdateTable` for an added column's (where the addressed resource's fault is a table
 //! that is not `ACTIVE` yet).
 //!
 //! Its consequences, also pinned here: a request whose resource CAN exist still gets the
-//! 404 `ResourceNotFoundException` its unresolvable reference earns (the conflict orders
+//! `ResourceNotFoundException` its unresolvable reference earns (the conflict orders
 //! those faults, it does not swallow them), and a refused request changes nothing.
 
 use serde_json::{json, Value};
@@ -28,11 +29,13 @@ use crate::keyspace_table_lifecycle::{
     assert_failure, assert_ok, error_code, minimal_schema, settle_wait, Emulator,
 };
 
-/// The modelled refusal a name already taken earns.
-const CONFLICT: (u16, &str) = (409, "ConflictException");
+/// The modelled refusal a name already taken earns, on the client-error status every
+/// refusal of this RPC service travels with
+/// (`service_..._keyspacesservice::scaffolded::CLIENT_ERROR_STATUS`).
+const CONFLICT: (u16, &str) = (400, "ConflictException");
 
 /// The modelled refusal an unresolvable type reference earns.
-const NOT_FOUND: (u16, &str) = (404, "ResourceNotFoundException");
+const NOT_FOUND: (u16, &str) = (400, "ResourceNotFoundException");
 
 /// One type expression that cannot be resolved, and the user-defined type name the
 /// service must report as missing.
@@ -48,7 +51,7 @@ struct BadType {
     name: &'static str,
     /// The type expression the field or column carries.
     expression: &'static str,
-    /// The type name the 404 must name.
+    /// The type name the not-found refusal must name.
     unresolvable: &'static str,
 }
 
@@ -143,7 +146,9 @@ impl Sibling {
     /// The message the service answers a name already taken with.
     fn conflict_message(self, keyspace: &str, name: &str) -> String {
         match self {
-            Sibling::CreateType => format!("Type '{keyspace}.{name}' already exists."),
+            Sibling::CreateType => {
+                format!("Cannot add already existing UDT {name} to keyspace {keyspace}")
+            }
             Sibling::CreateTable => format!("Table '{keyspace}.{name}' already exists."),
         }
     }
@@ -189,7 +194,7 @@ fn assert_message(case: &str, body: &Value, expected: &str) {
 }
 
 /// RULE: of the two faults, the name already taken is the one the caller is told about,
-/// while the same definition on a FREE name still earns the 404 its unresolvable
+/// while the same definition on a FREE name still earns the not-found its unresolvable
 /// reference deserves.
 #[tokio::test]
 async fn a_name_already_taken_is_graded_before_the_type_references_of_the_definition() {
@@ -278,7 +283,7 @@ async fn a_name_already_taken_is_graded_before_the_type_references_of_the_defini
         }
 
         // The control: the name taken with a definition that resolves perfectly is the
-        // same conflict, so the 409 above is the name's refusal and not the type's.
+        // same conflict, so the refusal above is the name's and not the type's.
         for resolvable in ["int", "frozen<addr>", "list<frozen<addr>>"] {
             let case = format!("{} taken name, resolvable {resolvable}", sibling.operation());
             let got = emulator
@@ -437,7 +442,7 @@ async fn a_name_already_taken_outranks_a_reference_to_a_type_that_is_not_active_
 /// The rule beyond the creates: `UpdateTable` resolves an added column's type only once
 /// the table it addresses is one that can take the change, so a table still settling
 /// answers the modelled conflict whatever `addColumns` says — and the same request
-/// against the settled table earns the 404 its unresolvable reference deserves.
+/// against the settled table earns the not-found its unresolvable reference deserves.
 #[tokio::test]
 async fn update_table_grades_a_table_that_cannot_take_the_change_before_the_added_types() {
     let emulator = Emulator::start();

@@ -356,7 +356,7 @@ async fn tagging_past_the_published_per_resource_quota_is_refused_and_stores_not
         name: String,
         /// Calls that must be accepted, in order.
         accepted: Vec<Vec<(String, String)>>,
-        /// The call that must be refused with 402, if the row has one.
+        /// The call that must be refused with the modelled quota error, if the row has one.
         refused: Option<Vec<(String, String)>>,
         /// How many tags the resource holds afterwards.
         expected_count: usize,
@@ -444,7 +444,7 @@ async fn tagging_past_the_published_per_resource_quota_is_refused_and_stores_not
                             json!({"resourceArn": resource_arn, "tags": tags_json(refused)}),
                         )
                         .await,
-                    402,
+                    400,
                     "ServiceQuotaExceededException",
                 );
             }
@@ -744,7 +744,7 @@ async fn an_arn_that_names_no_stored_resource_is_the_modelled_not_found() {
                         }),
                     )
                     .await,
-                404,
+                400,
                 "ResourceNotFoundException",
             );
         }
@@ -757,7 +757,7 @@ async fn an_arn_that_names_no_stored_resource_is_the_modelled_not_found() {
         assert_failure(
             &format!("ListTagsForResource on {name}"),
             (status, body.clone()),
-            404,
+            400,
             "ResourceNotFoundException",
         );
         assert_eq!(

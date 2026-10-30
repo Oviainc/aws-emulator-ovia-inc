@@ -316,7 +316,7 @@ async fn auto_scaling_settings_of_a_resource_that_is_not_in_state_are_the_modell
                     json!({"keyspaceName": keyspace_name, "tableName": table_name}),
                 )
                 .await,
-            404,
+            400,
             "ResourceNotFoundException",
         );
     }

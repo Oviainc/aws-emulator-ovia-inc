@@ -853,7 +853,7 @@ async fn the_cdc_specifications_tags_are_the_streams_own_tags() {
                     json!({"keyspaceName": keyspace, "tableName": case}),
                 )
                 .await,
-            404,
+            400,
             "ResourceNotFoundException",
         );
     }
