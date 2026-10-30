@@ -378,7 +378,10 @@ async fn list(
 /// to be recorded as one of the organisation's: those entries are the accounts
 /// the policy applies to or leaves out, which is the membership
 /// `ListMemberAccounts` reports.
-async fn put_account_scoped_policy(
+///
+/// `pub(crate)` so a sibling suite in this test target records a member account
+/// the same way rather than growing a second copy of it.
+pub(crate) async fn put_account_scoped_policy(
     router: &MultiServiceRouter,
     name: &str,
     scope_map: &str,
@@ -1347,26 +1350,41 @@ async fn paging_walks_the_inventory_once() {
 /// `smithy_query(query="shape", shape="AWSAccountId,Base62Id,PolicyId")` — and
 /// therefore a key of NO page of the URI-keyed inventory.
 const FOREIGN_PAGE_KEYS: &[(&str, &str)] = &[
-    ("hex of an account-keyed page's key", "123456789012"),
+    ("an account-keyed page's key", "123456789012"),
     (
-        "hex of a resource-set-keyed page's key",
+        "a resource-set-keyed page's key",
         "abcdefghij0123456789AB",
     ),
     (
-        "hex of a policy-keyed page's key",
+        "a policy-keyed page's key",
         "0f13c2a4-1111-4a26-9d0e-6b4f8d2a7c31",
     ),
 ];
 
+/// The `NextToken` this inventory page mints for the boundary `uri`: the URI
+/// stamped with the selection — Region, member account, resource type — whose
+/// page it is a boundary of.
+fn page_token(uri: &str) -> String {
+    state::encode_discovered_resources_page_token(
+        REGION,
+        ACCOUNT,
+        state::RESOURCE_TYPE_EC2_INSTANCE,
+        uri,
+    )
+}
+
 /// RULE: this page is ordered by the resource's URI, so a `NextToken` names a
-/// boundary in it exactly when it is the hex of a UTF-8 ARN; any other value —
-/// including a token this service minted for a page of another class, and any
-/// hex of a printable string that is no ARN — names no boundary, so the request
-/// is refused with the operation's modelled `InvalidInputException` instead of
-/// being answered with a page that starts at an arbitrary key, and the refusal
-/// reports nothing and changes nothing.
+/// boundary in it exactly when it carries an ARN stamped with the selection the
+/// request names; any other value — an ARN carrying no selection, a token this
+/// service minted for a page of another class, and any key that is no ARN —
+/// names no boundary, so the request is refused with the operation's modelled
+/// `InvalidInputException` instead of being answered with a page that starts at
+/// an arbitrary key, and the refusal reports nothing and changes nothing.
+///
+/// That a token minted under ANOTHER selection is refused too is the subject of
+/// [`crate::discovered_resources_page_token_scoping`].
 #[tokio::test]
-async fn a_next_token_is_a_boundary_only_when_it_decodes_to_a_resource_uri() {
+async fn a_next_token_is_a_boundary_only_when_it_carries_this_selections_resource_uri() {
     let (router, _engine) = emulator();
     associate_admin(&router).await;
 
@@ -1391,30 +1409,30 @@ async fn a_next_token_is_a_boundary_only_when_it_decodes_to_a_resource_uri() {
         "this test needs at least three keys in URI order, got {whole:?}"
     );
 
-    // ACCEPTED: the hex of an ARN is a boundary, and the page resumes at the
-    // first key at or after it. Rows differ in whether the ARN is one of this
-    // inventory's own keys, in the service, Region and account fields (API
-    // Gateway's and Amazon S3's leave some EMPTY), and in whether the ARN sorts
-    // before, inside or after the inventory.
+    // ACCEPTED: an ARN stamped with this selection is a boundary, and the page
+    // resumes at the first key at or after it. Rows differ in whether the ARN is
+    // one of this inventory's own keys, in the service, Region and account
+    // fields (API Gateway's and Amazon S3's leave some EMPTY), and in whether
+    // the ARN sorts before, inside or after the inventory.
     let mut accepted: Vec<(String, String)> = whole
         .iter()
-        .map(|uri| (format!("hex of its own key {uri}"), uri.clone()))
+        .map(|uri| (format!("its own key {uri}"), uri.clone()))
         .collect();
     accepted.extend([
         (
-            "hex of an ARN sorting before every key of this type".to_string(),
+            "an ARN sorting before every key of this type".to_string(),
             ec2_arn("instance/"),
         ),
         (
-            "hex of an ARN of another account".to_string(),
+            "an ARN of another account".to_string(),
             format!("arn:aws:ec2:{REGION}:{FOREIGN_ACCOUNT}:instance/i-0"),
         ),
         (
-            "hex of an ARN with an empty account field".to_string(),
+            "an ARN with an empty account field".to_string(),
             format!("arn:aws:apigateway:{REGION}::/restapis/a1b2c3/stages/prod"),
         ),
         (
-            "hex of a global ARN with no Region or account".to_string(),
+            "a global ARN with no Region or account".to_string(),
             "arn:aws:s3:::fms-discovery-bucket".to_string(),
         ),
     ]);
@@ -1425,7 +1443,7 @@ async fn a_next_token_is_a_boundary_only_when_it_decodes_to_a_resource_uri() {
             ACCOUNT,
             state::RESOURCE_TYPE_EC2_INSTANCE,
             None,
-            Some(&hex::encode(uri)),
+            Some(&page_token(uri)),
         )
         .await;
         let served: Vec<String> = items(&body).into_iter().map(|(served, ..)| served).collect();
@@ -1441,11 +1459,12 @@ async fn a_next_token_is_a_boundary_only_when_it_decodes_to_a_resource_uri() {
         );
     }
 
-    // REFUSED: every value that is not the hex of a UTF-8 ARN. Rows differ in
+    // REFUSED: every value that is not an ARN of this selection. Rows differ in
     // the encoding form (not hex, an odd number of digits, bytes that are not
     // UTF-8), in the CONTENT of the decoded key (a control character, a key of
-    // another page class of this service, a printable string that is no ARN) and
-    // in WHICH condition of the ARN form the decoded key breaks.
+    // another page class of this service, a printable string that is no ARN), in
+    // WHICH condition of the ARN form the decoded key breaks, and in whether the
+    // key carries this selection's stamp at all.
     let mut refused: Vec<(String, String)> = vec![
         (
             "not hex at all".to_string(),
@@ -1454,34 +1473,43 @@ async fn a_next_token_is_a_boundary_only_when_it_decodes_to_a_resource_uri() {
         ("hex of an odd number of digits".to_string(), "abc".to_string()),
         ("hex of bytes that are not UTF-8".to_string(), "ff".to_string()),
         (
-            "hex of a printable string that is no ARN".to_string(),
-            hex::encode("zzz"),
+            "a printable string that is no ARN".to_string(),
+            page_token("zzz"),
         ),
         (
-            "hex of one of its own keys carrying a control character".to_string(),
-            hex::encode(format!("{}\u{1}", whole[0])),
+            "one of its own keys carrying a control character".to_string(),
+            page_token(&format!("{}\u{1}", whole[0])),
         ),
         (
-            "hex of a value missing the arn prefix".to_string(),
-            hex::encode(format!("aws:ec2:{REGION}:{ACCOUNT}:instance/i-0")),
+            "a value missing the arn prefix".to_string(),
+            page_token(&format!("aws:ec2:{REGION}:{ACCOUNT}:instance/i-0")),
         ),
         (
-            "hex of a value with too few fields".to_string(),
-            hex::encode("arn:aws:ec2"),
+            "a value with too few fields".to_string(),
+            page_token("arn:aws:ec2"),
         ),
         (
-            "hex of an ARN with an empty partition".to_string(),
-            hex::encode(format!("arn::ec2:{REGION}:{ACCOUNT}:instance/i-0")),
+            "an ARN with an empty partition".to_string(),
+            page_token(&format!("arn::ec2:{REGION}:{ACCOUNT}:instance/i-0")),
         ),
         (
-            "hex of an ARN with an empty resource".to_string(),
-            hex::encode(format!("arn:aws:ec2:{REGION}:{ACCOUNT}:")),
+            "an ARN with an empty resource".to_string(),
+            page_token(&format!("arn:aws:ec2:{REGION}:{ACCOUNT}:")),
+        ),
+        (
+            "the BARE hex of one of its own keys, carrying no selection".to_string(),
+            hex::encode(&whole[0]),
         ),
     ];
     refused.extend(
         FOREIGN_PAGE_KEYS
             .iter()
-            .map(|(case, key)| ((*case).to_string(), hex::encode(key))),
+            .map(|(case, key)| (format!("{case} stamped with this selection"), page_token(key))),
+    );
+    refused.extend(
+        FOREIGN_PAGE_KEYS
+            .iter()
+            .map(|(case, key)| (format!("the bare hex of {case}"), hex::encode(key))),
     );
     for (case, token) in &refused {
         let (status, body) = call(

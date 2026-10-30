@@ -165,6 +165,12 @@ mod namespaced_list_page_single_rule;
 #[path = "all/organization_roster_clock_reading.rs"]
 mod organization_roster_clock_reading;
 
+// Declared beside them, for the same reason: this suite's name sorts right into
+// the contended region of the list below. The suite itself is an ordinary
+// `tests/all/<name>.rs` file.
+#[path = "all/discovered_resources_page_token_scoping.rs"]
+mod discovered_resources_page_token_scoping;
+
 #[path = "all/admin_account_disassociation.rs"]
 mod admin_account_disassociation;
 #[path = "all/admin_account_scopes.rs"]

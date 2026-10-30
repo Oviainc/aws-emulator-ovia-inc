@@ -15,6 +15,16 @@
 //! ([`crate::state::discovered_resources`]), filtered by the member account and
 //! the resource type the request names and served in bounded pages.
 //!
+//! Each of those pages is SELECTED by the request — the Region it addresses, the
+//! member account it names and the resource type it asks for — and each
+//! selection is a different collection of resource URIs, so a page boundary
+//! names a resource of the selection that minted it and of no other. The
+//! `NextToken` therefore carries that selection beside the URI
+//! ([`crate::state::encode_discovered_resources_page_token`]), and a token
+//! minted for another selection is refused rather than resumed from as an
+//! arbitrary lower bound, which would silently drop the resources sorting below
+//! it and report a short or empty page as a complete one.
+//!
 //! `MemberAccountIds` states two rules in one sentence pair, and BOTH are
 //! enforced: only one account per request, and that account must be one of the
 //! organisation's ([`crate::state::organization_accounts`] — the definition
@@ -256,12 +266,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A token this service did not mint for an inventory page names no page
-        // boundary: this page is keyed by a resource URI, so a token whose
-        // decoded key is not one is refused as a bad request rather than used as
-        // an arbitrary lower bound — the modelled `InvalidInputException` is
-        // exactly "the parameters of the request were invalid".
+        // boundary — and neither does one it minted for ANOTHER selection of the
+        // inventory. This page is SELECTED by three request-derived values: the
+        // Region the request addresses, the member account it names and the
+        // resource type it asks for, each of which is a different collection of
+        // resource URIs. A boundary of it is therefore a URI stamped with that
+        // selection ([`crate::state::encode_discovered_resources_page_token`]):
+        // a bare URI, a URI stamped with another selection, and a token whose
+        // decoded key is no URI at all are all refused as a bad request rather
+        // than used as an arbitrary lower bound — the modelled
+        // `InvalidInputException` is exactly "the parameters of the request were
+        // invalid".
         let start = match input.next_token.as_deref() {
-            Some(token) => match crate::state::decode_uri_page_token(token) {
+            Some(token) => match crate::state::decode_discovered_resources_page_token(
+                &region,
+                account,
+                &input.resource_type,
+                token,
+            ) {
                 Some(start) => Some(start),
                 None => {
                     return Err(ListDiscoveredResourcesErrorModeled::InvalidInputException(
@@ -300,10 +322,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|(_, resource)| resource.clone())
             .collect();
         // A token only when a resource is left AFTER this page, so the last page
-        // carries none.
-        let next_token = remaining
-            .next()
-            .map(|(uri, _)| crate::state::encode_key_token(uri));
+        // carries none. It names the URI the following page resumes at, under the
+        // selection whose page it is a boundary of.
+        let next_token = remaining.next().map(|(uri, _)| {
+            crate::state::encode_discovered_resources_page_token(
+                &region,
+                account,
+                &input.resource_type,
+                uri,
+            )
+        });
 
         Ok(ListDiscoveredResourcesOutput {
             items: Some(items),

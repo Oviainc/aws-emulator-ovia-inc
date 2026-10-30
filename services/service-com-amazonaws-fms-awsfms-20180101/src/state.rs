@@ -3502,21 +3502,69 @@ pub fn decode_base62_page_token(token: &str) -> Option<String> {
     is_base62_id.then_some(decoded)
 }
 
-/// Decode a URI-keyed `PaginationToken` produced by [`encode_key_token`], for
-/// the paginated operations whose store key is a resource's URI — a resource
-/// set's membership and the organisation's discoverable inventory
-/// ([`discovered_resources`]), which is keyed the same way. `None` when the
-/// token was not produced by this service for such a page.
+/// The page scope a boundary of the discoverable inventory is stamped with: the
+/// THREE values a `ListDiscoveredResources` request selects its page by — the
+/// Region it addresses, the member account it names and the resource type it
+/// asks for, which is exactly what [`discovered_resources`] builds the page
+/// from.
 ///
-/// The decoded value must still be an ARN ([`parse_arn`]), which every resource
-/// either page carries is — an item that is not one never becomes a member
-/// ([`resource_set_item_failure_reason`] refuses it as `NOT_VALID_ARN`), and a
-/// discovered resource is reported under the ARN it would be associated by — so a
-/// token minted for a policy, account or resource-set page, or any foreign token
-/// that happens to be valid hex, is refused rather than resumed from as an
-/// arbitrary key.
-pub fn decode_uri_page_token(token: &str) -> Option<String> {
-    let decoded = decode_key_token(token)?;
+/// All three are needed, and no two of them identify the page: each resource
+/// type is a different collection of URIs, each member account owns a different
+/// one again, and the same account's resources in another Region are reported
+/// under ARNs naming that Region. None of the three can contain the separator
+/// [`scoped_page_key`] joins with — a Region and an `AWSAccountId` (`^[0-9]+$`)
+/// carry no `#`, and neither does a `ResourceType`
+/// (`^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`) — so the stamp is unambiguous.
+fn discovered_resources_page_scope(region: &str, account: &str, resource_type: &str) -> String {
+    scoped_page_key(region, &scoped_page_key(account, resource_type))
+}
+
+/// Encode a page boundary (the resource URI the next page starts at) of the
+/// inventory one `ListDiscoveredResources` request selects, as an opaque
+/// `PaginationToken`.
+///
+/// The stamp is what lets [`decode_discovered_resources_page_token`] tell a
+/// boundary of THIS selection's page from one minted for another account,
+/// another resource type or another Region; the encoding is
+/// [`encode_scoped_page_token`]'s, so these tokens stay inside the modelled
+/// `PaginationToken` pattern and length and stay opaque to a caller.
+pub fn encode_discovered_resources_page_token(
+    region: &str,
+    account: &str,
+    resource_type: &str,
+    uri: &str,
+) -> String {
+    encode_scoped_page_token(
+        &discovered_resources_page_scope(region, account, resource_type),
+        uri,
+    )
+}
+
+/// Decode a `PaginationToken` produced by
+/// [`encode_discovered_resources_page_token`] for the inventory the Region,
+/// member account and resource type select, yielding the URI the next page
+/// resumes at.
+///
+/// `None` when the token was not produced by this service, or was produced for
+/// ANOTHER selection of the inventory: a URI of another selection's page is
+/// either absent from this one or sorts past resources this one does hold, so
+/// resuming from it would silently drop them and report a short page — or an
+/// empty one — as a complete page.
+///
+/// The decoded boundary must still be an ARN ([`parse_arn`]), the shape check
+/// this page class adds on top of the shared token-to-key step: a discovered
+/// resource is reported under the ARN it would be associated by, so nothing
+/// else is a key of this page.
+pub fn decode_discovered_resources_page_token(
+    region: &str,
+    account: &str,
+    resource_type: &str,
+    token: &str,
+) -> Option<String> {
+    let decoded = decode_scoped_page_token(
+        &discovered_resources_page_scope(region, account, resource_type),
+        token,
+    )?;
     parse_arn(&decoded).is_some().then_some(decoded)
 }
 
