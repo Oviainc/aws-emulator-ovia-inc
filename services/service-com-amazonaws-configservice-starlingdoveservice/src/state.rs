@@ -1123,10 +1123,19 @@ pub fn malformed_resource_arn_message(arn: &str) -> String {
 /// How Config words `ResourceNotFoundException` for a tagging request whose
 /// `ResourceArn` names a resource this account does not hold in this Region.
 ///
-/// BUILT FROM THE REQUEST, for the same reason as
-/// [`malformed_resource_arn_message`].
+/// BUILT FROM THE REQUEST AND FROM WHERE THE LOOKUP HAPPENED — the ARN the caller sent
+/// and the account it was looked up in — for the same reason as
+/// [`malformed_resource_arn_message`]: the sentence tells the caller both what was not
+/// found and that it was searched for among THEIR resources, which is what distinguishes
+/// an ARN naming nothing from an ARN belonging to somebody else. The account is this
+/// emulator's own ([`::emulator_server::emulator_account_id`]), the account every
+/// resource it holds belongs to, so it is read from the store's identity rather than
+/// from the ARN the request carried.
 pub fn resource_not_found_message(arn: &str) -> String {
-    format!("The resource '{arn}' provided in the request does not exist.")
+    format!(
+        "Resource {arn} does not exist for account {}",
+        ::emulator_server::emulator_account_id()
+    )
 }
 
 /// One persisted customer managed configuration recorder.
@@ -5997,14 +6006,11 @@ pub fn no_such_remediation_configuration_message(
 /// How Config words `NoSuchRetentionConfigurationException` for a request that named
 /// a retention configuration this account does not hold.
 ///
-/// The message is BUILT FROM THE REQUEST — it quotes the name the caller sent and
-/// names the member to check — so every operation that refuses an absent retention
-/// configuration words it the same way.
+/// The message is BUILT FROM THE REQUEST — it quotes the name the caller sent — so
+/// every operation that refuses an absent retention configuration words it the same
+/// way.
 pub fn no_such_retention_configuration_message(name: &str) -> String {
-    format!(
-        "Cannot find retention configuration with the specified name '{name}'. Please \
-         check the retentionConfigurationName."
-    )
+    format!("Cannot find retention configuration with specified name '{name}'.")
 }
 
 /// How Config words `MaxNumberOfRetentionConfigurationsExceededException`: the write

@@ -425,8 +425,12 @@ async fn a_validation_refusal_advertises_the_pattern_without_its_anchors() {
             "an account id that is too short",
             "DeletePendingAggregationRequest",
             json!({ "RequesterAccountId": "12345", "RequesterAwsRegion": "eu-west-1" }),
-            "1 validation error detected: Value '12345' at 'requesterAccountId' failed to \
-             satisfy constraint: Member must satisfy regular expression pattern: \\d{12}",
+            // Twelve digits are the only form the member admits, so a shorter value
+            // broke the length its digits fix as well as the pattern: a clause each.
+            "2 validation errors detected: Value '12345' at 'requesterAccountId' failed \
+             to satisfy constraint: Member must have length greater than or equal to 12; \
+             Value '12345' at 'requesterAccountId' failed to satisfy constraint: Member \
+             must satisfy regular expression pattern: \\d{12}",
         ),
         (
             "an aggregation request missing its Region",

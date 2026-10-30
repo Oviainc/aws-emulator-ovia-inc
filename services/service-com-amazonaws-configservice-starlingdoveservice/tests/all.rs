@@ -174,3 +174,5 @@ mod recorded_configuration_item_capture_time;
 mod unrecorded_resource_keys;
 #[path = "all/config_refusal_identifier_and_position.rs"]
 mod config_refusal_identifier_and_position;
+#[path = "all/refusals_that_share_an_error_code.rs"]
+mod refusals_that_share_an_error_code;

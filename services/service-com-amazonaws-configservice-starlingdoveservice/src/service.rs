@@ -44,7 +44,7 @@
 //!
 //! A request-validation refusal is BUILT FROM THE REQUEST — it names the member that
 //! failed and the constraint it failed — so its rendering is part of the contract, and
-//! Config's differs from the framework's conventional one in three ways, each a
+//! Config's differs from the framework's conventional one in four ways, each a
 //! property of the member or of the model rather than of one request:
 //!
 //! 1. a `@pattern` is advertised as the expression a value must satisfy, WITHOUT the
@@ -54,7 +54,11 @@
 //!    not the path `storedQuery.queryName` — with the model's pattern verbatim;
 //! 3. the value submitted at a member Config does not echo back
 //!    ([`WITHHELD_MEMBERS`]) is withheld: the clause states the position and the
-//!    constraint alone.
+//!    constraint alone;
+//! 4. a value is stated against EVERY constraint of its member it broke, one clause
+//!    each, including the length an account id's twelve digits fix
+//!    ([`implied_account_id_length`]) — so a member can account for more than one of
+//!    the validation errors the envelope counts.
 //!
 //! The status (400) and the error code ([`VALIDATION_EXCEPTION`]) are the framework's
 //! own choice for a constraint failure and are unchanged; only the sentence differs.
@@ -319,13 +323,76 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
     )
 }
 
+/// The `@pattern` Config's account-id shape declares
+/// (`smithy_query(query="shape", shape="AccountId")`), as the model spells it.
+const ACCOUNT_ID_PATTERN: &str = r"^\d{12}$";
+
+/// How long a Config account id is. The pattern above admits exactly twelve digits and
+/// every member targeting the shape documents it as "The 12-digit account ID", so the
+/// length is a bound of the shape in its own right — one the public model leaves
+/// implicit in the pattern and that Config's validator states as its own requirement:
+/// a seventeen-character id is refused for the length AND for the pattern, two clauses
+/// rather than one.
+const ACCOUNT_ID_LENGTH: i64 = 12;
+
+/// The length bound a value at an account-id member broke, as a violation of its own,
+/// or `None` when the member is not an account id or its value is twelve characters
+/// long (the only length the pattern admits, so the pattern is then the only clause).
+///
+/// Keyed on the `@pattern` the violation carries, which IS the account-id shape's own:
+/// the bound belongs to the shape, so it holds wherever a member targeting it travels
+/// rather than being a property of one operation's input.
+///
+/// A violation at a position INSIDE a collection is left alone: Config states a
+/// collection's element constraints against the COLLECTION, as the whole set the
+/// element shape declares, which is a rendering the framework's per-element violation
+/// cannot be rebuilt into here (`Violation` carries the one element's value, not the
+/// collection's). Stating a second per-element clause would move that rendering further
+/// from Config's, so the element keeps the framework's single clause.
+fn implied_account_id_length(violation: &Violation) -> Option<Violation> {
+    let value = violation.value.as_deref()?;
+    if violation.kind != ViolationKind::Pattern(ACCOUNT_ID_PATTERN.to_string())
+        || violation
+            .path
+            .split('.')
+            .any(|segment| segment == COLLECTION_STEP)
+    {
+        return None;
+    }
+    let length = i64::try_from(value.chars().count()).unwrap_or(i64::MAX);
+    let kind = match length {
+        length if length > ACCOUNT_ID_LENGTH => ViolationKind::MaxLength(ACCOUNT_ID_LENGTH),
+        length if length < ACCOUNT_ID_LENGTH => ViolationKind::MinLength(ACCOUNT_ID_LENGTH),
+        _ => return None,
+    };
+    Some(Violation {
+        path: violation.path.clone(),
+        kind,
+        value: violation.value.clone(),
+    })
+}
+
+/// Every clause ONE violation of the walk states: one per constraint of the member the
+/// value broke, length before pattern — the order the validating walk itself checks
+/// them in, so a member that declares both reads the same whether the walk found both
+/// or this file supplied the implied one ([`implied_account_id_length`]).
+fn constraint_clauses(violation: &Violation) -> Option<Vec<String>> {
+    let mut clauses = Vec::new();
+    if let Some(implied) = implied_account_id_length(violation) {
+        clauses.push(constraint_clause(&implied)?);
+    }
+    clauses.push(constraint_clause(violation)?);
+    Some(clauses)
+}
+
 /// The `ValidationException` message for a refusal: the AWS envelope over one clause
-/// per violation, in the order the validating walk found them.
+/// per violated constraint, in the order the validating walk found them.
 fn constraint_envelope(violations: &[Violation]) -> Option<String> {
     let clauses: Vec<String> = violations
         .iter()
-        .map(constraint_clause)
-        .collect::<Option<Vec<_>>>()?;
+        .map(constraint_clauses)
+        .collect::<Option<Vec<_>>>()?
+        .concat();
     match clauses.len() {
         0 => None,
         1 => Some(format!("1 validation error detected: {}", clauses[0])),
@@ -396,10 +463,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // framework's lowerCamel path and advertises a `@pattern` without the
         // model's whole-value `^`/`$` anchors, a member the input carries inside a
         // WRAPPER structure is named by its own declared name with the model's
-        // pattern verbatim, and a member whose value Config does not echo back
-        // ([`WITHHELD_MEMBERS`]) states the position and the constraint alone. The
-        // code stays `ValidationException` (HTTP 400) — what the framework would
-        // have answered — so only the wording changes.
+        // pattern verbatim, a member whose value Config does not echo back
+        // ([`WITHHELD_MEMBERS`]) states the position and the constraint alone, and a
+        // value that broke several of its member's constraints states one clause for
+        // each of them. The code stays `ValidationException` (HTTP 400) — what the
+        // framework would have answered — so only the wording changes.
         //
         // An authentication refusal is not an input-constraint failure and keeps
         // the framework's wording.
@@ -612,19 +680,179 @@ mod tests {
             Violation {
                 path: "requesterAccountId".to_string(),
                 kind: ViolationKind::Pattern(r"^\d{12}$".to_string()),
-                value: Some("1".to_string()),
+                value: Some("not-an-acct1".to_string()),
             },
         ];
         let stated = constraint_envelope(&found).expect("two violations word a refusal");
         let expected = "2 validation errors detected: Value '' at 'QueryName' failed to \
                         satisfy constraint: Member must have length greater than or equal \
-                        to 1; Value '1' at 'requesterAccountId' failed to satisfy \
-                        constraint: Member must satisfy regular expression pattern: \
-                        \\d{12}";
+                        to 1; Value 'not-an-acct1' at 'requesterAccountId' failed to \
+                        satisfy constraint: Member must satisfy regular expression \
+                        pattern: \\d{12}";
         assert_eq!(
             stated, expected,
             "case two violations: expected {expected:?}, got {stated:?}"
         );
+    }
+
+    /// An account id of any length but twelve broke the length its twelve digits fix as
+    /// well as the pattern, and the refusal states a clause for each.
+    #[test]
+    fn an_account_ids_broken_length_is_stated_beside_its_pattern() {
+        // (case, the violation the walk found, the message the service answers). The
+        // rows differ along the submitted value's LENGTH — past twelve, under twelve,
+        // exactly twelve — and along the position the member sits at.
+        let account_id_pattern = ViolationKind::Pattern(ACCOUNT_ID_PATTERN.to_string());
+        let rows: [(&str, Violation, &str); 5] = [
+            (
+                "longer than an account id",
+                Violation {
+                    path: "authorizedAccountId".to_string(),
+                    kind: account_id_pattern.clone(),
+                    value: Some("not-an-account-id".to_string()),
+                },
+                "2 validation errors detected: Value 'not-an-account-id' at \
+                 'authorizedAccountId' failed to satisfy constraint: Member must have \
+                 length less than or equal to 12; Value 'not-an-account-id' at \
+                 'authorizedAccountId' failed to satisfy constraint: Member must satisfy \
+                 regular expression pattern: \\d{12}",
+            ),
+            (
+                "shorter than an account id",
+                Violation {
+                    path: "requesterAccountId".to_string(),
+                    kind: account_id_pattern.clone(),
+                    value: Some("12345".to_string()),
+                },
+                "2 validation errors detected: Value '12345' at 'requesterAccountId' \
+                 failed to satisfy constraint: Member must have length greater than or \
+                 equal to 12; Value '12345' at 'requesterAccountId' failed to satisfy \
+                 constraint: Member must satisfy regular expression pattern: \\d{12}",
+            ),
+            (
+                "the empty value",
+                Violation {
+                    path: "accountId".to_string(),
+                    kind: account_id_pattern.clone(),
+                    value: Some(String::new()),
+                },
+                "2 validation errors detected: Value '' at 'accountId' failed to satisfy \
+                 constraint: Member must have length greater than or equal to 12; Value \
+                 '' at 'accountId' failed to satisfy constraint: Member must satisfy \
+                 regular expression pattern: \\d{12}",
+            ),
+            (
+                // Twelve characters is the only length the pattern admits, so a value
+                // of that length broke the pattern alone.
+                "an account id's length, but not its digits",
+                Violation {
+                    path: "authorizedAccountId".to_string(),
+                    kind: account_id_pattern.clone(),
+                    value: Some("not-an-acct1".to_string()),
+                },
+                "1 validation error detected: Value 'not-an-acct1' at \
+                 'authorizedAccountId' failed to satisfy constraint: Member must satisfy \
+                 regular expression pattern: \\d{12}",
+            ),
+            (
+                // An element of a list keeps the framework's single clause: Config
+                // states a collection's element constraints against the collection.
+                "an account id inside a list",
+                Violation {
+                    path: "accountAggregationSources.1.member.accountIds.1.member"
+                        .to_string(),
+                    kind: account_id_pattern,
+                    value: Some("12345".to_string()),
+                },
+                "1 validation error detected: Value '12345' at \
+                 'accountAggregationSources.1.member.accountIds.1.member' failed to \
+                 satisfy constraint: Member must satisfy regular expression pattern: \
+                 \\d{12}",
+            ),
+        ];
+
+        for (case, found, expected) in rows {
+            let stated = constraint_envelope(std::slice::from_ref(&found))
+                .unwrap_or_else(|| panic!("case {case:?}: expected a reworded refusal"));
+            assert_eq!(
+                stated, expected,
+                "case {case:?}: expected {expected:?}, got {stated:?}"
+            );
+        }
+    }
+
+    /// A member whose `@pattern` is not the account-id shape's keeps its single clause,
+    /// whatever its value's length: the implied bound belongs to that shape alone.
+    #[test]
+    fn another_shapes_pattern_states_one_clause_whatever_the_length() {
+        // The patterns are this model's own, from `smithy_query(query="shape",
+        // shape="ServicePrincipal"|"QueryName"|"QueryId")`.
+        for (case, pattern, value) in [
+            ("a long value", r"^[\w+=,.@-]+$", "not a valid principal!!"),
+            ("a short value", "^[a-zA-Z0-9-_]+$", "a b"),
+            ("a twelve-character value", r"^\S+$", "a b c d e f "),
+        ] {
+            let found = Violation {
+                path: "queryId".to_string(),
+                kind: ViolationKind::Pattern(pattern.to_string()),
+                value: Some(value.to_string()),
+            };
+            let stated = constraint_envelope(std::slice::from_ref(&found))
+                .unwrap_or_else(|| panic!("case {case:?}: expected a reworded refusal"));
+            assert!(
+                stated.starts_with("1 validation error detected: "),
+                "case {case:?}: expected one clause, got {stated:?}"
+            );
+        }
+    }
+
+    /// The pattern this file keys the implied account-id length on is the one the MODEL
+    /// declares for the members that carry an account id, read back off the generated
+    /// schemas rather than trusted as a copy of it.
+    #[test]
+    fn the_account_id_pattern_is_the_one_the_model_declares() {
+        use aws_smithy_schema_server::constraints::PatternTrait;
+
+        // (case, the operation's input schema, the member that carries an account id).
+        let rows: [(&str, &::aws_smithy_schema::Schema, &str); 3] = [
+            (
+                "PutAggregationAuthorization",
+                crate::ops::types::PUT_AGGREGATION_AUTHORIZATION_INPUT_SCHEMA,
+                "AuthorizedAccountId",
+            ),
+            (
+                "DeleteAggregationAuthorization",
+                crate::ops::types::DELETE_AGGREGATION_AUTHORIZATION_INPUT_SCHEMA,
+                "AuthorizedAccountId",
+            ),
+            (
+                "DeletePendingAggregationRequest",
+                crate::ops::types::DELETE_PENDING_AGGREGATION_REQUEST_INPUT_SCHEMA,
+                "RequesterAccountId",
+            ),
+        ];
+
+        for (case, schema, member_name) in rows {
+            let member = schema
+                .members()
+                .iter()
+                .copied()
+                .find(|member| member.member_name() == Some(member_name))
+                .unwrap_or_else(|| panic!("case {case:?}: the model declares {member_name}"));
+            let declared = member
+                .traits()
+                .and_then(|traits| traits.get(&PatternTrait::TRAIT_ID))
+                .and_then(|declared| declared.as_any().downcast_ref::<PatternTrait>())
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: {member_name} declares a @pattern")
+                });
+            assert_eq!(
+                declared.regex, ACCOUNT_ID_PATTERN,
+                "case {case:?}: expected the account-id pattern {ACCOUNT_ID_PATTERN:?}, \
+                 got {:?}",
+                declared.regex
+            );
+        }
     }
 
     /// Nothing to word is no refusal: a request that breaks no constraint is not

@@ -104,24 +104,6 @@ impl From<GetCustomRulePolicyErrorModeled> for GetCustomRulePolicyError {
     }
 }
 
-/// How Config words `NoSuchConfigRuleException` for a request that named a rule which
-/// is not a Config Custom Policy rule, so it carries no Guard policy body. The one
-/// modelled error covers this case as well as an absent rule
-/// (`NoSuchConfigRuleException`: "Verify that the rule is an Config Process Check
-/// rule, that the rule name is correct"), so the message says WHICH of the two the
-/// request got wrong.
-///
-/// It lives here rather than beside [`crate::state::no_such_config_rule_message`]
-/// because this is the only operation that reads a rule's Guard policy body, and it
-/// is worded the same way as that sibling: BUILT FROM THE REQUEST, quoting the
-/// `ConfigRuleName` the caller sent and naming what to check.
-fn not_a_custom_policy_rule_message(name: &str) -> String {
-    format!(
-        "The ConfigRule '{name}' provided in the request is invalid. Please check that \
-         the rule is a Config Custom Policy rule."
-    )
-}
-
 /// The `GetCustomRulePolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -188,7 +170,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Only a Custom Policy rule carries a Guard policy body. A managed rule or a
         // Custom Lambda rule is evaluated by something else entirely, so there is no
-        // policy to report and the request named the wrong kind of rule.
+        // policy to report. The one modelled error covers that as well as a name no
+        // rule carries, and it carries the SAME sentence for both: this operation
+        // selects Custom Policy rules, so a name that selects none of them names no
+        // rule this read can answer for, and the refusal states that and nothing about
+        // the kind of rule the account happens to hold under the name
+        // ([`crate::state::no_such_config_rule_message`], shared with every other
+        // operation that refuses a rule name).
         let policy = if rule.source.owner == crate::state::OWNER_CUSTOM_POLICY {
             rule.source.custom_policy_details.as_ref()
         } else {
@@ -197,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(policy) = policy else {
             return Err(GetCustomRulePolicyErrorModeled::NoSuchConfigRuleException(
                 NoSuchConfigRuleException {
-                    message: Some(not_a_custom_policy_rule_message(name)),
+                    message: Some(crate::state::no_such_config_rule_message(name)),
                 },
             )
             .into());

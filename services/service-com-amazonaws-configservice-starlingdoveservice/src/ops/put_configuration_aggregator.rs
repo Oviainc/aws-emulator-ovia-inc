@@ -197,18 +197,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         match (!account_sources.is_empty(), organization_source.is_some()) {
             (true, true) => {
                 return Err(invalid_parameter_value(
-                    "the configuration aggregator cannot be created because the request \
-                     contains both AccountAggregationSources and \
-                     OrganizationAggregationSource; include only one aggregation source \
-                     and try again",
+                    "The configuration aggregator cannot be created because your request \
+                     contains both the AccountAggregationSource and the \
+                     OrganizationAggregationSource. Include only one aggregation source \
+                     and try again.",
                 ));
             }
             (false, false) => {
                 return Err(invalid_parameter_value(
-                    "the configuration aggregator cannot be created because the request is \
-                     missing both AccountAggregationSources and \
-                     OrganizationAggregationSource; include one aggregation source and \
-                     try again",
+                    "The configuration aggregator cannot be created because your request \
+                     is missing both the AccountAggregationSource and the \
+                     OrganizationAggregationSource. Include one aggregation source and \
+                     try again.",
                 ));
             }
             _ => {}
@@ -360,8 +360,12 @@ fn invalid_parameter_value(message: &str) -> PutConfigurationAggregatorError {
 /// `AllAwsRegions` or a non-empty `AwsRegions` within the bound on how many Regions one
 /// source can list ([`crate::state::AGGREGATION_SOURCE_REGIONS_QUOTA`]), and not both.
 ///
-/// The message is BUILT FROM THE REQUEST — it names the member whose Regions are wrong
-/// — so both kinds of aggregation source are refused the same way.
+/// Only the quota refusal names the member and the count it carried, which is what the
+/// caller has to bring down. The other two — a source that names BOTH region forms, and
+/// one that names NEITHER — each carry one FIXED sentence about the request as a whole,
+/// naming neither the member nor the Regions it listed: the aggregator was asked for
+/// two contradictory region selections, or for none at all, whichever kind of source
+/// carried the fault.
 fn check_aggregated_regions(
     member: &str,
     all_aws_regions: bool,
@@ -378,14 +382,14 @@ fn check_aggregated_regions(
         )));
     }
     match (all_aws_regions, listed) {
-        (true, true) => Err(invalid_parameter_value(&format!(
-            "{member} contains both AllAwsRegions and AwsRegions; specify only one of them \
-             and try again"
-        ))),
-        (false, false) => Err(invalid_parameter_value(&format!(
-            "{member} specifies no regions; list the source regions in AwsRegions or set \
-             AllAwsRegions to true and try again"
-        ))),
+        (true, true) => Err(invalid_parameter_value(
+            "Your configuration aggregator contains a list of regions and also specifies \
+             the use of all regions. You must choose one of these options.",
+        )),
+        (false, false) => Err(invalid_parameter_value(
+            "Your request does not specify any regions. Select AWS Config-supported \
+             regions and try again.",
+        )),
         _ => Ok(()),
     }
 }

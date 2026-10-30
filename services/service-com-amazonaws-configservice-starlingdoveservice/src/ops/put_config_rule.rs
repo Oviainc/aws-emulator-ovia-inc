@@ -226,16 +226,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `CustomPolicyDetails` is required when the owner is CUSTOM_POLICY; for every
-        // other owner the rule is identified by its `SourceIdentifier` (a managed rule
-        // identifier, or the ARN of the rule's Lambda function).
+        // `CustomPolicyDetails` is required when the owner is CUSTOM_POLICY ("Required
+        // when owner is set to CUSTOM_POLICY"); for every other owner the rule is
+        // identified by its `SourceIdentifier` (a managed rule identifier, or the ARN of
+        // the rule's Lambda function) instead.
         if requested.source.owner == crate::state::OWNER_CUSTOM_POLICY {
             if requested.source.custom_policy_details.is_none() {
                 return Err(PutConfigRuleErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
                         message: Some(format!(
-                            "ConfigRule.Source.CustomPolicyDetails is required when \
-                             Source.Owner is {}",
+                            "CustomPolicyDetails is required when Owner is {}",
                             crate::state::OWNER_CUSTOM_POLICY,
                         )),
                     },
