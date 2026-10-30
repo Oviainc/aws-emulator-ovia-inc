@@ -29,9 +29,9 @@ use serde_json::{json, Value};
 use super::canary_lifecycle::{create_body, Synthetics};
 
 /// Runtime versions the service publishes, taken from the catalogue in `src/state.rs`
-/// (`RUNTIME_VERSIONS`, written from the CloudWatch Synthetics "Canary Runtime Versions"
-/// documentation): the newest and the oldest entry of each family it lists, plus the
-/// retired ones. None of these is the version the issue cited.
+/// (`RUNTIME_VERSION_CATALOG`, written from the CloudWatch Synthetics "Canary Runtime
+/// Versions" documentation): the newest and the oldest entry of each family it lists, plus
+/// the retired ones. None of these is the version the issue cited.
 const PUBLISHED_RUNTIME_VERSIONS: [&str; 8] = [
     "syn-nodejs-playwright-3.0",
     "syn-nodejs-playwright-1.0",

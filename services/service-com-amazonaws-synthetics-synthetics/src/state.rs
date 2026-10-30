@@ -938,28 +938,65 @@ pub fn group_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn("synthetics", region, &format!("group:{id}"))
 }
 
-/// `RuntimeVersion$Description` for the Node.js/Puppeteer runtime family.
+/// `RuntimeVersion$Language` for a runtime version whose canaries are written in Node.js.
+const LANGUAGE_NODEJS: &str = "nodejs";
+
+/// `RuntimeVersion$Language` for a runtime version whose canaries are written in Python.
+const LANGUAGE_PYTHON: &str = "python";
+
+/// What the name of a Python runtime family carries between the `syn-` prefix and the
+/// automation library it bundles (`syn-python-selenium-5.1`); every other published family
+/// is a Node.js one (`syn-nodejs-puppeteer-9.0`, `syn-nodejs-playwright-1.0`,
+/// `syn-nodejs-2.2`, `syn-1.0`).
+const PYTHON_FAMILY_SEGMENT: &str = "-python-";
+
+/// The language canary scripts on `version_name` are written in.
 ///
-/// The published table gives each version a one-line description naming the exact Node.js,
-/// Puppeteer and Chromium builds it bundles; those build numbers are not restated here, so
-/// what a description carries is the family — the language and the browser-automation API a
-/// canary on that runtime is written against — which is what distinguishes one runtime from
-/// another when a caller picks one.
-const PUPPETEER_RUNTIME_DESCRIPTION: &str =
-    "Node.js canary runtime: scripts are written against the Puppeteer API and run on a \
-     bundled headless Chromium.";
+/// A property of the runtime FAMILY, not of one catalogued entry: a version name names its
+/// family, so the language is read off the name rather than restated per entry and cannot
+/// disagree with it.
+pub fn runtime_language(version_name: &str) -> &'static str {
+    if version_name.contains(PYTHON_FAMILY_SEGMENT) {
+        LANGUAGE_PYTHON
+    } else {
+        LANGUAGE_NODEJS
+    }
+}
 
-/// `RuntimeVersion$Description` for the Node.js/Playwright runtime family, by the same rule
-/// as [`PUPPETEER_RUNTIME_DESCRIPTION`].
-const PLAYWRIGHT_RUNTIME_DESCRIPTION: &str =
-    "Node.js canary runtime: scripts are written against the Playwright API and run on a \
-     bundled headless Chromium.";
+/// How a description opens when the version it describes is a patch release of a family
+/// already published: such a release carries the dependency updates for the vulnerabilities
+/// fixed since the `.0` release, and the published description says so before listing the
+/// dependencies.
+const SECURITY_FIX_SENTENCE: &str = "Security fixes. ";
 
-/// `RuntimeVersion$Description` for the Python/Selenium runtime family, by the same rule as
-/// [`PUPPETEER_RUNTIME_DESCRIPTION`].
-const SELENIUM_RUNTIME_DESCRIPTION: &str =
-    "Python canary runtime: scripts are written against the Selenium WebDriver API and run \
-     on a bundled headless Chromium.";
+/// How a description introduces the runtime's dependency list, which is what the published
+/// description of a runtime version carries.
+const DEPENDENCIES_LABEL: &str = "Dependencies: ";
+
+/// Whether `version_name` is a PATCH release of its family: a published runtime version ends
+/// in `<major>.<minor>`, and a non-zero minor is a patch release of the `<major>.0` one.
+fn is_patch_release(version_name: &str) -> bool {
+    version_name
+        .rsplit_once('-')
+        .and_then(|(_, version)| version.split('.').nth(1))
+        .and_then(|minor| minor.parse::<u32>().ok())
+        .is_some_and(|minor| minor > 0)
+}
+
+/// `RuntimeVersion$Description` — "A description of the runtime version, created by Amazon".
+///
+/// The published description of a runtime version lists the dependencies that version
+/// bundles, prefixed with [`SECURITY_FIX_SENTENCE`] when the version is a patch release of
+/// an already published family. Derived rather than stored, so the catalog records each
+/// version's dependencies once and every description reads the same way.
+fn runtime_description(version_name: &str, dependencies: &str) -> String {
+    let security_fixes = if is_patch_release(version_name) {
+        SECURITY_FIX_SENTENCE
+    } else {
+        ""
+    };
+    format!("{security_fixes}{DEPENDENCIES_LABEL}{dependencies}")
+}
 
 /// The RFC 3339 form every catalogued date is written in, and the form the modelled
 /// `Timestamp` serialises as.
@@ -974,9 +1011,12 @@ const CATALOG_DATE_FORMAT: ::aws_smithy_types::date_time::Format =
 pub struct RuntimeVersionEntry {
     /// `RuntimeVersion$VersionName` — the value a canary carries as its `RuntimeVersion`.
     pub version_name: &'static str,
-    /// `RuntimeVersion$Description` — "A description of the runtime version, created by
-    /// Amazon".
-    pub description: &'static str,
+    /// What this version bundles, as the published description lists it: the language
+    /// runtime and the browser-automation library a canary on this version runs against, at
+    /// the line the runtime versions page gives for it. The exact patch builds of each
+    /// dependency are not restated here, so nothing is reported that this emulator does not
+    /// know; [`runtime_description`] renders this into the description.
+    pub dependencies: &'static str,
     /// `RuntimeVersion$ReleaseDate` — "The date that the runtime version was released".
     pub release_date: &'static str,
     /// `RuntimeVersion$DeprecationDate` — "If this runtime version is deprecated, this value
@@ -994,7 +1034,8 @@ impl RuntimeVersionEntry {
     pub fn to_runtime_version(&self) -> RuntimeVersion {
         RuntimeVersion {
             version_name: Some(self.version_name.to_string()),
-            description: Some(self.description.to_string()),
+            description: Some(runtime_description(self.version_name, self.dependencies)),
+            language: Some(runtime_language(self.version_name).to_string()),
             release_date: catalog_date(self.release_date),
             deprecation_date: self.deprecation_date.and_then(catalog_date),
         }
@@ -1015,15 +1056,23 @@ fn catalog_date(date: &str) -> Option<::aws_smithy_types::DateTime> {
     parsed
 }
 
-/// Every canary runtime version this emulator's Synthetics offers, OLDEST FIRST — a total,
-/// stable order, so a `DescribeRuntimeVersions` page boundary means the same thing on the
-/// next call.
+/// Every canary runtime version this service publishes, NEWEST FIRST — the order the
+/// published catalog is reported in, and a total, stable one, so a
+/// `DescribeRuntimeVersions` page boundary means the same thing on the next call.
+///
+/// This is the ONE catalog: `DescribeRuntimeVersions` reports it
+/// ([`RuntimeVersionEntry::to_runtime_version`]) and canary creation validates against it
+/// ([`is_published_runtime_version`]), so the versions a client discovers here and the
+/// versions a canary may be created on cannot disagree.
 ///
 /// Source: the CloudWatch User Guide's canary runtime versions page, which the model's own
 /// `RuntimeVersion` doc links to
 /// (<https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Synthetics_Canaries_Library.html>);
-/// it is that page that names the runtime versions and the release of each. A release the
-/// page dates by month is recorded here as the first day of that month.
+/// it is that page that names the runtime versions, the dependencies each bundles and the
+/// release of each. A release the page dates by month is recorded here as the first day of
+/// that month, and the entries are listed by release date so the newest runtime of every
+/// family — Node.js with Playwright, Node.js with Puppeteer, Python with Selenium, and the
+/// retired `syn-nodejs-2.x` / `syn-1.0` ones the page still names — comes first.
 ///
 /// Only versions that are OFFERED are catalogued: a canary cannot be created on a runtime
 /// this emulator does not offer, so nothing in the list is deprecated and every entry's
@@ -1031,81 +1080,249 @@ fn catalog_date(date: &str) -> Option<::aws_smithy_types::DateTime> {
 /// this runtime version is deprecated, this value is the date of deprecation").
 pub const RUNTIME_VERSION_CATALOG: &[RuntimeVersionEntry] = &[
     RuntimeVersionEntry {
-        version_name: "syn-python-selenium-3.0",
-        description: SELENIUM_RUNTIME_DESCRIPTION,
-        release_date: "2023-11-01T00:00:00Z",
+        version_name: "syn-nodejs-playwright-3.0",
+        dependencies: "Node JS 22.x, Playwright 1.x",
+        release_date: "2025-08-01T00:00:00Z",
         deprecation_date: None,
     },
     RuntimeVersionEntry {
-        version_name: "syn-nodejs-puppeteer-6.2",
-        description: PUPPETEER_RUNTIME_DESCRIPTION,
-        release_date: "2024-02-01T00:00:00Z",
+        version_name: "syn-nodejs-playwright-2.0",
+        dependencies: "Node JS 22.x, Playwright 1.x",
+        release_date: "2025-05-01T00:00:00Z",
         deprecation_date: None,
     },
     RuntimeVersionEntry {
-        version_name: "syn-nodejs-puppeteer-7.0",
-        description: PUPPETEER_RUNTIME_DESCRIPTION,
-        release_date: "2024-05-01T00:00:00Z",
-        deprecation_date: None,
-    },
-    RuntimeVersionEntry {
-        version_name: "syn-python-selenium-4.0",
-        description: SELENIUM_RUNTIME_DESCRIPTION,
-        release_date: "2024-05-01T00:00:00Z",
-        deprecation_date: None,
-    },
-    RuntimeVersionEntry {
-        version_name: "syn-nodejs-puppeteer-8.0",
-        description: PUPPETEER_RUNTIME_DESCRIPTION,
-        release_date: "2024-08-01T00:00:00Z",
-        deprecation_date: None,
-    },
-    RuntimeVersionEntry {
-        version_name: "syn-python-selenium-4.1",
-        description: SELENIUM_RUNTIME_DESCRIPTION,
-        release_date: "2024-08-01T00:00:00Z",
-        deprecation_date: None,
-    },
-    RuntimeVersionEntry {
-        version_name: "syn-nodejs-puppeteer-9.0",
-        description: PUPPETEER_RUNTIME_DESCRIPTION,
-        release_date: "2024-10-01T00:00:00Z",
-        deprecation_date: None,
-    },
-    RuntimeVersionEntry {
-        version_name: "syn-python-selenium-5.0",
-        description: SELENIUM_RUNTIME_DESCRIPTION,
-        release_date: "2024-10-01T00:00:00Z",
-        deprecation_date: None,
-    },
-    RuntimeVersionEntry {
-        version_name: "syn-nodejs-playwright-1.0",
-        description: PLAYWRIGHT_RUNTIME_DESCRIPTION,
-        release_date: "2024-11-01T00:00:00Z",
-        deprecation_date: None,
-    },
-    RuntimeVersionEntry {
-        version_name: "syn-nodejs-puppeteer-9.1",
-        description: PUPPETEER_RUNTIME_DESCRIPTION,
-        release_date: "2024-12-01T00:00:00Z",
+        version_name: "syn-nodejs-puppeteer-11.0",
+        dependencies: "Node JS 22.x, Puppeteer-core 24.x",
+        release_date: "2025-05-01T00:00:00Z",
         deprecation_date: None,
     },
     RuntimeVersionEntry {
         version_name: "syn-nodejs-puppeteer-10.0",
-        description: PUPPETEER_RUNTIME_DESCRIPTION,
+        dependencies: "Node JS 20.x, Puppeteer-core 23.x",
         release_date: "2025-02-01T00:00:00Z",
         deprecation_date: None,
     },
     RuntimeVersionEntry {
         version_name: "syn-python-selenium-5.1",
-        description: SELENIUM_RUNTIME_DESCRIPTION,
+        dependencies: "Python 3.9, Selenium 4.x",
         release_date: "2025-02-01T00:00:00Z",
         deprecation_date: None,
     },
     RuntimeVersionEntry {
-        version_name: "syn-nodejs-playwright-2.0",
-        description: PLAYWRIGHT_RUNTIME_DESCRIPTION,
-        release_date: "2025-05-01T00:00:00Z",
+        version_name: "syn-nodejs-puppeteer-9.1",
+        dependencies: "Node JS 20.x, Puppeteer-core 22.x",
+        release_date: "2024-12-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-playwright-1.0",
+        dependencies: "Node JS 20.x, Playwright 1.x",
+        release_date: "2024-11-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-9.0",
+        dependencies: "Node JS 20.x, Puppeteer-core 22.x",
+        release_date: "2024-10-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-python-selenium-5.0",
+        dependencies: "Python 3.9, Selenium 4.x",
+        release_date: "2024-10-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-8.0",
+        dependencies: "Node JS 20.x, Puppeteer-core 22.x",
+        release_date: "2024-08-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-python-selenium-4.1",
+        dependencies: "Python 3.9, Selenium 4.x",
+        release_date: "2024-08-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-7.0",
+        dependencies: "Node JS 18.x, Puppeteer-core 21.x",
+        release_date: "2024-05-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-python-selenium-4.0",
+        dependencies: "Python 3.9, Selenium 4.x",
+        release_date: "2024-05-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-6.2",
+        dependencies: "Node JS 18.x, Puppeteer-core 19.x",
+        release_date: "2024-02-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-6.1",
+        dependencies: "Node JS 18.x, Puppeteer-core 19.x",
+        release_date: "2023-11-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-python-selenium-3.0",
+        dependencies: "Python 3.8, Selenium 4.x",
+        release_date: "2023-11-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-6.0",
+        dependencies: "Node JS 18.x, Puppeteer-core 19.x",
+        release_date: "2023-08-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-python-selenium-2.1",
+        dependencies: "Python 3.8, Selenium 3.x",
+        release_date: "2023-08-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-5.2",
+        dependencies: "Node JS 16.x, Puppeteer-core 5.x",
+        release_date: "2023-06-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-5.1",
+        dependencies: "Node JS 16.x, Puppeteer-core 5.x",
+        release_date: "2023-03-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-python-selenium-2.0",
+        dependencies: "Python 3.8, Selenium 3.x",
+        release_date: "2023-02-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-5.0",
+        dependencies: "Node JS 16.x, Puppeteer-core 5.x",
+        release_date: "2023-01-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-4.0",
+        dependencies: "Node JS 14.x, Puppeteer-core 5.x",
+        release_date: "2022-11-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-3.9",
+        dependencies: "Node JS 12.x, Puppeteer-core 5.x",
+        release_date: "2022-08-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-3.8",
+        dependencies: "Node JS 12.x, Puppeteer-core 5.x",
+        release_date: "2022-06-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-3.7",
+        dependencies: "Node JS 12.x, Puppeteer-core 5.x",
+        release_date: "2022-05-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-python-selenium-1.3",
+        dependencies: "Python 3.8, Selenium 3.x",
+        release_date: "2022-05-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-3.6",
+        dependencies: "Node JS 12.x, Puppeteer-core 5.x",
+        release_date: "2022-04-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-3.5",
+        dependencies: "Node JS 12.x, Puppeteer-core 5.x",
+        release_date: "2022-02-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-python-selenium-1.2",
+        dependencies: "Python 3.8, Selenium 3.x",
+        release_date: "2022-02-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-3.4",
+        dependencies: "Node JS 12.x, Puppeteer-core 5.x",
+        release_date: "2021-12-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-3.3",
+        dependencies: "Node JS 12.x, Puppeteer-core 5.x",
+        release_date: "2021-10-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-python-selenium-1.1",
+        dependencies: "Python 3.8, Selenium 3.x",
+        release_date: "2021-10-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-3.2",
+        dependencies: "Node JS 12.x, Puppeteer-core 5.x",
+        release_date: "2021-07-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-3.1",
+        dependencies: "Node JS 12.x, Puppeteer-core 5.x",
+        release_date: "2021-05-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-3.0",
+        dependencies: "Node JS 12.x, Puppeteer-core 5.x",
+        release_date: "2021-02-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-python-selenium-1.0",
+        dependencies: "Python 3.8, Selenium 3.x",
+        release_date: "2021-02-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-2.2",
+        dependencies: "Node JS 10.x, Puppeteer-core 3.x",
+        release_date: "2021-01-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-2.1",
+        dependencies: "Node JS 10.x, Puppeteer-core 3.x",
+        release_date: "2020-11-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-2.0",
+        dependencies: "Node JS 10.x, Puppeteer-core 3.x",
+        release_date: "2020-10-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-1.0",
+        dependencies: "Node JS 10.x, Puppeteer-core 1.x",
+        release_date: "2020-06-01T00:00:00Z",
         deprecation_date: None,
     },
 ];
@@ -1320,77 +1537,22 @@ fn is_s3_bucket_name(bucket: &str) -> bool {
 /// it carries nothing from the request, so a rejected value is never echoed back.
 pub const ARTIFACT_S3_LOCATION_MALFORMED: &str = "ArtifactS3Location: The location is malformed.";
 
-/// Every CloudWatch Synthetics canary runtime version this service publishes.
+/// Whether `requested` names a runtime version this service publishes — a lookup in the ONE
+/// catalog [`RUNTIME_VERSION_CATALOG`], the same list `DescribeRuntimeVersions` reports, so
+/// a client that picks a version out of that answer can create a canary on it.
 ///
 /// `RuntimeVersion` is modelled as a bare `String` with `@length 1..1024` and no enum, and
 /// the member documents its value set as something the service publishes rather than
 /// something the model carries — "Specifies the runtime version to use for the canary. For
 /// a list of valid runtime versions and more information about runtime versions, see
 /// Canary Runtime Versions"
-/// (`smithy_query(query="doc",shape="CreateCanaryRequest",member="RuntimeVersion")`). The
-/// allow-list is therefore a server-side catalogue, written out here from the CloudWatch
-/// Synthetics "Canary Runtime Versions" documentation (the `syn-nodejs-playwright-*`,
-/// `syn-nodejs-puppeteer-*` and `syn-python-selenium-*` families it lists, plus the
-/// retired `syn-nodejs-2.x` / `syn-1.0` ones it still names), newest first within each
-/// family.
+/// (`smithy_query(query="doc",shape="CreateCanaryRequest",member="RuntimeVersion")`), hence
+/// a server-side catalog.
 ///
-/// This is the catalogue `DescribeRuntimeVersions` is to report; that operation is still a
-/// scaffold stub with an issue of its own
-/// (`issues/things-that-do-not-work/20261022T200712Z-synthetics-describeruntimeversions-stub.md`),
-/// so it is kept here, beside the state, rather than inside one handler.
-pub const RUNTIME_VERSIONS: &[&str] = &[
-    // Node.js with Playwright.
-    "syn-nodejs-playwright-3.0",
-    "syn-nodejs-playwright-2.0",
-    "syn-nodejs-playwright-1.0",
-    // Node.js with Puppeteer.
-    "syn-nodejs-puppeteer-11.0",
-    "syn-nodejs-puppeteer-10.0",
-    "syn-nodejs-puppeteer-9.1",
-    "syn-nodejs-puppeteer-9.0",
-    "syn-nodejs-puppeteer-8.0",
-    "syn-nodejs-puppeteer-7.0",
-    "syn-nodejs-puppeteer-6.2",
-    "syn-nodejs-puppeteer-6.1",
-    "syn-nodejs-puppeteer-6.0",
-    "syn-nodejs-puppeteer-5.2",
-    "syn-nodejs-puppeteer-5.1",
-    "syn-nodejs-puppeteer-5.0",
-    "syn-nodejs-puppeteer-4.0",
-    "syn-nodejs-puppeteer-3.9",
-    "syn-nodejs-puppeteer-3.8",
-    "syn-nodejs-puppeteer-3.7",
-    "syn-nodejs-puppeteer-3.6",
-    "syn-nodejs-puppeteer-3.5",
-    "syn-nodejs-puppeteer-3.4",
-    "syn-nodejs-puppeteer-3.3",
-    "syn-nodejs-puppeteer-3.2",
-    "syn-nodejs-puppeteer-3.1",
-    "syn-nodejs-puppeteer-3.0",
-    // Python with Selenium.
-    "syn-python-selenium-5.1",
-    "syn-python-selenium-5.0",
-    "syn-python-selenium-4.1",
-    "syn-python-selenium-4.0",
-    "syn-python-selenium-3.0",
-    "syn-python-selenium-2.1",
-    "syn-python-selenium-2.0",
-    "syn-python-selenium-1.3",
-    "syn-python-selenium-1.2",
-    "syn-python-selenium-1.1",
-    "syn-python-selenium-1.0",
-    // The retired families the service still names.
-    "syn-nodejs-2.2",
-    "syn-nodejs-2.1",
-    "syn-nodejs-2.0",
-    "syn-1.0",
-];
-
-/// Whether `requested` names a runtime version this service publishes
-/// ([`RUNTIME_VERSIONS`]). An exact match: a runtime version is an identifier the service
-/// mints, not a pattern, so nothing about the value is normalised first.
+/// An exact match: a runtime version is an identifier the service publishes, not a pattern,
+/// so nothing about the value is normalised first.
 pub fn is_published_runtime_version(requested: &str) -> bool {
-    RUNTIME_VERSIONS.contains(&requested)
+    runtime_version_position(requested).is_some()
 }
 
 /// How Synthetics words the refusal of a runtime version it does not publish.

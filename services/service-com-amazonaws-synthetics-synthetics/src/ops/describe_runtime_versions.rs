@@ -3,7 +3,8 @@
 //! @op DescribeRuntimeVersions
 //! Pages over the canary runtime versions this service publishes
 //! ([`crate::state::RUNTIME_VERSION_CATALOG`]) — the one catalog, so the names this
-//! operation reports and the names a canary may be created on cannot disagree.
+//! operation reports and the names a canary may be created on cannot disagree. The catalog
+//! is reported NEWEST FIRST, the order the service publishes it in.
 //!
 //! A pure read: nothing about the account's canaries is touched, and nothing is written.
 //!

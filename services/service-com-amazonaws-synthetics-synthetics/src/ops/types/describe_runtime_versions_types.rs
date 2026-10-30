@@ -30,6 +30,7 @@ pub struct DescribeRuntimeVersionsOutput {
 pub struct RuntimeVersion {
     pub version_name: Option<String>,
     pub description: Option<String>,
+    pub language: Option<String>,
     pub release_date: Option<::aws_smithy_types::DateTime>,
     pub deprecation_date: Option<::aws_smithy_types::DateTime>,
 }

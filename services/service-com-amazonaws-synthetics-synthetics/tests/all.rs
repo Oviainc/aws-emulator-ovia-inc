@@ -27,6 +27,8 @@ mod input_validation;
 mod missing_resource_errors;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/runtime_catalog.rs"]
+mod runtime_catalog;
 #[path = "all/runtime_versions.rs"]
 mod runtime_versions;
 #[path = "all/server_side_validation.rs"]

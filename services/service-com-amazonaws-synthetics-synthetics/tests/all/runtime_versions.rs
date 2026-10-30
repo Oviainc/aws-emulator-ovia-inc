@@ -4,10 +4,10 @@
 //! emulator boots, through the harness in `canary_lifecycle`).
 //!
 //! The rule pinned here: `DescribeRuntimeVersions` reports the service's published catalog
-//! of canary runtime versions — one modelled `RuntimeVersion` per catalogued version, in a
-//! total and stable order, paged by `MaxResults`/`NextToken` so that walking the pages
-//! yields exactly the catalog once, with a `NextToken` emitted only while entries remain —
-//! and it reports it without changing anything a later caller sees.
+//! of canary runtime versions — one modelled `RuntimeVersion` per catalogued version,
+//! newest first in a total and stable order, paged by `MaxResults`/`NextToken` so that
+//! walking the pages yields exactly the catalog once, with a `NextToken` emitted only while
+//! entries remain — and it reports it without changing anything a later caller sees.
 //!
 //! The assertions below therefore span what the rule generalises over rather than one
 //! recorded call: every catalogued entry (not a cited one), a table of page sizes from 1 to
@@ -162,12 +162,13 @@ async fn every_reported_runtime_version_carries_the_modelled_shape() {
         );
 
         // `RuntimeVersion$ReleaseDate`: "The date that the runtime version was released" —
-        // so a released runtime carries one, and the catalog's order is that ladder.
+        // so a released runtime carries one, and the catalog is reported newest first, so
+        // that ladder descends.
         let release = timestamp_seconds(&entry["ReleaseDate"], &case);
-        if let Some(earlier) = previous_release {
+        if let Some(newer) = previous_release {
             assert!(
-                release >= earlier,
-                "case {case}: the catalog is ordered by release date, got {release} after {earlier}"
+                release <= newer,
+                "case {case}: the catalog is reported newest first, got {release} after {newer}"
             );
         }
         previous_release = Some(release);

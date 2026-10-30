@@ -253,8 +253,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `CreateCanaryRequest$RuntimeVersion` is "the runtime version to use for the
         // canary. For a list of valid runtime versions … see Canary Runtime Versions":
         // the model constrains only the value's LENGTH, so the set of values the service
-        // accepts is its own runtime catalogue (`crate::state::RUNTIME_VERSIONS`, what
-        // `DescribeRuntimeVersions` reports). A version outside it names no runtime the
+        // accepts is its own runtime catalogue (`crate::state::RUNTIME_VERSION_CATALOG`,
+        // the one list `DescribeRuntimeVersions` reports). A version outside it names no runtime the
         // canary could ever be provisioned on, so it is refused here — before any state
         // is written, so a refused create leaves nothing behind.
         if !is_published_runtime_version(&input.runtime_version) {
