@@ -53,6 +53,8 @@ mod get_service;
 mod grouping_configuration;
 #[path = "all/handler_enforced_constraint_wording.rs"]
 mod handler_enforced_constraint_wording;
+#[path = "all/instrumentation_capture_defaults.rs"]
+mod instrumentation_capture_defaults;
 #[path = "all/instrumentation_configuration_arn.rs"]
 mod instrumentation_configuration_arn;
 #[path = "all/instrumentation_configuration_deletion.rs"]

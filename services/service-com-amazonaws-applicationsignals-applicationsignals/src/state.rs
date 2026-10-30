@@ -36,7 +36,8 @@ use crate::ops::types::{
 };
 // The dynamic instrumentation shapes, on their own `use` for the same reason.
 use crate::ops::types::{
-    CodeLocation, InstrumentationConfiguration, InstrumentationConfigurationWithoutServiceEnv,
+    CaptureConfiguration, CaptureLimitsConfig, CodeCaptureConfiguration, CodeLocation,
+    InstrumentationConfiguration, InstrumentationConfigurationWithoutServiceEnv,
     InstrumentationStatusEvent, Location, LocationIdentifier,
 };
 // The shapes the audit read projects, on their own `use` for the same reason.
@@ -4209,6 +4210,49 @@ pub const BREAKPOINT_MIN_EXPIRY: Duration = Duration::from_secs(5 * 60);
 /// The longest BREAKPOINT expiry a request may name, from the same sentence.
 pub const BREAKPOINT_MAX_EXPIRY: Duration = BREAKPOINT_DEFAULT_EXPIRY;
 
+/// `CaptureLimitsConfig.MaxHits` when omitted. Model doc
+/// (`smithy_query(query="shape",shape="CaptureLimitsConfig")`): "The maximum number of times
+/// the instrumentation point can be hit before it is automatically disabled. Defaults to 100."
+const DEFAULT_MAX_HITS: i32 = 100;
+
+/// `CaptureLimitsConfig.MaxStringLength` when omitted. Model doc: "The maximum length of
+/// captured string values in characters. Strings longer than this are truncated. Defaults to
+/// 128."
+const DEFAULT_MAX_STRING_LENGTH: i32 = 128;
+
+/// `CaptureLimitsConfig.MaxCollectionWidth` when omitted. Model doc: "The maximum number of
+/// items to capture from any collection to prevent large payloads. Defaults to 10."
+const DEFAULT_MAX_COLLECTION_WIDTH: i32 = 10;
+
+/// `CaptureLimitsConfig.MaxCollectionDepth` when omitted. Model doc: "The maximum nesting
+/// depth to traverse inside collections. Defaults to 3."
+const DEFAULT_MAX_COLLECTION_DEPTH: i32 = 3;
+
+/// `CaptureLimitsConfig.MaxStackFrames` when omitted. Model doc: "The maximum number of stack
+/// frames to capture in stack traces. Defaults to 2."
+const DEFAULT_MAX_STACK_FRAMES: i32 = 2;
+
+/// `CaptureLimitsConfig.MaxStackTraceSize` when omitted. Model doc: "The maximum total size,
+/// in bytes, of a captured stack trace. Defaults to 1000."
+const DEFAULT_MAX_STACK_TRACE_SIZE: i32 = 1000;
+
+/// `CaptureLimitsConfig.MaxObjectDepth` when omitted. Model doc: "The maximum depth for nested
+/// object traversal when capturing structured data. Defaults to 3."
+const DEFAULT_MAX_OBJECT_DEPTH: i32 = 3;
+
+/// `CaptureLimitsConfig.MaxFieldsPerObject` when omitted. Model doc: "The maximum number of
+/// fields to capture for any object. Defaults to 10."
+const DEFAULT_MAX_FIELDS_PER_OBJECT: i32 = 10;
+
+/// `CodeCaptureConfiguration.CaptureReturn` when omitted. Model doc
+/// (`smithy_query(query="shape",shape="CodeCaptureConfiguration")`): "Whether to capture the
+/// return value. Defaults to false."
+const DEFAULT_CAPTURE_RETURN: bool = false;
+
+/// `CodeCaptureConfiguration.CaptureStackTrace` when omitted. Model doc: "Whether to capture a
+/// stack trace when the instrumentation point is hit. Defaults to true."
+const DEFAULT_CAPTURE_STACK_TRACE: bool = true;
+
 /// The `SyncInterval` a list reports. `InstrumentationConfigurationsPage.SyncInterval`'s
 /// doc: "The suggested number of seconds to wait before the next sync request. This is at
 /// least 60 seconds to prevent excessive polling", which is also the member's modelled
@@ -5343,6 +5387,72 @@ pub fn requested_expiry(
         ));
     }
     Ok(Some(*requested))
+}
+
+/// The `CaptureConfiguration` stored for a request, with each member the model documents a
+/// default for filled in when the request omitted it — the same rule
+/// [`goal_with_defaults`] settles an SLO's `Goal` by, and [`requested_expiry`] a BREAKPOINT's
+/// `ExpiresAt`.
+///
+/// A create is the only writer of this structure and configurations are immutable after it,
+/// so settling the defaults once, here, is what makes every later read report the setting the
+/// service APPLIED rather than the absence the request sent.
+///
+/// The two LISTS are left as the request sent them, because neither doc states a value the
+/// service writes back for an omission: `CaptureArguments` names none at all ("Omit to
+/// capture defaults, use an empty list to capture none, use `["*"]` to capture all
+/// arguments"), and `CaptureLocals` states only that omitting it captures what an empty list
+/// captures ("Omit or pass an empty list to capture none") — an equivalence of effect, not a
+/// stored default like the "Defaults to …" sentence each of its siblings carries.
+pub fn stored_capture_configuration(requested: &CaptureConfiguration) -> CaptureConfiguration {
+    match requested {
+        CaptureConfiguration::CodeCapture(code) => {
+            CaptureConfiguration::CodeCapture(CodeCaptureConfiguration {
+                capture_arguments: code.capture_arguments.clone(),
+                capture_return: Some(code.capture_return.unwrap_or(DEFAULT_CAPTURE_RETURN)),
+                capture_stack_trace: Some(
+                    code.capture_stack_trace.unwrap_or(DEFAULT_CAPTURE_STACK_TRACE),
+                ),
+                capture_locals: code.capture_locals.clone(),
+                capture_limits: stored_capture_limits(&code.capture_limits),
+            })
+        }
+    }
+}
+
+/// The `CaptureLimitsConfig` stored for a request: every limit the model documents a default
+/// for, settled to that default when the request named none.
+fn stored_capture_limits(requested: &CaptureLimitsConfig) -> CaptureLimitsConfig {
+    CaptureLimitsConfig {
+        max_hits: Some(requested.max_hits.unwrap_or(DEFAULT_MAX_HITS)),
+        max_string_length: Some(
+            requested
+                .max_string_length
+                .unwrap_or(DEFAULT_MAX_STRING_LENGTH),
+        ),
+        max_collection_width: Some(
+            requested
+                .max_collection_width
+                .unwrap_or(DEFAULT_MAX_COLLECTION_WIDTH),
+        ),
+        max_collection_depth: Some(
+            requested
+                .max_collection_depth
+                .unwrap_or(DEFAULT_MAX_COLLECTION_DEPTH),
+        ),
+        max_stack_frames: Some(requested.max_stack_frames.unwrap_or(DEFAULT_MAX_STACK_FRAMES)),
+        max_stack_trace_size: Some(
+            requested
+                .max_stack_trace_size
+                .unwrap_or(DEFAULT_MAX_STACK_TRACE_SIZE),
+        ),
+        max_object_depth: Some(requested.max_object_depth.unwrap_or(DEFAULT_MAX_OBJECT_DEPTH)),
+        max_fields_per_object: Some(
+            requested
+                .max_fields_per_object
+                .unwrap_or(DEFAULT_MAX_FIELDS_PER_OBJECT),
+        ),
+    }
 }
 
 /// The refusal an `ExpiresAt` outside the documented lifetime window earns: the bound it

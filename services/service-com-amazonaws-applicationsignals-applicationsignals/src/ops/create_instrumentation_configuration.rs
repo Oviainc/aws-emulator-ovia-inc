@@ -189,13 +189,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ///
     /// The response is the stored record, never a re-echo of the request: `LocationHash` is
     /// the stable hash of the location, `ARN` is built from this service's namespace, the
-    /// request's region and the identity, `CreatedAt` comes from the clock, and `ExpiresAt`
+    /// request's region and the identity, `CreatedAt` comes from the clock, `ExpiresAt`
     /// is the lifetime the type documents (24 hours by default for BREAKPOINT, absent for
-    /// PROBE). A second create at the same identity — service, environment, signal type and
-    /// location, the four parts the ARN spells — is a `ConflictException`, because
-    /// "configurations are immutable after creation"; the instrumentation type is not part
-    /// of that identity, so a create of the OTHER type at an occupied location conflicts
-    /// too.
+    /// PROBE), and the capture settings carry every member the model documents a default for
+    /// settled to that default. A second create at the same identity — service,
+    /// environment, signal type and location, the four parts the ARN spells — is a
+    /// `ConflictException`, because "configurations are immutable after creation"; the
+    /// instrumentation type is not part of that identity, so a create of the OTHER type at
+    /// an occupied location conflicts too.
     async fn handle(
         &self,
         input: Self::Input,
@@ -295,7 +296,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description.clone(),
             expires_at,
             attribute_filters: input.attribute_filters.clone(),
-            capture_configuration: input.capture_configuration.clone(),
+            // The capture settings are stored with every member the model documents a default
+            // for settled, like the `ExpiresAt` above: a limit the request left out is applied
+            // by the service all the same, so the record — and every read that projects it —
+            // reports the value in force rather than an absence.
+            capture_configuration: crate::state::stored_capture_configuration(
+                &input.capture_configuration,
+            ),
             created_at: now,
             arn: crate::state::instrumentation_configuration_arn(
                 &region,

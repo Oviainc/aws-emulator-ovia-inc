@@ -44,6 +44,9 @@ use service_com_amazonaws_applicationsignals_applicationsignals::state::{
 // The conflict sentence, written once for this crate's tests in the suite that owns the rule
 // wording it.
 use crate::refusal_wording::CONFIGURATION_CONFLICT;
+// The capture configuration a create STORES for a request, written once for this crate's
+// tests in the suite that owns the defaulting rule.
+use crate::instrumentation_capture_defaults::settled;
 
 /// The SigV4 credential scope routes the request to this service. Signature verification is
 /// off (see `set_request_authentication`), so the signature bytes are never read.
@@ -393,10 +396,15 @@ async fn create_all(router: &MultiServiceRouter, cases: &[Case]) -> Vec<String> 
             "case {:?}: expected the stored location, got {:?}",
             case.label, answer["Location"]
         );
+        // The stored capture settings are the ones the request sent, with every member the
+        // model documents a default for settled to that default — the rule
+        // `instrumentation_capture_defaults` owns, stated here by the same expectation.
         assert_eq!(
-            answer["CaptureConfiguration"], body["CaptureConfiguration"],
+            answer["CaptureConfiguration"],
+            json!({ "CodeCapture": settled(&case.capture) }),
             "case {:?}: expected the stored capture configuration, got {:?}",
-            case.label, answer["CaptureConfiguration"]
+            case.label,
+            answer["CaptureConfiguration"]
         );
         assert_eq!(
             answer["Description"], body["Description"],
