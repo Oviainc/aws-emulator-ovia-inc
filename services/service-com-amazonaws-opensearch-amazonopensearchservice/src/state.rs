@@ -36,6 +36,11 @@ pub mod ingest;
 /// path and the update path share.
 pub mod cognito_authentication;
 
+/// Whether a value satisfies its member's modelled `@pattern` over its WHOLE length —
+/// the reading AWS applies, which the request boundary's find does not enforce for an
+/// unanchored expression.
+mod whole_value_pattern;
+
 use crate::ops::types::{
     AIMLOptionsInput, AIMLOptionsOutput, AIMLOptionsStatus, AWSDomainInformation,
     AccessPoliciesStatus, AdditionalLimit,
@@ -927,6 +932,10 @@ pub fn malformed_policy_document(member: &str) -> ValidationException {
 /// A policy document as this service persists and reports it, or the refusal for one
 /// it cannot read: `None` where the request named no document at all.
 ///
+/// The text is first held to its member's modelled `@pattern` over its whole value
+/// ([`whole_value_pattern`]), the constraint every input member is settled against at
+/// the boundary.
+///
 /// A policy document "must be in valid JSON format and follow IAM policy syntax", so
 /// the text is READ as JSON: one that is not JSON is a malformed request
 /// ([`malformed_policy_document`]), a blank one names no policy, and one that IS JSON
@@ -944,6 +953,16 @@ pub fn stored_policy_document(
     let Some(document) = document else {
         return Ok(None);
     };
+    // The member's modelled `@pattern` is satisfied only by a value that matches it over
+    // its WHOLE length, and the document is held to it BEFORE anything is read out of it:
+    // a constraint on an input member is settled at the boundary, so what the text
+    // denotes — a document, or no policy at all — is never what decides whether the value
+    // was admissible. See [`whole_value_pattern`] for why this member is checked here.
+    if let Some(message) = whole_value_pattern::policy_document_refusal(&document) {
+        return Err(ValidationException {
+            message: Some(message),
+        });
+    }
     if document.trim().is_empty() {
         return Ok(None);
     }

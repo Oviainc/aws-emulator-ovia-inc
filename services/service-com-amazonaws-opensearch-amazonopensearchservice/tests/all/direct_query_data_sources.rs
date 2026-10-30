@@ -24,7 +24,8 @@
 //!   over a table of documents whose integers are past what a double holds exactly,
 //!   whose decimals go past a double's precision, whose timestamps carry sub-second
 //!   digits, and which carry non-ASCII text, escaped quotes, whitespace inside strings
-//!   and nothing at all;
+//!   and nothing at all (a document carrying a LINE TERMINATOR is outside the member's
+//!   modelled pattern and is refused, which `direct_query_data_source_updates` pins);
 //! * the name is unique within the account, so a second add of one it already holds is
 //!   refused and the first record stands;
 //! * a name the account holds no data source under is refused as the value it is: the
@@ -178,13 +179,17 @@ const PRECISE_POLICY: &str = concat!(
 
 /// The same document written the way a client formats one: whitespace between the
 /// tokens, which denotes nothing.
+///
+/// The whitespace is spaces and tabs: a LINE TERMINATOR is outside this member's
+/// modelled `@pattern` taken over the whole value (`PolicyDocument`'s `.*`), which
+/// `direct_query_data_source_updates` pins for the add and the update alike.
 const SPACED_POLICY: &str = concat!(
-    "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n",
-    "      \"Effect\": \"Allow\",\n",
-    "      \"Action\": [ \"es:ESHttpGet\" ],\n",
-    "      \"Resource\": \"*\",\n",
-    "      \"Condition\": { \"NumericEquals\": { \"es:QueryBudget\": 9007199254740993 } }\n",
-    "    }\n  ]\n}"
+    "{  \"Version\": \"2012-10-17\",\t\"Statement\": [  {  ",
+    "\"Effect\": \"Allow\",  ",
+    "\"Action\": [ \"es:ESHttpGet\" ],  ",
+    "\"Resource\": \"*\",  ",
+    "\"Condition\": { \"NumericEquals\": { \"es:QueryBudget\": 9007199254740993 } }  ",
+    "}  ]  }"
 );
 
 /// [`SPACED_POLICY`] as the service holds it: the same tokens in the same order, with
@@ -423,7 +428,7 @@ async fn an_access_policy_document_is_reported_as_the_document_it_denotes() {
         ),
         (
             "member order a re-render through a sorted map would not keep",
-            "{\n  \"Statement\" : [ ],\n  \"Version\" : \"2012-10-17\"\n}".to_string(),
+            "{  \"Statement\" : [ ],  \"Version\" : \"2012-10-17\"  }".to_string(),
             Some(r#"{"Statement":[],"Version":"2012-10-17"}"#.to_string()),
         ),
         (
@@ -457,7 +462,7 @@ async fn an_access_policy_document_is_reported_as_the_document_it_denotes() {
         ),
         (
             "a document of whitespace only, which names no policy either",
-            "   \n".to_string(),
+            "   \t ".to_string(),
             None,
         ),
     ];

@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDirectQueryDataSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDirectQueryDataSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDirectQueryDataSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates an existing direct query data source of this account.
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +87,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    direct_query_data_source_absent, direct_query_data_source_type_name, is_arn, malformed_arn,
+    open_search_arns_required, requires_open_search_arns, service_state, state_unavailable,
+    stored_policy_document,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -168,18 +166,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDirectQueryDataSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDirectQueryDataSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDirectQueryDataSource"))
+        let _ = ctx;
+        let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
+
+        let mut store = state.lock();
+
+        // This operation updates an EXISTING direct query data source, addressed by the
+        // name the path carries, so a name the account holds nothing under names
+        // nothing to update: it is refused in the same words every read of an absent
+        // name is refused in, and an update creates no record.
+        let Some(record) = store
+            .direct_query_data_sources
+            .get_mut(&input.data_source_name)
+        else {
+            return Err(UpdateDirectQueryDataSourceErrorModeled::ValidationException(
+                direct_query_data_source_absent(),
+            )
+            .into());
+        };
+
+        // The same rule the add is held to, because it is a rule about the REQUEST's
+        // type rather than about how the data source came to exist: `OpenSearchArns`
+        // "is required for CloudWatchLogs and SecurityLake datasource types", so an
+        // update to one of those types that names no collection asks for a data source
+        // the service does not define. A member that is present but empty names no
+        // collection either.
+        let open_search_arns = input.open_search_arns.unwrap_or_default();
+        if open_search_arns.is_empty() && requires_open_search_arns(&input.data_source_type) {
+            return Err(UpdateDirectQueryDataSourceErrorModeled::ValidationException(
+                open_search_arns_required(direct_query_data_source_type_name(
+                    &input.data_source_type,
+                )),
+            )
+            .into());
+        }
+
+        // Each element of `OpenSearchArns` is an `ARN`, `@length(min: 20, max: 2048)`
+        // with pattern `.*`: the request boundary enforces only the length, so a value
+        // that is not an ARN at all is a malformed request rather than an ARN naming
+        // nothing.
+        for arn in &open_search_arns {
+            if !is_arn(arn) {
+                return Err(UpdateDirectQueryDataSourceErrorModeled::ValidationException(
+                    malformed_arn("OpenSearchArns", arn),
+                )
+                .into());
+            }
+        }
+
+        // "If not specified, the existing access policy if present remains unchanged":
+        // the member being ABSENT is what leaves the document the data source already
+        // carries where it is, so an update speaking only about the type or the
+        // description cannot silently drop the policy. A document that IS specified
+        // replaces it, read as JSON before it is stored exactly as the add reads one —
+        // and a blank document names no policy, so specifying one clears the policy.
+        let data_source_access_policy = match input.data_source_access_policy {
+            None => record.data_source_access_policy.clone(),
+            specified => stored_policy_document("DataSourceAccessPolicy", specified)
+                .map_err(UpdateDirectQueryDataSourceErrorModeled::ValidationException)?,
+        };
+
+        // Nothing above this line has written to the record, so a refused update leaves
+        // the data source exactly as the last served call left it. The members the
+        // request speaks about are REPLACED by what it says: the type and the
+        // collections it names, and the description it carries — absent where it
+        // carries none, the member the model states no "remains unchanged" rule for.
+        record.data_source_type = input.data_source_type;
+        record.description = input.description;
+        record.open_search_arns = open_search_arns;
+        record.data_source_access_policy = data_source_access_policy;
+
+        // "The unique, system-generated identifier that represents the data source" was
+        // minted when the data source was added and names the same data source
+        // afterwards, so the update answers with the STORED identifier rather than
+        // minting a second one for a record that already carries one.
+        Ok(UpdateDirectQueryDataSourceOutput {
+            data_source_arn: Some(record.arn.clone()),
+        })
     }
 }
+
