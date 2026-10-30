@@ -278,13 +278,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if domain.patient_insights_jobs.len() >= crate::state::MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN
         {
             return Err(StartPatientInsightsJobErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "domain {} already holds the maximum of {} patient insights jobs",
-                        input.domain_id,
-                        crate::state::MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN
-                    )),
-                },
+                crate::state::invalid_request(format!(
+                    "domain {} already holds the maximum of {} patient insights jobs",
+                    input.domain_id,
+                    crate::state::MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN
+                )),
             )
             .into());
         }

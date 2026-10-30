@@ -67,10 +67,11 @@
 //!   below): it is a shape this SERVICE models and other operations declare, and the
 //!   channel for the one server-side failure this handler can meet — a store it cannot
 //!   reach ([`crate::state::store_unreachable`]).
-//! * `ValidationException` (HTTP 400), through `crate::scaffolded::Scaffolded::validation`
-//!   — a request this listing cannot serve: a page size outside the modelled
-//!   `maxResults` range, a `nextToken` this service did not issue, or a `status` outside
-//!   the modelled enum.
+//! * `ValidationException` (HTTP 400) — widened in the same way, for a request this
+//!   listing cannot serve: a page size outside the modelled `maxResults` range, a
+//!   `nextToken` this service did not issue, or a `status` outside the modelled enum.
+//!   Built where every handler of this service builds a client-input refusal
+//!   ([`crate::state::invalid_request`]).
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -86,20 +87,31 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-connecthealth-connecthe
 // here — hence the `ListDomainsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-// `InternalServerException` is widened in through `extra_errors`: this operation's own
-// `errors` list is EMPTY, but the shape is one this SERVICE models
-// (`smithy_query(query="shape", shape="InternalServerException")`, errorKind server,
-// httpError 500, retryable) and six of its operations declare — and a server-side
-// failure has to be reported as one.
+// Both shapes are widened in through `extra_errors`: this operation's own `errors` list
+// is EMPTY, but each is a shape this SERVICE models and six of its operations declare,
+// and each is the channel one of the two failures this handler can meet has to be
+// reported on.
+//
+// `InternalServerException` (`smithy_query(query="shape",
+// shape="InternalServerException")`, errorKind server, httpError 500, retryable) for a
+// server-side failure: a store this handler cannot reach.
+//
+// `ValidationException` (`smithy_query(query="shape", shape="ValidationException")`,
+// errorKind client, httpError 400) for a fault in the REQUEST, so a refusal of this
+// listing carries the shape a client's generated code deserialises — the same shape
+// `ListSubscriptions`, which declares it outright, refuses the same page with.
 #[smithy_macros::operation_error(
     "com.amazonaws.connecthealth#ListDomains",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum ListDomainsErrorModeled {
     /// Declared on the service (and on six of its operations), not on this one: the
     /// store this listing enumerates could not be reached.
     InternalServerException(InternalServerException),
+    /// Declared on the service (and on six of its operations), not on this one: the
+    /// request asks for a listing this service cannot serve.
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -180,10 +192,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(value) => match crate::state::DomainStatus::from_wire(value) {
                 Some(status) => Some(status),
                 None => {
-                    return Err(crate::scaffolded::Scaffolded::validation(format!(
-                        "status '{value}' is not one of {}",
-                        DOMAIN_STATUS_VALUES.join(", ")
-                    )))
+                    return Err(ListDomainsErrorModeled::ValidationException(
+                        crate::state::invalid_request(format!(
+                            "status '{value}' is not one of {}",
+                            DOMAIN_STATUS_VALUES.join(", ")
+                        )),
+                    )
+                    .into())
                 }
             },
         };
@@ -191,9 +206,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The page this request asks for: the page size it bounds the answer with, and
         // the cursor it resumes from. Both are decided by the pagination rule this
         // service states ONCE in `crate::state::Page`, which the other listing obeys
-        // too; what belongs to this operation is only the channel a refusal travels on —
-        // and this is a fault in the REQUEST, which the model carries no shape of its own
-        // for, so the scaffold channel's client refusal is what words it.
+        // too; what belongs to this operation is only lifting the refusal into its own
+        // error enum — the shape itself is the one this service models for a fault in the
+        // REQUEST, built where every handler builds it.
         //
         // The collection a cursor of this listing is a position into is narrowed by the
         // `status` filter as well as the Region, so the filter is part of the scope: a
@@ -205,7 +220,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.next_token.as_deref(),
         ) {
             Ok(page) => page,
-            Err(detail) => return Err(crate::scaffolded::Scaffolded::validation(detail)),
+            Err(detail) => {
+                return Err(ListDomainsErrorModeled::ValidationException(
+                    crate::state::invalid_request(detail),
+                )
+                .into())
+            }
         };
 
         let mut store = state.lock();

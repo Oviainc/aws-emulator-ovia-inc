@@ -58,7 +58,7 @@
 //!
 //! The model lists NONE for this operation
 //! (`smithy_query(query="operation",operation="TagResource")` reports `errors: []`), so
-//! all three of the shapes below are widened in through `extra_errors`; each is a shape
+//! all four of the shapes below are widened in through `extra_errors`; each is a shape
 //! this SERVICE models and another operation declares:
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — `resourceArn` names no resource of this
@@ -71,15 +71,16 @@
 //!   the result, so neither operation can count a different set.
 //! * `InternalServerException` (HTTP 500) — the one server-side failure this handler can
 //!   meet: a store it cannot reach ([`crate::state::store_unreachable`]).
-//!
-//! A tag entry this service does not accept — a key or value outside its modelled length,
-//! or a key in the reserved `crate::state::RESERVED_TAG_KEY_PREFIX` namespace — is refused
-//! as a 400 `ValidationException` (`crate::scaffolded::Scaffolded::validation`): the model
-//! bounds `TagKey` at 1..128 and `TagValue` at 0..256, states the reserved namespace
-//! nowhere, and declares no error shape for a bad input, so that is the only channel for
-//! it. The check itself is [`crate::service::tag_bounds::accepted_entries`], shared with
-//! `CreateDomain` — and it is decided from the request alone, so it is decided BEFORE the
-//! ARN is resolved and before the count above, the same place `CreateDomain` decides it.
+//! * `ValidationException` (HTTP 400) — a tag entry this service does not accept: a key
+//!   or value outside its modelled length (the model bounds `TagKey` at 1..128 and
+//!   `TagValue` at 0..256), or a key in the reserved
+//!   `crate::state::RESERVED_TAG_KEY_PREFIX` namespace, which the model states nowhere.
+//!   Neither is a rule the boundary walk refuses, so the handler refuses it — through the
+//!   shape this SERVICE models for invalid client input, built where every handler builds
+//!   it ([`crate::state::invalid_request`]). The check itself is
+//!   [`crate::service::tag_bounds::accepted_entries`], shared with `CreateDomain` — and it
+//!   is decided from the request alone, so it is decided BEFORE the ARN is resolved and
+//!   before the count above, the same place `CreateDomain` decides it.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -124,7 +125,8 @@ impl ::aws_smithy_schema::serde::SerializableStruct for TagResourceOutput {
     extra_errors = [
         "ResourceNotFoundException",
         "ServiceQuotaExceededException",
-        "InternalServerException"
+        "InternalServerException",
+        "ValidationException"
     ]
 )]
 #[derive(Debug)]
@@ -138,6 +140,9 @@ pub enum TagResourceErrorModeled {
     /// Declared on the service (and on six of its operations), not on this one: the
     /// store this write goes to could not be reached.
     InternalServerException(InternalServerException),
+    /// Declared on the service (and on six of its operations), not on this one: the
+    /// request carries a tag entry this service does not accept.
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -217,8 +222,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // where the boundary would have decided it. So neither operation enforces half
         // the rule, and neither answers a different refusal for one map. Nothing is
         // written: the store has not even been looked at yet.
-        let requested_tags = crate::service::tag_bounds::accepted_entries(input.tags)
-            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        let requested_tags = crate::service::tag_bounds::accepted_entries(input.tags).map_err(
+            |detail| {
+                TagResourceErrorModeled::ValidationException(crate::state::invalid_request(detail))
+            },
+        )?;
 
         let mut store = state.lock();
         // The preamble every handler shares materialises what the CLOCK already made due

@@ -88,20 +88,22 @@
 //!   `TagResource` bound the same count on the same set.
 //! * `ValidationException` (HTTP 400) — widened in through `extra_errors` (see below):
 //!   this SERVICE models the shape, this operation's own `errors` list does not name it,
-//!   and it is the error the account-wide Domain cap is surfaced as.
+//!   and it is the error BOTH of this handler's client-input refusals are surfaced as —
+//!   the account-wide Domain cap, and a `tags` entry this service does not accept: one
+//!   outside the modelled `TagKey`/`TagValue` lengths (key 1..128 characters, value
+//!   0..256), or one whose key lies in the reserved
+//!   `crate::state::RESERVED_TAG_KEY_PREFIX` namespace. Both entry rules are refused
+//!   through the one check every operation that accepts a `TagMap` shares
+//!   ([`crate::service::tag_bounds::accepted_entries`]), because neither a constraint on
+//!   a map's key or value nor a rule the model does not state is one the boundary walk
+//!   refuses. The entry rule is decided from the request alone, so it is decided BEFORE
+//!   the tag count above and before anything else this handler reads: a map that breaks
+//!   both rules earns this 400, exactly as it does on `TagResource`. The shape is built
+//!   where every handler of this service builds a client-input refusal
+//!   ([`crate::state::invalid_request`]).
 //! * `InternalServerException` (HTTP 500) — widened in the same way, for the one
 //!   server-side failure this handler can meet: a store it cannot reach
 //!   ([`crate::state::store_unreachable`]).
-//! * `ValidationException` (HTTP 400), through `crate::scaffolded::Scaffolded::validation`
-//!   — a `tags` entry this service does not accept: one outside the modelled
-//!   `TagKey`/`TagValue` lengths (key 1..128 characters, value 0..256), or one whose key
-//!   lies in the reserved `crate::state::RESERVED_TAG_KEY_PREFIX` namespace. Both are
-//!   refused through the one check every operation that accepts a `TagMap` shares
-//!   ([`crate::service::tag_bounds::accepted_entries`]), because neither a constraint on
-//!   a map's key or value nor a rule the model does not state is one the boundary walk
-//!   refuses. It is decided from the request alone, so it is decided BEFORE the tag count
-//!   above and before anything else this handler reads: a map that breaks both rules
-//!   earns this 400, exactly as it does on `TagResource`.
 //!
 //! ## Beside the model
 //!
@@ -198,9 +200,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-connecthealth-connecthe
 // `ValidationException` is widened in through `extra_errors`: this SERVICE models the
 // shape (`smithy_query(query="shape", shape="ValidationException")`, errorKind client,
 // httpError 400) and six of its operations list it, but `CreateDomain`'s own `errors`
-// list names only `ServiceQuotaExceededException` — while the account-wide Domain cap is
-// surfaced as a `ValidationException`, so the modelled shape is what this handler
-// answers with rather than the framework's synthetic one.
+// list names only `ServiceQuotaExceededException` — while both of this handler's
+// client-input refusals, the account-wide Domain cap and a tag entry this service does
+// not accept, are surfaced as a `ValidationException`, so the modelled shape is what
+// this handler answers them with rather than a shape outside the model.
 //
 // `InternalServerException` is widened in for the same reason and through the same
 // mechanism (`smithy_query(query="shape", shape="InternalServerException")`, errorKind
@@ -293,8 +296,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same one `TagResource` answers for the same map. A refusal writes nothing —
         // nothing has been read, let alone minted.
         let requested_tags =
-            crate::service::tag_bounds::accepted_entries(input.tags.unwrap_or_default())
-                .map_err(crate::scaffolded::Scaffolded::validation)?;
+            crate::service::tag_bounds::accepted_entries(input.tags.unwrap_or_default()).map_err(
+                |detail| {
+                    CreateDomainErrorModeled::ValidationException(crate::state::invalid_request(
+                        detail,
+                    ))
+                },
+            )?;
         // The account this create is signed for, which is the account that will own the
         // domain and the one the cap below is measured against.
         let account_id = crate::state::owning_account_id();
@@ -333,12 +341,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let held = store.domains_held_by(&region, &account_id);
         if held >= crate::state::MAX_DOMAINS_PER_ACCOUNT {
             return Err(CreateDomainErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "Account {account_id} has reached the maximum limit of {} domains.",
-                        crate::state::MAX_DOMAINS_PER_ACCOUNT
-                    )),
-                },
+                crate::state::invalid_request(format!(
+                    "Account {account_id} has reached the maximum limit of {} domains.",
+                    crate::state::MAX_DOMAINS_PER_ACCOUNT
+                )),
             )
             .into());
         }

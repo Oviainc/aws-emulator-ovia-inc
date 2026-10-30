@@ -156,8 +156,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The page this request asks for: the page size it bounds the answer with, and
         // the cursor it resumes from. Both are decided by the pagination rule this
         // service states ONCE in `crate::state::Page`, which the other listing obeys
-        // too; what belongs to this operation is only the channel a refusal travels on —
-        // here the `ValidationException` this operation's model declares.
+        // too; what belongs to this operation is only lifting the refusal into its own
+        // error enum — the shape itself is the `ValidationException` this service models
+        // for a fault in the request, built where every handler builds it.
         let page = match crate::state::Page::resolve(
             crate::state::subscriptions_page_scope(&region, &input.domain_id),
             input.max_results,
@@ -166,9 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(page) => page,
             Err(detail) => {
                 return Err(ListSubscriptionsErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(detail),
-                    },
+                    crate::state::invalid_request(detail),
                 )
                 .into())
             }

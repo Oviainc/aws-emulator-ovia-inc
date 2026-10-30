@@ -26,7 +26,8 @@ use crate::ops::types::{
     InsightsContext, InsightsOutput, InternalServerException, MedicalScribeChannelDefinition,
     MedicalScribeListeningSessionDetails, MedicalScribePostStreamActionSettingsResponse,
     MedicalScribePostStreamActionsResult, OutputDataConfig, PatientInsightsEncounterContext,
-    PatientInsightsPatientContext, SubscriptionDescription, UserContext, WebAppConfiguration,
+    PatientInsightsPatientContext, SubscriptionDescription, UserContext, ValidationException,
+    WebAppConfiguration,
 };
 
 /// The region an emulated ARN carries when the request names none.
@@ -1609,11 +1610,11 @@ const UNISSUED_PAGE_TOKEN_DETAIL: &str = "nextToken is not a token this service 
 /// when this service issued it FOR THIS collection; and a page issues a cursor only when
 /// a matching record is left after it.
 ///
-/// [`Page::resolve`] answers the refusal TEXT rather than a modelled error, because the
-/// two listings refuse on different channels — the one whose model declares a
-/// `ValidationException` uses it, the one that declares no error at all uses
-/// [`crate::scaffolded::Scaffolded::validation`] — so the channel stays with the handler
-/// and only the rule is shared.
+/// [`Page::resolve`] answers the refusal TEXT rather than a modelled error, because a
+/// refusal has to be lifted into the CALLING operation's own error enum, which is a
+/// distinct type per operation. The shape that text is built as is the one this service
+/// models for a client-input refusal, built once in [`invalid_request`], so both listings
+/// refuse a page this service cannot serve with the same shape and the same words.
 #[derive(Debug)]
 pub struct Page {
     /// The collection this page is a position into, as the `*_page_scope` constructors
@@ -1720,5 +1721,25 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 pub fn store_unreachable(operation: &str) -> InternalServerException {
     InternalServerException {
         message: Some(format!("{operation} could not reach this service's store")),
+    }
+}
+
+/// The failure every handler answers A REQUEST THIS SERVICE CANNOT SERVE with — a page
+/// size outside the bound, a `nextToken` it never issued, a `status` outside the enum, a
+/// tag entry or key it does not accept.
+///
+/// It is the counterpart of [`store_unreachable`] on the CLIENT side: a fault in the
+/// request, which the caller fixes by changing a member of it. So it is reported through
+/// the shape this service MODELS for invalid client input
+/// (`smithy_query(query="shape", shape="ValidationException")`, errorKind client,
+/// httpError 400), which six of its operations declare — never through a shape outside
+/// the model that merely renders the same status and code, which no client's generated
+/// code can deserialise and which cannot carry a member the modelled shape grows. Built
+/// HERE, once, so every handler words and classifies the condition identically; each
+/// lifts it into its own operation's error enum, widening the shape in through
+/// `extra_errors` where the operation's own `errors` list omits it.
+pub fn invalid_request(detail: impl Into<String>) -> ValidationException {
+    ValidationException {
+        message: Some(detail.into()),
     }
 }

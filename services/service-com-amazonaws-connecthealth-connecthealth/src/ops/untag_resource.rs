@@ -60,23 +60,23 @@
 //!
 //! The model lists NONE for this operation
 //! (`smithy_query(query="operation",operation="UntagResource")` reports `errors: []`), so
-//! both of the shapes below are widened in through `extra_errors`; each is a shape this
-//! SERVICE models and other operations declare:
+//! all three of the shapes below are widened in through `extra_errors`; each is a shape
+//! this SERVICE models and other operations declare:
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — `resourceArn` names no resource of this
 //!   service, resolved exactly as `TagResource` and `ListTagsForResource` resolve the
 //!   same label.
 //! * `InternalServerException` (HTTP 500) — the one server-side failure this handler can
 //!   meet: a store it cannot reach ([`crate::state::store_unreachable`]).
-//!
-//! A tag key this service does not accept — one outside the modelled `TagKey` length, or
-//! one in the reserved `crate::state::RESERVED_TAG_KEY_PREFIX` namespace, which names a
-//! tag no caller may set OR remove — is refused as a 400 `ValidationException`
-//! (`crate::scaffolded::Scaffolded::validation`), through the same per-key check
-//! `CreateDomain` and `TagResource` apply to the keys THEY name
-//! ([`crate::service::tag_bounds::removed_key_violation`]). It is decided from the
-//! request alone, so it is decided BEFORE the ARN above is resolved — the place those two
-//! decide the same rules.
+//! * `ValidationException` (HTTP 400) — a tag key this service does not accept: one
+//!   outside the modelled `TagKey` length, or one in the reserved
+//!   `crate::state::RESERVED_TAG_KEY_PREFIX` namespace, which names a tag no caller may
+//!   set OR remove. It is refused through the same per-key check `CreateDomain` and
+//!   `TagResource` apply to the keys THEY name
+//!   ([`crate::service::tag_bounds::removed_key_violation`]), and carries the shape this
+//!   SERVICE models for invalid client input, built where every handler builds it
+//!   ([`crate::state::invalid_request`]). It is decided from the request alone, so it is
+//!   decided BEFORE the ARN above is resolved — the place those two decide the same rules.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -118,7 +118,11 @@ impl ::aws_smithy_schema::serde::SerializableStruct for UntagResourceOutput {
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.connecthealth#UntagResource",
-    extra_errors = ["ResourceNotFoundException", "InternalServerException"]
+    extra_errors = [
+        "ResourceNotFoundException",
+        "InternalServerException",
+        "ValidationException"
+    ]
 )]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
@@ -128,6 +132,9 @@ pub enum UntagResourceErrorModeled {
     /// Declared on the service (and on six of its operations), not on this one: the
     /// store this removal goes to could not be reached.
     InternalServerException(InternalServerException),
+    /// Declared on the service (and on six of its operations), not on this one: the
+    /// request names a tag key this service does not accept.
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -208,7 +215,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(violation) =
             crate::service::tag_bounds::removed_key_violation(input.tag_keys.iter())
         {
-            return Err(crate::scaffolded::Scaffolded::validation(violation));
+            return Err(UntagResourceErrorModeled::ValidationException(
+                crate::state::invalid_request(violation),
+            )
+            .into());
         }
 
         let mut store = state.lock();
