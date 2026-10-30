@@ -1548,12 +1548,21 @@ fn arn_fields(arn: &str) -> Option<[&str; 6]> {
 // ---------------------------------------------------------------------------
 // Client rejections
 //
-// GuardDuty classifies a rejection by the REQUEST, not by what the store holds:
-// a value that is not a well-formed id for its member is a parameter-validation
-// failure, a well-formed id this account/Region does not own is an ownership
-// failure, and neither message quotes the caller's value or the endpoint's
-// Region back at them. The messages are built here, once, so every operation
-// rejects the same input the same way.
+// GuardDuty classifies a rejection by the REQUEST, not by what the store holds,
+// and no message quotes the caller's value or the endpoint's Region back at
+// them. Which SENTENCE it answers with belongs to the resource family the
+// identifier addresses, and to the class of operation that was asked:
+//
+//   * the DETECTOR family names the member at fault — a value that is not a
+//     well-formed detector id is a parameter-validation failure, a well-formed
+//     one this account/Region does not hold an ownership failure;
+//   * every family rooted IN a detector answers its own fixed absent-resource
+//     sentence instead, which names no member at all and makes no claim about
+//     the account ([`NO_SUCH_RESOURCE_MESSAGE`] and the family constants beside
+//     it).
+//
+// The messages are built here, once, so every operation of a family rejects the
+// same input the same way.
 // ---------------------------------------------------------------------------
 
 /// The wire name of the `DetectorId` member, as the request carries it
@@ -1567,7 +1576,8 @@ pub const NEXT_TOKEN_MEMBER: &str = "nextToken";
 
 /// The wire name of the `DestinationId` member
 /// (`smithy_query(operation="DescribePublishingDestination")` renders it as the
-/// `destinationId` JSON name / URI label).
+/// `destinationId` JSON name / URI label). The family's own absence refusals name no
+/// member ([`DESTINATION_NOT_FOUND_MESSAGE`], [`DESTINATION_ABSENT_MESSAGE`]).
 pub const DESTINATION_ID_MEMBER: &str = "destinationId";
 
 /// The wire path of `DestinationProperties.DestinationArn`, as a rejection names
@@ -1597,7 +1607,8 @@ pub const LIST_EXPECTED_BUCKET_OWNER_MEMBER: &str = "expectedBucketOwner";
 
 /// The wire name of the `ThreatIntelSetId` member, as the request carries it in the
 /// URI (`smithy_query(operation="GetThreatIntelSet")` renders it
-/// `threatIntelSetId`).
+/// `threatIntelSetId`). The family's own absence refusal names no member
+/// ([`SET_ID_NOT_FOUND_MESSAGE`]).
 pub const THREAT_INTEL_SET_ID_MEMBER: &str = "threatIntelSetId";
 
 /// The wire name of the `ScanResourceCriteria` member of
@@ -1681,11 +1692,32 @@ pub fn missing_parameter_message(member: &str) -> String {
 /// another account created, or one a delete removed. GuardDuty does not
 /// distinguish "never existed" from "belongs to someone else": both are the same
 /// refusal, which is also what keeps one account from probing another's ids.
+///
+/// It is the DETECTOR family's refusal and makes a claim about the ACCOUNT, so it
+/// is not a generic not-found text: a family whose own refusal says only that
+/// nothing of that name is there answers with that family's sentence instead —
+/// [`NO_SUCH_RESOURCE_MESSAGE`], [`INVALID_FILTER_NAME_MESSAGE`],
+/// [`MALWARE_PROTECTION_PLAN_NOT_FOUND_MESSAGE`], [`INVALID_FINDING_IDS_MESSAGE`]
+/// or [`INVALID_INPUT_PARAMETERS_MESSAGE`].
 pub fn not_owned_message(member: &str) -> String {
     format!(
         "The request is rejected because the input {member} is not owned by the current account."
     )
 }
+
+/// The sentence GuardDuty refuses an identifier that resolves to no resource with
+/// on the families whose answer is that nothing of that name is there: ONE fixed
+/// text for the whole class, naming neither the member that carried the identifier
+/// nor the value itself.
+///
+/// The detector-rooted uploaded lists — an IPSet and a threat list, read, updated
+/// or deleted — and a filter READ answer with this one, whatever the FORM of the
+/// identifier they were handed: a value that was never minted, one minted under
+/// another detector and one that could never have been minted at all are the same
+/// absence, so the refusal depends on neither the store nor the spelling. It is not
+/// [`not_owned_message`], which claims the id belongs to another ACCOUNT, and not
+/// [`invalid_parameter_message`], which claims the value could not be an id at all.
+pub const NO_SUCH_RESOURCE_MESSAGE: &str = "The request is rejected since no such resource found.";
 
 /// How many Regions this store will hold detectors for.
 ///
@@ -2107,24 +2139,49 @@ pub fn detector_id_rejection(detector_id: &str) -> String {
     minted_id_rejection(DETECTOR_ID_MEMBER, detector_id)
 }
 
-/// Classify a `DestinationId` the detector does not hold, the same way: a
-/// publishing destination id is one of the ids this service mints, so it is
-/// refused exactly as a detector id is.
-pub fn destination_id_rejection(destination_id: &str) -> String {
-    minted_id_rejection(DESTINATION_ID_MEMBER, destination_id)
-}
+/// The message a publishing-destination READ refuses a `DestinationId` it cannot
+/// resolve with: `DescribePublishingDestination` reports a destination id that names
+/// nothing as an unusable input PARAMETER ([`INVALID_INPUT_PARAMETERS_MESSAGE`])
+/// rather than as an absent resource or a foreign one, and interpolates nothing — so
+/// the one sentence answers an id a delete removed and one that could never have been
+/// minted alike.
+pub const DESTINATION_NOT_FOUND_MESSAGE: &str = INVALID_INPUT_PARAMETERS_MESSAGE;
+
+/// The message the MUTATING publishing-destination paths refuse a `DestinationId`
+/// they cannot resolve with: a write says the destination is not there, where the
+/// read reports a bad parameter ([`DESTINATION_NOT_FOUND_MESSAGE`]) — the same
+/// read-versus-write split the filter family makes
+/// ([`NO_SUCH_RESOURCE_MESSAGE`] against [`INVALID_FILTER_NAME_MESSAGE`]).
+///
+/// Fixed text: the sentence names the parameter in AWS's own words for this refusal,
+/// which is not the request's wire member name, and nothing of the caller's is
+/// interpolated into it.
+pub const DESTINATION_ABSENT_MESSAGE: &str =
+    "The request failed because no publishingDestination exists with the provided publishingDestinationId.";
 
 /// The wire name of the `FindingIds` member — `jsonName` `findingIds` on every
 /// operation that addresses findings by id
 /// (`smithy_query(operation="ArchiveFindings")`). It is what a rejection names.
 pub const FINDING_IDS_MEMBER: &str = "findingIds";
 
-/// Classify a finding id the detector does not hold, the same way a detector id
-/// is classified: a finding `Id` is one of the ids this service mints
-/// ([`is_minted_id`]), so a value that is not of that form is a parameter failure
-/// and a well-formed one this detector does not hold an ownership failure.
+/// The sentence a findings write is refused with when the batch names a finding
+/// the detector does not hold — AWS's own wording for that class, its disagreement
+/// in number included, and with none of the ids quoted back.
+pub const INVALID_FINDING_IDS_MESSAGE: &str =
+    "The request is rejected because an invalid finding identifiers is specified.";
+
+/// Classify a finding id the detector does not hold: a finding `Id` is one of the
+/// ids this service mints ([`is_minted_id`]), so a well-formed one the detector does
+/// not hold is the finding-identifier refusal ([`INVALID_FINDING_IDS_MESSAGE`]),
+/// while a value that is not of that form at all is a parameter failure — a value
+/// the request could not have meant as a finding id, which is a different class
+/// from a finding that is simply not this detector's.
 pub fn finding_id_rejection(finding_id: &str) -> String {
-    minted_id_rejection(FINDING_IDS_MEMBER, finding_id)
+    if is_minted_id(finding_id) {
+        INVALID_FINDING_IDS_MESSAGE.to_string()
+    } else {
+        invalid_parameter_message(FINDING_IDS_MEMBER)
+    }
 }
 
 /// The wire name of the `MalwareProtectionPlanId` member, as the request carries
@@ -2280,11 +2337,21 @@ pub const MAX_MALWARE_PROTECTION_PLANS_TOTAL: usize =
 pub const MALWARE_PROTECTION_PLAN_TOTAL_LIMIT_MESSAGE: &str =
     "The request is rejected because the maximum number of Malware Protection plans has been reached.";
 
+/// The sentence a plan this account and Region does not hold is refused with.
+///
+/// "Never existed" and "belongs to someone else" are ONE refusal, with one fixed
+/// text and the plan id not quoted back, so one account cannot probe another's plan
+/// ids — and the text says the plan was not found rather than that the caller does
+/// not own it ([`not_owned_message`]), which would disclose the very distinction the
+/// single wording hides.
+pub const MALWARE_PROTECTION_PLAN_NOT_FOUND_MESSAGE: &str =
+    "The request was rejected because the specified malware protection plan was not found.";
+
 /// The message a read of a plan this account and Region does not hold answers
-/// with. As with a detector id, "never existed" and "belongs to someone else" are
-/// one refusal, so one account cannot probe another's plan ids.
+/// with: [`MALWARE_PROTECTION_PLAN_NOT_FOUND_MESSAGE`], owned by this one reader so
+/// every plan operation refuses an unresolvable id the same way.
 pub fn malware_protection_plan_not_found_message() -> String {
-    not_owned_message(MALWARE_PROTECTION_PLAN_ID_MEMBER)
+    MALWARE_PROTECTION_PLAN_NOT_FOUND_MESSAGE.to_string()
 }
 
 /// Is `value` an IAM role ARN?
@@ -2345,13 +2412,15 @@ pub const GUARDDUTY_SERVICE_NAME: &str = "guardduty";
 /// The wire name of the filter-name member on the operations that carry it as a
 /// URI label — `GetFilter`, `UpdateFilter` and `DeleteFilter` bind
 /// `FilterName` to `/detector/{DetectorId}/filter/{FilterName}`
-/// (`smithy_query(operation="GetFilter")`).
+/// (`smithy_query(operation="GetFilter")`). The filter family's own refusals name no
+/// member ([`NO_SUCH_RESOURCE_MESSAGE`], [`INVALID_FILTER_NAME_MESSAGE`]), so this is
+/// the wire name itself and not a rejection's subject.
 pub const FILTER_NAME_MEMBER: &str = "filterName";
 
 /// The wire name `CreateFilter` carries the filter name under: its `Name` member
-/// has `jsonName` `name` (`smithy_query(operation="CreateFilter")`). A rejection
-/// names the member AS THE REQUEST CARRIES IT, which is why creating and reading
-/// a filter name it differently.
+/// has `jsonName` `name` (`smithy_query(operation="CreateFilter")`). A rejection that
+/// names a member names it AS THE REQUEST CARRIES IT, which is why a create and a read
+/// would name a filter name differently.
 pub const CREATE_FILTER_NAME_MEMBER: &str = "name";
 
 /// The `FilterName` length bounds (`smithy_query(shape="FilterName")`: len
@@ -2376,17 +2445,14 @@ pub fn is_filter_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// Classify a filter name the detector does not hold, the way
-/// [`detector_id_rejection`] classifies a detector id: a value that cannot be a
-/// filter name at all is a parameter failure, a well-formed one this account
-/// does not hold is an ownership failure.
-pub fn filter_name_rejection(name: &str) -> String {
-    if is_filter_name(name) {
-        not_owned_message(FILTER_NAME_MEMBER)
-    } else {
-        invalid_parameter_message(FILTER_NAME_MEMBER)
-    }
-}
+/// The sentence the MUTATING filter paths refuse a `FilterName` they cannot act on
+/// with: `UpdateFilter` and `DeleteFilter` answer that the name they were given is
+/// not a usable one, where the READ answers that no such resource was found
+/// ([`NO_SUCH_RESOURCE_MESSAGE`]). Fixed text — the name is not quoted back — and it
+/// is the answer for a name the detector does not hold and for a value that could
+/// not be a filter name at all alike.
+pub const INVALID_FILTER_NAME_MESSAGE: &str =
+    "The request is rejected because the given filter name is invalid.";
 
 /// The message a second `CreateFilter` under a name the detector already holds
 /// is refused with. Creating is not updating — `UpdateFilter` is the operation
@@ -3760,22 +3826,18 @@ pub fn ip_set_limit_message() -> String {
 
 /// The wire name of the `IpSetId` member, as the request carries it
 /// (`smithy_query(operation="GetIPSet")` binds it as the URI label `IpSetId`,
-/// rendered `ipSetId` in the JSON body of the sibling operations). It is what a
-/// rejection names.
+/// rendered `ipSetId` in the JSON body of the sibling operations). The family's own
+/// absence refusal names no member ([`SET_ID_NOT_FOUND_MESSAGE`]), so this is the
+/// wire name itself and not a rejection's subject.
 pub const IP_SET_ID_MEMBER: &str = "ipSetId";
 
-/// Classify an `IpSetId` the detector does not hold: a value that is not an id
-/// this service mints at all is a parameter failure, a well-formed one the
-/// detector does not hold is an ownership failure. Same split as
-/// [`detector_id_rejection`], for the same reason — the class comes from the
-/// REQUEST, not from the store.
-pub fn ip_set_id_rejection(ip_set_id: &str) -> String {
-    if is_minted_id(ip_set_id) {
-        not_owned_message(IP_SET_ID_MEMBER)
-    } else {
-        invalid_parameter_message(IP_SET_ID_MEMBER)
-    }
-}
+/// The message the uploaded-list families — an IPSet and a threat list, read,
+/// updated or deleted — refuse an id the detector does not hold with:
+/// [`NO_SUCH_RESOURCE_MESSAGE`], one fixed sentence that names neither the member
+/// nor the value, and the same one whatever the FORM of the id, since a list that
+/// was never minted, one minted under another detector and a value that could never
+/// have been minted at all are the same absence.
+pub const SET_ID_NOT_FOUND_MESSAGE: &str = NO_SUCH_RESOURCE_MESSAGE;
 
 /// The wire name of the `Name` member an IPSet create or update carries: both
 /// bind it in the JSON body under `jsonName` `name`

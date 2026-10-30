@@ -29,8 +29,10 @@
 //!    request is signed for. A delete addressed through another Region's endpoint, or
 //!    under another detector's id, is refused and writes nothing.
 //! 4. A refusal is the classified HTTP 400 every id rejection on this service carries —
-//!    the `BadRequestException` envelope, the `InvalidInputException` class, a message
-//!    naming the member at fault and never the caller's value — and persists nothing.
+//!    the `BadRequestException` envelope, the `InvalidInputException` class, the fixed
+//!    sentence the refused resource family and operation class answer with (a WRITE
+//!    says no such destination exists, the describe reports an unusable input
+//!    parameter) and never the caller's value — and persists nothing.
 //!
 //! The rows span what the rule generalises over: the stored destination's PROPERTIES
 //! (bucket, folder depth, KMS resource form, partition, `expectedBucketOwner`, tags),
@@ -43,10 +45,12 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    DESTINATION_ID_MEMBER, DETECTOR_ID_MEMBER, PENDING_VERIFICATION, PUBLISHING,
+    DESTINATION_ABSENT_MESSAGE, DESTINATION_ID_MEMBER, DESTINATION_NOT_FOUND_MESSAGE,
+    DETECTOR_ID_MEMBER, PENDING_VERIFICATION, PUBLISHING,
     PUBLISHING_DESTINATIONS_PER_DETECTOR, VERIFICATION_DELAY_MILLIS,
 };
 
+use crate::client_rejections::{invalid_parameter, not_owned};
 use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, error_shape, new_router, Router,
     ABSENT_DETECTOR_ID,
@@ -250,9 +254,9 @@ async fn detector_updated_at(router: &Router, region: &str, detector_id: &str, c
 }
 
 /// Assert one classified refusal: HTTP 400, the modelled envelope shape, the service's
-/// error class, a message naming `member` and a message that does not quote `quoted`
-/// back at the caller.
-fn assert_refusal(case: &str, status: u16, body: &Value, member: &str, quoted: &str) {
+/// error class, the message the refused class carries, and that the message does not
+/// quote `quoted` back at the caller.
+fn assert_refusal(case: &str, status: u16, body: &Value, expected_message: &str, quoted: &str) {
     assert_eq!(
         status, 400,
         "case {case:?}: expected HTTP 400, got {status} {body:?}"
@@ -268,9 +272,9 @@ fn assert_refusal(case: &str, status: u16, body: &Value, member: &str, quoted: &
         "case {case:?}: expected the {INVALID_INPUT} class, got {body:?}"
     );
     let message = body["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains(member),
-        "case {case:?}: the refusal must name {member}, got {message:?}"
+    assert_eq!(
+        message, expected_message,
+        "case {case:?}: expected message {expected_message:?}, got {message:?}"
     );
     assert!(
         !message.contains(quoted),
@@ -369,7 +373,7 @@ async fn a_delete_drops_exactly_the_destination_it_names() {
             &format!("{case}: a describe after the delete"),
             status,
             &refused,
-            DESTINATION_ID_MEMBER,
+            DESTINATION_NOT_FOUND_MESSAGE,
             &victim,
         );
         let (status, refused) = update_in(&router, HOME_REGION, &detector_id, &victim).await;
@@ -377,7 +381,7 @@ async fn a_delete_drops_exactly_the_destination_it_names() {
             &format!("{case}: an update after the delete"),
             status,
             &refused,
-            DESTINATION_ID_MEMBER,
+            DESTINATION_ABSENT_MESSAGE,
             &victim,
         );
         let (status, refused) = delete(&router, &detector_id, &victim).await;
@@ -385,7 +389,7 @@ async fn a_delete_drops_exactly_the_destination_it_names() {
             &format!("{case}: a second delete"),
             status,
             &refused,
-            DESTINATION_ID_MEMBER,
+            DESTINATION_ABSENT_MESSAGE,
             &victim,
         );
 
@@ -644,7 +648,7 @@ async fn a_delete_reaches_only_the_detector_and_region_it_names() {
         "a delete on another Region's detector through this Region's endpoint",
         status,
         &refused,
-        DETECTOR_ID_MEMBER,
+        &not_owned(DETECTOR_ID_MEMBER),
         &away,
     );
     let (status, refused) = delete_in(&router, AWAY_REGION, &home, &home_destination).await;
@@ -652,7 +656,7 @@ async fn a_delete_reaches_only_the_detector_and_region_it_names() {
         "a delete on this Region's detector through another Region's endpoint",
         status,
         &refused,
-        DETECTOR_ID_MEMBER,
+        &not_owned(DETECTOR_ID_MEMBER),
         &home,
     );
     let (status, refused) = delete(&router, &home, &away_destination).await;
@@ -660,7 +664,7 @@ async fn a_delete_reaches_only_the_detector_and_region_it_names() {
         "a delete of a destination another detector holds",
         status,
         &refused,
-        DESTINATION_ID_MEMBER,
+        DESTINATION_ABSENT_MESSAGE,
         &away_destination,
     );
 
@@ -705,44 +709,50 @@ async fn a_delete_of_something_the_store_does_not_hold_is_refused() {
     let detector_id = enabled_detector(&router).await;
     let destination_id = created(&router, HOME_REGION, &detector_id, "the baseline", create_body(1)).await;
 
-    // (case, detector id, destination id, the member the message must name). The
-    // member at fault is also the value the message must not quote back, so each row
-    // names which of its two ids that is rather than assuming the destination.
-    let rows: Vec<(&str, String, String, &str)> = vec![
+    // (case, detector id, destination id, the member at fault, the message the
+    // refusal carries). The member at fault is also the value the message must not
+    // quote back, so each row names which of its two ids that is rather than assuming
+    // the destination.
+    let rows: Vec<(&str, String, String, &str, String)> = vec![
         (
             "a detector id nothing minted",
             ABSENT_DETECTOR_ID.to_string(),
             destination_id.clone(),
             DETECTOR_ID_MEMBER,
+            not_owned(DETECTOR_ID_MEMBER),
         ),
         (
             "a detector id that is not one at all",
             "not-a-detector-id".to_string(),
             destination_id.clone(),
             DETECTOR_ID_MEMBER,
+            invalid_parameter(DETECTOR_ID_MEMBER),
         ),
         (
             "a destination id nothing minted",
             detector_id.clone(),
             ABSENT_DESTINATION_ID.to_string(),
             DESTINATION_ID_MEMBER,
+            DESTINATION_ABSENT_MESSAGE.to_string(),
         ),
         (
             "a destination id that is not one at all",
             detector_id.clone(),
             "not-a-destination-id".to_string(),
             DESTINATION_ID_MEMBER,
+            DESTINATION_ABSENT_MESSAGE.to_string(),
         ),
         (
             "the stored destination id upper-cased",
             detector_id.clone(),
             destination_id.to_uppercase(),
             DESTINATION_ID_MEMBER,
+            DESTINATION_ABSENT_MESSAGE.to_string(),
         ),
     ];
 
     let before = detector_updated_at(&router, HOME_REGION, &detector_id, "before the refusals").await;
-    for (case, detector, destination, member) in rows {
+    for (case, detector, destination, member, expected) in rows {
         let (status, refused) = delete(&router, &detector, &destination).await;
         // The value at fault is the one the refusing member carried.
         let at_fault = if member == DETECTOR_ID_MEMBER {
@@ -750,7 +760,7 @@ async fn a_delete_of_something_the_store_does_not_hold_is_refused() {
         } else {
             destination.clone()
         };
-        assert_refusal(case, status, &refused, member, &at_fault);
+        assert_refusal(case, status, &refused, &expected, &at_fault);
     }
 
     // Nothing was written: the destination is still there, and the detector did not

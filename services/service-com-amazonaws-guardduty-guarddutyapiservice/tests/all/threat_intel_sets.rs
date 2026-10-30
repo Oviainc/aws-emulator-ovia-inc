@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_guardduty_guarddutyapiservice::state;
+use service_com_amazonaws_guardduty_guarddutyapiservice::state::SET_ID_NOT_FOUND_MESSAGE;
 
 use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, error_shape, new_router, Router,
@@ -596,8 +597,10 @@ async fn a_threat_intel_set_id_the_detector_does_not_hold_is_refused() {
     )
     .await;
 
-    // Values that cannot be an id this service mints: the rows differ along LENGTH
-    // (both sides of the 32-character boundary) and along the ALPHABET.
+    // An id the detector does not hold is ONE refusal on this family, whatever the
+    // form of the value: the rows differ along LENGTH (both sides of the 32-character
+    // boundary) and along the ALPHABET, and every one of them is the fixed
+    // absent-resource sentence.
     for (id, why) in [
         ("deadbeefdeadbeefdeadbeefdeadbee", "31 characters"),
         ("deadbeefdeadbeefdeadbeefdeadbeef0", "33 characters"),
@@ -606,7 +609,7 @@ async fn a_threat_intel_set_id_the_detector_does_not_hold_is_refused() {
         ("0", "a single character"),
     ] {
         let (status, body) = get_set(&router, &detector_id, id).await;
-        assert_rejection(why, status, &body, &invalid_parameter("threatIntelSetId"));
+        assert_rejection(why, status, &body, SET_ID_NOT_FOUND_MESSAGE);
         assert!(
             !body["message"].as_str().unwrap_or_default().contains(id),
             "case {why:?}: a rejection must not echo the caller's value, got {body:?}"
@@ -614,15 +617,15 @@ async fn a_threat_intel_set_id_the_detector_does_not_hold_is_refused() {
     }
 
     // Well-formed ids no create minted here, including the id of a list the detector
-    // does hold, upper-cased: case is not significant to the FORM, so it is the
-    // ownership failure and not a parameter one.
+    // does hold, upper-cased: case is not significant to the FORM, and the list is
+    // absent either way, so the same sentence answers these too.
     for (id, why) in [
         ("deadbeefdeadbeefdeadbeefdeadbeef".to_string(), "32 lowercase hex characters"),
         ("00000000000000000000000000000000".to_string(), "32 zeros"),
         (stored.to_uppercase(), "a stored id, upper-cased"),
     ] {
         let (status, body) = get_set(&router, &detector_id, &id).await;
-        assert_rejection(why, status, &body, &not_owned("threatIntelSetId"));
+        assert_rejection(why, status, &body, SET_ID_NOT_FOUND_MESSAGE);
     }
 }
 

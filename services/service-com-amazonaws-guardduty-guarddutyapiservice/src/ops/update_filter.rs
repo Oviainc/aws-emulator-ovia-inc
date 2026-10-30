@@ -203,11 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !detector.filters.contains_key(&input.filter_name) {
             // `FilterName` is a plain `String` URI label here
             // (`smithy_query(operation="UpdateFilter")`), so it carries no modelled
-            // constraint and a malformed name reaches this handler: classified from
-            // the REQUEST the same way a detector id is.
-            return Err(bad_request(crate::state::filter_name_rejection(
-                &input.filter_name,
-            )));
+            // constraint and a malformed name reaches this handler, where it is the
+            // same refusal as a well-formed name the detector does not hold: a
+            // MUTATING filter path answers that the name it was handed is not a
+            // usable one ([`crate::state::INVALID_FILTER_NAME_MESSAGE`]), where the
+            // read answers that no such resource was found.
+            return Err(bad_request(crate::state::INVALID_FILTER_NAME_MESSAGE));
         }
 
         let now = state.tick_millis();

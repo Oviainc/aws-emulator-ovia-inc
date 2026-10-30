@@ -173,9 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .publishing_destinations
             .get_mut(&input.destination_id)
         else {
-            return Err(bad_request(crate::state::destination_id_rejection(
-                &input.destination_id,
-            )));
+            // A `DestinationId` this detector does not hold — one a delete removed,
+            // one minted elsewhere, or one that could never have been minted — is
+            // reported as an unusable input PARAMETER, which is this family's one
+            // fixed refusal ([`crate::state::DESTINATION_NOT_FOUND_MESSAGE`]).
+            return Err(bad_request(crate::state::DESTINATION_NOT_FOUND_MESSAGE));
         };
         destination.settle(now);
 

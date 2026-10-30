@@ -155,13 +155,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let Some(set) = detector.threat_intel_set(&input.threat_intel_set_id) else {
-            // A `ThreatIntelSetId` this detector does not hold, classified from the
-            // REQUEST exactly as `GetThreatIntelSet` classifies it.
+            // A `ThreatIntelSetId` this detector does not hold is the absence every
+            // uploaded-list operation reports the same way
+            // ([`crate::state::SET_ID_NOT_FOUND_MESSAGE`]), exactly as
+            // `GetThreatIntelSet` reports it.
             return Err(crate::scaffolded::Scaffolded::invalid_input(
-                crate::state::minted_id_rejection(
-                    crate::state::THREAT_INTEL_SET_ID_MEMBER,
-                    &input.threat_intel_set_id,
-                ),
+                crate::state::SET_ID_NOT_FOUND_MESSAGE,
             ));
         };
         // A second delete of the same id asks for the state the list is already in,

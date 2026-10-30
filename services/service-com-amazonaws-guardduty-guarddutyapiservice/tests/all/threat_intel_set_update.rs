@@ -36,6 +36,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_guardduty_guarddutyapiservice::state;
 
+use crate::client_rejections::{invalid_parameter, not_owned};
 use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, new_router, Router, ABSENT_DETECTOR_ID,
 };
@@ -48,10 +49,6 @@ const CLASS: &str = "InvalidInputException";
 /// A well-formed `ThreatIntelSetId` (32 lowercase hex characters, the form this
 /// service mints) that no create ever minted.
 const ABSENT_SET_ID: &str = "0123456789abcdef0123456789abcdef";
-
-/// The wire name of the member that carries the threat list's id, as a refusal must
-/// name it.
-const SET_ID_MEMBER: &str = "threatIntelSetId";
 
 // ---------------------------------------------------------------------------
 // The four routes this suite drives, under `/detector/{DetectorId}/threatintelset`.
@@ -154,13 +151,13 @@ async fn retire(router: &Router, detector_id: &str, set_id: &str, case: &str) {
     );
 }
 
-/// Assert a refusal is this service's classified HTTP 400, names `member` and echoes
-/// none of `never_echoed`.
+/// Assert a refusal is this service's classified HTTP 400, carries `expected_message`
+/// and echoes none of `never_echoed`.
 fn assert_classified_refusal(
     case: &str,
     status: u16,
     body: &Value,
-    member: &str,
+    expected_message: &str,
     never_echoed: &[&str],
 ) {
     assert_eq!(
@@ -173,9 +170,9 @@ fn assert_classified_refusal(
         "case {case:?}: expected the {CLASS} class, got {class:?} {body:?}"
     );
     let message = body["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains(member),
-        "case {case:?}: the refusal must name {member}, got {message:?}"
+    assert_eq!(
+        message, expected_message,
+        "case {case:?}: expected message {expected_message:?}, got {message:?}"
     );
     for value in never_echoed {
         assert!(
@@ -654,7 +651,7 @@ async fn an_unresolvable_id_is_refused_and_updates_nothing() {
         "a detectorId no create minted",
         status,
         &body,
-        state::DETECTOR_ID_MEMBER,
+        &not_owned(state::DETECTOR_ID_MEMBER),
         &[ABSENT_DETECTOR_ID],
     );
 
@@ -665,7 +662,7 @@ async fn an_unresolvable_id_is_refused_and_updates_nothing() {
         "a malformed detectorId",
         status,
         &body,
-        state::DETECTOR_ID_MEMBER,
+        &invalid_parameter(state::DETECTOR_ID_MEMBER),
         &[malformed_detector],
     );
 
@@ -675,18 +672,19 @@ async fn an_unresolvable_id_is_refused_and_updates_nothing() {
         "a threatIntelSetId no create minted",
         status,
         &body,
-        SET_ID_MEMBER,
+        state::SET_ID_NOT_FOUND_MESSAGE,
         &[ABSENT_SET_ID],
     );
 
-    // A `ThreatIntelSetId` that is not an id of that form at all.
+    // A `ThreatIntelSetId` that is not an id of that form at all: the list is absent
+    // either way, so it is the same refusal.
     let malformed_set = "not-a-threat-list";
     let (status, body) = update_set(&router, &detector, malformed_set, rename.clone()).await;
     assert_classified_refusal(
         "a malformed threatIntelSetId",
         status,
         &body,
-        SET_ID_MEMBER,
+        state::SET_ID_NOT_FOUND_MESSAGE,
         &[malformed_set],
     );
 
@@ -704,7 +702,7 @@ async fn an_unresolvable_id_is_refused_and_updates_nothing() {
         "another Region's endpoint",
         status,
         &body,
-        state::DETECTOR_ID_MEMBER,
+        &not_owned(state::DETECTOR_ID_MEMBER),
         &[detector.as_str()],
     );
 
@@ -738,7 +736,13 @@ async fn an_update_of_a_deleted_list_is_refused() {
         let expected = status_of(&router, &detector, &id, case).await;
 
         let (status, body) = update_set(&router, &detector, &id, json!({"activate": true})).await;
-        assert_classified_refusal(case, status, &body, SET_ID_MEMBER, &[id.as_str()]);
+        assert_classified_refusal(
+            case,
+            status,
+            &body,
+            state::SET_ID_NOT_FOUND_MESSAGE,
+            &[id.as_str()],
+        );
 
         let after = status_of(&router, &detector, &id, case).await;
         assert_eq!(

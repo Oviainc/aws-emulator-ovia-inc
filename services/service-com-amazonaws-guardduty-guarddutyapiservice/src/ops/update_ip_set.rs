@@ -192,17 +192,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // A list whose delete has already been accepted is no longer one the account
         // can act on, so it is refused exactly like an id the detector never held:
-        // "an id another account created, or one a delete removed" are the same
-        // refusal (`crate::state::not_owned_message`). The delete itself stays
-        // idempotent — it asks for the state the record is already in — while an
-        // update would otherwise walk a DELETED record back into use.
+        // both are the absence every uploaded-list operation reports with one fixed
+        // sentence (`crate::state::SET_ID_NOT_FOUND_MESSAGE`). The delete itself
+        // stays idempotent — it asks for the state the record is already in — while
+        // an update would otherwise walk a DELETED record back into use.
         let Some(ip_set) = detector
             .ip_sets
             .get(&input.ip_set_id)
             .filter(|ip_set| !ip_set.is_deleting())
         else {
             return Err(crate::scaffolded::Scaffolded::invalid_input(
-                crate::state::ip_set_id_rejection(&input.ip_set_id),
+                crate::state::SET_ID_NOT_FOUND_MESSAGE,
             ));
         };
 

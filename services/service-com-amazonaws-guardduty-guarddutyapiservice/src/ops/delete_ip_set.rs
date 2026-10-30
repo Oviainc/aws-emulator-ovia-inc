@@ -153,10 +153,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let Some(ip_set) = detector.ip_sets.get(&input.ip_set_id) else {
-            // An `IpSetId` this detector does not hold, classified from the REQUEST
-            // like every other id this service refuses.
+            // An `IpSetId` this detector does not hold is the absence every
+            // uploaded-list operation reports the same way
+            // ([`crate::state::SET_ID_NOT_FOUND_MESSAGE`]): one fixed sentence,
+            // whatever the form of the id and whoever minted it.
             return Err(crate::scaffolded::Scaffolded::invalid_input(
-                crate::state::ip_set_id_rejection(&input.ip_set_id),
+                crate::state::SET_ID_NOT_FOUND_MESSAGE,
             ));
         };
         // A second delete of the same id asks for the state the list is already in,

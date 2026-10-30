@@ -32,9 +32,11 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    now_millis, service_state, ReceivedInvitationRecord, FINDING_ATTRIBUTES, RELATIONSHIP_INVITED,
+    now_millis, service_state, ReceivedInvitationRecord, FINDING_ATTRIBUTES,
+    INVALID_FINDING_IDS_MESSAGE, RELATIONSHIP_INVITED, SET_ID_NOT_FOUND_MESSAGE,
 };
 
+use super::client_rejections::invalid_parameter;
 use super::detector_lifecycle::{
     all_finding_ids, call, enabled_detector, error_code, error_shape, new_router, router_over,
     Router,
@@ -95,6 +97,51 @@ fn assert_bad_request(case: &str, status: u16, body: &Value, member: &str, value
     assert!(
         message.contains(member),
         "case {case}: expected a message naming {member:?}, got {message:?}"
+    );
+    assert!(
+        value.is_empty() || !message.contains(value),
+        "case {case}: a rejection must not echo the caller's value {value:?}, got {message:?}"
+    );
+}
+
+/// Assert a response is this service's 400 client rejection carrying the FIXED
+/// sentence its resource family answers with: the status, the class in all three
+/// places it appears, the whole message, and no echo of `value`.
+///
+/// The sibling above is for the families whose refusal names the member at fault;
+/// this one is for the families whose refusal is one fixed text naming nothing — the
+/// absent-resource and finding-identifier classes — where "contains the member name"
+/// is not the rule and the message itself is.
+fn assert_bad_request_message(
+    case: &str,
+    status: u16,
+    body: &Value,
+    expected_message: &str,
+    value: &str,
+) {
+    assert_eq!(
+        status, 400,
+        "case {case}: expected HTTP 400, got {status} {body:?}"
+    );
+    assert_eq!(
+        error_shape(body),
+        BAD_REQUEST,
+        "case {case}: expected the modelled envelope shape, got {body:?}"
+    );
+    assert_eq!(
+        error_code(body),
+        INVALID_INPUT,
+        "case {case}: expected the invalid-input class in __type, got {body:?}"
+    );
+    assert_eq!(
+        body["type"],
+        json!(INVALID_INPUT),
+        "case {case}: expected the invalid-input class in the type member, got {body:?}"
+    );
+    let message = body["message"].as_str().unwrap_or_default();
+    assert_eq!(
+        message, expected_message,
+        "case {case}: expected message {expected_message:?}, got {message:?}"
     );
     assert!(
         value.is_empty() || !message.contains(value),
@@ -439,9 +486,10 @@ const SAMPLE_TYPES: [&str; 3] = [
 /// is refused whole and moves nothing.
 ///
 /// The rows differ along the way an id fails to resolve and along where in the batch
-/// it sits: a well-formed id nobody minted, a real id upper-cased (well formed, so an
-/// OWNERSHIP failure), values that cannot be a finding id at all, alone and mixed in
-/// beside ids the detector does hold.
+/// it sits: a well-formed id nobody minted and a real id upper-cased (both of the
+/// finding-id form, so both the finding-identifier refusal), values that cannot be a
+/// finding id at all (a parameter refusal), alone and mixed in beside ids the
+/// detector does hold.
 #[tokio::test]
 async fn archiving_a_finding_id_the_detector_does_not_hold_is_refused_and_moves_nothing() {
     let router = new_router();
@@ -460,24 +508,39 @@ async fn archiving_a_finding_id_the_detector_does_not_hold_is_refused_and_moves_
     let before = archived_ids(&router, &detector_id).await;
 
     let upper_cased = held[0].to_uppercase();
-    let absent: [(&str, &str); 5] = [
+    // Each row: the id the batch names, why it resolves to nothing, and the message
+    // the refusal carries — the finding-identifier sentence for a value that IS of
+    // the finding-id form but names no finding of this detector, and the
+    // parameter-value refusal for a value that could not be a finding id at all.
+    let absent: [(&str, &str, String); 5] = [
         (
             "ffffffffffffffffffffffffffffffff",
             "32 hexadecimal characters nobody minted",
+            INVALID_FINDING_IDS_MESSAGE.to_string(),
         ),
         (
             upper_cased.as_str(),
             "a held id upper-cased, which is still well formed",
+            INVALID_FINDING_IDS_MESSAGE.to_string(),
         ),
-        ("not-a-finding-id", "not hexadecimal at all"),
-        ("abc123", "too short to be a finding id"),
+        (
+            "not-a-finding-id",
+            "not hexadecimal at all",
+            invalid_parameter("findingIds"),
+        ),
+        (
+            "abc123",
+            "too short to be a finding id",
+            invalid_parameter("findingIds"),
+        ),
         (
             "0123456789abcdef0123456789abcdef0",
             "33 characters: one past the id length",
+            invalid_parameter("findingIds"),
         ),
     ];
 
-    for (id, why) in absent {
+    for (id, why, expected_message) in absent {
         // The batch SHAPES: the absent id alone, after a held id, and before one.
         let batches: [(&str, Vec<String>); 3] = [
             ("alone", vec![id.to_string()]),
@@ -488,7 +551,13 @@ async fn archiving_a_finding_id_the_detector_does_not_hold_is_refused_and_moves_
             for archived in [true, false] {
                 let case = format!("{why}, {shape}, archived={archived}");
                 let (status, body) = set_archived(&router, &detector_id, &batch, archived).await;
-                assert_bad_request(&case, status, &body, "findingIds", id);
+                assert_bad_request_message(
+                    &case,
+                    status,
+                    &body,
+                    &expected_message,
+                    id,
+                );
                 assert_eq!(
                     archived_ids(&router, &detector_id).await,
                     before,
@@ -873,7 +942,13 @@ async fn update_ip_set_with_an_id_the_detector_does_not_hold_is_refused_and_list
                 Some(body.clone()),
             )
             .await;
-            assert_bad_request(&case, status, &response, "ipSetId", ip_set_id);
+            assert_bad_request_message(
+                &case,
+                status,
+                &response,
+                SET_ID_NOT_FOUND_MESSAGE,
+                ip_set_id,
+            );
             assert!(
                 !ip_set_ids(&router, &detector_id).await.contains(ip_set_id),
                 "case {case}: a refused update must not make the id appear in ListIPSets"

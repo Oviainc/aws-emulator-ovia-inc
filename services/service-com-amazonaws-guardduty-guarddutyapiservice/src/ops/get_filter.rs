@@ -169,11 +169,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(filter) = detector.filters.get(&input.filter_name) else {
             // `FilterName` is a plain `String` URI label here
             // (`smithy_query(operation="GetFilter")`), so it carries no modelled
-            // constraint and a malformed name reaches this handler: classified from
-            // the REQUEST the same way a detector id is.
-            return Err(bad_request(crate::state::filter_name_rejection(
-                &input.filter_name,
-            )));
+            // constraint and a malformed name reaches this handler. A name the
+            // detector does not hold is the same absence either way, and a READ
+            // reports it with the fixed absent-resource sentence
+            // ([`crate::state::NO_SUCH_RESOURCE_MESSAGE`]) — where the mutating
+            // filter paths answer that the name itself is not usable.
+            return Err(bad_request(crate::state::NO_SUCH_RESOURCE_MESSAGE));
         };
 
         Ok(GetFilterOutput {

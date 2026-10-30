@@ -165,9 +165,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             let Some(destination) = detector.publishing_destinations.get(&input.destination_id)
             else {
-                return Err(bad_request(crate::state::destination_id_rejection(
-                    &input.destination_id,
-                )));
+                // The one fixed refusal a WRITE on this family answers a
+                // `DestinationId` it cannot resolve with
+                // ([`crate::state::DESTINATION_ABSENT_MESSAGE`]): the destination is
+                // not there, where the describe reports a bad input parameter.
+                return Err(bad_request(crate::state::DESTINATION_ABSENT_MESSAGE));
             };
             let destination_service =
                 crate::state::validate_destination_type(&destination.destination_type)
@@ -212,9 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Unreachable: the same two lookups resolved above under the same lock.
             // The branch is kept rather than unwrapped so a lookup that ever stops
             // resolving answers the caller's own refusal instead of panicking.
-            return Err(bad_request(crate::state::destination_id_rejection(
-                &input.destination_id,
-            )));
+            return Err(bad_request(crate::state::DESTINATION_ABSENT_MESSAGE));
         };
         // Materialise the verification the clock already made due before this call's
         // own change is applied, so an update neither skips it nor replays it.

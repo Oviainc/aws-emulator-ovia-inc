@@ -179,11 +179,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         detector.settle_threat_intel_sets(now);
 
         let Some(set) = detector.threat_intel_set(&input.threat_intel_set_id) else {
+            // A `ThreatIntelSetId` this detector does not hold is the absence every
+            // uploaded-list operation reports the same way
+            // ([`crate::state::SET_ID_NOT_FOUND_MESSAGE`]).
             return Err(crate::scaffolded::Scaffolded::invalid_input(
-                crate::state::minted_id_rejection(
-                    crate::state::THREAT_INTEL_SET_ID_MEMBER,
-                    &input.threat_intel_set_id,
-                ),
+                crate::state::SET_ID_NOT_FOUND_MESSAGE,
             ));
         };
 

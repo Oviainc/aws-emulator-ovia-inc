@@ -152,14 +152,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // A delete is not idempotent on this service: the filter must be there to be
         // deleted, so deleting the same name twice is refused the second time — the
-        // detector no longer holds it, which is the same fact `GetFilter` refuses on.
-        // `FilterName` is a plain `String` URI label here
-        // (`smithy_query(operation="DeleteFilter")`), so it carries no modelled
-        // constraint and a malformed name reaches this handler.
+        // detector no longer holds it. A MUTATING filter path answers that the name
+        // it was handed is not a usable one
+        // ([`crate::state::INVALID_FILTER_NAME_MESSAGE`]), where the read answers
+        // that no such resource was found. `FilterName` is a plain `String` URI label
+        // here (`smithy_query(operation="DeleteFilter")`), so it carries no modelled
+        // constraint and a malformed name reaches this handler, where it is the same
+        // refusal: the name names no filter this detector holds.
         if !detector.filters.contains_key(&input.filter_name) {
-            return Err(bad_request(crate::state::filter_name_rejection(
-                &input.filter_name,
-            )));
+            return Err(bad_request(crate::state::INVALID_FILTER_NAME_MESSAGE));
         }
 
         // Past the refusals this is a MUTATION, so the instant a successful delete

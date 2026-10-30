@@ -38,6 +38,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_guardduty_guarddutyapiservice::state;
+use service_com_amazonaws_guardduty_guarddutyapiservice::state::SET_ID_NOT_FOUND_MESSAGE;
 
 use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, error_shape, new_router, Router,
@@ -591,7 +592,7 @@ async fn the_retained_deleted_lists_are_bounded_oldest_deletion_first() {
         "the oldest deleted list, past the retention ceiling",
         status,
         &refused,
-        &not_owned("threatIntelSetId"),
+        SET_ID_NOT_FOUND_MESSAGE,
     );
 
     // Every later deletion is still reported, with the status its delete moved it to.
@@ -626,8 +627,9 @@ async fn an_id_the_detector_does_not_hold_is_refused_and_deletes_nothing() {
     )
     .await;
 
-    // Values that cannot be an id this service mints: the rows differ along LENGTH
-    // (both sides of the 32-character boundary) and along the ALPHABET.
+    // An id the detector does not hold is ONE refusal on this family, whatever the
+    // form of the value: the rows differ along LENGTH (both sides of the 32-character
+    // boundary) and along the ALPHABET.
     for (id, why) in [
         ("deadbeefdeadbeefdeadbeefdeadbee", "31 characters"),
         ("deadbeefdeadbeefdeadbeefdeadbeef0", "33 characters"),
@@ -636,7 +638,7 @@ async fn an_id_the_detector_does_not_hold_is_refused_and_deletes_nothing() {
         ("0", "a single character"),
     ] {
         let (status, body) = delete_set(&router, &detector_id, id).await;
-        assert_rejection(why, status, &body, &invalid_parameter("threatIntelSetId"));
+        assert_rejection(why, status, &body, SET_ID_NOT_FOUND_MESSAGE);
         assert!(
             !body["message"].as_str().unwrap_or_default().contains(id),
             "case {why:?}: a rejection must not echo the caller's value, got {body:?}"
@@ -644,7 +646,7 @@ async fn an_id_the_detector_does_not_hold_is_refused_and_deletes_nothing() {
     }
 
     // Well-formed ids no create minted here, including the stored id upper-cased:
-    // case is not significant to the FORM, so it is the ownership failure.
+    // case is not significant to the FORM, and the list is absent either way.
     for (id, why) in [
         (
             "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
@@ -654,7 +656,7 @@ async fn an_id_the_detector_does_not_hold_is_refused_and_deletes_nothing() {
         (stored.to_uppercase(), "a stored id, upper-cased"),
     ] {
         let (status, body) = delete_set(&router, &detector_id, &id).await;
-        assert_rejection(why, status, &body, &not_owned("threatIntelSetId"));
+        assert_rejection(why, status, &body, SET_ID_NOT_FOUND_MESSAGE);
     }
 
     // A detector the request's Region does not hold is refused on the DETECTOR, and a

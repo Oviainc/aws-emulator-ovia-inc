@@ -24,7 +24,9 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_guardduty_guarddutyapiservice::state;
+use service_com_amazonaws_guardduty_guarddutyapiservice::state::DESTINATION_ABSENT_MESSAGE;
 
+use crate::client_rejections::{invalid_parameter, not_owned};
 use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, error_shape, new_router, Router,
     ABSENT_DETECTOR_ID,
@@ -513,37 +515,38 @@ async fn an_update_the_service_cannot_accept_is_refused_and_writes_nothing() {
     }
 }
 
-/// An id the store does not resolve is the same classified 400 `DescribePublishing
-/// Destination` answers: a value that is not an id of this service at all is a
-/// parameter failure, a well-formed one the account does not own is an ownership
-/// failure, and neither message quotes the caller's value back at them.
+/// An id the store does not resolve is the classified 400 every id rejection on this
+/// service carries, with the fixed sentence the refused resource family and operation
+/// class answer: a `detectorId` is a parameter failure or an ownership failure, and a
+/// `destinationId` a WRITE cannot resolve is refused as a destination that does not
+/// exist. Neither message quotes the caller's value back at them.
 #[tokio::test]
 async fn an_update_addressed_to_an_id_the_store_does_not_hold_is_refused() {
     let router = new_router();
     let detector_id = enabled_detector(&router).await;
     let destination_id = base_destination(&router, &detector_id).await;
 
-    // (case, path, the member the message must name)
-    let cases: [(&str, String, &str); 5] = [
+    // (case, path, the message the refusal carries)
+    let cases: [(&str, String, String); 5] = [
         (
             "an absent detector",
             format!("/detector/{ABSENT_DETECTOR_ID}/publishingDestination/{destination_id}"),
-            "detectorId",
+            not_owned("detectorId"),
         ),
         (
             "a detector id that is not one",
             format!("/detector/not-a-detector-id/publishingDestination/{destination_id}"),
-            "detectorId",
+            invalid_parameter("detectorId"),
         ),
         (
             "an absent destination",
             format!("/detector/{detector_id}/publishingDestination/{ABSENT_DESTINATION_ID}"),
-            "destinationId",
+            DESTINATION_ABSENT_MESSAGE.to_string(),
         ),
         (
             "a destination id that is not one",
             format!("/detector/{detector_id}/publishingDestination/not-a-destination-id"),
-            "destinationId",
+            DESTINATION_ABSENT_MESSAGE.to_string(),
         ),
         (
             "a destination id the caller upper-cased",
@@ -551,11 +554,11 @@ async fn an_update_addressed_to_an_id_the_store_does_not_hold_is_refused() {
                 "/detector/{detector_id}/publishingDestination/{}",
                 destination_id.to_uppercase()
             ),
-            "destinationId",
+            DESTINATION_ABSENT_MESSAGE.to_string(),
         ),
     ];
 
-    for (case, path, member) in cases {
+    for (case, path, expected) in cases {
         let (status, response) = call(
             &router,
             "POST",
@@ -573,9 +576,9 @@ async fn an_update_addressed_to_an_id_the_store_does_not_hold_is_refused() {
             "case {case:?}: expected the {CLASS} class, got {response:?}"
         );
         let message = response["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains(member),
-            "case {case:?}: the refusal must name {member}, got {message:?}"
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected message {expected:?}, got {message:?}"
         );
         assert!(
             !message.contains(ABSENT_DETECTOR_ID) && !message.contains(ABSENT_DESTINATION_ID),
@@ -701,8 +704,9 @@ async fn an_update_through_another_regions_endpoint_does_not_reach_the_destinati
         "case \"update under the {away} detector\": expected 400, got {status} {response:?}"
     );
     let message = response["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("destinationId"),
-        "case \"update under the {away} detector\": the refusal must name destinationId, got {message:?}"
+    assert_eq!(
+        message, DESTINATION_ABSENT_MESSAGE,
+        "case \"update under the {away} detector\": expected message \
+         {DESTINATION_ABSENT_MESSAGE:?}, got {message:?}"
     );
 }

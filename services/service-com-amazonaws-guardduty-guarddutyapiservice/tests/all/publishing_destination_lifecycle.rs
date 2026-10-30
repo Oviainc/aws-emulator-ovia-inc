@@ -32,6 +32,7 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use service_com_amazonaws_guardduty_guarddutyapiservice::state;
 
+use crate::client_rejections::{invalid_parameter, not_owned};
 use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, error_shape, new_router, Router,
     ABSENT_DETECTOR_ID,
@@ -702,10 +703,10 @@ async fn the_per_detector_maximum_is_enforced_at_its_bound() {
     );
 }
 
-/// An id neither operation's store resolves is the same classified 400: a value that
-/// is not an id of this service at all is a parameter failure, a well-formed one the
-/// account does not own is an ownership failure, and neither message quotes the
-/// caller's value back at them.
+/// An id neither operation's store resolves is the same classified 400, with the fixed
+/// sentence the refused resource family answers: a `detectorId` is a parameter failure
+/// or an ownership failure, a `destinationId` is reported as an unusable input
+/// parameter, and neither message quotes the caller's value back at them.
 #[tokio::test]
 async fn an_id_the_store_does_not_hold_is_refused_by_both_operations() {
     let router = new_router();
@@ -723,8 +724,8 @@ async fn an_id_the_store_does_not_hold_is_refused_by_both_operations() {
     )
     .await;
 
-    // (case, method, path, body, the member the message must name)
-    let cases: [(&str, &str, String, Option<Value>, &str); 6] = [
+    // (case, method, path, body, the message the refusal carries)
+    let cases: [(&str, &str, String, Option<Value>, String); 6] = [
         (
             "create under an absent detector",
             "POST",
@@ -736,7 +737,7 @@ async fn an_id_the_store_does_not_hold_is_refused_by_both_operations() {
                     "kmsKeyArn": KEY_ARN,
                 },
             })),
-            "detectorId",
+            not_owned("detectorId"),
         ),
         (
             "create under a detector id that is not one",
@@ -749,28 +750,28 @@ async fn an_id_the_store_does_not_hold_is_refused_by_both_operations() {
                     "kmsKeyArn": KEY_ARN,
                 },
             })),
-            "detectorId",
+            invalid_parameter("detectorId"),
         ),
         (
             "describe under an absent detector",
             "GET",
             format!("/detector/{ABSENT_DETECTOR_ID}/publishingDestination/{destination_id}"),
             None,
-            "detectorId",
+            not_owned("detectorId"),
         ),
         (
             "describe an absent destination",
             "GET",
             format!("/detector/{detector_id}/publishingDestination/{ABSENT_DESTINATION_ID}"),
             None,
-            "destinationId",
+            state::DESTINATION_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "describe a destination id that is not one",
             "GET",
             format!("/detector/{detector_id}/publishingDestination/not-a-destination-id"),
             None,
-            "destinationId",
+            state::DESTINATION_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "describe a destination id the caller upper-cased",
@@ -780,11 +781,11 @@ async fn an_id_the_store_does_not_hold_is_refused_by_both_operations() {
                 destination_id.to_uppercase()
             ),
             None,
-            "destinationId",
+            state::DESTINATION_NOT_FOUND_MESSAGE.to_string(),
         ),
     ];
 
-    for (case, method, path, body, member) in cases {
+    for (case, method, path, body, expected) in cases {
         let (status, response) = call(&router, method, &path, body).await;
         assert_eq!(
             status, 400,
@@ -796,9 +797,9 @@ async fn an_id_the_store_does_not_hold_is_refused_by_both_operations() {
             "case {case:?}: expected the {CLASS} class, got {response:?}"
         );
         let message = response["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains(member),
-            "case {case:?}: the refusal must name {member}, got {message:?}"
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected message {expected:?}, got {message:?}"
         );
         assert!(
             !message.contains(ABSENT_DETECTOR_ID) && !message.contains(ABSENT_DESTINATION_ID),

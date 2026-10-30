@@ -203,6 +203,8 @@ mod refused_create_clock;
 mod refused_mutation_clock;
 #[path = "all/request_region_partition_bounds.rs"]
 mod request_region_partition_bounds;
+#[path = "all/resource_not_found_messages.rs"]
+mod resource_not_found_messages;
 #[path = "all/resource_tag_addition.rs"]
 mod resource_tag_addition;
 #[path = "all/resource_tag_listing.rs"]

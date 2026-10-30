@@ -155,9 +155,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .publishing_destinations
             .contains_key(&input.destination_id)
         {
-            return Err(bad_request(crate::state::destination_id_rejection(
-                &input.destination_id,
-            )));
+            // The one fixed refusal a WRITE on this family answers a
+            // `DestinationId` it cannot resolve with
+            // ([`crate::state::DESTINATION_ABSENT_MESSAGE`]): the destination is not
+            // there, where the describe reports a bad input parameter.
+            return Err(bad_request(crate::state::DESTINATION_ABSENT_MESSAGE));
         }
 
         // Past the refusals this is a MUTATION, so it advances this state's clock:

@@ -23,10 +23,12 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
+use super::client_rejections::{invalid_parameter, not_owned};
 use super::detector_lifecycle::{
     all_finding_ids, call_in, enabled_detector, error_code, error_shape, new_router, Router,
     ABSENT_DETECTOR_ID,
 };
+use service_com_amazonaws_guardduty_guarddutyapiservice::state::INVALID_FINDING_IDS_MESSAGE;
 
 /// The Region the detector under test is created in: the Region the harness signs for
 /// by default.
@@ -46,11 +48,11 @@ const SAMPLE_TYPES: [&str; 4] = [
     "Policy:Kubernetes/ExposedDashboard",
 ];
 
-/// What a row expects: the request is accepted, or refused naming this member.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a row expects: the request is accepted, or refused with this exact message.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Expected {
     Accepted,
-    RefusedNaming(&'static str),
+    RefusedWith(String),
 }
 
 /// One request to either direction of the write, as a status and parsed body.
@@ -125,9 +127,9 @@ async fn detector_with_findings(router: &Router) -> (String, Vec<String>) {
     (detector_id, ids)
 }
 
-/// Assert one refusal: the modelled envelope, the invalid-input class, a message that
-/// names the member and does not echo the request's value.
-fn assert_refusal(case: &str, member: &str, value: &str, status: u16, body: &Value) {
+/// Assert one refusal: the modelled envelope, the invalid-input class, the message the
+/// refused class carries, and no echo of the request's value.
+fn assert_refusal(case: &str, expected_message: &str, value: &str, status: u16, body: &Value) {
     assert_eq!(status, 400, "case {case:?}: expected 400, got {status} {body:?}");
     assert_eq!(
         error_shape(body),
@@ -140,9 +142,9 @@ fn assert_refusal(case: &str, member: &str, value: &str, status: u16, body: &Val
         "case {case:?}: expected the invalid-input class, got {body:?}"
     );
     let message = body["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains(member),
-        "case {case:?}: expected a message naming {member}, got {message:?}"
+    assert_eq!(
+        message, expected_message,
+        "case {case:?}: expected message {expected_message:?}, got {message:?}"
     );
     assert!(
         !message.contains(value),
@@ -195,7 +197,7 @@ async fn both_directions_of_the_archive_write_follow_one_rule() {
             HOME_REGION,
             detector_id.as_str(),
             vec!["ffffffffffffffffffffffffffffffff".to_string()],
-            Expected::RefusedNaming("findingIds"),
+            Expected::RefusedWith(INVALID_FINDING_IDS_MESSAGE.to_string()),
         ),
         (
             "a finding id nobody minted, after held ids",
@@ -206,42 +208,42 @@ async fn both_directions_of_the_archive_write_follow_one_rule() {
                 held[2].clone(),
                 "ffffffffffffffffffffffffffffffff".to_string(),
             ],
-            Expected::RefusedNaming("findingIds"),
+            Expected::RefusedWith(INVALID_FINDING_IDS_MESSAGE.to_string()),
         ),
         (
             "a value that cannot be a finding id, before a held id",
             HOME_REGION,
             detector_id.as_str(),
             vec!["not-a-finding-id".to_string(), held[3].clone()],
-            Expected::RefusedNaming("findingIds"),
+            Expected::RefusedWith(invalid_parameter("findingIds")),
         ),
         (
             "a held finding id upper-cased",
             HOME_REGION,
             detector_id.as_str(),
             vec![upper_cased_finding.clone()],
-            Expected::RefusedNaming("findingIds"),
+            Expected::RefusedWith(INVALID_FINDING_IDS_MESSAGE.to_string()),
         ),
         (
             "a detector id nobody created",
             HOME_REGION,
             ABSENT_DETECTOR_ID,
             held.clone(),
-            Expected::RefusedNaming("detectorId"),
+            Expected::RefusedWith(not_owned("detectorId")),
         ),
         (
             "a value that cannot be a detector id",
             HOME_REGION,
             "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
             held.clone(),
-            Expected::RefusedNaming("detectorId"),
+            Expected::RefusedWith(invalid_parameter("detectorId")),
         ),
         (
             "the detector through another Region's endpoint",
             OTHER_REGION,
             detector_id.as_str(),
             held.clone(),
-            Expected::RefusedNaming("detectorId"),
+            Expected::RefusedWith(not_owned("detectorId")),
         ),
         // The detector is resolved BEFORE the batch, so a request that fails both ways
         // is refused on the detector id.
@@ -250,7 +252,7 @@ async fn both_directions_of_the_archive_write_follow_one_rule() {
             HOME_REGION,
             upper_cased_detector.as_str(),
             vec!["ffffffffffffffffffffffffffffffff".to_string()],
-            Expected::RefusedNaming("detectorId"),
+            Expected::RefusedWith(not_owned("detectorId")),
         ),
     ];
 
@@ -312,25 +314,28 @@ async fn both_directions_of_the_archive_write_follow_one_rule() {
                     "case {label:?}: restoring the starting state expected 200, got {status} {body:?}"
                 );
             }
-            Expected::RefusedNaming(member) => {
-                let value = match member {
-                    "detectorId" => request_detector_id.to_string(),
-                    _ => ids
-                        .iter()
+            Expected::RefusedWith(expected_message) => {
+                // The request's own value, which no refusal may echo: the detector id
+                // when that is what failed to resolve, otherwise the first named
+                // finding id the detector does not hold.
+                let value = if expected_message.contains("detectorId") {
+                    request_detector_id.to_string()
+                } else {
+                    ids.iter()
                         .find(|id| !held.contains(id))
                         .cloned()
-                        .unwrap_or_default(),
+                        .unwrap_or_default()
                 };
                 assert_refusal(
                     &format!("{label} (archive)"),
-                    member,
+                    &expected_message,
                     &value,
                     archive_status,
                     &archive_body,
                 );
                 assert_refusal(
                     &format!("{label} (unarchive)"),
-                    member,
+                    &expected_message,
                     &value,
                     unarchive_status,
                     &unarchive_body,

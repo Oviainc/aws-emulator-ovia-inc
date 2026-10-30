@@ -38,13 +38,15 @@
 
 use serde_json::{json, Value};
 
+use crate::client_rejections::{invalid_parameter, not_owned};
 use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, new_router, Router, ABSENT_DETECTOR_ID,
 };
 use crate::ip_set_lifecycle::past_the_transition;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
     DETECTOR_ID_MEMBER, IP_SETS_PER_DETECTOR, IP_SET_ACTIVATING, IP_SET_ACTIVE,
-    IP_SET_DEACTIVATING, IP_SET_DELETED, IP_SET_DELETE_PENDING, IP_SET_ID_MEMBER, IP_SET_INACTIVE,
+    IP_SET_DEACTIVATING, IP_SET_DELETED, IP_SET_DELETE_PENDING, IP_SET_INACTIVE,
+    SET_ID_NOT_FOUND_MESSAGE,
 };
 
 /// The error class every client rejection on this service carries in the body's
@@ -154,9 +156,15 @@ async fn updated(router: &Router, detector_id: &str, ip_set_id: &str, case: &str
     );
 }
 
-/// Assert a refusal is this service's classified HTTP 400, names `member` and echoes
-/// none of `never_echoed`.
-fn assert_classified_refusal(case: &str, status: u16, body: &Value, member: &str, echoed: &[&str]) {
+/// Assert a refusal is this service's classified HTTP 400, carries `expected_message`
+/// and echoes none of `never_echoed`.
+fn assert_classified_refusal(
+    case: &str,
+    status: u16,
+    body: &Value,
+    expected_message: &str,
+    echoed: &[&str],
+) {
     assert_eq!(
         status, 400,
         "case {case:?}: expected 400, got {status} {body:?}"
@@ -167,9 +175,9 @@ fn assert_classified_refusal(case: &str, status: u16, body: &Value, member: &str
         "case {case:?}: expected the {INVALID_INPUT} class, got {class:?} {body:?}"
     );
     let message = body["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains(member),
-        "case {case:?}: the refusal must name {member}, got {message:?}"
+    assert_eq!(
+        message, expected_message,
+        "case {case:?}: expected message {expected_message:?}, got {message:?}"
     );
     for value in echoed {
         assert!(
@@ -654,7 +662,7 @@ async fn an_update_of_a_deleted_ip_set_is_refused() {
             json!({"name": "resurrected", "activate": true}),
         )
         .await;
-        assert_classified_refusal(case, status, &body, IP_SET_ID_MEMBER, &[id.as_str()]);
+        assert_classified_refusal(case, status, &body, SET_ID_NOT_FOUND_MESSAGE, &[id.as_str()]);
 
         // The refusal wrote nothing: neither the name nor the status moved.
         let body = read(&router, &detector, &id, case).await;
@@ -819,54 +827,54 @@ async fn an_unresolvable_id_is_refused_by_update_and_delete() {
     )
     .await;
 
-    // Each row: the case, the ids the call uses, and the member the refusal must
-    // name. They span an id that cannot be an id of its kind at all (a parameter
-    // failure) and a well-formed one the store does not hold (an ownership failure),
-    // on both labels.
-    let rows: Vec<(&str, String, String, &str)> = vec![
+    // Each row: the case, the ids the call uses, and the exact message the refusal
+    // carries. They span an id that cannot be an id of its kind at all and a
+    // well-formed one the store does not hold, on both labels: on the IPSet label the
+    // two are one refusal, on the detector label they are not.
+    let rows: Vec<(&str, String, String, String)> = vec![
         (
             "a well-formed detectorId no create minted",
             ABSENT_DETECTOR_ID.to_string(),
             ip_set.clone(),
-            DETECTOR_ID_MEMBER,
+            not_owned(DETECTOR_ID_MEMBER),
         ),
         (
             "a value that cannot be a detectorId at all",
             "not-a-detector".to_string(),
             ip_set.clone(),
-            DETECTOR_ID_MEMBER,
+            invalid_parameter(DETECTOR_ID_MEMBER),
         ),
         (
             "a well-formed ipSetId this detector does not hold",
             detector.clone(),
             ABSENT_IP_SET_ID.to_string(),
-            IP_SET_ID_MEMBER,
+            SET_ID_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "a value that cannot be an ipSetId at all",
             detector.clone(),
             "not-an-ip-set".to_string(),
-            IP_SET_ID_MEMBER,
+            SET_ID_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "an ipSetId a one-character typo produced",
             detector.clone(),
             format!("{}0", &ip_set[..ip_set.len() - 1]),
-            IP_SET_ID_MEMBER,
+            SET_ID_NOT_FOUND_MESSAGE.to_string(),
         ),
     ];
 
-    for (case, detector_id, ip_set_id, member) in rows {
+    for (case, detector_id, ip_set_id, expected) in rows {
         let echoed = [detector_id.as_str(), ip_set_id.as_str()];
 
         let update_case = format!("{case}: UpdateIPSet");
         let (status, body) =
             update_ip_set(&router, &detector_id, &ip_set_id, json!({"name": "nope"})).await;
-        assert_classified_refusal(&update_case, status, &body, member, &echoed);
+        assert_classified_refusal(&update_case, status, &body, &expected, &echoed);
 
         let delete_case = format!("{case}: DeleteIPSet");
         let (status, body) = delete_ip_set(&router, &detector_id, &ip_set_id).await;
-        assert_classified_refusal(&delete_case, status, &body, member, &echoed);
+        assert_classified_refusal(&delete_case, status, &body, &expected, &echoed);
     }
 
     // None of those refusals touched the stored IPSet.

@@ -22,22 +22,25 @@
 //! 3. `ClientToken` is `@idempotencyToken`: the same token returns the IPSet the
 //!    first call minted, a different token (or none) mints another.
 //! 4. An id the store does not resolve is refused with HTTP 400 under the
-//!    `InvalidInputException` class — a value that cannot be an id at all as a
-//!    parameter failure, a well-formed one the account/detector does not hold as an
-//!    ownership failure — and the refusal names the MEMBER, never the caller's
-//!    value. A create past `state::IP_SETS_PER_DETECTOR` is refused the same way,
-//!    which is also what bounds what one caller can make the service retain.
+//!    `InvalidInputException` class, with the fixed sentence its own resource family
+//!    answers: a `DetectorId` is refused as a parameter failure or as not owned by
+//!    the account, an `IpSetId` with the one absent-resource sentence the
+//!    uploaded-list families share (`state::SET_ID_NOT_FOUND_MESSAGE`), whatever the
+//!    form of the id. No refusal echoes the caller's value. A create past
+//!    `state::IP_SETS_PER_DETECTOR` is refused the same way, which is also what
+//!    bounds what one caller can make the service retain.
 //! 5. An IPSet is a sub-resource of a REGIONAL detector, so it is served only
 //!    through the Region's endpoint that created it.
 
 use serde_json::{json, Value};
 
+use crate::client_rejections::{invalid_parameter, not_owned};
 use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, new_router, Router, ABSENT_DETECTOR_ID,
 };
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    DETECTOR_ID_MEMBER, IP_SETS_PER_DETECTOR, IP_SET_ACTIVATING, IP_SET_ACTIVE, IP_SET_ID_MEMBER,
-    IP_SET_INACTIVE, IP_SET_TRANSITION_MILLIS,
+    DETECTOR_ID_MEMBER, IP_SETS_PER_DETECTOR, IP_SET_ACTIVATING, IP_SET_ACTIVE,
+    IP_SET_INACTIVE, IP_SET_TRANSITION_MILLIS, SET_ID_NOT_FOUND_MESSAGE,
 };
 
 /// Every member of `IpSetFormat` — "the format of the file that contains the IPSet"
@@ -440,48 +443,48 @@ async fn an_unresolvable_id_is_refused_without_echoing_it() {
     )
     .await;
 
-    // Each row: the case, the detector id and IPSet id the read uses, and the
-    // member the refusal must name.
-    let rows: Vec<(&str, String, String, &str)> = vec![
+    // Each row: the case, the detector id and IPSet id the read uses, and the exact
+    // message its family answers with.
+    let rows: Vec<(&str, String, String, String)> = vec![
         (
             "a well-formed detectorId no create minted",
             ABSENT_DETECTOR_ID.to_string(),
             ip_set.clone(),
-            DETECTOR_ID_MEMBER,
+            not_owned(DETECTOR_ID_MEMBER),
         ),
         (
             "a value that cannot be a detectorId at all",
             "not-a-detector".to_string(),
             ip_set.clone(),
-            DETECTOR_ID_MEMBER,
+            invalid_parameter(DETECTOR_ID_MEMBER),
         ),
         (
             "an empty-ish detectorId at the modelled minimum length",
             "x".to_string(),
             ip_set.clone(),
-            DETECTOR_ID_MEMBER,
+            invalid_parameter(DETECTOR_ID_MEMBER),
         ),
         (
             "a well-formed ipSetId this detector does not hold",
             detector.clone(),
             ABSENT_IP_SET_ID.to_string(),
-            IP_SET_ID_MEMBER,
+            SET_ID_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "a value that cannot be an ipSetId at all",
             detector.clone(),
             "not-an-ip-set".to_string(),
-            IP_SET_ID_MEMBER,
+            SET_ID_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "an ipSetId a delete-shaped typo produced",
             detector.clone(),
             format!("{}0", &ip_set[..ip_set.len() - 1]),
-            IP_SET_ID_MEMBER,
+            SET_ID_NOT_FOUND_MESSAGE.to_string(),
         ),
     ];
 
-    for (case, detector_id, ip_set_id, member) in rows {
+    for (case, detector_id, ip_set_id, expected) in rows {
         let (status, body) = get_ip_set(&router, &detector_id, &ip_set_id).await;
         assert_eq!(
             status, 400,
@@ -493,9 +496,9 @@ async fn an_unresolvable_id_is_refused_without_echoing_it() {
             "case {case:?}: expected the {INVALID_INPUT} class, got {class:?} {body:?}"
         );
         let message = body["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains(member),
-            "case {case:?}: the refusal must name {member}, got {message:?}"
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected message {expected:?}, got {message:?}"
         );
         for echoed in [detector_id.as_str(), ip_set_id.as_str()] {
             assert!(
