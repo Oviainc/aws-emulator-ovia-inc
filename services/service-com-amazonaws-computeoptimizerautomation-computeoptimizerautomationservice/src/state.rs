@@ -3359,7 +3359,7 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
         account_id == caller_account_id() || self.is_associated(account_id)
     }
 
-    /// May an organization rule be scoped to every account `configuration`
+    /// May a rule of `rule_type` be scoped to every account `configuration`
     /// names?
     ///
     /// An organization configuration's `accountIds` are "specific Amazon Web
@@ -3384,7 +3384,25 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
     /// [`preview_account_scope`]) and reaches a member account only for as long
     /// as that account's association lasts. An absent configuration is only
     /// valid for a rule that is not an organization rule at all.
-    pub fn may_scope_rule_to(&self, configuration: Option<&OrganizationConfiguration>) -> bool {
+    ///
+    /// Judged for the RESULTING rule type too, because the configuration is the
+    /// organization-wide half of a rule and the `OrganizationRule` type is what
+    /// puts it into effect: a rule of any other type applies its actions in the
+    /// account it lives in, so the accounts such a configuration names scope
+    /// nothing and no association can be required for them. Such a pairing is
+    /// not stored either — it is refused as an inapplicable member
+    /// ([`organization_configuration_violation`]), the same answer a preview
+    /// gives an `organizationScope` outside that rule type
+    /// ([`preview_selection_violation`]) — so this standing check never decides
+    /// what happens to it.
+    pub fn may_scope_rule_to(
+        &self,
+        rule_type: &str,
+        configuration: Option<&OrganizationConfiguration>,
+    ) -> bool {
+        if rule_type != "OrganizationRule" {
+            return true;
+        }
         configuration
             .and_then(|configuration| configuration.account_ids.as_deref())
             .into_iter()

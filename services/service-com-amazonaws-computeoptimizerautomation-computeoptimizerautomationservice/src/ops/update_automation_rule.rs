@@ -293,6 +293,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // effect — so an update that turns a rule into an organization rule is
         // held to the scope it thereby activates, whether that scope arrives in
         // this request or is already stored, exactly as replacing the scope is.
+        // What is judged is the scope the MERGED rule would put into effect, so
+        // both the configuration and the rule type are the merged ones: an
+        // update that leaves the rule outside the organization type activates
+        // no account scope at all, whatever configuration it carries (such a
+        // merged rule is refused as an inapplicable member below instead).
         // Judged AHEAD of the token ledger and of the store, so a refused update
         // neither consumes its client token, applies a member nor bumps the
         // revision. An update that writes neither member re-points nothing and
@@ -302,15 +307,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.organization_configuration.is_some()
             || input.rule_type.as_deref() == Some("OrganizationRule")
         {
-            // The configuration the merged rule would carry: the one this
-            // request writes, or the stored one when it writes none.
-            let scoped_configuration = input.organization_configuration.clone().or_else(|| {
-                guard
-                    .rules
-                    .get(&input.rule_arn)
-                    .and_then(|rule| rule.organization_configuration.clone())
-            });
-            if !guard.may_scope_rule_to(scoped_configuration.as_ref()) {
+            // The rule type and the configuration the merged rule would carry:
+            // the ones this request writes, or the stored ones when it writes
+            // none.
+            let stored = guard.rules.get(&input.rule_arn);
+            let scoped_rule_type = input
+                .rule_type
+                .clone()
+                .or_else(|| stored.map(|rule| rule.rule_type.clone()))
+                .unwrap_or_default();
+            let scoped_configuration = input
+                .organization_configuration
+                .clone()
+                .or_else(|| stored.and_then(|rule| rule.organization_configuration.clone()));
+            if !guard.may_scope_rule_to(&scoped_rule_type, scoped_configuration.as_ref()) {
                 return Err(access_denied());
             }
         }

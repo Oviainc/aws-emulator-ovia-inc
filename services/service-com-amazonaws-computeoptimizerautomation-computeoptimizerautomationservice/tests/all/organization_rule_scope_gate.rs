@@ -49,14 +49,18 @@ use crate::member_account_association_gate::assert_access_denied;
 /// (`^[0-9]{12}$`), numbered from `first`. Each row draws from its own range, so
 /// no row's association state can disturb another's, and none of them is the
 /// calling account (`first` is never 0).
-fn member_ids(first: usize, count: usize) -> Vec<String> {
+///
+/// `pub(crate)` so a suite about what an organization configuration's accounts
+/// are judged for builds its account lists the same way instead of growing a
+/// copy of these helpers.
+pub(crate) fn member_ids(first: usize, count: usize) -> Vec<String> {
     (first..first + count).map(|n| format!("{n:012}")).collect()
 }
 
 /// An organization configuration naming `account_ids`, or carrying no
 /// `accountIds` member at all when they are `None`. `ruleApplyOrder` is a value
 /// of the model's `RuleApplyOrder`; what a case varies is the account list.
-fn scope_configuration(rule_apply_order: &str, account_ids: Option<&[String]>) -> Value {
+pub(crate) fn scope_configuration(rule_apply_order: &str, account_ids: Option<&[String]>) -> Value {
     let mut configuration = json!({"ruleApplyOrder": rule_apply_order});
     if let Some(account_ids) = account_ids {
         configuration["accountIds"] = json!(account_ids);
@@ -78,7 +82,7 @@ pub(crate) fn organization_rule(name: &str, account_ids: Option<&[String]>) -> V
 
 /// One arrangement step: `AssociateAccounts` when `associate`, otherwise
 /// `DisassociateAccounts`, over the accounts it names.
-type Step = (bool, Vec<String>);
+pub(crate) type Step = (bool, Vec<String>);
 
 /// A row of the table: the association state its accounts are put in, the
 /// account list the rule names, and whether the write is served.
@@ -93,7 +97,7 @@ struct Row {
 
 /// Run an arrangement over the wire, so a case is judged on association state
 /// some call actually stored.
-async fn arrange(router: &MultiServiceRouter, steps: &[Step], case: &str) {
+pub(crate) async fn arrange(router: &MultiServiceRouter, steps: &[Step], case: &str) {
     for (associate, accounts) in steps {
         let operation = if *associate {
             "AssociateAccounts"
@@ -157,7 +161,7 @@ async fn reported_rule_modes(
 /// How many rules the store holds, read over the wire. One page holds every rule
 /// a case creates: `maxResults` is modelled at 1..=100, which is also
 /// `state::MAX_RULES_PER_ACCOUNT`.
-async fn rule_count(router: &MultiServiceRouter, case: &str) -> usize {
+pub(crate) async fn rule_count(router: &MultiServiceRouter, case: &str) -> usize {
     let listed = call_ok(
         router,
         "ListAutomationRules",

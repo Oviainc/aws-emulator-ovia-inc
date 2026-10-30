@@ -255,10 +255,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an organization rule automatically applies its actions to the accounts
         // its configuration names, which is what an association permits, so an
         // account that is not associated right now may not be scoped — see
-        // `crate::state::…::may_scope_rule_to`. Judged AHEAD of the token ledger
-        // and of the store, so a refused create neither consumes its client
-        // token nor mints a rule.
-        if !guard.may_scope_rule_to(input.organization_configuration.as_ref()) {
+        // `crate::state::…::may_scope_rule_to`, which is where the rule type
+        // the create stores is weighed too: a rule of any other type applies
+        // its actions in the caller's own account, so a configuration sent with
+        // one scopes nothing (and is refused as an inapplicable member above).
+        // Judged AHEAD of the token ledger and of the store, so a refused
+        // create neither consumes its client token nor mints a rule.
+        if !guard.may_scope_rule_to(&input.rule_type, input.organization_configuration.as_ref()) {
             return Err(access_denied());
         }
 

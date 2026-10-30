@@ -48,7 +48,11 @@ const CONFIGURATION_REQUIRED: &str = "Member is required for the OrganizationRul
 
 /// What a rule carrying a configuration outside the `OrganizationRule` type is
 /// refused with.
-const CONFIGURATION_ONLY_FOR_ORGANIZATION_RULES: &str =
+///
+/// `pub(crate)` so the suite about what that configuration's accounts are — and
+/// are not — judged for states the refusal from here rather than spelling it
+/// again.
+pub(crate) const CONFIGURATION_ONLY_FOR_ORGANIZATION_RULES: &str =
     "Member is valid only for the OrganizationRule rule type";
 
 /// Every form an `organizationConfiguration` arrives in, as `(case, member)`.
@@ -131,7 +135,7 @@ async fn listed_rules(router: &MultiServiceRouter, case: &str) -> Vec<Value> {
 
 /// Assert a call was refused with the report that names `requirement` on
 /// `organizationConfiguration`.
-fn assert_pairing_refusal((status, body): (u16, Value), requirement: &str, case: &str) {
+pub(crate) fn assert_pairing_refusal((status, body): (u16, Value), requirement: &str, case: &str) {
     assert_refused(
         (status, body.clone()),
         400,
