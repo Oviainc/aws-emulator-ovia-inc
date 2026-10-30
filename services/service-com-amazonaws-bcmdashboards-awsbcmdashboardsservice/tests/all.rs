@@ -27,6 +27,8 @@ mod create_time_tag_merge;
 mod dashboard_lifecycle;
 #[path = "all/dashboard_name_uniqueness.rs"]
 mod dashboard_name_uniqueness;
+#[path = "all/date_time_value_message_bound.rs"]
+mod date_time_value_message_bound;
 #[path = "all/delete_dashboard_idempotency.rs"]
 mod delete_dashboard_idempotency;
 #[path = "all/delete_scheduled_report.rs"]

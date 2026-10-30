@@ -1352,13 +1352,28 @@ pub fn is_reserved_tag_key(key: &str) -> bool {
 /// have to hold it (see [`MAX_MESSAGE_LENGTH`]). Characters, not bytes: `@length` on a
 /// string counts characters, which is what the boundary validator charges a value by.
 pub fn within_message_bound(message: impl Into<String>) -> String {
-    let message = message.into();
-    if message.chars().count() <= MAX_MESSAGE_LENGTH {
-        return message;
+    elided_within(&message.into(), MAX_MESSAGE_LENGTH)
+}
+
+/// `text` within `budget` characters: itself when it already fits, else its longest prefix
+/// that leaves room for [`MESSAGE_ELISION`] — cut between characters, never inside one —
+/// followed by that marker.
+///
+/// [`within_message_bound`] applied to the WHOLE message is this with the message member's
+/// own maximum as the budget; a message that quotes a request value in the MIDDLE of its
+/// clause applies it to that value instead, with the room the clause leaves as the budget,
+/// so the rule the caller has to read survives the bound rather than being cut off after
+/// the value. The result never exceeds `budget`: a budget with no room for the marker
+/// itself keeps no text at all.
+fn elided_within(text: &str, budget: usize) -> String {
+    if text.chars().count() <= budget {
+        return text.to_string();
     }
-    let kept = MAX_MESSAGE_LENGTH - MESSAGE_ELISION.chars().count();
-    let mut bounded: String = message.chars().take(kept).collect();
-    bounded.push_str(MESSAGE_ELISION);
+    let marker = MESSAGE_ELISION.chars().count();
+    let mut bounded: String = text.chars().take(budget.saturating_sub(marker)).collect();
+    if budget >= marker {
+        bounded.push_str(MESSAGE_ELISION);
+    }
     bounded
 }
 
@@ -1851,6 +1866,15 @@ fn names_a_point_in_time(point: &DateTimeValue) -> bool {
 /// Worded from the request, like every other refusal this service builds: the member that
 /// broke the rule, the value it carried and the form that `type` requires, named with the
 /// model's own example of it.
+///
+/// The submitted value is quoted within what the clause itself leaves of
+/// [`MAX_MESSAGE_LENGTH`] ([`elided_within`]), because `DateTimeValue$value` admits as much
+/// text as the message member that has to carry it — both target `GenericString`, `@length
+/// min 0, max 1024` (`smithy_query(query="shape",shape="DateTimeValue,GenericString")`) —
+/// so quoting a maximal value whole beside the clause puts a message on the wire some two
+/// hundred characters past the maximum the model declares for it. The value is the part
+/// that gives way: the member path and the form `type` requires are what tell the caller
+/// what to change.
 fn malformed_date_time_value_message(path: &str, point: &DateTimeValue) -> String {
     let requirement = if point.r#type == DATE_TIME_TYPE_ABSOLUTE {
         "the value of an ABSOLUTE date/time value must be an absolute date, for example \
@@ -1859,10 +1883,14 @@ fn malformed_date_time_value_message(path: &str, point: &DateTimeValue) -> Strin
         "the value of a RELATIVE date/time value must be a relative time period in the ISO \
          8601 duration format, for example '-P3M' for three months ago"
     };
-    format!(
-        "{path}.value: '{}' is not a valid {} date/time value; {requirement}",
-        point.value, point.r#type
-    )
+    let worded = |value: &str| {
+        format!(
+            "{path}.value: '{value}' is not a valid {} date/time value; {requirement}",
+            point.r#type
+        )
+    };
+    let budget = MAX_MESSAGE_LENGTH.saturating_sub(worded("").chars().count());
+    within_message_bound(worded(&elided_within(&point.value, budget)))
 }
 
 /// How this service refuses the [`DateTimeRange`] at the member path `path`, or `None`
@@ -1883,6 +1911,10 @@ fn malformed_date_time_value_message(path: &str, point: &DateTimeValue) -> Strin
 ///
 /// One helper for every write that submits a range, so a widget's `timeRange` and a
 /// scheduled report's `widgetDateRangeOverride` cannot drift apart on either rule.
+///
+/// Both refusals quote the values the request carried within the maximum the member that
+/// has to carry the message declares ([`MAX_MESSAGE_LENGTH`]), which is the same maximum
+/// one of those values alone may reach.
 pub fn date_time_range_refusal(path: &str, range: &DateTimeRange) -> Option<String> {
     for (member, point) in [
         ("startTime", &range.start_time),
@@ -1901,11 +1933,21 @@ pub fn date_time_range_refusal(path: &str, range: &DateTimeRange) -> Option<Stri
         let start = absolute_instant(&range.start_time.value)?;
         let end = absolute_instant(&range.end_time.value)?;
         if end < start {
-            return Some(format!(
-                "{path}: endTime '{}' is earlier than startTime '{}'; a date/time range \
-                 defines a time period with explicit start and end times",
-                range.end_time.value, range.start_time.value
-            ));
+            let worded = |end: &str, start: &str| {
+                format!(
+                    "{path}: endTime '{end}' is earlier than startTime '{start}'; a date/time \
+                     range defines a time period with explicit start and end times"
+                )
+            };
+            // Two quoted values this time, so each is held to an equal share of the room
+            // the clause leaves — the same rule as the malformed-value refusal above, and
+            // needed for the same reason: either bound may carry a `GenericString` as long
+            // as the message member itself.
+            let share = MAX_MESSAGE_LENGTH.saturating_sub(worded("", "").chars().count()) / 2;
+            return Some(within_message_bound(worded(
+                &elided_within(&range.end_time.value, share),
+                &elided_within(&range.start_time.value, share),
+            )));
         }
     }
     None
