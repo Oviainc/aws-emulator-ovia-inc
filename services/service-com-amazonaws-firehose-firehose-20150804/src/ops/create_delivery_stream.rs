@@ -643,7 +643,7 @@ fn sole_destination(
     supplied
         .pop()
         .map(|(_, kind)| kind)
-        .ok_or_else(|| invalid_argument("a destination configuration must be specified".to_string()))
+        .ok_or_else(|| invalid_argument(crate::service::sole_destination_required_message()))
 }
 
 /// The `SourceDescription` for the declared stream type, refusing a source configuration

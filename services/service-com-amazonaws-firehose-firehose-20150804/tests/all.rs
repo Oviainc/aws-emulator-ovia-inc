@@ -29,6 +29,8 @@ mod delivery_stream_tag_updates;
 mod delivery_stream_tags;
 #[path = "all/description_defaults.rs"]
 mod description_defaults;
+#[path = "all/destination_arity_refusal.rs"]
+mod destination_arity_refusal;
 #[path = "all/destination_bucket_preflight.rs"]
 mod destination_bucket_preflight;
 #[path = "all/destination_bucket_resolution.rs"]
@@ -47,6 +49,8 @@ mod encryption_conflict_messages;
 mod http_endpoint_delivery;
 #[path = "all/kms_key_resolution.rs"]
 mod kms_key_resolution;
+#[path = "all/legacy_s3_destination_mirror.rs"]
+mod legacy_s3_destination_mirror;
 #[path = "all/opensearch_destination_delivery.rs"]
 mod opensearch_destination_delivery;
 #[path = "all/processor_parameters.rs"]

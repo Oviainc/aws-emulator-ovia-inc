@@ -689,6 +689,15 @@ pub fn blocked_delete_message(name: &str, state: &str) -> String {
     )
 }
 
+/// A create that carried NO destination configuration at all.
+///
+/// A Firehose stream is "configured with a single destination", so the refusal states that
+/// arity rule as one fixed sentence. It names no member because the request supplied none
+/// to name: the sentence is the same whichever destination the caller meant to configure.
+pub fn sole_destination_required_message() -> String {
+    "Exactly one destination configuration is supported for a Firehose".to_string()
+}
+
 /// Two or more members that exclude each other were supplied: the members, in the order
 /// the model declares them.
 ///

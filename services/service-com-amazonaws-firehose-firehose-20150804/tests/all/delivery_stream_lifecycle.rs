@@ -732,7 +732,9 @@ async fn every_destination_kind_is_described_from_the_configuration_it_was_creat
             case.stream
         );
         let destination = &described["DeliveryStreamDescription"]["Destinations"][0];
-        let reported: Vec<String> = destination
+        // Compared as a SET: which members the body carries is the rule, and the order a
+        // JSON object renders them in is not part of it.
+        let mut reported: Vec<String> = destination
             .as_object()
             .map(|members| {
                 members
@@ -742,11 +744,20 @@ async fn every_destination_kind_is_described_from_the_configuration_it_was_creat
                     .collect()
             })
             .unwrap_or_default();
+        reported.sort();
+        // Exactly the description matching the supplied configuration — plus, for a
+        // destination whose own destination IS Amazon S3, the deprecated
+        // `S3DestinationDescription` mirror Firehose reports beside the extended spelling
+        // (`tests/all/legacy_s3_destination_mirror.rs` asserts the two agree). No other
+        // kind's description is ever reported.
+        let mut expected = vec![case.description_member.to_string()];
+        if case.description_member == "ExtendedS3DestinationDescription" {
+            expected.push("S3DestinationDescription".to_string());
+        }
+        expected.sort();
         assert_eq!(
-            reported,
-            vec![case.description_member.to_string()],
-            "case {}: exactly the description matching the supplied configuration is \
-             reported, got {destination:?}",
+            reported, expected,
+            "case {}: expected the descriptions {expected:?}, got {destination:?}",
             case.stream
         );
 

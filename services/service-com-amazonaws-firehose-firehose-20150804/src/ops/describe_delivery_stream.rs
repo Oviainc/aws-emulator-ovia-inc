@@ -13,6 +13,11 @@
 //! configuration, or round-tripping a description back into `UpdateDestination`,
 //! then reads an explicit value where AWS reports one.
 //!
+//! A destination whose destination IS Amazon S3 is reported through BOTH spellings the
+//! model gives it: the deprecated `DestinationDescription$S3DestinationDescription` mirror
+//! beside the variant-specific description, both rendered from the same effective
+//! configuration.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -268,7 +273,14 @@ fn logging(options: &Option<CloudWatchLoggingOptions>) -> Option<CloudWatchLoggi
 }
 
 /// Render one stored destination: its assigned id plus the `*DestinationDescription`
-/// matching the configuration variant the create supplied.
+/// matching the configuration variant the create supplied, and — for a destination that is
+/// itself an Amazon S3 destination — the deprecated `S3DestinationDescription` mirror of it
+/// as well.
+///
+/// A destination that merely uses Amazon S3 as its intermediate location (Redshift, Splunk,
+/// a search offering, an HTTP endpoint, Iceberg, Snowflake) reports that location inside
+/// its own description, where the model places it, and carries no top-level mirror: its
+/// destination is not Amazon S3.
 fn destination_description(destination: &crate::state::Destination) -> DestinationDescription {
     use crate::state::DestinationConfigKind as Kind;
 
@@ -281,8 +293,8 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
             s3_destination_description: Some(s3_description(config)),
             ..rendered
         },
-        Kind::ExtendedS3(config) => DestinationDescription {
-            extended_s3_destination_description: Some(ExtendedS3DestinationDescription {
+        Kind::ExtendedS3(config) => {
+            let extended = ExtendedS3DestinationDescription {
                 role_arn: config.role_arn.clone(),
                 bucket_arn: config.bucket_arn.clone(),
                 prefix: config.prefix.clone(),
@@ -310,9 +322,13 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                     .clone(),
                 file_extension: config.file_extension.clone(),
                 custom_time_zone: config.custom_time_zone.clone(),
-            }),
-            ..rendered
-        },
+            };
+            DestinationDescription {
+                s3_destination_description: Some(legacy_s3_mirror(&extended)),
+                extended_s3_destination_description: Some(extended),
+                ..rendered
+            }
+        }
         Kind::Redshift(config) => DestinationDescription {
             redshift_destination_description: Some(RedshiftDestinationDescription {
                 role_arn: config.role_arn.clone(),
@@ -477,6 +493,28 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
             }),
             ..rendered
         },
+    }
+}
+
+/// The deprecated `DestinationDescription$S3DestinationDescription` mirror of an Amazon S3
+/// destination, projected from the description Firehose renders for it.
+///
+/// The member predates `ExtendedS3DestinationDescription` and reports the same destination
+/// under the shape the deprecated spelling models: the subset of members the two
+/// descriptions share, already carrying this destination's EFFECTIVE configuration (the
+/// supplied values with every documented default materialised). A destination that IS an
+/// Amazon S3 destination is reported through both members, so a client reading either one
+/// sees the same bucket, role, buffering, compression, encryption and logging.
+fn legacy_s3_mirror(extended: &ExtendedS3DestinationDescription) -> S3DestinationDescription {
+    S3DestinationDescription {
+        role_arn: extended.role_arn.clone(),
+        bucket_arn: extended.bucket_arn.clone(),
+        prefix: extended.prefix.clone(),
+        error_output_prefix: extended.error_output_prefix.clone(),
+        buffering_hints: extended.buffering_hints.clone(),
+        compression_format: extended.compression_format.clone(),
+        encryption_configuration: extended.encryption_configuration.clone(),
+        cloud_watch_logging_options: extended.cloud_watch_logging_options.clone(),
     }
 }
 
