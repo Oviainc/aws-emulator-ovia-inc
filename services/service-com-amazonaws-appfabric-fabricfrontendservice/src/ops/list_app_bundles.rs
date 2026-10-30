@@ -163,6 +163,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let bundles = store.bundles_in_order();
+        // The instant this page is answered as of: it dates the `nextToken` the
+        // page hands out and decides whether the one the caller brought has
+        // outlived its documented lifetime.
+        let now = ::std::time::SystemTime::now();
         let page = crate::state::page(
             &bundles,
             crate::state::APP_BUNDLE_LISTING,
@@ -170,6 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::AppBundleRecord::to_summary,
             input.max_results,
             input.next_token.as_deref(),
+            now,
         )
         .map_err(ListAppBundlesErrorModeled::ValidationException)?;
 

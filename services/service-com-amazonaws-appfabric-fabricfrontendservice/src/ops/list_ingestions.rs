@@ -179,6 +179,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every summary is read AS OF ONE INSTANT, so a page cannot report two
         // ingestions as of two different clocks: a disable the clock already owes
         // one of them shows in its summary, and this reporting call writes nothing.
+        // The same instant dates the `nextToken` this page hands out and decides
+        // whether the one the caller brought has outlived its documented lifetime.
         let now = ::std::time::SystemTime::now();
         // The token is scoped to THIS bundle's ingestions, so one bundle's token
         // is not read as a position in another's listing.
@@ -190,6 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             |ingestion: &crate::state::IngestionRecord| ingestion.to_summary(now),
             input.max_results,
             input.next_token.as_deref(),
+            now,
         )
         .map_err(ListIngestionsErrorModeled::ValidationException)?;
 

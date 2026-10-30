@@ -59,6 +59,8 @@ mod ingestion_enablement;
 mod nested_resource_arn_region;
 #[path = "all/oauth2_auth_type_predicate.rs"]
 mod oauth2_auth_type_predicate;
+#[path = "all/pagination_token_lifetime.rs"]
+mod pagination_token_lifetime;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/spent_client_token_decision.rs"]

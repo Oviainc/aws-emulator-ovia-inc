@@ -70,6 +70,16 @@ pub const INGESTION_DISABLE_AFTER_DESTINATION_LOSS: Duration = Duration::from_mi
 /// used when a caller names none.
 pub const MAX_PAGE_SIZE: usize = 100;
 
+/// How long a `nextToken` stays usable after the call that issued it.
+///
+/// An AWS-PUBLISHED duration, not a chosen one: the model states it in the
+/// documentation of the `nextToken` member of every paginated operation of this
+/// service — "Each pagination token expires after 24 hours. Using an expired
+/// pagination token will return an HTTP 400 InvalidToken error." A token older
+/// than this is refused by [`decode_page_token`] instead of being read as a
+/// position.
+pub const PAGE_TOKEN_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// The app bundles ONE account may hold in ONE Region.
 ///
 /// AppFabric's published, non-adjustable service quota: an account holds at most
@@ -1466,6 +1476,11 @@ pub struct Page<T> {
 /// `listing` names the listing the token belongs to (see [`encode_page_token`]),
 /// so a token one listing issued is refused by another instead of silently
 /// skipping records.
+///
+/// `now` is the instant the call is answered as of: the token this page hands
+/// out carries it as its issue time, and a token the caller brought is refused
+/// once `now` is more than [`PAGE_TOKEN_LIFETIME`] past the instant IT was
+/// issued.
 pub fn page<R, T>(
     records: &[&R],
     listing: &str,
@@ -1473,9 +1488,10 @@ pub fn page<R, T>(
     item_of: impl Fn(&R) -> T,
     max_results: Option<i32>,
     next_token: Option<&str>,
+    now: SystemTime,
 ) -> Result<Page<T>, ValidationException> {
     let after = match next_token {
-        Some(token) => Some(decode_page_token(listing, token)?),
+        Some(token) => Some(decode_page_token(listing, token, now)?),
         None => None,
     };
     let limit = max_results.map_or(MAX_PAGE_SIZE, |max| {
@@ -1495,37 +1511,93 @@ pub fn page<R, T>(
     let next_token = (remaining.len() > items.len())
         .then(|| items.len().saturating_sub(1))
         .and_then(|last| remaining.get(last))
-        .map(|last| encode_page_token(listing, sequence_of(last)));
+        .map(|last| encode_page_token(listing, sequence_of(last), now));
 
     Ok(Page { items, next_token })
 }
 
 /// The opaque `nextToken` naming the position after `sequence` WITHIN one
 /// listing ([`APP_BUNDLE_LISTING`], or [`ingestion_listing`] for one bundle's
-/// ingestions).
+/// ingestions), as issued at `issued_at`.
 ///
 /// The listing is part of the token because a position is only meaningful inside
 /// the listing that issued it: a token carried across to another listing — or to
 /// another bundle's ingestions — would otherwise be read as a position there and
 /// silently skip records. Decoding checks it, so such a token is refused.
 ///
-/// The rendering is a version prefix, the listing and hex: every character is
-/// URL-unreserved, so the token survives a round trip through a query string
-/// whatever the client's encoder does with it (base64's `+` and `/` do not), and
-/// it is well inside the 1..=2048 the model allows.
-pub fn encode_page_token(listing: &str, sequence: u64) -> String {
-    format!("v1-{listing}-{sequence:016x}")
+/// The ISSUE INSTANT is part of it because the token has a lifetime
+/// ([`PAGE_TOKEN_LIFETIME`]): it is carried so that a later call can tell how old
+/// the token it is handed is, which a token holding only a position cannot.
+///
+/// The rendering is a version prefix, the listing and two fixed-width hex
+/// fields: every character is URL-unreserved, so the token survives a round trip
+/// through a query string whatever the client's encoder does with it (base64's
+/// `+` and `/` do not), and it is well inside the 1..=2048 the model allows.
+pub fn encode_page_token(listing: &str, sequence: u64, issued_at: SystemTime) -> String {
+    let issued_at = epoch_millis(issued_at);
+    format!("v1-{listing}-{sequence:016x}-{issued_at:016x}")
 }
 
 /// The position a `nextToken` names in `listing`, or a `ValidationException`
-/// naming the member when the token is not one this listing issued.
-pub fn decode_page_token(listing: &str, token: &str) -> Result<u64, ValidationException> {
-    token
+/// naming the member when the token is not one this listing issued, or is one it
+/// issued longer than [`PAGE_TOKEN_LIFETIME`] before `now`.
+pub fn decode_page_token(
+    listing: &str,
+    token: &str,
+    now: SystemTime,
+) -> Result<u64, ValidationException> {
+    let not_a_token =
+        || field_validation_failed("nextToken", "nextToken is not a valid pagination token");
+
+    let (sequence, issued_at) = token
         .strip_prefix(&format!("v1-{listing}-"))
-        .and_then(|sequence| u64::from_str_radix(sequence, 16).ok())
-        .ok_or_else(|| {
-            field_validation_failed("nextToken", "nextToken is not a valid pagination token")
-        })
+        .and_then(|fields| fields.split_once('-'))
+        .ok_or_else(not_a_token)?;
+    let sequence = u64::from_str_radix(sequence, 16).map_err(|_| not_a_token())?;
+    let issued_at = u64::from_str_radix(issued_at, 16).map_err(|_| not_a_token())?;
+
+    // A token is expired once the lifetime has fully elapsed since it was
+    // issued. An issue instant no clock could have produced (one that does not
+    // land in the representable range) is not one this service rendered, so such
+    // a token is refused as malformed rather than as expired.
+    let expires_at = ::std::time::UNIX_EPOCH
+        .checked_add(Duration::from_millis(issued_at))
+        .and_then(|issued_at| issued_at.checked_add(PAGE_TOKEN_LIFETIME))
+        .ok_or_else(not_a_token)?;
+    if now > expires_at {
+        return Err(expired_page_token());
+    }
+
+    Ok(sequence)
+}
+
+/// Milliseconds since the Unix epoch, which is how an instant is rendered into
+/// a [`encode_page_token`] token: a whole number of milliseconds is plenty to
+/// date a token whose lifetime is counted in hours.
+fn epoch_millis(at: SystemTime) -> u64 {
+    at.duration_since(::std::time::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_millis())
+        .map(|millis| u64::try_from(millis).unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
+
+/// A modelled `ValidationException` refusing a `nextToken` the service DID issue
+/// but whose documented lifetime has run out.
+///
+/// The service models no separate token error (`ValidationException` is its only
+/// HTTP 400), and the member is at fault by name, so the refusal is a
+/// field-level one naming `nextToken` — distinct in wording from a token this
+/// service never issued, because the caller's remedy differs: a listing restarted
+/// from its first page issues a usable token, while a malformed token stays
+/// malformed however often it is replayed.
+fn expired_page_token() -> ValidationException {
+    field_validation_failed(
+        "nextToken",
+        &format!(
+            "nextToken is expired: each pagination token expires after {} hours",
+            PAGE_TOKEN_LIFETIME.as_secs() / 3600
+        ),
+    )
 }
 
 /// The [`encode_page_token`] listing name of `ListAppBundles`.

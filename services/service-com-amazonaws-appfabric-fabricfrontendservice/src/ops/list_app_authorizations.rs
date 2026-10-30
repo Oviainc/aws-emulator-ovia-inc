@@ -183,6 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token is scoped to THIS bundle's authorizations, so one bundle's
         // token is not read as a position in another's listing.
         let listing = crate::state::app_authorization_listing(&bundle.id);
+        // The instant this page is answered as of: it dates the `nextToken` the
+        // page hands out and decides whether the one the caller brought has
+        // outlived its documented lifetime.
+        let now = ::std::time::SystemTime::now();
         let page = crate::state::page(
             &authorizations,
             &listing,
@@ -190,6 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::AppAuthorizationRecord::to_summary,
             input.max_results,
             input.next_token.as_deref(),
+            now,
         )
         .map_err(ListAppAuthorizationsErrorModeled::ValidationException)?;
 
