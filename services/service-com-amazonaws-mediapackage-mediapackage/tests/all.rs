@@ -79,3 +79,5 @@ mod startover_window_bound;
 mod state_roundtrip;
 #[path = "all/tag_content_judged_before_the_lookup.rs"]
 mod tag_content_judged_before_the_lookup;
+#[path = "all/tag_key_length_is_one_rule.rs"]
+mod tag_key_length_is_one_rule;

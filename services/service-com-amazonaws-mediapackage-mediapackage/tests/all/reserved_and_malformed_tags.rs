@@ -30,17 +30,9 @@ use service_com_amazonaws_mediapackage_mediapackage::state::RESERVED_TAG_KEY_PRE
 
 use crate::channel_lifecycle::{call, create_channel, emulator, error_code};
 use crate::resource_tags::{
-    create_with_tags, described_tags, list_tags, tags_path, urlencode, Kind, PARENT_CHANNEL,
+    create_with_tags, described_tags, list_tags, one_tag, tags_path, untag_query, Kind,
+    PARENT_CHANNEL,
 };
-
-/// A one-entry tag map. Built rather than written with a literal, because every key below
-/// is a value computed from the rule's own constant or from a table row.
-fn one_tag(key: &str, value: &str) -> Value {
-    Value::Object(serde_json::Map::from_iter([(
-        key.to_string(),
-        json!(value),
-    )]))
-}
 
 /// The tag set every resource in the mutation suites below is created with, and which a
 /// refused request must leave untouched.
@@ -178,17 +170,6 @@ fn accepted_tag_cases() -> Vec<(&'static str, String, String)> {
             "vidéo".to_string(),
         ),
     ]
-}
-
-/// `UntagResource`'s request line for `keys`: one `tagKeys=` parameter each, with every
-/// reserved character percent-encoded.
-fn untag_query(arn: &str, keys: &[&str]) -> String {
-    let query = keys
-        .iter()
-        .map(|key| format!("tagKeys={}", urlencode(key)))
-        .collect::<Vec<String>>()
-        .join("&");
-    format!("{}?{query}", tags_path(arn))
 }
 
 /// Assert `error` is this service's 422 refusal keyed by `member`, stating a requirement

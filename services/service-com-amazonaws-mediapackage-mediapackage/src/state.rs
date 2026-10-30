@@ -581,15 +581,19 @@ fn offending_tag_character(text: &str) -> Option<char> {
 
 /// Refuse a tag key a caller may not name — whatever it would do with it.
 ///
-/// Two rules, both AWS's universal tag restrictions rather than a modelled constraint:
-/// the key is built from [`is_tag_character`]'s set, and it does not carry the reserved
-/// [`RESERVED_TAG_KEY_PREFIX`]. Because the reserved prefix is refused on NAMING the key
-/// and not on writing it, `UntagResource` answers the same refusal as a tag map does: a
-/// caller may neither create, nor modify, nor delete such a tag.
+/// THREE rules, all AWS's universal tag restrictions rather than a modelled constraint:
+/// the key is at most [`MAX_TAG_KEY_CHARS`] characters, it is built from
+/// [`is_tag_character`]'s set, and it does not carry the reserved
+/// [`RESERVED_TAG_KEY_PREFIX`]. This is the one place a tag KEY is judged, so every
+/// operation that names one — a create's tag map, `TagResource`'s and `UntagResource`'s
+/// key list — decides the same keys well-formed: a key no write path could ever have
+/// stored is refused by the door that would DELETE it too, and a key carrying the
+/// reserved prefix names a tag a caller may neither create, nor modify, nor delete.
 ///
 /// `member` is the member the wire named, so one request is refused by the member it
 /// actually carried: `tags` for a tag map, `tagKeys` for `UntagResource`'s key list.
 pub fn validate_tag_key(member: &str, key: &str) -> Result<(), ServiceError> {
+    bound_part_chars(member, &format!("key {key:?}"), key, MAX_TAG_KEY_CHARS)?;
     if let Some(character) = offending_tag_character(key) {
         return Err(member_invalid(
             member,
@@ -652,14 +656,16 @@ where
     entries.sort_unstable();
     bound_tag_count(entries.len())?;
     for (key, value) in entries {
-        bound_part_chars("tags", &format!("key {key:?}"), key, MAX_TAG_KEY_CHARS)?;
+        // The key by the whole key rule — length, character set and reserved prefix —
+        // through the one function every door that names a key goes through, then the
+        // value by its own two.
+        validate_tag_key("tags", key)?;
         bound_part_chars(
             "tags",
             &format!("the value of {key:?}"),
             value,
             MAX_TAG_VALUE_CHARS,
         )?;
-        validate_tag_key("tags", key)?;
         validate_tag_value("tags", key, value)?;
     }
     Ok(())

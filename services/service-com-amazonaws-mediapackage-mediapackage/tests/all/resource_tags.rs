@@ -75,6 +75,29 @@ pub(crate) fn urlencode(value: &str) -> String {
         .collect()
 }
 
+/// `UntagResource`'s request line: one `tagKeys=` parameter per key, every reserved
+/// character percent-encoded, as an SDK sends an `@httpQuery` list.
+///
+/// The one copy in this test target, beside the [`tags_path`] and [`urlencode`] it is
+/// built from, so every suite driving `UntagResource` sends the same request line.
+pub(crate) fn untag_query(arn: &str, keys: &[&str]) -> String {
+    let query = keys
+        .iter()
+        .map(|key| format!("tagKeys={}", urlencode(key)))
+        .collect::<Vec<String>>()
+        .join("&");
+    format!("{}?{query}", tags_path(arn))
+}
+
+/// A one-entry tag map. Built rather than written as a literal, because the suites below
+/// key it by a value computed from a table row or from one of the service's constants.
+pub(crate) fn one_tag(key: &str, value: &str) -> Value {
+    Value::Object(serde_json::Map::from_iter([(
+        key.to_string(),
+        json!(value),
+    )]))
+}
+
 /// The two resource types this service tags, each as the create path, the create body a
 /// fresh one needs, the ARN form and the read-back path — so every row of every table
 /// below is asserted on both.
@@ -387,18 +410,8 @@ async fn list_tags_for_resource_reports_what_tag_and_untag_left_behind() {
                 );
             }
             if !removed.is_empty() {
-                let query = removed
-                    .iter()
-                    .map(|key| format!("tagKeys={}", urlencode(key)))
-                    .collect::<Vec<String>>()
-                    .join("&");
-                let (status, body) = call(
-                    &router,
-                    "DELETE",
-                    &format!("{}?{query}", tags_path(&arn)),
-                    None,
-                )
-                .await;
+                let (status, body) =
+                    call(&router, "DELETE", &untag_query(&arn, &removed), None).await;
                 assert_eq!(
                     status, 204,
                     "case {case:?}: UntagResource expected 204, got {status} {body:?}"

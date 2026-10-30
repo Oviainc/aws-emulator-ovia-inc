@@ -40,22 +40,14 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::{call, create_channel, emulator, error_code};
 use crate::resource_tags::{
-    create_with_tags, described_tags, list_tags, tags_path, urlencode, Kind, PARENT_CHANNEL,
+    create_with_tags, described_tags, list_tags, one_tag, tags_path, untag_query, Kind,
+    PARENT_CHANNEL,
 };
 
 /// The tag set every stored fixture below carries, and which a refused request must leave
 /// exactly as it was.
 fn baseline_tags() -> Value {
     json!({ "team": "video", "env": "staging" })
-}
-
-/// A one-entry tag map, built rather than written as a literal because every key below is
-/// computed from a table row or from the service's own constant.
-fn one_tag(key: &str, value: &str) -> Value {
-    Value::Object(serde_json::Map::from_iter([(
-        key.to_string(),
-        json!(value),
-    )]))
 }
 
 /// A tag map of `count` distinct entries, for the rows about how MANY tags a request or a
@@ -152,9 +144,11 @@ fn refused_tag_cases() -> Vec<RefusedTags> {
             one_tag("owners", "ops,sre"),
             vec!["\"owners\"".to_string(), format!("{:?}", ',')],
         ),
-        refused_map(
+        // How long a key may be is something the KEY says, so `UntagResource` carries this
+        // row too: the length bound is part of the one rule every tag door applies to a key.
+        refused_key(
             "a key one character past the published maximum",
-            one_tag(&long_key, "v"),
+            long_key,
             vec![format!("at most {MAX_TAG_KEY_CHARS} characters")],
         ),
         refused_map(
@@ -168,17 +162,6 @@ fn refused_tag_cases() -> Vec<RefusedTags> {
             vec![format!("at most {MAX_TAGS} entries")],
         ),
     ]
-}
-
-/// `UntagResource`'s request line for `keys`: one `tagKeys=` parameter each, every reserved
-/// character percent-encoded.
-fn untag_query(arn: &str, keys: &[&str]) -> String {
-    let query = keys
-        .iter()
-        .map(|key| format!("tagKeys={}", urlencode(key)))
-        .collect::<Vec<String>>()
-        .join("&");
-    format!("{}?{query}", tags_path(arn))
 }
 
 /// Assert `(status, body)` is this service's 422 refusal keyed by `member`, stating a
