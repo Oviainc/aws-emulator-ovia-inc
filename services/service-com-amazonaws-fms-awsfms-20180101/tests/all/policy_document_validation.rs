@@ -169,7 +169,10 @@ const UNKNOWN_RESOURCE_SET_IDS: &[&str] = &[
 ];
 
 /// A policy document: every required `Policy` member, with the scope under test.
-fn policy_document(
+///
+/// `pub(crate)` so a sibling suite in this test target builds a valid document
+/// the same way rather than growing a second copy of it.
+pub(crate) fn policy_document(
     name: &str,
     security_service_type: &str,
     resource_type: &str,
@@ -568,8 +571,27 @@ async fn resource_set_ids_must_name_resource_sets_that_exist() {
     );
 
     // The check reads the live store, not a list captured once: deleting a set
-    // makes its id unacceptable.
-    let deleted = known[2].clone();
+    // makes its id unacceptable. The set deleted here is a FOURTH one, created
+    // after the policies above and so used by none of them: a set a stored
+    // policy uses cannot be deleted at all, which is the other half of the same
+    // referential rule (asserted by the `resource_set_in_use_by_policies`
+    // suite).
+    let (status, body) = call(
+        &router,
+        "PutResourceSet",
+        &json!({
+            "ResourceSet": { "Name": "unused-set", "ResourceTypeList": ["AWS::EC2::VPC"] }
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case deleted-set: PutResourceSet must answer 200, got {status} with {body}"
+    );
+    let deleted = body["ResourceSet"]["Id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case deleted-set: PutResourceSet minted no Id: {body}"))
+        .to_string();
     let (status, body) = call(
         &router,
         "DeleteResourceSet",

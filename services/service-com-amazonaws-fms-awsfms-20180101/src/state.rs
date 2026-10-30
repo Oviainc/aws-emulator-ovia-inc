@@ -2034,6 +2034,70 @@ impl ComAmazonawsFmsAwsfms20180101State {
         ))
     }
 
+    /// The stored policies that USE the resource set `resource_set_id`, in
+    /// `PolicyId` order: the ones whose document names that id among
+    /// `ResourceSetIds`, "the unique identifiers of the resource sets used by
+    /// the policy" (`Policy$ResourceSetIds`).
+    ///
+    /// Read off the stored document rather than from an index maintained beside
+    /// it, so the answer cannot drift from what `GetPolicy` reports.
+    pub fn policies_using_resource_set(&self, resource_set_id: &str) -> Vec<&str> {
+        self.policies
+            .values()
+            .filter(|record| {
+                record
+                    .policy
+                    .resource_set_ids
+                    .as_ref()
+                    .is_some_and(|ids| ids.iter().any(|id| id == resource_set_id))
+            })
+            .map(|record| record.policy_id.as_str())
+            .collect()
+    }
+
+    /// Why the caller may not DELETE the resource set `resource_set_id` while
+    /// stored policies still USE it, or `None` when none does.
+    ///
+    /// A policy's `ResourceSetIds` are "the unique identifiers of the resource
+    /// sets used by the policy", and a write of a policy document is accepted
+    /// only while every id it names resolves to a resource set this
+    /// organisation holds — so a resource set a stored policy names is in use by
+    /// that policy, and removing it would leave behind a stored document the
+    /// service itself would refuse to write. The removal is therefore refused
+    /// while any policy uses the set, and nothing is removed: the caller takes
+    /// the set out of the policies that use it (or deletes those policies)
+    /// first.
+    ///
+    /// `InvalidOperationException` — "the operation failed because … the
+    /// operation wasn't possible" — is the modelled refusal, declared by the
+    /// operation that deletes a resource set, so the refusal needs no unmodelled
+    /// shape. The message states what makes the removal impossible and names the
+    /// set the request asked for and every policy the store holds using it,
+    /// which is what the caller needs to clear the reference and retry.
+    ///
+    /// Judged per CALL from the stored documents, so a set stops being in use
+    /// the moment the last policy naming it is updated or deleted.
+    pub fn resource_set_in_use_refusal(
+        &self,
+        resource_set_id: &str,
+    ) -> Option<InvalidOperationException> {
+        let users = self.policies_using_resource_set(resource_set_id);
+        if users.is_empty() {
+            return None;
+        }
+        let named = if users.len() == 1 {
+            format!("policy {}", users[0])
+        } else {
+            format!("policies {}", users.join(", "))
+        };
+        Some(InvalidOperationException {
+            message: Some(format!(
+                "The resource set {resource_set_id} is in use by Firewall Manager {named} and \
+                 can't be deleted."
+            )),
+        })
+    }
+
     /// The violations recorded against ONE stored policy in ONE member account,
     /// in ascending resource-id order.
     ///

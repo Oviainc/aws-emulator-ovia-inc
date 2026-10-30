@@ -23,6 +23,14 @@ mod third_party_firewall_firewall_policies;
 
 // Declared here too, outside the sorted list below, for the reason stated above:
 // inserting a `mod` into that list collides with every other fms suite landing
+// in the same window, and this suite's name sorts right into the stretch of it
+// the late-sorting suites keep landing in. The suite itself is an ordinary
+// `tests/all/<name>.rs` file.
+#[path = "all/resource_set_in_use_by_policies.rs"]
+mod resource_set_in_use_by_policies;
+
+// Declared here too, outside the sorted list below, for the reason stated above:
+// inserting a `mod` into that list collides with every other fms suite landing
 // in the same window. The suite itself is an ordinary `tests/all/<name>.rs` file.
 #[path = "all/account_page_token_scoping.rs"]
 mod account_page_token_scoping;

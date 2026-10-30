@@ -16,6 +16,13 @@
 //! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::resource_set_mutation_refusal`])
 //! and nothing is removed — "existing protections stay in place".
 //!
+//! A set a stored policy USES is refused for the same modelled reason
+//! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::resource_set_in_use_refusal`]):
+//! `ResourceSetIds` are "the unique identifiers of the resource sets used by the
+//! policy", and a policy document is only ever accepted while every id it names
+//! resolves to a stored set, so removing a set out from under a policy would
+//! leave behind a document this service would refuse to write.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -189,6 +196,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resource_sets
             .get(&input.identifier)
             .and_then(|existing| store.resource_set_mutation_refusal(existing))
+        {
+            return Err(
+                DeleteResourceSetErrorModeled::InvalidOperationException(refusal).into(),
+            );
+        }
+
+        // A resource set a stored policy USES is not the caller's to remove
+        // while the policy uses it: the write side accepts a policy document
+        // only while every id in its `ResourceSetIds` resolves to a stored set,
+        // so the delete is refused on the SAME referential rule rather than
+        // leaving a stored policy naming a set that no longer exists. Decided
+        // before anything is removed, and — like the scope refusal above — only
+        // for an identifier that names a stored set, since an unknown one
+        // reaches the not-found below instead.
+        if let Some(refusal) = store
+            .resource_sets
+            .get(&input.identifier)
+            .and_then(|_| store.resource_set_in_use_refusal(&input.identifier))
         {
             return Err(
                 DeleteResourceSetErrorModeled::InvalidOperationException(refusal).into(),
