@@ -17,6 +17,13 @@
 //! version it already had; deleting the version it IS running on takes the team with it,
 //! the store holding one live version per team.
 //!
+//! A refusal states the status of the VERSION the request named and the statuses THAT
+//! version is deleted in, which are not the same set for the two versions a team holds
+//! ([`RefusedVersion`]): the version a team is running on is deleted once it has never
+//! been activated or is no longer active, while the version the team was asked to approve
+//! is deleted only once it is one the team will never move to. So the status a refusal
+//! reports is never among the statuses the same sentence says the operation would accept.
+//!
 //! A pair that names NOTHING this store holds — an ARN under which no team is stored, or
 //! a `VersionId` other than the stored team's current one — is a success that changes
 //! nothing: the operation is `@idempotent`, so asking for a version that is already gone
@@ -137,6 +144,46 @@ impl From<DeleteInactiveApprovalTeamVersionErrorModeled> for DeleteInactiveAppro
     }
 }
 
+/// Which of the two versions an approval team holds a refusal is about, and therefore
+/// which statuses that refusal names as the ones this operation deletes in.
+///
+/// The two sets differ, so they are read off the version the request resolved to rather
+/// than stated once for the operation: a sentence that named the whole operation's
+/// statuses would tell the caller a status is deletable in the very breath it refuses it.
+#[derive(Clone, Copy)]
+enum RefusedVersion {
+    /// The version the team is RUNNING on. Deleted when it has never been activated (the
+    /// team draft, `PENDING`) or is no longer active (`INACTIVE`).
+    Live,
+    /// The version the team was ASKED TO APPROVE. Deleted once it is a version the team
+    /// will never move to (`INACTIVE`); while the team's answer is outstanding it is
+    /// `PENDING`, and abandoning it is the update session's business, not this one's.
+    Requested,
+}
+
+impl RefusedVersion {
+    /// The statuses this operation deletes this version in, in the order a refusal names
+    /// them.
+    fn deletable(self) -> &'static [crate::state::TeamStatus] {
+        match self {
+            Self::Live => &[
+                crate::state::TeamStatus::Inactive,
+                crate::state::TeamStatus::Pending,
+            ],
+            Self::Requested => &[crate::state::TeamStatus::Inactive],
+        }
+    }
+
+    /// Those statuses as the refusal reads them: `INACTIVE`, or `INACTIVE or PENDING`.
+    fn deletable_statuses(self) -> String {
+        self.deletable()
+            .iter()
+            .map(|status| status.as_wire())
+            .collect::<Vec<_>>()
+            .join(" or ")
+    }
+}
+
 /// The `DeleteInactiveApprovalTeamVersion` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -204,18 +251,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The refusal this operation answers a version it may not delete with: the
-        // version's own status, and what the caller can do about it instead.
-        let conflict = |version_status: &str, remedy: &str| {
+        // version's own status, the statuses THAT version would have been deleted in, and
+        // what the caller can do about it instead.
+        let conflict = |version: RefusedVersion, version_status: &str, remedy: &str| {
             DeleteInactiveApprovalTeamVersionError::Modeled(
                 DeleteInactiveApprovalTeamVersionErrorModeled::ConflictException(
                     ConflictException {
                         message: crate::state::bounded_message(format!(
-                            "Approval team '{}' version '{}' is {version_status} and not {} or \
-                             {}, so it cannot be deleted by {}; {remedy}.",
+                            "Approval team '{}' version '{}' is {version_status} and not {}, so \
+                             it cannot be deleted by {}; {remedy}.",
                             input.arn,
                             input.version_id,
-                            crate::state::TeamStatus::Inactive.as_wire(),
-                            crate::state::TeamStatus::Pending.as_wire(),
+                            version.deletable_statuses(),
                             Self::NAME,
                         )),
                     },
@@ -225,15 +272,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A version the team was asked to approve is the other version it holds. Once it
         // is one the team will never move to (`INACTIVE`) it is this operation's to
-        // delete — the team draft its own documentation names — and the team keeps the
-        // configuration and the version it is running on.
+        // delete, and the team keeps the configuration and the version it is running on;
+        // while the team's answer is outstanding
+        // ([`crate::state::PendingTeamUpdate::is_outstanding`]) it is not. The statuses
+        // that version is deleted in decide the call AND the sentence a refusal states,
+        // so the two cannot disagree.
         if let Some(requested) = team
             .pending_update
             .as_ref()
             .filter(|update| update.version_id == input.version_id)
         {
-            if requested.is_outstanding() {
+            if !RefusedVersion::Requested
+                .deletable()
+                .contains(&requested.status)
+            {
                 return Err(conflict(
+                    RefusedVersion::Requested,
                     requested.status.as_wire(),
                     "a version awaiting the team's approval is abandoned by cancelling its \
                      update session with CancelSession",
@@ -257,23 +311,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // running: that version is not a draft, whatever the team's status reads.
         if awaiting_approval {
             return Err(conflict(
+                RefusedVersion::Live,
                 crate::state::TeamStatus::Active.as_wire(),
                 "an active team's deletion is started with StartActiveApprovalTeamDeletion",
             ));
         }
 
-        match status {
-            // A version that has never been activated (the team draft) or one that is no
-            // longer active is this operation's to delete.
-            crate::state::TeamStatus::Pending | crate::state::TeamStatus::Inactive => {}
-            // An active team — and a team already inside the pending deletion window
-            // that `StartActiveApprovalTeamDeletion` opened — is not deleted here.
-            other => {
-                return Err(conflict(
-                    other.as_wire(),
-                    "an active team's deletion is started with StartActiveApprovalTeamDeletion",
-                ));
-            }
+        // The version the team is RUNNING on is this operation's to delete when it has
+        // never been activated (the team draft) or is no longer active. An active team —
+        // and a team already inside the pending deletion window that
+        // `StartActiveApprovalTeamDeletion` opened — is not deleted here, and is refused
+        // with the statuses this same set names.
+        if !RefusedVersion::Live.deletable().contains(&status) {
+            return Err(conflict(
+                RefusedVersion::Live,
+                status.as_wire(),
+                "an active team's deletion is started with StartActiveApprovalTeamDeletion",
+            ));
         }
 
         // The store holds one version per team, so removing the named version removes

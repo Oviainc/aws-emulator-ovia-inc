@@ -101,7 +101,7 @@ fn make_activation_due(harness: &Harness, team_arn: &str) {
     });
 }
 
-fn with_pending_update(
+pub(crate) fn with_pending_update(
     harness: &Harness,
     team_arn: &str,
     edit: impl FnOnce(&mut state::PendingTeamUpdate),
