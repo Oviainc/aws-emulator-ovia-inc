@@ -377,18 +377,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             // The store is bounded, so a caller looping on this operation cannot grow
-            // this process's memory without end (`crate::state::MAX_SESSIONS`). This
-            // operation declares `ServiceQuotaExceededException` (402), which is the
-            // error for exactly this condition.
-            if state.sessions.len() >= crate::state::MAX_SESSIONS {
+            // this process's memory without end. The predicate and its sentence live once,
+            // beside the bound itself in `crate::state`; this operation declares
+            // `ServiceQuotaExceededException` (402), which is the error for exactly this
+            // condition.
+            if let Some(message) = state.session_ceiling_refusal() {
                 return Err(
                     UpdateApprovalTeamErrorModeled::ServiceQuotaExceededException(
-                        ServiceQuotaExceededException {
-                            message: format!(
-                                "The account has reached its quota of {} approval sessions.",
-                                crate::state::MAX_SESSIONS
-                            ),
-                        },
+                        ServiceQuotaExceededException { message },
                     )
                     .into(),
                 );

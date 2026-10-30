@@ -246,20 +246,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::TeamStatus::Deleting => {}
             crate::state::TeamStatus::Active => {
                 // The store is bounded, so a caller looping on this operation cannot grow
-                // this process's memory without end
-                // (`crate::state::MAX_SESSIONS`). This operation declares no quota error,
-                // so the ceiling is reported with the `ValidationException` (400) it does
-                // declare.
-                if state.sessions.len() >= crate::state::MAX_SESSIONS {
+                // this process's memory without end. The predicate and its sentence live
+                // once, beside the bound itself in `crate::state`; this operation declares
+                // no quota error, so the ceiling is reported with the `ValidationException`
+                // (400) it does declare.
+                if let Some(message) = state.session_ceiling_refusal() {
                     return Err(
                         StartActiveApprovalTeamDeletionErrorModeled::ValidationException(
-                            ValidationException {
-                                message: format!(
-                                    "The account has reached its quota of {} approval \
-                                     sessions.",
-                                    crate::state::MAX_SESSIONS
-                                ),
-                            },
+                            ValidationException { message },
                         )
                         .into(),
                     );

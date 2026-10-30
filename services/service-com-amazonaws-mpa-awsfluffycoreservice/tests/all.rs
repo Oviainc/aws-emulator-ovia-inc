@@ -95,6 +95,8 @@ mod session_cancellation;
 mod session_filter_value_bound;
 #[path = "all/session_listing.rs"]
 mod session_listing;
+#[path = "all/session_store_ceiling.rs"]
+mod session_store_ceiling;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_write_rule_order.rs"]

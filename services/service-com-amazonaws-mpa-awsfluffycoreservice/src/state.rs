@@ -3549,6 +3549,23 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
         })
     }
 
+    /// The sentence a request that would record a further session is refused with once the
+    /// store already holds as many as it will ([`MAX_SESSIONS`]), or `None` while it can
+    /// hold another.
+    ///
+    /// The ONE place the store's session ceiling is decided and worded, so the operations
+    /// that start a session cannot drift apart in the count they compare, the comparison
+    /// they make or the words they refuse with — [`MAX_SESSIONS`]'s own doc owns the reason
+    /// for the bound. Only the ERROR stays per operation, the way the model fixes it: each
+    /// caller lifts this sentence into the error IT declares for a request it cannot
+    /// satisfy, exactly as every create lifts [`tags_past_resource_ceiling`] into its own.
+    #[must_use]
+    pub fn session_ceiling_refusal(&self) -> Option<String> {
+        (self.sessions.len() >= MAX_SESSIONS).then(|| {
+            format!("The account has reached its quota of {MAX_SESSIONS} approval sessions.")
+        })
+    }
+
     /// The next initiation-order sequence number, which is also the id a session's ARN
     /// carries ([`session_arn`]). Never reused.
     pub fn next_session_seq(&mut self) -> u64 {
