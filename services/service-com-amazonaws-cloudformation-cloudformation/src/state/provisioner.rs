@@ -303,7 +303,7 @@
 //!   entry this arm just created is removed before the refusal is reported.
 //!
 //! * the `AWS::ApiGatewayV2::*` types' properties are their creates' own members with the
-//!   initial letter lower-cased, all the way down ([`apigatewayv2_request`],
+//!   initial letter lower-cased, all the way down ([`api_gateway_request`],
 //!   [`apigatewayv2_child_request`]), with the declared tags sent as those calls' tag MAP
 //!   where the type publishes any. The identity of an api, a mapping, an integration, a
 //!   route, a deployment and an authorizer is API Gateway v2's OWN — `Ref` returns the id
@@ -317,6 +317,15 @@
 //!   definition is IMPORTED from it ([`import_apigatewayv2_api`]), which is a different call
 //!   on a different binding; one declared with a definition held in Amazon S3 is refused
 //!   rather than created without it.
+//!
+//! * `AWS::ApiGateway::DomainName`'s properties are the REST control plane's own
+//!   `CreateDomainName` members under the same rule ([`api_gateway_request`]), with its
+//!   `Policy` sent as the TEXT of the document a template declares, since that member is "a
+//!   stringified JSON policy document". Its identity is the domain name the template states
+//!   ("Ref returns the domain name"), so the create is sent that name and the delete and the
+//!   drift read address the domain by it; the endpoint names and the ARN the type publishes
+//!   are read off the create's answer ([`APIGATEWAY_DOMAIN_NAME_ATTRIBUTES`]), because only
+//!   API Gateway assigns them.
 //!
 //! * `AWS::SES::ConfigurationSet`'s one property that reaches a call of this service is
 //!   `TrackingOptions`: a configuration set's own create takes nothing but the name
@@ -443,7 +452,7 @@ use super::provisioning::{
 use super::template::{
     ACMPCA_CERTIFICATE, ACMPCA_CERTIFICATE_AUTHORITY, ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION,
     ACM_ACME_ENDPOINT, ACM_CERTIFICATE, AOSS_COLLECTION,
-    AOSS_SECURITY_POLICY, APIGATEWAYV2_API,
+    AOSS_SECURITY_POLICY, APIGATEWAY_DOMAIN_NAME, APIGATEWAYV2_API,
     APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_AUTHORIZER, APIGATEWAYV2_DEPLOYMENT,
     APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
     APIGATEWAYV2_STAGE, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT, BATCH_COMPUTE_ENVIRONMENT,
@@ -672,6 +681,10 @@ pub(super) enum Provisioner {
     BatchJobQueue,
     BatchServiceEnvironment,
     EksAccessEntry,
+    /// `AWS::ApiGateway::DomainName`: a custom domain name of the REST control plane, which
+    /// `CreateDomainName` creates under the name the template states and
+    /// `DeleteDomainName` removes.
+    ApiGatewayDomainName,
     ApiGatewayV2Api,
     ApiGatewayV2DomainName,
     ApiGatewayV2ApiMapping,
@@ -784,6 +797,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         BATCH_JOB_QUEUE => Some(Provisioner::BatchJobQueue),
         BATCH_SERVICE_ENVIRONMENT => Some(Provisioner::BatchServiceEnvironment),
         EKS_ACCESS_ENTRY => Some(Provisioner::EksAccessEntry),
+        APIGATEWAY_DOMAIN_NAME => Some(Provisioner::ApiGatewayDomainName),
         APIGATEWAYV2_API => Some(Provisioner::ApiGatewayV2Api),
         APIGATEWAYV2_DOMAIN_NAME => Some(Provisioner::ApiGatewayV2DomainName),
         APIGATEWAYV2_API_MAPPING => Some(Provisioner::ApiGatewayV2ApiMapping),
@@ -1080,6 +1094,9 @@ impl Provisioner {
                 create_service_environment(ctx, region, resource, propagated).await
             }
             Self::EksAccessEntry => create_access_entry(ctx, region, resource, propagated).await,
+            Self::ApiGatewayDomainName => {
+                create_apigateway_domain_name(ctx, region, resource, propagated).await
+            }
             Self::ApiGatewayV2Api => {
                 create_apigatewayv2_api(ctx, region, resource, propagated).await
             }
@@ -1229,6 +1246,12 @@ impl Provisioner {
                 | Self::Wafv2RuleGroup
                 | Self::Wafv2IpSet
                 | Self::Wafv2RegexPatternSet
+                // Amazon API Gateway refuses a tag key in the reserved namespace on every
+                // call that takes tags — the `tags` member of each create and `TagResource`
+                // alike, in the one check its own crate's tag validation makes ("The tag
+                // key … must not start with aws:") — so a custom domain name carries the
+                // stack's own tags without the three.
+                | Self::ApiGatewayDomainName
         );
         propagated
             .iter()
@@ -1324,6 +1347,14 @@ impl Provisioner {
             // it `ACTIVE`.
             Self::KinesisStream => {
                 kinesis_stream_readiness(ctx, region, physical_resource_id).await
+            }
+            // "If the status is UPDATING, you cannot update the domain name"
+            // (`DomainName$domainNameStatus`), and an edge-optimized domain is served by a
+            // CloudFront distribution that is not in place when the create answers, so the
+            // resource's creation is finished once API Gateway reports the domain
+            // `AVAILABLE`.
+            Self::ApiGatewayDomainName => {
+                domain_name_readiness(ctx, region, physical_resource_id).await
             }
             _ => Ok(Readiness::Ready),
         }
@@ -1813,6 +1844,9 @@ impl Provisioner {
             // The delete addresses the entry by the PAIR Amazon EKS keys one by, both
             // halves of which are on the resource's own declaration.
             Self::EksAccessEntry => delete_access_entry(ctx, region, resource).await,
+            Self::ApiGatewayDomainName => {
+                delete_apigateway_domain_name(ctx, region, physical_resource_id).await
+            }
             Self::ApiGatewayV2Api => {
                 delete_apigatewayv2_api(ctx, region, physical_resource_id).await
             }
@@ -2121,6 +2155,9 @@ impl Provisioner {
             }
             // Read back by the same cluster-and-principal pair the delete uses.
             Self::EksAccessEntry => describe_access_entry(ctx, region, resource).await,
+            Self::ApiGatewayDomainName => {
+                describe_apigateway_domain_name(ctx, region, physical_resource_id).await
+            }
             Self::ApiGatewayV2Api => {
                 describe_apigatewayv2_api(ctx, region, physical_resource_id).await
             }
@@ -19193,15 +19230,237 @@ fn access_policy_request(resource: &StoredResource, declared: &Value) -> Result<
 }
 
 // ---------------------------------------------------------------------------
+// Amazon API Gateway (REST): AWS::ApiGateway::DomainName
+// ---------------------------------------------------------------------------
+
+/// The URI the REST control plane binds its custom-domain-name collection to, as that
+/// model's `@http` traits declare it: `POST /domainnames` creates one and
+/// `GET|DELETE /domainnames/{domainName}` reads and deletes it. The calls ride on
+/// [`API_GATEWAY_SIGNING_NAME`], the signing name both API Gateway models share.
+const APIGATEWAY_DOMAIN_NAMES_URI: &str = "/domainnames";
+
+/// The property of this type whose value is a POLICY DOCUMENT: "a stringified JSON policy
+/// document" on the wire, while a template declares it as the JSON object it is.
+const APIGATEWAY_DOMAIN_NAME_POLICY: &str = "Policy";
+
+/// The attributes an `AWS::ApiGateway::DomainName` publishes that only API Gateway can
+/// answer, as `(attribute, answered member)`: the CloudFront distribution an
+/// edge-optimized domain is served by and that distribution's region-agnostic Route 53
+/// zone, the host a regional one is served on, and the ARN API Gateway names the custom
+/// domain by.
+///
+/// Each is read off the create's own answer, so what the stack publishes for the resource
+/// is the endpoint that service really assigned — never a host or an ARN computed here,
+/// which is a value a caller could put in a real DNS alias record. `RegionalHostedZoneId`
+/// is not among them for that same reason: it names a Route 53 zone this emulator neither
+/// owns nor can look up.
+const APIGATEWAY_DOMAIN_NAME_ATTRIBUTES: &[(&str, &str)] = &[
+    ("DistributionDomainName", "distributionDomainName"),
+    ("DistributionHostedZoneId", "distributionHostedZoneId"),
+    ("DomainNameArn", "domainNameArn"),
+    ("RegionalDomainName", "regionalDomainName"),
+];
+
+/// The properties of this type API Gateway's own read reports, as `(property, member)`
+/// pairs, which is what drift is judged on.
+///
+/// The SCALAR configuration of the domain name: `Tags` are left out for the reason they
+/// are everywhere here (the tags a resource carries change independently of its
+/// declaration), the two structured properties (`EndpointConfiguration`,
+/// `MutualTlsAuthentication`) are left out because that read spells their members in the
+/// model's own case while a declaration spells them in CloudFormation's, and `Policy` is
+/// left out because the read reports the TEXT of a document a template declares as an
+/// object — a property the read does not report is not evidence of anything
+/// ([`super::drift`]), while one reported in a different SHAPE would be evidence of a
+/// change nobody made.
+const APIGATEWAY_DOMAIN_NAME_REPORTED_PROPERTIES: &[(&str, &str)] = &[
+    ("CertificateArn", "certificateArn"),
+    ("CertificateName", "certificateName"),
+    ("DomainName", "domainName"),
+    (
+        "OwnershipVerificationCertificateArn",
+        "ownershipVerificationCertificateArn",
+    ),
+    ("RegionalCertificateArn", "regionalCertificateArn"),
+    ("RegionalCertificateName", "regionalCertificateName"),
+    ("RoutingMode", "routingMode"),
+    ("SecurityPolicy", "securityPolicy"),
+];
+
+/// Create the custom domain name an `AWS::ApiGateway::DomainName` declares, so a client
+/// that deployed the stack and then calls `apigateway GetDomainName` for the declared name
+/// reads it back — with the configuration the template stated and the `domainNameStatus`
+/// that service reports it under — rather than a `NotFoundException` for a domain nothing
+/// created, and can map a base path of it onto a REST API with a direct
+/// `CreateBasePathMapping`.
+///
+/// The type's properties ARE `CreateDomainName`'s own members under the same names with a
+/// lower-cased initial (`CertificateArn`, `CertificateName`, `EndpointConfiguration` and
+/// its own members, `MutualTlsAuthentication`, `OwnershipVerificationCertificateArn`,
+/// `RegionalCertificateArn`, `RegionalCertificateName`, `RoutingMode`, `SecurityPolicy`),
+/// so the declaration is the request once re-cased ([`api_gateway_request`]), with the tags
+/// CloudFormation gives the resource carried as that create's tag map. "Ref returns the
+/// domain name", which is the name the template stated and the physical id the naming rules
+/// already computed ([`super::template::declared_name_property`]), so nothing replaces it.
+async fn create_apigateway_domain_name(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    // The policy travels as the document's TEXT rather than re-cased member by member like
+    // every other property: the keys inside a policy document are the policy language's own
+    // (`Version`, `Statement`), not member names.
+    let mut request =
+        api_gateway_request(resource, propagated, &[], &[APIGATEWAY_DOMAIN_NAME_POLICY])?;
+    if let Some(members) = request.as_object_mut() {
+        // The name the resource is created under is CloudFormation's to decide: it is this
+        // resource's physical id, which is the declared `DomainName` itself.
+        members.insert(
+            "domainName".to_string(),
+            Value::String(resource.physical_resource_id.clone()),
+        );
+    }
+    let answered = call_rest_json(
+        ctx,
+        API_GATEWAY_SIGNING_NAME,
+        region,
+        "POST",
+        APIGATEWAY_DOMAIN_NAMES_URI,
+        Some(&request),
+    )
+    .await?;
+    let mut attributes = BTreeMap::new();
+    for (attribute, member) in APIGATEWAY_DOMAIN_NAME_ATTRIBUTES {
+        if let Some(value) = answered.get(*member).and_then(Value::as_str) {
+            attributes.insert((*attribute).to_string(), value.to_string());
+        }
+    }
+    Ok(Created::attributes(attributes))
+}
+
+/// Delete the custom domain name a stack created, addressed by the name it was created
+/// under — this resource's physical id, which is what `Ref` returns for the type. One API
+/// Gateway no longer holds (`NotFoundException`, judged on the CODE) is already in the
+/// state the delete asks for.
+async fn delete_apigateway_domain_name(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    api_gateway_deleted(ctx, region, &apigateway_domain_name_uri(physical_resource_id)).await
+}
+
+/// The domain name's configuration as API Gateway reports it, for drift detection:
+/// `GetDomainName`'s own record, under this type's property names. One that service no
+/// longer holds (`NotFoundException`) was deleted.
+async fn describe_apigateway_domain_name(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let uri = apigateway_domain_name_uri(physical_resource_id);
+    match call_rest_json(ctx, API_GATEWAY_SIGNING_NAME, region, "GET", &uri, None).await {
+        Ok(answer) => Ok(Some(reported_as_properties(
+            &answer,
+            APIGATEWAY_DOMAIN_NAME_REPORTED_PROPERTIES,
+        ))),
+        Err(refusal) if refusal.code == API_GATEWAY_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The `DomainNameStatus` a custom domain name is usable in: "AVAILABLE" — the status of
+/// the domain-name migration having finished — out of the `DomainNameStatus` enum that
+/// model declares.
+const DOMAIN_NAME_AVAILABLE: &str = "AVAILABLE";
+
+/// The `DomainNameStatus` values a custom domain name is still COMING UP in: an
+/// edge-optimized domain is `PENDING` until the CloudFront distribution serving it is in
+/// place, `UPDATING` is the status of a migration that is not complete ("If the status is
+/// UPDATING, you cannot update the domain name"), and the two `PENDING_…` values are
+/// waiting on a certificate re-import and on the ownership verification of the domain. Each
+/// is a state the domain leaves on its own, so the resource's creation is held open in it;
+/// `FAILED`, and a domain API Gateway no longer holds, are not.
+const DOMAIN_NAME_COMING_UP: &[&str] = &[
+    "UPDATING",
+    "PENDING",
+    "PENDING_CERTIFICATE_REIMPORT",
+    "PENDING_OWNERSHIP_VERIFICATION",
+];
+
+/// Whether API Gateway has finished bringing up the custom domain name a stack created.
+///
+/// `DomainName$domainNameStatus` is "the status of the DomainName migration" and the member
+/// documents that a domain name in `UPDATING` cannot be updated — an edge-optimized domain
+/// is served by a CloudFront distribution that is not in place when the create answers — so
+/// `AVAILABLE` is the state the resource's creation is finished in, the statuses in
+/// [`DOMAIN_NAME_COMING_UP`] are the ones it is still coming up in, and anything else is a
+/// state no wait brings the domain out of.
+async fn domain_name_readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Readiness, Refusal> {
+    let uri = apigateway_domain_name_uri(physical_resource_id);
+    let answered = match call_rest_json(ctx, API_GATEWAY_SIGNING_NAME, region, "GET", &uri, None)
+        .await
+    {
+        Ok(answered) => answered,
+        Err(refusal) if refusal.code == API_GATEWAY_NOT_FOUND => {
+            return Ok(Readiness::Failed(format!(
+                "API Gateway holds no custom domain name {physical_resource_id}"
+            )))
+        }
+        Err(refusal) => return Err(refusal),
+    };
+    let status = answered
+        .get("domainNameStatus")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if status == DOMAIN_NAME_AVAILABLE {
+        return Ok(Readiness::Ready);
+    }
+    if DOMAIN_NAME_COMING_UP.contains(&status) {
+        return Ok(Readiness::Pending(status.to_string()));
+    }
+    // `domainNameStatusMessage` is "an optional text message containing detailed
+    // information about status of the DomainName migration", which is the detail that
+    // service has about the state it reports; the status speaks for itself otherwise.
+    let detail = answered
+        .get("domainNameStatusMessage")
+        .and_then(Value::as_str);
+    Ok(Readiness::Failed(match detail {
+        Some(detail) => format!(
+            "API Gateway reports custom domain name {physical_resource_id} as {status}: \
+             {detail}"
+        ),
+        None => format!(
+            "API Gateway reports custom domain name {physical_resource_id} as {status}"
+        ),
+    }))
+}
+
+/// The URI that addresses ONE custom domain name: the `@httpLabel` every read and delete of
+/// it binds, which is the name it was created under.
+fn apigateway_domain_name_uri(domain_name: &str) -> String {
+    format!(
+        "{APIGATEWAY_DOMAIN_NAMES_URI}/{}",
+        percent_encoded(domain_name)
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Amazon API Gateway v2: AWS::ApiGatewayV2::Api / ::DomainName / ::ApiMapping
 // ---------------------------------------------------------------------------
 
-/// API Gateway v2's signing name, from its model (`sigv4Name: apigateway`, service shape
-/// `ApiGatewayV2`), which speaks `restJson1` — so its calls ride on [`call_rest_json`],
-/// each on the URI its own operation's `@http` binding declares. Every operation of that
-/// model is bound under `/v2/…`, which is what separates it from the Amazon API Gateway
-/// control plane it shares the signing name with.
-const APIGATEWAYV2_SIGNING_NAME: &str = "apigateway";
+/// API Gateway's signing name, from the models of BOTH its control planes (`sigv4Name:
+/// apigateway`, service shapes `BackplaneControlService` and `ApiGatewayV2`), each of which
+/// speaks `restJson1` — so their calls ride on [`call_rest_json`], each on the URI its own
+/// operation's `@http` binding declares. Every operation of the v2 model is bound under
+/// [`APIGATEWAYV2_URI_PREFIX`], which is what separates the two surfaces that share this
+/// one signing name.
+const API_GATEWAY_SIGNING_NAME: &str = "apigateway";
 
 /// The URIs the API Gateway v2 operations a stack makes are bound to, as that model's
 /// `@http` traits declare them: `POST|PUT /v2/apis`, `DELETE|GET /v2/apis/{ApiId}`,
@@ -19215,9 +19474,9 @@ const APIGATEWAYV2_APIS_URI: &str = "/v2/apis";
 const APIGATEWAYV2_DOMAIN_NAMES_URI: &str = "/v2/domainnames";
 const APIGATEWAYV2_API_MAPPINGS_SEGMENT: &str = "apimappings";
 
-/// The error code API Gateway v2 answers for a resource it does not hold
-/// (`NotFoundException`, the modelled 404 of every read and delete of this model).
-const APIGATEWAYV2_NOT_FOUND: &str = "NotFoundException";
+/// The error code either API Gateway control plane answers for a resource it does not hold
+/// (`NotFoundException`, the modelled 404 of every read and delete of both models).
+const API_GATEWAY_NOT_FOUND: &str = "NotFoundException";
 
 /// The `AWS::ApiGatewayV2::Api` properties that are NOT members of `CreateApi`.
 ///
@@ -19287,10 +19546,10 @@ async fn create_apigatewayv2_api(
     if let Some(definition) = resource.properties.get(APIGATEWAYV2_BODY) {
         return import_apigatewayv2_api(ctx, region, resource, definition).await;
     }
-    let request = apigatewayv2_request(resource, propagated, APIGATEWAYV2_IMPORT_PROPERTIES)?;
+    let request = api_gateway_request(resource, propagated, APIGATEWAYV2_IMPORT_PROPERTIES, &[])?;
     let answered = call_rest_json(
         ctx,
-        APIGATEWAYV2_SIGNING_NAME,
+        API_GATEWAY_SIGNING_NAME,
         region,
         "POST",
         APIGATEWAYV2_APIS_URI,
@@ -19370,7 +19629,7 @@ async fn import_apigatewayv2_api(
     };
     let answered = call_rest_json(
         ctx,
-        APIGATEWAYV2_SIGNING_NAME,
+        API_GATEWAY_SIGNING_NAME,
         region,
         "PUT",
         &uri,
@@ -19408,7 +19667,7 @@ async fn delete_apigatewayv2_api(
         "{APIGATEWAYV2_APIS_URI}/{}",
         percent_encoded(physical_resource_id)
     );
-    apigatewayv2_deleted(ctx, region, &uri).await
+    api_gateway_deleted(ctx, region, &uri).await
 }
 
 /// The api's configuration as API Gateway v2 reports it, for drift detection: `GetApi`'s
@@ -19427,12 +19686,12 @@ async fn describe_apigatewayv2_api(
         "{APIGATEWAYV2_APIS_URI}/{}",
         percent_encoded(physical_resource_id)
     );
-    match call_rest_json(ctx, APIGATEWAYV2_SIGNING_NAME, region, "GET", &uri, None).await {
+    match call_rest_json(ctx, API_GATEWAY_SIGNING_NAME, region, "GET", &uri, None).await {
         Ok(answer) => Ok(Some(reported_as_properties(
             &answer,
             APIGATEWAYV2_API_REPORTED_PROPERTIES,
         ))),
-        Err(refusal) if refusal.code == APIGATEWAYV2_NOT_FOUND => Ok(None),
+        Err(refusal) if refusal.code == API_GATEWAY_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }
 }
@@ -19470,7 +19729,7 @@ async fn create_apigatewayv2_domain_name(
     resource: &StoredResource,
     propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
-    let mut request = apigatewayv2_request(resource, propagated, &[])?;
+    let mut request = api_gateway_request(resource, propagated, &[], &[])?;
     // The name the resource is created under is CloudFormation's to decide: it is this
     // resource's physical id, which is the declared `DomainName` itself.
     if let Some(members) = request.as_object_mut() {
@@ -19481,7 +19740,7 @@ async fn create_apigatewayv2_domain_name(
     }
     let answered = call_rest_json(
         ctx,
-        APIGATEWAYV2_SIGNING_NAME,
+        API_GATEWAY_SIGNING_NAME,
         region,
         "POST",
         APIGATEWAYV2_DOMAIN_NAMES_URI,
@@ -19544,7 +19803,7 @@ async fn delete_apigatewayv2_domain_name(
         "{APIGATEWAYV2_DOMAIN_NAMES_URI}/{}",
         percent_encoded(physical_resource_id)
     );
-    apigatewayv2_deleted(ctx, region, &uri).await
+    api_gateway_deleted(ctx, region, &uri).await
 }
 
 /// The domain name's configuration as API Gateway v2 reports it, for drift detection:
@@ -19558,7 +19817,7 @@ async fn describe_apigatewayv2_domain_name(
         "{APIGATEWAYV2_DOMAIN_NAMES_URI}/{}",
         percent_encoded(physical_resource_id)
     );
-    match call_rest_json(ctx, APIGATEWAYV2_SIGNING_NAME, region, "GET", &uri, None).await {
+    match call_rest_json(ctx, API_GATEWAY_SIGNING_NAME, region, "GET", &uri, None).await {
         Ok(answer) => Ok(Some(reported_as_properties(
             &answer,
             &[
@@ -19567,7 +19826,7 @@ async fn describe_apigatewayv2_domain_name(
                 ("RoutingMode", "routingMode"),
             ],
         ))),
-        Err(refusal) if refusal.code == APIGATEWAYV2_NOT_FOUND => Ok(None),
+        Err(refusal) if refusal.code == API_GATEWAY_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }
 }
@@ -19592,14 +19851,14 @@ async fn create_apigatewayv2_api_mapping(
     resource: &StoredResource,
 ) -> Result<Created, Refusal> {
     let domain_name = required_property(resource, "DomainName")?;
-    let mut request = apigatewayv2_request(resource, &[], &[])?;
+    let mut request = api_gateway_request(resource, &[], &[], &[])?;
     if let Some(members) = request.as_object_mut() {
         // Bound to the create's URI rather than sent as a member of its body.
         members.remove("domainName");
     }
     let answered = call_rest_json(
         ctx,
-        APIGATEWAYV2_SIGNING_NAME,
+        API_GATEWAY_SIGNING_NAME,
         region,
         "POST",
         &apigatewayv2_api_mappings_uri(&domain_name),
@@ -19626,7 +19885,7 @@ async fn delete_apigatewayv2_api_mapping(
     resource: &StoredResource,
 ) -> Result<(), Refusal> {
     let uri = apigatewayv2_api_mapping_uri(resource)?;
-    apigatewayv2_deleted(ctx, region, &uri).await
+    api_gateway_deleted(ctx, region, &uri).await
 }
 
 /// The api mapping's configuration as API Gateway v2 reports it, for drift detection:
@@ -19638,7 +19897,7 @@ async fn describe_apigatewayv2_api_mapping(
     resource: &StoredResource,
 ) -> Result<Option<Value>, Refusal> {
     let uri = apigatewayv2_api_mapping_uri(resource)?;
-    match call_rest_json(ctx, APIGATEWAYV2_SIGNING_NAME, region, "GET", &uri, None).await {
+    match call_rest_json(ctx, API_GATEWAY_SIGNING_NAME, region, "GET", &uri, None).await {
         Ok(answer) => Ok(Some(reported_as_properties(
             &answer,
             &[
@@ -19647,7 +19906,7 @@ async fn describe_apigatewayv2_api_mapping(
                 ("Stage", "stage"),
             ],
         ))),
-        Err(refusal) if refusal.code == APIGATEWAYV2_NOT_FOUND => Ok(None),
+        Err(refusal) if refusal.code == API_GATEWAY_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }
 }
@@ -19896,7 +20155,7 @@ async fn create_apigatewayv2_child(
     let request = apigatewayv2_child_request(resource, propagated, child)?;
     let answered = call_rest_json(
         ctx,
-        APIGATEWAYV2_SIGNING_NAME,
+        API_GATEWAY_SIGNING_NAME,
         region,
         "POST",
         &uri,
@@ -19988,7 +20247,7 @@ async fn delete_apigatewayv2_child(
     child: &ApiGatewayV2Child,
 ) -> Result<(), Refusal> {
     let uri = apigatewayv2_child_uri(resource, child)?;
-    apigatewayv2_deleted(ctx, region, &uri).await
+    api_gateway_deleted(ctx, region, &uri).await
 }
 
 /// The configuration one of these resources has as API Gateway v2 reports it, for drift
@@ -20002,7 +20261,7 @@ async fn describe_apigatewayv2_child(
     child: &ApiGatewayV2Child,
 ) -> Result<Option<Value>, Refusal> {
     let uri = apigatewayv2_child_uri(resource, child)?;
-    match call_rest_json(ctx, APIGATEWAYV2_SIGNING_NAME, region, "GET", &uri, None).await {
+    match call_rest_json(ctx, API_GATEWAY_SIGNING_NAME, region, "GET", &uri, None).await {
         Ok(answer) => {
             let mut reported = Map::new();
             for property in child.reported {
@@ -20012,23 +20271,33 @@ async fn describe_apigatewayv2_child(
             }
             Ok(Some(Value::Object(reported)))
         }
-        Err(refusal) if refusal.code == APIGATEWAYV2_NOT_FOUND => Ok(None),
+        Err(refusal) if refusal.code == API_GATEWAY_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }
 }
 
-/// One declared API Gateway v2 resource as the request that creates it: every property
+/// One declared API Gateway resource as the request that creates it: every property
 /// under the member name that model spells it with — the property with a lower-cased
 /// initial, all the way down ([`lower_camel_members`]) — with the declared tags beside the
 /// ones CloudFormation gives the resource, as the tag MAP these creates take.
 ///
+/// Shared by both API Gateway control planes, whose types are in the same shape: an
+/// `AWS::ApiGatewayV2::*` property and an `AWS::ApiGateway::DomainName` one are alike their
+/// create's own member with a lower-cased initial.
+///
 /// `unmapped` names the properties that are NOT members of this create: one of those is
 /// REFUSED rather than dropped, so a stack never reports a resource configured differently
 /// from its declaration.
-fn apigatewayv2_request(
+///
+/// `documents` names the properties whose member takes the TEXT of a document a template
+/// declares as an object (a resource policy): such a value travels as that text
+/// ([`attribute_text`]) rather than being walked member by member, because the keys inside
+/// it are the declared document's own and not modelled member names.
+fn api_gateway_request(
     resource: &StoredResource,
     propagated: &[(String, String)],
     unmapped: &[&str],
+    documents: &[&str],
 ) -> Result<Value, Refusal> {
     let mut request = Map::new();
     if let Some(properties) = resource.properties.as_object() {
@@ -20045,6 +20314,10 @@ fn apigatewayv2_request(
                         resource.resource_type
                     ),
                 });
+            }
+            if documents.contains(&property.as_str()) {
+                request.insert(lower_initial(property), Value::String(attribute_text(value)));
+                continue;
             }
             request.insert(lower_initial(property), lower_camel_members(value, 0)?);
         }
@@ -20075,18 +20348,20 @@ fn apigatewayv2_answered(
         })
 }
 
-/// One API Gateway v2 delete, on the URI that addresses the resource: a resource that
-/// service no longer holds is already in the state the delete asks for, judged on its
-/// modelled not-found CODE and never on a message, which carries the request's own
-/// identifier.
-async fn apigatewayv2_deleted(
+/// One API Gateway delete, on the URI that addresses the resource: a resource that service
+/// no longer holds is already in the state the delete asks for, judged on its modelled
+/// not-found CODE and never on a message, which carries the request's own identifier.
+///
+/// Shared by both API Gateway control planes: each models the same `NotFoundException` for
+/// a resource it does not hold ([`API_GATEWAY_NOT_FOUND`]).
+async fn api_gateway_deleted(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     uri: &str,
 ) -> Result<(), Refusal> {
-    match call_rest_json(ctx, APIGATEWAYV2_SIGNING_NAME, region, "DELETE", uri, None).await {
+    match call_rest_json(ctx, API_GATEWAY_SIGNING_NAME, region, "DELETE", uri, None).await {
         Ok(_) => Ok(()),
-        Err(refusal) if refusal.code == APIGATEWAYV2_NOT_FOUND => Ok(()),
+        Err(refusal) if refusal.code == API_GATEWAY_NOT_FOUND => Ok(()),
         Err(refusal) => Err(refusal),
     }
 }

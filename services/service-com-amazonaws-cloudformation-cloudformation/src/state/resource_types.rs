@@ -75,7 +75,7 @@
 
 use super::template::{
     DeclaredResource, Template, ACMPCA_CERTIFICATE, ACMPCA_CERTIFICATE_AUTHORITY,
-    ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION,
+    ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION, APIGATEWAY_DOMAIN_NAME,
 };
 
 /// The namespace Amazon Web Services' own resource types live under: a type spelled with
@@ -154,7 +154,7 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::ApiGateway::Deployment",
     "AWS::ApiGateway::DocumentationPart",
     "AWS::ApiGateway::DocumentationVersion",
-    "AWS::ApiGateway::DomainName",
+    APIGATEWAY_DOMAIN_NAME,
     "AWS::ApiGateway::GatewayResponse",
     "AWS::ApiGateway::Method",
     "AWS::ApiGateway::Model",

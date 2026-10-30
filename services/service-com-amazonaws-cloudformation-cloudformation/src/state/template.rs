@@ -2851,10 +2851,11 @@ fn database_port(
 fn declared_name_property(resource_type: &str) -> Option<&'static str> {
     match resource_type {
         "AWS::BedrockAgentCore::Runtime" => Some("AgentRuntimeName"),
-        // API Gateway v2's `CreateDomainName` takes the `DomainName` the resource IS, and
-        // that name is what this type's `Ref` returns — the type's last segment is
-        // `DomainName`, so neither `DomainNameName` nor `Name` finds it.
-        APIGATEWAYV2_DOMAIN_NAME => Some("DomainName"),
+        // API Gateway's `CreateDomainName` takes the `DomainName` the resource IS, on both
+        // of its control planes, and that name is what either type's `Ref` returns — the
+        // type's last segment is `DomainName`, so neither `DomainNameName` nor `Name` finds
+        // it.
+        APIGATEWAY_DOMAIN_NAME | APIGATEWAYV2_DOMAIN_NAME => Some("DomainName"),
         ECR_PUBLIC_REPOSITORY => Some("RepositoryName"),
         // Amazon SES's `CreateReceiptRuleSet` takes a `RuleSetName` — "Ref returns the rule
         // set name" — so the type publishes `RuleSetName`; the type's last segment is
@@ -5260,6 +5261,17 @@ pub const CLOUDFRONT_RESPONSE_HEADERS_POLICY: &str = "AWS::CloudFront::ResponseH
 pub const APIGATEWAY_REST_API: &str = "AWS::ApiGateway::RestApi";
 pub const APIGATEWAY_RESOURCE: &str = "AWS::ApiGateway::Resource";
 pub const APIGATEWAY_DEPLOYMENT: &str = "AWS::ApiGateway::Deployment";
+
+/// `AWS::ApiGateway::DomainName`: a custom domain name of the REST control plane, which a
+/// stack creates in API Gateway itself ([`super::provisioner`]).
+///
+/// "Ref returns the domain name" — the name the template states in its own `DomainName`
+/// property, which is this type's identifier ([`declared_name_property`]) — while every
+/// attribute the type publishes (the CloudFront distribution an edge-optimized domain is
+/// served by, the host a regional one is served on, the ARN API Gateway names the domain
+/// by) is a value only that service assigns, so each is read off the create's answer rather
+/// than computed by the naming rules ([`return_values`] carries no arm for this type).
+pub const APIGATEWAY_DOMAIN_NAME: &str = "AWS::ApiGateway::DomainName";
 
 /// The Amazon API Gateway v2 resource types a stack creates in that service.
 ///
