@@ -1090,6 +1090,25 @@ pub fn one_of(member: &str, values: &[&str], value: Option<&str>) -> Result<(), 
     ))
 }
 
+/// Check a caller-chosen name that IS the identity of the resource it creates,
+/// answering the message that refusal carries: the member and the rule it broke.
+///
+/// A name of this kind is what a later request uses to address the resource —
+/// the key it is stored at, and the path segment the operations that name one
+/// resource carry — so an empty value names no resource at all and nothing can
+/// be stored under it: the request is refused with the operation's own modelled
+/// client error instead of creating something no request can name again.
+///
+/// ONE copy of that rule and of its wording, for the reason [`bounded_length`]
+/// states: every operation that keys a resource by a name the caller supplied is
+/// held to it, so none can drift into its own reading of it.
+pub fn non_empty_identity(member: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{member} must not be empty"));
+    }
+    Ok(())
+}
+
 /// Check a count against the floor the model's `__integerMin1` sets for it,
 /// answering the message that refusal carries: the member and the count that
 /// broke it.

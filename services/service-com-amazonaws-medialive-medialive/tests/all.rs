@@ -164,6 +164,9 @@ mod event_bridge_rule_templates;
 #[path = "all/held_reference_resolution.rs"]
 mod held_reference_resolution;
 
+#[path = "all/identity_name_rule.rs"]
+mod identity_name_rule;
+
 #[path = "all/input_configuration_validation.rs"]
 mod input_configuration_validation;
 

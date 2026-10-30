@@ -616,11 +616,8 @@ impl ChannelSchedule {
         for (index, action) in creates.iter().enumerate() {
             let path = format!("creates/scheduleActions/{index}");
             let name = action.action_name.as_str();
-            if name.is_empty() {
-                problems.push(problem(
-                    &format!("{path}/actionName"),
-                    "actionName must not be empty",
-                ));
+            if let Err(message) = super::non_empty_identity("actionName", name) {
+                problems.push(problem(&format!("{path}/actionName"), &message));
                 continue;
             }
             if minted.contains(name) {

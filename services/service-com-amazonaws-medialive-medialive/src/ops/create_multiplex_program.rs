@@ -9,7 +9,10 @@
 //! the same `@idempotencyToken` `RequestId` to the SAME multiplex's endpoint answers with
 //! the program the first call created; the same token presented for another multiplex is
 //! a different create, because the multiplex is part of the endpoint the token was
-//! presented to.
+//! presented to. The `ProgramName` is the program's identity — the key it is stored
+//! at and the path segment the operations that name one program carry — so a request
+//! supplying an empty one is refused with the modelled 400 rather than storing a
+//! program no later request could name.
 //!
 //! ## Shape of an operation
 //!
@@ -223,14 +226,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// Turn a store refusal into this operation's own modelled error.
 ///
-/// A settings value outside the range or the length the model publishes for it,
-/// and `VideoSettings` defining both of the two alternatives its documentation
-/// makes exclusive, are bad requests, and the message names the member, the rule
-/// and the value the request carried so the caller can fix the request from that
-/// text alone. A name or a program number another program of the same multiplex
-/// already holds is a conflict with the state, as is a multiplex that is going
-/// away. A full multiplex is this emulator's own ceiling — a throttle, not a
-/// fault in the request.
+/// An empty `ProgramName`, a settings value outside the range or the length the
+/// model publishes for it, and `VideoSettings` defining both of the two
+/// alternatives its documentation makes exclusive, are bad requests, and the
+/// message names the member, the rule and the value the request carried so the
+/// caller can fix the request from that text alone. A name or a program number
+/// another program of the same multiplex already holds is a conflict with the
+/// state, as is a multiplex that is going away. A full multiplex is this
+/// emulator's own ceiling — a throttle, not a fault in the request.
 ///
 /// This operation models NO `NotFoundException`
 /// (`smithy_query(query="operation", operation="CreateMultiplexProgram")`), so a
@@ -254,6 +257,15 @@ fn refused(
                 message: Some(format!(
                     "Multiplex {multiplex_id} is {state}; no program can be created in it"
                 )),
+            })
+        }
+        // The name is what identifies a program within its multiplex and the
+        // path segment every operation that names one program carries, so a
+        // request supplying none asks for a program nothing could name again:
+        // the operation's own modelled 400, worded by the one copy of the rule.
+        Refusal::ProgramNameEmpty(message) => {
+            CreateMultiplexProgramErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
             })
         }
         Refusal::ProgramNameInUse => {

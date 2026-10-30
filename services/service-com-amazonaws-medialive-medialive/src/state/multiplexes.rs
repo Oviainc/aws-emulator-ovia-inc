@@ -493,6 +493,11 @@ pub enum MultiplexProgramRefusal {
     /// The multiplex already holds a program with that `ProgramName`, which is
     /// what identifies a program within one multiplex.
     ProgramNameInUse,
+    /// The request carried no `ProgramName` to create the program under — the
+    /// name is what identifies a program within its multiplex, so an empty one
+    /// names no program. Carries the refusal's wording, which is the one copy of
+    /// that rule's ([`super::non_empty_identity`]).
+    ProgramNameEmpty(String),
     /// The multiplex already holds a program with that `ProgramNumber`
     /// ("Unique program number"). Carries the number and the name of the
     /// program already holding it.
@@ -1477,22 +1482,33 @@ impl ComAmazonawsMedialiveMedialiveState {
 
     /// Store a program in the multiplex `multiplex_id`, or refuse.
     ///
-    /// The published ranges and lengths of the nested settings, the documented
-    /// mutual exclusion inside `VideoSettings`, the state the multiplex must be
-    /// in, the uniqueness of `ProgramName` and of `ProgramNumber` within that
-    /// multiplex, the per-multiplex cap and the insert live together here, so a
-    /// handler cannot check one of them and write past another; the handler's
-    /// job is only to turn a [`MultiplexProgramRefusal`] into the operation's
-    /// own modelled error.
+    /// The `ProgramName` the program is identified by, the published ranges and
+    /// lengths of the nested settings, the documented mutual exclusion inside
+    /// `VideoSettings`, the state the multiplex must be in, the uniqueness of
+    /// `ProgramName` and of `ProgramNumber` within that multiplex, the
+    /// per-multiplex cap and the insert live together here, so a handler cannot
+    /// check one of them and write past another; the handler's job is only to
+    /// turn a [`MultiplexProgramRefusal`] into the operation's own modelled
+    /// error.
     ///
-    /// The request is validated before it is resolved: a settings value the
-    /// real service refuses is refused whatever multiplex the request names.
+    /// The request is validated before it is resolved: a `ProgramName` or a
+    /// settings value the real service refuses is refused whatever multiplex the
+    /// request names.
+    ///
+    /// `program_name` is both the key the program is stored at and the path
+    /// segment `DescribeMultiplexProgram`, `UpdateMultiplexProgram` and
+    /// `DeleteMultiplexProgram` carry, so an empty one is refused here rather
+    /// than stored: it would take a program slot and a PID block of the
+    /// multiplex that no later request could name again.
     pub fn insert_multiplex_program(
         &mut self,
         multiplex_id: &str,
         program_name: String,
         multiplex_program_settings: MultiplexProgramSettings,
     ) -> Result<(), MultiplexProgramRefusal> {
+        if let Err(message) = super::non_empty_identity("programName", &program_name) {
+            return Err(MultiplexProgramRefusal::ProgramNameEmpty(message));
+        }
         if let Some(refusal) = program_settings_refusal(&multiplex_program_settings) {
             return Err(MultiplexProgramRefusal::Settings(refusal));
         }
