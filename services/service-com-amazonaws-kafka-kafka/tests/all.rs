@@ -79,6 +79,8 @@ mod replicator_lifecycle;
 mod replicator_listing;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/scram_secret_cluster_state.rs"]
+mod scram_secret_cluster_state;
 #[path = "all/scram_secrets.rs"]
 mod scram_secrets;
 #[path = "all/security_update.rs"]

@@ -246,6 +246,15 @@ pub const CLUSTER_STATE_UPDATING: &str = "UPDATING";
 /// The `ClusterState` of a cluster whose provisioning or repair did not succeed.
 pub const CLUSTER_STATE_FAILED: &str = "FAILED";
 
+/// The `ClusterState` of a cluster the service is repairing a broker of.
+pub const CLUSTER_STATE_HEALING: &str = "HEALING";
+
+/// The `ClusterState` of a cluster the service is applying maintenance to.
+pub const CLUSTER_STATE_MAINTENANCE: &str = "MAINTENANCE";
+
+/// The `ClusterState` of a cluster whose brokers are being rebooted.
+pub const CLUSTER_STATE_REBOOTING_BROKER: &str = "REBOOTING_BROKER";
+
 /// The `ClusterState` values a cluster delete is accepted from.
 ///
 /// These are the two values of the model's `ClusterState` enum
@@ -1547,15 +1556,74 @@ pub const MAX_CLUSTER_POLICY_BYTES: usize = 256 * 1024;
 /// time. Sized well above any realistic client script.
 pub const MAX_SCRAM_SECRETS_PER_CLUSTER: usize = 1_000;
 
-/// The message Amazon MSK answers a secret association against a cluster whose
-/// client authentication does not turn SASL/SCRAM on.
+/// The message Amazon MSK answers a SCRAM-secret operation against a cluster
+/// whose client authentication does not turn SASL/SCRAM on.
 ///
 /// A cluster holds SCRAM secrets only to authenticate SASL/SCRAM clients with,
 /// so the condition is about the cluster's configuration and nothing else about
-/// the request; the parameter at fault is reported through
+/// the request: the whole sentence is fixed text, with no cluster ARN, secret
+/// ARN or other request value in it. The parameter at fault is reported through
 /// `BadRequestException$InvalidParameter`.
 pub const SASL_SCRAM_NOT_ENABLED_MESSAGE: &str =
-    "The cluster does not have SASL/SCRAM authentication enabled.";
+    "SASL/SCRAM client authentication must be enabled for the cluster.";
+
+/// The `ClusterState` values a SCRAM-secret operation acts on a cluster's secret
+/// set from.
+///
+/// A cluster's SCRAM secrets are credentials its BROKERS authenticate clients
+/// with, so an operation that reaches that set is served only from a state in
+/// which the cluster has brokers that are not being taken away from it: every
+/// value of the model's `ClusterState` enum (`crate::ops::types::CLUSTER_STATE_VALUES`)
+/// except the one in which the cluster has no brokers yet (`CREATING`) and the
+/// ones in which it is losing or has lost them (`DELETING`, `FAILED`). Spelled
+/// in the order the refusal sentence lists them, which is the order
+/// [`invalid_cluster_state_for_scram_message`] builds it from.
+pub const CLUSTER_STATES_SCRAM_SECRETS_ARE_SERVED_FROM: [&str; 5] = [
+    CLUSTER_STATE_ACTIVE,
+    CLUSTER_STATE_UPDATING,
+    CLUSTER_STATE_MAINTENANCE,
+    CLUSTER_STATE_HEALING,
+    CLUSTER_STATE_REBOOTING_BROKER,
+];
+
+/// Whether a cluster reported in `state` serves a SCRAM-secret operation, per
+/// [`CLUSTER_STATES_SCRAM_SECRETS_ARE_SERVED_FROM`]. One predicate, so every
+/// operation that reaches a cluster's secret set decides it the same way.
+pub fn scram_secrets_served_from_cluster_state(state: &str) -> bool {
+    CLUSTER_STATES_SCRAM_SECRETS_ARE_SERVED_FROM.contains(&state)
+}
+
+/// What a SCRAM-secret operation DOES to the secret set, as the state refusal's
+/// sentence names it: the association's verb phrase, and the listing's.
+pub const SCRAM_SECRET_ACTION_ASSOCIATE: &str = "associate secrets";
+/// See [`SCRAM_SECRET_ACTION_ASSOCIATE`].
+pub const SCRAM_SECRET_ACTION_LIST: &str = "list secrets";
+
+/// The message a SCRAM-secret operation named by `action` (one of
+/// [`SCRAM_SECRET_ACTION_ASSOCIATE`], [`SCRAM_SECRET_ACTION_LIST`]) is refused
+/// with on a cluster whose state does not serve it.
+///
+/// Fixed text: the states come from
+/// [`CLUSTER_STATES_SCRAM_SECRETS_ARE_SERVED_FROM`] and the verb phrase from the
+/// operation, so nothing of the request — not the cluster ARN, not a secret ARN,
+/// not the cluster's own state — is interpolated. Built here rather than written
+/// out per operation, so the sentence and the set it names cannot drift apart.
+pub fn invalid_cluster_state_for_scram_message(action: &str) -> String {
+    format!(
+        "Invalid cluster state. Cluster must be in the {} state to {action}.",
+        comma_or_list(&CLUSTER_STATES_SCRAM_SECRETS_ARE_SERVED_FROM)
+    )
+}
+
+/// `values` as English lists them in a sentence: separated by commas, with `or`
+/// before the last.
+fn comma_or_list(values: &[&str]) -> String {
+    match values.split_last() {
+        None => String::new(),
+        Some((last, [])) => (*last).to_string(),
+        Some((last, rest)) => format!("{}, or {last}", rest.join(", ")),
+    }
+}
 
 /// Why a batch of SASL/SCRAM secrets was not associated with a cluster. Decided
 /// on the one association path ([`Cluster::associate_scram_secrets`]) rather

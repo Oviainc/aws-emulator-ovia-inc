@@ -13,7 +13,13 @@
 //! The request-level refusals are the association's: a `ClusterArn` that is not
 //! an MSK cluster ARN and a `SecretArnList` entry that is not a Secrets Manager
 //! secret ARN are `BadRequestException`, and a well-formed cluster ARN this
-//! endpoint's region holds no cluster for is `NotFoundException`.
+//! endpoint's region holds no cluster for is `NotFoundException`. A cluster
+//! whose client authentication does not turn SASL/SCRAM on holds no secret set
+//! to remove from, so it is refused with
+//! [`crate::state::SASL_SCRAM_NOT_ENABLED_MESSAGE`] — and, unlike the
+//! association and the listing, that test is what this operation answers on
+//! WHATEVER state the cluster is in, because withdrawing a credential is not
+//! something the cluster has to be serving for.
 //! `UnprocessedScramSecrets` is therefore empty on every accepted call.
 //!
 //! ## Shape of an operation
@@ -224,6 +230,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // A cluster authenticates SASL/SCRAM clients only where its client
+        // authentication says so, so a cluster that does not has no secret set
+        // to take anything off — the same test, and the same sentence, the
+        // association is refused with. Answered in every cluster state, which is
+        // where this operation differs from the association and the listing: a
+        // credential is withdrawn from the configuration, not from brokers that
+        // have to be serving.
+        if !cluster.sasl_scram_enabled() {
+            return Err(
+                BatchDisassociateScramSecretErrorModeled::BadRequestException(
+                    BadRequestException {
+                        invalid_parameter: Some("ClusterArn".to_string()),
+                        message: Some(crate::state::SASL_SCRAM_NOT_ENABLED_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
 
         // Removal goes through the record's own path, which drops exactly the
         // secrets the cluster holds and leaves the rest of the set alone.

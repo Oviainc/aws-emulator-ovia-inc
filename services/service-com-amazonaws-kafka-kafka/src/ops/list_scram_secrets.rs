@@ -7,6 +7,12 @@
 //! has not taken off again. REPORTING ONLY: the single write it makes is the
 //! one the settling lookup owes the cluster itself.
 //!
+//! The set is reported only from a cluster state that HAS it
+//! ([`crate::state::CLUSTER_STATES_SCRAM_SECRETS_ARE_SERVED_FROM`]): a cluster
+//! outside those states is refused on its state
+//! ([`crate::state::invalid_cluster_state_for_scram_message`]) rather than
+//! answered with a page.
+//!
 //! The stored set is ordered, so the listing walks one total order: a page stops
 //! at a secret and the token it mints resumes after that secret, which is why a
 //! secret associated or disassociated between pages shifts nothing already
@@ -251,6 +257,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // A cluster's SCRAM secrets are credentials its brokers authenticate
+        // clients with, so the cluster's state is what decides whether that set
+        // can be reported at all: a cluster that has no brokers yet, or is
+        // losing them, has no secret set to list and is refused on its state.
+        if !crate::state::scram_secrets_served_from_cluster_state(&cluster.state) {
+            return Err(
+                ListScramSecretsErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::invalid_cluster_state_for_scram_message(
+                        crate::state::SCRAM_SECRET_ACTION_LIST,
+                    )),
+                })
+                .into(),
+            );
+        }
 
         // Absent `MaxResults` pages at the largest size the model allows, and no
         // request may ask for a longer page than that range permits.

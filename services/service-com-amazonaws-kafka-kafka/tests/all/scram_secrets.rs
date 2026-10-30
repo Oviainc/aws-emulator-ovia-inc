@@ -29,7 +29,9 @@ use service_com_amazonaws_kafka_kafka::state::{
 
 // The router harness, the signing region, the account id and the URI encoder
 // every suite of this crate shares, so this one adds only its own rule.
-use super::kafka_harness::{pct, ClusterRequest, Emulator, Reply, ACCOUNT, REGION};
+use super::kafka_harness::{
+    pct, sleep_past_activation, ClusterRequest, Emulator, Reply, ACCOUNT, REGION,
+};
 
 /// The resource URI of one cluster's SCRAM secrets: the model binds all three
 /// operations to `/v1/clusters/{ClusterArn}/scram-secrets`, with the ARN
@@ -298,14 +300,18 @@ fn values_that_are_not_secret_arns() -> Vec<&'static str> {
     ]
 }
 
-/// A cluster that authenticates SASL/SCRAM clients, so it may hold secrets.
+/// A cluster that authenticates SASL/SCRAM clients, SETTLED past the emulator's
+/// `CREATING` -> `ACTIVE` span, so it may hold secrets: a cluster's secret set is
+/// only served from a state that has the brokers holding it.
 async fn scram_cluster(emulator: &Emulator, name: &str) -> String {
-    emulator
+    let arn = emulator
         .create_ok(&ClusterRequest {
             sasl_scram: Some(true),
             ..ClusterRequest::named(name)
         })
-        .await
+        .await;
+    sleep_past_activation();
+    arn
 }
 
 /// RULE: an association stores exactly the secrets it named, and the listing
@@ -532,6 +538,10 @@ async fn a_cluster_that_does_not_authenticate_sasl_scram_holds_no_secrets() {
             .create_serverless_ok("scram-off-serverless", &[vec!["subnet-a", "subnet-b"]], Some(true))
             .await,
     ));
+    // The rule under test is about the client authentication, so every row is
+    // settled first: a cluster still being provisioned would be refused on its
+    // STATE instead, which is the subject of its own suite below.
+    sleep_past_activation();
 
     for (case, cluster) in clusters {
         let reply = associate(&emulator, &cluster, &secrets).await;
@@ -592,6 +602,7 @@ async fn a_cluster_arn_this_endpoint_cannot_resolve_is_refused() {
             },
         )
         .await;
+    sleep_past_activation();
     for (case, arn) in [
         (
             "never-minted",

@@ -17,6 +17,11 @@
 //! ARN this endpoint's region holds no cluster for is `NotFoundException`, and a
 //! cluster whose client authentication does not turn SASL/SCRAM on has nothing
 //! to authenticate with those secrets ([`crate::state::SASL_SCRAM_NOT_ENABLED_MESSAGE`]).
+//! Before that last one, the cluster's STATE is what decides whether its secret
+//! set can be acted on at all: a cluster outside
+//! [`crate::state::CLUSTER_STATES_SCRAM_SECRETS_ARE_SERVED_FROM`] is refused on
+//! its state ([`crate::state::invalid_cluster_state_for_scram_message`]),
+//! whatever its client authentication says.
 //! `UnprocessedScramSecrets` is therefore empty on every accepted call: each
 //! secret of a batch this handler admits is associated. The real service also
 //! reports a PER-SECRET failure there, with a 200, for a secret only AWS
@@ -240,6 +245,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // A cluster's SCRAM secrets are credentials its brokers authenticate
+        // clients with, so the state is what decides whether this cluster can be
+        // acted on at all — and it decides BEFORE the cluster's client
+        // authentication is looked at, so a cluster that is still being
+        // provisioned is refused on its state rather than on a configuration the
+        // caller could not yet have corrected.
+        if !crate::state::scram_secrets_served_from_cluster_state(&cluster.state) {
+            return Err(
+                BatchAssociateScramSecretErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::invalid_cluster_state_for_scram_message(
+                        crate::state::SCRAM_SECRET_ACTION_ASSOCIATE,
+                    )),
+                })
+                .into(),
+            );
+        }
 
         // A cluster authenticates SASL/SCRAM clients only where its client
         // authentication says so, so a cluster that does not (a serverless one
