@@ -27,6 +27,10 @@ mod query_results;
 #[path = "all/component_model_property_inheritance.rs"]
 mod component_model_property_inheritance;
 
+// Declared HERE, beside the suite above, for the reason that note gives.
+#[path = "all/component_model_definition_reach.rs"]
+mod component_model_definition_reach;
+
 // `pagination_token_binding` is declared HERE, beside the suite above, for the
 // reason the note above gives: the sorted list and the END of this file are both
 // where every concurrent iotsitewise change puts a declaration of its own. Fold it
