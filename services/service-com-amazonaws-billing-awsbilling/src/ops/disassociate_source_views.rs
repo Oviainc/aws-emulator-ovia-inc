@@ -145,6 +145,37 @@ fn not_found(arn: &str) -> DisassociateSourceViewsError {
     .into()
 }
 
+/// The modeled `ValidationException` (HTTP 400) for an `arn` that names a
+/// billing view this account holds but which is not `CUSTOM`.
+/// The sentence is this operation's own and is entirely FIXED for the error
+/// class: it interpolates no ARN, name, account or source view from the request,
+/// because the refusal is about the KIND of view rather than about any value the
+/// caller sent. The lifecycle writers (`UpdateBillingView`, `DeleteBillingView`)
+/// word their own non-custom-view refusal differently
+/// (`state::not_a_custom_view`), so that helper is not reused here.
+///
+/// `reason`/`fieldList` still report `arn` as the member the decision was made
+/// from, as every other field-level `ValidationException` of this service does.
+fn not_a_custom_view() -> DisassociateSourceViewsError {
+    DisassociateSourceViewsErrorModeled::ValidationException(ValidationException {
+        message: NOT_A_CUSTOM_VIEW_MESSAGE.to_string(),
+        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: ARN_MEMBER.to_string(),
+            message: NOT_A_CUSTOM_VIEW_MESSAGE.to_string(),
+        }]),
+    })
+    .into()
+}
+
+/// The message this operation answers when the view the request named is not a
+/// `CUSTOM` billing view: fixed text for this refusal.
+const NOT_A_CUSTOM_VIEW_MESSAGE: &str =
+    "Only custom billing views can have source views disassociated";
+
+/// The input member a non-`CUSTOM` view refusal reports in its `fieldList`.
+const ARN_MEMBER: &str = "arn";
+
 impl<Eng> DisassociateSourceViews<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -201,15 +232,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Only a `CUSTOM` view has a source-view association the customer owns:
         // every other `BillingViewType` names a view the service maintains, so
-        // its composition is not a caller's to change (`BillingView::is_managed`,
-        // and the same refusal `UpdateBillingView` and `DeleteBillingView`
-        // answer through `state::not_a_custom_view`).
+        // its composition is not a caller's to change (`BillingView::is_managed`).
+        // The refusal is this operation's own sentence — see
+        // [`not_a_custom_view`] — not the lifecycle writers' wording.
         let now = ::std::time::SystemTime::now();
         let Some(view) = state.custom_view_mut(&input.arn) else {
-            return Err(DisassociateSourceViewsErrorModeled::ValidationException(
-                crate::state::not_a_custom_view(&input.arn, "disassociated from their source views"),
-            )
-            .into());
+            return Err(not_a_custom_view());
         };
 
         // `BillingViewHealthStatusException`: "a billing view's health status

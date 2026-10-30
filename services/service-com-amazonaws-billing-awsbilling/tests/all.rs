@@ -23,6 +23,8 @@ mod credit_allocation_history;
 mod credits;
 #[path = "all/refusal_and_projection_fidelity.rs"]
 mod refusal_and_projection_fidelity;
+#[path = "all/refusal_message_text.rs"]
+mod refusal_message_text;
 #[path = "all/rejection_fidelity.rs"]
 mod rejection_fidelity;
 #[path = "all/source_view_disassociation.rs"]

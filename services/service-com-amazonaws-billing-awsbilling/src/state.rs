@@ -1022,19 +1022,43 @@ pub fn caller_identity_arn<Eng: Send + Sync + 'static>(
         .arn
 }
 
+/// The suffix the billing-preference surface's BACKEND operation token carries
+/// on top of the public operation name.
+///
+/// The bracketed `[Operation = …]` segment of this refusal reports the token of
+/// the backend operation that made the decision, not the public API name the
+/// caller invoked: the preference surface's backend operations are the public
+/// names with this suffix appended (`GetBillingPreferences` is served by
+/// `GetBillingPreferencesPaperwork`). It is a property of the surface, not of
+/// any one run.
+const PREFERENCES_BACKEND_SUFFIX: &str = "Paperwork";
+
+/// The backend operation token the per-feature billing-access refusal names for
+/// the public billing-preference operation `operation` — see
+/// [`PREFERENCES_BACKEND_SUFFIX`]. Stated once, so both preference handlers
+/// report the token their own backend operation carries.
+pub fn preferences_backend_operation(operation: &str) -> String {
+    format!("{operation}{PREFERENCES_BACKEND_SUFFIX}")
+}
+
 /// The `AccessDeniedException` payload for a `BillingFeature` this account's
 /// caller has no access to.
 ///
 /// Built from the account, the operation and the feature the request named —
 /// the three things the decision was made from — so a client can tell "this
 /// feature is not accessible to this caller" from "this feature is accessible
-/// and has no preferences stored".
+/// and has no preferences stored". `operation` is the PUBLIC name of the
+/// preference operation the request called; the segment reports the backend
+/// token that name resolves to ([`preferences_backend_operation`]), which is the
+/// only discriminator this error carries, since the model gives it no member
+/// besides `message`.
 pub fn feature_access_denied(operation: &str, feature: &str) -> AccessDeniedException {
     AccessDeniedException {
         message: format!(
-            "[Exception=AccessDeniedException][AccountId = {}][Operation = {operation}]\
+            "[Exception=AccessDeniedException][AccountId = {}][Operation = {}]\
              [Message=No access to feature {feature}]",
-            caller_account_id()
+            caller_account_id(),
+            preferences_backend_operation(operation)
         ),
     }
 }
@@ -1056,6 +1080,10 @@ pub fn invalid_billing_view_arn(arn: &str) -> String {
 /// `action` is the past participle of what the refused request would have done
 /// to the view (`"edited"`, `"deleted"`), so the sentence names the action the
 /// caller asked for rather than a fixed one.
+///
+/// This two-sentence wording belongs to the view-lifecycle writers that share
+/// it; an operation whose own refusal text differs builds its own message
+/// beside its handler rather than parameterising this one.
 pub fn not_a_custom_view(arn: &str, action: &str) -> ValidationException {
     ValidationException {
         message: format!(

@@ -30,7 +30,7 @@ use crate::rejection_fidelity::message;
 
 /// Every `BillingFeature` the model declares. Source:
 /// `smithy_query(query="shape", shape="com.amazonaws.billing#BillingFeature")`.
-const ALL_FEATURES: &[&str] = &[
+pub(crate) const ALL_FEATURES: &[&str] = &[
     "BILLING_ALERTS",
     "CREDIT_LEVEL_SHARING",
     "CREDIT_PREFERENCE_OPTIONS",
@@ -49,14 +49,14 @@ const HISTORY_FEATURES: &[&str] = &["CREDIT_SHARING_HISTORY", "RI_SHARING_HISTOR
 
 /// A preference key that is legal for every feature under test except
 /// `CREDIT_PREFERENCE_OPTIONS`, whose keys must name one credit.
-const PLAIN_KEY: &str = "sharing";
+pub(crate) const PLAIN_KEY: &str = "sharing";
 
 /// The key `CREDIT_PREFERENCE_OPTIONS` takes, in the documented
 /// `credit/{creditId}/{option}` form.
-const CREDIT_KEY: &str = "credit/CR-ACCESS-1/status";
+pub(crate) const CREDIT_KEY: &str = "credit/CR-ACCESS-1/status";
 
 /// The key an update of `feature` carries.
-fn key_for(feature: &str) -> &'static str {
+pub(crate) fn key_for(feature: &str) -> &'static str {
     if feature == "CREDIT_PREFERENCE_OPTIONS" {
         CREDIT_KEY
     } else {
@@ -65,12 +65,12 @@ fn key_for(feature: &str) -> &'static str {
 }
 
 /// `GetBillingPreferences` for one feature.
-fn get_body(feature: &str) -> Value {
+pub(crate) fn get_body(feature: &str) -> Value {
     json!({ "features": [feature] })
 }
 
 /// `UpdateBillingPreferences` for one feature, setting that feature's key.
-fn update_body(feature: &str) -> Value {
+pub(crate) fn update_body(feature: &str) -> Value {
     json!({
         "feature": feature,
         "billingPreferencesPerKey": [{ "key": key_for(feature), "value": "ENABLED" }],
@@ -78,7 +78,7 @@ fn update_body(feature: &str) -> Value {
 }
 
 /// Grant or withdraw one feature's access on the engine the router serves from.
-fn set_access(engine: &Arc<engine::InMemoryEngine>, feature: &str, granted: bool) {
+pub(crate) fn set_access(engine: &Arc<engine::InMemoryEngine>, feature: &str, granted: bool) {
     let state = engine.state::<ComAmazonawsBillingAwsbillingState>();
     let mut state = state.lock();
     if granted {
