@@ -405,6 +405,23 @@ pub fn table_deleting_rejection(keyspace_name: &str, table_name: &str) -> String
     )
 }
 
+/// The refusal a restore whose SOURCE table is not settled carries: a table is restorable
+/// only from [`TABLE_STATUS_ACTIVE`], and the status the caller is waiting on is in the
+/// message, worded as the rejections above word a status that blocks a request.
+///
+/// ONE wording, so the check a restore makes before it reads the source table and the one
+/// it makes again under the guard that creates the restored table refuse alike.
+pub fn table_not_restorable_rejection(
+    keyspace_name: &str,
+    table_name: &str,
+    status: &str,
+) -> String {
+    format!(
+        "Table '{keyspace_name}.{table_name}' is in status {status} and cannot be restored \
+         until it is {TABLE_STATUS_ACTIVE}."
+    )
+}
+
 /// Whether `status` is one whose own change is still in flight: the resource is neither
 /// settled nor on its way out, so the clock still owes it a transition.
 ///

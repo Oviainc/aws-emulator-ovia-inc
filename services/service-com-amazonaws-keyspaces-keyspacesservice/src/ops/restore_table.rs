@@ -15,7 +15,9 @@
 //! * the source table's CURRENT settings decide the capacity mode, auto scaling,
 //!   encryption, point-in-time recovery and tags ("these settings are always restored
 //!   based on the table's settings as of the current time"), each overridable by this
-//!   request's matching `*Override` member;
+//!   request's matching `*Override` member — and the current auto scaling settings of a
+//!   table are the ones Application Auto Scaling holds for its two capacities, which
+//!   [`crate::state::reported_auto_scaling`] reads, since that is where they live;
 //! * `restoreTimestamp` has to lie inside the source table's restorable window
 //!   (`earliestRestorableTimestamp` to the current time), so a table point-in-time
 //!   recovery is not enabled on has no window and cannot be restored at all.
@@ -356,12 +358,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // answers for a source in the same state.
         if source.status != crate::state::TABLE_STATUS_ACTIVE {
             return Err(RestoreTableErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Table '{}.{}' is in status {} and cannot be restored until it is {}.",
-                    input.source_keyspace_name,
-                    input.source_table_name,
-                    source.status,
-                    crate::state::TABLE_STATUS_ACTIVE
+                message: Some(crate::state::table_not_restorable_rejection(
+                    &input.source_keyspace_name,
+                    &input.source_table_name,
+                    &source.status,
                 )),
             })
             .into());
@@ -407,25 +407,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let point_in_time_recovery = input
             .point_in_time_recovery_override
             .or_else(|| source.point_in_time_recovery.clone());
-        // Auto scaling is "the optional auto scaling settings for the restored table in
-        // provisioned capacity mode", so it belongs to the mode the RESTORED table lands in:
-        // a supplied specification is checked against that mode (and refused when it is not
-        // provisioned), and the source table's own is carried over only while it still
-        // applies.
+        // The capacity mode the restored table lands in, which is what the request's own
+        // settings and the ones carried over from the source table are resolved against.
         let effective_capacity = capacity_specification.clone().unwrap_or(CapacitySpecification {
             throughput_mode: crate::state::DEFAULT_THROUGHPUT_MODE.to_string(),
             read_capacity_units: None,
             write_capacity_units: None,
         });
-        let auto_scaling_specification = match input.auto_scaling_specification {
-            Some(supplied) => {
-                crate::state::resolve_auto_scaling(Some(supplied), &effective_capacity)
-                    .map_err(invalid)?
-            }
-            None => source.auto_scaling_specification.clone().filter(|_| {
-                effective_capacity.throughput_mode == crate::state::PROVISIONED_THROUGHPUT_MODE
-            }),
-        };
         // "The optional Region specific settings of a multi-Regional table" the source
         // table holds now. Which of them the restored table keeps depends on the TARGET
         // keyspace's replication group, resolved once that keyspace is known.
@@ -435,6 +423,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stand.
         let tags = tags_override.unwrap_or_else(|| source.tags.clone());
 
+        // Everything this restore reads out of the source table has been read, so this
+        // service's lock is released before the source table's auto scaling settings are:
+        // those live in Application Auto Scaling, and no request holds two service stores
+        // at once.
+        drop(store);
+
+        // Auto scaling is "the optional auto scaling settings for the restored table in
+        // provisioned capacity mode", so it belongs to the mode the RESTORED table lands in:
+        // a supplied specification is checked against that mode (and refused when it is not
+        // provisioned), and the source table's own is carried over only while it still
+        // applies.
+        //
+        // The source table's own are the ones it has "as of the current time", and a
+        // table's auto scaling settings ARE its Application Auto Scaling scalable targets
+        // and the target-tracking policies that steer them: so they are read from that
+        // store, whichever service wrote them there, and not from the specification this
+        // service last recorded for the table — which says nothing about a capacity
+        // re-tuned or deregistered through Application Auto Scaling since. That is the
+        // same read `GetTableAutoScalingSettings` answers for a table
+        // (`crate::state::reported_auto_scaling`), so both operations report one table's
+        // settings alike.
+        let auto_scaling_specification = match input.auto_scaling_specification {
+            Some(supplied) => {
+                crate::state::resolve_auto_scaling(Some(supplied), &effective_capacity)
+                    .map_err(invalid)?
+            }
+            None => crate::state::reported_auto_scaling(
+                &*self.engine,
+                &region,
+                &source.keyspace_name,
+                &source.table_name,
+                source.auto_scaling_specification.as_ref(),
+            )
+            .filter(|_| {
+                effective_capacity.throughput_mode == crate::state::PROVISIONED_THROUGHPUT_MODE
+            }),
+        };
+
+        // The guard the restored table is created under. Everything the restore is still
+        // free to refuse is decided here, on the store as it stands at the instant of that
+        // write rather than on anything read before the lock was released above — including
+        // the SOURCE table, re-resolved below, since a source another request has deleted
+        // or moved out of `ACTIVE` meanwhile is no longer one a restore may be built from.
+        let mut store = state.lock();
+        let source_status = store.keyspace(&region, &source.keyspace_name).and_then(|keyspace| {
+            keyspace
+                .tables
+                .get(&source.table_name)
+                .map(|table| table.status.clone())
+        });
+        match source_status {
+            None => {
+                return Err(RestoreTableErrorModeled::ResourceNotFoundException(
+                    crate::state::table_not_found(
+                        &region,
+                        &source.keyspace_name,
+                        &source.table_name,
+                    ),
+                )
+                .into())
+            }
+            Some(status) if status != crate::state::TABLE_STATUS_ACTIVE => {
+                return Err(RestoreTableErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::table_not_restorable_rejection(
+                        &source.keyspace_name,
+                        &source.table_name,
+                        &status,
+                    )),
+                })
+                .into())
+            }
+            Some(_) => {}
+        }
         // "Any number of users can execute up to 4 concurrent restores (any type of
         // restore) in a given account": past that the account is out of the quota this
         // operation models, until one of the restores in flight finishes. Counted here,

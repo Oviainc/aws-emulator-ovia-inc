@@ -935,7 +935,11 @@ async fn settings_registered_through_application_auto_scaling_are_reported_by_ke
 /// the table (recorded Amazon Keyspaces behaviour — the Smithy model constrains
 /// `ScalingPolicy$PolicyName` only as a required 1..256 `^\p{Print}+$` string and says
 /// nothing about who mints it: `smithy_query(query="shape", shape="PolicyName")`).
-fn expected_policy_name(keyspace: &str, table: &str) -> String {
+///
+/// Shared with the other suites of this test binary that address the policy of a table
+/// (`tests/all/restore_table_auto_scaling_as_of_now.rs`), so the naming rule lives in ONE
+/// place on the test side too.
+pub(crate) fn expected_policy_name(keyspace: &str, table: &str) -> String {
     format!("{keyspace}-{table}-scaling-policy")
 }
 

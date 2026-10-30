@@ -77,6 +77,8 @@ mod reserved_tag_key_stage;
 mod resource_tagging;
 #[path = "all/restore_table.rs"]
 mod restore_table;
+#[path = "all/restore_table_auto_scaling_as_of_now.rs"]
+mod restore_table_auto_scaling_as_of_now;
 #[path = "all/restore_table_restoring_status.rs"]
 mod restore_table_restoring_status;
 #[path = "all/service_managed_catalog.rs"]
