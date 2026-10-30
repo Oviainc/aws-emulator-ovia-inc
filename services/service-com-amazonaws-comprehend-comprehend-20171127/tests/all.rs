@@ -19,6 +19,8 @@ mod analysis_job_runs;
 mod batch_detect_entities;
 #[path = "all/batch_inference.rs"]
 mod batch_inference;
+#[path = "all/batch_inference_calibration.rs"]
+mod batch_inference_calibration;
 #[path = "all/batch_sentiment.rs"]
 mod batch_sentiment;
 #[path = "all/batch_syntax.rs"]
@@ -45,6 +47,8 @@ mod scratch_dump;
 mod key_phrases;
 #[path = "all/key_phrases_jobs.rs"]
 mod key_phrases_jobs;
+#[path = "all/noun_phrase_key_phrases.rs"]
+mod noun_phrase_key_phrases;
 #[path = "all/phone_number_forms.rs"]
 mod phone_number_forms;
 #[path = "all/pii_detection.rs"]
@@ -75,3 +79,9 @@ mod syntax;
 mod targeted_sentiment;
 #[path = "all/toxic_content.rs"]
 mod toxic_content;
+// Declared beside the suites it backs rather than under `b`: `zz_scratch` holds the
+// documents written from scratch for the four `BatchDetect*` analysers and the
+// whole-document baseline they must keep answering, which
+// `batch_inference_calibration` and `noun_phrase_key_phrases` assert the rules of.
+#[path = "all/zz_scratch.rs"]
+mod zz_scratch;

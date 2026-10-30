@@ -253,11 +253,7 @@ fn candidates(words: &[Word], stopwords: &HashSet<String>) -> Vec<Candidate> {
 /// One list per language the `LanguageCode` enum names, from the `stop-words` crate's
 /// ISO lists rather than a list written out here. A language the crate carries no
 /// list for leaves the set empty, which makes punctuation the only phrase delimiter.
-///
-/// Public beside [`key_phrases`] itself, because `BatchDetectKeyPhrases` extracts the
-/// phrases of its own documents with the SAME delimiters: one language's stop words
-/// cannot depend on whether the document travelled through a job or a batch call.
-pub fn stopwords(language_code: &str) -> HashSet<String> {
+fn stopwords(language_code: &str) -> HashSet<String> {
     let language = match language_code {
         "ar" => ::stop_words::LANGUAGE::Arabic,
         "de" => ::stop_words::LANGUAGE::German,
@@ -279,7 +275,132 @@ pub fn stopwords(language_code: &str) -> HashSet<String> {
         .collect()
 }
 
-/// The key phrases of `text`, in document order.
+/// The analyser one request's `LanguageCode` is read with.
+///
+/// What a key phrase IS, from this operation's own documentation: the service "detects
+/// the key noun phrases found in the text" and reports, for each one, "the text of the
+/// key phrase, where the key phrase begins and ends". A reported phrase is therefore a
+/// NOUN PHRASE of the document — its determiner and modifiers through its head noun —
+/// spanning the characters that phrase really occupies, which is what a client
+/// highlighting the span in its own copy of the document marks.
+///
+/// Chunking a noun phrase needs each word's part of speech, which this service has a
+/// lexicon for in the languages `crate::ops::detect_syntax::TAGGABLE_LANGUAGES` names.
+/// For every other value of the modelled `LanguageCode` enum there is no
+/// part-of-speech analysis to chunk over, so a document in one of them is read by the
+/// salience extraction below, which needs only the language's stop-word list: it
+/// reports the runs of content words the document holds rather than claiming a
+/// noun-phrase analysis this emulator cannot perform for that language.
+///
+/// Built ONCE per request by [`KeyPhraseAnalyser::for_language`]: one `LanguageCode`
+/// covers every document of a batch ("All documents must be in the same language")
+/// and every document of a job's run, so neither rebuilds it per document.
+#[derive(Debug)]
+pub enum KeyPhraseAnalyser {
+    /// A language the part-of-speech tagger reads: the phrases are the document's own
+    /// noun phrases, as `crate::ops::detect_syntax` analyses it.
+    NounPhrases,
+    /// Every other language: the runs of content words between the language's stop
+    /// words and its punctuation.
+    ContentRuns(HashSet<String>),
+}
+
+impl KeyPhraseAnalyser {
+    /// The analyser for `language_code`.
+    pub fn for_language(language_code: &str) -> Self {
+        if crate::ops::detect_syntax::TAGGABLE_LANGUAGES.contains(&language_code) {
+            Self::NounPhrases
+        } else {
+            Self::ContentRuns(stopwords(language_code))
+        }
+    }
+
+    /// The key phrases of `text`, in document order.
+    ///
+    /// A document the analyser finds no phrase in gets an EMPTY list rather than an
+    /// invented phrase, and a document holding more phrases than one answer may carry
+    /// keeps its highest-scoring ones, back in document order: a key-phrase list reads
+    /// with the document.
+    pub fn key_phrases(&self, text: &str) -> Vec<KeyPhrase> {
+        let mut phrases = match self {
+            Self::NounPhrases => noun_phrases(text),
+            Self::ContentRuns(stopwords) => content_runs(text, stopwords),
+        };
+        if phrases.len() > MAX_KEY_PHRASES_PER_DOCUMENT {
+            phrases.sort_by(|left, right| {
+                right
+                    .score
+                    .unwrap_or_default()
+                    .total_cmp(&left.score.unwrap_or_default())
+            });
+            phrases.truncate(MAX_KEY_PHRASES_PER_DOCUMENT);
+            phrases.sort_by_key(|phrase| phrase.begin_offset.unwrap_or_default());
+        }
+        phrases
+    }
+}
+
+/// The noun phrases of `text`, in document order.
+///
+/// A phrase is a maximal run of the words a noun phrase is built from — a determiner,
+/// the modifiers after it and the nouns of a compound
+/// (`detect_syntax::NOUN_PHRASE_MODIFIER_TAGS`) — cut off after the last word in the
+/// run that can HEAD one (`detect_syntax::NOUN_PHRASE_HEAD_TAGS`). So the determiner
+/// is part of the phrase and part of its span, the offsets cover the whole phrase, and
+/// a run with no head at all — a bare figure, a determiner on its own, an adjective in
+/// a predicate — is no key phrase rather than a one-word phrase invented from it.
+///
+/// `Score` is the confidence of that analysis: the joint confidence of the tags that
+/// formed the phrase, which is each token's own `PartOfSpeech.Score` multiplied
+/// together. A phrase every word of which the tagger reads unambiguously comes back
+/// near 1; one resting on a reading the context had to resolve comes back lower, by
+/// exactly the share that reading left behind. Nothing here is invented: both the
+/// phrase and its confidence come from the analysis of the submitted document.
+fn noun_phrases(text: &str) -> Vec<KeyPhrase> {
+    let tokens = crate::ops::detect_syntax::analyse(text);
+    let mut phrases: Vec<KeyPhrase> = Vec::new();
+    // The first token of the run being read, and the last one in it that can head a
+    // noun phrase.
+    let mut first: Option<usize> = None;
+    let mut head: Option<usize> = None;
+    for (position, token) in tokens.iter().enumerate() {
+        let tag = token.tag();
+        if crate::ops::detect_syntax::NOUN_PHRASE_MODIFIER_TAGS.contains(&tag) {
+            first = first.or(Some(position));
+            if crate::ops::detect_syntax::NOUN_PHRASE_HEAD_TAGS.contains(&tag) {
+                head = Some(position);
+            }
+            continue;
+        }
+        push_noun_phrase(text, &tokens, first.take(), head.take(), &mut phrases);
+    }
+    push_noun_phrase(text, &tokens, first, head, &mut phrases);
+    phrases
+}
+
+/// Report the noun phrase a run of tokens holds, when it holds one.
+fn push_noun_phrase(
+    text: &str,
+    tokens: &[crate::ops::detect_syntax::AnalysedToken<'_>],
+    first: Option<usize>,
+    head: Option<usize>,
+    phrases: &mut Vec<KeyPhrase>,
+) {
+    let (Some(first), Some(head)) = (first, head) else {
+        return;
+    };
+    let span = &tokens[first..=head];
+    let confidence: f32 = span.iter().map(|token| token.score()).product();
+    phrases.push(KeyPhrase {
+        score: Some(confidence),
+        text: Some(text[tokens[first].byte_begin..tokens[head].byte_end].to_string()),
+        begin_offset: Some(tokens[first].begin as i32),
+        end_offset: Some(tokens[head].end as i32),
+    });
+}
+
+/// The content-word runs of `text`, in document order, for a language the
+/// part-of-speech tagger has no lexicon for.
 ///
 /// Extraction is RAKE (Rose et al., "Automatic keyword extraction from individual
 /// documents"), computed over the document's own spans so each phrase reports the
@@ -287,14 +408,15 @@ pub fn stopwords(language_code: &str) -> HashSet<String> {
 /// between stop words and punctuation, each word scores its degree over its
 /// frequency across the candidates, and a phrase scores the sum of its words'.
 ///
-/// `stopwords` is the language's set, built ONCE per run by [`stopwords`] and handed
-/// in, so a job of many documents does not rebuild it per document.
+/// `stopwords` is the language's set, built ONCE per request by
+/// [`KeyPhraseAnalyser::for_language`] and handed in, so a job of many documents does
+/// not rebuild it per document.
 ///
 /// `Score` is that phrase score relative to the document's highest — a computed,
 /// document-relative weight in `(0, 1]`, so the phrase the document is most about
 /// scores 1.0. Nothing here is invented: a document with no content word produces no
 /// key phrase at all.
-pub fn key_phrases(text: &str, stopwords: &HashSet<String>) -> Vec<KeyPhrase> {
+fn content_runs(text: &str, stopwords: &HashSet<String>) -> Vec<KeyPhrase> {
     let words = words(text);
     let candidates = candidates(&words, stopwords);
 
@@ -340,14 +462,6 @@ pub fn key_phrases(text: &str, stopwords: &HashSet<String>) -> Vec<KeyPhrase> {
         ));
     }
 
-    // The document's highest-scoring phrases, when it holds more than one entry can
-    // report, and then back into document order: a key-phrase list reads with the
-    // document.
-    if scored.len() > MAX_KEY_PHRASES_PER_DOCUMENT {
-        scored.sort_by(|(left, _), (right, _)| right.total_cmp(left));
-        scored.truncate(MAX_KEY_PHRASES_PER_DOCUMENT);
-    }
-    scored.sort_by_key(|(_, phrase)| phrase.begin_offset.unwrap_or_default());
     scored
         .into_iter()
         .map(|(score, mut phrase)| {
@@ -359,8 +473,9 @@ pub fn key_phrases(text: &str, stopwords: &HashSet<String>) -> Vec<KeyPhrase> {
 
 /// The output line for one analysed document: the file it came from, its line for a
 /// `ONE_DOC_PER_LINE` input, and the key phrases the extractor found in it.
-fn output_entry(document: &Document<'_>, stopwords: &HashSet<String>) -> ::serde_json::Value {
-    let phrases: Vec<::serde_json::Value> = key_phrases(document.text, stopwords)
+fn output_entry(document: &Document<'_>, analyser: &KeyPhraseAnalyser) -> ::serde_json::Value {
+    let phrases: Vec<::serde_json::Value> = analyser
+        .key_phrases(document.text)
         .into_iter()
         .map(|phrase| {
             ::serde_json::json!({
@@ -577,8 +692,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // handler never getting to report it — is recorded against the record by the
         // recorder's `Drop`.
         let mut recorder = RunOutcomeRecorder::new(state.clone(), FAMILY, job_id.clone());
-        // The language's stop-word set, built ONCE for the whole run.
-        let stopwords = stopwords(&input.language_code);
+        // The analyser for the run's language, built ONCE for the whole run.
+        let analyser = KeyPhraseAnalyser::for_language(&input.language_code);
         let outcome = run_analysis_job(
             ctx,
             &region,
@@ -586,7 +701,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &job_id,
             &input.input_data_config,
             &input.output_data_config,
-            |document| output_entry(document, &stopwords),
+            |document| output_entry(document, &analyser),
         )
         .await;
         // The outcome is RECORDED, not revealed: the clock owes the terminal status

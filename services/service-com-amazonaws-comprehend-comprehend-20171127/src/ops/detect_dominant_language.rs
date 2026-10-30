@@ -6,12 +6,14 @@
 //! identification engine, restricted to the languages Comprehend's `LanguageCode`
 //! enum names, so the answer is that engine's own identification of the
 //! submitted text — never a value matched out of the request. The engine reports a
-//! confidence for EVERY language it was built with, and that ranked distribution is
-//! what the modelled `Languages` list carries: the dominant language first, the
-//! runner-up candidates after it in descending order of score. The engine's values
-//! are a RELATIVE metric, so they are calibrated into the confidence the modelled
-//! member describes by [`SCORE_CONTRAST_EXPONENT`] — monotonically, so the engine's
-//! ranking is reported untouched.
+//! confidence for EVERY language it was built with, and the candidates it places
+//! material confidence in are what the modelled `Languages` list carries: the
+//! dominant language first, the runner-up candidates after it in descending order of
+//! score. A hypothesis the engine scored more than [`CANDIDATE_RELATIVE_FLOOR`] below
+//! the dominant language is not a language it detected, so it is not reported, and
+//! every reported confidence is the engine's own less the mass
+//! [`UNMODELLED_LANGUAGE_MASS`] keeps for a language outside the engine's set — so no
+//! identification comes back certain.
 //!
 //! ## Shape of an operation
 //!
@@ -183,40 +185,79 @@ fn detector() -> &'static LanguageDetector {
 /// clear about read as ambiguous.
 ///
 /// What this is: each candidate's relative value raised to this exponent, then
-/// renormalised over the candidates the engine placed. The transform is strictly
+/// renormalised over every candidate the engine placed. The transform is strictly
 /// monotone, so it changes NO ranking — the dominant language, the runner-up order
 /// and the set of candidates are exactly the engine's — and it introduces no number
 /// of its own: every score is still a function of the engine's values over the
-/// submitted text. It concentrates mass on the leading candidate in proportion to
-/// the margin the engine gave it, so a document the engine ranks one language first
-/// by a clear margin comes back decisive (past the 0.5 threshold a client gates on)
-/// while a genuinely ambiguous document — two candidates the engine scored equally —
-/// stays ambiguous, which is the honest answer for it.
+/// submitted text.
 ///
-/// The value is the ONE calibration constant of this projection, and it is an
-/// integer exponent rather than a fitted curve: 4 is where documents of the class
-/// the modelled member describes — one language predominating, shorter material in
-/// others — clear the decision threshold with a margin instead of sitting on it (at
-/// 2 and 3 the same documents land within a few hundredths of it). It is applied
-/// identically to every candidate of every document, so no request can select it.
-const SCORE_CONTRAST_EXPONENT: i32 = 4;
+/// The value is the ONE contrast constant of this projection, applied identically to
+/// every candidate of every document, so no request can select it. It is 2 because
+/// that is where both halves of a confidence hold: a document with one predominating
+/// language clears the decision threshold a caller gates on, while the score still
+/// FOLLOWS the margin the engine gave it, so two documents the engine is differently
+/// sure about are reported differently. Higher exponents lose the second half — by 4,
+/// the engine's margin is squeezed past the float width and every clear document comes
+/// back carrying the same rounded confidence, which tells a caller nothing.
+const SCORE_CONTRAST_EXPONENT: i32 = 2;
+
+/// The confidence the reported distribution keeps for a language outside the set the
+/// identification engine was built with.
+///
+/// The engine's per-language values sum to 1 over [`DETECTABLE_LANGUAGES`] alone, so
+/// they are a distribution CONDITIONAL on the document being written in one of those
+/// languages — a document in a language Comprehend's `LanguageCode` enum does not
+/// name, or in the traditional-script Chinese the engine cannot tell apart, still has
+/// its whole mass spread over them. An identification is therefore never certain, and
+/// this is the mass the response withholds from the candidates to say so: every
+/// reported `Score` is the engine's own confidence scaled by `1 - ` this value, which
+/// is strictly monotone and so changes no ranking, and which keeps the dominant
+/// language's confidence strictly below 1 however clear the document is.
+const UNMODELLED_LANGUAGE_MASS: f64 = 1e-3;
+
+/// How far below the dominant language a candidate may be scored and still be
+/// reported as a runner-up.
+///
+/// The engine scores EVERY language it was built with, so a document written plainly
+/// in one of them still comes back with ten runner-ups carrying the rounding of a
+/// rejected hypothesis. The modelled `Languages` member describes an "array of
+/// languages that Amazon Comprehend detected in the input text", each with "the level
+/// of confidence that Amazon Comprehend has in the accuracy of its inference": a
+/// hypothesis the engine has all but rejected is not a language it detected, and a
+/// caller reading `Languages[1]` as the second-best candidate must not be handed one.
+///
+/// The bound is RELATIVE to the leading candidate rather than an absolute confidence,
+/// so it says the same thing about a long document the engine is sure about and a
+/// two-word one it is not: a candidate the engine prefers the dominant language over
+/// by more than an order of magnitude is a rejected hypothesis, while a document the
+/// engine cannot decide between two or more languages keeps every one of them, since
+/// they sit within an order of magnitude of each other.
+const CANDIDATE_RELATIVE_FLOOR: f64 = 0.1;
 
 /// The engine's answer for `text`, as the modelled `DominantLanguage` list: every
-/// language the engine gives a non-zero confidence, each carrying that confidence
-/// calibrated by [`SCORE_CONTRAST_EXPONENT`] as its `Score`, "sorted in descending
-/// order of the score (the dominant language is always the first element in the
-/// array)" as the modelled `Languages` member documents. Nothing here is invented:
-/// the engine computes one confidence per language it was built with over the
-/// submitted text, and this projects them.
+/// language the engine places material confidence in, each carrying that confidence
+/// as its `Score`, "sorted in descending order of the score (the dominant language is
+/// always the first element in the array)" as the modelled `Languages` member
+/// documents. Nothing here is invented: the engine computes one confidence per
+/// language it was built with over the submitted text, and this reports them.
+///
+/// Three things the projection does, and nothing else. Every candidate's relative
+/// value is raised to [`SCORE_CONTRAST_EXPONENT`] and renormalised over the set, so
+/// the score is a confidence rather than a relative rank; a candidate scored more
+/// than [`CANDIDATE_RELATIVE_FLOOR`] below the dominant one is DROPPED rather than
+/// reported as a runner-up the engine did not detect; and every reported confidence
+/// is scaled by the mass [`UNMODELLED_LANGUAGE_MASS`] withholds for a language
+/// outside the engine's set. All three are strictly monotone over the engine's
+/// values, so the dominant language and the order of the runner-ups are exactly the
+/// engine's; the scores stay a distribution, summing to at most 1, and the dominant
+/// language's score stays strictly below 1.
 ///
 /// Equal confidences are ordered by language code, so the list is a total order and
 /// two identical requests return byte-identical arrays.
 ///
-/// A language the engine gives no confidence at all is NOT reported: a zero is the
-/// engine saying the document carries none of that language, and an entry with a
-/// zero score would claim a candidate it rejected. A document the engine can place
-/// nowhere — one carrying no letters at all — therefore gets an EMPTY list, which is
-/// why the modelled `Languages` member is optional in the first place.
+/// A document the engine can place nowhere — one carrying no letters at all — gets an
+/// EMPTY list, which is why the modelled `Languages` member is optional in the first
+/// place.
 ///
 /// `pub(crate)` because every other caller identifies a document with the SAME
 /// engine, through this one function: `BatchDetectDominantLanguage`, documented as
@@ -226,9 +267,9 @@ const SCORE_CONTRAST_EXPONENT: i32 = 4;
 /// implementations that can disagree.
 pub(crate) fn detect_languages(text: &str) -> Vec<DominantLanguage> {
     let sample: String = text.chars().take(IDENTIFICATION_SAMPLE_CHARS).collect();
-    // The candidates the engine placed, each with its relative confidence raised to
-    // the calibration exponent. A confidence of zero is the engine rejecting the
-    // candidate, so it is dropped before the renormalisation rather than scaled.
+    // Every candidate the engine placed, with its relative confidence raised to the
+    // contrast exponent and renormalised over the whole set: a confidence rather
+    // than a relative rank, over exactly the candidates the engine scored.
     let weighted: Vec<(&'static str, f64)> = detector()
         .compute_language_confidence_values(&sample)
         .into_iter()
@@ -240,16 +281,23 @@ pub(crate) fn detect_languages(text: &str) -> Vec<DominantLanguage> {
                 .map(|(_, code)| (*code, confidence.powi(SCORE_CONTRAST_EXPONENT)))
         })
         .collect();
-    // Renormalising over the placed candidates keeps `Languages` a distribution:
-    // the scores never sum past 1, whichever candidates the engine placed.
     let total: f64 = weighted.iter().map(|(_, weight)| weight).sum();
     if total <= 0.0 {
         return Vec::new();
     }
+    // What the dominant language is scored. Every other candidate is measured
+    // against it, so the reporting bound is the engine's own preference for the
+    // leader rather than a confidence this emulator fixed.
+    let leading = weighted
+        .iter()
+        .map(|(_, weight)| *weight)
+        .fold(0.0f64, f64::max);
     let mut candidates: Vec<DominantLanguage> = weighted
         .into_iter()
+        // A candidate the engine all but rejected is not a language it detected.
+        .filter(|(_, weight)| *weight >= leading * CANDIDATE_RELATIVE_FLOOR)
         .filter_map(|(code, weight)| {
-            let score = (weight / total) as f32;
+            let score = (weight / total * (1.0 - UNMODELLED_LANGUAGE_MASS)) as f32;
             // A score that renders as zero at the modelled float width would claim
             // a candidate with no confidence at all.
             (score > 0.0).then(|| DominantLanguage {

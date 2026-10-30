@@ -115,7 +115,9 @@ const TAGGED_DOCUMENTS: &[TaggedDocument] = &[
             ("the", "DET"),
             // "train" is also a verb, but an article opens a noun phrase.
             ("train", "NOUN"),
-            ("was", "AUX"),
+            // A copula with no main verb behind it IS the clause's main verb: AUX is
+            // for a word that "accompanies the main verb", which this one does not.
+            ("was", "VERB"),
             ("late", "ADJ"),
             (".", "PUNCT"),
         ],

@@ -4,8 +4,12 @@
 //!
 //! IMPLEMENTED. The inference runs in-process through the VADER sentiment engine
 //! (`vader_sentiment`), so the verdict and its four confidences are computed from the
-//! submitted text rather than matched out of the request. A `LanguageCode` the engine
-//! has no lexicon for is answered with the modelled `UnsupportedLanguageException`.
+//! submitted text rather than matched out of the request. The engine answers with an
+//! INTENSITY, which [`score_sentiment`] calibrates into the four confidences the
+//! modelled `SentimentScore` carries — how sure the document carries sentiment at
+//! all, and how that confidence splits between the two polarities and the both-signed
+//! MIXED class. A `LanguageCode` the engine has no lexicon for is answered with the
+//! modelled `UnsupportedLanguageException`.
 //!
 //! ## Shape of an operation
 //!
@@ -122,22 +126,77 @@ fn ranked_labels(
     ]
 }
 
+/// The probability that ONE lexicon hit is a true sentiment signal rather than a
+/// word the lexicon happens to carry (a figure of speech, a brand name, a negated
+/// aside).
+///
+/// The engine answers how INTENSE the sentiment of a document is; the modelled
+/// `SentimentScore` members are confidences — "the sentiments, and their
+/// corresponding confidence levels" — so an intensity has to be calibrated into one.
+/// The calibration is this: each sentiment-bearing word of the document is one
+/// independent piece of evidence that the document carries sentiment at all, each
+/// right with this probability, so a document holding `m` of them carries sentiment
+/// with confidence `1 - (1 - this)^m`. One hit leaves real doubt, a second squares it,
+/// and a handful leave a classifier's confidence — which is why a document of plain
+/// facts comes back NEUTRAL with near-certainty while a one-word complaint does not.
+///
+/// It is the ONE calibration constant of this projection, applied identically to
+/// every document, so no request can select it.
+const SENTIMENT_EVIDENCE_RELIABILITY: f64 = 0.9;
+
+/// The confidence each of the four modelled classes keeps whatever the document says.
+///
+/// `SentimentScore` is a distribution over four hypotheses, and no hypothesis about a
+/// natural-language document is impossible: a document the engine reads as wholly
+/// positive still leaves a little room for a negative reading the lexicon missed.
+/// This is that room — the prior mass each class carries before the document's own
+/// evidence is added, which is what keeps every member strictly positive instead of
+/// reporting a flat 0 for a class the engine found no word for.
+const SENTIMENT_CLASS_PRIOR: f64 = 1e-3;
+
+/// How many words of `text` carry sentiment of their own.
+///
+/// The count of independent evidence [`SENTIMENT_EVIDENCE_RELIABILITY`] calibrates:
+/// each word is scored BY THE ENGINE on its own, and the ones the engine gives a
+/// non-zero polarity to are its lexicon's hits in this document. Scoring a word alone
+/// drops the document's negations and boosters, which is the point — this counts how
+/// much sentiment-bearing material the document holds, while the polarity and the
+/// balance of it come from the engine's reading of the whole text.
+fn sentiment_bearing_words(text: &str) -> usize {
+    text.split_whitespace()
+        .filter(|word| {
+            analyzer()
+                .polarity_scores(word)
+                .get("compound")
+                .copied()
+                .unwrap_or_default()
+                != 0.0
+        })
+        .count()
+}
+
 /// Score `text` into Comprehend's four confidences plus the winning label.
 ///
-/// The engine reports `pos`/`neg`/`neu` — the proportions of the document carrying
-/// each polarity, which sum to 1 — and `compound`, the normalised net polarity in
-/// -1..1. Those map onto Comprehend's four classes as:
+/// The engine reports `pos`/`neg`/`neu` — the shares of the document's weight
+/// carrying each polarity, which sum to 1 — and `compound`, its normalised net
+/// polarity. Those become the four modelled confidences in two steps:
 ///
-/// * `Mixed` = `2 * min(pos, neg)`: the share of the document that carries BOTH
-///   polarities, which is what MIXED means.
-/// * `Positive` / `Negative` = the positive / negative part of `compound`: the net
-///   signed polarity, so only the winning direction is scored.
-/// * `Neutral` = whatever is left of the document once the signed and the
-///   both-signed shares are taken out.
+/// 1. HOW SURE the document carries sentiment at all: `1 - (1 -
+///    `[`SENTIMENT_EVIDENCE_RELIABILITY`]`)^m` over the `m` sentiment-bearing words
+///    the engine finds in it ([`sentiment_bearing_words`]). Whatever is left of 1 is
+///    the confidence of `Neutral` — the hypothesis that the document carries no
+///    sentiment.
+/// 2. HOW that confidence splits between the signed classes: over the
+///    sentiment-bearing weight alone, `p` and `n` are the positive and negative
+///    shares (`p + n = 1`). `Mixed` is the part of it carrying BOTH polarities,
+///    `2 * min(p, n)`, which is what MIXED means, and the rest, `|p - n|`, goes to
+///    whichever direction predominates. The three sum to 1, so the four confidences
+///    sum to 1 with no renormalisation, and a document carrying both polarities in
+///    balance is MIXED rather than the stronger of the two.
 ///
-/// The four are then normalised, so they sum to 1, and the verdict is their
-/// arg-max. Text the engine finds no sentiment in leaves `Neutral` holding all of
-/// it.
+/// Each class then keeps the [`SENTIMENT_CLASS_PRIOR`] every hypothesis holds, so no
+/// member is reported as a flat impossibility, and the verdict is the arg-max of the
+/// four the response carries.
 ///
 /// Visible to the crate because `DetectTargetedSentiment` scores the clause each
 /// mention sits in through exactly this function, and `BatchDetectSentiment` scores
@@ -149,25 +208,44 @@ pub(crate) fn score_sentiment(text: &str) -> (String, SentimentScore) {
     let scores = analyzer().polarity_scores(text);
     let positive_share = scores.get("pos").copied().unwrap_or_default();
     let negative_share = scores.get("neg").copied().unwrap_or_default();
-    let compound = scores.get("compound").copied().unwrap_or_default();
 
-    let mixed = 2.0 * positive_share.min(negative_share);
-    let positive = compound.max(0.0);
-    let negative = (-compound).max(0.0);
-    let neutral = (1.0 - compound.abs() - mixed).max(0.0);
+    // Step 1: the confidence that the document carries sentiment at all, from the
+    // number of independent lexicon hits in it.
+    let hits = sentiment_bearing_words(text);
+    // Past a few hits the confidence is already 1 to double precision, so the count
+    // is capped where the exponent stops changing the answer.
+    let carries_sentiment = 1.0 - (1.0 - SENTIMENT_EVIDENCE_RELIABILITY).powi(hits.min(64) as i32);
 
-    let total = positive + negative + neutral + mixed;
-    let (positive, negative, neutral, mixed) = if total > 0.0 {
+    // Step 2: how that confidence splits, from the balance of the two polarities
+    // over the sentiment-bearing weight alone.
+    let signed = positive_share + negative_share;
+    let (positive, negative, mixed) = if signed > 0.0 {
+        let positive_part = positive_share / signed;
+        let negative_part = negative_share / signed;
+        let both = 2.0 * positive_part.min(negative_part);
         (
-            positive / total,
-            negative / total,
-            neutral / total,
-            mixed / total,
+            carries_sentiment * (positive_part - negative_part).max(0.0),
+            carries_sentiment * (negative_part - positive_part).max(0.0),
+            carries_sentiment * both,
         )
     } else {
-        // No polarity and no room left for one: the document is wholly neutral.
-        (0.0, 0.0, 1.0, 0.0)
+        // The engine found no polarity to split: the whole confidence that the
+        // document carries sentiment has nowhere to go, so the document is neutral.
+        (0.0, 0.0, 0.0)
     };
+    let neutral = (1.0 - positive - negative - mixed).max(0.0);
+
+    // The prior every hypothesis keeps, which is also what renormalises the four
+    // back onto a distribution.
+    let smooth = |confidence: f64| {
+        (confidence + SENTIMENT_CLASS_PRIOR) / (1.0 + 4.0 * SENTIMENT_CLASS_PRIOR)
+    };
+    let (positive, negative, neutral, mixed) = (
+        smooth(positive),
+        smooth(negative),
+        smooth(neutral),
+        smooth(mixed),
+    );
 
     // Arg-max over the four. `ranked_labels` is already in tie-break order and the
     // fold keeps the incumbent on a tie, so two equal confidences always resolve to

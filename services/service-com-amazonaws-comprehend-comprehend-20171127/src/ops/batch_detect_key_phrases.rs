@@ -4,15 +4,17 @@
 //!
 //! IMPLEMENTED. Every document of `TextList` is analysed by the SAME in-process
 //! key-phrase extractor the asynchronous key-phrases detection job runs
-//! ([`crate::ops::start_key_phrases_detection_job::key_phrases`]): RAKE over the
-//! language's stop-word list, so each reported phrase is a run of content words CUT
-//! OUT OF its own document, carrying the character offsets it really occupies and a
-//! score computed from the document's own word statistics — nothing is matched out of
-//! the request and a document cannot be analysed differently for having travelled in
-//! a batch. Batching changes only how many documents one request carries: the
-//! documented document-count and per-document byte quotas are refused with this
-//! operation's own modelled errors, through the same `crate::state` helpers the rest
-//! of the `BatchDetect*` family reads.
+//! ([`crate::ops::start_key_phrases_detection_job::KeyPhraseAnalyser`]): for a
+//! language the part-of-speech tagger reads, each reported phrase is a NOUN PHRASE of
+//! its own document — its determiner and modifiers through its head noun — carrying
+//! the character offsets that phrase really occupies and the confidence of the
+//! analysis that found it; for a language with no lexicon, the runs of content words
+//! between the language's stop words. Nothing is matched out of the request and a
+//! document cannot be analysed differently for having travelled in a batch. Batching
+//! changes only how many documents one request carries: the documented document-count
+//! and per-document byte quotas are refused with this operation's own modelled errors,
+//! through the same `crate::state` helpers the rest of the `BatchDetect*` family
+//! reads.
 //!
 //! ## Shape of an operation
 //!
@@ -93,11 +95,11 @@ use super::types::*;
 
 // Batching changes how many documents one request carries, never how a document is
 // analysed or how large it may be: the extraction itself and the per-language
-// stop-word lists live with the key-phrases detection job that already runs them, and
-// the per-document byte quota lives with the state module, so the operations cannot
-// drift apart. Every value the modelled `LanguageCode` enum names has a stop-word
-// list there, so no language of this operation is left unanalysable.
-use super::start_key_phrases_detection_job::{key_phrases, stopwords};
+// analysers live with the key-phrases detection job that already runs them, and the
+// per-document byte quota lives with the state module, so the operations cannot
+// drift apart. Every value the modelled `LanguageCode` enum names has an analyser
+// there, so no language of this operation is left unanalysable.
+use super::start_key_phrases_detection_job::KeyPhraseAnalyser;
 
 /// The most documents one batch may carry: the ONE ceiling the whole `BatchDetect*`
 /// family shares, [`crate::state::MAX_BATCH_DOCUMENTS`], documented twice in this
@@ -235,12 +237,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // One `LanguageCode` covers the whole batch ("All documents must be in the
-        // same language"), so the language's stop-word set — the phrase delimiters
-        // the extraction reads — is built ONCE and shared by every document rather
+        // same language"), so the language's analyser — the part-of-speech analysis
+        // the noun-phrase chunking reads, or the stop-word set a language with no
+        // lexicon is read with — is built ONCE and shared by every document rather
         // than rebuilt per document. Membership of the `LanguageCode` enum is
-        // enforced at the boundary, and every value it names has a list, so no
+        // enforced at the boundary, and every value it names has an analyser, so no
         // accepted request is left without an analysis.
-        let stopwords = stopwords(&input.language_code);
+        let analyser = KeyPhraseAnalyser::for_language(&input.language_code);
 
         // Every precondition holds, so the whole batch is analysed: `ResultList` is
         // built in input order, so it is "sorted in ascending order by the Index
@@ -255,7 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .enumerate()
             .map(|(position, text)| BatchDetectKeyPhrasesItemResult {
                 index: i32::try_from(position).ok(),
-                key_phrases: Some(key_phrases(text, &stopwords)),
+                key_phrases: Some(analyser.key_phrases(text)),
             })
             .collect();
 

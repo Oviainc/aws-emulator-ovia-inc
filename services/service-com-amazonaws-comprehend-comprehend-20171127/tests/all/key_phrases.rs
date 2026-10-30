@@ -6,11 +6,15 @@
 //! service's ONE key-phrase extractor, and every phrase it reports is a span CUT OUT
 //! OF that document — `Text` is exactly the document's `BeginOffset..EndOffset`
 //! characters, the spans walk the document forwards without overlapping, and `Score`
-//! is a confidence in `(0, 1]` relative to the document's own strongest phrase. The
+//! is the confidence of the analysis that found the phrase, in `(0, 1]`. The
 //! analysis is a function of the document and `LanguageCode` alone, so a document
 //! repeated inside one batch, submitted beside other documents, or submitted again to
 //! a fresh emulator is answered identically, and `ResultList` carries one entry per
 //! document at that document's own zero-based `Index`.
+//!
+//! What a phrase IS for a language the part-of-speech tagger reads is asserted in
+//! `noun_phrase_key_phrases.rs`: a whole noun phrase, determiner included. This suite
+//! holds the rules every language shares.
 //!
 //! Every suite asserts that rule over a TABLE spanning what it generalises over —
 //! language and script, document length, punctuation inside a phrase, repetition,
@@ -46,8 +50,8 @@ const KEY_PHRASE_DOCUMENTS: &[(&str, &str, &str, bool)] = &[
     (
         "english repeated phrase",
         "en",
-        "Amazon Comprehend is a natural language processing service. The natural \
-         language processing service finds insights in documents.",
+        "The natural language processing service finds insights in documents. The \
+         natural language processing service reads plain text.",
         true,
     ),
     ("english one word", "en", "Seattle", true),
@@ -93,7 +97,6 @@ fn assert_phrases_describe_document(case: &str, document: &str, result: &Value) 
     let characters = document.chars().count();
 
     let mut previous_end = 0usize;
-    let mut strongest = 0.0f64;
     for phrase in &phrases {
         let text = phrase["Text"]
             .as_str()
@@ -132,19 +135,8 @@ fn assert_phrases_describe_document(case: &str, document: &str, result: &Value) 
              {begin}..{end} after a span ending at {previous_end} in {phrases:?}"
         );
         previous_end = end;
-        strongest = strongest.max(score);
     }
 
-    // The score is relative to the document's own strongest phrase, so a document
-    // with any key phrase at all has one scoring 1.0 — the phrase the document is
-    // most about.
-    if !phrases.is_empty() {
-        assert!(
-            (strongest - 1.0).abs() < 1e-6,
-            "case {case:?}: expected the document's strongest phrase to score 1.0, the \
-             highest was {strongest} in {phrases:?}"
-        );
-    }
     phrases
 }
 

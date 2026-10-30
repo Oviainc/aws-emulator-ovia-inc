@@ -111,14 +111,20 @@ async fn detect_dominant_language_ranks_the_language_of_the_document() {
     }
 }
 
-/// Documents that carry MORE than one language, and the language each is
+/// Documents the engine cannot place in a SINGLE language, and the language each is
 /// predominantly written in.
 ///
-/// The ranked list is observable only on a document with a runner-up, which is what
-/// these rows are: a clause in one language beside shorter material in others. The
-/// first row is the document the issue cited; the others differ along what the rule
-/// generalises over — which language predominates, how many others appear, and
-/// whether the minority material is a greeting or a whole clause.
+/// The ranked list is observable only on a document the engine ranks more than one
+/// candidate for, which is what these rows are: a document carrying two languages in
+/// comparable measure, and a fragment too short to carry a language profile at all.
+/// The rows differ along what the rule generalises over — which language
+/// predominates, how many others appear, whether the minority material is a greeting
+/// or a whole clause, and document length.
+///
+/// A document plainly in ONE language is the other half of the same rule: the engine
+/// detects that language and nothing else, so the array carries one entry. That half
+/// is asserted by [`a_document_plainly_in_one_language_reports_that_language_alone`]
+/// over the whole per-language table.
 const MIXED_DOCUMENTS: &[(&str, &str, &str)] = &[
     (
         "english clause beside greetings in five languages",
@@ -127,16 +133,17 @@ const MIXED_DOCUMENTS: &[(&str, &str, &str)] = &[
          in Seattle.",
     ),
     (
-        "german paragraph beside an english clause",
-        "de",
-        "Das Wetter in Berlin ist heute sehr schön und wir gehen später mit den Kindern \
-         im Park spazieren. The weather is nice.",
+        "one latin letter",
+        // Every Latin-script language the engine was built with is a candidate for a
+        // single letter; which one leads is the engine's own ranking, so no dominant
+        // language is asserted for this row.
+        "",
+        "a",
     ),
     (
-        "french paragraph beside a spanish greeting",
-        "fr",
-        "Il fait très beau à Paris en ce moment et nous allons nous promener dans le \
-         parc cet après-midi avec les enfants. Hola amigo, buenos días.",
+        "two words, one from each of two languages",
+        "",
+        "Hola Ciao",
     ),
 ];
 
@@ -155,14 +162,50 @@ async fn detect_dominant_language_ranks_runner_up_candidates_behind_the_dominant
 
         assert!(
             languages.len() >= 2,
-            "case {case:?}: a document carrying more than one language has runner-up \
-             candidates, so expected at least 2 ranked entries, got {languages:?}"
+            "case {case:?}: a document the engine cannot place in one language has \
+             runner-up candidates, so expected at least 2 ranked entries, got \
+             {languages:?}"
         );
-        let top = languages[0]["LanguageCode"].as_str().unwrap_or_default();
+        if !expected.is_empty() {
+            let top = languages[0]["LanguageCode"].as_str().unwrap_or_default();
+            assert_eq!(
+                top, *expected,
+                "case {case:?}: expected the dominant language {expected:?} first, got \
+                 {top:?} in {languages:?}"
+            );
+        }
+        assert_ranked_distribution(case, &languages);
+    }
+}
+
+/// The other half of the rule: a document plainly in one language is answered with
+/// THAT language and no runner-up — a hypothesis the engine all but rejected is not a
+/// language it detected — and with a confidence strictly below 1, since an
+/// identification is never certain.
+#[tokio::test]
+async fn a_document_plainly_in_one_language_reports_that_language_alone() {
+    let comprehend = Comprehend::new();
+
+    for (case, expected, text) in DOCUMENTS {
+        let output = comprehend
+            .ok("DetectDominantLanguage", &json!({ "Text": text }))
+            .await;
+        let languages = output["Languages"].as_array().cloned().unwrap_or_default();
+
+        let reported: Vec<&str> = languages
+            .iter()
+            .map(|entry| entry["LanguageCode"].as_str().unwrap_or_default())
+            .collect();
         assert_eq!(
-            top, *expected,
-            "case {case:?}: expected the dominant language {expected:?} first, got \
-             {top:?} in {languages:?}"
+            reported,
+            vec![*expected],
+            "case {case:?}: expected the document's own language alone, got {languages:?}"
+        );
+        let score = languages[0]["Score"].as_f64().unwrap_or(f64::NAN);
+        assert!(
+            score < 1.0,
+            "case {case:?}: an identification is never certain, so expected a Score \
+             below 1, got {score}"
         );
         assert_ranked_distribution(case, &languages);
     }

@@ -356,7 +356,6 @@ async fn a_key_phrases_job_analyses_its_documents_and_writes_the_output_archive(
             );
 
             let mut previous_end = 0usize;
-            let mut top_scores = 0usize;
             for phrase in phrases {
                 let begin = phrase["BeginOffset"].as_u64().unwrap_or_default() as usize;
                 let end = phrase["EndOffset"].as_u64().unwrap_or_default() as usize;
@@ -385,14 +384,7 @@ async fn a_key_phrases_job_analyses_its_documents_and_writes_the_output_archive(
                     score > 0.0 && score <= 1.0,
                     "case {case:?}: expected a Score in (0, 1], got {phrase}"
                 );
-                if (score - 1.0).abs() < 1e-6 {
-                    top_scores += 1;
-                }
             }
-            assert!(
-                top_scores >= 1,
-                "case {case:?}: the document's highest-scoring phrase scores 1.0, got {phrases:?}"
-            );
             // The phrases name terms the document names.
             if document.contains("laptop") {
                 assert!(

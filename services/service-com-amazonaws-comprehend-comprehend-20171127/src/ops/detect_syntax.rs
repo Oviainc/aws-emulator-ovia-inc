@@ -100,43 +100,71 @@ const MAX_TEXT_BYTES: usize = crate::state::REALTIME_TEXT_QUOTA_BYTES;
 /// `LanguageCode` covers every document in the batch.
 pub(crate) const TAGGABLE_LANGUAGES: &[&str] = &["en"];
 
-/// Confidence reported for a token whose class follows from its Unicode general
-/// categories alone (punctuation, symbol, digits): nothing about it is ambiguous.
-const SCORE_NON_WORD: f32 = 0.99;
+// ---------------------------------------------------------------------------
+// What a reported confidence IS.
+//
+// The tagger does not label a token and then look a confidence up: it collects
+// every READING the token's evidence allows — a word class the lexicon claims the
+// word for, an inflection, a derivational suffix, a syntactic context — weighs each
+// by the cue that speaks for it, and reports the DISTRIBUTION that induces. The tag
+// is the reading holding the most weight and `PartOfSpeech.Score` is that reading's
+// share of the whole, so the confidence follows the token's own evidence: cues that
+// agree add up and come back near certain, two word classes claiming one word leave
+// the most frequent reading holding only its share, and a reading a context rule
+// overturns keeps the share that context leaves it.
+//
+// The weights below are the model's parameters: one per KIND of evidence, applied
+// identically to every token of every document, so no request can select them.
+// ---------------------------------------------------------------------------
 
-/// Confidence for a token carrying a non-linguistic marker (`@`, `:`, `/`, `\`, `_`),
-/// reported as the modelled `O` tag.
-const SCORE_NON_LINGUISTIC: f32 = 0.95;
+/// The class a token's Unicode general categories decide on their own: punctuation, a
+/// symbol, a figure. There is no competing reading of such a token, so it is the one
+/// case a confidence of exactly 1 is the honest answer.
+const CUE_CATEGORY: f64 = 1.0;
 
-/// Confidence for a digit-initial token that also carries letters — an ordinal or a
-/// measurement (`3rd`, `1980s`, `5km`).
-const SCORE_MIXED_NUMERIC: f32 = 0.85;
+/// The most frequent reading of a word the closed-class lexicon carries.
+const CUE_LEXICON_PRIMARY: f64 = 1.0;
 
-/// Confidence for a closed-class word that only one word list claims.
-const SCORE_UNAMBIGUOUS: f32 = 0.99;
+/// Each FURTHER word class that also claims the word (`that` is a determiner, a
+/// pronoun and a subordinating conjunction): a reading the word really has, but the
+/// less frequent one.
+const CUE_LEXICON_FURTHER: f64 = 0.35;
 
-/// Confidence for a word more than one word list claims, so the tag is the most
-/// frequent of its readings rather than the only one (`that`, `to`, `so`, `have`).
-const SCORE_AMBIGUOUS: f32 = 0.8;
+/// The stem left after stripping an English clitic (`don't` -> `do`, `it's` -> `it`).
+const CUE_CLITIC_STEM: f64 = 0.5;
 
-/// Confidence for a word recognised as an inflected form of a lexicon verb
-/// (`barks`, `stopped`, `making`).
-const SCORE_INFLECTED_VERB: f32 = 0.9;
+/// A regular inflection of a lexicon verb (`barks`, `stopped`, `making`).
+const CUE_INFLECTION: f64 = 0.45;
 
-/// Confidence for a token tagged from the stem left after stripping an English
-/// clitic (`don't` -> `do`, `it's` -> `it`).
-const SCORE_CLITIC: f32 = 0.8;
+/// Capitalisation away from the start of a sentence, or an all-capital acronym: the
+/// proper-noun evidence.
+const CUE_CAPITALISATION: f64 = 0.4;
 
-/// Confidence for a capitalised word away from the start of a sentence, or an
-/// all-capital acronym: the proper-noun heuristic.
-const SCORE_PROPER_NOUN: f32 = 0.9;
+/// A derivational suffix marking a class (`-ness`, `-able`, `-ly`).
+const CUE_MORPHOLOGY: f64 = 0.3;
 
-/// Confidence for a word classified by a derivational suffix alone.
-const SCORE_MORPHOLOGY: f32 = 0.85;
+/// The open-class default: a word no other cue speaks for is a common noun.
+const CUE_OPEN_CLASS: f64 = 0.2;
 
-/// Confidence for the open-class default: an unknown word with no suffix the rules
-/// below recognise is reported as a common noun.
-const SCORE_DEFAULT_NOUN: f32 = 0.6;
+/// A syntactic-context rule — the position the token stands in (after an article,
+/// between a modifier and its head noun, predicative after a copula, accompanying a
+/// main verb). Context outweighs any single lexicon reading, which is what lets it
+/// overturn one.
+const CUE_CONTEXT: f64 = 1.0;
+
+/// What is left of a reading the context it stands in speaks AGAINST. The reading
+/// does not disappear — the word still has it — so it keeps a third of its weight
+/// and the confidence reported for the reading that won says how much it left behind.
+const CONTEXT_CONTRADICTED: f64 = 1.0 / 3.0;
+
+/// The weight every WORD keeps for a reading this lexicon does not carry.
+///
+/// English is an open vocabulary and the lexicon below is a finite list, so no
+/// labelling of a word is certain: this is the residual the distribution holds back
+/// to say so, which keeps a word's confidence strictly below 1 however much evidence
+/// agrees on it. A token whose class follows from its Unicode general category alone
+/// — punctuation, a symbol, a figure — has no unlisted reading to keep weight for.
+const CUE_UNLISTED_READING: f64 = 1e-5;
 
 /// Characters that end a sentence, after which a capitalised word is no longer
 /// evidence of a proper noun. A line break does too, and is handled where
@@ -144,9 +172,38 @@ const SCORE_DEFAULT_NOUN: f32 = 0.6;
 const SENTENCE_FINAL: &[char] = &['.', '!', '?', '…'];
 
 /// The articles. A word straight after one of them heads a noun phrase, so a verb
-/// reading of it is demoted to a common noun — the one contextual rule the tagger
-/// applies (`the train`, `the running of the bulls`).
+/// reading of it is spoken against by that context (`the train`, `the running of the
+/// bulls`).
 const ARTICLES: &[&str] = &["a", "an", "the"];
+
+/// The forms of `be`. A clause whose predicate is one of these carries no other verb,
+/// which is what decides both of the contextual rules around a copula: the form
+/// itself is the clause's main verb rather than an auxiliary accompanying one, and a
+/// participle standing after it is predicative — an adjective rather than a second
+/// verb (`the flight was delayed`, `the screen is broken`).
+const COPULA_FORMS: &[&str] = &[
+    "am", "is", "are", "was", "were", "be", "been", "being", "isn't", "aren't", "wasn't",
+    "weren't", "ain't", "'s", "'re", "'m",
+];
+
+/// The endings an English participle carries, for the predicative rule above.
+const PARTICIPLE_ENDINGS: &[&str] = &["ed", "en"];
+
+/// The ending an English gerund carries: the form that names a thing rather than an
+/// action, which is what lets it stand inside a noun phrase.
+const GERUND_ENDING: &str = "ing";
+
+/// The tags that stand INSIDE a noun phrase before its head: a determiner, a
+/// modifier or a noun in a compound. Read by the contextual rules and by the
+/// noun-phrase chunking `BatchDetectKeyPhrases` reports.
+pub(crate) const NOUN_PHRASE_MODIFIER_TAGS: &[&str] = &["DET", "ADJ", "NUM", "NOUN", "PROPN"];
+
+/// The tags a noun phrase can be headed by.
+pub(crate) const NOUN_PHRASE_HEAD_TAGS: &[&str] = &["NOUN", "PROPN"];
+
+/// The tags of a word that can stand between an auxiliary and the main verb it
+/// accompanies (`does not like`, `has really grown`).
+const AUXILIARY_SKIPPABLE_TAGS: &[&str] = &["ADV", "PART"];
 
 /// The connector a word can carry inside it. A token holding one is an identifier
 /// (`user_id`) rather than a word, so it is reported with the modelled `O` tag —
@@ -380,12 +437,79 @@ const SUFFIX_RULES: &[(&str, &str)] = &[
     ("fy", "VERB"),
 ];
 
+/// The readings one token's evidence allows, as `(modelled tag, weight)` in the
+/// order the cues were collected — strongest cue first, so a tie resolves to the
+/// most frequent reading.
+///
+/// This is what the tagger computes and what the response reports: the tag is the
+/// reading holding the most weight and the confidence is that reading's share.
+#[derive(Debug, Default, Clone)]
+struct Readings {
+    readings: Vec<(&'static str, f64)>,
+    /// Whether the only reading the token's own evidence left is the open-class
+    /// default: no word class claims the word, no inflection and no suffix speaks for
+    /// it, so it is read as a common noun. The contextual rules read this, because
+    /// such a word is the one a context can say the most about.
+    open_class_default: bool,
+}
+
+impl Readings {
+    /// Add `weight` to the evidence for `tag`, as a new reading or on top of one the
+    /// token already had: cues that agree add up.
+    fn support(&mut self, tag: &'static str, weight: f64) {
+        match self
+            .readings
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == tag)
+        {
+            Some(reading) => reading.1 += weight,
+            None => self.readings.push((tag, weight)),
+        }
+    }
+
+    /// Leave the reading of `tag` what [`CONTEXT_CONTRADICTED`] keeps: the context
+    /// speaks against it, which does not make it impossible.
+    fn contradict(&mut self, tag: &str) {
+        if let Some(reading) = self
+            .readings
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == tag)
+        {
+            reading.1 *= CONTEXT_CONTRADICTED;
+        }
+    }
+
+    /// The reading holding the most weight, and its share of the whole.
+    ///
+    /// The share is strictly positive, and strictly below 1 for any token carrying
+    /// the [`CUE_UNLISTED_READING`] residual, so no word is ever reported as
+    /// certain.
+    fn reported(&self) -> (&'static str, f32) {
+        let mut best: Option<(&'static str, f64)> = None;
+        let mut total = 0.0;
+        for (tag, weight) in &self.readings {
+            total += *weight;
+            if best.is_none_or(|(_, best_weight)| *weight > best_weight) {
+                best = Some((*tag, *weight));
+            }
+        }
+        match best {
+            // Nothing the tagger can read: an empty token cannot occur, since every
+            // token carries at least one character, but the class is reported rather
+            // than asserted away.
+            None => ("O", 1.0),
+            Some((tag, weight)) => (tag, (weight / total.max(f64::MIN_POSITIVE)) as f32),
+        }
+    }
+}
+
 /// The part-of-speech tagger: the lexicon indexed by word, plus the verb stems the
 /// inflectional rules derive forms from.
 #[derive(Debug)]
 struct Tagger {
-    /// Word -> (modelled tag, confidence), built from [`LEXICON`].
-    lexicon: HashMap<&'static str, (&'static str, f32)>,
+    /// Word -> every modelled tag a word class of [`LEXICON`] claims it for, in that
+    /// list's precedence order, which is the order of how frequent the readings are.
+    lexicon: HashMap<&'static str, Vec<&'static str>>,
     /// The verb stems of [`VERBS`], for recognising regular inflections.
     verb_stems: HashSet<&'static str>,
 }
@@ -398,20 +522,15 @@ fn tagger() -> &'static Tagger {
 }
 
 impl Tagger {
-    /// Index [`LEXICON`] in precedence order, marking a word more than one class
-    /// claims as ambiguous.
+    /// Index [`LEXICON`] in precedence order, keeping EVERY class that claims a word
+    /// so an ambiguous one carries each of its readings.
     fn build() -> Self {
-        let mut lexicon: HashMap<&'static str, (&'static str, f32)> = HashMap::new();
+        let mut lexicon: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
         for (tag, words) in LEXICON {
             for word in *words {
-                match lexicon.get_mut(*word) {
-                    // A later class claims a word an earlier one already holds: keep
-                    // the earlier (more frequent) reading, report it as ambiguous.
-                    Some(entry) if entry.0 != *tag => entry.1 = SCORE_AMBIGUOUS,
-                    Some(_) => {}
-                    None => {
-                        lexicon.insert(*word, (tag, SCORE_UNAMBIGUOUS));
-                    }
+                let readings = lexicon.entry(*word).or_default();
+                if !readings.contains(tag) {
+                    readings.push(tag);
                 }
             }
         }
@@ -421,23 +540,12 @@ impl Tagger {
         }
     }
 
-    /// The modelled tag and confidence for one token.
+    /// Every reading `token` carries on its own, before the context it stands in.
     ///
     /// `sentence_initial` says whether the token opens a sentence, where
-    /// capitalisation carries no proper-noun evidence; `after_article` says whether
-    /// the token straight before it was an article, which opens a noun phrase.
-    fn tag(&self, token: &str, sentence_initial: bool, after_article: bool) -> (&'static str, f32) {
-        let (tag, score) = self.classify(token, sentence_initial);
-        // The one contextual rule: a word straight after an article heads a noun
-        // phrase, so a verb reading of it is a common noun instead (`the train`).
-        if after_article && tag == "VERB" {
-            return ("NOUN", SCORE_AMBIGUOUS);
-        }
-        (tag, score)
-    }
-
-    /// The tag and confidence `token` carries on its own, before context.
-    fn classify(&self, token: &str, sentence_initial: bool) -> (&'static str, f32) {
+    /// capitalisation carries no proper-noun evidence.
+    fn readings(&self, token: &str, sentence_initial: bool) -> Readings {
+        let mut readings = Readings::default();
         let mut letters = false;
         let mut digits = false;
         let mut symbols = false;
@@ -449,59 +557,75 @@ impl Tagger {
             marker |= NON_LINGUISTIC_MARKERS.contains(&character);
         }
 
-        // Tokens carrying neither letters nor digits are punctuation, or symbols when
-        // any of their characters is a Unicode Symbol (`$`, `+`, `=`).
+        // The classes a token's Unicode general categories decide on their own: there
+        // is no other reading of them, and no unlisted one either.
         if !letters && !digits {
-            return if symbols {
-                ("SYM", SCORE_NON_WORD)
-            } else {
-                ("PUNCT", SCORE_NON_WORD)
-            };
+            // Punctuation, or a symbol when any character is a Unicode Symbol.
+            readings.support(if symbols { "SYM" } else { "PUNCT" }, CUE_CATEGORY);
+            return readings;
         }
         // A word carrying an address, URL, path or identifier marker is non-linguistic.
         if letters && marker {
-            return ("O", SCORE_NON_LINGUISTIC);
+            readings.support("O", CUE_CATEGORY);
+            return readings;
         }
-        if digits {
+        if digits && (!letters || token.starts_with(|c: char| c.is_numeric())) {
             // All digits (and the separators inside a figure): a numeral. Digits
             // followed by letters: an ordinal or a measurement, still a numeral.
-            if !letters {
-                return ("NUM", SCORE_NON_WORD);
-            }
-            if token.starts_with(|c: char| c.is_numeric()) {
-                return ("NUM", SCORE_MIXED_NUMERIC);
-            }
+            readings.support("NUM", CUE_CATEGORY);
+            return readings;
         }
 
+        // A word: the lexicon's readings first, most frequent first, then the
+        // morphological ones, and the open-class default only when nothing else
+        // speaks for the word at all.
         let lower = token.to_lowercase();
-        if let Some((tag, score)) = self.lexicon.get(lower.as_str()) {
-            return (tag, *score);
+        if let Some(claimed) = self.lexicon.get(lower.as_str()) {
+            for (rank, tag) in claimed.iter().enumerate() {
+                let weight = if rank == 0 {
+                    CUE_LEXICON_PRIMARY
+                } else {
+                    CUE_LEXICON_FURTHER
+                };
+                readings.support(tag, weight);
+            }
         }
-        // A clitic UAX#29 kept attached: the stem before it decides the tag.
+        // A clitic UAX#29 kept attached: the stem before it carries the readings.
         if let Some(stem) = strip_clitic(&lower) {
-            if let Some((tag, _)) = self.lexicon.get(stem) {
-                return (tag, SCORE_CLITIC);
+            if let Some(claimed) = self.lexicon.get(stem) {
+                for tag in claimed {
+                    readings.support(tag, CUE_CLITIC_STEM);
+                }
             }
         }
         // A regular inflection of a lexicon verb (`barks`, `stopped`, `making`).
         if self.is_inflected_verb(&lower) {
-            return ("VERB", SCORE_INFLECTED_VERB);
+            readings.support("VERB", CUE_INFLECTION);
         }
         // Capitalisation away from the start of a sentence, and all-capital acronyms,
-        // mark a proper noun.
+        // are evidence of a proper noun.
         if is_acronym(token) || (!sentence_initial && starts_uppercase(token)) {
-            return ("PROPN", SCORE_PROPER_NOUN);
+            readings.support("PROPN", CUE_CAPITALISATION);
         }
-        // Derivational morphology, then the open-class default.
+        // Derivational morphology: the first suffix that matches, longest first.
         let length = lower.chars().count();
         for (suffix, tag) in SUFFIX_RULES {
             // Longer than the suffix it is matched on, counted in characters like
             // every other length in this handler.
             if length > suffix.chars().count() + 1 && lower.ends_with(suffix) {
-                return (tag, SCORE_MORPHOLOGY);
+                readings.support(tag, CUE_MORPHOLOGY);
+                break;
             }
         }
-        ("NOUN", SCORE_DEFAULT_NOUN)
+        if readings.readings.is_empty() {
+            readings.support("NOUN", CUE_OPEN_CLASS);
+            readings.open_class_default = true;
+        }
+        // The residual every open vocabulary leaves: a reading this lexicon does not
+        // carry, reported as the modelled `O` tag if it ever won, which it cannot,
+        // since the cues above always weigh more.
+        readings.support("O", CUE_UNLISTED_READING);
+        readings
     }
 
     /// Whether `word` is a regular `-s`, `-ed` or `-ing` inflection of a verb the
@@ -613,12 +737,95 @@ fn word_end(characters: &[(usize, char)], start: usize) -> usize {
 /// one request carries, never how a document is segmented or tagged, so the two
 /// operations cannot drift apart.
 pub(crate) fn syntax_tokens(text: &str) -> Vec<SyntaxToken> {
+    analyse(text)
+        .into_iter()
+        .enumerate()
+        .map(|(position, analysed)| {
+            let (tag, score) = analysed.readings.reported();
+            SyntaxToken {
+                token_id: Some(position as i32 + 1),
+                text: Some(analysed.text.to_string()),
+                begin_offset: Some(analysed.begin as i32),
+                end_offset: Some(analysed.end as i32),
+                part_of_speech: Some(PartOfSpeechTag {
+                    tag: Some(tag.to_string()),
+                    score: Some(score),
+                }),
+            }
+        })
+        .collect()
+}
+
+/// One analysed token of a document: the span it occupies and the readings its own
+/// evidence and the context it stands in leave it with.
+///
+/// `pub(crate)` beside [`analyse`], because `BatchDetectKeyPhrases` chunks the noun
+/// phrases of its documents out of exactly this analysis: a key phrase and a syntax
+/// token of one document must never come from two analyses that can disagree.
+#[derive(Debug)]
+pub(crate) struct AnalysedToken<'a> {
+    /// The token's own text, a slice of the document.
+    pub(crate) text: &'a str,
+    /// Zero-based CHARACTER offset of the token's first character, which is the scale
+    /// every offset this service reports is on.
+    pub(crate) begin: usize,
+    /// Zero-based character offset one past the token's last character.
+    pub(crate) end: usize,
+    /// Byte offset of the token's first character, for slicing a span of the document
+    /// that covers more than one token out of it.
+    pub(crate) byte_begin: usize,
+    /// Byte offset one past the token's last byte.
+    pub(crate) byte_end: usize,
+    /// The token's lowercased form, for the contextual rules.
+    lowercase: String,
+    readings: Readings,
+}
+
+impl AnalysedToken<'_> {
+    /// The tag this token is reported with.
+    pub(crate) fn tag(&self) -> &'static str {
+        self.readings.reported().0
+    }
+
+    /// The confidence this token's tag is reported with.
+    pub(crate) fn score(&self) -> f32 {
+        self.readings.reported().1
+    }
+}
+
+/// Segment `text` into tokens, read each one's own evidence, and resolve the readings
+/// the context they stand in speaks for or against.
+///
+/// Three contextual rules, each over the readings rather than over a decided tag, so
+/// the confidence a token comes back with says how much the context left to the
+/// reading it overturned:
+///
+/// 1. A noun phrase's head and its modifiers. A verb reading of the word straight
+///    after an article is spoken against by that position and the noun reading is
+///    supported (`the train`, `the running water`); a GERUND or PARTICIPLE standing
+///    between a modifier and a head noun is part of that noun phrase, naming a thing
+///    (`language processing service`) or describing one (`the delayed flight`), while
+///    a finite verb form in the same position is the clause's predicate (`the service
+///    finds insights`) and keeps its reading.
+/// 2. A predicative complement. A participle, or a word no word class claims at all,
+///    standing in the predicate of a form of `be` — straight after it or past the
+///    adverbs between them — with no object and no `by` behind it, is the predicate's
+///    adjective rather than a second verb or a noun (`the flight was delayed`, `the
+///    screen is broken`, `the staff were rude`, `the weather is rather pleasant`) — a
+///    passive, which `by` or an object marks, keeps its verb reading.
+/// 3. An auxiliary. An auxiliary or modal is AUX when it ACCOMPANIES a main verb, as
+///    the modelled tag's own documentation says; standing with no verb behind it, it
+///    IS the clause's main verb and its verb reading is the supported one (`the train
+///    was late`, `I have a car`).
+///
+/// Rule 1 and rule 2 run before rule 3, because whether an auxiliary accompanies a
+/// main verb depends on what the word behind it was resolved to.
+pub(crate) fn analyse(text: &str) -> Vec<AnalysedToken<'_>> {
     let tagger = tagger();
     let characters: Vec<(usize, char)> = text.char_indices().collect();
-    let mut tokens: Vec<SyntaxToken> = Vec::new();
+    let mut tokens: Vec<AnalysedToken<'_>> = Vec::new();
     let mut index = 0usize;
     let mut sentence_initial = true;
-    let mut after_article = false;
 
     while index < characters.len() {
         let (byte, character) = characters[index];
@@ -642,23 +849,127 @@ pub(crate) fn syntax_tokens(text: &str) -> Vec<SyntaxToken> {
         let piece = &text[byte..end_byte];
         index = end;
 
-        let (tag, score) = tagger.tag(piece, sentence_initial, after_article);
+        let readings = tagger.readings(piece, sentence_initial);
         sentence_initial = piece.chars().all(|c| SENTENCE_FINAL.contains(&c));
-        after_article = ARTICLES.contains(&piece.to_lowercase().as_str());
 
-        tokens.push(SyntaxToken {
-            token_id: Some(tokens.len() as i32 + 1),
-            text: Some(piece.to_string()),
-            begin_offset: Some(begin as i32),
-            end_offset: Some(end as i32),
-            part_of_speech: Some(PartOfSpeechTag {
-                tag: Some(tag.to_string()),
-                score: Some(score),
-            }),
+        tokens.push(AnalysedToken {
+            text: piece,
+            begin,
+            end,
+            byte_begin: byte,
+            byte_end: end_byte,
+            lowercase: piece.to_lowercase(),
+            readings,
         });
     }
 
+    resolve_noun_phrases(&mut tokens);
+    resolve_auxiliaries(&mut tokens);
     tokens
+}
+
+/// Rules 1 and 2 of [`analyse`], left to right: a resolved token is the context the
+/// next one is read in.
+fn resolve_noun_phrases(tokens: &mut [AnalysedToken<'_>]) {
+    for position in 0..tokens.len() {
+        let tag = tokens[position].tag();
+        // Rule 1 is about a verb reading; rule 2 also covers a word no word class
+        // claims at all, which in the predicate of a copula is its adjective.
+        let open_class = tokens[position].readings.open_class_default;
+        if tag != "VERB" && !open_class {
+            continue;
+        }
+        let previous = position
+            .checked_sub(1)
+            .map(|before| (tokens[before].tag(), tokens[before].lowercase.clone()));
+        let next = tokens
+            .get(position + 1)
+            .map(|after| (after.tag(), after.lowercase.clone()));
+        let (previous_tag, previous_word) = match previous {
+            // A verb opening a document stands after nothing.
+            None => continue,
+            Some(previous) => previous,
+        };
+        // The word carrying the predicate, past the adverbs standing between it and
+        // this one (`is rather pleasant`, `was very delayed`).
+        let mut before = position;
+        while before > 0 && AUXILIARY_SKIPPABLE_TAGS.contains(&tokens[before - 1].tag()) {
+            before -= 1;
+        }
+        let predicate_of = before
+            .checked_sub(1)
+            .map(|copula| tokens[copula].lowercase.clone())
+            .is_some_and(|word| COPULA_FORMS.contains(&word.as_str()));
+        let predicative = predicate_of
+            && (open_class
+                || PARTICIPLE_ENDINGS
+                    .iter()
+                    .any(|ending| tokens[position].lowercase.ends_with(ending)))
+            && next.as_ref().is_none_or(|(tag, word)| {
+                // An object or a `by` phrase behind it makes it a passive verb or a
+                // predicate noun rather than the predicate's adjective.
+                word != "by"
+                    && !NOUN_PHRASE_HEAD_TAGS.contains(tag)
+                    && *tag != "DET"
+                    && *tag != "PRON"
+            });
+        if predicative {
+            tokens[position].readings.contradict("VERB");
+            tokens[position].readings.contradict("NOUN");
+            tokens[position].readings.support("ADJ", CUE_CONTEXT);
+            continue;
+        }
+        if tag != "VERB" {
+            continue;
+        }
+        // A gerund or a participle standing between a modifier and a head noun is
+        // part of that noun phrase rather than its clause's verb: the `-ing` form
+        // names a thing (`language processing service`) and the `-ed` form describes
+        // one (`the delayed flight`). A FINITE verb form in the same position is the
+        // clause's predicate (`the service finds insights`), so it keeps its reading.
+        let nominal_modifier = NOUN_PHRASE_MODIFIER_TAGS.contains(&previous_tag)
+            && next.is_some_and(|(tag, _)| NOUN_PHRASE_HEAD_TAGS.contains(&tag));
+        let gerund = tokens[position].lowercase.ends_with(GERUND_ENDING);
+        let participle = PARTICIPLE_ENDINGS
+            .iter()
+            .any(|ending| tokens[position].lowercase.ends_with(ending));
+        if ARTICLES.contains(&previous_word.as_str()) {
+            // An article opens a noun phrase, so the word it opens heads one.
+            tokens[position].readings.contradict("VERB");
+            tokens[position].readings.support("NOUN", CUE_CONTEXT);
+        } else if nominal_modifier && (gerund || participle) {
+            tokens[position].readings.contradict("VERB");
+            tokens[position]
+                .readings
+                .support(if gerund { "NOUN" } else { "ADJ" }, CUE_CONTEXT);
+        }
+    }
+}
+
+/// Rule 3 of [`analyse`]: an auxiliary accompanies a main verb, or it is one.
+fn resolve_auxiliaries(tokens: &mut [AnalysedToken<'_>]) {
+    for position in 0..tokens.len() {
+        if !AUXILIARIES.contains(&tokens[position].lowercase.as_str()) {
+            continue;
+        }
+        // The word that would be the main verb, past the adverbs and the negator an
+        // auxiliary can carry before it.
+        let mut behind = position + 1;
+        while behind < tokens.len() && AUXILIARY_SKIPPABLE_TAGS.contains(&tokens[behind].tag()) {
+            behind += 1;
+        }
+        let accompanies = tokens
+            .get(behind)
+            .is_some_and(|candidate| candidate.tag() == "VERB");
+        let readings = &mut tokens[position].readings;
+        if accompanies {
+            readings.support("AUX", CUE_CONTEXT);
+            readings.contradict("VERB");
+        } else {
+            readings.support("VERB", CUE_CONTEXT);
+            readings.contradict("AUX");
+        }
+    }
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
