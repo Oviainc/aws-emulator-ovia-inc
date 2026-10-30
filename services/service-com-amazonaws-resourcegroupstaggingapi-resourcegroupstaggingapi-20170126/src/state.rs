@@ -380,14 +380,19 @@ pub fn parse_arn(arn: &str) -> Option<ParsedArn> {
 /// nothing — which is a per-resource `FailedResourcesMap` entry:
 ///
 /// * the value is not an ARN at all ("A provided string parameter is
-///   malformed");
+///   malformed"), reported by [`not_an_arn_message`];
 /// * its partition is not the one the operation was invoked in ("The partition
 ///   specified in an ARN parameter in the request doesn't match the partition
 ///   where you invoked the operation");
-/// * its region is another one: "You can only tag resources that are located in
-///   the specified Amazon Web Services Region" (`TagResources` documentation),
-///   and this endpoint serves exactly one.
-pub fn addressable_arn(value: &str, region: &str) -> Result<ParsedArn, String> {
+/// * its region is another one — "You can only tag resources that are located
+///   in the specified Amazon Web Services Region" (`TagResources`
+///   documentation) and this endpoint serves exactly one — reported by
+///   [`region_mismatch_message`].
+///
+/// `operation` is the name of the operation being invoked, which the
+/// region-mismatch message names — so each caller passes its own
+/// `Operation::NAME` rather than a literal.
+pub fn addressable_arn(value: &str, region: &str, operation: &str) -> Result<ParsedArn, String> {
     let Some(parsed) = parse_arn(value) else {
         return Err(not_an_arn_message(value));
     };
@@ -398,18 +403,32 @@ pub fn addressable_arn(value: &str, region: &str) -> Result<ParsedArn, String> {
         ));
     }
     if !parsed.region.is_empty() && parsed.region != region {
-        return Err(format!(
-            "ResourceARNList contains an ARN in a Region other than {region}, which this \
-             request was made in: {value}"
-        ));
+        return Err(region_mismatch_message(value, operation));
     }
     Ok(parsed)
 }
 
-/// The `InvalidParameterException` message for a `ResourceARNList` value that is
-/// not an ARN: it names the member and what was wrong with it.
+/// The `InvalidParameterException` message for an ARN-list value that cannot be
+/// parsed as an ARN.
+///
+/// The offending value comes first and the rest is fixed text: the service
+/// reports the value it could not parse, not the member it arrived in, so the
+/// same text serves every ARN-list parameter of every operation here.
 pub fn not_an_arn_message(value: &str) -> String {
-    format!("ResourceARNList contains a value that is not an Amazon Resource Name: {value}")
+    format!("{value} is not a valid AmazonResourceName (ARN)")
+}
+
+/// The `InvalidParameterException` message for an ARN whose region field is not
+/// the region the call was invoked in.
+///
+/// The two variable parts are the offending ARN, echoed as the request wrote it,
+/// and the invoked operation's name — not the endpoint's region, which the
+/// message does not state.
+pub fn region_mismatch_message(value: &str, operation: &str) -> String {
+    format!(
+        "Region in the ARN {value} does not match with the region in which {operation} API is \
+         invoked"
+    )
 }
 
 /// Whether `key` is in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace.

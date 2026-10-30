@@ -218,7 +218,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut addressed: Vec<crate::state::ParsedArn> =
             Vec::with_capacity(input.resource_arn_list.len());
         for arn in &input.resource_arn_list {
-            addressed.push(crate::state::addressable_arn(arn, &region).map_err(invalid)?);
+            addressed.push(
+                crate::state::addressable_arn(arn, &region, Self::NAME).map_err(invalid)?,
+            );
         }
         if input
             .tags

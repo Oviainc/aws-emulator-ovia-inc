@@ -33,3 +33,6 @@ mod apigateway_tagged_resource_index;
 
 #[path = "all/sfn_tagged_resource_index.rs"]
 mod sfn_tagged_resource_index;
+
+#[path = "all/arn_parameter_refusal_wording.rs"]
+mod arn_parameter_refusal_wording;
