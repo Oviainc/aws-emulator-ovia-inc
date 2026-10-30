@@ -2,12 +2,12 @@
 
 //! Engine state for the com-amazonaws-rolesanywhere-rolesanywhere service.
 //!
-//! The trust-anchor and profile lifecycle (`CreateTrustAnchor`, `GetTrustAnchor`,
-//! `ListTrustAnchors`, `DeleteTrustAnchor`, `CreateProfile`, `GetProfile`,
-//! `ListProfiles`, `DeleteProfile`) is backed entirely by the two maps below, so a
-//! create is visible to the next request on the same engine. The record types and
-//! their projections live here rather than in a handler because four operations reach
-//! each of them.
+//! The trust-anchor, profile and certificate-revocation-list lifecycles
+//! (`CreateTrustAnchor`, `GetTrustAnchor`, `ListTrustAnchors`, `DeleteTrustAnchor`,
+//! `CreateProfile`, `GetProfile`, `ListProfiles`, `DeleteProfile`, `ImportCrl`,
+//! `GetCrl`) are backed entirely by the maps below, so a write is visible to the next
+//! request on the same engine. The record types and their projections live here rather
+//! than in a handler because several operations reach each of them.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -15,8 +15,8 @@ use std::time::SystemTime;
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AttributeMapping, NotificationSetting, NotificationSettingDetail, ProfileDetail, Source, Tag,
-    TrustAnchorDetail,
+    AttributeMapping, CrlDetail, NotificationSetting, NotificationSettingDetail, ProfileDetail,
+    Source, Tag, TrustAnchorDetail,
 };
 
 /// The ARN service namespace (`OPERATIONS.md`: "ARN namespace: `rolesanywhere`").
@@ -39,19 +39,24 @@ pub const DEFAULT_PROFILE_DURATION_SECONDS: i32 = 3600;
 /// response; a caller that wants more pages the rest with `nextToken`.
 pub const MAX_PAGE_SIZE: i32 = 100;
 
-/// The most trust anchors, and the most profiles, this emulator holds.
+/// The most trust anchors, the most profiles, and the most certificate revocation
+/// lists this emulator holds.
 ///
-/// Both stores live for the process's lifetime and grow only on a create, and neither
-/// resource can be given a TTL or evicted: a `GetTrustAnchor` / `GetProfile` has to
-/// keep answering with what its create returned, so dropping a record would be a
-/// divergence rather than a cleanup. A maximum entry count, refused on the create path,
+/// Every store lives for the process's lifetime and grows only on a create, and none of
+/// these resources can be given a TTL or evicted: a `GetTrustAnchor` / `GetProfile` /
+/// `GetCrl` has to keep answering with what its create returned, so dropping a record
+/// would be a divergence rather than a cleanup. A maximum entry count, refused on the create path,
 /// is therefore the bound available here — the same construct this workspace's other
 /// services use (`MAX_CHANNELS`, `MAX_STORED_CASES`). It sits far above any realistic
-/// client workflow, so a caller never meets it by accident. Neither operation models a
-/// quota error, so the refusal is their modelled `ValidationException`.
+/// client workflow, so a caller never meets it by accident. None of these operations
+/// models a quota error, so the refusal is their modelled `ValidationException`.
 pub const MAX_TRUST_ANCHORS: usize = 10_000;
 /// See [`MAX_TRUST_ANCHORS`].
 pub const MAX_PROFILES: usize = 10_000;
+/// See [`MAX_TRUST_ANCHORS`]. A CRL record also holds the imported `crlData`, whose own
+/// size the modelled `Blob` `@length(1, 300000)` already caps per request, so this count
+/// is what bounds the PRODUCT — the bytes every stored CRL can add up to.
+pub const MAX_CRLS: usize = 1_000;
 
 /// The `sourceType` values a trust anchor can carry whose certificate data member the
 /// model names: `x509CertificateData` is "Included for trust anchors of type
@@ -89,6 +94,45 @@ impl TrustAnchorRecord {
             created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
             updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
             notification_settings: Some(self.notification_settings.clone()),
+        }
+    }
+}
+
+/// One stored certificate revocation list. Every `CrlDetail` member this service can
+/// know about is persisted here; [`Self::to_detail`] is the only place a response is
+/// built from it.
+#[derive(Debug, Clone)]
+pub struct CrlRecord {
+    pub crl_id: String,
+    pub crl_arn: String,
+    pub name: String,
+    pub enabled: bool,
+    /// The PEM bytes the import (or a later update) carried, stored verbatim: `crlData`
+    /// is "The state of the certificate revocation list (CRL) after a read or write
+    /// operation" (`smithy_query(query="shape", shape="CrlDetail")`), so a read returns
+    /// exactly the bytes that were written.
+    pub crl_data: Vec<u8>,
+    pub trust_anchor_arn: String,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    /// Tags the import carried. `CrlDetail` models no tag member, so they are reachable
+    /// only through `ListTagsForResource` (still a stub, tracked by its own issue) and
+    /// are kept here rather than dropped.
+    pub tags: Vec<Tag>,
+}
+
+impl CrlRecord {
+    /// The `CrlDetail` every CRL operation returns.
+    pub fn to_detail(&self) -> CrlDetail {
+        CrlDetail {
+            crl_id: Some(self.crl_id.clone()),
+            crl_arn: Some(self.crl_arn.clone()),
+            name: Some(self.name.clone()),
+            enabled: Some(self.enabled),
+            crl_data: Some(self.crl_data.clone()),
+            trust_anchor_arn: Some(self.trust_anchor_arn.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
         }
     }
 }
@@ -142,7 +186,7 @@ impl ProfileRecord {
 
 /// Per-service state for com-amazonaws-rolesanywhere-rolesanywhere. A handler reaches it through [`service_state`].
 ///
-/// Both maps are `BTreeMap`s keyed by the resource's `Uuid`, so iteration order is a
+/// Every map is a `BTreeMap` keyed by the resource's `Uuid`, so iteration order is a
 /// stable total order and the `@paginated` list operations can resume from an opaque
 /// cursor without keeping a server-side token table.
 #[derive(Debug, Default)]
@@ -151,6 +195,8 @@ pub struct ComAmazonawsRolesanywhereRolesanywhereState {
     pub trust_anchors: BTreeMap<String, TrustAnchorRecord>,
     /// Every stored profile, keyed by its `profileId`.
     pub profiles: BTreeMap<String, ProfileRecord>,
+    /// Every stored certificate revocation list, keyed by its `crlId`.
+    pub crls: BTreeMap<String, CrlRecord>,
     /// Monotonic input to [`Self::mint_uuid`]; never returned to a caller.
     id_counter: u64,
 }
@@ -158,7 +204,7 @@ pub struct ComAmazonawsRolesanywhereRolesanywhereState {
 impl ComAmazonawsRolesanywhereRolesanywhereState {
     /// A fresh resource id in the modelled `Uuid` form
     /// (`@length(36, 36)` + `@pattern("[a-f0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}")`),
-    /// unused by any stored trust anchor or profile.
+    /// unused by any stored trust anchor, profile or certificate revocation list.
     ///
     /// Derived from a per-store counter and the wall clock — never from the request —
     /// so two identical requests still get distinct ids. Every character is lowercase
@@ -181,7 +227,10 @@ impl ComAmazonawsRolesanywhereRolesanywhereState {
                 &hex[16..20],
                 &hex[20..32]
             );
-            if !self.trust_anchors.contains_key(&id) && !self.profiles.contains_key(&id) {
+            if !self.trust_anchors.contains_key(&id)
+                && !self.profiles.contains_key(&id)
+                && !self.crls.contains_key(&id)
+            {
                 return id;
             }
         }
