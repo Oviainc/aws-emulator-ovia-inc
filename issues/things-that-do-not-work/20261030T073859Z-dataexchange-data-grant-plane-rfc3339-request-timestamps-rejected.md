@@ -1,0 +1,52 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: dataexchange.accept-data-grant-wrong-caller-rejected dataexchange.data-grant-create-reflects-pending-state dataexchange.data-grant-delete-removes-grant dataexchange.update-revoked-revision-rejected dataexchange.revoke-revision-not-in-grant-rejected
+Issue-Shape-Id: com.amazonaws.dataexchange#DataExchange
+Issue-Key: dataexchange|CreateDataGrant|ValidationException
+Issue-Key: dataexchange.revoke-revision-not-in-grant-rejected|run#7|AssertionError|assert code == "ConflictException", f"expected ConflictException, got {code}"
+Issue-Commit: 99a6bf4e8a9dd64f73b61f622317c845b92ac2b7
+
+# DataExchange data-grant plane: RFC3339 request timestamps rejected as ints, and CreateDataGrant/RevokeRevision answer 501
+
+> _Note: this issue was identified against the code base at commit `99a6bf4e8a9dd64f73b61f622317c845b92ac2b7`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateDataGrant
+
+## Description
+Three distinct root causes in the com.amazonaws.dataexchange emulator, all on the data-grant / revision-revocation surface. Related but DIFFERENT open issues: 20261029T172356Z-dataexchange-serializes-every-date-time-member-as-an.md covers date-time members on the RESPONSE side (serialization); Cause 1 below is the REQUEST side (deserialization) and is not covered by it. 20261029T183418Z-dataexchange-deleterevision-stub.md and -startjob-stub.md cover other operations' stubs, not these two.
+
+Cause 1 of 3 — a `date-time` timestamp in a REST-JSON request body is rejected as a malformed integer (CreateDataGrant.EndsAt). Failing checks: dataexchange.accept-data-grant-wrong-caller-rejected, dataexchange.data-grant-create-reflects-pending-state, dataexchange.data-grant-delete-removes-grant, dataexchange.update-revoked-revision-rejected.
+AWS: Smithy — CreateDataGrant input member `EndsAt` targets `Timestamp` with `timestampFormat: date-time`, so an AWS SDK puts it in the JSON body as an RFC3339/ISO-8601 string (e.g. "2026-11-28T12:00:00Z"), not as an epoch number. AWS accepts that representation and answers HTTP 201 with the CreateDataGrantResponse; `ValidationException` (HTTP 400, modeled on this operation) is reserved for genuinely invalid input.
+Emulator: every CreateDataGrant call made by a stock botocore client is refused before the handler runs with HTTP 400 `ValidationException`, message `invalid timestamp: failed to parse int`. Fixed text of that message is the emulator's own prose ("invalid timestamp: failed to parse int"); it contains no values from the request and names no member — AWS would neither word it that way nor reject this input at all. The whole data-grant plane is therefore unreachable from a normal SDK.
+Why: a client that passes a datetime for `EndsAt` — the only thing botocore can send for a `date-time` member — can never create a data grant; it sees a spurious client-side validation error and cannot work around it, because the serialization is fixed by the model.
+Fix: the request deserializer's timestamp decoding for body members (the shared smithy_server_runtime / aws-smithy-schema JSON deserialization path used by this service's generated input schema, CREATE_DATA_GRANT_INPUT_SCHEMA): honour the member's `timestampFormat` trait (date-time -> parse RFC3339) instead of unconditionally parsing an integer epoch, and only raise ValidationException when the value really does not parse.
+
+Cause 2 of 3 — CreateDataGrant is an unimplemented scaffold stub, so the whole grant lifecycle is absent. Failing checks: dataexchange.data-grant-create-reflects-pending-state, dataexchange.data-grant-delete-removes-grant, dataexchange.accept-data-grant-wrong-caller-rejected.
+AWS: Smithy — CreateDataGrant POST /v1/data-grants, success status 201, response requires Id, Arn, Name, SenderPrincipal, ReceiverPrincipal, AcceptanceState, GrantDistributionScope, DataSetId, SourceDataSetId, CreatedAt, UpdatedAt. A freshly created grant has AcceptanceState `PENDING_RECEIVER_ACCEPTANCE`, SenderPrincipal = the calling account, and NO `AcceptedAt` member; GetDataGrant (GET /v1/data-grants/{DataGrantId}) reads back the same state and SourceDataSetId; DeleteDataGrant is 204 and a subsequent GetDataGrant is `ResourceNotFoundException` (HTTP 404). AcceptDataGrant (POST /v1/data-grants/{DataGrantArn}/accept) moves a grant whose ReceiverPrincipal equals the caller to `ACCEPTED` and stamps AcceptedAt; called by a NON-receiver it is refused with `ResourceNotFoundException` (HTTP 404), message "The requested resource was not found." (fixed text, no variable parts), and the grant stays `PENDING_RECEIVER_ACCEPTANCE` with no AcceptedAt.
+Emulator: once Cause 1 no longer blocks the request, CreateDataGrant answers HTTP 501 `NotImplemented` with message "operation CreateDataGrant is scaffolded but not implemented in this emulator" — the handler body is still the scaffold `Err(Scaffolded::not_implemented("CreateDataGrant"))`.
+Why: no client can create, read, accept or delete a data grant, and nothing that depends on a grant (revision revocation, grant-scoped access) can be exercised; a 501 is not a status any modeled client path handles.
+Fix: implement the operation's handler and the grant records in this service's state (create -> PENDING_RECEIVER_ACCEPTANCE + SenderPrincipal from the caller identity, no AcceptedAt; Get/Delete/Accept reading and mutating the same record, with the receiver-identity check driving the 404 refusal above).
+Traces: services/service-com-amazonaws-dataexchange-dataexchange/src/ops/create_data_grant.rs:192 (and the sibling accept_data_grant / get_data_grant / delete_data_grant handlers).
+
+Cause 3 of 3 — RevokeRevision is an unimplemented scaffold stub, so a revision that is in no data product or grant is NOT refused. Failing check: dataexchange.revoke-revision-not-in-grant-rejected.
+AWS: Smithy — RevokeRevision POST /v1/data-sets/{DataSetId}/revisions/{RevisionId}/revoke, success 200, models `ConflictException` (HTTP 409). A finalized revision that is included in no data product and no data grant is refused with ConflictException, message "Can only revoke a Revision that is included in a data product or data grant." (entirely fixed text), and the revision stays `Revoked: false`. Once the revision's data set backs a data grant, the same call succeeds (200) and GetRevision reports Revoked: true (plus RevokedAt and RevocationComment). A revoked revision is then immutable: UpdateRevision on it is refused with ConflictException and message "Cannot take action on a Finalized Revision." and the stored Comment is unchanged.
+Emulator: RevokeRevision answers HTTP 501 with error code `NotImplemented` and message "operation RevokeRevision is scaffolded but not implemented in this emulator" for every call — the check asserting the ConflictException refusal observes code `NotImplemented` instead.
+Why: a client cannot revoke a revision at all, and the overly-permissive direction is worse once implemented naively — code that relies on AWS refusing a revoke of an ungranted revision gets no refusal to key on, and the post-revoke immutability of UpdateRevision is likewise unverifiable.
+Fix: implement the operation's handler plus the revoked/revoked-at fields on the revision record in this service's state, including the inclusion-in-product-or-grant precondition and the ConflictException wording above, and the corresponding ConflictException in UpdateRevision for an already-revoked/finalized revision.
+Traces: services/service-com-amazonaws-dataexchange-dataexchange/src/ops/revoke_revision.rs (SCAFFOLDED marker at line 4).
+
+## Evidence
+Cause 1 — expected: HTTP 201 CreateDataGrantResponse for `EndsAt` sent as an RFC3339 string (botocore's only encoding for a `date-time` member). Actual, from the replay of 4 checks: `botocore.errorfactory.ValidationException: An error occurred (ValidationException) when calling the CreateDataGrant operation: invalid timestamp: failed to parse int` (HTTP 400), raised before the handler.
+
+Cause 2 — expected: grant['AcceptanceState'] == 'PENDING_RECEIVER_ACCEPTANCE', grant['SenderPrincipal'] == the caller's account, no 'AcceptedAt'; GetDataGrant reflects the same; a non-receiver AcceptDataGrant -> ResourceNotFoundException / "The requested resource was not found." with the grant still PENDING_RECEIVER_ACCEPTANCE. Actual: HTTP 501 `NotImplemented`, "operation CreateDataGrant is scaffolded but not implemented in this emulator"; handler is the scaffold Err(...) at create_data_grant.rs:192.
+
+Cause 3 — expected: ConflictException (HTTP 409) with message "Can only revoke a Revision that is included in a data product or data grant.", revision still Revoked=false; then a successful revoke after a grant exists. Actual: `AssertionError: expected ConflictException, got NotImplemented` (check_dataexchange_revoke_revision_not_in_grant_rejected.py line 41), i.e. HTTP 501 "operation RevokeRevision is scaffolded but not implemented in this emulator".
+
+## Steps to Reproduce
+1. Boot the emulator and point a botocore `dataexchange` client at it.
+2. Cause 1: create and finalize a data set, then call CreateDataGrant(Name=..., GrantDistributionScope='NONE', ReceiverPrincipal='111122223333', SourceDataSetId=<id>, EndsAt=datetime.now(timezone.utc)+timedelta(days=30)). Observe HTTP 400 ValidationException "invalid timestamp: failed to parse int" instead of a 201 response.
+3. Cause 2: with the timestamp accepted (e.g. omit EndsAt, or fix Cause 1), repeat the CreateDataGrant call and then GetDataGrant / AcceptDataGrant / DeleteDataGrant. Observe HTTP 501 NotImplemented rather than a PENDING_RECEIVER_ACCEPTANCE grant, and no ResourceNotFoundException path for a non-receiver accept.
+4. Cause 3: create a data set and revision, import an asset via the signed URL, UpdateRevision(Finalized=True), then RevokeRevision(DataSetId=..., RevisionId=..., RevocationComment='not yet grantable'). Observe error code NotImplemented (HTTP 501) instead of ConflictException 409 "Can only revoke a Revision that is included in a data product or data grant."
+5. Re-replay dataexchange.data-grant-create-reflects-pending-state, dataexchange.data-grant-delete-removes-grant, dataexchange.accept-data-grant-wrong-caller-rejected, dataexchange.update-revoked-revision-rejected and dataexchange.revoke-revision-not-in-grant-rejected to confirm.
