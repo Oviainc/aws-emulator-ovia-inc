@@ -80,6 +80,24 @@ pub fn channel_engine_version_label(release: usize) -> String {
     format!("{CHANNEL_ENGINE_VERSION_SERIES}.{release}.0")
 }
 
+/// The `ChannelEngineVersionRequest$Version` value that is not a build
+/// identifier but a reset: "The build identifier of the engine version to use
+/// for this channel. Specify 'DEFAULT' to reset to the default version."
+pub const DEFAULT_ENGINE_VERSION: &str = "DEFAULT";
+
+/// The engine version a channel is PINNED to after a request asked for the build
+/// identifier `version`, for every operation that writes the pin from a
+/// `ChannelEngineVersionRequest`.
+///
+/// The documented reset value is not a build identifier a channel can run on, so
+/// asking for it un-pins the channel — the state a channel that named no engine
+/// version at all is in, and the one the default version is served from — rather
+/// than storing the literal the caller typed as the channel's pinned build. Any
+/// other value is the build identifier the caller pinned and is stored as given.
+pub fn requested_engine_version_pin(version: String) -> Option<String> {
+    (version != DEFAULT_ENGINE_VERSION).then_some(version)
+}
+
 /// One engine version of the account's catalogue: the build identifier it is named
 /// by, when it was released and when it expires.
 ///

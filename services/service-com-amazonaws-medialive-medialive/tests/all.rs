@@ -44,6 +44,9 @@ mod channel_configuration_validation;
 #[path = "all/channel_engine_version_expiry.rs"]
 mod channel_engine_version_expiry;
 
+#[path = "all/channel_engine_version_pin.rs"]
+mod channel_engine_version_pin;
+
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
 

@@ -400,15 +400,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             apply_maintenance(&mut channel.maintenance, maintenance);
         }
         if let Some(version) = input.channel_engine_version.and_then(|version| version.version) {
-            // "Specify 'DEFAULT' to reset to the default version": the reset
-            // un-pins the channel, which is the state a channel created without
-            // an engine version is in, so the stored pin is cleared rather than
-            // being set to the literal the caller typed.
-            channel.channel_engine_version = if version == DEFAULT_ENGINE_VERSION {
-                None
-            } else {
-                Some(version)
-            };
+            // The requested build identifier decides the stored pin through the
+            // one helper every writer of this member goes through, so a reset
+            // means the same thing here as it does on a create.
+            channel.channel_engine_version = crate::state::requested_engine_version_pin(version);
         }
         // `RoleArn`'s own documentation makes it the one member an OMISSION
         // writes: "If you do not specify this on an update call but the role was
@@ -430,10 +425,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The `ChannelEngineVersionRequest$Version` value that is not a build
-/// identifier but a reset: "Specify 'DEFAULT' to reset to the default version".
-const DEFAULT_ENGINE_VERSION: &str = "DEFAULT";
 
 /// Apply a `MaintenanceUpdateSettings` patch to a channel's stored
 /// `MaintenanceStatus`.

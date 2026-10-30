@@ -324,8 +324,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         channel.linked_channel_settings = input.linked_channel_settings;
         channel.inference_settings = input.inference_settings;
         channel.vpc = input.vpc;
-        channel.channel_engine_version =
-            input.channel_engine_version.and_then(|version| version.version);
+        // The requested build identifier decides the stored pin through the one
+        // helper every writer of this member goes through: the documented reset
+        // value is not a build to pin but a request to un-pin, which leaves the
+        // channel in the state one created with no engine version is in.
+        channel.channel_engine_version = input
+            .channel_engine_version
+            .and_then(|version| version.version)
+            .and_then(crate::state::requested_engine_version_pin);
 
         state.channels.insert(id.clone(), channel);
         // The channel's pipelines now exist, so each gets the public address its

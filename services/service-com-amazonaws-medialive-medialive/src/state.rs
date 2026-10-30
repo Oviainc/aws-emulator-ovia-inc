@@ -498,8 +498,9 @@ pub use reservations::{
 pub mod engine_versions;
 
 pub use engine_versions::{
-    channel_engine_version_label, ChannelEngineVersionCatalog, ChannelEngineVersionRecord,
-    CHANNEL_ENGINE_VERSION_COUNT, CHANNEL_ENGINE_VERSION_INTERVAL, CHANNEL_ENGINE_VERSION_LIFETIME,
+    channel_engine_version_label, requested_engine_version_pin, ChannelEngineVersionCatalog,
+    ChannelEngineVersionRecord, CHANNEL_ENGINE_VERSION_COUNT, CHANNEL_ENGINE_VERSION_INTERVAL,
+    CHANNEL_ENGINE_VERSION_LIFETIME, DEFAULT_ENGINE_VERSION,
 };
 
 /// The `ChannelState` enum values this slice uses, spelled exactly as the model
