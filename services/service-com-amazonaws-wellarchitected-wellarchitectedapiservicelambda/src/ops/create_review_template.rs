@@ -227,7 +227,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "Lenses": crate::state::lens_identities(&lenses),
             "Notes": &input.notes,
             "Tags": &tags,
-            "TemplateName": &input.template_name,
+            // The name as the NAME it names rather than as the spelling it was named by
+            // (`crate::state::normalize_unique_name`): a review template's name is one name
+            // in the account however a request spells it, which is the comparison this
+            // create is metered for uniqueness by, so a retry that spells it the other way
+            // is the same request.
+            "TemplateName": crate::state::normalize_unique_name(&input.template_name),
         }));
         let region = crate::state::request_region(ctx.parts());
 

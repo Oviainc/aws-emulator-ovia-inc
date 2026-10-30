@@ -8227,6 +8227,14 @@ fn take_share<R>(
 /// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::review_template_holding_name`])
 /// and a milestone name within its workload (through
 /// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::milestone_holding_name`]).
+///
+/// It is also the form such a name takes inside a [`parameter_fingerprint`]: "if you retry
+/// a request with the same client request token and the same parameters after the original
+/// request has completed successfully, the result of the original request is returned"
+/// (`ClientRequestToken` doc), and the parameter a loosely-metered name carries is the NAME
+/// it names rather than the spelling it was named by — the identity this comparison decides
+/// — so a retry that spells it the other way carries the SAME parameters and replays
+/// instead of being refused as a different request.
 pub fn normalize_unique_name(name: &str) -> String {
     name.chars()
         .filter(|c| !c.is_whitespace())

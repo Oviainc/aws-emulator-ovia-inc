@@ -345,6 +345,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // names none falls back to the framework's own order.
             &[],
         );
+        // The workload's name as the service COMPARES it, which is also what the name
+        // index below is keyed by: "spaces and capitalization are ignored when checking for
+        // uniqueness" (`WorkloadName` doc), so one spelling of a name is one workload name.
+        let normalized_name = crate::state::normalize_unique_name(&input.workload_name);
         let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
             "AccountIds": &account_ids,
             "Applications": &applications,
@@ -380,11 +384,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // under one `ClientRequestToken`.
             "ReviewTemplateArns": &review_template_arns,
             "Tags": &tags,
-            "WorkloadName": &input.workload_name,
+            // The name as the NAME it names rather than as the spelling it was named by
+            // (`normalized_name` above): a workload name is one name in the account however
+            // a request spells it, which is the comparison this create is metered for
+            // uniqueness by, so a retry that spells it the other way is the same request.
+            "WorkloadName": &normalized_name,
         }));
 
         let region = crate::state::request_region(ctx.parts());
-        let normalized_name = crate::state::normalize_unique_name(&input.workload_name);
 
         let mut store = state.lock();
 

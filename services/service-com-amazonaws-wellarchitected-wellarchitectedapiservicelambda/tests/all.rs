@@ -478,3 +478,8 @@ mod workload_ftr_support;
 // are appended here so a new suite does not collide with another insertion.
 #[path = "all/workload_lens_list_projections.rs"]
 mod workload_lens_list_projections;
+
+// Appended at the end of this list for the same reason as the declaration above: modules
+// are appended here so a new suite does not collide with another insertion.
+#[path = "all/unique_name_token_identity.rs"]
+mod unique_name_token_identity;

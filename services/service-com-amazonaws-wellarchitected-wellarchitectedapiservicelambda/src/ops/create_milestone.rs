@@ -168,8 +168,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // `ClientRequestToken` is the `@idempotencyToken` whose rule is "if you retry a
+        // request with the same client request token and the same parameters after the
+        // original request has completed successfully, the result of the original request
+        // is returned" (its own doc). The parameters besides the token are the two this
+        // request carries, with the milestone name taken as the NAME it names rather than
+        // as the spelling it was named by (`crate::state::normalize_unique_name`): a
+        // milestone name is one name within its workload however a request spells it —
+        // which is what the uniqueness this handler is refused by compares — so a retry
+        // that spells it the other way is the same request and replays.
         let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
-            "MilestoneName": &input.milestone_name,
+            "MilestoneName": crate::state::normalize_unique_name(&input.milestone_name),
             "WorkloadId": &input.workload_id,
         }));
 

@@ -195,8 +195,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // at and what the workload's `UpdatedAt` moves to, read once so both carry one
         // reading of the clock.
         let now = std::time::SystemTime::now();
+        // The parameters a retry is compared on, with the milestone name taken as the NAME
+        // it names rather than as the spelling it was named by
+        // (`crate::state::normalize_unique_name`): a milestone name is one name within its
+        // workload however a request spells it, which is the comparison the milestone this
+        // request records is metered for uniqueness by, so a retry that spells it the other
+        // way is the same request and replays. A request naming no milestone carries no
+        // name, which is itself a parameter a retry has to match.
         let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
-            "MilestoneName": &input.milestone_name,
+            "MilestoneName": input
+                .milestone_name
+                .as_deref()
+                .map(crate::state::normalize_unique_name),
             "ProfileArn": &input.profile_arn,
             "WorkloadId": &input.workload_id,
         }));

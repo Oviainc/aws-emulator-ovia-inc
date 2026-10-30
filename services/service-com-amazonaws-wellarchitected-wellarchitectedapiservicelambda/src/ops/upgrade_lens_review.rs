@@ -216,10 +216,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request carries, with the lens taken as the review it names rather than as the
         // spelling it was named by — a lens review is one review however the request spells
         // its lens (`crate::state::lens_alias`), so a retry that names it the other way is
-        // the same request.
+        // the same request. The milestone name is taken the same way, as the NAME it names
+        // rather than as the spelling it was named by
+        // (`crate::state::normalize_unique_name`): a milestone name is one name within its
+        // workload however a request spells it, which is the comparison the milestone this
+        // request records is metered for uniqueness by.
         let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
             "LensAlias": crate::state::lens_alias(&input.lens_alias),
-            "MilestoneName": &input.milestone_name,
+            "MilestoneName": crate::state::normalize_unique_name(&input.milestone_name),
             "WorkloadId": &input.workload_id,
         }));
 
