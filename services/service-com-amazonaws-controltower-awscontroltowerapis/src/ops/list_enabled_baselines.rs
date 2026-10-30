@@ -280,18 +280,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn: enabled_baseline.arn.clone(),
                 baseline_identifier: enabled_baseline.baseline_identifier.clone(),
                 baseline_version: Some(enabled_baseline.baseline_version.clone()),
-                // The drift summary `GetEnabledBaseline` reports for the same resource,
-                // read from the same stored status: absent when no inheritance drift is
-                // assessed for the enablement.
-                drift_status_summary: enabled_baseline.inheritance_drift_status.map(|status| {
-                    EnabledBaselineDriftStatusSummary {
-                        types: Some(EnabledBaselineDriftTypes {
-                            inheritance: Some(EnabledBaselineInheritanceDrift {
-                                status: Some(status.as_wire().to_string()),
-                            }),
-                        }),
-                    }
-                }),
+                // The same projection `GetEnabledBaseline` reports the member through, so
+                // the listing and the detail cannot disagree about one stored record.
+                drift_status_summary: enabled_baseline.drift_status_summary(),
                 target_identifier: enabled_baseline.target_identifier.clone(),
                 // The enablement this one inherited its configuration from, read off the
                 // same stored member `GetEnabledBaseline` reports: absent for an enablement

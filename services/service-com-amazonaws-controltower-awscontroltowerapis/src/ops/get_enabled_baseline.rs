@@ -212,18 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn: enabled_baseline.arn.clone(),
                 baseline_identifier: enabled_baseline.baseline_identifier.clone(),
                 baseline_version: Some(enabled_baseline.baseline_version.clone()),
-                // Absent for an enablement whose inheritance drift is not assessed — a
-                // baseline AWS detects no drift on, or a deployment the clock has not made
-                // due yet — rather than reported as a status the model does not declare.
-                drift_status_summary: enabled_baseline.inheritance_drift_status.map(|status| {
-                    EnabledBaselineDriftStatusSummary {
-                        types: Some(EnabledBaselineDriftTypes {
-                            inheritance: Some(EnabledBaselineInheritanceDrift {
-                                status: Some(status.as_wire().to_string()),
-                            }),
-                        }),
-                    }
-                }),
+                // This crate's one enabled-baseline drift projection, which both
+                // reporting operations read the member through: absent for an enablement
+                // whose inheritance drift is not assessed.
+                drift_status_summary: enabled_baseline.drift_status_summary(),
                 target_identifier: enabled_baseline.target_identifier.clone(),
                 // The enablement this one inherited its configuration from, read off the
                 // record: absent for an enablement applied directly to its target, which

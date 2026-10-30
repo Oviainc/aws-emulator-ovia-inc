@@ -268,17 +268,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     status: Some(control.status.as_wire().to_string()),
                     last_operation_identifier: Some(control.last_operation_identifier.clone()),
                 }),
-                drift_status_summary: Some(DriftStatusSummary {
-                    drift_status: Some(control.drift_status.as_wire().to_string()),
-                    types: Some(EnabledControlDriftTypes {
-                        inheritance: Some(EnabledControlInheritanceDrift {
-                            status: Some(control.inheritance_drift_status.as_wire().to_string()),
-                        }),
-                        resource: Some(EnabledControlResourceDrift {
-                            status: Some(control.resource_drift_status.as_wire().to_string()),
-                        }),
-                    }),
-                }),
+                // The same projection `GetEnabledControl` reports the member through, so
+                // the listing and the detail cannot disagree about one stored record.
+                drift_status_summary: Some(control.drift_status_summary()),
                 parent_identifier: control.parent_identifier.clone(),
             })
             .collect();

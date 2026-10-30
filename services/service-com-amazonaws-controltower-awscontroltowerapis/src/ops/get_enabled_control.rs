@@ -188,6 +188,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // governance rather than the enabling call, so they are derived here from what is
         // deployed now.
         let target_regions = store.target_regions_of(&control);
+        // This crate's one enabled-control drift projection, which both reporting
+        // operations read the member through; taken before the record is consumed below.
+        let drift_status_summary = control.drift_status_summary();
 
         Ok(GetEnabledControlOutput {
             enabled_control_details: EnabledControlDetails {
@@ -198,17 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     status: Some(control.status.as_wire().to_string()),
                     last_operation_identifier: Some(control.last_operation_identifier),
                 }),
-                drift_status_summary: Some(DriftStatusSummary {
-                    drift_status: Some(control.drift_status.as_wire().to_string()),
-                    types: Some(EnabledControlDriftTypes {
-                        inheritance: Some(EnabledControlInheritanceDrift {
-                            status: Some(control.inheritance_drift_status.as_wire().to_string()),
-                        }),
-                        resource: Some(EnabledControlResourceDrift {
-                            status: Some(control.resource_drift_status.as_wire().to_string()),
-                        }),
-                    }),
-                }),
+                drift_status_summary: Some(drift_status_summary),
                 parent_identifier: control.parent_identifier,
                 target_regions: Some(
                     target_regions

@@ -74,6 +74,14 @@
 //! operation of this crate reaches the rule through [`page`], so a page boundary — and
 //! the refusal of a token no page handed out — cannot drift between them either.
 //!
+//! A resource reported by BOTH a Get and a List operation projects its stored drift onto
+//! the modelled drift summary here once, for the same reason: [`EnabledBaseline::drift_status_summary`]
+//! is the `driftStatusSummary` an enabled baseline reports and
+//! [`EnabledControl::drift_status_summary`] the one an enabled control reports. Both
+//! reporting operations of each resource kind read the member through its projection, so
+//! which stored status becomes which reported member — and whether the member is reported
+//! at all — cannot drift between the detail and the listing.
+//!
 //! [`merge_tags`]: ComAmazonawsControltowerAwscontroltowerapisState::merge_tags
 //! [`remove_tags`]: ComAmazonawsControltowerAwscontroltowerapisState::remove_tags
 //!
@@ -83,6 +91,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
+
+// The modelled drift-summary shapes the projections below build, so a reported drift
+// summary is written out once for each resource kind rather than once per handler.
+use crate::ops::types::{
+    DriftStatusSummary, EnabledBaselineDriftStatusSummary, EnabledBaselineDriftTypes,
+    EnabledBaselineInheritanceDrift, EnabledControlDriftTypes, EnabledControlInheritanceDrift,
+    EnabledControlResourceDrift,
+};
 
 /// The ARN namespace (and SigV4 signing name) this service's ARNs carry, from the
 /// model's `aws.api#service` trait (`arnNamespace: controltower`).
@@ -852,6 +868,28 @@ impl EnabledControl {
         self.inheritance_drift_status = DriftStatus::Unknown;
         self.resource_drift_status = DriftStatus::Unknown;
     }
+
+    /// The `driftStatusSummary` this control reports: its overall [`DriftStatus`] plus one
+    /// member of `types` per drift dimension the model declares for a control
+    /// (`inheritance` and `resource`), each read off the stored status for that dimension.
+    ///
+    /// Every drift dimension of a control always carries a status — `UNKNOWN` is the value
+    /// for a dimension the service "is not able to check" — so the summary and both of its
+    /// members are always reported. `GetEnabledControl` and `ListEnabledControls` both
+    /// report the member through here, so they cannot disagree about one stored record.
+    pub fn drift_status_summary(&self) -> DriftStatusSummary {
+        DriftStatusSummary {
+            drift_status: Some(self.drift_status.as_wire().to_string()),
+            types: Some(EnabledControlDriftTypes {
+                inheritance: Some(EnabledControlInheritanceDrift {
+                    status: Some(self.inheritance_drift_status.as_wire().to_string()),
+                }),
+                resource: Some(EnabledControlResourceDrift {
+                    status: Some(self.resource_drift_status.as_wire().to_string()),
+                }),
+            }),
+        }
+    }
 }
 
 /// A control teardown a `DISABLE_CONTROL` has started and the clock has not yet made due.
@@ -1106,6 +1144,30 @@ pub struct EnabledBaseline {
     ///
     /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
     pub pending_deletion: Option<PendingEnabledBaselineDeletion>,
+}
+
+impl EnabledBaseline {
+    /// The `driftStatusSummary` this enablement reports: the stored
+    /// [`inheritance_drift_status`] nested under the one drift dimension the model declares
+    /// for a baseline (`types.inheritance.status`), and NOTHING at all when no inheritance
+    /// drift is assessed for the enablement — a baseline AWS detects no drift on, or a
+    /// deployment the clock has not made due yet — rather than a status the model does not
+    /// declare.
+    ///
+    /// `GetEnabledBaseline` and `ListEnabledBaselines` both report the member through here,
+    /// so they cannot disagree about one stored record.
+    ///
+    /// [`inheritance_drift_status`]: EnabledBaseline::inheritance_drift_status
+    pub fn drift_status_summary(&self) -> Option<EnabledBaselineDriftStatusSummary> {
+        self.inheritance_drift_status
+            .map(|status| EnabledBaselineDriftStatusSummary {
+                types: Some(EnabledBaselineDriftTypes {
+                    inheritance: Some(EnabledBaselineInheritanceDrift {
+                        status: Some(status.as_wire().to_string()),
+                    }),
+                }),
+            })
+    }
 }
 
 /// A baseline teardown a `DISABLE_BASELINE` has started and the clock has not yet made
