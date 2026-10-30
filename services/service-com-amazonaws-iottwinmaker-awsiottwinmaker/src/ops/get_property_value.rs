@@ -1002,13 +1002,16 @@ fn table_response(
     // what this request's own filters and ordering say — so the token resumes
     // at the row's ORDINAL in that sequence, and is bound to the query that
     // produced it — those conditions included ([`token_scope`]) — so a token
-    // from another one is refused rather than resumed.
+    // from another one is refused rather than resumed. An ordinal is only
+    // minted at a row the sequence holds, so one at or past its end is refused
+    // too ([`crate::state::ordinal_resumes_a_selected_row`]).
+    let total = rows.len();
     let resume_at = match input.next_token.as_deref() {
         None | Some("") => 0,
         Some(token) => decode_row_token(input, token)
+            .filter(|resume_at| crate::state::ordinal_resumes_a_selected_row(*resume_at, total))
             .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
     };
-    let total = rows.len();
     let page: Vec<::std::collections::HashMap<String, DataValue>> = rows
         .into_iter()
         .skip(resume_at)
@@ -1246,21 +1249,25 @@ fn decode_value_token(input: &GetPropertyValueInput, token: &str) -> Option<Stri
 
 /// The opaque `nextToken` for a tabular page that resumes at the row `ordinal`.
 fn encode_row_token(input: &GetPropertyValueInput, ordinal: usize) -> String {
-    crate::state::encode_page_token(
+    crate::state::encode_ordinal_page_token(
         ROW_TOKEN_PREFIX,
         &[&input.workspace_id, &token_scope(input)],
-        &ordinal.to_string(),
+        ordinal,
     )
 }
 
 /// The row ordinal inside a tabular `nextToken`, or `None` when the token is not
 /// one this query minted.
+///
+/// The ordinal is one of the positions [`encode_row_token`] writes
+/// ([`crate::state::decode_ordinal_page_token`]); whether the sequence this
+/// request selects still holds a row there is decided by
+/// [`crate::state::ordinal_resumes_a_selected_row`] where that sequence is in
+/// hand ([`table_response`]).
 fn decode_row_token(input: &GetPropertyValueInput, token: &str) -> Option<usize> {
-    crate::state::decode_page_token(
+    crate::state::decode_ordinal_page_token(
         ROW_TOKEN_PREFIX,
         &[&input.workspace_id, &token_scope(input)],
         token,
-    )?
-    .parse()
-    .ok()
+    )
 }

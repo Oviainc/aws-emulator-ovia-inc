@@ -110,6 +110,9 @@ mod metadata_transfer_job_listing;
 #[path = "all/metadata_transfer_job_read.rs"]
 mod metadata_transfer_job_read;
 
+#[path = "all/minted_page_position.rs"]
+mod minted_page_position;
+
 #[path = "all/next_token_refusal.rs"]
 mod next_token_refusal;
 

@@ -247,12 +247,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A `nextToken` carries the row offset the page resumes at, and is bound to BOTH
         // the workspace and the statement it was minted for: the row set is recomputed
         // from state on every call, so resuming one query's paging inside another would
-        // report rows from a listing the caller never asked for.
+        // report rows from a listing the caller never asked for. Only the offset's
+        // SPELLING can be judged here — whether it names a row this query selects is
+        // judged against the row set itself, below.
         let resume_at = match input.next_token.as_deref() {
-            None | Some("") => 0,
-            Some(token) => decode_next_token(token, &input.workspace_id, &input.query_statement)
-                .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
+            None | Some("") => None,
+            Some(token) => Some(
+                decode_next_token(token, &input.workspace_id, &input.query_statement)
+                    .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
+            ),
         };
+        // Where a request names no token the walk starts at the first row.
+        let skip = resume_at.unwrap_or(0);
 
         // "The maximum number of results to return at one time. The default is 50" — the
         // `maxResults` member's own documentation. The modelled range is 1..100, so the
@@ -298,7 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let bindings = Matcher::new(&graph, &query, &plan).run()?;
             let rows: Vec<Row> = bindings
                 .iter()
-                .skip(resume_at)
+                .skip(skip)
                 .take(page_size)
                 .map(|binding| plan.project(&graph, binding))
                 .collect();
@@ -342,7 +348,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let served_through = resume_at.saturating_add(rows.len());
+        // The row count is only known once the row set is recomputed, so this is where
+        // an offset past the rows this query selects is refused: a page is only minted
+        // at a row that exists, so such an offset is one this operation never wrote.
+        if resume_at.is_some_and(|resume_at| {
+            !crate::state::ordinal_resumes_a_selected_row(resume_at, selected)
+        }) {
+            return Err(invalid(crate::state::invalid_next_token_message()).into());
+        }
+
+        let served_through = skip.saturating_add(rows.len());
         let next_token = (served_through < selected).then(|| {
             encode_next_token(
                 served_through,
@@ -2079,17 +2094,16 @@ const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:query:1:";
 
 /// The opaque `nextToken` for the page of this query's rows starting at `offset`.
 fn encode_next_token(offset: usize, workspace_id: &str, statement: &str) -> String {
-    crate::state::encode_page_token(
-        NEXT_TOKEN_PREFIX,
-        &[workspace_id, statement],
-        &offset.to_string(),
-    )
+    crate::state::encode_ordinal_page_token(NEXT_TOKEN_PREFIX, &[workspace_id, statement], offset)
 }
 
 /// The row offset inside a `nextToken` minted for this workspace and statement, or
 /// `None` when the token is not one of ours or belongs to another query.
+///
+/// The offset is one of the positions [`encode_next_token`] writes
+/// ([`crate::state::decode_ordinal_page_token`]); whether it names a row this query
+/// still selects is decided against the recomputed row set
+/// ([`crate::state::ordinal_resumes_a_selected_row`]).
 fn decode_next_token(token: &str, workspace_id: &str, statement: &str) -> Option<usize> {
-    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id, statement], token)?
-        .parse::<usize>()
-        .ok()
+    crate::state::decode_ordinal_page_token(NEXT_TOKEN_PREFIX, &[workspace_id, statement], token)
 }

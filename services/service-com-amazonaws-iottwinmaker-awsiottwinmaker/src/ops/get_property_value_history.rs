@@ -1010,12 +1010,16 @@ fn page(
     page_size: usize,
     input: &GetPropertyValueHistoryInput,
 ) -> Result<GetPropertyValueHistoryOutput, GetPropertyValueHistoryError> {
+    let total: usize = series.iter().map(|one| one.values.len()).sum();
+    // An ordinal is only minted at a value the sequence holds, so a token at or
+    // past its end is refused the way one of another query is
+    // ([`crate::state::ordinal_resumes_a_selected_row`]).
     let resume_at = match input.next_token.as_deref() {
         None | Some("") => 0,
         Some(token) => decode_token(input, token)
+            .filter(|resume_at| crate::state::ordinal_resumes_a_selected_row(*resume_at, total))
             .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
     };
-    let total: usize = series.iter().map(|one| one.values.len()).sum();
 
     let mut skipped = 0usize;
     let mut taken = 0usize;
@@ -1140,21 +1144,25 @@ fn bound_key(time: Option<&str>, timestamp: Option<&::aws_smithy_types::DateTime
 
 /// The opaque `nextToken` for a page that resumes at the value `ordinal`.
 fn encode_token(input: &GetPropertyValueHistoryInput, ordinal: usize) -> String {
-    crate::state::encode_page_token(
+    crate::state::encode_ordinal_page_token(
         HISTORY_TOKEN_PREFIX,
         &[&input.workspace_id, &token_scope(input)],
-        &ordinal.to_string(),
+        ordinal,
     )
 }
 
 /// The value ordinal inside a `nextToken`, or `None` when the token is not one
 /// this query minted.
+///
+/// The ordinal is one of the positions [`encode_token`] writes
+/// ([`crate::state::decode_ordinal_page_token`]); whether the sequence this
+/// request selects still holds a value there is decided by
+/// [`crate::state::ordinal_resumes_a_selected_row`] where that sequence is in
+/// hand ([`page`]).
 fn decode_token(input: &GetPropertyValueHistoryInput, token: &str) -> Option<usize> {
-    crate::state::decode_page_token(
+    crate::state::decode_ordinal_page_token(
         HISTORY_TOKEN_PREFIX,
         &[&input.workspace_id, &token_scope(input)],
         token,
-    )?
-    .parse()
-    .ok()
+    )
 }

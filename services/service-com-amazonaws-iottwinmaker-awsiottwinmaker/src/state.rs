@@ -4915,6 +4915,51 @@ pub fn decode_page_token(envelope: &str, scope: &[&str], token: &str) -> Option<
     (!key.is_empty()).then(|| key.to_string())
 }
 
+/// The opaque `nextToken` for a page that resumes at a row's ORDINAL rather
+/// than at a key of its own: [`encode_page_token`] over the ONE spelling of a
+/// position this service mints.
+///
+/// A sequence whose rows carry no key — a query's rows, a table's rows, a
+/// series' samples — is resumed at a row's position in it, and that position is
+/// written here in exactly one spelling (`usize::to_string`: a plain decimal,
+/// no sign and no leading zero), so [`decode_ordinal_page_token`] can tell a
+/// position this service wrote from any other spelling of the same number.
+pub fn encode_ordinal_page_token(envelope: &str, scope: &[&str], ordinal: usize) -> String {
+    encode_page_token(envelope, scope, &ordinal.to_string())
+}
+
+/// The row ORDINAL inside a `nextToken` [`encode_ordinal_page_token`] minted for
+/// this `envelope` and `scope`, or `None` when the token is not one of them.
+///
+/// A token is only minted where a page stopped with rows still LEFT OVER, so a
+/// minted position is at least 1 and is spelled the one way
+/// [`encode_ordinal_page_token`] writes it. Every other spelling of a number is
+/// a position nothing minted — a sign, a leading zero, a value no `usize`
+/// holds — and so is 0 itself; each earns the refusal a key no listing minted
+/// earns ([`invalid_next_token_message`]), rather than being resumed at
+/// whatever position the text happens to parse to.
+///
+/// The other half of the rule is [`ordinal_resumes_a_selected_row`], asked
+/// where the length of the sequence the position is read against is known.
+pub fn decode_ordinal_page_token(envelope: &str, scope: &[&str], token: &str) -> Option<usize> {
+    let key = decode_page_token(envelope, scope, token)?;
+    let ordinal: usize = key.parse().ok()?;
+    (ordinal >= 1 && key == ordinal.to_string()).then_some(ordinal)
+}
+
+/// Whether an ordinal [`decode_ordinal_page_token`] read is a position a token
+/// can have been minted at in a sequence of `selected` rows.
+///
+/// A page mints a token only where rows are still left over, so a minted
+/// position is the position of a row the sequence really HOLDS. A position at
+/// or past its end is one nothing minted: it earns the same refusal
+/// ([`invalid_next_token_message`]) as a token of another listing, rather than
+/// an HTTP 200 page of no rows and no further token — which would report the
+/// end of a walk this service never started.
+pub fn ordinal_resumes_a_selected_row(resume_at: usize, selected: usize) -> bool {
+    resume_at < selected
+}
+
 /// What a `nextToken` binds the `filters` of a LISTING to: the conjunction
 /// those filters stand for, as a value two requests share exactly when they
 /// select the same rows.
