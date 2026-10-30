@@ -3,9 +3,11 @@
 //! @op CreateEventSourceMapping
 //! Persists ONE event source mapping in [`crate::state`]: the event source the request
 //! names, the function it resolves, and every polling, filtering, destination and
-//! logging setting the request stated, under a UUID and an ARN minted once. The mapping
-//! answers `Creating`, and the move to the state its `Enabled` setting asks for is owed
-//! by the CLOCK (see [`crate::state::EventSourceMappingRecord::materialize`]).
+//! logging setting the request stated, under a UUID and an ARN minted once. A mapping
+//! asked to be active answers `Creating`, and the move to `Enabled` is owed by the CLOCK
+//! (see [`crate::state::EventSourceMappingRecord::materialize`]); a mapping asked for
+//! with polling paused has no poller to stand up and so is created already `Disabled`
+//! (see [`crate::state::created_event_source_mapping_state`]).
 //!
 //! The event source has to be one `EventSourceArn` names: a resource of one of the
 //! vendors and resource types that member enumerates, in this account (see
@@ -583,6 +585,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let uuid = crate::state::mint_event_source_mapping_uuid();
+        // "When true, the event source mapping is active. When false, Lambda pauses
+        // polling and invocation. Default: True" — read once, so the setting the mapping
+        // is stored with and the state it is created in cannot disagree.
+        let enabled = input.enabled.unwrap_or(true);
         let record = crate::state::EventSourceMappingRecord {
             arn: crate::state::event_source_mapping_arn(&region, &uuid),
             uuid: uuid.clone(),
@@ -590,9 +596,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             function_name,
             function_qualifier,
             event_source_arn,
-            // "When true, the event source mapping is active. When false, Lambda pauses
-            // polling and invocation. Default: True"
-            enabled: input.enabled.unwrap_or(true),
+            enabled,
             batch_size: input
                 .batch_size
                 .unwrap_or_else(|| crate::state::default_batch_size(vendor)),
@@ -631,7 +635,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             queues: input.queues.clone(),
             source_access_configurations: input.source_access_configurations.clone(),
             self_managed_event_source: input.self_managed_event_source.clone(),
-            function_response_types: input.function_response_types.clone(),
+            // The response types applied to a mapping whose request named none: none of
+            // them, which is an empty list rather than an unknown one.
+            function_response_types: input.function_response_types.clone().unwrap_or_default(),
             amazon_managed_kafka_event_source_config: input
                 .amazon_managed_kafka_event_source_config
                 .clone(),
@@ -646,10 +652,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default()
                 .into_iter()
                 .collect(),
-            // This call only starts the mapping's poller up — the operation answers 202
-            // Accepted — so the mapping is `Creating`, and the move to `Enabled` or
-            // `Disabled` is owed by the clock at `settled_due`. Nothing waits for it.
-            state: crate::state::EVENT_SOURCE_MAPPING_STATE_CREATING.to_string(),
+            // A mapping asked to be active only has its poller STARTED here — the
+            // operation answers 202 Accepted — so it is `Creating` and the move to
+            // `Enabled` is owed by the clock at `settled_due`; nothing waits for it. A
+            // mapping asked for with polling paused has no poller to stand up, so it is
+            // created already `Disabled` (see
+            // [`crate::state::created_event_source_mapping_state`]).
+            state: crate::state::created_event_source_mapping_state(enabled).to_string(),
             state_transition_reason: crate::state::EVENT_SOURCE_MAPPING_USER_INITIATED.to_string(),
             settled_due: now + crate::state::EVENT_SOURCE_MAPPING_SETTLE_DELAY,
             // Nobody has deleted this mapping, so no removal is owed.

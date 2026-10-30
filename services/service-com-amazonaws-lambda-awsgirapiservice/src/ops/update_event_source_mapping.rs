@@ -532,8 +532,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.source_access_configurations.is_some() {
             record.source_access_configurations = input.source_access_configurations.clone();
         }
-        if input.function_response_types.is_some() {
-            record.function_response_types = input.function_response_types.clone();
+        if let Some(function_response_types) = input.function_response_types.clone() {
+            record.function_response_types = function_response_types;
         }
         if input.amazon_managed_kafka_event_source_config.is_some() {
             record.amazon_managed_kafka_event_source_config =

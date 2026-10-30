@@ -68,7 +68,23 @@ pub(crate) const STATE_CREATING: &str = "Creating";
 /// See [`STATE_CREATING`].
 const STATE_ENABLED: &str = "Enabled";
 /// See [`STATE_CREATING`].
-const STATE_DISABLED: &str = "Disabled";
+pub(crate) const STATE_DISABLED: &str = "Disabled";
+
+/// The `State` a create answers for a request carrying `extras`: `Creating` while the
+/// poller of a mapping asked to be active is stood up, and `Disabled` for one asked for
+/// with polling paused, which has no poller to stand up and so is created in the terminal
+/// state its setting asks for ("When false, Lambda pauses polling and invocation").
+///
+/// Stated here from the REQUEST, independently of the store's own resolution of the same
+/// rule, so that these assertions check the emulator rather than restate it: keep the two
+/// apart rather than collapsing this into the production helper.
+pub(crate) fn created_state_for(extras: &Value) -> &'static str {
+    if extras.get("Enabled").and_then(Value::as_bool) == Some(false) {
+        STATE_DISABLED
+    } else {
+        STATE_CREATING
+    }
+}
 
 /// `StateTransitionReason` for a change a caller asked for.
 pub(crate) const USER_INITIATED: &str = "USER_INITIATED";
@@ -744,6 +760,10 @@ async fn a_created_event_source_mapping_is_persisted_and_reported() {
              {MAPPING_ARN_MAX_LEN} length, got {} in {arn:?}",
             arn.len()
         );
+        // A mapping asked to be active is `Creating` while its poller is stood up; one
+        // asked for with polling paused has no poller to stand up, so it is created
+        // already in the terminal state its setting asks for.
+        let created_state = created_state_for(&case.request_extras);
         assert_eq!(
             (
                 created.string("FunctionArn"),
@@ -752,11 +772,11 @@ async fn a_created_event_source_mapping_is_persisted_and_reported() {
             ),
             (
                 Some(function_arn(function)),
-                Some(STATE_CREATING.to_string()),
+                Some(created_state.to_string()),
                 Some(USER_INITIATED.to_string())
             ),
             "case {label:?}: a created mapping names the function it resolved and starts \
-             {STATE_CREATING}, got {}",
+             {created_state}, got {}",
             created.text()
         );
         assert!(
@@ -864,10 +884,13 @@ async fn a_mapping_settles_into_the_state_its_enabled_setting_asks_for() {
             &create_request(function, Some(&source), extras),
         )
         .await;
+        // Only a mapping with a poller to stand up starts transitional; a paused one is
+        // created in the terminal state it asked for.
+        let created_state = created_state_for(extras);
         assert_eq!(
             (created.status, created.string("State")),
-            (202, Some(STATE_CREATING.to_string())),
-            "case {label:?}: a created mapping starts {STATE_CREATING}, got {} {}",
+            (202, Some(created_state.to_string())),
+            "case {label:?}: a created mapping starts {created_state}, got {} {}",
             created.status,
             created.text()
         );
@@ -875,6 +898,7 @@ async fn a_mapping_settles_into_the_state_its_enabled_setting_asks_for() {
             label,
             created.string("UUID").expect("the create answers a UUID"),
             *expected,
+            created_state,
             created
                 .json()
                 .get("LastModified")
@@ -890,7 +914,7 @@ async fn a_mapping_settles_into_the_state_its_enabled_setting_asks_for() {
     let delay = service_com_amazonaws_lambda_awsgirapiservice::state::EVENT_SOURCE_MAPPING_SETTLE_DELAY;
     tokio::time::sleep(delay + std::time::Duration::from_millis(100)).await;
 
-    for (label, uuid, expected, created_at) in uuids {
+    for (label, uuid, expected, created_state, created_at) in uuids {
         let mut settled_at = None;
         for read in 1..=2 {
             let fetched = get_mapping(&router, &uuid).await;
@@ -906,11 +930,22 @@ async fn a_mapping_settles_into_the_state_its_enabled_setting_asks_for() {
             // changed": the transition IS a state change, so the instant moves with it —
             // to when the clock owed it, which is why two reads report the same instant.
             let reported = fetched.json().get("LastModified").and_then(Value::as_f64);
-            assert!(
-                reported.is_some_and(|modified| modified > created_at),
-                "case {label:?} read {read}: LastModified must move with the state change \
-                 from {created_at}, got {reported:?}"
-            );
+            if created_state == expected {
+                // Nothing transitioned: the mapping was already in this state when it was
+                // created, so the instant it reports is still the creation's.
+                assert_eq!(
+                    reported,
+                    Some(created_at),
+                    "case {label:?} read {read}: a mapping created {expected} owes no \
+                     transition, so LastModified stays at {created_at}, got {reported:?}"
+                );
+            } else {
+                assert!(
+                    reported.is_some_and(|modified| modified > created_at),
+                    "case {label:?} read {read}: LastModified must move with the state change \
+                     from {created_at}, got {reported:?}"
+                );
+            }
             if let Some(before) = settled_at {
                 assert_eq!(
                     reported,

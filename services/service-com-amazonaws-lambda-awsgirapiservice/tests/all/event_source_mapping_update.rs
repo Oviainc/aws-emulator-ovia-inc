@@ -33,8 +33,9 @@ use service_com_amazonaws_lambda_awsgirapiservice::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mappings::{
-    call, create_function, create_mapping, create_request, get_mapping, router_on, Answer,
-    DYNAMODB_SOURCE, KINESIS_SOURCE, MAPPINGS_URI, QUEUE_SOURCE,
+    call, create_function, create_mapping, create_request, created_state_for, get_mapping,
+    router_on, Answer, DYNAMODB_SOURCE, KINESIS_SOURCE, MAPPINGS_URI, QUEUE_SOURCE,
+    STATE_CREATING,
 };
 
 /// The `State` a mapping an update was accepted for carries, from
@@ -211,19 +212,34 @@ async fn an_update_replaces_the_members_it_states_and_settles_by_the_clock() {
 
         // The mapping is not available while it is still being created, which is the
         // model's own example of `ResourceInUseException`.
-        let too_early = update_mapping(&router, &uuid, &case.update).await;
-        assert_eq!(
-            too_early.status,
-            400,
-            "case {label:?}: an update inside the create window is refused, got {} {}",
-            too_early.status,
-            too_early.text()
-        );
-        assert!(
-            too_early.error_code().contains("ResourceInUseException"),
-            "case {label:?}: expected ResourceInUseException, got {}",
-            too_early.error_code()
-        );
+        // A mapping created with polling PAUSED was never in that window — it is created
+        // in the terminal state its setting asks for — so there is no create window to be
+        // refused inside for such a row.
+        if created_state_for(&case.create_extras) == STATE_CREATING {
+            let too_early = update_mapping(&router, &uuid, &case.update).await;
+            assert_eq!(
+                too_early.status,
+                400,
+                "case {label:?}: an update inside the create window is refused, got {} {}",
+                too_early.status,
+                too_early.text()
+            );
+            assert!(
+                too_early.error_code().contains("ResourceInUseException"),
+                "case {label:?}: expected ResourceInUseException, got {}",
+                too_early.error_code()
+            );
+        } else {
+            let settled = get_mapping(&router, &uuid).await;
+            assert_eq!(
+                (settled.status, settled.string("State")),
+                (200, Some(STATE_DISABLED.to_string())),
+                "case {label:?}: a mapping created paused is already {STATE_DISABLED}, got \
+                 {} {}",
+                settled.status,
+                settled.text()
+            );
+        }
 
         tokio::time::sleep(EVENT_SOURCE_MAPPING_SETTLE_DELAY + SLACK).await;
         let updated = update_mapping(&router, &uuid, &case.update).await;

@@ -77,6 +77,8 @@ mod event_source_mapping_delete_in_use;
 mod event_source_mapping_deletion;
 #[path = "all/event_source_mapping_event_counts.rs"]
 mod event_source_mapping_event_counts;
+#[path = "all/event_source_mapping_paused_state_and_response_types.rs"]
+mod event_source_mapping_paused_state_and_response_types;
 #[path = "all/event_source_mapping_queue_visibility.rs"]
 mod event_source_mapping_queue_visibility;
 #[path = "all/event_source_mapping_sqs_delivery.rs"]

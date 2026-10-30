@@ -3568,6 +3568,25 @@ pub const EVENT_SOURCE_MAPPING_STATE_DELETING: &str = "Deleting";
 /// currently UPDATING".
 pub const EVENT_SOURCE_MAPPING_STATE_UPDATING: &str = "Updating";
 
+/// The `State` a mapping `CreateEventSourceMapping` has just accepted is in, from the
+/// `Enabled` setting the request asked for: "When true, the event source mapping is
+/// active. When false, Lambda pauses polling and invocation."
+///
+/// A mapping asked to be ACTIVE has a poller to stand up before it reads anything, which
+/// is the transitional `Creating` window the clock closes
+/// ([`EventSourceMappingRecord::materialize`]). A mapping asked for with polling PAUSED
+/// has nothing to stand up, so it is already in the terminal state its settings ask for
+/// at the instant it is created, and a caller waiting for it to leave a transitional
+/// state has nothing to wait for.
+#[must_use]
+pub fn created_event_source_mapping_state(enabled: bool) -> &'static str {
+    if enabled {
+        EVENT_SOURCE_MAPPING_STATE_CREATING
+    } else {
+        EVENT_SOURCE_MAPPING_STATE_DISABLED
+    }
+}
+
 /// `StateTransitionReason`: "Indicates whether a user or Lambda made the last change to
 /// the event source mapping." A mapping this store holds only ever changes because a
 /// caller asked it to, which Lambda reports as `USER_INITIATED`.
@@ -4006,7 +4025,11 @@ pub struct EventSourceMappingRecord {
     pub self_managed_event_source: Option<SelfManagedEventSource>,
     /// `FunctionResponseTypes`: "A list of current response type enums applied to the
     /// event source mapping."
-    pub function_response_types: Option<Vec<String>>,
+    ///
+    /// The response types CURRENTLY applied are always known — none of them is applied
+    /// to a mapping whose request named none — so this is a list rather than an optional
+    /// one, and [`Self::reported`] renders it whether or not it holds anything.
+    pub function_response_types: Vec<String>,
     /// `AmazonManagedKafkaEventSourceConfig`, when the request stated one.
     pub amazon_managed_kafka_event_source_config: Option<AmazonManagedKafkaEventSourceConfig>,
     /// `SelfManagedKafkaEventSourceConfig`, when the request stated one.
@@ -4193,7 +4216,10 @@ impl EventSourceMappingRecord {
             bisect_batch_on_function_error: self.bisect_batch_on_function_error,
             maximum_retry_attempts: self.maximum_retry_attempts,
             tumbling_window_in_seconds: self.tumbling_window_in_seconds,
-            function_response_types: self.function_response_types.clone(),
+            // "A list of CURRENT response type enums applied to the event source
+            // mapping": a mapping to which none is applied has an empty list of them, not
+            // an unknown one, so the member is reported either way.
+            function_response_types: Some(self.function_response_types.clone()),
             amazon_managed_kafka_event_source_config: self
                 .amazon_managed_kafka_event_source_config
                 .clone(),
