@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBlueprint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBlueprint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBlueprint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one blueprint from this account's per-account blueprint namespace
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::blueprints`]), addressed by `Name`
+//! alone, and answers with the name it was addressed by. The WHOLE record goes — the
+//! runs `StartBlueprintRun` started of it and the tags it was registered with are held on
+//! the entry — so after it `GetBlueprint` reports the name as one this account holds no
+//! blueprint under, `ListBlueprints` no longer lists it, and a `CreateBlueprint` under the
+//! same name is free to succeed again. The workflows a run of the blueprint created are
+//! their own resources and are left where they are.
+//!
+//! The model declares no entity-miss error for this operation (its errors are
+//! `InvalidInputException`, `InternalServiceException` and `OperationTimeoutException`,
+//! where `GetBlueprint` and `UpdateBlueprint` each also model `EntityNotFoundException`),
+//! so a delete of a name that holds no blueprint is not refused: it leaves the namespace
+//! as it found it and answers the same way — the tolerance `DeleteJob` states in prose
+//! ("If the job definition is not found, no exception is thrown"). Nor is the status the
+//! registration is in a reason to refuse: `DeleteBlueprint` models no
+//! `IllegalBlueprintStateException`, so a blueprint still `CREATING`, and one with a run
+//! in flight, delete exactly as an `ACTIVE` idle one does.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +152,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBlueprint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBlueprintErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBlueprint"))
+        // Blueprints live in one per-account namespace, so nothing here depends on the
+        // request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(DeleteBlueprintErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue blueprint store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // `Name` is `@required` with `length 1..255` and a pattern, every one of them
+        // refused at the boundary, so there is nothing left for this handler to validate.
+        // A blueprint is addressed by that name alone, so removing the record stored under
+        // it is the whole delete; a name this account holds no blueprint under leaves the
+        // namespace unchanged, which the module docs give the reason for.
+        let removed = state.lock().remove_blueprint(&input.name);
+        ::tracing::info!(
+            operation = "DeleteBlueprint",
+            blueprint = %input.name,
+            removed = removed.is_some(),
+            // How much went with the record: the runs the removed blueprint held, and none
+            // for a name that held no blueprint at all.
+            runs_removed = removed.map_or(0, |entry| entry.runs.len()),
+            "served a Glue blueprint delete"
+        );
+
+        // "Returns the name of the blueprint that was deleted" — the name the record was
+        // stored under, and the one a name that held nothing is answered with too, since
+        // this delete is not refused for a miss.
+        Ok(DeleteBlueprintOutput {
+            name: Some(input.name),
+        })
     }
 }

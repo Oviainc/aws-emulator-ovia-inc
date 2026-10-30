@@ -1768,6 +1768,20 @@ impl ComAmazonawsGlueAwsglueState {
         self.blueprints.get_mut(name)
     }
 
+    /// Remove the blueprint `name`, answering the record that was removed, or `None` when
+    /// this account holds no blueprint under that name.
+    ///
+    /// The whole record goes: a blueprint's tags and the runs started of it are held ON the
+    /// entry ([`BlueprintEntry::tags`], [`BlueprintEntry::runs`]), so the name a delete
+    /// frees carries neither into the next create under it. The workflows those runs laid
+    /// out are separate records of this store and are left alone, because a workflow
+    /// outlives the run that created it. Matched by name exactly as the read path matches
+    /// it ([`Self::blueprint`]), and the removed entry is handed back rather than dropped
+    /// for symmetry with [`Self::remove_job`].
+    pub fn remove_blueprint(&mut self, name: &str) -> Option<BlueprintEntry> {
+        self.blueprints.remove(name)
+    }
+
     /// Whether the store can hold another interactive session, i.e. is below
     /// [`MAX_SESSIONS`].
     pub fn can_store_session(&self) -> bool {
