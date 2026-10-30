@@ -177,9 +177,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `@readonly`: this reports the entries payload held by the stored dictionary
-        // and writes nothing. A dictionary that was never given entries holds an EMPTY
-        // payload, which is what it reports — the member is the dictionary's payload,
-        // so it is present whenever the dictionary is.
+        // and writes nothing. The stored payload IS the service's canonical document
+        // (`crate::state::canonical_entries`, applied where a dictionary is written), so
+        // what a client reads back is the service's form of the entry list and not the
+        // bytes whichever client stored it happened to format. A dictionary that was
+        // never given entries holds an EMPTY payload, which is what it reports — the
+        // member is the dictionary's payload, so it is present whenever the dictionary
+        // is.
         Ok(ExportDictionaryEntriesOutput {
             entries: Some(dictionary.entries.clone()),
         })

@@ -231,7 +231,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             dictionary.language = language;
         }
         if let Some(entries) = input.entries {
-            dictionary.entries = entries;
+            // Stored as the canonical document the service exports, as a create stores
+            // one: the payload states an entry list, and what the dictionary holds is
+            // that list rather than the client's bytes.
+            dictionary.entries = crate::state::canonical_entries(&entries);
         }
 
         // HTTP 200: the update is applied when the call answers, so it moves the

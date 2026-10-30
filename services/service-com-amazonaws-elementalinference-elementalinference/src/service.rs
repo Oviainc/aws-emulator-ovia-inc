@@ -101,6 +101,39 @@ fn without_pattern_anchors(violation: &Violation) -> Violation {
     }
 }
 
+/// The same violation with its enum value set in the order this service STATES that
+/// enum's values in.
+///
+/// A service states a value set in its own published order
+/// ([`crate::state::published_enum_value_set`]), which is not the order the model
+/// happens to declare the enum's members in — the order a value set reaches this seam
+/// in. The enum is recognised by the SET of values, so every member targeting it states
+/// it alike; a set this service publishes no order for, and every other violation kind,
+/// is returned unchanged.
+fn in_stated_enum_order(violation: &Violation) -> Violation {
+    let ViolationKind::EnumValue(values) = &violation.kind else {
+        return violation.clone();
+    };
+    let Some(stated) = crate::state::published_enum_value_set(values) else {
+        return violation.clone();
+    };
+    Violation {
+        kind: ViolationKind::EnumValue(
+            stated.iter().map(|value| (*value).to_string()).collect(),
+        ),
+        ..violation.clone()
+    }
+}
+
+/// One violation as THIS SERVICE states it: a pattern without its anchors
+/// ([`without_pattern_anchors`]) and an enum value set in the order the service states
+/// that enum's values in ([`in_stated_enum_order`]). A violation it states exactly as
+/// the framework does comes back unchanged, which is what
+/// [`EmulatedService::override_refusal`] reads to decide whether to reword at all.
+fn as_this_service_states_it(violation: &Violation) -> Violation {
+    in_stated_enum_order(&without_pattern_anchors(violation))
+}
+
 /// The `com-amazonaws-elementalinference-elementalinference` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -165,8 +198,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //    offline, it evaluates the role by attempting to pass it, so that check
         //    is reached before the member's own syntax rules are. Both the code and
         //    the message change together, which is what a client branches on.
-        // 2. a `@pattern` renders into a constraint-violation message WITHOUT its
-        //    anchors, for every anchored pattern member of this service.
+        // 2. a constraint-violation message states a `@pattern` WITHOUT its anchors,
+        //    and an enum's value set in the order this service states that enum's
+        //    values in rather than the order the model declares them in — for every
+        //    member of this service those rules reach.
         let Refusal::Invalid(violations) = refusal else {
             return None;
         };
@@ -176,16 +211,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 message: crate::state::CROSS_ACCOUNT_PASS_ROLE_MESSAGE.to_string(),
             });
         }
-        // Nothing else this service words differently, so a refusal with no pattern
-        // violation keeps the framework's own rendering rather than being re-rendered
-        // here: the blast radius stays on the one rule above.
-        if !violations
-            .iter()
-            .any(|violation| matches!(violation.kind, ViolationKind::Pattern(_)))
-        {
+        let reworded: Vec<Violation> = violations.iter().map(as_this_service_states_it).collect();
+        // Nothing else this service words differently, so a refusal it states exactly as
+        // the framework already does keeps the framework's own rendering rather than
+        // being re-rendered here: the blast radius stays on the rules above.
+        if reworded == *violations {
             return None;
         }
-        let reworded: Vec<Violation> = violations.iter().map(without_pattern_anchors).collect();
         Some(Refused {
             code: "ValidationException".to_string(),
             // The same envelope the framework renders (`1 validation error detected:

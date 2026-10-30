@@ -224,8 +224,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::Instant::now();
         // The members this request sets on the record it asks for, normalised the way
         // they are STORED, so they can be compared with what the Region already holds:
-        // an absent payload is no entries, an absent tag map is no tags.
-        let entries = input.entries.unwrap_or_default();
+        // an absent payload is no entries, an absent tag map is no tags, and an entries
+        // payload is the canonical document the service exports rather than the bytes
+        // the client happened to format (`crate::state::canonical_entries`) — so a
+        // replay that states the same entry list is recognised as the same create.
+        let entries = crate::state::canonical_entries(&input.entries.unwrap_or_default());
         let tags: std::collections::BTreeMap<String, String> =
             input.tags.unwrap_or_default().into_iter().collect();
 
@@ -283,7 +286,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name,
             language: input.language,
             // The payload is optional; a dictionary created without one holds no
-            // entries rather than none at all.
+            // entries rather than none at all, and one created with a payload holds the
+            // service's canonical form of the entry list it stated.
             entries,
             status: crate::state::DictionaryStatus::Creating,
             tags,

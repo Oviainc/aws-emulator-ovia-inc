@@ -27,6 +27,8 @@ mod dictionary_lifecycle;
 mod dictionary_listing;
 #[path = "all/dictionary_mutation.rs"]
 mod dictionary_mutation;
+#[path = "all/dictionary_service_forms.rs"]
+mod dictionary_service_forms;
 #[path = "all/error_contract.rs"]
 mod error_contract;
 #[path = "all/error_message_rule.rs"]

@@ -86,19 +86,21 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// Length of a `FeedId` — the modelled pattern is `^[a-z0-9]{19}$`.
 const FEED_ID_LEN: usize = 19;
 
-/// The alphabet a `FeedId` is drawn from, i.e. exactly the characters its
-/// modelled pattern `^[a-z0-9]{19}$` admits.
-const FEED_ID_ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-
 /// Length of a `DictionaryId`: the model constrains it to `len 1..19`, so this is
 /// the longest id the shape admits.
 const DICTIONARY_ID_LEN: usize = 19;
 
-/// The alphabet a `DictionaryId` is drawn from, i.e. exactly the characters its
-/// modelled pattern `^[a-zA-Z0-9]+$` admits (and which the `resourceArn` pattern
-/// `…:(feed|dictionary)/[a-zA-Z0-9]{1,19}$` also admits).
-const DICTIONARY_ID_ALPHABET: &[u8; 62] =
-    b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+/// The alphabet EVERY id this service mints is drawn from: the lower-case
+/// alphanumeric characters.
+///
+/// This service issues one form of id for every resource it mints, and it is the
+/// narrower of the two the model describes — exactly the characters `FeedId`'s pattern
+/// `^[a-z0-9]{19}$` admits, which is a subset of the `^[a-zA-Z0-9]+$` a `DictionaryId`
+/// admits (and of the `…:(feed|dictionary)/[a-zA-Z0-9]{1,19}$` a `resourceArn`
+/// admits). So a minted id of either kind satisfies its own modelled pattern, and a
+/// client that matches this service's ids against the form it issues them in — case
+/// included — accepts every one of them.
+const ID_ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
 /// How long a clock-owed transition takes: a feed's `DELETING` -> gone and its
 /// `UPDATING` -> the status it was reconfigured from, and a dictionary's `CREATING` ->
@@ -706,7 +708,9 @@ pub struct Dictionary {
     pub region: String,
     /// An ISO 639-2/T code from the modelled `DictionaryLanguage` enum.
     pub language: String,
-    /// The entries payload as submitted; empty when the request carried none.
+    /// The entry list the dictionary holds, in the canonical document this service
+    /// exports it as ([`canonical_entries`]); empty when the request carried no
+    /// payload.
     pub entries: String,
     pub status: DictionaryStatus,
     pub tags: BTreeMap<String, String>,
@@ -1132,8 +1136,6 @@ pub struct ComAmazonawsElementalinferenceElementalinferenceState {
     /// past either with the modelled `ServiceQuotaExceededException`, so this map
     /// cannot grow without limit however many requests arrive.
     pub feeds: BTreeMap<String, Feed>,
-    /// Monotonic source for minted feed ids: one more per feed this emulator mints.
-    pub next_feed_seq: u64,
     /// Every live dictionary, keyed by its `DictionaryId`. `BTreeMap` so
     /// `ListDictionaries` has one stable order to paginate over. Partitioned by Region
     /// exactly as [`Self::feeds`] is ([`Dictionary::region`], [`Self::dictionary`],
@@ -1141,9 +1143,13 @@ pub struct ComAmazonawsElementalinferenceElementalinferenceState {
     /// Region across at most [`MAX_REGIONS`] Regions: `CreateDictionary` refuses past
     /// either with the modelled `ServiceQuotaExceededException`.
     pub dictionaries: BTreeMap<String, Dictionary>,
-    /// Monotonic source for minted dictionary ids: one more per dictionary this
-    /// emulator mints.
-    pub next_dictionary_seq: u64,
+    /// Monotonic source for every id this emulator mints: one more per resource,
+    /// whichever kind it is.
+    ///
+    /// SHARED by both kinds, because both are drawn from one form
+    /// ([`ID_ALPHABET`]): a sequence per kind would hand the first feed and the first
+    /// dictionary of a store the same mixed value, and so the same id.
+    pub next_id_seq: u64,
     /// Every fixture the external sports data source holds, keyed by its `FixtureId`.
     /// `BTreeMap` so a search has ONE stable order to page over, which is what a
     /// `nextToken` names a position in.
@@ -1183,9 +1189,8 @@ impl Default for ComAmazonawsElementalinferenceElementalinferenceState {
     fn default() -> Self {
         let mut state = Self {
             feeds: BTreeMap::new(),
-            next_feed_seq: 0,
             dictionaries: BTreeMap::new(),
-            next_dictionary_seq: 0,
+            next_id_seq: 0,
             fixtures: BTreeMap::new(),
             earliest_due: None,
             run_seed: None,
@@ -1203,43 +1208,53 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
         *self.run_seed.get_or_insert_with(fresh_run_seed)
     }
 
-    /// Mint a fresh `FeedId`: 19 characters of `[a-z0-9]`, as the model requires.
+    /// Mint a fresh `FeedId`: [`FEED_ID_LEN`] characters of [`ID_ALPHABET`], the form
+    /// this service issues its ids in.
     ///
-    /// Derived from this store's [`Self::run_seed`] plus the per-resource sequence
-    /// through a bit mixer, so no two feeds — of this store or of any other — share
-    /// an id, and consecutive ids share no prefix. The loop is the collision guard: a
-    /// mixed value that happens to land on a live feed's id takes the next sequence
-    /// number instead.
+    /// Derived from this store's [`Self::run_seed`] plus the store's id sequence
+    /// through a bit mixer, so no two resources — of this store or of any other —
+    /// share an id, and consecutive ids share no prefix. The loop is the collision
+    /// guard: a mixed value that happens to land on an id this store already holds
+    /// takes the next sequence number instead.
     pub fn mint_feed_id(&mut self) -> String {
         let run_seed = self.run_seed();
         loop {
-            self.next_feed_seq += 1;
-            let id = feed_id_from_seq(run_seed.wrapping_add(self.next_feed_seq));
-            if !self.feeds.contains_key(&id) {
+            self.next_id_seq += 1;
+            let id = feed_id_from_seq(run_seed.wrapping_add(self.next_id_seq));
+            if !self.holds_id(&id) {
                 return id;
             }
         }
     }
 
-    /// Mint a fresh `DictionaryId`: up to [`DICTIONARY_ID_LEN`] characters of
-    /// `[a-zA-Z0-9]`, as the model requires.
+    /// Mint a fresh `DictionaryId`: [`DICTIONARY_ID_LEN`] characters of
+    /// [`ID_ALPHABET`], the form this service issues its ids in.
     ///
-    /// Same construction as [`Self::mint_feed_id`] — this store's seed plus the
-    /// per-resource sequence through a bit mixer, with the loop as the collision
-    /// guard — over the wider alphabet the `DictionaryId` pattern admits.
+    /// Same construction as [`Self::mint_feed_id`] — this store's seed plus the store's
+    /// id sequence through a bit mixer, with the loop as the collision guard — over the
+    /// same alphabet, so the two kinds of id differ in what they name and not in their
+    /// form.
     pub fn mint_dictionary_id(&mut self) -> String {
         let run_seed = self.run_seed();
         loop {
-            self.next_dictionary_seq += 1;
+            self.next_id_seq += 1;
             let id = id_from_seq(
-                run_seed.wrapping_add(self.next_dictionary_seq),
+                run_seed.wrapping_add(self.next_id_seq),
                 DICTIONARY_ID_LEN,
-                DICTIONARY_ID_ALPHABET,
+                ID_ALPHABET,
             );
-            if !self.dictionaries.contains_key(&id) {
+            if !self.holds_id(&id) {
                 return id;
             }
         }
+    }
+
+    /// Whether this store already holds a resource under `id`, of either kind.
+    ///
+    /// Both kinds of id are drawn from one form and one sequence, so what a mint has to
+    /// avoid is an id this store holds at all — not just one its own kind holds.
+    fn holds_id(&self, id: &str) -> bool {
+        self.feeds.contains_key(id) || self.dictionaries.contains_key(id)
     }
 
     /// Install fixtures into the data-source catalog, keyed by their `FixtureId`.
@@ -1949,6 +1964,70 @@ pub fn names_another_account(arn: &str) -> bool {
     is_account_id && *account != ::engine::emulator_account_id()
 }
 
+/// The order this service STATES the `DictionaryLanguage` value set in when it refuses
+/// a value outside it.
+///
+/// A service states an enum's value set in its own published order, which is not the
+/// order the model happens to declare that enum's members in: this is the order this
+/// service's refusal of a language outside `DictionaryLanguage` lists them in, taken
+/// from the refusal the service answers such a request with. It is FIXED text — no
+/// member of the request and nothing in the store varies it — so it lives here beside
+/// the service's other refusal wording, as the one copy both the boundary renderer
+/// (`crate::service`) and a handler's own refusal
+/// ([`invalid_language_message`]) state the set from.
+///
+/// It holds exactly the values `crate::ops::types::DICTIONARY_LANGUAGE_VALUES` holds,
+/// which is what [`published_enum_value_set`] recognises an enum's value set by and
+/// what the dictionary suite asserts.
+pub const DICTIONARY_LANGUAGE_VALUE_SET: [&str; 6] = ["spa", "por", "deu", "fra", "ita", "eng"];
+
+/// Every enum value set this service publishes an order for.
+///
+/// One row per enum whose stated order is known to differ from its declaration order;
+/// a value set absent from this table is stated as the model declares it, because this
+/// service has shown no other order for it.
+const PUBLISHED_ENUM_VALUE_SETS: &[&[&str]] = &[&DICTIONARY_LANGUAGE_VALUE_SET];
+
+/// The order this service states `values` in, when `values` is the value set of an
+/// enum whose order it publishes ([`PUBLISHED_ENUM_VALUE_SETS`]); `None` for any other
+/// value set.
+///
+/// An enum is recognised by its value SET rather than by the member that carried the
+/// rejected value, so every member targeting one enum — of any operation, at any depth
+/// — states that enum's set in the one order, and a set this service publishes no
+/// order for keeps the order it was presented in.
+pub fn published_enum_value_set(values: &[String]) -> Option<&'static [&'static str]> {
+    let presented: BTreeSet<&str> = values.iter().map(String::as_str).collect();
+    PUBLISHED_ENUM_VALUE_SETS
+        .iter()
+        .copied()
+        .find(|published| {
+            published.len() == presented.len()
+                && published.iter().all(|value| presented.contains(value))
+        })
+}
+
+/// The refusal a value outside an enum's value set earns: the constraint sentence the
+/// service words such a refusal with, stating the member at fault, the value it
+/// carried and the value set in the order this service publishes for it
+/// ([`published_enum_value_set`]).
+///
+/// Built through the framework's own violation rendering, so a refusal a HANDLER words
+/// is byte-identical to the one the boundary walk words for the same member and value.
+pub fn enum_value_refusal_message(member: &str, value: &str, values: &[&str]) -> String {
+    let stated: Vec<String> = values.iter().map(|value| (*value).to_string()).collect();
+    let stated = published_enum_value_set(&stated).map_or(stated, |published| {
+        published.iter().map(|value| (*value).to_string()).collect()
+    });
+    let violation = ::aws_smithy_schema_server::constraints::Violation {
+        path: ::aws_smithy_schema_server::constraints::path::member(member),
+        kind: ::aws_smithy_schema_server::constraints::ViolationKind::EnumValue(stated),
+        value: Some(value.to_string()),
+    };
+    ::aws_smithy_schema_server::constraints::envelope(std::slice::from_ref(&violation))
+        .unwrap_or_default()
+}
+
 /// The refusal a `language` outside the modelled `DictionaryLanguage` enum earns, or
 /// `None` when the value is one the enum lists.
 ///
@@ -1956,15 +2035,123 @@ pub fn names_another_account(arn: &str) -> bool {
 /// language. The boundary validator refuses the rest, and this is the same refusal for
 /// a request that reaches a handler regardless — ONE copy, so `CreateDictionary` and
 /// `UpdateDictionary` cannot drift in which values they accept or in what they say
-/// about a value they do not.
+/// about a value they do not, and the sentence is the one the boundary states
+/// ([`enum_value_refusal_message`]) rather than a second wording of the same rule.
 pub fn invalid_language_message(language: &str) -> Option<String> {
     if crate::ops::types::DICTIONARY_LANGUAGE_VALUES.contains(&language) {
         return None;
     }
-    Some(format!(
-        "'{language}' is not a valid value for 'language'; it must be one of {}.",
-        crate::ops::types::DICTIONARY_LANGUAGE_VALUES.join(", ")
+    Some(enum_value_refusal_message(
+        LANGUAGE_MEMBER,
+        language,
+        crate::ops::types::DICTIONARY_LANGUAGE_VALUES,
     ))
+}
+
+/// The input member a dictionary's language is carried by
+/// (`CreateDictionaryRequest$language`, `UpdateDictionaryRequest$language`), as a
+/// refusal names it.
+const LANGUAGE_MEMBER: &str = "language";
+
+/// The member an entry of a dictionary payload carries its word or phrase under, as the
+/// exported document spells it.
+const ENTRY_CONTENT: &str = "content";
+
+/// The member an entry of a dictionary payload carries its alternate pronunciations
+/// under, as the exported document spells it.
+const ENTRY_SOUNDS_LIKE: &str = "sounds_like";
+
+/// One entry of a dictionary payload: a word or phrase, and the alternates it sounds
+/// like.
+#[derive(Debug, Clone)]
+struct DictionaryEntry {
+    content: String,
+    /// The alternates the entry was stored with, or `None` when it carries no list at
+    /// all — a member the service reports only for an entry that has one.
+    sounds_like: Option<Vec<String>>,
+}
+
+/// The CANONICAL form of a dictionary entries payload: the entry list as this service
+/// renders it, whatever formatting the client that stored it used.
+///
+/// The service does not keep a submitted payload's bytes: the payload states an entry
+/// list, and what a reader is given back is that list rendered as a COMPACT JSON
+/// document — no whitespace between tokens — one object per entry carrying the entry's
+/// content and, when it has one, its alternates, in the order the entries were
+/// supplied. So two clients that state the same entry list store the same dictionary
+/// and export the same document, however either of them spaced or indented its
+/// request.
+///
+/// A payload that states no entry list at all — it is not a JSON array of entry
+/// objects — has no entry list to render, so it is kept exactly as submitted.
+pub fn canonical_entries(payload: &str) -> String {
+    match parsed_entries(payload) {
+        Some(entries) => rendered_entries(&entries),
+        None => payload.to_string(),
+    }
+}
+
+/// The entry list a payload states, or `None` when it states none.
+fn parsed_entries(payload: &str) -> Option<Vec<DictionaryEntry>> {
+    let serde_json::Value::Array(elements) = serde_json::from_str::<serde_json::Value>(payload).ok()?
+    else {
+        return None;
+    };
+    elements.iter().map(parsed_entry).collect()
+}
+
+/// The one entry an element of the payload states, or `None` when it states none:
+/// anything but an object carrying a string content and an optional list of string
+/// alternates, and nothing else.
+fn parsed_entry(element: &serde_json::Value) -> Option<DictionaryEntry> {
+    let members = element.as_object()?;
+    if members
+        .keys()
+        .any(|member| member != ENTRY_CONTENT && member != ENTRY_SOUNDS_LIKE)
+    {
+        return None;
+    }
+    let content = members.get(ENTRY_CONTENT)?.as_str()?.to_string();
+    let sounds_like = match members.get(ENTRY_SOUNDS_LIKE) {
+        Some(stated) => Some(
+            stated
+                .as_array()?
+                .iter()
+                .map(|alternate| alternate.as_str().map(str::to_string))
+                .collect::<Option<Vec<String>>>()?,
+        ),
+        None => None,
+    };
+    Some(DictionaryEntry {
+        content,
+        sounds_like,
+    })
+}
+
+/// `entries` as the compact document this service exports.
+fn rendered_entries(entries: &[DictionaryEntry]) -> String {
+    let rendered: Vec<String> = entries
+        .iter()
+        .map(|entry| {
+            let content = format!("\"{ENTRY_CONTENT}\":{}", json_string(&entry.content));
+            match &entry.sounds_like {
+                Some(alternates) => {
+                    let list: Vec<String> = alternates.iter().map(|a| json_string(a)).collect();
+                    format!(
+                        "{{{content},\"{ENTRY_SOUNDS_LIKE}\":[{}]}}",
+                        list.join(",")
+                    )
+                }
+                None => format!("{{{content}}}"),
+            }
+        })
+        .collect();
+    format!("[{}]", rendered.join(","))
+}
+
+/// `value` as a JSON string literal, escaped the way a JSON document escapes one.
+fn json_string(value: &str) -> String {
+    serde_json::Value::String(value.to_string()).to_string()
 }
 
 /// The ARN of a dictionary in `region`:
@@ -2155,20 +2342,19 @@ fn fresh_run_seed() -> u64 {
     splitmix64(&mut seed)
 }
 
-/// Mix `seq` into `FEED_ID_LEN` characters of [`FEED_ID_ALPHABET`].
+/// Mix `seq` into `FEED_ID_LEN` characters of [`ID_ALPHABET`].
 fn feed_id_from_seq(seq: u64) -> String {
-    id_from_seq(seq, FEED_ID_LEN, FEED_ID_ALPHABET)
+    id_from_seq(seq, FEED_ID_LEN, ID_ALPHABET)
 }
 
 /// Mix `seq` into `len` characters of `alphabet`.
 ///
 /// Shared by every id this service mints, so one construction backs them all: only
-/// the length and the alphabet the id's modelled pattern admits differ.
+/// the length of the id differs.
 fn id_from_seq(seq: u64, len: usize, alphabet: &[u8]) -> String {
     let base = alphabet.len() as u64;
     // The most characters one mixed word can carry while `base^n` still fits in a
-    // u64 — twelve for the feed alphabet's 36 symbols, ten for the dictionary
-    // alphabet's 62.
+    // u64 — twelve for this service's 36-symbol alphabet.
     let chars_per_word = {
         let mut chars = 0usize;
         let mut capacity = 1u64;
