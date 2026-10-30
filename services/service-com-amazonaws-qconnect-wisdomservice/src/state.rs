@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    AIAgentConfigurationData, AIGuardrailContentPolicyConfig,
+    AIAgentConfiguration, AIAgentConfigurationData, AIAgentData, AIGuardrailContentPolicyConfig,
     AIGuardrailContextualGroundingPolicyConfig, AIGuardrailData,
     AIGuardrailSensitiveInformationPolicyConfig, AIGuardrailTopicPolicyConfig,
     AIGuardrailWordPolicyConfig, AssistantAssociationData, AssistantAssociationInputData,
@@ -194,6 +194,11 @@ pub const MESSAGE_UNAUTHORIZED: &str = "Unauthorized";
 /// (`smithy_query(query="shape",shape="AIAgentData")`, member `origin`).
 pub const AI_AGENT_ORIGIN_SYSTEM: &str = "SYSTEM";
 
+/// The `Origin` of an AI agent a CALLER created, the other half of the wording quoted on
+/// [`AI_AGENT_ORIGIN_SYSTEM`]: an agent made by calling the AI agent creation APIs rather
+/// than one Amazon Q in Connect provisioned with the assistant.
+pub const AI_AGENT_ORIGIN_CUSTOMER: &str = "CUSTOMER";
+
 /// The `VisibilityStatus` of a default AI agent: it is in service for the assistant the
 /// moment the assistant exists, which is what `PUBLISHED` means
 /// (`smithy_query(query="shape",shape="VisibilityStatus")` declares `SAVED` and
@@ -308,6 +313,164 @@ pub const DEFAULT_AI_AGENT_TYPES: [&str; BUILT_IN_AI_AGENTS.len()] = [
     BUILT_IN_AI_AGENTS[6].r#type,
     BUILT_IN_AI_AGENTS[7].r#type,
 ];
+
+/// The fixed text for a request addressed to an AI agent its named assistant does not
+/// hold. See [`MESSAGE_ASSISTANT_NOT_FOUND`] for why the sentence quotes nothing from the
+/// request.
+pub const MESSAGE_AI_AGENT_NOT_FOUND: &str = "AI Agent does not exist.";
+
+/// The most AI agents one assistant may hold at a time, with the same contract as
+/// [`MAX_AI_GUARDRAILS_PER_ASSISTANT`]: a create beyond it is refused with the modelled
+/// `ServiceQuotaExceededException` (HTTP 402), which `CreateAIAgent` declares for exactly
+/// this, and which is also what keeps this store finite — an agent is released only by
+/// `DeleteAIAgent` or by the delete of its assistant.
+///
+/// CHOSEN: AWS quotas AI agents per assistant but does not publish the figure. The
+/// built-in agents the SERVICE provisions (see [`BUILT_IN_AI_AGENTS`]) are not what a
+/// caller asked for, so they do not spend the caller's allowance — the rule
+/// [`Assistant::customer_session_count`] states for the other family the service
+/// provisions records in.
+pub const MAX_AI_AGENTS_PER_ASSISTANT: usize = 100;
+
+/// The sentence a create past [`MAX_AI_AGENTS_PER_ASSISTANT`] is refused with, stating
+/// the RULE — the ceiling and what to do about it — and carrying nothing from the request
+/// or from what the assistant already holds, the way [`message_ai_guardrail_quota`] does
+/// for the other family with a per-parent ceiling.
+pub fn message_ai_agent_quota() -> String {
+    format!(
+        "The maximum number of AI Agents ({MAX_AI_AGENTS_PER_ASSISTANT}) in this assistant \
+         has been reached. Delete an AI Agent before creating another."
+    )
+}
+
+/// The sentence a create or update whose `configuration` is not the union member the AI
+/// agent's `type` is configured through is refused with. It states the RULE and names the
+/// type the request itself carried.
+pub fn message_configuration_type_mismatch(agent_type: &str) -> String {
+    format!("The configuration must be the AI Agent configuration for type {agent_type}.")
+}
+
+/// The `AIAgentType` one `AIAgentConfiguration` configures.
+///
+/// The model declares that union as "a typed union that specifies the configuration based
+/// on the type of AI Agent" and documents each member as the configuration "for AI Agents
+/// of type `<TYPE>`" (`smithy_query(query="shape",shape="AIAgentConfiguration")`), so a
+/// configuration names exactly one type — which is what an operation taking both a `type`
+/// and a `configuration` holds the pair to.
+pub fn ai_agent_configuration_type(configuration: &AIAgentConfiguration) -> &'static str {
+    match configuration {
+        AIAgentConfiguration::manualSearchAIAgentConfiguration(_) => "MANUAL_SEARCH",
+        AIAgentConfiguration::answerRecommendationAIAgentConfiguration(_) => {
+            AI_AGENT_TYPE_ANSWER_RECOMMENDATION
+        }
+        AIAgentConfiguration::selfServiceAIAgentConfiguration(_) => "SELF_SERVICE",
+        AIAgentConfiguration::emailResponseAIAgentConfiguration(_) => "EMAIL_RESPONSE",
+        AIAgentConfiguration::emailOverviewAIAgentConfiguration(_) => "EMAIL_OVERVIEW",
+        AIAgentConfiguration::emailGenerativeAnswerAIAgentConfiguration(_) => {
+            "EMAIL_GENERATIVE_ANSWER"
+        }
+        AIAgentConfiguration::orchestrationAIAgentConfiguration(_) => "ORCHESTRATION",
+        AIAgentConfiguration::noteTakingAIAgentConfiguration(_) => "NOTE_TAKING",
+        AIAgentConfiguration::caseSummarizationAIAgentConfiguration(_) => "CASE_SUMMARIZATION",
+    }
+}
+
+/// The configuration a built-in (`SYSTEM`-origin) AI agent of `agent_type` reports: the
+/// union member that type is configured through, carrying no member of its own. `None`
+/// when the label is no `AIAgentType` this model declares, since no configuration is
+/// declared for it.
+///
+/// A built-in agent runs the SERVICE's own prompts and guardrails, which belong to no
+/// account and which this model gives a caller no id for, so the record states the typed
+/// shape of the configuration and claims nothing beyond it. An agent a CALLER creates
+/// reports the configuration that caller sent, member for member.
+///
+/// The one mapping [`ai_agent_configuration_type`] states, read the other way round, so
+/// the two cannot drift apart.
+pub fn ai_agent_configuration_for_type(agent_type: &str) -> Option<AIAgentConfiguration> {
+    [
+        AIAgentConfiguration::manualSearchAIAgentConfiguration(Default::default()),
+        AIAgentConfiguration::answerRecommendationAIAgentConfiguration(Default::default()),
+        AIAgentConfiguration::selfServiceAIAgentConfiguration(Default::default()),
+        AIAgentConfiguration::emailResponseAIAgentConfiguration(Default::default()),
+        AIAgentConfiguration::emailOverviewAIAgentConfiguration(Default::default()),
+        AIAgentConfiguration::emailGenerativeAnswerAIAgentConfiguration(Default::default()),
+        AIAgentConfiguration::orchestrationAIAgentConfiguration(Default::default()),
+        AIAgentConfiguration::noteTakingAIAgentConfiguration(Default::default()),
+        AIAgentConfiguration::caseSummarizationAIAgentConfiguration(Default::default()),
+    ]
+    .into_iter()
+    .find(|configuration| ai_agent_configuration_type(configuration) == agent_type)
+}
+
+/// The most entries one AI agent's configuration carries across the lists it is created
+/// with — the association configurations, the suggested messages, and the orchestration
+/// agent's tool, collaborator and schema lists.
+///
+/// The model puts no maximum on most of those lists
+/// (`smithy_query(query="shape",shape="AssociationConfigurationList")` and its siblings),
+/// so without this ceiling one caller could leave an arbitrarily long configuration in
+/// this process's heap — the same reason [`MAX_TAGS_PER_RESOURCE`] exists for the equally
+/// unbounded tag map, and the one [`MAX_AI_GUARDRAIL_POLICY_ENTRIES`] states for the other
+/// family whose create carries open-ended lists.
+///
+/// It is a HEAP GUARD rather than a quota: it sits an order of magnitude above the most
+/// associations an assistant can hold ([`MAX_ASSOCIATIONS_PER_ASSISTANT`]), which is what
+/// an association configuration list can meaningfully name, so a configuration AWS would
+/// accept is never refused here, and the figure is this emulator's own.
+pub const MAX_AI_AGENT_CONFIGURATION_ENTRIES: usize = 1_000;
+
+/// The sentence a create or update whose configuration carries more than
+/// [`MAX_AI_AGENT_CONFIGURATION_ENTRIES`] entries between its lists is refused with. It
+/// states the RULE — the ceiling the resulting configuration must stay within — and
+/// carries nothing from the request.
+pub fn message_too_many_configuration_entries() -> String {
+    format!(
+        "The resultant AI Agent configuration must not have more than \
+         {MAX_AI_AGENT_CONFIGURATION_ENTRIES} entries."
+    )
+}
+
+/// How many entries one AI agent configuration's lists carry between them, which is what
+/// [`MAX_AI_AGENT_CONFIGURATION_ENTRIES`] bounds: every list of the union member the
+/// request carried, counted once, since it is the whole stored configuration the ceiling
+/// is about.
+pub fn ai_agent_configuration_entries(configuration: &AIAgentConfiguration) -> usize {
+    /// The entries one optional list carries.
+    fn count<T>(list: &Option<Vec<T>>) -> usize {
+        list.as_ref().map_or(0, Vec::len)
+    }
+
+    match configuration {
+        AIAgentConfiguration::manualSearchAIAgentConfiguration(config) => {
+            count(&config.association_configurations)
+        }
+        AIAgentConfiguration::answerRecommendationAIAgentConfiguration(config) => {
+            count(&config.association_configurations)
+                .saturating_add(count(&config.suggested_messages))
+        }
+        AIAgentConfiguration::selfServiceAIAgentConfiguration(config) => {
+            count(&config.association_configurations)
+        }
+        AIAgentConfiguration::emailResponseAIAgentConfiguration(config) => {
+            count(&config.association_configurations)
+        }
+        AIAgentConfiguration::emailGenerativeAnswerAIAgentConfiguration(config) => {
+            count(&config.association_configurations)
+        }
+        AIAgentConfiguration::orchestrationAIAgentConfiguration(config) => {
+            count(&config.tool_configurations)
+                .saturating_add(count(&config.multi_agent_configurations))
+                .saturating_add(count(&config.input_schemas))
+                .saturating_add(count(&config.output_schemas))
+        }
+        // The configurations of these types carry no list at all: an AI prompt id, an AI
+        // guardrail id and a locale, each a single bounded value.
+        AIAgentConfiguration::emailOverviewAIAgentConfiguration(_)
+        | AIAgentConfiguration::noteTakingAIAgentConfiguration(_)
+        | AIAgentConfiguration::caseSummarizationAIAgentConfiguration(_) => 0,
+    }
+}
 
 /// The fixed text for a request addressed to an AI guardrail its named assistant does
 /// not hold. See [`MESSAGE_ASSISTANT_NOT_FOUND`] for why the sentence quotes nothing
@@ -786,6 +949,16 @@ pub fn quick_response_arn(region: &str, knowledge_base_id: &str, quick_response_
     )
 }
 
+/// The version qualifier that names a resource's unversioned WORKING COPY rather than one
+/// of its published versions.
+///
+/// The modelled label shapes admit a qualifier of `[A-Z0-9_$]+`
+/// (`smithy_query(query="shape",shape="UuidOrArnOrEitherWithQualifier")`), and AWS
+/// addresses the working copy of a versioned resource by this one — which is why a read
+/// addressed with it answers with the resource itself and reports no `versionNumber`,
+/// while a numbered qualifier names a version.
+pub const VERSION_QUALIFIER_LATEST: &str = "$LATEST";
+
 /// The id a binding to an AI agent names that agent by: the agent's own `Uuid` followed
 /// by the `:<VERSION>` qualifier of the version of it that runs.
 ///
@@ -859,19 +1032,32 @@ pub fn default_ai_agents(
     let mut agents: HashMap<String, AiAgent> = HashMap::new();
     let mut bindings: HashMap<String, AIAgentConfigurationData> = HashMap::new();
     for agent in BUILT_IN_AI_AGENTS {
+        let Some(configuration) = ai_agent_configuration_for_type(agent.r#type) else {
+            // Unreachable: every built-in's type is one of the modelled `AIAgentType`
+            // values, each of which the union declares a configuration member for.
+            continue;
+        };
         agents.insert(
             agent.ai_agent_id.to_string(),
             AiAgent {
                 ai_agent_arn: ai_agent_arn(region, assistant_id, agent.ai_agent_id),
                 ai_agent_id: agent.ai_agent_id.to_string(),
                 assistant_id: assistant_id.to_string(),
+                assistant_arn: assistant_arn(region, assistant_id),
                 name: agent.r#type.to_string(),
                 r#type: agent.r#type.to_string(),
+                configuration,
+                // Nothing a caller sent is on a built-in agent: no caller created it.
+                description: None,
+                tags: HashMap::new(),
                 origin: AI_AGENT_ORIGIN_SYSTEM.to_string(),
                 visibility_status: AI_AGENT_VISIBILITY_PUBLISHED.to_string(),
                 status: AI_RESOURCE_STATUS_ACTIVE.to_string(),
-                version_number: agent.version_number,
+                published_version: Some(agent.version_number),
                 created_at,
+                // Nothing has modified the record yet, so it was last written when the
+                // assistant it belongs to was created.
+                modified_at: created_at,
             },
         );
         bindings.insert(
@@ -1276,24 +1462,58 @@ impl Session {
 /// The built-in agents the service provisions with the assistant are `SYSTEM`-origin
 /// records under the service's own ids (see [`BUILT_IN_AI_AGENTS`]); an agent a caller
 /// creates through `CreateAIAgent` is `CUSTOMER`-origin and carries the configuration the
-/// caller gave. Nothing reports these yet — `GetAIAgent` and `ListAIAgents` are still
-/// scaffolded — but the assistant's `aiAgentConfiguration` names them, so the ids it
-/// reports are the ids of records this store holds rather than numbers with nothing
-/// behind them.
+/// caller gave. Every member a create carried is kept here, so what the create answered is
+/// what every later read answers, and the assistant's `aiAgentConfiguration` names these
+/// records rather than ids with nothing behind them.
 #[derive(Debug, Clone)]
 pub struct AiAgent {
     pub ai_agent_id: String,
     pub ai_agent_arn: String,
     pub assistant_id: String,
+    /// The ARN of the assistant this agent belongs to, read off that stored record rather
+    /// than rebuilt, so the agent reports its parent's own ARN.
+    pub assistant_arn: String,
     pub name: String,
     pub r#type: String,
+    /// The configuration this agent runs with: the union member its `type` is configured
+    /// through — see [`ai_agent_configuration_type`].
+    pub configuration: AIAgentConfiguration,
+    pub description: Option<String>,
     pub origin: String,
     pub visibility_status: String,
     pub status: String,
+    pub tags: HashMap<String, String>,
     /// The version of this agent that is published, and so the version an assistant's or
-    /// session's binding to it names — see [`qualified_ai_agent_id`].
-    pub version_number: i64,
+    /// session's binding to it names — see [`qualified_ai_agent_id`]. A built-in agent
+    /// carries the version the SERVICE publishes it at; an agent a caller created has
+    /// none until `CreateAIAgentVersion` publishes one.
+    pub published_version: Option<i64>,
     pub created_at: SystemTime,
+    /// When this record was last written: the create that minted it, until something
+    /// modifies it. It is what the reported `modifiedTime` renders.
+    pub modified_at: SystemTime,
+}
+
+impl AiAgent {
+    /// The `AIAgentData` every operation that reports this agent answers with, rendered
+    /// entirely out of the stored record.
+    pub fn to_ai_agent_data(&self) -> AIAgentData {
+        AIAgentData {
+            assistant_id: self.assistant_id.clone(),
+            assistant_arn: self.assistant_arn.clone(),
+            ai_agent_arn: self.ai_agent_arn.clone(),
+            ai_agent_id: self.ai_agent_id.clone(),
+            name: self.name.clone(),
+            r#type: self.r#type.clone(),
+            configuration: self.configuration.clone(),
+            description: self.description.clone(),
+            visibility_status: self.visibility_status.clone(),
+            tags: tags_out(&self.tags),
+            origin: Some(self.origin.clone()),
+            status: Some(self.status.clone()),
+            modified_time: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+        }
+    }
 }
 
 /// One Amazon Q in Connect AI guardrail, as this emulator persists it.
@@ -1529,6 +1749,42 @@ impl Assistant {
         (0..MINT_ATTEMPTS as u64)
             .map(|attempt| mint_candidate(seq, attempt))
             .find(|candidate| !self.ai_guardrails.contains_key(candidate))
+    }
+
+    /// An `aiAgentId` no AI agent of this assistant holds, with the same contract as
+    /// [`Self::mint_session_id`]. The built-in agents' ids are in that map too, so a
+    /// minted id never collides with one the SERVICE publishes.
+    pub fn mint_ai_agent_id(&self, seq: u64) -> Option<String> {
+        (0..MINT_ATTEMPTS as u64)
+            .map(|attempt| mint_candidate(seq, attempt))
+            .find(|candidate| !self.ai_agents.contains_key(candidate))
+    }
+
+    /// The AI agent a `UuidOrArnOrEitherWithQualifier` label names, or `None` when this
+    /// assistant holds none under it.
+    ///
+    /// A label carrying the `$LATEST` qualifier names the agent's own working copy, which
+    /// is the record below; any other qualifier names a numbered VERSION of the agent, and
+    /// this emulator publishes none — `CreateAIAgentVersion` is still a scaffold stub — so
+    /// such a label names nothing here and the caller gets the operation's not-found
+    /// answer.
+    pub fn ai_agent(&self, label: &str) -> Option<&AiAgent> {
+        let (id, qualifier) = resolve_qualified_id(label);
+        match qualifier {
+            Some(qualifier) if qualifier != VERSION_QUALIFIER_LATEST => None,
+            _ => self.ai_agents.get(id),
+        }
+    }
+
+    /// How many AI agents a CALLER has created under this assistant, which is what
+    /// [`MAX_AI_AGENTS_PER_ASSISTANT`] bounds: the agents the SERVICE provisioned with the
+    /// assistant (see [`default_ai_agents`]) are not ones a caller asked for, so they do
+    /// not spend the caller's allowance.
+    pub fn customer_ai_agent_count(&self) -> usize {
+        self.ai_agents
+            .values()
+            .filter(|agent| agent.origin != AI_AGENT_ORIGIN_SYSTEM)
+            .count()
     }
 
     /// The AI guardrail a `UuidOrArnOrEitherWithQualifier` label names, or `None` when
@@ -2560,11 +2816,11 @@ impl ComAmazonawsQconnectWisdomserviceState {
         {
             return Some(&quick_response.tags);
         }
-        // A resource nested inside an assistant — a session, an AI guardrail — is
-        // reachable only through its parent, whose id its ARN carries in the segment
-        // before the resource's own ([`session_arn`], [`ai_guardrail_arn`]). A
-        // single-segment ARN's preceding field still holds the `arn:…:<label>` prefix,
-        // which is no assistant id, so it simply misses.
+        // A resource nested inside an assistant — a session, an AI agent, an AI guardrail
+        // — is reachable only through its parent, whose id its ARN carries in the segment
+        // before the resource's own ([`session_arn`], [`ai_agent_arn`],
+        // [`ai_guardrail_arn`]). A single-segment ARN's preceding field still holds the
+        // `arn:…:<label>` prefix, which is no assistant id, so it simply misses.
         let parent = resource_arn.rsplit('/').nth(1)?;
         let assistant = self.assistants.get(parent)?;
         if let Some(guardrail) = assistant
@@ -2573,6 +2829,13 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .filter(|guardrail| guardrail.ai_guardrail_arn == resource_arn)
         {
             return Some(&guardrail.tags);
+        }
+        if let Some(agent) = assistant
+            .ai_agents
+            .get(id)
+            .filter(|agent| agent.ai_agent_arn == resource_arn)
+        {
+            return Some(&agent.tags);
         }
         assistant
             .sessions
@@ -2641,8 +2904,8 @@ impl ComAmazonawsQconnectWisdomserviceState {
                 .get_mut(&id)
                 .map(|quick_response| &mut quick_response.tags);
         }
-        // A resource nested inside an assistant — a session, an AI guardrail — is
-        // reachable only through its parent, whose id its ARN carries in the segment
+        // A resource nested inside an assistant — a session, an AI agent, an AI guardrail
+        // — is reachable only through its parent, whose id its ARN carries in the segment
         // before the resource's own.
         let parent = resource_arn.rsplit('/').nth(1)?.to_string();
         let assistant = self.assistants.get_mut(&parent)?;
@@ -2652,6 +2915,13 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .filter(|guardrail| guardrail.ai_guardrail_arn == resource_arn)
         {
             return Some(&mut guardrail.tags);
+        }
+        if let Some(agent) = assistant
+            .ai_agents
+            .get_mut(&id)
+            .filter(|agent| agent.ai_agent_arn == resource_arn)
+        {
+            return Some(&mut agent.tags);
         }
         assistant
             .sessions
@@ -2858,6 +3128,9 @@ impl ComAmazonawsQconnectWisdomserviceState {
                     || assistant
                         .ai_guardrails
                         .contains_key(created.resource_id.as_str())
+                    || assistant
+                        .ai_agents
+                        .contains_key(created.resource_id.as_str())
                     || associations.contains(&created.resource_id)
             })
             .map(|(token, _)| token.clone())
@@ -2878,6 +3151,28 @@ impl ComAmazonawsQconnectWisdomserviceState {
         guardrail_label: &str,
     ) -> Option<&AiGuardrail> {
         self.assistant(assistant_label)?.ai_guardrail(guardrail_label)
+    }
+
+    /// The AI agent a (`assistantId` label, `aiAgentId` label) pair names, with the same
+    /// contract as [`Self::ai_guardrail`]: an agent is reachable only through its
+    /// assistant, so an agent of ANOTHER assistant is not found under this one.
+    pub fn ai_agent(&self, assistant_label: &str, agent_label: &str) -> Option<&AiAgent> {
+        self.assistant(assistant_label)?.ai_agent(agent_label)
+    }
+
+    /// Store an AI agent inside the assistant it names. `false` — nothing stored — when
+    /// this account holds no such assistant, or when that assistant already holds
+    /// [`MAX_AI_AGENTS_PER_ASSISTANT`] of a caller's own, so the bound holds however the
+    /// caller reaches this.
+    pub fn insert_ai_agent(&mut self, agent: AiAgent) -> bool {
+        let Some(assistant) = self.assistants.get_mut(&agent.assistant_id) else {
+            return false;
+        };
+        if assistant.customer_ai_agent_count() >= MAX_AI_AGENTS_PER_ASSISTANT {
+            return false;
+        }
+        assistant.ai_agents.insert(agent.ai_agent_id.clone(), agent);
+        true
     }
 
     /// Store an AI guardrail inside the assistant it names. `false` — nothing stored —

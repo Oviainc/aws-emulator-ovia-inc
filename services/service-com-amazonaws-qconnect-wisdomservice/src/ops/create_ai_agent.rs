@@ -1,23 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAIAgent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAIAgent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! ONE request it does NOT answer 501 for: a create whose `assistantId` names no
-//! assistant this account holds. An AI agent is created inside an assistant, so a parent
-//! that is not there is a CLIENT error the model names — `ResourceNotFoundException`
-//! (HTTP 404) — and that is the recorded wire answer for such a request. An unwritten
-//! success path must not report a client's bad request as a server fault, so the parent
-//! is resolved first and refused with the modelled error; everything past that
-//! resolution is still unwritten and still answers 501.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAIAgent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an AI agent INSIDE the assistant the route names, stores it, and answers out of
+//! the STORED record, so what this call reports is what every later `GetAIAgent` reports.
+//! The service answers the create with the agent already `ACTIVE`, so no status change is
+//! owed afterwards; a create whose `assistantId` names no assistant this account holds is
+//! the modelled `ResourceNotFoundException` (HTTP 404); a `configuration` that is not the
+//! union member the requested `type` is configured through is refused with the modelled
+//! `ValidationException`; and a replayed `clientToken` answers with the agent that token
+//! already created.
 //!
 //! ## Shape of an operation
 //!
@@ -105,6 +97,34 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::AiAgent;
+
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the request
+/// addressed — the member the model provides for exactly that.
+fn not_found(message: &str, resource_name: &str) -> CreateAIAgentError {
+    CreateAIAgentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.to_string()),
+        resource_name: Some(resource_name.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ValidationException` (HTTP 400).
+fn validation(message: String) -> CreateAIAgentError {
+    CreateAIAgentErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled `ServiceQuotaExceededException` (HTTP 402).
+fn quota_exceeded() -> CreateAIAgentError {
+    CreateAIAgentErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message: Some(crate::state::message_ai_agent_quota()),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -179,35 +199,168 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Modeled constraints (`name`'s and `description`'s length and pattern, and the
+        // `type` and `visibilityStatus` enumerations) are already refused BEFORE this
+        // handler runs, so reaching here means the input satisfies every one of them.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // Unreachable in this emulator: the router builds one `InMemoryEngine` and
             // hands it to every service.
             crate::scaffolded::Scaffolded::not_implemented("CreateAIAgent")
         })?;
 
-        // The parent assistant is resolved before anything else: an AI agent lives
-        // inside an assistant, so a create naming one this account does not hold is the
-        // modelled `ResourceNotFoundException` (HTTP 404) — a client error, which a 501
-        // would misreport as a server fault.
-        if state.lock().assistant(&input.assistant_id).is_none() {
-            return Err(CreateAIAgentErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::MESSAGE_ASSISTANT_NOT_FOUND.to_string()),
-                    resource_name: Some(input.assistant_id.clone()),
-                },
-            )
-            .into());
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // An AI agent exists only inside an assistant, so the parent is resolved first: a
+        // create naming an assistant this account does not hold is not found, whatever
+        // else the request carries. Its id and ARN are read off the stored record rather
+        // than rebuilt, so the agent reports the assistant's own ARN.
+        let Some(assistant) = store.assistant(&input.assistant_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_ASSISTANT_NOT_FOUND,
+                &input.assistant_id,
+            ));
+        };
+        let assistant_id = assistant.assistant_id.clone();
+        let assistant_arn = assistant.assistant_arn.clone();
+
+        // `configuration` is a union whose member says which AI agent type it configures,
+        // so the pair the request carries has to agree: a configuration for another type
+        // is a request the service cannot run as the type it names.
+        let configured_type = crate::state::ai_agent_configuration_type(&input.configuration);
+        if configured_type != input.r#type {
+            return Err(validation(crate::state::message_configuration_type_mismatch(
+                &input.r#type,
+            )));
         }
 
-        // The parent exists, so this is a request the operation would have to SERVE, and
-        // minting an AI agent is not written yet: 501 says "nobody has written it yet".
-        // Implement it here (and delete the SCAFFOLDED marker at the top of this file)
-        // by storing an AI agent under its assistant and answering out of the stored
-        // record, the way `CreateSession` does. Return modeled failures as
-        // `Err(CreateAIAgentErrorModeled::Variant(..).into())` — the `From` impl above
-        // lifts it; refuse a bad request this operation models no error for with
-        // `Err(crate::scaffolded::Scaffolded::validation(".."))`, never with a 501.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAIAgent"))
+        // The model puts no maximum on the lists a configuration carries, so the store
+        // bounds the configuration as a whole: without a ceiling one caller could leave an
+        // arbitrarily long configuration in this process's heap, the same reason the tag
+        // map below has one.
+        if crate::state::ai_agent_configuration_entries(&input.configuration)
+            > crate::state::MAX_AI_AGENT_CONFIGURATION_ENTRIES
+        {
+            return Err(validation(
+                crate::state::message_too_many_configuration_entries(),
+            ));
+        }
+
+        // The model puts no bound on the `tags` map, so the store does: AWS's tagging
+        // restrictions allow at most 50 tags on a resource, and a request past that is
+        // outside what the service accepts. The count is taken from what the caller sent,
+        // before the map is stored.
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(validation(crate::state::message_too_many_tags()));
+        }
+
+        // What this create's `@idempotencyToken` identifies: every member the record below
+        // is built from, with the tag map fingerprinted in key order
+        // (`crate::state::tags_fingerprint`). The configuration is fingerprinted through
+        // its `Debug` rendering, which is stable for one request.
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.name.clone(),
+            input.r#type.clone(),
+            input.visibility_status.clone(),
+            input.description.clone().unwrap_or_default(),
+            format!("{:?}", input.configuration),
+            crate::state::tags_fingerprint(&tags),
+        ]);
+
+        // A replayed `@idempotencyToken` answers with the agent it already created under
+        // THIS assistant rather than creating a second one, while the same token carrying
+        // a DIFFERENT request is the modelled idempotency conflict rather than a record
+        // the caller did not ask for. The token is scoped to this operation and this
+        // parent, so the same token on another create is another resource.
+        let token_scope = format!("{}/{assistant_id}", Self::NAME);
+        match store.replayed_create(&token_scope, input.client_token.as_deref(), &fingerprint) {
+            crate::state::Replay::Conflict => {
+                return Err(CreateAIAgentErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::MESSAGE_IDEMPOTENCY_CONFLICT.to_string()),
+                })
+                .into())
+            }
+            crate::state::Replay::Retry(created) => {
+                if let Some(agent) = store.ai_agent(&assistant_id, &created) {
+                    return Ok(CreateAIAgentOutput {
+                        ai_agent: Some(agent.to_ai_agent_data()),
+                    });
+                }
+            }
+            crate::state::Replay::Fresh => {}
+        }
+
+        // The assistant's AI agent bound, which is what keeps this store finite. Only the
+        // agents a caller created count against it — the built-in ones are the service's.
+        let Some(assistant) = store.assistant(&assistant_id) else {
+            // Unreachable: the lookup above found this assistant while the lock is held.
+            return Err(not_found(
+                crate::state::MESSAGE_ASSISTANT_NOT_FOUND,
+                &input.assistant_id,
+            ));
+        };
+        if assistant.customer_ai_agent_count() >= crate::state::MAX_AI_AGENTS_PER_ASSISTANT {
+            return Err(quota_exceeded());
+        }
+
+        let seq = store.next_seq();
+        let Some(ai_agent_id) = store
+            .assistant(&assistant_id)
+            .and_then(|assistant| assistant.mint_ai_agent_id(seq))
+        else {
+            return Err(validation(
+                "could not mint a unique aiAgentId; retry the request".to_string(),
+            ));
+        };
+        let agent = AiAgent {
+            ai_agent_arn: crate::state::ai_agent_arn(&region, &assistant_id, &ai_agent_id),
+            ai_agent_id: ai_agent_id.clone(),
+            assistant_id: assistant_id.clone(),
+            assistant_arn,
+            name: input.name.clone(),
+            r#type: input.r#type.clone(),
+            configuration: input.configuration.clone(),
+            description: input.description.clone(),
+            // A caller created this one, which is what the model's `Origin` wording calls
+            // `CUSTOMER`, and the visibility status is the caller's own choice.
+            origin: crate::state::AI_AGENT_ORIGIN_CUSTOMER.to_string(),
+            visibility_status: input.visibility_status.clone(),
+            // The service answers the create with the agent already in service, so there
+            // is no transition the clock owes it afterwards.
+            status: crate::state::AI_RESOURCE_STATUS_ACTIVE.to_string(),
+            tags,
+            // A fresh agent has no published version: one is published by
+            // `CreateAIAgentVersion`.
+            published_version: None,
+            created_at: now,
+            // Nothing has modified the record yet, so it was last written when it was
+            // created.
+            modified_at: now,
+        };
+        if !store.insert_ai_agent(agent) {
+            // The bound the insert enforces, which the check above already answered for:
+            // reaching here means the assistant filled up while the lock was held, which
+            // this operation cannot do.
+            return Err(quota_exceeded());
+        }
+        store.remember_create(
+            &token_scope,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &ai_agent_id,
+        );
+
+        // Render out of the INSERTED record rather than out of the request: what this
+        // call answers is what a later `GetAIAgent` answers.
+        let Some(stored) = store.ai_agent(&assistant_id, &ai_agent_id) else {
+            // Unreachable: the insert above put this id on the assistant while the lock
+            // is held.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateAIAgent"));
+        };
+        Ok(CreateAIAgentOutput {
+            ai_agent: Some(stored.to_ai_agent_data()),
+        })
     }
 }

@@ -390,11 +390,12 @@ async fn a_not_found_answer_names_the_addressed_label_in_resource_name() {
     }
 }
 
-/// `CreateAIAgent`'s success path is still scaffolded: a create whose parent assistant
-/// DOES resolve answers 501, so the refusal above is the client error it is and not a
-/// side effect of the operation being unwritten.
+/// `CreateAIAgent`'s success path is SERVED now that the operation is implemented: a
+/// create whose parent assistant DOES resolve answers 200 with the agent it stored, so the
+/// refusal above is the client error it is and not a side effect of an unwritten
+/// operation. What that stored record reports is `ai_agent.rs`'s subject.
 #[tokio::test]
-async fn create_ai_agent_under_a_live_assistant_is_still_scaffolded() {
+async fn create_ai_agent_under_a_live_assistant_is_served() {
     let emulator = Emulator::new();
     let created = emulator
         .send(
@@ -415,9 +416,15 @@ async fn create_ai_agent_under_a_live_assistant_is_still_scaffolded() {
         )
         .await;
     assert_eq!(
-        reply.status, 501,
-        "case {:?}: expected HTTP 501 for the unwritten success path, got {} with body {}",
+        reply.status, 200,
+        "case {:?}: expected HTTP 200 for a create under a live assistant, got {} with body {}",
         "live parent", reply.status, reply.body
+    );
+    assert!(
+        reply.string("/aiAgent/aiAgentId").is_some(),
+        "case {:?}: the create must answer with the agent it minted, body {}",
+        "live parent",
+        reply.body
     );
 }
 
