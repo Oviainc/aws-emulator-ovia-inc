@@ -33,5 +33,7 @@ mod selector_validation;
 mod state_roundtrip;
 #[path = "all/tag_write_conflict.rs"]
 mod tag_write_conflict;
+#[path = "all/vector_data_plane_not_found.rs"]
+mod vector_data_plane_not_found;
 #[path = "all/vector_lifecycle.rs"]
 mod vector_lifecycle;
