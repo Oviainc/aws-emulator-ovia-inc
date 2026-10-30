@@ -90,16 +90,22 @@ const UNKNOWN_AGREEMENT: &str = "agmt-ffffffffffffffff";
 /// One store to ask about: the terms an acceptor accepted, how long before now
 /// the first agreement of the chain was signed, and how many renewals the clock
 /// therefore owes it.
-struct Aged {
-    case: &'static str,
-    requested: Vec<Value>,
-    signed_ago: Duration,
-    renewals: usize,
+///
+/// `pub(crate)` because the suite over the invoices one of those calls reports
+/// (`tests/all/unsettled_store_invoice_reports.rs`) ages the same stores rather
+/// than spelling a second copy of this harness.
+pub(crate) struct Aged {
+    pub(crate) case: &'static str,
+    pub(crate) requested: Vec<Value>,
+    pub(crate) signed_ago: Duration,
+    pub(crate) renewals: usize,
 }
 
 /// The rows: one renewal, several, and as many as the renewal term allows, over
 /// three of the contract lengths the rate card prices.
-fn aged_rows() -> Vec<Aged> {
+///
+/// `pub(crate)` for the same reason as [`Aged`].
+pub(crate) fn aged_rows() -> Vec<Aged> {
     vec![
         Aged {
             case: "a month's purchase a day past its end date",
@@ -140,7 +146,9 @@ fn aged_rows() -> Vec<Aged> {
 /// Ids are minted from the store's own counter, so two stores built from the
 /// same row mint the same ids — which is what lets a call under test name a
 /// renewal on a store nothing else has read.
-async fn aged_store(row: &Aged, proposal: &str) -> (MultiServiceRouter, String) {
+///
+/// `pub(crate)` for the same reason as [`Aged`].
+pub(crate) async fn aged_store(row: &Aged, proposal: &str) -> (MultiServiceRouter, String) {
     let (router, engine) = emulator_over_engine();
     let source = aged_agreement(
         &router,
@@ -159,7 +167,9 @@ async fn aged_store(row: &Aged, proposal: &str) -> (MultiServiceRouter, String) 
 /// (`AgreementViewSummary$initialAgreementId`: "you can also use it as the
 /// `InitialAgreementId` filter value to return every agreement in the same
 /// chain").
-async fn chain_after_an_unrelated_read(router: &MultiServiceRouter, source: &str) -> Vec<String> {
+///
+/// `pub(crate)` for the same reason as [`Aged`].
+pub(crate) async fn chain_after_an_unrelated_read(router: &MultiServiceRouter, source: &str) -> Vec<String> {
     let described = describe(router, source).await;
     assert_eq!(
         described.status, 200,
@@ -201,8 +211,10 @@ async fn chain_after_an_unrelated_read(router: &MultiServiceRouter, source: &str
         .collect()
 }
 
-/// The instant `member` of one reported agreement, in epoch seconds.
-fn instant(reported: &Value, member: &str) -> f64 {
+/// The instant `member` of one reported record, in epoch seconds.
+///
+/// `pub(crate)` for the same reason as [`Aged`].
+pub(crate) fn instant(reported: &Value, member: &str) -> f64 {
     reported[member]
         .as_f64()
         .unwrap_or_else(|| panic!("{member} must be reported, got {reported:?}"))

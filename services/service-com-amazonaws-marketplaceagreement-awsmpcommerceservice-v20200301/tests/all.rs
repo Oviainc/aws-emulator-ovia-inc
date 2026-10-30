@@ -113,6 +113,8 @@ mod store_full_replays;
 mod time_windows;
 #[path = "all/unknown_ids.rs"]
 mod unknown_ids;
+#[path = "all/unsettled_store_invoice_reports.rs"]
+mod unsettled_store_invoice_reports;
 #[path = "all/unsettled_store_listings.rs"]
 mod unsettled_store_listings;
 #[path = "all/unsettled_store_single_agreement_reads.rs"]
