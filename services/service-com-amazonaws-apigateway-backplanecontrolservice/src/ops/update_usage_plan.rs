@@ -189,20 +189,20 @@ fn split_api_stage(patch: &Patch, key: &str) -> Result<(String, String), PatchFa
 /// Refuse an association that names no stored stage of a stored API.
 ///
 /// The plan's limits apply to that stage, so an association naming no stage meters
-/// nothing; either identifier unresolvable is the modelled not-found, exactly as it is on
-/// the create.
+/// nothing; the entry addresses ONE stage of ONE API, so either identifier unresolvable is
+/// the modelled not-found naming that pair, exactly as it is on the create.
 fn require_stage(
     apis: &BTreeMap<String, RestApiEntry>,
     api_id: &str,
     stage: &str,
 ) -> Result<(), PatchFailure> {
-    let api = apis
+    if !apis
         .get(api_id)
-        .ok_or_else(|| PatchFailure::NotFound(crate::state::no_such_rest_api(api_id)))?;
-    if !api.stages.contains_key(stage) {
-        return Err(PatchFailure::NotFound(
-            crate::state::NO_SUCH_STAGE.to_string(),
-        ));
+        .is_some_and(|api| api.stages.contains_key(stage))
+    {
+        return Err(PatchFailure::NotFound(crate::state::no_such_api_stage(
+            api_id, stage,
+        )));
     }
     Ok(())
 }

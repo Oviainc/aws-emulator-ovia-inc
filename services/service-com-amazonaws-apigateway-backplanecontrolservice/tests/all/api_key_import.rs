@@ -53,7 +53,10 @@ const BAD_REQUEST: &str = "BadRequestException";
 /// `ImportApiKeys` with `document` as its payload, sent verbatim on the operation's own
 /// route (`POST /apikeys?mode=import`, `format` and `failonwarnings` bound to the query
 /// string).
-async fn import(
+///
+/// `pub(crate)` so a sibling suite drives the import through this one spelling of the call
+/// rather than keeping its own copy (the `api_key_import_enablement` suite does).
+pub(crate) async fn import(
     gateway: &Gateway,
     document: &str,
     fail_on_warnings: bool,
@@ -69,7 +72,9 @@ fn row_value(case: usize, row: usize) -> String {
 }
 
 /// The `ids` a successful import answered with.
-fn imported_ids(body: &Value, case: &str) -> Vec<String> {
+///
+/// `pub(crate)` for the reason [`import`] is.
+pub(crate) fn imported_ids(body: &Value, case: &str) -> Vec<String> {
     body["ids"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case}: expected an ids array, got {body:?}"))
@@ -154,13 +159,15 @@ async fn assert_stored(gateway: &Gateway, id: &str, expected: &Expected, case: &
     );
 }
 
-/// An expected record, with the optional members left unset.
+/// An expected record, with the optional members left unset: an imported key whose row
+/// carries no `Enabled` cell is ENABLED, the default an API key file's optional column
+/// leaves a row with.
 fn expected(value: &str, name: &str) -> Expected {
     Expected {
         value: value.to_owned(),
         name: name.to_owned(),
         description: None,
-        enabled: false,
+        enabled: true,
     }
 }
 
@@ -213,7 +220,12 @@ async fn an_imported_api_key_file_creates_one_key_per_row_read_back_through_get_
                 description: Some("one, with a comma".to_string()),
                 enabled: true,
             },
-            expected(&second, "second"),
+            Expected {
+                value: second.clone(),
+                name: "second".to_string(),
+                description: None,
+                enabled: false,
+            },
             expected(&third, "third"),
         ],
     ));
@@ -234,7 +246,7 @@ async fn an_imported_api_key_file_creates_one_key_per_row_read_back_through_get_
 
     // Both words the `Enabled` column carries, in each spelling the format's example
     // file and a spreadsheet export write them with: the cell is read without regard to
-    // case, and an EMPTY cell is the modelled default (`enabled` is `default false`).
+    // case, and an EMPTY cell leaves the key with the column's default, which is enabled.
     let mut document = String::from("key,name,Enabled\n");
     let mut rows = Vec::new();
     for (index, (word, enabled)) in [
@@ -244,7 +256,7 @@ async fn an_imported_api_key_file_creates_one_key_per_row_read_back_through_get_
         ("FALSE", false),
         ("false", false),
         ("False", false),
-        ("", false),
+        ("", true),
     ]
     .into_iter()
     .enumerate()
@@ -310,7 +322,7 @@ async fn an_imported_api_key_file_creates_one_key_per_row_read_back_through_get_
             value: value.clone(),
             name: "quoted".to_string(),
             description: Some("the \"only\" one".to_string()),
-            enabled: false,
+            enabled: true,
         }],
     ));
 
@@ -323,7 +335,7 @@ async fn an_imported_api_key_file_creates_one_key_per_row_read_back_through_get_
             value: value.clone(),
             name: "multiline".to_string(),
             description: Some("first line\nsecond line".to_string()),
-            enabled: false,
+            enabled: true,
         }],
     ));
 
@@ -449,14 +461,14 @@ async fn a_row_the_import_cannot_carry_over_is_a_warning_naming_it_and_the_rest_
         ),
         (
             // The one malformed CELL that does not stop the row being imported: the key
-            // keeps the modelled default and the caller is told the cell was not read.
+            // keeps the column's default and the caller is told the cell was not read.
             "an Enabled cell that is neither of the format's words".to_string(),
             format!("key,name,Enabled\n{mistyped},mistyped,yes\n"),
             vec![mistyped.clone()],
             vec![
                 "row 1".to_string(),
                 "enabled must be one of TRUE, FALSE".to_string(),
-                "left disabled".to_string(),
+                "kept the default".to_string(),
             ],
         ),
     ];

@@ -60,7 +60,11 @@ fn supplied_value(n: usize) -> String {
 }
 
 /// `GetUsagePlanKeys` on `plan`, with `query` appended when it is not empty.
-async fn list_keys(gateway: &Gateway, plan: &str, query: &str) -> Answer {
+///
+/// `pub(crate)` so a sibling suite reads the collection through this one spelling of the
+/// call rather than keeping its own copy (the `usage_plan_state_and_refusals` suite does,
+/// to see what a `DeleteUsagePlanKey` removed from it).
+pub(crate) async fn list_keys(gateway: &Gateway, plan: &str, query: &str) -> Answer {
     let uri = if query.is_empty() {
         format!("/usageplans/{plan}/keys")
     } else {

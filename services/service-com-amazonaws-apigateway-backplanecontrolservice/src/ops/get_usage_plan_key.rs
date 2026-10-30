@@ -175,21 +175,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
         let store = state.lock();
-        // A plan the store does not hold meters nothing, so it is refused as the missing
-        // plan it is rather than as a missing key of a plan that does not exist.
-        if !store.usage_plans.contains_key(&input.usage_plan_id) {
+        // The `keyId` names an API KEY of the account, so it is resolved against the
+        // account's keys first and an id no key answers to is refused as the API key
+        // identifier it is, whichever plan the request addressed.
+        if !store.api_keys.contains_key(&input.key_id) {
             return Err(GetUsagePlanKeyErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(crate::state::NO_SUCH_USAGE_PLAN.to_string()),
+                    message: Some(crate::state::NO_SUCH_API_KEY.to_string()),
                 },
             )
             .into());
         }
+        // Both identifiers resolving is not yet an association: a `UsagePlanKey` is
+        // addressed under the plan that meters it, so a pair the store holds no association
+        // for — a plan it does not hold, or a stored plan metering no such key — resolves
+        // to no usage plan key of that plan.
         let body = store
             .usage_plan_key(&input.usage_plan_id, &input.key_id)
             .ok_or_else(|| {
                 GetUsagePlanKeyErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::NO_SUCH_API_KEY.to_string()),
+                    message: Some(crate::state::NO_SUCH_USAGE_PLAN.to_string()),
                 })
             })?;
         Ok(GetUsagePlanKeyOutput::from(body))

@@ -198,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.key_type != crate::state::USAGE_PLAN_KEY_TYPE {
             return Err(CreateUsagePlanKeyErrorModeled::BadRequestException(
                 BadRequestException {
-                    message: Some(crate::state::invalid_usage_plan_key_type(&input.key_type)),
+                    message: Some(crate::state::invalid_usage_plan_key_type()),
                 },
             )
             .into());

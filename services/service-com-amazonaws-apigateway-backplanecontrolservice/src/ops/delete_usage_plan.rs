@@ -3,7 +3,12 @@
 //! @op DeleteUsagePlan
 //! IMPLEMENTED: removes the stored `UsagePlan` record for `usagePlanId`, so a later
 //! `GetUsagePlan` no longer finds it and the account's `GetUsagePlans` listing stops
-//! reporting it; answers `NotFoundException` when no plan has that id.
+//! reporting it; answers `NotFoundException` when no plan has that id, and
+//! `BadRequestException` while the plan is still associated with API stages.
+//!
+//! An `apiStages` association is what makes the plan gate traffic on that stage, so it
+//! stands in the way of the delete: the caller removes the associations first (through
+//! `UpdateUsagePlan`) and deletes the plan after.
 //!
 //! The `UsagePlanKey` associations the plan metered are the PLAN's own records — they are
 //! held on it (see [`crate::state::UsagePlanEntry::keys`]) — so they go with it, leaving
@@ -178,20 +183,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than reporting a silent success; that is also what makes a second delete
         // of one plan, or two concurrent ones, resolve to one success and one 404 rather
         // than to a conflict.
-        //
-        // Nothing the plan carries conditions the removal: a plan with a quota, with a
-        // throttle, associated with API stages, carrying tags or metering API keys goes
-        // the same way. The associations it metered are its own records and go with it;
-        // the `ApiKey`s they named are the account's and stay, so each key remains
-        // readable and remains metered by every OTHER plan that meters it.
-        let removed = store
+        let plan = store
             .usage_plans
-            .remove(&input.usage_plan_id)
+            .get(&input.usage_plan_id)
             .ok_or_else(|| {
                 DeleteUsagePlanErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::NO_SUCH_USAGE_PLAN.to_string()),
                 })
             })?;
+
+        // A plan still associated with API stages is a plan that still gates traffic on
+        // them, so the association stands in the way of the delete: the caller
+        // disassociates the stages first (the `UpdateUsagePlan` patch that removes an
+        // `apiStages` entry) and deletes the plan after. The refusal names one of the
+        // associations in the way, so the caller can see what to remove; nothing is
+        // written, so the plan and everything it carries are exactly as they were.
+        //
+        // Both writers of an association — this plan's create and the update's `add` —
+        // resolve the `<apiId>:<stageName>` pair before storing it, so a stored entry
+        // always carries both halves and the first entry is the one named here; an entry
+        // carrying only one half could name no API stage at all, so it is passed over
+        // rather than reported as half a pair.
+        let named = plan.api_stages.iter().find_map(|association| {
+            Some((
+                association.api_id.as_deref()?,
+                association.stage.as_deref()?,
+            ))
+        });
+        if let Some((api_id, stage_name)) = named {
+            let message = crate::state::usage_plan_has_api_stages(&plan.id, api_id, stage_name);
+            return Err(DeleteUsagePlanErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // Nothing ELSE the plan carries conditions the removal: a plan with a quota, with
+        // a throttle, carrying tags or metering API keys goes the same way. The
+        // associations it metered are its own records and go with it; the `ApiKey`s they
+        // named are the account's and stay, so each key remains readable and remains
+        // metered by every OTHER plan that meters it.
+        let removed = store
+            .usage_plans
+            .remove(&input.usage_plan_id)
+            .ok_or_else(crate::state::state_unavailable)?;
         // The plan's own `UsagePlanKey` records, reclaimed with it — not a count of keys
         // that stopped being metered anywhere, since each `ApiKey` stays metered by every
         // other plan that meters it.

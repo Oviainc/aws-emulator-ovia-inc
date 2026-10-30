@@ -1058,16 +1058,18 @@ impl ThrottleBucket {
 
 /// The `BadRequestException` message for a `keyType` that is not [`USAGE_PLAN_KEY_TYPE`].
 ///
-/// API Gateway states no fixed sentence here, so the message is BUILT FROM THE REQUEST:
-/// it names the value that was rejected and the one type the model declares, the way the
-/// identifier refusals below name what they could not resolve.
-pub fn invalid_usage_plan_key_type(key_type: &str) -> String {
-    format!("Invalid key type specified: {key_type}, expected {USAGE_PLAN_KEY_TYPE}")
+/// A SENTENCE OF ITS OWN, like [`INVALID_REST_API_IDENTIFIER`]: the rejected value is not
+/// quoted back. What it carries is the set of types the request COULD have named — the
+/// types the model declares, so the list is [`USAGE_PLAN_KEY_TYPE`] itself rather than a
+/// second spelling of it — because that set is what the caller has to choose from.
+pub fn invalid_usage_plan_key_type() -> String {
+    format!("Invalid Usage Plan key type specified. Must be one of [{USAGE_PLAN_KEY_TYPE}]")
 }
 
 /// The `ConflictException` message for a key already metered by the plan.
 ///
-/// Built from the request, for the reason [`invalid_usage_plan_key_type`] gives.
+/// Built from the request, for the reason [`no_such_rest_api`] gives: API Gateway states
+/// no fixed sentence here, so the message names the pair it refused.
 pub fn usage_plan_key_already_exists(usage_plan_id: &str, key_id: &str) -> String {
     format!("API Key {key_id} already in Usage Plan {usage_plan_id}")
 }
@@ -3422,7 +3424,7 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
                 .usage_plans
                 .get(usage_plan_id)
                 .map(|plan| &plan.tags)
-                .ok_or_else(|| NO_SUCH_USAGE_PLAN.to_string()),
+                .ok_or_else(|| tagged_usage_plan_not_found(usage_plan_id)),
             TaggedResource::DomainName { domain_name_key } => self
                 .domain_names
                 .get(domain_name_key)
@@ -3487,7 +3489,7 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
                 .usage_plans
                 .get_mut(usage_plan_id)
                 .map(|plan| &mut plan.tags)
-                .ok_or_else(|| NO_SUCH_USAGE_PLAN.to_string()),
+                .ok_or_else(|| tagged_usage_plan_not_found(usage_plan_id)),
             TaggedResource::DomainName { domain_name_key } => self
                 .domain_names
                 .get_mut(domain_name_key)
@@ -3716,7 +3718,53 @@ pub const NO_SUCH_API_KEY: &str = "Invalid API Key identifier specified";
 /// The `NotFoundException` message for a `usagePlanId` that names no stored usage plan,
 /// in the shape of the sibling identifier messages above. Shared by every operation that
 /// resolves a usage plan, so all of them say the same thing about the same failure.
+///
+/// Also the answer for a `(usagePlanId, keyId)` pair that names no stored association:
+/// a `UsagePlanKey` is addressed under the plan that meters it, so a pair that resolves
+/// to nothing resolves to no usage plan key of that plan.
 pub const NO_SUCH_USAGE_PLAN: &str = "Invalid Usage Plan ID specified";
+
+/// The `NotFoundException` message for a usage plan ARN that no stored plan answers to,
+/// as the TAG operations word it.
+///
+/// The tag operations resolve a resource ARN rather than a `usagePlanId` path label, and
+/// for a usage plan they report the record they could not find by its modelled resource
+/// type and the id the ARN carried, instead of the fixed identifier sentence
+/// [`NO_SUCH_USAGE_PLAN`] the usage-plan operations answer. One copy, reached through
+/// [`ComAmazonawsApigatewayBackplanecontrolserviceState::tags_of`] /
+/// [`ComAmazonawsApigatewayBackplanecontrolserviceState::tags_of_mut`], so every tag
+/// operation says the same thing about the same ARN.
+pub fn tagged_usage_plan_not_found(usage_plan_id: &str) -> String {
+    format!("UsagePlan {usage_plan_id} was not found")
+}
+
+/// The `NotFoundException` message for an `apiStages` entry that names no stored stage of
+/// a stored API.
+///
+/// An association covers ONE stage of ONE API, so the pair is resolved as a unit and the
+/// refusal names that pair — `<apiId>:<stageName>`, the spelling an `apiStages` entry is
+/// addressed by — whichever half of it the store could not resolve. Shared by every
+/// operation that associates a plan with a stage, so the create and the update say the
+/// same thing about the same unresolvable pair.
+pub fn no_such_api_stage(api_id: &str, stage_name: &str) -> String {
+    format!("API Stage not found: {api_id}:{stage_name}")
+}
+
+/// The `BadRequestException` message for a `DeleteUsagePlan` of a plan that is still
+/// associated with API stages.
+///
+/// The association is what makes the plan gate traffic on that stage, so the plan cannot
+/// go while it stands: the caller has to disassociate the stages first (an
+/// `UpdateUsagePlan` patch that removes them). Built FROM STORED STATE the way
+/// [`domain_name_has_access_associations`] is — the plan the request addressed, and one of
+/// the associations standing in its way, in the `<apiId>:<stageName>` spelling an
+/// `apiStages` entry is addressed by — so the caller can see which call to make first.
+pub fn usage_plan_has_api_stages(usage_plan_id: &str, api_id: &str, stage_name: &str) -> String {
+    format!(
+        "Cannot delete Usage Plan {usage_plan_id} because there are API Stages associated \
+         with it, including {api_id}:{stage_name}"
+    )
+}
 
 /// The `NotFoundException` message for a `domainName` (with its `domainNameId`, for a
 /// private one) that names no stored custom domain name, in the shape of the sibling
@@ -3884,7 +3932,12 @@ pub const INVALID_MODEL_SCHEMA: &str = "Invalid model specified: Validation Resu
 
 /// The `NotFoundException` message for a `vpcLinkId` that names no stored VPC link, in
 /// the shape of the sibling identifier messages above.
-pub const NO_SUCH_VPC_LINK: &str = "Invalid VPC link identifier specified";
+///
+/// The resource kind is spelled `Vpc Link` — two capitalised words — which is the spelling
+/// API Gateway answers for a VPC link wherever one is resolved, the path label of a VPC
+/// link operation and a `resourceArn` naming one alike. One copy, so no two of them word
+/// the same failure differently.
+pub const NO_SUCH_VPC_LINK: &str = "Invalid Vpc Link identifier specified";
 
 /// The `BadRequestException` message for a VPC link an `Integration` of some API still
 /// reaches through its `connectionId`, which is what `DeleteVpcLink` refuses while the

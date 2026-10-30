@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteUsagePlanKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteUsagePlanKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the stored `UsagePlanKey` association a `(usagePlanId, keyId)`
+//! pair addresses from the plan that held it (see [`crate::state::UsagePlanEntry::keys`]),
+//! so the plan stops metering that key: a later `GetUsagePlanKey` no longer resolves the
+//! pair and the plan's `GetUsagePlanKeys` listing stops reporting it. This is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteUsagePlanKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The `ApiKey` record the association named is the ACCOUNT's, so it stays: "remove the
+//! underlying API key from the associated usage plan" unmeters the key, it does not delete
+//! it. A pair the store holds no association for is the modelled 404 `NotFoundException`,
+//! resolved and refused exactly as the pair's own `GetUsagePlanKey` read resolves and
+//! refuses it, which is what makes a second delete of one association, or two concurrent
+//! ones, resolve to one success and one not-found rather than to a conflict.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +174,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteUsagePlanKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteUsagePlanKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteUsagePlanKey"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut store = state.lock();
+        // The pair is resolved the way the pair's own read resolves it, so a delete can
+        // only remove an association that read reports and the two refuse an unresolvable
+        // pair the same way: the `keyId` names an API KEY of the account first, and the
+        // pair then names an association held on the plan. A pair resolving to nothing is
+        // nothing to delete, so it is refused rather than reported a silent success.
+        if !store.api_keys.contains_key(&input.key_id) {
+            return Err(DeleteUsagePlanKeyErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::NO_SUCH_API_KEY.to_string()),
+                },
+            )
+            .into());
+        }
+        if store
+            .usage_plan_key(&input.usage_plan_id, &input.key_id)
+            .is_none()
+        {
+            return Err(DeleteUsagePlanKeyErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::NO_SUCH_USAGE_PLAN.to_string()),
+                },
+            )
+            .into());
+        }
+        // The association is the PLAN's own record, so removing it from the plan is what
+        // makes the plan stop metering the key. The `ApiKey` itself is the account's and is
+        // left alone: it stays readable and stays metered by every OTHER plan that meters
+        // it.
+        store
+            .usage_plans
+            .get_mut(&input.usage_plan_id)
+            .ok_or_else(crate::state::state_unavailable)?
+            .keys
+            .remove(&input.key_id);
+        // The throttle accounting goes with the association, for the reason
+        // `forget_api_key` gives: a pair no association joins has no request rate to keep,
+        // and an association added later must not inherit this one's.
+        store
+            .throttle_buckets
+            .remove(&crate::state::metering_key(
+                &input.usage_plan_id,
+                &input.key_id,
+            ));
+        // The store lock is released before the outcome is recorded: the critical section
+        // covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome, as
+        // the sibling `DeleteUsagePlan` handler emits it. Metadata only — the key's `value`
+        // is a secret and is never a field.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            usage_plan = ?input.usage_plan_id,
+            api_key = ?input.key_id,
+            outcome = "deleted",
+            "usage plan key deleted",
+        );
+        Ok(DeleteUsagePlanKeyOutput)
     }
 }

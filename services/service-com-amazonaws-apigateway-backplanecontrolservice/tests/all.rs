@@ -297,3 +297,9 @@ mod stage_variable_integration_target;
 // Appended for the reason the note above gives.
 #[path = "all/patch_path_refusal_templates.rs"]
 mod patch_path_refusal_templates;
+// Appended for the reason the note above gives.
+#[path = "all/usage_plan_state_and_refusals.rs"]
+mod usage_plan_state_and_refusals;
+// Appended for the reason the note above gives.
+#[path = "all/api_key_import_enablement.rs"]
+mod api_key_import_enablement;

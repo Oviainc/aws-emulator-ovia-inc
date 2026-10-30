@@ -115,7 +115,8 @@ const COLUMN_NAME: &str = "name";
 /// The column carrying the key's description. Optional.
 const COLUMN_DESCRIPTION: &str = "description";
 
-/// The column saying whether the key may be used by callers. Optional.
+/// The column saying whether the key may be used by callers. Optional, and an imported
+/// key is ENABLED when the row does not say otherwise; see [`DEFAULT_ENABLED`].
 const COLUMN_ENABLED: &str = "enabled";
 
 /// The column naming the usage plans the key is to be metered by, as a comma-separated
@@ -162,6 +163,23 @@ const VALUE_REQUIRED: &str = "API Key value is required";
 /// The reason a record whose `name` cell is empty is skipped; `name` is a required column
 /// of the API key file format.
 const NAME_REQUIRED: &str = "API Key name is required";
+
+/// The `BadRequestException` message for a header line that declares none of a column the
+/// API key file format requires.
+///
+/// The sentence is fixed and the column is the variable part, quoted and with its first
+/// letter capitalised — the spelling API Gateway names a column of this format with, as a
+/// recorded refusal of a header declaring no key column shows (`Missing required column
+/// 'Key' `, whose trailing space is part of the sentence). One copy for every required
+/// column, so a header missing either one is refused the same way.
+fn missing_required_column(column: &str) -> String {
+    let mut characters = column.chars();
+    let capitalised = match characters.next() {
+        Some(first) => format!("{}{}", first.to_ascii_uppercase(), characters.as_str()),
+        None => String::new(),
+    };
+    format!("Missing required column '{capitalised}' ")
+}
 
 /// The reason a record is skipped for a key value shorter than the published minimum,
 /// which is the recorded wording of this warning.
@@ -231,16 +249,26 @@ fn cell<'r>(
 /// rest of the document's column names are too).
 const ENABLED_WORDS: [(&str, bool); 2] = [("true", true), ("false", false)];
 
+/// What an imported key's `enabled` is when its row does not say: an API key file's
+/// `Enabled` column is OPTIONAL, and the keys an import creates are usable by callers
+/// unless a row disables them, so a row that carries no such cell creates an ENABLED key.
+///
+/// This is the IMPORT's default and not `CreateApiKey$enabled`'s (`default false`): a key
+/// created one at a time is enabled by the member the request carries, while a row of an
+/// imported file has only the column the format declares optional.
+const DEFAULT_ENABLED: bool = true;
+
 /// Whether an `Enabled` cell says the key may be used by callers, or `None` when the cell
 /// carries something that is not one of [`ENABLED_WORDS`] at all.
 ///
-/// An EMPTY cell (no such column, or a row that stops short of it) is `Some(false)`: the
-/// default `CreateApiKey$enabled` declares (`default false`). A cell carrying any other
-/// text is a cell this service could not read, which the import reports as a warning on
-/// that row rather than silently treating as disabled.
+/// An EMPTY cell (no such column, or a row that stops short of it) is
+/// `Some(DEFAULT_ENABLED)`: the row said nothing, so the key takes the column's default. A
+/// cell carrying any other text is a cell this service could not read, which the import
+/// reports as a warning on that row rather than silently reading a typo as a deliberate
+/// value.
 fn enabled_cell(cell: &str) -> Option<bool> {
     if cell.is_empty() {
-        return Some(false);
+        return Some(DEFAULT_ENABLED);
     }
     ENABLED_WORDS
         .iter()
@@ -300,21 +328,21 @@ fn imported_key(
     // created from the rest of the row.
     let mut notes: Vec<String> = Vec::new();
     // A cell that is not one of the format's boolean words is a cell this service could
-    // not read: the key keeps the modelled default (`enabled` is `default false`) and the
-    // caller is told, rather than reading a typo as a deliberate `false`.
+    // not read: the key keeps the column's default ([`DEFAULT_ENABLED`]) and the caller is
+    // told, rather than reading a typo as a deliberate value.
     let enabled = match enabled_cell(cell(record, indices, COLUMN_ENABLED)) {
         Some(enabled) => enabled,
         None => {
             notes.push(format!(
-                "{COLUMN_ENABLED} must be one of {}, so the imported API Key was left \
-                 disabled",
+                "{COLUMN_ENABLED} must be one of {}, so the imported API Key kept the \
+                 default",
                 ENABLED_WORDS
                     .iter()
                     .map(|(word, _)| word.to_ascii_uppercase())
                     .collect::<Vec<String>>()
                     .join(", ")
             ));
-            false
+            DEFAULT_ENABLED
         }
     };
 
@@ -374,9 +402,7 @@ fn parse_import(body: &[u8]) -> Result<ImportedKeys, String> {
     let indices = column_indices(&header);
     for required in [COLUMN_KEY, COLUMN_NAME] {
         if !indices.contains_key(required) {
-            return Err(format!(
-                "the CSV header line must declare the required {required} column"
-            ));
+            return Err(missing_required_column(required));
         }
     }
 

@@ -17,8 +17,9 @@
 //! * a delete removes exactly the plan its `usagePlanId` names, so the reads that
 //!   reported that plan — its own read, the account's collection and its tag collection —
 //!   stop reporting it while every sibling plan is untouched; nothing the plan carries
-//!   conditions the removal, so the table spans the optional members a plan may carry and
-//!   how many API keys it meters;
+//!   conditions the removal EXCEPT an `apiStages` association (the
+//!   `usage_plan_state_and_refusals` suite's own rule), so the table spans the other
+//!   optional members a plan may carry and how many API keys it meters;
 //! * the `UsagePlanKey` associations the deleted plan held go with it, while the `ApiKey`
 //!   records they named are the account's and stay — readable, and still metered by every
 //!   other plan that meters them;
@@ -31,10 +32,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::USAGE_PLAN_KEY_TYPE;
 
 use crate::api_key_lifecycle::{create_key, get_key};
-use crate::rest_api_lifecycle::{
-    assert_failure, create_api, page_items, string_member, Answer, Gateway,
-};
-use crate::stage_lifecycle::create_deployed_stage;
+use crate::rest_api_lifecycle::{assert_failure, page_items, string_member, Answer, Gateway};
 use crate::tag_reads_by_arn::{apigateway_arn, get_tags};
 use crate::usage_plan_key_lifecycle::{create_usage_plan_key, get_usage_plan_key};
 use crate::usage_plan_lifecycle::{create_usage_plan, get_usage_plan, tag_map};
@@ -92,8 +90,6 @@ async fn meter_key(gateway: &Gateway, plan: &str, key_id: &str) {
 #[tokio::test]
 async fn deleting_a_usage_plan_removes_that_plan_alone_and_a_second_delete_is_not_found() {
     let gateway = Gateway::new();
-    let (api, _root) = create_api(&gateway, "usage-plan-deletes").await;
-    create_deployed_stage(&gateway, &api, "prod").await;
     let metered = created_key_id(&gateway, "plan-delete-metered-key").await;
 
     // Rows differ along what the rule generalises over: which optional members the plan
@@ -119,8 +115,12 @@ async fn deleting_a_usage_plan_removes_that_plan_alone_and_a_second_delete_is_no
             0,
         ),
         (
-            "a plan associated with an api stage",
-            json!({ "name": "del-staged", "apiStages": [{ "apiId": api, "stage": "prod" }] }),
+            "a plan carrying every limit at once",
+            json!({
+                "name": "del-limited",
+                "throttle": { "burstLimit": 7, "rateLimit": 3.5 },
+                "quota": { "limit": 50, "offset": 0, "period": "MONTH" },
+            }),
             0,
         ),
         ("a tagged plan", json!({ "name": "del-tagged", "tags": tag_map(3) }), 0),
