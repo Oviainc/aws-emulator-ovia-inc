@@ -668,9 +668,12 @@ pub const ARN_PARTITIONS: [&str; 5] = ["aws", "aws-us-gov", "aws-iso", "aws-iso-
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// The text this service refuses a request that would leave one resource holding more
-/// than [`MAX_TAGS_PER_RESOURCE`] tags with. `requested` is how many the resource would
-/// end up with — a count computed from the request, so the sentence says which side of
-/// the bound the caller landed on without echoing any key.
+/// than [`MAX_TAGS_PER_RESOURCE`] tags with. `requested` is how many tags the refused
+/// request accounts for — the count the map it carries would leave a resource holding
+/// none of its keys when the map is judged on its own ([`tag_map_refusal`]), and the
+/// count the write would actually leave once the resource's own map is in hand. Either
+/// way a count computed from the request, so the sentence says which side of the bound
+/// the caller landed on without echoing any key.
 ///
 /// One sentence for both write paths: the create path and the tag path enforce one
 /// bound, so they state it with one text.
@@ -777,6 +780,33 @@ pub fn tag_map_violation(member: &str, tags: &HashMap<String, String>) -> Option
     keys.sort();
     keys.into_iter()
         .find_map(|key| tag_key_violation(member, key))
+}
+
+/// The `ValidationException` message a supplied tag MAP earns, or `None` when the map is
+/// installable by itself. `member` is the map member's own path (`tags`), as
+/// [`tag_map_violation`] reports it.
+///
+/// These are the rules of the tag MAP rather than of any operation, so EVERY write path
+/// that installs one applies them here — one place, hence one order, so the same map is
+/// refused for the same reason whichever operation carries it. They are applied before
+/// any state is read, so what a map is refused for never depends on what this emulator
+/// holds:
+///
+/// 1. the ENTRY COUNT first, as the boundary validator checks a collection's size before
+///    its elements: a map carrying more than [`MAX_TAGS_PER_RESOURCE`] entries would
+///    leave a resource holding more tags than one may hold whatever it holds already, so
+///    no resource has to be resolved to refuse it.
+/// 2. then the KEYS, against every constraint the model puts on a `TagKey` — which the
+///    boundary validator never visits ([`tag_map_violation`]).
+///
+/// How much room the TARGET resource has left is not a rule of the map: it is a fact
+/// about that resource, so the operation that resolves one checks the count the install
+/// would leave AFTER this passes.
+pub fn tag_map_refusal(member: &str, tags: &HashMap<String, String>) -> Option<String> {
+    if tags.len() > MAX_TAGS_PER_RESOURCE {
+        return Some(too_many_tags_message(tags.len()));
+    }
+    tag_map_violation(member, tags).map(|violation| one_validation_error(&violation))
 }
 
 /// The rejected value as a MESSAGE carries it: itself when short, a
@@ -1184,15 +1214,23 @@ impl ImageSetAttributes {
     }
 }
 
-/// The recursive half of [`ImageSetAttributes::written_attributes`].
+/// The descending half of [`ImageSetAttributes::written_attributes`].
+///
+/// Walks the levels on an explicit worklist rather than by recursion, for the reason
+/// [`merge_written_attributes`] states: the document's nesting is chosen by whoever wrote
+/// it, so the descent has to cost heap rather than stack.
 fn count_written_attributes(attributes: &::serde_json::Map<String, ::serde_json::Value>) -> usize {
-    attributes
-        .values()
-        .map(|value| match value {
-            ::serde_json::Value::Object(level) => count_written_attributes(level),
-            _ => 1,
-        })
-        .sum()
+    let mut pending: Vec<&::serde_json::Map<String, ::serde_json::Value>> = vec![attributes];
+    let mut leaves = 0;
+    while let Some(level) = pending.pop() {
+        for value in level.values() {
+            match value {
+                ::serde_json::Value::Object(nested) => pending.push(nested),
+                _ => leaves += 1,
+            }
+        }
+    }
+    leaves
 }
 
 /// Deliver `delivered` into the modelled attributes `held`, ELEMENT BY ELEMENT: an element
@@ -1260,21 +1298,62 @@ fn merge_dicom_tags(held: &mut DICOMTags, delivered: DICOMTags) {
 /// mention at all is untouched. Where one side holds a level and the other an attribute's
 /// value, the delivered shape stands: what a path names is decided by what was last written
 /// there, exactly as writing an attribute into the document decides it.
+///
+/// The descent walks the levels on an explicit stack rather than by recursion, because
+/// how deeply the document NESTS is chosen by whoever wrote it: a level costs an entry in
+/// a heap-allocated vector, which a request can grow without touching the thread stack,
+/// while a recursive descent would spend one stack frame per level and a deep enough
+/// document would exhaust the stack — an abort no request can be answered around.
 fn merge_written_attributes(
     held: &mut ::serde_json::Map<String, ::serde_json::Value>,
     delivered: ::serde_json::Map<String, ::serde_json::Value>,
 ) {
-    for (name, delivered_value) in delivered {
-        match (held.remove(&name), delivered_value) {
-            (
-                Some(::serde_json::Value::Object(mut held_level)),
-                ::serde_json::Value::Object(delivered_level),
-            ) => {
-                merge_written_attributes(&mut held_level, delivered_level);
-                held.insert(name, ::serde_json::Value::Object(held_level));
+    /// One level of the descent: the level being merged, the delivered entries it has
+    /// still to take, and the name it sits under one level up (`None` for the document
+    /// itself, which lands back in `held`).
+    struct Level {
+        name: Option<String>,
+        held: ::serde_json::Map<String, ::serde_json::Value>,
+        delivered: ::serde_json::map::IntoIter,
+    }
+
+    let mut descent = vec![Level {
+        name: None,
+        held: ::std::mem::take(held),
+        delivered: delivered.into_iter(),
+    }];
+
+    while !descent.is_empty() {
+        let standing = descent.len() - 1;
+        let Some((name, delivered_value)) = descent[standing].delivered.next() else {
+            // This level is merged: it lands where it belongs, one level up.
+            let finished = descent.pop().expect("the level the descent is standing on");
+            match finished.name {
+                // A nested level lands back under the name it sits at.
+                Some(name) => {
+                    let parent = descent
+                        .last_mut()
+                        .expect("a named level sits inside the level above it");
+                    parent
+                        .held
+                        .insert(name, ::serde_json::Value::Object(finished.held));
+                }
+                // The root level IS the merged document.
+                None => *held = finished.held,
             }
+            continue;
+        };
+        match (descent[standing].held.remove(&name), delivered_value) {
+            (
+                Some(::serde_json::Value::Object(held_level)),
+                ::serde_json::Value::Object(delivered_level),
+            ) => descent.push(Level {
+                name: Some(name),
+                held: held_level,
+                delivered: delivered_level.into_iter(),
+            }),
             (_, delivered_value) => {
-                held.insert(name, delivered_value);
+                descent[standing].held.insert(name, delivered_value);
             }
         }
     }

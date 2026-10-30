@@ -156,33 +156,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The tag map is validated BEFORE anything is read or written: a refused
         // request mints no data store and consumes no `clientToken`, so an illegal tag
-        // map is observable nowhere. Both rules below belong to the TAG MAP rather than
-        // to this operation, so they are the same two `TagResource` applies — a map one
-        // write path refuses cannot be installed through the other.
-        //
-        // The ENTRY COUNT first, as the boundary validator checks a collection's size
-        // before its elements: one call may not install more tags than a resource
-        // holds ([`crate::state::MAX_TAGS_PER_RESOURCE`]).
-        if let Some(tags) = &input.tags {
-            if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
-                return Err(CreateDatastoreErrorModeled::ValidationException(
-                    ValidationException {
-                        message: crate::state::too_many_tags_message(tags.len()),
-                    },
-                )
-                .into());
-            }
-            // Then the KEYS, against every constraint the model puts on a `TagKey`.
-            // The boundary validator never visits a map key, so this is the only place
-            // the key rules are applied — see `crate::state::tag_map_violation`.
-            if let Some(violation) = crate::state::tag_map_violation("tags", tags) {
-                return Err(CreateDatastoreErrorModeled::ValidationException(
-                    ValidationException {
-                        message: crate::state::one_validation_error(&violation),
-                    },
-                )
-                .into());
-            }
+        // map is observable nowhere. The rules are the TAG MAP's rather than this
+        // operation's, so they are applied where every write path applies them
+        // (`crate::state::tag_map_refusal`) — one ordered sequence, so a map `TagResource`
+        // refuses is refused here for the same reason, and the other way round.
+        if let Some(message) = input
+            .tags
+            .as_ref()
+            .and_then(|tags| crate::state::tag_map_refusal("tags", tags))
+        {
+            return Err(
+                CreateDatastoreErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

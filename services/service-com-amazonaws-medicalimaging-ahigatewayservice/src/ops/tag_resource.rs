@@ -174,16 +174,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // The KEYS, against every constraint the model puts on a `TagKey` — the same
-        // check `CreateDatastore` applies, because what makes a tag map legal belongs
-        // to the map and not to the operation installing it. After the ARN parse, so a
-        // request that is both malformed and illegally tagged keeps answering for its
-        // label; before the store is touched, so an illegal map changes nothing.
-        if let Some(violation) = crate::state::tag_map_violation("tags", &input.tags) {
-            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
-                message: crate::state::one_validation_error(&violation),
-            })
-            .into());
+        // The MAP, against the rules of a tag map — its entry count and its keys, in
+        // the one order every write path applies them
+        // (`crate::state::tag_map_refusal`), because what makes a tag map legal belongs
+        // to the map and not to the operation installing it: the same map is refused for
+        // the same reason here as on the create path. After the ARN parse, so a request
+        // that is both malformed and illegally tagged keeps answering for its label;
+        // before the store is touched, so an illegal map changes nothing and a map no
+        // resource could hold is refused whether or not this emulator holds the one the
+        // ARN names.
+        if let Some(message) = crate::state::tag_map_refusal("tags", &input.tags) {
+            return Err(
+                TagResourceErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -211,8 +215,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
 
-        // Only a key the resource does not already carry grows the map, so
-        // re-tagging an existing key is never refused by the bound.
+        // How much room the resource has LEFT, which is the one tag rule that is a fact
+        // about the resource rather than about the map, so it is the one checked once the
+        // resource is in hand: a map the rules above admit still may not push the
+        // resource past the bound. Only a key the resource does not already carry grows
+        // the map, so re-tagging an existing key is never refused by the bound.
         let added = input
             .tags
             .keys()

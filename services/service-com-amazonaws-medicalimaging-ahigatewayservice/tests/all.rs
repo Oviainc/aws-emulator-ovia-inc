@@ -75,6 +75,8 @@ mod resource_tagging;
 mod state_roundtrip;
 #[path = "all/study_update_membership.rs"]
 mod study_update_membership;
+#[path = "all/tag_map_rule_order.rs"]
+mod tag_map_rule_order;
 #[path = "all/tag_map_validation.rs"]
 mod tag_map_validation;
 #[path = "all/tag_resource_key_pattern.rs"]
