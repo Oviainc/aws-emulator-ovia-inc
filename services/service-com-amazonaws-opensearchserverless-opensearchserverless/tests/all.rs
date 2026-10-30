@@ -79,6 +79,8 @@ mod state_roundtrip;
 mod tag_key_uniqueness;
 #[path = "all/tag_write_timestamps.rs"]
 mod tag_write_timestamps;
+#[path = "all/tagging_plane_resource_kinds.rs"]
+mod tagging_plane_resource_kinds;
 #[path = "all/update_collection_token_scope.rs"]
 mod update_collection_token_scope;
 #[path = "all/vpc_endpoint.rs"]
