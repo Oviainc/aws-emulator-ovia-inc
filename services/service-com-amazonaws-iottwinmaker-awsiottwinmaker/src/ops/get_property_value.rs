@@ -205,17 +205,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it: a workspace created through another Region's endpoint is not in
         // it, so it holds no property value to report.
         let region = crate::state::request_region(ctx.parts());
-        // The page size served, under the rule every paginated operation of this
-        // service shares (`crate::state::page_size`): THIS member documents a
-        // minimum of 1 and the service's default of 25, so an explicit zero is
-        // refused and a request that names none is served that default; whatever
-        // is asked for, at most `crate::state::MAX_PAGE_SIZE` rows are built
-        // under the state lock.
-        let page_size = crate::state::page_size(
-            input.max_results,
-            crate::state::PageSizeRule::minimum_one(crate::state::DEFAULT_PAGE_SIZE),
-        )
-        .map_err(invalid)?;
 
         // Everything either answer is computed from is read under the store's
         // lock, and the lock is RELEASED before a table is filtered and
@@ -224,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // serialise every other operation of this service behind one request.
         // The latest-value answer is built here instead: it is at most
         // `SelectedPropertyList`'s modelled ten properties of one component.
-        let table = {
+        let (table, page_size) = {
             let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
                 GetPropertyValueErrorModeled::InternalServerException(InternalServerException {
                     message: Some("the iottwinmaker store is unavailable".to_string()),
@@ -242,15 +231,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let query = resolve_query(workspace, &input)?;
             let selected = selected_properties(workspace, &query, &input)?;
 
+            // The SCOPE is resolved before the request's own members, so a read
+            // naming a workspace, entity, component or component type this
+            // service does not hold is refused for THAT — with the status a
+            // caller branches on — whatever page members the request carries;
+            // the page size is decided only once the scope stands, the order
+            // `ListProperties` and this service's listings resolve them in.
+            //
+            // The page size served, under the rule every paginated operation of
+            // this service shares (`crate::state::page_size`): THIS member
+            // documents a minimum of 1 and the service's default of 25, so an
+            // explicit zero is refused and a request that names none is served
+            // that default; whatever is asked for, at most
+            // `crate::state::MAX_PAGE_SIZE` rows are built under the state
+            // lock.
+            let page_size = crate::state::page_size(
+                input.max_results,
+                crate::state::PageSizeRule::minimum_one(crate::state::DEFAULT_PAGE_SIZE),
+            )
+            .map_err(invalid)?;
+
             match &query {
                 Query::LatestValues(component) => {
                     return latest_values_response(
                         workspace, component, &selected, page_size, &input,
                     )
                 }
-                Query::Table { conditions, .. } => {
-                    Table::read(workspace, &query, conditions, selected)?
-                }
+                Query::Table { conditions, .. } => (
+                    Table::read(workspace, &query, conditions, selected)?,
+                    page_size,
+                ),
             }
         };
 
