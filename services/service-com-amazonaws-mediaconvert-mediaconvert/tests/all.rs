@@ -25,6 +25,8 @@ mod blank_filter_value;
 mod blank_job_reference;
 #[path = "all/blank_jobs_query_id.rs"]
 mod blank_jobs_query_id;
+#[path = "all/blank_output_preset.rs"]
+mod blank_output_preset;
 #[path = "all/blank_read_name.rs"]
 mod blank_read_name;
 #[path = "all/blank_resource_name.rs"]

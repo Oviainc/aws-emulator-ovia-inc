@@ -40,7 +40,11 @@ const DELETED_PRESET: &str = "preset-that-went-away";
 const UPDATED_TEMPLATE: &str = "outputs-replaced-here";
 
 /// One output, stating a preset, container settings, or neither.
-fn output(preset: Option<&str>, container: Option<&str>) -> Value {
+///
+/// `pub(crate)` with the three builders below, because the suite that drives the blank
+/// half of the same rule (`tests/all/blank_output_preset.rs`) builds its graphs the same
+/// way, and one builder beats a second copy of it.
+pub(crate) fn output(preset: Option<&str>, container: Option<&str>) -> Value {
     let mut output = json!({ "nameModifier": "_a" });
     if let Some(members) = output.as_object_mut() {
         if let Some(preset) = preset {
@@ -58,7 +62,7 @@ fn output(preset: Option<&str>, container: Option<&str>) -> Value {
 
 /// An output group per entry, each holding that entry's outputs, so a row can put the
 /// output at fault anywhere in the graph.
-fn output_groups(groups: &[Vec<Value>]) -> Value {
+pub(crate) fn output_groups(groups: &[Vec<Value>]) -> Value {
     Value::Array(
         groups
             .iter()
@@ -80,7 +84,7 @@ fn output_groups(groups: &[Vec<Value>]) -> Value {
 }
 
 /// A `JobSettings` whose outputs are the row's: one source file, and the row's groups.
-fn job_settings(groups: &[Vec<Value>]) -> Value {
+pub(crate) fn job_settings(groups: &[Vec<Value>]) -> Value {
     json!({
         "inputs": [{ "fileInput": INPUT_URI }],
         "outputGroups": output_groups(groups)
@@ -89,7 +93,7 @@ fn job_settings(groups: &[Vec<Value>]) -> Value {
 
 /// A `JobTemplateSettings` whose outputs are the row's. A template's `Inputs` are
 /// `InputTemplate`s, which carry no file input — the file comes from the job.
-fn template_settings(groups: &[Vec<Value>]) -> Value {
+pub(crate) fn template_settings(groups: &[Vec<Value>]) -> Value {
     json!({
         "inputs": [{ "timecodeSource": "ZEROBASED" }],
         "outputGroups": output_groups(groups)
@@ -100,7 +104,7 @@ fn template_settings(groups: &[Vec<Value>]) -> Value {
 ///
 /// A refusal must leave the store as it was, and this is how every refusal row checks it:
 /// through the API, never by reaching into the state struct.
-async fn stored_jobs(emulator: &Emulator) -> usize {
+pub(crate) async fn stored_jobs(emulator: &Emulator) -> usize {
     let listed = emulator.send("GET", "/2017-08-29/jobs", None).await;
     assert_eq!(
         listed.status, 200,

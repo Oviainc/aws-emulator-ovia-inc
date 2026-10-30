@@ -1192,10 +1192,12 @@ pub fn invalid_job_engine_version_message() -> String {
 /// container to write nor the preset that states it, names nothing to write. An output that
 /// states BOTH states it twice, which the member forbids, and one that names a preset the
 /// account does not hold names settings nothing can supply — so neither describes a
-/// transcode either. In each case there is nothing for the service to run. MediaConvert
-/// validates the settings graph when it is handed one — the error envelope's
-/// `settingsValidationErrorsJsonBlob` member exists to report exactly that — and refuses
-/// such a request with `BadRequestException` (400) rather than storing it.
+/// transcode either. An output whose `Preset` carries no characters STATES the reference
+/// without naming anything, which is the one reading every resource-naming member in this
+/// service gets ([`carries_no_characters`]). In each case there is nothing for the service
+/// to run. MediaConvert validates the settings graph when it is handed one — the error
+/// envelope's `settingsValidationErrorsJsonBlob` member exists to report exactly that —
+/// and refuses such a request with `BadRequestException` (400) rather than storing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsProblem {
     /// Nothing supplies an input, so the graph names no source.
@@ -1218,6 +1220,17 @@ pub enum SettingsProblem {
     /// The output at this position states what it is written as TWICE: it names a preset
     /// and carries container settings of its own, which `Output$Preset` forbids.
     BothPresetAndContainer {
+        /// The group's index in `OutputGroups`, as the request stated it.
+        group: usize,
+        /// The output's index in that group's `Outputs`.
+        output: usize,
+    },
+    /// The output at this position STATES a preset whose value carries no characters, so
+    /// the member names no preset this or any account could hold. Stating the member and
+    /// leaving it out are different requests: only the second is "this output has no
+    /// preset" ([`SettingsProblem::NoContainer`] is then what an output with no container
+    /// of its own gets).
+    BlankPreset {
         /// The group's index in `OutputGroups`, as the request stated it.
         group: usize,
         /// The output's index in that group's `Outputs`.
@@ -1267,6 +1280,13 @@ impl SettingsProblem {
                  OutputGroups[{group}].Outputs[{output}]: you can specify either Preset or \
                  Container settings, but not both."
             ),
+            // The blank-reference sentence every resource-naming member in this service is
+            // refused with ([`blank_member_message`]), naming the member by its path from
+            // the request — with the output's position, as the two refusals around it name
+            // it, because one graph carries many such members.
+            Self::BlankPreset { group, output } => blank_member_message(&format!(
+                "OutputGroups[{group}].Outputs[{output}].Preset"
+            )),
             Self::PresetNotFound {
                 group,
                 output,
@@ -1324,13 +1344,19 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     /// against the account's presets here — the built-in catalogue and whatever this account
     /// created — exactly as every other reference a request makes is resolved against the
     /// store that holds it, and a name the store does not hold supplies no settings however
-    /// well formed it is.
+    /// well formed it is. A reference the request STATES but which carries no characters
+    /// names no preset at all ([`carries_no_characters`]), so it is a bad request on its
+    /// own and never read as the member left out.
     ///
-    /// The two halves are reported in that order: an output stating BOTH is refused for the
-    /// contradiction whether or not the preset it names resolves, because the request has
-    /// not yet said which of the two it means — resolving a reference the caller may not
-    /// have meant to make would report the wrong member. Keep that order if this is
-    /// reworked.
+    /// The tests are reported in this order: a `Preset` the request STATED but which
+    /// carries no characters is refused first, as the blank reference it is and before
+    /// anything is read from it, because such a value is neither a name this store could
+    /// hold nor the member left out — the one reading every resource-naming member in this
+    /// service gets ([`carries_no_characters`]), so it cannot depend on what the output's
+    /// other members say. Then an output stating BOTH is refused for the contradiction
+    /// whether or not the preset it names resolves, because the request has not yet said
+    /// which of the two it means — resolving a reference the caller may not have meant to
+    /// make would report the wrong member. Keep that order if this is reworked.
     fn output_problem(
         &self,
         group: usize,
@@ -1338,11 +1364,14 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         entry: &Output,
     ) -> Option<SettingsProblem> {
         let container = container_settings_name_a_container(entry.container_settings.as_ref());
-        let Some(preset) = named_preset(entry) else {
-            // Nothing names a preset, so the output's own container settings are the only
+        let Some(preset) = stated_preset(entry) else {
+            // Nothing states a preset, so the output's own container settings are the only
             // thing that can say what it is.
             return (!container).then_some(SettingsProblem::NoContainer { group, output });
         };
+        if carries_no_characters(preset) {
+            return Some(SettingsProblem::BlankPreset { group, output });
+        }
         if container {
             return Some(SettingsProblem::BothPresetAndContainer { group, output });
         }
@@ -1354,17 +1383,19 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     }
 }
 
-/// The preset an output names, or `None` when it names none.
+/// The `Preset` an output STATES, exactly as the request sent it, or `None` when the output
+/// leaves the member out.
 ///
 /// `Output$Preset` is the "system or custom preset name", which is a preset's identity in
-/// this store, so it is read exactly as the caller sent it — as `GetPreset` reads it. A
-/// value made only of whitespace carries no name at all, the same reading every other
-/// optional free-text member in this module gets ([`optional_free_text`]).
-fn named_preset(output: &Output) -> Option<&str> {
-    output
-        .preset
-        .as_deref()
-        .filter(|preset| !preset.trim().is_empty())
+/// this store, so it is read byte for byte as the caller sent it — as `GetPreset` reads it,
+/// and as every other resource-naming member in this module is read
+/// ([`carries_no_characters`] is the only test such a value takes). Stating the member and
+/// leaving it out are therefore DIFFERENT requests, and a value carrying no characters is
+/// reported by the walk above rather than dropped here: [`optional_free_text`]'s
+/// blank-is-absent reading belongs to the free-text members (`Category`, `Description`),
+/// not to a reference.
+fn stated_preset(output: &Output) -> Option<&str> {
+    output.preset.as_deref()
 }
 
 /// Whether a `ContainerSettings` names the container its output is written in.
