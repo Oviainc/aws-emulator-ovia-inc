@@ -4629,6 +4629,22 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             .find(|record| record.site_id.as_deref() == Some(site_id) && record.is_outstanding())
     }
 
+    /// The order of `region` that has been PLACED at `site_id`, whatever status it
+    /// now holds, if this store holds one.
+    ///
+    /// An order is placed at a site through an Outpost of that site
+    /// ([`OrderRecord::site_id`]), and placing it is what happened whether it is
+    /// still outstanding or has since completed or been cancelled — so unlike
+    /// [`Self::outstanding_order_at_site`], which asks what the service still OWES
+    /// the site, this asks whether an order was ever placed there at all: the fact
+    /// that closes the "before you place an order at the site" window
+    /// ([`Self::site_address_block`]). Scoped to `region` for the reason
+    /// [`RegionalRecord`] gives.
+    pub fn order_placed_at_site(&self, region: &str, site_id: &str) -> Option<&OrderRecord> {
+        all_in_region(&self.orders, region)
+            .find(|record| record.site_id.as_deref() == Some(site_id))
+    }
+
     /// The order placed at `site_id` in `region` that a change to that site has to
     /// wait for, or `None` when no order there is still outstanding.
     ///
@@ -4794,8 +4810,9 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// one.
     ///
     /// An Outpost names the site it lives at, so what this answers is whether that
-    /// site still has hardware at it: the fact `DeleteSite` refuses a delete on and
-    /// a change to the site's OPERATING address conflicts with. Stated once here so
+    /// site still has hardware at it: the fact `DeleteSite` refuses a delete on, and
+    /// the one a change to the site's OPERATING address waits on once an order has
+    /// been placed at the site ([`Self::site_address_block`]). Stated once here so
     /// the two cannot disagree about what "the site still has an Outpost" means.
     pub fn outpost_at_site(&self, region: &str, site_id: &str) -> Option<&OutpostRecord> {
         self.outposts_in(region)
@@ -4817,10 +4834,15 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     ///   where both hold.
     /// * "You can update the operating address before you place an order at the
     ///   site, or after all Outposts that belong to the site have been deactivated."
-    ///   — on the OPERATING address only, while an Outpost still belongs to the site
-    ///   ([`Self::outpost_at_site`]). The operating address is where the site itself
-    ///   is, so hardware at it depends on it; the shipping address is where that
-    ///   hardware ships to and no Outpost at the site holds it up.
+    ///   — on the OPERATING address only, and only OUTSIDE both windows that
+    ///   sentence permits: an order has been placed at the site
+    ///   ([`Self::order_placed_at_site`]), so the first window has closed, AND an
+    ///   Outpost still belongs to the site ([`Self::outpost_at_site`]), so the
+    ///   second has not opened. The operating address is where the site itself is,
+    ///   so hardware ordered for it depends on it; a site no order was ever placed
+    ///   at is inside the first window however many Outposts belong to it, and the
+    ///   shipping address is where that hardware ships to and no Outpost at the site
+    ///   holds it up.
     ///
     /// Callers settle first (see [`Self::settle_orders`]), so the order statuses read
     /// here are the ones the orders hold at that instant.
@@ -4839,6 +4861,9 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         if kind != SiteAddressKind::Operating {
             return None;
         }
+        // The first window is open until an order is placed AT THE SITE, so an
+        // Outpost at a site nobody has ordered hardware for holds nothing up.
+        self.order_placed_at_site(region, site_id)?;
         let outpost_id = self
             .outpost_at_site(region, site_id)
             .and_then(|record| record.outpost.outpost_id.clone())?;
@@ -6260,7 +6285,8 @@ pub fn address_type_value_report() -> String {
 }
 
 /// How this service states that a site's OPERATING address cannot be changed
-/// while an Outpost still belongs to that site.
+/// while an Outpost still belongs to that site, an order having been placed at
+/// it.
 ///
 /// AWS documents the rule — "You can update the operating address before you
 /// place an order at the site, or after all Outposts that belong to the site have

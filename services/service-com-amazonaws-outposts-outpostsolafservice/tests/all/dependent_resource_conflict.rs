@@ -31,7 +31,7 @@
 use serde_json::{json, Value};
 
 use super::site_and_outpost_lifecycle::{
-    address, segment, text, Outposts, ABSENT_SITE_ID, HOME_REGION,
+    a_cancelled_order_in, address, segment, text, Outposts, ABSENT_SITE_ID, HOME_REGION,
 };
 
 /// The `ResourceType` a conflict about an Outpost names.
@@ -122,6 +122,14 @@ async fn a_call_held_back_by_a_dependent_resource_is_a_conflict_naming_that_depe
                 )
                 .await;
             dependents.push(text(&outpost, "OutpostId"));
+            if count == 1 {
+                // `UpdateSiteAddress` permits an operating-address change "before you
+                // place an order at the site", so a site no order was placed at has no
+                // dependent conflict to answer; the workflow places one at the site and
+                // cancels it, leaving the site's Outposts as the only thing holding
+                // either call below back.
+                a_cancelled_order_in(&outposts, region, &dependents[0]).await;
+            }
 
             for identifier in [site_id.clone(), site_arn.clone()] {
                 for call in &calls {

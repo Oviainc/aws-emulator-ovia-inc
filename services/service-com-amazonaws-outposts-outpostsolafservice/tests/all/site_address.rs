@@ -20,10 +20,13 @@
 //!    it (`OperatingAddress{CountryCode,StateOrRegion,City}`) and changes nothing else
 //!    about the site; writing the SHIPPING address changes no member of `Site` at all.
 //! 3. The operating address is where the site itself is, so AWS accepts a change to it
-//!    only "before you place an order at the site, or after all Outposts that belong to
-//!    the site have been deactivated": while an Outpost belongs to the site the change
-//!    is refused 409 `ConflictException`, naming that Outpost, and nothing is written.
-//!    A shipping-address change is not held up by it.
+//!    "before you place an order at the site, or after all Outposts that belong to the
+//!    site have been deactivated": inside either of those windows the change goes
+//!    through, and outside both — an order having been placed at the site while an
+//!    Outpost still belongs to it — it is refused 409 `ConflictException`, naming that
+//!    Outpost, with nothing written. A shipping-address change is not held up by it.
+//!    ([`crate::site_operating_address_windows`] spans the two windows; this pins them
+//!    on this suite's own workflow.)
 //! 4. An identifier that names nothing is 404 `NotFoundException`; one that is no
 //!    identifier at all, and a request outside the model's own constraints, is 400
 //!    `ValidationException` — on both routes. (A `GET` that carries no `AddressType`
@@ -39,7 +42,8 @@
 use serde_json::{json, Value};
 
 use super::site_and_outpost_lifecycle::{
-    address, query_value, refusal, segment, text, Outposts, ABSENT_SITE_ID, SITE_ARN_PREFIX,
+    a_cancelled_order_in, address, query_value, refusal, segment, text, Outposts, ABSENT_SITE_ID,
+    HOME_REGION, SITE_ARN_PREFIX,
 };
 
 /// Every value the modelled `AddressType` enum declares.
@@ -339,18 +343,19 @@ async fn a_type_the_site_holds_no_address_for_is_reported_absent() {
     );
 }
 
-/// Rule 3: while an Outpost belongs to the site, a change to the OPERATING address is
-/// refused 409 `ConflictException` naming that Outpost, and the stored address is left
-/// as it was; a change to the SHIPPING address goes through. Once the Outpost is gone
-/// the operating change is accepted and reads back.
+/// Rule 3: an Outpost at the site holds an OPERATING change up only once an order has
+/// been placed at that site — before that the site is inside the first window the model
+/// names and the change goes through. Once the order has been placed the change is
+/// refused 409 `ConflictException` naming that Outpost and the stored address is left as
+/// it was, while a change to the SHIPPING address goes through; once the Outpost is gone
+/// the operating change is accepted again and reads back.
 #[tokio::test]
-async fn the_operating_address_is_held_while_an_outpost_belongs_to_the_site() {
+async fn the_operating_address_is_held_while_an_outpost_belongs_to_an_ordered_site() {
     let outposts = Outposts::new();
-    let before = address("US", "WA", "Seattle");
     let site = outposts
         .create_site(&json!({
             "Name": "occupied site",
-            "OperatingAddress": before,
+            "OperatingAddress": address("US", "WA", "Seattle"),
         }))
         .await;
     let site_id = text(&site, "SiteId");
@@ -359,6 +364,20 @@ async fn the_operating_address_is_held_while_an_outpost_belongs_to_the_site() {
         .create_outpost(&json!({ "Name": "resident", "SiteId": site_id }))
         .await;
     let outpost_id = text(&outpost, "OutpostId");
+
+    // The first window: no order has been placed at the site, so the Outpost at it
+    // holds nothing up and the change goes through.
+    let before = address("DE", "Hesse", "Frankfurt");
+    let answered = update_site_address(&outposts, &site_id, OPERATING, &before).await;
+    assert_eq!(
+        answered,
+        json!({ "AddressType": OPERATING, "Address": before }),
+        "case \"operating change before any order at the site\": it must be accepted, got {answered:?}"
+    );
+
+    // Placing an order at the site closes that window; cancelling it leaves no order in
+    // progress, so what holds the change up below is the Outpost alone.
+    a_cancelled_order_in(&outposts, HOME_REGION, &outpost_id).await;
 
     let attempt = address("IE", "Leinster", "Dublin");
     // Both identifier forms are refused the same way: the conflict is about the site's
@@ -374,7 +393,7 @@ async fn the_operating_address_is_held_while_an_outpost_belongs_to_the_site() {
         assert_eq!(
             (reply.status, reply.error_code.as_str()),
             (409, "ConflictException"),
-            "case {named_by:?}: an operating-address change must be refused while an Outpost belongs to the site, got {} {:?}",
+            "case {named_by:?}: an operating-address change must be refused while an Outpost belongs to a site an order has been placed at, got {} {:?}",
             reply.status,
             reply.body
         );

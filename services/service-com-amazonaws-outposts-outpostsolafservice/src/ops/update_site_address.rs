@@ -16,8 +16,9 @@
 //! still
 //! outstanding, naming that order; "You can update the operating address before you
 //! place an order at the site, or after all Outposts that belong to the site have been
-//! deactivated" additionally holds an OPERATING change while an Outpost still belongs to
-//! the site, naming that Outpost.
+//! deactivated" permits an OPERATING change in either of those two windows and holds it
+//! outside both — an order has been placed at the site AND an Outpost still belongs to
+//! it — naming that Outpost.
 //!
 //! ## Shape of an operation
 //!
@@ -218,9 +219,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // What holds this change up, read before the mutable borrow below: an order
         // still in progress at the site, on an address of either type, or — for the
-        // OPERATING address, which is where the site itself is — an Outpost that
-        // still belongs to the site. Nothing is written in either case: the stored
-        // addresses are left exactly as they were.
+        // OPERATING address, which is where the site itself is — a site outside both
+        // windows that address may change in, an order having been placed at it while
+        // an Outpost still belongs to it. Nothing is written in either case: the
+        // stored addresses are left exactly as they were.
         if let Some(block) = store.site_address_block(&region, &site_id, kind) {
             let (resource_type, resource_id) = match block.resource {
                 Some((resource_type, resource_id)) => {

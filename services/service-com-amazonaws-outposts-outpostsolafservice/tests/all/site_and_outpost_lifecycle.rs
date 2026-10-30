@@ -119,6 +119,30 @@ fn hardware_order(outpost_identifier: &str) -> Value {
     })
 }
 
+/// Place an order at the site `outpost_identifier` belongs to, through the `region`
+/// endpoint, and cancel it again — both over the wire — answering the `OrderId` it
+/// was placed under.
+///
+/// `UpdateSiteAddress` permits an operating-address change "before you place an order
+/// at the site", so a case about what else holds such a change up has to place one
+/// first; cancelling it then leaves no order in progress, which is the OTHER limit the
+/// same operation documents.
+pub(crate) async fn a_cancelled_order_in(
+    outposts: &Outposts,
+    region: &str,
+    outpost_identifier: &str,
+) -> String {
+    let order = hardware_order(outpost_identifier);
+    let placed = outposts
+        .ok_in(region, "POST", "/orders", Some(&order))
+        .await;
+    let order_id = text(&placed["Order"], "OrderId");
+    outposts
+        .ok_in(region, "POST", &format!("/orders/{order_id}/cancel"), None)
+        .await;
+    order_id
+}
+
 /// Bring every install the orders this store already holds owe due NOW.
 ///
 /// The counterpart of [`install_hardware`] for a case that places its OWN orders: the
