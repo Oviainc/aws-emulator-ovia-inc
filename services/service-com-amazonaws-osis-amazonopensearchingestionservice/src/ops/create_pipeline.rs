@@ -179,10 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The one rule the model cannot state is the relation between the two counts.
         if input.max_units < input.min_units {
             return Err(CreatePipelineErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "MaxUnits ({}) must be greater than or equal to MinUnits ({})",
-                    input.max_units, input.min_units
-                )),
+                // The refusal states the rule, in the lower-camel member spellings the
+                // service words it with, and nothing else: neither submitted count is a
+                // variable part of this message.
+                message: Some("minUnits cannot be greater than maxUnits".to_string()),
             })
             .into());
         }
@@ -197,8 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.pipelines.contains_key(&input.pipeline_name) {
             return Err(CreatePipelineErrorModeled::ResourceAlreadyExistsException(
                 ResourceAlreadyExistsException {
+                    // The only variable part is the name the request asked for, quoted,
+                    // so a caller can parse it back out of the message whatever it
+                    // contains.
                     message: Some(format!(
-                        "Pipeline with name {} already exists",
+                        "Pipeline with given name \"{}\" already exists",
                         input.pipeline_name
                     )),
                 },

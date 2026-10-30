@@ -2,9 +2,11 @@
 
 //! @op StartPipeline
 //!
-//! A MUTATION, the inverse of `StopPipeline`: it moves a stopped pipeline into
-//! `STARTING` and the clock owes it `ACTIVE`. The new status is persisted, so a later
-//! `GetPipeline` / `ListPipelines` reports it.
+//! A MUTATION, the inverse of `StopPipeline`: it moves a pipeline that is eligible for
+//! starting into `STARTING` and the clock owes it `ACTIVE`. The new status is persisted,
+//! so a later `GetPipeline` / `ListPipelines` reports it. A start of a pipeline that an
+//! accepted start already put on its way to running is idempotent: it is accepted and
+//! reports that same transition rather than starting a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -156,15 +158,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored = store
             .pipelines
             .get_mut(&pipeline_name)
-            .ok_or_else(|| not_found(&pipeline_name))?;
+            .ok_or_else(not_found)?;
 
-        // Only a stopped pipeline can be started: one that is already running, or still
-        // settling into a status, is not in a startable state, which is what this
-        // operation's ConflictException reports.
-        if stored.status != crate::state::STATUS_STOPPED {
+        // A start of a pipeline that an accepted start has already put on its way to
+        // running is the SAME start, not a conflicting one: the duplicate request is
+        // accepted and reports the transition already in flight, so the pipeline still
+        // makes exactly one transition however many times the caller (or its retry) asks.
+        if stored.status == crate::state::STATUS_STARTING {
+            return Ok(StartPipelineOutput {
+                pipeline: Some(stored.to_pipeline()),
+            });
+        }
+
+        // Otherwise the pipeline must be in one of the statuses a start is eligible from:
+        // a running pipeline, or one mid-change, is not, which is what this operation's
+        // ConflictException reports — stating the eligible set the caller has to get the
+        // pipeline into and the status it is in instead.
+        if !crate::state::START_ELIGIBLE_STATUSES.contains(&stored.status.as_str()) {
             return Err(StartPipelineErrorModeled::ConflictException(ConflictException {
                 message: Some(format!(
-                    "Pipeline {pipeline_name} cannot be started while its status is {}",
+                    "Only pipelines with one of the following statuses are eligible for \
+                     starting: {}. The current status is {}.",
+                    crate::state::START_ELIGIBLE_STATUSES.join(", "),
                     stored.status
                 )),
             })
@@ -186,9 +201,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// No pipeline of this name is stored — HTTP 404 `ResourceNotFoundException`.
-fn not_found(pipeline_name: &str) -> StartPipelineError {
+///
+/// The message is this operation's own and has no variable part: it states that there are
+/// no settings to start and reveals no name back to the caller. A not-found message is
+/// per-operation, not one template shared across the service.
+fn not_found() -> StartPipelineError {
     StartPipelineErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("Pipeline {pipeline_name} could not be found")),
+        message: Some("No pipeline settings found".to_string()),
     })
     .into()
 }

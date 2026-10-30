@@ -186,9 +186,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// No pipeline of this name is stored — HTTP 404 `ResourceNotFoundException`.
+///
+/// The message is this stop's own: it states the operation that could not be carried out
+/// and names the pipeline the request named. A not-found message is per-operation, not one
+/// template shared across the service.
 fn not_found(pipeline_name: &str) -> StopPipelineError {
     StopPipelineErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("Pipeline {pipeline_name} could not be found")),
+        message: Some(format!(
+            "The pipeline {pipeline_name} could not be stopped because it does not exist"
+        )),
     })
     .into()
 }

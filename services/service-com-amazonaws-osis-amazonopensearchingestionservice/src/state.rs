@@ -28,6 +28,19 @@ pub const STATUS_STOPPING: &str = "STOPPING";
 pub const STATUS_STOPPED: &str = "STOPPED";
 /// Transient state entered by `StartPipeline`.
 pub const STATUS_STARTING: &str = "STARTING";
+/// Terminal state a start that did not come up leaves a pipeline in.
+pub const STATUS_START_FAILED: &str = "START_FAILED";
+/// Terminal state a create that did not come up leaves a pipeline in.
+pub const STATUS_CREATE_FAILED: &str = "CREATE_FAILED";
+
+/// The `PipelineStatus` values a pipeline can be STARTED from.
+///
+/// A pipeline is startable only out of a settled, not-running status: it is stopped, or a
+/// previous start or create left it failed. Every other status — running, or mid-change —
+/// is ineligible, which is what `StartPipeline`'s `ConflictException` reports, and this
+/// list is the one the refusal enumerates, so the check and the message cannot disagree.
+pub const START_ELIGIBLE_STATUSES: &[&str] =
+    &[STATUS_STOPPED, STATUS_START_FAILED, STATUS_CREATE_FAILED];
 
 /// How long a pipeline stays in a transient status (`CREATING`, `UPDATING`, `STARTING`,
 /// `STOPPING`) before the clock owes it the settled one.
