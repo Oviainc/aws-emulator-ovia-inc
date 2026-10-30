@@ -170,22 +170,26 @@ const ROWS: &[Row] = &[
         label: "AddRegion enabling the instance in one more Region",
         operation: "AddRegion",
         body: |arn| json!({"InstanceArn": arn, "RegionName": OTHER_REGION}),
-        once_active: "",
+        // Once the instance is active the add is refused for its OWN reason: an ACCOUNT
+        // instance — which is what `CreateInstance` creates — serves no Region write at
+        // all (`account_instance_region_writes.rs`).
+        once_active: "ValidationException",
     },
     Row {
         label: "RemoveRegion naming the primary Region",
         operation: "RemoveRegion",
         body: |arn| json!({"InstanceArn": arn, "RegionName": TEST_REGION}),
-        // Once the instance is active the remove is refused for its OWN reason: "The
-        // primary Region cannot be removed."
+        // Once the instance is active the remove is refused for its OWN reason: this is an
+        // account instance, so no Region of it can be removed.
         once_active: "ValidationException",
     },
     Row {
         label: "RemoveRegion naming a Region the instance is not enabled in",
         operation: "RemoveRegion",
         body: |arn| json!({"InstanceArn": arn, "RegionName": OTHER_REGION}),
-        // Once the instance is active that Region names no resource of it.
-        once_active: "ResourceNotFoundException",
+        // Same reason, and it does not depend on the Region named: the account-instance
+        // guard precedes every check on the Region itself.
+        once_active: "ValidationException",
     },
 ];
 

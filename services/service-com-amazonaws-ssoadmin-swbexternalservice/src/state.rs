@@ -820,6 +820,56 @@ pub fn region_ceiling_message(instance_arn: &str) -> String {
 /// and therefore admits a request this ceiling refuses.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The prefix AWS reserves for the tags it applies ITSELF — a SYSTEM (service-owned) tag.
+///
+/// A key under it belongs to Amazon Web Services rather than to the caller, so an end user
+/// may neither write one nor remove one ([`mutates_system_tag`]); a key that merely
+/// CONTAINS the prefix, or starts with `aws` and no colon, is an ordinary tag.
+pub const SYSTEM_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` names a SYSTEM tag: one in the reserved [`SYSTEM_TAG_KEY_PREFIX`]
+/// namespace.
+///
+/// Matched without regard to case, because the namespace is AWS's however the caller
+/// spells it, and `TagKey`'s pattern (`^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`) admits both
+/// spellings. A PREFIX test and nothing more: the reservation is on where the segment
+/// stands, so `my-aws:thing` is the caller's own key.
+pub fn is_system_tag_key(key: &str) -> bool {
+    key.get(..SYSTEM_TAG_KEY_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(SYSTEM_TAG_KEY_PREFIX))
+}
+
+/// Whether `keys` asks to mutate a SYSTEM tag — the one question every tag write of this
+/// service asks before it changes anything.
+///
+/// ONE key under the reserved namespace is enough, wherever it stands in the request: the
+/// write is refused whole, so a request that names an ordinary key beside a system one
+/// stores neither.
+///
+/// WHERE IT IS ASKED, and the order this service keeps for its pre-mutation refusals: this
+/// one reads the REQUEST and nothing else, so what it settles no state can change and every
+/// operation asks it FIRST — before the resource the request names is resolved, and so
+/// before the refusals that need a resolved record. Those follow, broadest withdrawal
+/// first: the instance's own `CREATE_IN_PROGRESS` window, which withdraws every operation
+/// but the instance's describe and delete; then the instance's KIND, which withdraws one
+/// surface ([`Instance::region_write_refusal`]); then what the request named inside it.
+pub fn mutates_system_tag<'a>(keys: impl IntoIterator<Item = &'a str>) -> bool {
+    keys.into_iter().any(is_system_tag_key)
+}
+
+/// The refusal a request that would mutate a SYSTEM tag earns, as the message of the
+/// modelled `ValidationException` (HTTP 400).
+///
+/// SOURCE: recorded behaviour of `TagResource` and `UntagResource` naming a service-owned
+/// key — the model documents only "Associates a set of tags with a specified resource" and
+/// states no such rule. The sentence is wholly FIXED for the error class: it interpolates
+/// nothing from the request, naming neither the key nor the resource. Every write that
+/// takes caller-supplied tags refuses through this one constant — the tagging pair and the
+/// four creates that carry `Tags` — so one condition reads ONE way whichever operation the
+/// client called, exactly as [`instance_not_found_message`] keeps the missing instance.
+pub const SYSTEM_TAG_MUTATION_MESSAGE: &str =
+    "Caller is an end user and not allowed to mutate system tags";
+
 /// The message a tagging write refuses with once a resource would carry more than
 /// [`MAX_TAGS_PER_RESOURCE`] distinct keys, as the message of the modelled
 /// `ServiceQuotaExceededException`.
@@ -1600,6 +1650,46 @@ impl Instance {
     /// instance whose activation has fallen due is `ACTIVE` and no longer in this window.
     pub fn creation_in_progress(&self) -> bool {
         self.status == STATUS_CREATE_IN_PROGRESS
+    }
+
+    /// Whether this is an ACCOUNT instance — the instance of a single standalone account,
+    /// which is what `CreateInstance` creates and what the account's ambient instance is
+    /// ([`SEED_INSTANCE_TYPE`]).
+    ///
+    /// Asked of the instance's KIND and not of its permission-set enablement: the kind is
+    /// fixed when the instance is enabled and nothing in this API changes it, while
+    /// `UpdateInstance` turns permission sets on per instance
+    /// ([`Instance::permission_sets_enabled`]), which is a different question and the one
+    /// [`ComAmazonawsSsoadminSwbexternalserviceState::permission_set_surface_withdrawn`]
+    /// asks.
+    pub fn is_account_instance(&self) -> bool {
+        matches!(self.instance_type, InstanceType::Account)
+    }
+
+    /// The refusal a REGION WRITE (`AddRegion`, `RemoveRegion`) earns on this instance
+    /// before anything about the Region it names is judged, or `None` for an instance such
+    /// a write can reach at all.
+    ///
+    /// Replicating an instance across Regions is a feature of the ORGANIZATION instance,
+    /// so on an ACCOUNT instance no Region can be added and none removed — which is why the
+    /// refusal does not depend on whether the Region the request names is already enabled,
+    /// is the primary one, or exists at all: the guard runs BEFORE every one of those
+    /// checks. It carries [`ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE`], the same sentence the
+    /// permission-set surface answers for the same restriction, as the modelled
+    /// `ValidationException` (HTTP 400).
+    ///
+    /// The REPORTING side of the Region surface (`DescribeRegion`, `ListRegions`) is served
+    /// on an account instance: an account instance is enabled in its own primary Region and
+    /// reports it, so only the WRITES are withdrawn.
+    ///
+    /// It needs a RESOLVED instance, so it is asked after the instance lookup and after the
+    /// `CREATE_IN_PROGRESS` window (which withdraws every operation but the instance's own
+    /// describe and delete, and is therefore the broader withdrawal of the two), and before
+    /// anything about the Region the request named — the order [`mutates_system_tag`]
+    /// states once for every pre-mutation refusal of this service.
+    pub fn region_write_refusal(&self) -> Option<&'static str> {
+        self.is_account_instance()
+            .then_some(ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE)
     }
 
     /// Enable this instance in one MORE Region, or refuse the add when the instance

@@ -36,7 +36,9 @@ use service_com_amazonaws_ssoadmin_swbexternalservice::ops::types::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::ssoadmin_permission_sets::{call_in_region, router_over, with_store};
+use crate::ssoadmin_permission_sets::{
+    as_organization_instance, call_in_region, router_over, with_store,
+};
 
 /// A router over an account that holds NO instance yet, so `CreateInstance` is the call
 /// that enables the account's one instance — and the engine behind it, for the stored due
@@ -294,11 +296,15 @@ async fn a_removing_region_reports_the_third_region_status_value() {
         .as_str()
         .unwrap_or_else(|| panic!("no InstanceArn in {created}"))
         .to_string();
-    // The activation is due, so the instance is operational; the additional Region is
+    // The activation is due, so the instance is operational; removing a Region is a
+    // feature of the ORGANIZATION instance, so the instance is seeded into that kind
+    // through the shared harness (the refusal an ACCOUNT instance answers instead is
+    // `account_instance_region_writes.rs`), and the additional Region is
     // seeded through the service's own `state::Region` constructor so it starts out
     // `ACTIVE` (the add over the wire is `instance_region_addition.rs`), and everything
     // asserted then goes over the wire.
     hold_activation(&engine, SystemTime::now() - Duration::from_secs(1));
+    as_organization_instance(&engine, &instance_arn);
     with_store(&engine, |store| {
         store
             .instance_mut(&instance_arn)

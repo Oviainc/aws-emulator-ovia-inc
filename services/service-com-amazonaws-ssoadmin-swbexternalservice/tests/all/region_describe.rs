@@ -42,7 +42,8 @@ use service_com_amazonaws_ssoadmin_swbexternalservice::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{
-    call_in_region, error_code, router_over, with_store, UNKNOWN_INSTANCE_ARN,
+    as_organization_instance, call_in_region, error_code, router_over, with_store,
+    UNKNOWN_INSTANCE_ARN,
 };
 
 /// One Region record a row seeds: its name and the `RegionStatus` it is in.
@@ -503,6 +504,11 @@ async fn a_region_added_over_the_wire_describes_through_its_whole_workflow() {
     let case = "an additional Region added over the wire";
     let (router, engine) = router_and_engine();
     let instance_arn = instance_arn_in(&router, "us-east-1").await;
+    // The round trip drives `AddRegion` and `RemoveRegion`, which are served on the
+    // ORGANIZATION instance (the account instance's refusal is
+    // `account_instance_region_writes.rs`), so the account's instance is seeded into that
+    // kind through the shared harness; the describes below still go over the wire.
+    as_organization_instance(&engine, &instance_arn);
 
     let (status, added) = call_in_region(
         &router,

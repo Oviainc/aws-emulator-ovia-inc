@@ -27,6 +27,8 @@ mod account_assignment_deletion_status_list;
 mod account_assignment_deletion_status_withdrawal;
 #[path = "all/account_assignments_for_principal.rs"]
 mod account_assignments_for_principal;
+#[path = "all/account_instance_region_writes.rs"]
+mod account_instance_region_writes;
 #[path = "all/account_instance_restriction.rs"]
 mod account_instance_restriction;
 #[path = "all/accounts_for_provisioned_permission_set.rs"]
@@ -179,6 +181,8 @@ mod singleton_child_delete;
 mod ssoadmin_permission_sets;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/system_tag_mutations.rs"]
+mod system_tag_mutations;
 #[path = "all/tag_resource_resolution.rs"]
 mod tag_resource_resolution;
 #[path = "all/tags_from_creates.rs"]

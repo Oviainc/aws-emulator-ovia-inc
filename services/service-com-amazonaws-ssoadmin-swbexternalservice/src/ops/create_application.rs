@@ -220,6 +220,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+        // A key in the reserved namespace names a tag Amazon Web Services applies itself,
+        // which an end user may not write (`crate::state::mutates_system_tag`, which states
+        // where this guard sits among this service's pre-mutation refusals) — the guard the
+        // tagging writes apply to their own members, asked of the `Tags` a create carries.
+        // Judged on the REQUEST alone, before anything is resolved or stored, so a refused
+        // create leaves no resource behind.
+        if crate::state::mutates_system_tag(input.tags.iter().flatten().map(|tag| tag.key.as_str()))
+        {
+            return Err(CreateApplicationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::SYSTEM_TAG_MUTATION_MESSAGE.to_string()),
+                    // The model's `ValidationExceptionReason` enum carries only KMS key
+                    // states, none of which this refusal is.
+                    reason: None,
+                },
+            )
+            .into());
+        }
         let mut store = state.lock();
         // What the CLOCK already owes every instance, plus the account's ambient instance
         // if nothing has enabled one yet, so this create resolves the same instance a read

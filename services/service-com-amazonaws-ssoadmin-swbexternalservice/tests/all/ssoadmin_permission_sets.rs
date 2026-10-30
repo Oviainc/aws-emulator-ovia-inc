@@ -172,6 +172,31 @@ pub(crate) fn organization_engine() -> (Arc<engine::InMemoryEngine>, String) {
     (engine, instance_arn)
 }
 
+/// Make the instance `instance_arn` names the ORGANIZATION instance of an AWS
+/// Organizations organization, for a test whose subject is a Region WRITE.
+///
+/// Replicating an IAM Identity Center instance across Regions is a feature of the
+/// organization instance, so `AddRegion` and `RemoveRegion` are withdrawn on an account
+/// instance — the refusal `account_instance_region_writes.rs` pins. An organization
+/// instance is enabled through AWS Organizations rather than through this API, so a test
+/// that drives a Region write reaches one by seeding the instance's KIND, exactly as
+/// [`organization_engine`] seeds a whole organization instance.
+///
+/// Only the kind and the permission-set enablement that comes with it change: the Regions
+/// the instance holds, its status, its primary Region and its tags are whatever the calls
+/// before this left, and everything the test then asserts goes over the wire.
+pub(crate) fn as_organization_instance(engine: &Arc<engine::InMemoryEngine>, instance_arn: &str) {
+    use service_com_amazonaws_ssoadmin_swbexternalservice::state;
+
+    with_store(engine, |store| {
+        let instance = store
+            .instance_mut(instance_arn)
+            .unwrap_or_else(|| panic!("no instance is held under {instance_arn}"));
+        instance.instance_type = state::InstanceType::Organization;
+        instance.permission_sets_enabled = true;
+    });
+}
+
 /// A router whose account holds an ACCOUNT instance — the instance of a single
 /// standalone account — and that instance's ARN.
 ///

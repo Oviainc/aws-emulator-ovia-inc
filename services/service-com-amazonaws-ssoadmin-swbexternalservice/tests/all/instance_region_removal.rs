@@ -45,7 +45,8 @@ use service_com_amazonaws_ssoadmin_swbexternalservice::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{
-    call_in_region, error_code, router_over, with_store, UNKNOWN_INSTANCE_ARN,
+    as_organization_instance, call_in_region, error_code, router_over, with_store,
+    UNKNOWN_INSTANCE_ARN,
 };
 
 /// A router over a fresh engine, and that engine.
@@ -71,7 +72,11 @@ async fn instance_arn_in(router: &MultiServiceRouter, region: &str) -> String {
 /// An account whose instance is enabled in `primary` and additionally enabled in
 /// `additional`, and that instance's ARN.
 ///
-/// The additional Regions are seeded through `state::Instance::add_region` — the one
+/// The instance is the ORGANIZATION instance a Region write is served on at all — removing
+/// a Region is a feature of that kind, so the shared harness's [`as_organization_instance`]
+/// seeds the kind and the refusal an ACCOUNT instance answers instead is
+/// `account_instance_region_writes.rs`. The additional Regions are seeded through
+/// `state::Instance::add_region` — the one
 /// place the service's own records append a Region — so each starts out `ACTIVE`, which is
 /// the state a removal row needs; the add over the wire has its own suite
 /// (`instance_region_addition.rs`). Everything asserted afterwards goes over the wire.
@@ -82,6 +87,7 @@ async fn instance_enabled_in(
     additional: &[&str],
 ) -> String {
     let instance_arn = instance_arn_in(router, primary).await;
+    as_organization_instance(engine, &instance_arn);
     with_store(engine, |store| {
         let instance = store
             .instance_mut(&instance_arn)

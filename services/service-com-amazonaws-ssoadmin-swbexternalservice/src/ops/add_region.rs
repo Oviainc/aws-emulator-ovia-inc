@@ -21,6 +21,10 @@
 //!   `AccessDeniedException` — the only not-found channel this operation's model declares
 //!   (it carries no `ResourceNotFoundException`), and the one `DescribeInstance` answers
 //!   for the same ARN;
+//! * an ACCOUNT instance of IAM Identity Center serves no Region write at all — replicating
+//!   an instance across Regions is a feature of the organization instance — so the add is
+//!   the modelled `ValidationException`, answered BEFORE anything about the Region the
+//!   request names is judged (`crate::state::Instance::region_write_refusal`);
 //! * a Region the instance is ALREADY enabled in, and a Region of it with another add or
 //!   remove Region workflow in progress, are the modelled `ConflictException`;
 //! * an instance whose own creation has not finished serves only its describe and its
@@ -167,6 +171,19 @@ fn instance_not_found(instance_arn: &str) -> AddRegionError {
     .into()
 }
 
+/// The modelled refusal channel for an add this instance can never serve, whatever Region
+/// it names: `ValidationException` (HTTP 400), which this operation's model declares and
+/// which every caller below words for the rule it refuses. `Reason` is left absent: every
+/// value the model's `ValidationExceptionReason` enum carries reports a KMS key fault, and
+/// these refusals inspect no key.
+fn validation(message: impl Into<String>) -> AddRegionError {
+    AddRegionErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+        reason: None,
+    })
+    .into()
+}
+
 /// The modelled refusal for an add that conflicts with the instance's current Regions —
 /// one it is already enabled in, or a Region extension or removal workflow in progress.
 fn conflict(message: impl Into<String>) -> AddRegionError {
@@ -244,6 +261,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(conflict(
                 crate::state::instance_creation_in_progress_message(&input.instance_arn),
             ));
+        }
+
+        // Replicating an instance across Regions is a feature of the ORGANIZATION instance,
+        // so on an ACCOUNT instance this operation is not served at all
+        // (`crate::state::Instance::region_write_refusal`, which states where this guard
+        // sits among this service's pre-mutation refusals) — asked BEFORE anything about
+        // the Region the request names, because no Region of such an instance can be added
+        // whether or not it is already enabled.
+        if let Some(message) = instance.region_write_refusal() {
+            return Err(validation(message));
         }
 
         // A Region the instance already holds a record for is not one this add can

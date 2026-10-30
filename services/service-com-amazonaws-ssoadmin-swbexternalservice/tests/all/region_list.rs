@@ -42,7 +42,8 @@ use service_com_amazonaws_ssoadmin_swbexternalservice::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{
-    call_in_region, error_code, router_over, with_store, UNKNOWN_INSTANCE_ARN,
+    as_organization_instance, call_in_region, error_code, router_over, with_store,
+    UNKNOWN_INSTANCE_ARN,
 };
 
 /// One Region record the rows seed: its name and the `RegionStatus` it is in.
@@ -521,6 +522,10 @@ async fn a_region_is_listed_while_it_is_being_removed_and_gone_once_the_removal_
         &[("eu-west-1", "ACTIVE"), ("ap-south-1", "ACTIVE")],
     )
     .await;
+    // The removal below is served on the ORGANIZATION instance (the account instance's
+    // refusal is `account_instance_region_writes.rs`), so the account's instance is seeded
+    // into that kind through the shared harness; the lists still go over the wire.
+    as_organization_instance(&engine, &instance_arn);
 
     // The removal is started over the WIRE; only the stored due INSTANT is moved below, so
     // both sides of it can be observed without the test sleeping.

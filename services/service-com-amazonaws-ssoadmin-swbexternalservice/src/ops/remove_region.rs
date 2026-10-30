@@ -18,6 +18,10 @@
 //!
 //! * an `InstanceArn` this account holds no instance for, and a `RegionName` the instance
 //!   is not enabled in, are the modelled `ResourceNotFoundException`;
+//! * an ACCOUNT instance of IAM Identity Center serves no Region write at all — replicating
+//!   an instance across Regions is a feature of the organization instance — so the remove is
+//!   the modelled `ValidationException`, answered BEFORE the Region the request names is
+//!   judged at all (`crate::state::Instance::region_write_refusal`);
 //! * "The request must be made from the primary Region" and "The target Region cannot be
 //!   the primary Region" are the modelled `ValidationException`;
 //! * "no other add or remove Region workflows can be in progress" is the modelled
@@ -246,6 +250,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into(),
             );
+        }
+
+        // Replicating an instance across Regions is a feature of the ORGANIZATION instance,
+        // so on an ACCOUNT instance this operation is not served at all
+        // (`crate::state::Instance::region_write_refusal`, which states where this guard
+        // sits among this service's pre-mutation refusals) — asked BEFORE the Region the
+        // request names is judged, because no Region of such an instance can be removed
+        // whether or not it is the primary one or one the instance is enabled in.
+        if let Some(message) = instance.region_write_refusal() {
+            return Err(validation(message));
         }
 
         // "The request must be made from the primary Region."

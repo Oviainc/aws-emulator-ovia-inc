@@ -16,6 +16,11 @@
 //! resource past [`crate::state::MAX_TAGS_PER_RESOURCE`] distinct keys with the modelled
 //! `ServiceQuotaExceededException`. `ListTagsForResource` reports what this stored.
 //!
+//! A tag AWS applies ITSELF — a key in the reserved `aws:` namespace
+//! ([`crate::state::SYSTEM_TAG_KEY_PREFIX`]) — is not the caller's to write, so a request
+//! naming one is refused with the modelled `ValidationException` and stores nothing, for
+//! the whole request: a system key named beside ordinary ones refuses them all.
+//!
 //! An instance whose own creation has not finished serves only its describe and its delete
 //! (`DescribeInstance`: "While the instance is in the CREATE_IN_PROGRESS state, you can
 //! call only DescribeInstance and DeleteInstance operations"), so a tag write on such an
@@ -177,6 +182,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let region = crate::state::request_region(ctx.parts());
+        // A key in the reserved namespace names a tag Amazon Web Services applies itself,
+        // which an end user may not mutate (`crate::state::mutates_system_tag`, which
+        // states where this guard sits among this service's pre-mutation refusals). Judged
+        // on the REQUEST alone, so it is settled before the resource it names is resolved,
+        // and for the whole request at once, so nothing is written when one key of the set
+        // is a system one.
+        if crate::state::mutates_system_tag(input.tags.iter().map(|tag| tag.key.as_str())) {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::SYSTEM_TAG_MUTATION_MESSAGE.to_string()),
+                // The model's `ValidationExceptionReason` enum carries only KMS key
+                // states, none of which this refusal is.
+                reason: None,
+            })
+            .into());
+        }
+
         let mut store = state.lock();
         // What every handler does before it resolves anything: enable the account's
         // ambient instance if nothing has decided its enablement yet, and apply what the

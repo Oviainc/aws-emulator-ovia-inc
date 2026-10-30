@@ -28,7 +28,10 @@
 //!
 //! Every call goes through `MultiServiceRouter::dispatch`, so the modelled constraints and
 //! the `X-Amz-Target` routing are exercised rather than bypassed; the harness is the one
-//! `ssoadmin_permission_sets.rs` owns. Where a test has to be on the far side of a due
+//! `ssoadmin_permission_sets.rs` owns, and the instance every row adds to is the
+//! ORGANIZATION instance a Region write is served on at all (the refusal an ACCOUNT
+//! instance answers is `account_instance_region_writes.rs`). Where a test has to be on the
+//! far side of a due
 //! instant it moves the STORED instant rather than sleeping — the transition itself is
 //! still applied by the service's own `materialize_due`, exactly as in production.
 
@@ -41,7 +44,8 @@ use service_com_amazonaws_ssoadmin_swbexternalservice::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{
-    call_in_region, error_code, router_over, with_store, UNKNOWN_INSTANCE_ARN,
+    as_organization_instance, call_in_region, error_code, router_over, with_store,
+    UNKNOWN_INSTANCE_ARN,
 };
 
 /// A router over a fresh engine, and that engine.
@@ -51,17 +55,30 @@ fn router_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// The ARN of the account's instance, read the way a client reads it — from `region`, so
-/// the instance this account holds is enabled in `region` as its primary one.
-async fn instance_arn_in(router: &MultiServiceRouter, region: &str) -> String {
+/// the instance this account holds is enabled in `region` as its primary one, as the
+/// ORGANIZATION instance a Region write is served on.
+///
+/// Replicating an instance across Regions is a feature of the organization instance, so
+/// `AddRegion` is withdrawn on the ACCOUNT instance an account discovers — the refusal
+/// `account_instance_region_writes.rs` pins. The kind is seeded through the shared
+/// harness's [`as_organization_instance`], and everything asserted afterwards goes over the
+/// wire.
+async fn instance_arn_in(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    region: &str,
+) -> String {
     let (status, body) = call_in_region(router, region, "ListInstances", &json!({})).await;
     assert_eq!(
         status, 200,
         "region {region}: ListInstances expected 200, got {status} {body}"
     );
-    body["Instances"][0]["InstanceArn"]
+    let instance_arn = body["Instances"][0]["InstanceArn"]
         .as_str()
         .unwrap_or_else(|| panic!("region {region}: no instance in {body}"))
-        .to_string()
+        .to_string();
+    as_organization_instance(engine, &instance_arn);
+    instance_arn
 }
 
 /// `AddRegion` for `region_name`, called from `called_from`.
@@ -237,7 +254,7 @@ async fn adding_a_region_runs_the_clock_and_enables_the_instance_in_it() {
         // One account per row: the Region an instance is enabled in is decided once, by the
         // request that enabled it.
         let (router, engine) = router_and_engine();
-        let instance_arn = instance_arn_in(&router, primary).await;
+        let instance_arn = instance_arn_in(&router, &engine, primary).await;
         // The order the records are expected in: the primary Region first, then every
         // Region this row adds, in the order it adds them.
         let mut expected_order: Vec<&str> = vec![primary];
@@ -444,10 +461,10 @@ async fn adding_a_region_to_an_unknown_instance_is_denied() {
         ),
     ];
 
-    let (router, _engine) = router_and_engine();
+    let (router, engine) = router_and_engine();
     // The account's own instance, so the store holds one and the refusal is about the ARN
     // the request named rather than about an account that holds nothing.
-    let held = instance_arn_in(&router, "us-east-1").await;
+    let held = instance_arn_in(&router, &engine, "us-east-1").await;
 
     for (case, instance_arn) in unknown {
         assert_ne!(
@@ -520,7 +537,7 @@ async fn adding_a_region_while_a_region_workflow_runs_is_a_conflict() {
     for row in rows {
         let label = row.label;
         let (router, engine) = router_and_engine();
-        let instance_arn = instance_arn_in(&router, "us-east-1").await;
+        let instance_arn = instance_arn_in(&router, &engine, "us-east-1").await;
         // Two additional Regions to be busy in, seeded ACTIVE through the service's own
         // records, then the row's workflow held the way the clock holds one: a due instant
         // far enough out that it is still running at this instant.
@@ -612,7 +629,7 @@ async fn adding_a_region_past_the_per_instance_ceiling_is_refused() {
     );
 
     let (router, engine) = router_and_engine();
-    let instance_arn = instance_arn_in(&router, "us-east-1").await;
+    let instance_arn = instance_arn_in(&router, &engine, "us-east-1").await;
     // One short of the ceiling, counting the primary Region the instance already holds:
     // seeded ACTIVE through the service's own records, so the wire add below is the one
     // that reaches the ceiling.

@@ -35,7 +35,8 @@ use service_com_amazonaws_ssoadmin_swbexternalservice::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{
-    call, organization_router, router_over, seeded_instance_arn, with_store,
+    as_organization_instance, call, organization_router, router_over, seeded_instance_arn,
+    with_store,
 };
 
 /// A customer managed key ARN in the hyphenated-UUID spelling the model's `KmsKeyArn`
@@ -250,6 +251,11 @@ async fn one_response_reports_both_pending_transitions_at_one_instant() {
         let label = case.label;
         let (router, engine) = router_and_engine();
         let instance_arn = seeded_instance_arn(&router).await;
+        // The Region half of the pair is an `AddRegion`, which is served on the
+        // ORGANIZATION instance (the account instance's refusal is
+        // `account_instance_region_writes.rs`), so the account's instance is seeded into
+        // that kind through the shared harness.
+        as_organization_instance(&engine, &instance_arn);
         start_both_transitions(
             &router,
             &instance_arn,
@@ -300,6 +306,9 @@ async fn no_sweep_position_mixes_two_instants_in_one_response() {
     let (router, engine) = router_and_engine();
     let instance_arn = seeded_instance_arn(&router).await;
     let region_name = "ap-northeast-1";
+    // As above: the sweep's Region half is an `AddRegion`, served on the ORGANIZATION
+    // instance.
+    as_organization_instance(&engine, &instance_arn);
     start_both_transitions(
         &router,
         &instance_arn,
