@@ -8,8 +8,9 @@
 //!
 //! Beside those resources the store holds this service's AUTHORIZATION records: which
 //! signing principals Security Lake refuses ([`Admission`], keyed by
-//! [`caller_principal`]). They are read by the request-admission layer in
-//! `crate::service`, ahead of operation dispatch, so an unauthorized caller is answered
+//! [`caller_principal`]) and which Security Lake role the caller account holds
+//! ([`AccountRole`]). They are read by the request-admission layer in `crate::service`,
+//! ahead of operation dispatch, so an unauthorized or unentitled caller is answered
 //! without any resource being looked up.
 
 use std::collections::{BTreeSet, HashSet};
@@ -59,6 +60,14 @@ pub const DATA_LAKE_COMPLETION_DELAY: Duration = Duration::from_millis(500);
 /// try again") and is held in one place so the gate reads the same from every handler.
 pub const NOT_ENABLED_IN_ANY_REGION_MESSAGE: &str = "The request failed because Security Lake isn't enabled for your account in any Regions. Enable Security Lake for your account and then try again.";
 
+/// What Security Lake answers an entitlement-gated control-plane call with when the
+/// CALLER ACCOUNT holds no Security Lake administrator role ([`AccountRole`]).
+///
+/// RECORDED wording, and entirely FIXED text: the refusal is reached from the caller's
+/// role alone, before the request is read, so it interpolates nothing from the request or
+/// from this store. Held in one place so every gated route words it identically.
+pub const NOT_ENTITLED_MESSAGE: &str = "To perform this operation, your account must be a delegated Security Lake administrator account or a standalone Security Lake account.";
+
 /// The most data lakes this emulator holds at once.
 ///
 /// A BOUND the emulator enforces, not a number AWS publishes. `DataLakeConfiguration$region`
@@ -92,6 +101,43 @@ pub enum Admission {
     Admitted,
     /// The principal may not: the request is refused before any resource lookup.
     Unauthorized,
+}
+
+/// The role the CALLER ACCOUNT holds in Security Lake's account topology.
+///
+/// Security Lake's data lake is configured either by the account AWS Organizations
+/// designated as the organization's delegated Security Lake administrator, or by an
+/// account that administers its own Security Lake (a standalone account). An
+/// organization member account holding neither role may not configure or inspect a data
+/// lake at all, so the control plane refuses its calls from the role alone — before the
+/// request is validated and before anything is looked up or written.
+///
+/// No modelled operation writes this record: `RegisterDataLakeDelegatedAdministrator` is
+/// the organization MANAGEMENT account's call, not a call of the account being
+/// administered. So, like the [`Admission`] records, it is part of the account topology
+/// the surrounding environment configures through this store.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AccountRole {
+    /// An AWS Organizations member account that is neither the organization's delegated
+    /// Security Lake administrator nor a standalone Security Lake account.
+    ///
+    /// The DEFAULT: an account holds no Security Lake role until one is given to it, and
+    /// an account with no role may not administer a data lake.
+    #[default]
+    OrganizationMember,
+    /// The organization's delegated Security Lake administrator.
+    DelegatedAdministrator,
+    /// An account that administers its own Security Lake rather than an organization's.
+    Standalone,
+}
+
+impl AccountRole {
+    /// Whether an account in this role may administer Security Lake's data lake: the
+    /// delegated administrator and the standalone account may, an organization member
+    /// holding neither role may not.
+    pub fn administers_security_lake(self) -> bool {
+        matches!(self, Self::DelegatedAdministrator | Self::Standalone)
+    }
 }
 
 /// One Security Lake data lake, as this emulator holds it. One per Region.
@@ -209,6 +255,11 @@ pub struct ComAmazonawsSecuritylakeSecuritylakeState {
     /// one — the same shape the `marketplacereporting` service's per-principal `access`
     /// records take. Ordered, so a `Debug` of the store reads the same on every run.
     unauthorized_principals: BTreeSet<String>,
+    /// The Security Lake role the caller account holds ([`AccountRole`]), which the
+    /// entitlement gate in `crate::service` decides on. Defaults to
+    /// [`AccountRole::OrganizationMember`]: an account holds no Security Lake role until
+    /// one is given to it.
+    account_role: AccountRole,
 }
 
 impl ComAmazonawsSecuritylakeSecuritylakeState {
@@ -239,6 +290,17 @@ impl ComAmazonawsSecuritylakeSecuritylakeState {
     /// Every principal this service refuses, in order.
     pub fn unauthorized_principals(&self) -> impl Iterator<Item = &str> + Clone {
         self.unauthorized_principals.iter().map(String::as_str)
+    }
+
+    /// The Security Lake role the caller account holds, as the entitlement gate reaches
+    /// it BEFORE the operation the request names runs.
+    pub fn account_role(&self) -> AccountRole {
+        self.account_role
+    }
+
+    /// Give the caller account `role`, answering the role it held before.
+    pub fn set_account_role(&mut self, role: AccountRole) -> AccountRole {
+        ::std::mem::replace(&mut self.account_role, role)
     }
 
     /// Materialise every state change the CLOCK has already made due.
@@ -409,6 +471,24 @@ pub fn not_enabled_in_any_region() -> ResourceNotFoundException {
     }
 }
 
+/// The modelled `ResourceNotFoundException` a Region-scoped data-lake call is refused
+/// with when `regions` name no stored data lake.
+///
+/// `resourceName` names the FIRST Region the caller asked about, because the member names
+/// one resource while a request may name several, and `resourceType` the resource kind.
+/// Held here so `DeleteDataLake` and `GetDataLakeSources` word the same condition
+/// identically.
+pub fn data_lake_not_found(regions: &[&str]) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Security Lake is not enabled in Region {}",
+            regions.join(", ")
+        )),
+        resource_name: regions.first().map(|region| (*region).to_string()),
+        resource_type: Some("DataLake".to_string()),
+    }
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
@@ -494,8 +574,10 @@ pub fn resource_share_name(subscriber_name: &str) -> String {
     )
 }
 
-/// The opaque `nextToken` that resumes `ListSubscribers` at `subscriber_id`, which sat at
-/// `index` in the page order the token was issued from.
+/// The opaque `nextToken` that resumes a paginated read at `anchor` — the id of the next
+/// item, a `subscriberId` for `ListSubscribers` and an account id for
+/// `GetDataLakeSources` — which sat at `index` in the page order the token was issued
+/// from.
 ///
 /// Carrying BOTH lets a resume stay exact while the anchor is still stored, and fall back
 /// to the position it held when a `DeleteSubscriber` removed it between pages, rather than
@@ -503,17 +585,17 @@ pub fn resource_share_name(subscriber_name: &str) -> String {
 ///
 /// Hex, so the token is opaque to a caller and needs no escaping in the `nextToken` query
 /// parameter.
-pub fn encode_next_token(index: usize, subscriber_id: &str) -> String {
-    hex::encode(format!("{index}:{subscriber_id}"))
+pub fn encode_next_token(index: usize, anchor: &str) -> String {
+    hex::encode(format!("{index}:{anchor}"))
 }
 
-/// The `(index, subscriber id)` an opaque `nextToken` names, or `None` when the token is
+/// The `(index, anchor id)` an opaque `nextToken` names, or `None` when the token is
 /// not one this service minted.
 pub fn decode_next_token(token: &str) -> Option<(usize, String)> {
     let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    let (index, subscriber_id) = decoded.split_once(':')?;
+    let (index, anchor) = decoded.split_once(':')?;
     let index = index.parse::<usize>().ok()?;
-    (!subscriber_id.is_empty()).then(|| (index, subscriber_id.to_string()))
+    (!anchor.is_empty()).then(|| (index, anchor.to_string()))
 }
 
 /// A stable 12-character suffix for a Region's data-lake bucket, so the bucket ARN looks

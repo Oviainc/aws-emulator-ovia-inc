@@ -49,6 +49,26 @@
 //! HTTP 401 `{"message": …}` body — never with one of this service's modelled resource
 //! errors, which would tell a caller that may not ask what this account holds.
 //!
+//! ## The account-entitlement gate
+//!
+//! Security Lake's data lake is administered by the organization's delegated Security
+//! Lake administrator or by a standalone Security Lake account
+//! ([`crate::state::AccountRole`]). A caller account holding neither role may not
+//! configure or inspect a data lake, and that verdict is reached from the caller's role
+//! alone: it precedes the request-level validation the modelled walk performs, so a
+//! gated call is refused identically whatever it carries, and nothing it would have
+//! written is applied. That ordering is only reachable from this pre-dispatch seam, which
+//! is why the gate lives here rather than in each handler.
+//!
+//! Each gated route reports that refusal the way Security Lake does for that route
+//! ([`ENTITLEMENT_GATED_OPERATIONS`]): the routes the service itself denies answer the
+//! modelled `AccessDeniedException` (HTTP 403) carrying the fixed entitlement text, and
+//! the two whose authorizer refuses ahead of the service answer HTTP 401
+//! `UnauthorizedException` / "Unauthorized". A reporting call that only tells the caller
+//! which of its own Regions are enabled (`ListDataLakes`) is not gated, and neither are
+//! the delegated-administrator registration calls, which the organization MANAGEMENT
+//! account makes rather than the account being administered.
+//!
 //! The decision itself lives in state, beside the resources, as
 //! [`crate::state::ComAmazonawsSecuritylakeSecuritylakeState::admission`] keyed by the
 //! request's signing principal ([`crate::state::caller_principal`]); this file only
@@ -70,7 +90,57 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
-use crate::state::Admission;
+use crate::ops::types::{AccessDeniedException, SCHEMA_ACCESS_DENIED_EXCEPTION};
+use crate::state::{AccountRole, Admission};
+
+/// How one entitlement-gated operation reports a caller account that holds no Security
+/// Lake role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// The service denies the call itself: this service's modelled
+    /// `AccessDeniedException`, which the model gives `@httpError 403`, carrying the
+    /// fixed entitlement text.
+    AccessDenied,
+    /// The route's authorizer refuses the call ahead of the service: HTTP 401 with the
+    /// error code `UnauthorizedException` and the message "Unauthorized". RECORDED per
+    /// route — this service's model declares no 401 shape at all, so it is rendered as
+    /// the front door's own refusal rather than through the modelled error channel.
+    Unauthorized,
+}
+
+/// The operations an unentitled caller account may not invoke, and how each one reports
+/// the refusal.
+///
+/// The gated set is the DATA LAKE control plane: the operations that configure the
+/// account's data lake, its exception subscription and its organization configuration, or
+/// report what those hold. `ListDataLakes` is absent on purpose — it reports only which
+/// of the caller's own Regions are enabled, which any account may ask about itself — and
+/// so are `RegisterDataLakeDelegatedAdministrator` and
+/// `DeregisterDataLakeDelegatedAdministrator`, which the organization management account
+/// calls to GIVE an account the role this gate tests for.
+const ENTITLEMENT_GATED_OPERATIONS: &[(&str, Gate)] = &[
+    ("CreateDataLake", Gate::AccessDenied),
+    ("CreateDataLakeExceptionSubscription", Gate::AccessDenied),
+    ("CreateDataLakeOrganizationConfiguration", Gate::AccessDenied),
+    ("DeleteDataLake", Gate::Unauthorized),
+    ("DeleteDataLakeExceptionSubscription", Gate::AccessDenied),
+    ("DeleteDataLakeOrganizationConfiguration", Gate::AccessDenied),
+    ("GetDataLakeExceptionSubscription", Gate::AccessDenied),
+    ("GetDataLakeOrganizationConfiguration", Gate::AccessDenied),
+    ("GetDataLakeSources", Gate::Unauthorized),
+    ("ListDataLakeExceptions", Gate::AccessDenied),
+    ("UpdateDataLake", Gate::AccessDenied),
+    ("UpdateDataLakeExceptionSubscription", Gate::AccessDenied),
+];
+
+/// How `operation` reports an unentitled caller account, or `None` when the operation is
+/// not gated on the caller's Security Lake role.
+fn entitlement_gate(operation: &str) -> Option<Gate> {
+    ENTITLEMENT_GATED_OPERATIONS
+        .iter()
+        .find(|(gated, _)| *gated == operation)
+        .map(|(_, gate)| *gate)
+}
 
 /// The HTTP status the front door refuses an unauthorized request with.
 ///
@@ -84,15 +154,25 @@ const UNAUTHORIZED_STATUS: u16 = 401;
 /// into it.
 const UNAUTHORIZED_MESSAGE: &str = "Unauthorized";
 
-/// The refusal of a request whose principal this service does not admit, as a
-/// pre-dispatch operation.
-///
-/// Built here rather than through the protocol's modelled-error renderer because the
-/// shape is not in the model: that renderer would name an error code in
-/// `x-amzn-errortype`, and the front door states none.
-struct UnauthorizedAnswer;
+/// The error code a client reads a refused route's verdict from, in `x-amzn-errortype`
+/// (which is where `restJson1` resolves an error shape from). RECORDED, not modelled:
+/// this service's model declares no 401 shape, so the code cannot come from it.
+const UNAUTHORIZED_CODE: &str = "UnauthorizedException";
 
-impl ErasedOperation for UnauthorizedAnswer {
+/// A refusal the front door states itself, as a pre-dispatch operation: one whose shape
+/// is NOT in this service's model, so it cannot be rendered through the modelled error
+/// channel.
+///
+/// `error_type` is the code a client branches on; `None` states no code, which is what
+/// the principal-admission refusal does — it names no modelled error and reports nothing
+/// about this account.
+struct GatewayRefusal {
+    status: u16,
+    error_type: Option<&'static str>,
+    message: &'static str,
+}
+
+impl ErasedOperation for GatewayRefusal {
     fn run<'r>(
         &'r self,
         _svc: &'r dyn Service,
@@ -100,19 +180,65 @@ impl ErasedOperation for UnauthorizedAnswer {
         _ctx: &'r smithy_server_runtime::OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            let body = ::serde_json::json!({ "message": UNAUTHORIZED_MESSAGE }).to_string();
-            let status = StatusCode::try_from(UNAUTHORIZED_STATUS)
-                .expect("401 is a valid HTTP status code");
+            let body = ::serde_json::json!({ "message": self.message }).to_string();
+            let status =
+                StatusCode::try_from(self.status).expect("the refusal statuses are constants");
             let mut response = RtResponse::new(status, SdkBody::from(body));
             // `restJson1`'s own media type, so the body a client parses is the one it
             // parses for every other answer from this service.
             response
                 .headers_mut()
                 .insert("content-type", "application/json");
+            if let Some(error_type) = self.error_type {
+                response.headers_mut().insert("x-amzn-errortype", error_type);
+            }
             response
         })
     }
 }
+
+/// The refusal of a gated request from a caller account that holds no Security Lake
+/// role, as a pre-dispatch operation: this service's own modelled
+/// `AccessDeniedException`.
+///
+/// Rendered through the SERVICE's protocol rather than by hand, so a pre-dispatch denial
+/// and the same modelled error returned by a handler answer in one envelope.
+struct NotEntitledAnswer;
+
+impl ErasedOperation for NotEntitledAnswer {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        _req: &'r aws_smithy_runtime_api::http::Request,
+        _ctx: &'r smithy_server_runtime::OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            let denied = AccessDeniedException {
+                message: Some(crate::state::NOT_ENTITLED_MESSAGE.to_string()),
+                // The model's other member is for a service-supplied sub-code; the
+                // recorded refusal carries none.
+                error_code: None,
+            };
+            let definition = svc.definition();
+            definition
+                .protocol()
+                .serialize_error(
+                    &denied,
+                    &SCHEMA_ACCESS_DENIED_EXCEPTION,
+                    ACCESS_DENIED_CODE,
+                    ACCESS_DENIED_STATUS,
+                )
+                .unwrap_or_else(|error| definition.framework_error_response(error))
+        })
+    }
+}
+
+/// The modelled `AccessDeniedException`'s shape name, which `restJson1` carries in
+/// `x-amzn-errortype` and in the body's `__type`.
+const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
+
+/// The status the model gives `AccessDeniedException` (`@httpError 403`).
+const ACCESS_DENIED_STATUS: u16 = 403;
 
 /// The `com-amazonaws-securitylake-securitylake` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -126,7 +252,13 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// this is the one `Arc` both share, never a second store.
     engine: Arc<Eng>,
     /// Answers a request whose principal this service does not admit.
-    unauthorized: UnauthorizedAnswer,
+    unauthorized: GatewayRefusal,
+    /// Answers a gated request from an unentitled caller account on a route whose
+    /// authorizer refuses it ahead of the service ([`Gate::Unauthorized`]).
+    unauthorized_route: GatewayRefusal,
+    /// Answers a gated request from an unentitled caller account on a route the service
+    /// itself denies ([`Gate::AccessDenied`]).
+    not_entitled: NotEntitledAnswer,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -137,29 +269,49 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             engine,
-            unauthorized: UnauthorizedAnswer,
+            unauthorized: GatewayRefusal {
+                status: UNAUTHORIZED_STATUS,
+                error_type: None,
+                message: UNAUTHORIZED_MESSAGE,
+            },
+            unauthorized_route: GatewayRefusal {
+                status: UNAUTHORIZED_STATUS,
+                error_type: Some(UNAUTHORIZED_CODE),
+                message: UNAUTHORIZED_MESSAGE,
+            },
+            not_entitled: NotEntitledAnswer,
         }
     }
 
     /// The authorization decision for one request, reached from its signing principal
     /// alone and before anything is looked up.
     ///
-    /// A request that names no modelled operation is left alone — there is nothing to
-    /// authorize, and the routing failure is the answer it gets. A store this process
-    /// cannot reach cannot hold a refusal either, so such a request is admitted and the
-    /// handler reports the unreachable store as the modelled server error.
+    /// A store this process cannot reach cannot hold a refusal either, so such a request
+    /// is admitted and the handler reports the unreachable store as the modelled server
+    /// error.
     ///
     /// This is a READ: it takes the store's lock to look one principal up and writes
     /// nothing, so a refused request changes nothing a later caller sees.
     fn admission(&self, req: &aws_smithy_runtime_api::http::Request) -> Admission {
-        if self.definition().protocol().routing_key(req).is_err() {
-            return Admission::Admitted;
-        }
         let principal =
             crate::state::caller_principal(req.headers().get(http::header::AUTHORIZATION.as_str()));
         match crate::state::service_state(&*self.engine) {
             Some(state) => state.lock().admission(&principal),
             None => Admission::Admitted,
+        }
+    }
+
+    /// The Security Lake role the caller account holds, as the entitlement gate reads it
+    /// before dispatch. A store this process cannot reach holds no topology either, so
+    /// such a request is treated as the administering account's and the handler reports
+    /// the unreachable store as the modelled server error.
+    ///
+    /// This is a READ: it takes the store's lock to look one record up and writes
+    /// nothing, so a refused request changes nothing a later caller sees.
+    fn account_role(&self) -> AccountRole {
+        match crate::state::service_state(&*self.engine) {
+            Some(state) => state.lock().account_role(),
+            None => AccountRole::Standalone,
         }
     }
 }
@@ -199,10 +351,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The request's auth schemes are unaffected: the router reads them off the
         // MODELLED operation the routing key names, so a refusal here is still only
         // reached by a request whose signature verified.
-        match self.admission(req) {
-            Admission::Admitted => None,
-            Admission::Unauthorized => Some(&self.unauthorized as &dyn ErasedOperation),
+        //
+        // A request that names no modelled operation is left alone: there is nothing to
+        // authorize, and the routing failure is the answer it gets.
+        let operation = self.definition().protocol().routing_key(req).ok()?;
+
+        if self.admission(req) == Admission::Unauthorized {
+            return Some(&self.unauthorized as &dyn ErasedOperation);
         }
+
+        // The account-entitlement gate (see the module docs): the caller's Security Lake
+        // role decides, so the verdict precedes the modelled walk's own validation and
+        // nothing the request names is looked up or written.
+        let gate = entitlement_gate(operation)?;
+        if self.account_role().administers_security_lake() {
+            return None;
+        }
+        Some(match gate {
+            Gate::AccessDenied => &self.not_entitled as &dyn ErasedOperation,
+            Gate::Unauthorized => &self.unauthorized_route as &dyn ErasedOperation,
+        })
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

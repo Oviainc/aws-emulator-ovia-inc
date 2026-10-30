@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDataLakeSources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDataLakeSources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDataLakeSources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a snapshot of the caller's Region: the data lake stored there and, for each
+//! account in scope, what Security Lake collects for it. A caller account that holds no
+//! Security Lake role never reaches this handler — the entitlement gate in
+//! `crate::service` refuses the route ahead of dispatch.
 //!
 //! ## Shape of an operation
 //!
@@ -140,6 +136,10 @@ impl From<GetDataLakeSourcesErrorModeled> for GetDataLakeSourcesError {
     }
 }
 
+/// `GetDataLakeSourcesRequest$maxResults` carries `@default(50)` in the model, and a
+/// member sent with no value deserializes to zero.
+const DEFAULT_MAX_RESULTS: usize = 50;
+
 /// The `GetDataLakeSources` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -176,18 +176,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDataLakeSources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDataLakeSourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDataLakeSources"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetDataLakeSourcesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Security Lake state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `maxResults` reaches this handler already inside the model's
+        // `@range(min: 1, max: 100)` — the boundary validator refused anything else — so
+        // the only value to interpret here is the zero that stands for "not sent".
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|requested| *requested > 0)
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        let region = crate::state::caller_region(ctx.parts());
+        // A pure read: paging consumes nothing, so the same token always returns the same
+        // page.
+        let store = state.lock();
+
+        // The snapshot is of ONE Region — the one this request was signed for — so it
+        // exists only while that Region holds a data lake. Refused with the modelled
+        // ResourceNotFoundException rather than answered with an empty snapshot a client
+        // cannot tell apart from an enabled Region that collects nothing. Checked before
+        // the token is interpreted: a token can only have been issued from a snapshot
+        // that exists.
+        let Some(lake) = store.data_lake(&region) else {
+            return Err(GetDataLakeSourcesErrorModeled::ResourceNotFoundException(
+                crate::state::data_lake_not_found(&[region.as_str()]),
+            )
+            .into());
+        };
+
+        // The accounts the snapshot covers: every account this Region's data lake
+        // collects for, narrowed to those the request names when it names any. This
+        // emulator serves the single account `::engine::emulator_account_id()`, so a
+        // filter naming other accounts only narrows the snapshot to nothing — it never
+        // reports an account Security Lake is not enabled for. The scan is over the
+        // request's OWN list and allocates nothing from it, so the snapshot it builds is
+        // bounded by the one covered account however long that list is.
+        let collecting = ::engine::emulator_account_id();
+        let covered: Vec<&str> = match input.accounts.as_deref() {
+            Some(named) if !named.iter().any(|account| account == collecting) => Vec::new(),
+            _ => vec![collecting],
+        };
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some((index, anchor)) = crate::state::decode_next_token(token) else {
+                    return Err(GetDataLakeSourcesErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(
+                                "nextToken is not a token this service issued".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                // Resume at the anchor while it is still covered, and otherwise at the
+                // position it held when the token was issued, so a snapshot that changed
+                // between pages does not break an in-flight paginator.
+                covered
+                    .iter()
+                    .position(|account| *account == anchor)
+                    .unwrap_or_else(|| index.min(covered.len()))
+            }
+        };
+
+        let data_lake_sources: Vec<DataLakeSource> = covered
+            .iter()
+            .skip(start)
+            .take(page_size)
+            .map(|account| DataLakeSource {
+                account: Some((*account).to_string()),
+                // What Security Lake collects for this account in this Region comes from
+                // the log sources enabled on the data lake, and this emulator stores none
+                // yet: `CreateAwsLogSource` is still a 501 scaffold, so there is no
+                // enablement record to report a `sourceName`, an event class or a
+                // collection status from. The account is reported as enabled, and these
+                // members stay ABSENT rather than carrying a status for collection that
+                // nothing performed.
+                source_name: None,
+                event_classes: None,
+                source_statuses: None,
+            })
+            .collect();
+
+        // A token only when something follows this page, and it names the NEXT entry, so
+        // a round trip resumes exactly after the last one returned.
+        let next = start + data_lake_sources.len();
+        let next_token = covered
+            .get(next)
+            .map(|account| crate::state::encode_next_token(next, account));
+
+        Ok(GetDataLakeSourcesOutput {
+            // Read back out of the store, so this ARN and the one `CreateDataLake` /
+            // `ListDataLakes` report cannot drift.
+            data_lake_arn: Some(lake.data_lake_arn.clone()),
+            data_lake_sources: Some(data_lake_sources),
+            next_token,
+        })
     }
 }

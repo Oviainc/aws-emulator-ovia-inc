@@ -24,6 +24,7 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_securitylake_securitylake::state::AccountRole;
 use service_com_amazonaws_securitylake_securitylake::state::ComAmazonawsSecuritylakeSecuritylakeState as Store;
 use service_com_amazonaws_securitylake_securitylake::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -144,6 +145,14 @@ struct Emulator {
 impl Emulator {
     fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        // These cases are about the PRINCIPAL-admission decision, so the caller account
+        // is given the Security Lake role the control plane requires of it (see
+        // `account_entitlement_gate` for the gate that tests the role itself); without it
+        // the data-lake calls below would be refused for a second, unrelated reason.
+        engine
+            .state::<Store>()
+            .lock()
+            .set_account_role(AccountRole::Standalone);
         let mut router = MultiServiceRouter::new();
         // Request signatures are verified by the emulator, not by the service: these
         // cases exercise the service's AUTHORIZATION decision, so the authenticator is

@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_securitylake_securitylake::state::{
+    AccountRole, ComAmazonawsSecuritylakeSecuritylakeState as Store,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The canonical emulator account id (`engine::EMULATOR_ACCOUNT_ID`): every ARN this
@@ -47,6 +50,9 @@ pub(crate) struct Reply {
 /// The emulator under test: this one service mounted on the production router.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The shared engine, so a case can set the account-topology records the control
+    /// plane decides on — the one `Arc` the service holds too, never a second store.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -58,9 +64,28 @@ impl Emulator {
         // header is present only to carry the route key and the Region.
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_securitylake_securitylake::EmulatedService::new(engine),
+            service_com_amazonaws_securitylake_securitylake::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
         );
-        Self { router }
+        let emulator = Self { router, engine };
+        // Security Lake's control plane only serves an account that administers a data
+        // lake — the organization's delegated administrator or a standalone account — and
+        // an account holds no such role until one is given to it. The cases on this
+        // harness are about what the data-lake and subscriber operations DO, so the
+        // account topology is seeded here, through the store that holds it: no modelled
+        // operation writes it (`RegisterDataLakeDelegatedAdministrator` is the
+        // organization management account's call). The gate itself is under test in
+        // `account_entitlement_gate`, which sets the role back through the accessor
+        // below.
+        emulator.set_account_role(AccountRole::Standalone);
+        emulator
+    }
+
+    /// Give the caller account `role`, answering the role it held before. The account
+    /// topology is a record of this service's store, like its authorization records.
+    pub(crate) fn set_account_role(&self, role: AccountRole) -> AccountRole {
+        self.engine.state::<Store>().lock().set_account_role(role)
     }
 
     pub(crate) async fn send(

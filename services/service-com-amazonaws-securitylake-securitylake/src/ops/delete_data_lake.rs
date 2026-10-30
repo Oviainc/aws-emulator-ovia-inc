@@ -174,16 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .copied()
             .filter(|region| store.data_lake(region).is_none())
             .collect();
-        if let [first, ..] = unknown.as_slice() {
+        if !unknown.is_empty() {
             return Err(DeleteDataLakeErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Security Lake is not enabled in Region {}",
-                        unknown.join(", ")
-                    )),
-                    resource_name: Some((*first).to_string()),
-                    resource_type: Some("DataLake".to_string()),
-                },
+                crate::state::data_lake_not_found(&unknown),
             )
             .into());
         }
