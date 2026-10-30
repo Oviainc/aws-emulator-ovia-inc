@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates a stored application in place, so a following `GetApplication` reports the
+//! new values. Every member the request carries REPLACES the stored one outright — a
+//! list arrives whole and is stored whole, never merged with the list already there —
+//! and a member the request omits leaves its stored value as it was. The identity the
+//! create minted (`Id`, `Arn`, `Namespace`, `CreatedTime`) is not an input here and is
+//! never touched; `LastModifiedTime` moves only when a member actually changed.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +166,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApplication"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateApplicationErrorModeled::InternalServiceError(InternalServiceError {
+                message: Some("the AppIntegrations store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // `Arn` is an `ArnOrUUID`, so either identifier form this service hands out
+        // addresses the application; one that names none is a 404.
+        let not_found = || {
+            UpdateApplicationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::application_not_found(&input.arn)),
+            })
+        };
+        let id = state.application_id(&input.arn).ok_or_else(not_found)?;
+
+        // An application's identity is its (`Namespace`, `Name`) pair — the invariant
+        // `CreateApplication` keeps with its `DuplicateResourceException` — and this
+        // operation cannot move an application to another namespace (the model binds no
+        // `Namespace` member here), so a rename onto a name another application in the
+        // same namespace already holds is refused rather than breaking that pair through
+        // the back door. The error is the one the MODEL puts on this operation for a
+        // clash: `smithy_query(query="operation", operation="UpdateApplication")` declares
+        // `ConflictException` (HTTP 409) — "The request conflicts with the current state
+        // of the resource" — where the create declares `DuplicateResourceException` for
+        // the same collision, and the wording is the create's, with both values read from
+        // the request and the stored record. `UpdateDataIntegration` keeps its own name
+        // invariant the same way.
+        if let Some(name) = input.name.as_deref() {
+            let namespace = state
+                .applications
+                .get(&id)
+                .map(|record| record.namespace.clone())
+                .ok_or_else(not_found)?;
+            if state.applications.values().any(|record| {
+                record.id != id && record.namespace == namespace && record.name == name
+            }) {
+                return Err(UpdateApplicationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "An application named {name} already exists in namespace {namespace}."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let record = state.applications.get_mut(&id).ok_or_else(not_found)?;
+
+        // Only the members the request carried are applied, and each one REPLACES the
+        // stored value whole: a `Permissions`, `Subscriptions`, `Publications`,
+        // `IframeConfig` or source config that arrives is the complete new value, never
+        // something merged into what was there. A member sent as an empty list is still a
+        // value (`PermissionList` is `len 0..150`), so it empties the stored list.
+        let mut applied = 0usize;
+        let mut changed = false;
+        if let Some(name) = input.name {
+            applied += 1;
+            changed |= record.name != name;
+            record.name = name;
+        }
+        if let Some(description) = input.description {
+            applied += 1;
+            changed |= record.description.as_deref() != Some(description.as_str());
+            record.description = Some(description);
+        }
+        if let Some(source_config) = input.application_source_config {
+            applied += 1;
+            changed |= record.application_source_config != source_config;
+            record.application_source_config = source_config;
+        }
+        if let Some(subscriptions) = input.subscriptions {
+            applied += 1;
+            changed |= record.subscriptions.as_deref() != Some(subscriptions.as_slice());
+            record.subscriptions = Some(subscriptions);
+        }
+        if let Some(publications) = input.publications {
+            applied += 1;
+            changed |= record.publications.as_deref() != Some(publications.as_slice());
+            record.publications = Some(publications);
+        }
+        if let Some(permissions) = input.permissions {
+            applied += 1;
+            changed |= record.permissions.as_deref() != Some(permissions.as_slice());
+            record.permissions = Some(permissions);
+        }
+        if let Some(is_service) = input.is_service {
+            applied += 1;
+            changed |= record.is_service != is_service;
+            record.is_service = is_service;
+        }
+        if let Some(timeout) = input.initialization_timeout {
+            applied += 1;
+            changed |= record.initialization_timeout != Some(timeout);
+            record.initialization_timeout = Some(timeout);
+        }
+        if let Some(application_config) = input.application_config {
+            applied += 1;
+            changed |= record.application_config.as_ref() != Some(&application_config);
+            record.application_config = Some(application_config);
+        }
+        if let Some(iframe_config) = input.iframe_config {
+            applied += 1;
+            changed |= record.iframe_config.as_ref() != Some(&iframe_config);
+            record.iframe_config = Some(iframe_config);
+        }
+        if let Some(application_type) = input.application_type {
+            applied += 1;
+            changed |= record.application_type.as_deref() != Some(application_type.as_str());
+            record.application_type = Some(application_type);
+        }
+        if let Some(auth_config) = input.auth_config {
+            applied += 1;
+            changed |= record.auth_config.as_ref() != Some(&auth_config);
+            record.auth_config = Some(auth_config);
+        }
+        // The resource's own clock moves only when the resource did: a request that
+        // re-sends what is already stored, or carries no updatable member at all, is
+        // accepted and leaves the record, timestamp included, as it was.
+        if changed {
+            record.last_modified_time = ::std::time::SystemTime::now();
+        }
+        // An operator's record that this call changed state: the operation, the resource
+        // it touched (the id this service minted, never a value the request supplied), how
+        // many members were applied and whether anything moved. No credential is logged.
+        ::tracing::info!(
+            operation = Self::NAME,
+            application_id = %id,
+            members_applied = applied,
+            outcome = if changed { "updated" } else { "unchanged" },
+            "applied an UpdateApplication"
+        );
+
+        Ok(UpdateApplicationOutput {})
     }
 }
