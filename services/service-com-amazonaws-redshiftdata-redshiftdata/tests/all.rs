@@ -35,6 +35,9 @@ mod list_databases;
 #[path = "all/numeric_bounds.rs"]
 mod numeric_bounds;
 
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

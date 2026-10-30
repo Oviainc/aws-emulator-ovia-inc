@@ -175,8 +175,14 @@
 use super::types::*;
 use crate::state::{
     non_empty, to_timestamp, BadConnection, ConnectionRequest, ExecutionMode, NoDatabase,
-    Statement, Submission, SubmissionKind, ABSENT_ENDPOINT_MESSAGE,
+    Statement, Submission, SubmissionKind, TargetSelectors, ABSENT_ENDPOINT_MESSAGE,
+    UNKNOWN_SESSION_MESSAGE,
 };
+
+/// The compute-target selectors THIS operation accepts: beside the two
+/// warehouse selectors its input models `SessionId`, and a submission may
+/// address a Glue-managed target.
+const SELECTORS: TargetSelectors = TargetSelectors::Submit;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -290,7 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 {
                     return Err(validation(ABSENT_ENDPOINT_MESSAGE));
                 }
-                return Err(validation(problem.message()));
+                return Err(validation(&problem.message(SELECTORS)));
             }
         };
 
@@ -560,9 +566,14 @@ fn unavailable() -> BatchExecuteStatementError {
 /// Refuse a `SessionId` that names no live session: a session this service does
 /// not hold, or one the clock has closed, which "can no longer run SQL
 /// statements".
+///
+/// The fixed words the Data API states for a session it holds none of
+/// ([`UNKNOWN_SESSION_MESSAGE`]) — no part of the id reaches the message —
+/// carried by the missing-resource error at the status its `@httpError`
+/// declares, which is the status this path answers.
 fn no_such_session(session_id: &str) -> BatchExecuteStatementError {
     BatchExecuteStatementErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: format!("Session does not exist: {session_id}"),
+        message: UNKNOWN_SESSION_MESSAGE.to_string(),
         resource_id: session_id.to_string(),
     })
     .into()

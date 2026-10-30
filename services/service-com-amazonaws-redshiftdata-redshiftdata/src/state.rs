@@ -111,16 +111,78 @@ pub const UNKNOWN_QUERY_STATUS: u16 = 400;
 /// which operation minted (or did not mint) it.
 pub const INVALID_TOKEN_MESSAGE: &str = "Invalid token value";
 
-/// The message the Data API answers a request that does not name one compute
-/// target with.
+/// The message the Data API answers a `SessionId` it holds no session for with.
 ///
-/// One canonical, request-independent sentence enumerating every target the
-/// service accepts — a provisioned cluster, a serverless workgroup, a Glue
-/// resource or an existing session — and it is the answer both when the request
-/// names none of them and when it names more than one.
-pub const ONE_TARGET_MESSAGE: &str =
-    "There should be only one of the following: ClusterIdentifier, WorkgroupName, Glue resource, \
-     SessionId";
+/// Fixed text, carrying no part of the request: the service states that the
+/// session does not exist and nothing about the id that was asked for. It lives
+/// here so every operation that RESOLVES a `SessionId` — the two submit
+/// operations, which run a statement on the session's connection, and
+/// `ListSessions`, which reports one session's metadata — states the same
+/// sentence for the same missing resource.
+pub const UNKNOWN_SESSION_MESSAGE: &str = "Session not found.";
+
+/// The HTTP status `ListSessions` answers that refusal at.
+///
+/// The missing-resource shape it carries declares `@httpError 404`, which is the
+/// status the submit operations answer it at; on the metadata read the service
+/// answers it as a client-input failure instead, so that reader states the status
+/// here and serves the error at it
+/// ([`crate::scaffolded::Scaffolded::ModeledWithStatus`]) rather than swapping
+/// the error code to move the status.
+pub const UNKNOWN_SESSION_STATUS: u16 = 400;
+
+/// The message the Data API answers a request that supplies members it documents
+/// as MUTUALLY EXCLUSIVE with.
+///
+/// Fixed text down to the closing period; the only variable part is the member
+/// list, which names the mutually exclusive members as the model spells them, in
+/// the order that operation's own documentation states the rule in.
+pub fn mutually_exclusive_message(members: &[&str]) -> String {
+    format!(
+        "Only one of the following can be specified: {}.",
+        members.join(", ")
+    )
+}
+
+/// The compute-target selectors ONE operation accepts, in the order its refusal
+/// enumerates them.
+///
+/// The refusal of a request that does not select exactly one compute target
+/// enumerates the selectors THAT operation accepts and no others, so an operation
+/// whose input shape models no session selector never names one: a caller told to
+/// choose between parameters it cannot pass has been sent after the wrong thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetSelectors {
+    /// A SUBMIT operation (`ExecuteStatement`, `BatchExecuteStatement`): it runs a
+    /// statement, so beside the two warehouse selectors its input models
+    /// `SessionId`, and it admits a Glue-managed target as well.
+    Submit,
+    /// A reader of ONE warehouse's catalog (`ListDatabases`, `DescribeTable`):
+    /// its input shape models the two warehouse selectors and no other — neither
+    /// a session nor a Glue resource
+    /// (`smithy_query(query="operation",operation="ListDatabases")`).
+    Warehouse,
+}
+
+impl TargetSelectors {
+    /// The selectors, as the refusal lists them.
+    pub fn listed(self) -> &'static str {
+        match self {
+            Self::Submit => "ClusterIdentifier, WorkgroupName, Glue resource, SessionId",
+            Self::Warehouse => "ClusterIdentifier, WorkgroupName",
+        }
+    }
+
+    /// The message the Data API answers a request that does not name exactly one
+    /// of these selectors with — the same sentence whether the request named none
+    /// of them or more than one, since neither decides an endpoint.
+    pub fn one_target_message(self) -> String {
+        format!(
+            "There should be only one of the following: {}",
+            self.listed()
+        )
+    }
+}
 
 /// The message the Data API answers a target that resolves to no endpoint in the
 /// caller's Region with. Fixed text: it names neither the cluster nor the
@@ -2184,21 +2246,26 @@ impl BadConnection {
     /// What is wrong with the request, as a `ValidationException` message.
     /// [`BadConnection::SessionOnly`] is NOT a malformed request, so its text
     /// says what is missing from the emulator instead.
-    pub fn message(self) -> &'static str {
+    ///
+    /// `selectors` are the compute-target selectors the CALLING operation
+    /// accepts, which is the only part of the target-selection sentence that
+    /// differs between operations ([`TargetSelectors`]).
+    pub fn message(self, selectors: TargetSelectors) -> String {
         match self {
             // Nothing the request named could resolve to an endpoint, so there
             // is nothing but the SELECTION to report: the canonical sentence,
             // which is also what naming two warehouses gets.
-            Self::NoTarget => ONE_TARGET_MESSAGE,
-            Self::SeveralTargets => ONE_TARGET_MESSAGE,
+            Self::NoTarget | Self::SeveralTargets => selectors.one_target_message(),
             Self::SessionOnly => {
                 "SessionId does not name a live session: the warehouse and database a statement \
                  runs against are the ones its session was opened with"
+                    .to_string()
             }
-            Self::NoDatabase => "Database is required",
+            Self::NoDatabase => "Database is required".to_string(),
             Self::BothAuthMethods => {
                 "DbUser and SecretArn cannot both be supplied: DbUser authenticates with \
                  temporary credentials and SecretArn with Secrets Manager"
+                    .to_string()
             }
         }
     }
@@ -2221,14 +2288,15 @@ impl ConnectionRequest<'_> {
     /// documented combinations name.
     ///
     /// A statement runs against ONE target. The service enumerates the targets
-    /// it accepts in the one sentence it refuses a bad selection with — a
-    /// provisioned cluster (`ClusterIdentifier`), a serverless workgroup
-    /// (`WorkgroupName`), a Glue resource, or a session a previous statement
-    /// opened (`SessionId`) — so a request that names two of them does not
-    /// decide which endpoint it addresses ([`BadConnection::SeveralTargets`]),
-    /// and one that names none of them selects nothing
-    /// ([`BadConnection::NoTarget`]); both carry that message
-    /// ([`ONE_TARGET_MESSAGE`]). Every documented authorization combination then
+    /// the CALLING operation accepts in the one sentence it refuses a bad
+    /// selection with — a provisioned cluster (`ClusterIdentifier`), a
+    /// serverless workgroup (`WorkgroupName`), and, where that operation models
+    /// them, a Glue resource or a session a previous statement opened
+    /// (`SessionId`) — so a request that names two of them does not decide
+    /// which endpoint it addresses ([`BadConnection::SeveralTargets`]), and one
+    /// that names none of them selects nothing ([`BadConnection::NoTarget`]);
+    /// both carry that message ([`TargetSelectors::one_target_message`]). Every
+    /// documented authorization combination then
     /// supplies the database; `SecretArn` selects Secrets Manager authorization
     /// and `DbUser` temporary credentials, which are alternatives, so supplying
     /// both names two methods for one submission.

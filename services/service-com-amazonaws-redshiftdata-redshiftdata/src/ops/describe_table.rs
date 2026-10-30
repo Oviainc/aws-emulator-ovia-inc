@@ -127,9 +127,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    decode_cursor, encode_cursor, non_empty, ConnectionRequest, ABSENT_ENDPOINT_MESSAGE,
-    CURSOR_COLUMNS, DEFAULT_PAGE_SIZE, DEFAULT_SCHEMA, INVALID_TOKEN_MESSAGE,
+    decode_cursor, encode_cursor, non_empty, ConnectionRequest, TargetSelectors,
+    ABSENT_ENDPOINT_MESSAGE, CURSOR_COLUMNS, DEFAULT_PAGE_SIZE, DEFAULT_SCHEMA,
+    INVALID_TOKEN_MESSAGE,
 };
+
+/// The compute-target selectors THIS operation accepts: its input shape models
+/// `ClusterIdentifier` and `WorkgroupName` and no other selector, so its
+/// target-selection refusal names those two alone.
+const SELECTORS: TargetSelectors = TargetSelectors::Warehouse;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -241,7 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 {
                     return Err(validation(ABSENT_ENDPOINT_MESSAGE));
                 }
-                return Err(validation(problem.message()));
+                return Err(validation(&problem.message(SELECTORS)));
             }
         };
 

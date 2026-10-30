@@ -110,9 +110,26 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    decode_cursor, encode_cursor, non_empty, to_timestamp, Session, SessionStatus,
-    CURSOR_SESSIONS, DEFAULT_LIST_PAGE_SIZE, INVALID_TOKEN_MESSAGE,
+    decode_cursor, encode_cursor, mutually_exclusive_message, non_empty, to_timestamp, Session,
+    SessionStatus, CURSOR_SESSIONS, DEFAULT_LIST_PAGE_SIZE, INVALID_TOKEN_MESSAGE,
+    UNKNOWN_SESSION_MESSAGE, UNKNOWN_SESSION_STATUS,
 };
+
+/// The message the Data API answers a `ListSessions` request that supplies
+/// `SessionId` beside a filter over a SET of sessions with.
+///
+/// Fixed text, recorded from the service: this rule is stated as one sentence
+/// about `SessionId` rather than as the mutual-exclusion sentence a conflict
+/// between the two TARGET selectors gets
+/// ([`crate::state::mutually_exclusive_message`]), so the two are not merged.
+const SESSION_ID_WITH_FILTERS: &str = "SessionId cannot be specified with other filter \
+                                       parameters.";
+
+/// The two compute-target selectors this operation documents as mutually
+/// exclusive: "When providing ClusterIdentifier, then WorkgroupName can't be
+/// specified"
+/// (`smithy_query(query="doc",shape="ListSessionsRequest",member="ClusterIdentifier")`).
+const EXCLUSIVE_TARGET_SELECTORS: [&str; 2] = ["ClusterIdentifier", "WorkgroupName"];
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -210,18 +227,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 || workgroup_name.is_some()
                 || database.is_some())
         {
-            return Err(validation(
-                "SessionId cannot be specified with other filter parameters.",
-            ));
+            return Err(validation(SESSION_ID_WITH_FILTERS));
         }
 
         // "When providing ClusterIdentifier, then WorkgroupName can't be
         // specified": a session runs on one data warehouse.
         if cluster_identifier.is_some() && workgroup_name.is_some() {
-            return Err(validation(
-                "ClusterIdentifier and WorkgroupName cannot both be supplied: a session runs on \
-                 either a provisioned cluster or a serverless workgroup",
-            ));
+            return Err(validation(&mutually_exclusive_message(
+                &EXCLUSIVE_TARGET_SELECTORS,
+            )));
         }
 
         // A `Status` outside the modelled set names no session status, so it is
@@ -263,6 +277,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A session's status is derived from the statements that ran in it, so
         // the outcomes their executions already reported are materialised first.
         store.materialise_due_transitions();
+
+        // "To retrieve the metadata for a single session, provide the SessionId
+        // parameter": a `SessionId` names ONE session, so it is RESOLVED against
+        // session state rather than applied as a filter. An id this account
+        // holds no session for therefore names a missing resource — "this
+        // session does not exist" and "this session has nothing to report" are
+        // different answers, and a caller that resolves an id before reusing it
+        // reads an empty page as the latter.
+        if let Some(wanted) = session_id.as_deref() {
+            if store.session(wanted).is_none() {
+                return Err(no_such_session(wanted));
+            }
+        }
 
         let mut page: Vec<SessionData> = Vec::new();
         let mut remaining = 0_usize;
@@ -340,4 +367,22 @@ fn validation(message: &str) -> ListSessionsError {
         message: Some(message.to_string()),
     })
     .into()
+}
+
+/// Refuse a `SessionId` this service holds no session for.
+///
+/// The missing-resource error the Data API carries this refusal in, in the fixed
+/// words it states for a session it does not hold ([`UNKNOWN_SESSION_MESSAGE`])
+/// — no part of the id reaches the message — served at the status the service
+/// answers this read with ([`UNKNOWN_SESSION_STATUS`]) rather than at the
+/// shape's own `@httpError`, so a client still branches on the error code it
+/// models.
+fn no_such_session(session_id: &str) -> ListSessionsError {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        ListSessionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message: UNKNOWN_SESSION_MESSAGE.to_string(),
+            resource_id: session_id.to_string(),
+        }),
+        UNKNOWN_SESSION_STATUS,
+    )
 }
