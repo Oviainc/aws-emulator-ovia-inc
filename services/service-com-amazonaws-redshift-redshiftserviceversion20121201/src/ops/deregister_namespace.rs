@@ -3,10 +3,13 @@
 //! @op DeregisterNamespace
 //! Releases one namespace registration: the namespace the request names stops being
 //! registered to the consumer account it names, and the call reports the release as
-//! under way. The record this service stored for that pair leaves the store once the
-//! release falls due, so a namespace nothing registered cannot be released. The cluster
-//! of a provisioned namespace is being modified from this call until the change falls
-//! due, applied by the store's clock-owed settle.
+//! under way. The namespace has to EXIST, through the same resolution
+//! `RegisterNamespace` admits one by — this service's clusters for the provisioned arm,
+//! the Redshift Serverless control plane that owns the pair for the serverless arm
+//! (`crate::state::serverless`). The record this service stored for that pair leaves the
+//! store once the release falls due, so a namespace nothing registered cannot be
+//! released. The cluster of a provisioned namespace is being modified from this call
+//! until the change falls due, applied by the store's clock-owed settle.
 //!
 //! ## Shape of an operation
 //!
@@ -159,7 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
@@ -185,13 +188,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let consumer_identifier = st::consumer_account_id(requested_consumer)
             .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
 
+        // The same precondition rule `RegisterNamespace` applies, so a
+        // namespace that could take no registration cannot take its release
+        // either, and both answer the same error for the same cause: the
+        // serverless arm asked of the control plane that owns the pair with no
+        // lock held, the provisioned arm of this store under the lock.
+        st::serverless::resolve_registration_target(ctx, &input.namespace_identifier)
+            .await
+            .map_err(refused)?;
+
         let started = ::std::time::Instant::now();
         let mut store = state.lock();
         store.settle(started);
 
-        // The same precondition rule `RegisterNamespace` applies, so a
-        // namespace that could take no registration cannot take its release
-        // either, and both answer the same error for the same cause.
         let namespace = store
             .registration_target(&input.namespace_identifier)
             .map_err(refused)?;

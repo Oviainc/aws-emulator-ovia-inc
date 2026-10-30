@@ -70,6 +70,10 @@ use std::time::{Duration, Instant, SystemTime};
 /// subscription scoped to it receives.
 pub mod notifications;
 
+/// Whether the serverless namespace a registration change names exists, resolved
+/// against the control plane that owns it.
+pub mod serverless;
+
 /// How long after the call that starts it a provisioning transition falls due:
 /// a cluster or a snapshot reported `creating` becomes `available` this long
 /// after the `CreateCluster` / `CreateClusterSnapshot` / `DeleteCluster` call
@@ -3181,9 +3185,8 @@ pub const NAMESPACE_REGISTRATION_SPAN: Duration = Duration::from_millis(500);
 /// on
 /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::namespace_registrations`],
 /// not a claim about an account's published limit. A registration's identity is
-/// the (namespace, consumer account) pair the request carries, and the
-/// serverless arm of that pair is any identifier a caller sends, so this bound
-/// is what stops the collection growing without end; it is set far above any
+/// the (namespace, consumer account) pair the request carries, and this bound is
+/// what stops the collection growing without end; it is set far above any
 /// workflow an emulator serves, and every record it holds is released by
 /// `DeregisterNamespace`.
 pub const NAMESPACE_REGISTRATION_QUOTA: usize = 10_000;
@@ -4044,16 +4047,18 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// The namespace a registration request names, checked against the state
     /// that holds it — or why it can take no registration change.
     ///
-    /// The ONE precondition rule `RegisterNamespace` and `DeregisterNamespace`
-    /// share: a provisioned cluster's namespace can be registered only while
-    /// this account holds that cluster and the cluster is
-    /// [`STATUS_AVAILABLE`], and an identifier that names nothing a namespace
-    /// could be names no namespace at all.
+    /// Half of the ONE precondition rule `RegisterNamespace` and
+    /// `DeregisterNamespace` share: a provisioned cluster's namespace can be
+    /// registered only while this account holds that cluster and the cluster is
+    /// [`STATUS_AVAILABLE`].
     ///
-    /// A serverless namespace lives in the Redshift Serverless control plane,
-    /// which is a DIFFERENT service with its own store, so this store checks
-    /// the identifier's form and records the registration against it rather
-    /// than refusing a namespace it cannot see.
+    /// The OTHER half is the serverless arm, whose namespace and workgroup live
+    /// in the Redshift Serverless control plane — a DIFFERENT service with its
+    /// own store — so it is resolved by asking that service
+    /// ([`serverless::resolve_registration_target`]), which both handlers do
+    /// BEFORE they take this store's lock. Each arm is resolved in exactly one
+    /// place, and both arms answer the same fault for the same cause: a target
+    /// that does not exist.
     pub fn registration_target(
         &self,
         identifier: &NamespaceIdentifierUnion,
@@ -4085,19 +4090,12 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
                 }
             }
             RegisteredNamespace::Serverless {
-                namespace_identifier,
-                workgroup_identifier,
+                namespace_identifier: _,
+                workgroup_identifier: _,
             } => {
-                // The model bounds both members only by length, so a blank one
-                // passes the boundary and still names no namespace and no
-                // workgroup to reach it through.
-                if namespace_identifier.trim().is_empty() || workgroup_identifier.trim().is_empty()
-                {
-                    return Err(NamespaceRefusal::InvalidNamespace(
-                        "The namespace isn't valid: ServerlessIdentifier must carry a NamespaceIdentifier and a WorkgroupIdentifier."
-                            .to_string(),
-                    ));
-                }
+                // Resolved against the control plane that owns the pair, before
+                // this lock was taken: see
+                // [`serverless::resolve_registration_target`].
             }
         }
         Ok(namespace)

@@ -79,6 +79,8 @@ mod modify_cluster_parameter_group;
 mod modify_cluster_snapshot;
 #[path = "all/namespace_registration.rs"]
 mod namespace_registration;
+#[path = "all/namespace_registration_serverless.rs"]
+mod namespace_registration_serverless;
 #[path = "all/orderable_cluster_options.rs"]
 mod orderable_cluster_options;
 #[path = "all/qev2_idc_applications.rs"]

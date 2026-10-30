@@ -36,6 +36,12 @@ aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio",
 # published catalog lists for it, and every subscription scoped to that event is
 # published to on its topic.
 aws-sdk-sns = { version = "1", default-features = false }
+# The Redshift Serverless client the SERVERLESS arm of a namespace registration
+# change is resolved through, over the same in-process callback: a serverless
+# namespace and its workgroup are resources of that control plane, so whether
+# the pair a `RegisterNamespace` / `DeregisterNamespace` names exists is a
+# question only it can answer (`state::serverless`).
+aws-sdk-redshiftserverless = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -58,6 +64,11 @@ service-com-amazonaws-kms-trentservice = { workspace = true }
 # engine, because a raised Redshift event is published onto the subscription's
 # Amazon SNS topic. Another workspace member this repository already locks.
 service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
+# The namespace-registration suite mounts the Redshift Serverless control plane
+# beside Redshift on one engine, because the serverless namespace and workgroup a
+# registration change names are ITS resources: the suite creates them there and
+# registers them here. Another workspace member this repository already locks.
+service-com-amazonaws-redshiftserverless-redshiftserverless = { workspace = true }
 
 [lints]
 workspace = true

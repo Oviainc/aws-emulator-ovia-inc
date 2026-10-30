@@ -87,6 +87,59 @@ impl Emulator {
         emulator
     }
 
+    /// An emulator with the Redshift Serverless control plane mounted beside
+    /// Redshift on the SAME engine, exactly as the assembled emulator mounts
+    /// them.
+    ///
+    /// The serverless namespace and workgroup a namespace registration change
+    /// names are resources of THAT service, so a suite about resolving them has
+    /// to have it to reach; [`Emulator::new`] deliberately leaves it unmounted,
+    /// which is the "Redshift Serverless said nothing" case.
+    pub(crate) fn with_serverless() -> Self {
+        let mut emulator = Self::build(false);
+        emulator.router.register_service(
+            service_com_amazonaws_redshiftserverless_redshiftserverless::EmulatedService::new(
+                Arc::clone(&emulator.engine),
+            ),
+        );
+        emulator
+    }
+
+    /// POST one Amazon Redshift Serverless operation with this JSON body,
+    /// signed for [`REGION`], and answer its status and parsed body.
+    ///
+    /// That service speaks awsJson1_1, so the operation travels in `x-amz-target`
+    /// rather than in a form field. Panics unless [`Emulator::with_serverless`]
+    /// built this emulator — there is no serverless control plane to call
+    /// otherwise.
+    pub(crate) async fn call_serverless(
+        &self,
+        operation: &str,
+        body: &serde_json::Value,
+    ) -> (u16, serde_json::Value) {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!(
+                "https://redshift-serverless.{REGION}.amazonaws.com/"
+            ))
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", format!("RedshiftServerless.{operation}"))
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/redshift-serverless/aws4_request, SignedHeaders=host;x-amz-target, Signature=0"
+                ),
+            )
+            .body(bytes::Bytes::from(
+                serde_json::to_vec(body).expect("the test request body serializes"),
+            ))
+            .expect("the test request is well formed");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let parsed = serde_json::from_slice(response.body()).unwrap_or(serde_json::Value::Null);
+        (status, parsed)
+    }
+
     /// A handle to this emulator for driving it through an AWS SDK client: the
     /// same in-process seam a handler reaches another mounted service through.
     pub(crate) fn callback(&self) -> smithy_server_runtime::EmbeddedEmulator {

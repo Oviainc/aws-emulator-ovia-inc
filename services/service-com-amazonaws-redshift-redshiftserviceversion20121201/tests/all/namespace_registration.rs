@@ -22,6 +22,13 @@
 //! being modified while the change applies and available again once it falls
 //! due; a serverless namespace is no cluster of this control plane, so no
 //! cluster moves for it.
+//!
+//! No Redshift Serverless control plane is mounted here, so a serverless pair
+//! is one this emulator cannot resolve either way and is admitted rather than
+//! refused on the strength of a peer that never answered. The resolution of
+//! that arm — the refusal a pair that does not exist earns, and the acceptance
+//! one that does — is [`crate::namespace_registration_serverless`], which
+//! mounts that service beside Redshift as the assembled emulator does.
 
 use std::time::Duration;
 
@@ -31,7 +38,7 @@ use crate::cluster_lifecycle::{Answer, Emulator};
 
 /// Wait out the span a clock-owed change falls due after, plus a margin for a
 /// loaded runner.
-async fn settle() {
+pub(crate) async fn settle() {
     tokio::time::sleep(
         state::PROVISIONING_SPAN + state::NAMESPACE_REGISTRATION_SPAN + Duration::from_millis(250),
     )
@@ -76,7 +83,7 @@ fn namespace_params(namespace: &state::RegisteredNamespace) -> Vec<(String, Stri
 
 /// One registration call: `action` with this namespace and this consumer
 /// account.
-async fn call(
+pub(crate) async fn call(
     emulator: &Emulator,
     action: &str,
     namespace: &state::RegisteredNamespace,
@@ -95,7 +102,7 @@ async fn call(
 }
 
 /// `RegisterNamespace` for one (namespace, consumer account) pair.
-async fn register(
+pub(crate) async fn register(
     emulator: &Emulator,
     namespace: &state::RegisteredNamespace,
     consumer: &str,
@@ -104,7 +111,7 @@ async fn register(
 }
 
 /// `DeregisterNamespace` for one (namespace, consumer account) pair.
-async fn deregister(
+pub(crate) async fn deregister(
     emulator: &Emulator,
     namespace: &state::RegisteredNamespace,
     consumer: &str,
@@ -113,14 +120,17 @@ async fn deregister(
 }
 
 /// The namespace of one provisioned cluster.
-fn provisioned(cluster_identifier: &str) -> state::RegisteredNamespace {
+pub(crate) fn provisioned(cluster_identifier: &str) -> state::RegisteredNamespace {
     state::RegisteredNamespace::Provisioned {
         cluster_identifier: cluster_identifier.to_string(),
     }
 }
 
 /// One serverless namespace, reached through one workgroup.
-fn serverless(namespace_identifier: &str, workgroup_identifier: &str) -> state::RegisteredNamespace {
+pub(crate) fn serverless(
+    namespace_identifier: &str,
+    workgroup_identifier: &str,
+) -> state::RegisteredNamespace {
     state::RegisteredNamespace::Serverless {
         namespace_identifier: namespace_identifier.to_string(),
         workgroup_identifier: workgroup_identifier.to_string(),
@@ -133,7 +143,10 @@ fn serverless(namespace_identifier: &str, workgroup_identifier: &str) -> state::
 /// Materialises the clock-owed changes first, exactly as every handler does
 /// before it reads or writes the store, so this reads what the next caller
 /// would see rather than a record the clock has already moved past.
-fn stored(emulator: &Emulator, namespace: &state::RegisteredNamespace) -> Vec<(String, String)> {
+pub(crate) fn stored(
+    emulator: &Emulator,
+    namespace: &state::RegisteredNamespace,
+) -> Vec<(String, String)> {
     let store = state::service_state(&*emulator.engine).expect("the Redshift store");
     let mut store = store.lock();
     store.settle(std::time::Instant::now());

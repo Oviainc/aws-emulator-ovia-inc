@@ -3,10 +3,14 @@
 //! @op RegisterNamespace
 //! Registers one namespace — a provisioned cluster's, or a serverless one — to the
 //! consumer account the request names, and reports the registration as under way. The
-//! registration is recorded in this service's store, which is what makes a later
-//! `DeregisterNamespace` of the same pair a release of something rather than a release
-//! of nothing. The cluster of a provisioned namespace is being modified from this call
-//! until the change falls due, applied by the store's clock-owed settle.
+//! namespace has to EXIST: the provisioned arm is resolved against this service's own
+//! clusters and the serverless arm against the Redshift Serverless control plane that
+//! owns the pair (`crate::state::serverless`), and a target that resolves to nothing is
+//! refused rather than recorded. The registration is then recorded in this service's
+//! store, which is what makes a later `DeregisterNamespace` of the same pair a release
+//! of something rather than a release of nothing. The cluster of a provisioned namespace
+//! is being modified from this call until the change falls due, applied by the store's
+//! clock-owed settle.
 //!
 //! ## Shape of an operation
 //!
@@ -156,7 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
@@ -182,12 +186,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let consumer_identifier = st::consumer_account_id(requested_consumer)
             .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
 
+        // The namespace has to be one a registration change is admitted for,
+        // through the rule this operation shares with `DeregisterNamespace`.
+        // The SERVERLESS arm of that rule is a question for the control plane
+        // that owns the pair, so it is asked first, with no lock held.
+        st::serverless::resolve_registration_target(ctx, &input.namespace_identifier)
+            .await
+            .map_err(refused)?;
+
         let started = ::std::time::Instant::now();
         let mut store = state.lock();
         store.settle(started);
 
-        // The namespace has to be one a registration change is admitted for,
-        // through the rule this operation shares with `DeregisterNamespace`.
+        // ... and the PROVISIONED arm is this store's own, resolved under the
+        // same lock the registration is written under.
         let namespace = store
             .registration_target(&input.namespace_identifier)
             .map_err(refused)?;
@@ -202,10 +214,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stored.removed_at = None;
             }
             None => {
-                // A registration is a record this request creates, and the
-                // serverless arm of its key is any identifier a caller sends,
-                // so the collection is bounded rather than grown without end.
-                // The model declares no quota fault for this operation, so the
+                // A registration is a record this request creates, so the
+                // collection is bounded rather than grown without end. The
+                // model declares no quota fault for this operation, so the
                 // refusal is the 400 `InvalidParameterValue` Amazon Redshift
                 // answers a request it cannot honour with.
                 if store.namespace_registrations.len() >= st::NAMESPACE_REGISTRATION_QUOTA {
