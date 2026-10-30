@@ -401,13 +401,12 @@ async fn a_report_is_recorded_per_resource_and_served_once_the_clock_completes_i
             "case {what:?}: expected each service's published name, got {:?}",
             elements(&body, "ServiceName")
         );
-        // Nothing in this emulator records a principal reaching a service, so no attempt
-        // is reported for one.
+        // Nothing in this emulator records a principal reaching a service, so no INSTANT
+        // of an attempt is reported for one.
         for withheld in [
             "LastAuthenticated",
             "LastAuthenticatedEntity",
             "LastAuthenticatedRegion",
-            "TotalAuthenticatedEntities",
         ] {
             assert!(
                 elements(&body, withheld).is_empty(),
@@ -415,6 +414,15 @@ async fn a_report_is_recorded_per_resource_and_served_once_the_clock_completes_i
                 elements(&body, withheld)
             );
         }
+        // The number of principals that have attempted to reach the service is a COUNT,
+        // which every entry of a report carries: it is zero for a service nothing has
+        // recorded an attempt against, never absent.
+        assert_eq!(
+            elements(&body, "TotalAuthenticatedEntities"),
+            vec!["0".to_string(); elements(&body, "ServiceNamespace").len()],
+            "case {what:?}: expected one attempt count of zero per reported service, got {:?}",
+            elements(&body, "TotalAuthenticatedEntities")
+        );
         assert_eq!(
             element(&body, "IsTruncated"),
             "false",
@@ -479,7 +487,8 @@ async fn the_report_lists_every_service_the_resources_policies_allow_an_action_o
         (
             "a wildcard inside the namespace",
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3*:Get*","Resource":"*"}]}"#,
-            Expected::Only(&["s3", "s3-object-lambda"]),
+            // Every namespace the catalog carries that the run `s3*` reaches.
+            Expected::Only(&["s3", "s3-object-lambda", "s3express", "s3outposts"]),
         ),
         (
             "the whole-element wildcard",
@@ -508,7 +517,7 @@ async fn the_report_lists_every_service_the_resources_policies_allow_an_action_o
         ),
         (
             "a service outside the ones a report covers",
-            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"a4b:ListDevices","Resource":"*"}]}"#,
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"deepracer:ListModels","Resource":"*"}]}"#,
             Expected::Only(&[]),
         ),
     ];
@@ -602,8 +611,17 @@ fn the_services_a_report_covers_are_a_sorted_catalog_of_distinct_namespaces() {
     }
     // And a prefix the catalog does not carry names no service a report covers.
     assert!(
-        state::reported_service("a4b").is_none(),
+        state::reported_service("deepracer").is_none(),
         "a namespace outside the catalog names no service a report covers"
+    );
+    // The catalog is the published breadth of AWS service prefixes rather than a
+    // shortlist, so a report of it runs past one page of the default `MaxItems` — which
+    // is what makes the pagination of the read observable at all.
+    assert!(
+        state::REPORTED_SERVICES.len() > 100,
+        "the services a report covers must be the published catalog, not a shortlist, got \
+         {}",
+        state::REPORTED_SERVICES.len()
     );
 }
 
@@ -964,8 +982,8 @@ async fn a_service_namespace_covering_no_service_is_refused_as_an_invalid_input(
     let longest = "n".repeat(64);
     for (what, namespace) in [
         ("a value naming no service at all", "not-a-real-aws-service-namespace"),
-        ("a published prefix the report covers nothing for", "a4b"),
-        ("a prefix that merely extends a covered one", "s3outposts"),
+        ("a published prefix the report covers nothing for", "deepracer"),
+        ("a prefix that merely extends a covered one", "iotjobsdata"),
         ("the shortest namespace the shape admits", "x"),
         ("the longest namespace the shape admits", longest.as_str()),
     ] {

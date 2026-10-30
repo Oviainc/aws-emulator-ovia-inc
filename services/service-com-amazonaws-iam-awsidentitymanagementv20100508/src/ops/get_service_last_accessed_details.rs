@@ -355,13 +355,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// One service of the report, as this operation reports it.
 ///
-/// The service's namespace and name come from the catalog of services a report covers; the
-/// access instants do not come from anywhere, because nothing in this emulator records a
-/// principal reaching a service — which is exactly the state the members document for that
-/// case: `LastAuthenticated`, `LastAuthenticatedEntity`, `LastAuthenticatedRegion` and
-/// `TotalAuthenticatedEntities` are "null if no principals attempted to access the service
-/// in the tracking period", and `TrackedActionsLastAccessed` is "null if there no tracked
-/// actions or if the principal did not use the tracked actions within the tracking period".
+/// The service's namespace and name come from the catalog of services a report covers. The
+/// access INSTANTS do not come from anywhere, because nothing in this emulator records a
+/// principal reaching a service — which is exactly the state those members document for that
+/// case: `LastAuthenticated`, `LastAuthenticatedEntity` and `LastAuthenticatedRegion` are
+/// "null if no principals attempted to access the service in the tracking period", and
+/// `TrackedActionsLastAccessed` is "null if there no tracked actions or if the principal did
+/// not use the tracked actions within the tracking period".
+///
+/// `TotalAuthenticatedEntities` is a COUNT rather than an instant — "the total number of
+/// authenticated principals (root user, IAM users, or IAM roles) that have attempted to
+/// access the service" — and recorded AWS reports that count for every service a report
+/// covers, including the ones no principal has reached, where the count is zero. So what is
+/// reported is the number of attempts this account's records hold for the service
+/// (`crate::state::RECORDED_SERVICE_ACCESS_ATTEMPTS`).
 fn reported_entry(service: &crate::state::ReportedService) -> ServiceLastAccessed {
     ServiceLastAccessed {
         service_name: service.service_name.to_string(),
@@ -369,7 +376,7 @@ fn reported_entry(service: &crate::state::ReportedService) -> ServiceLastAccesse
         last_authenticated: None,
         last_authenticated_entity: None,
         last_authenticated_region: None,
-        total_authenticated_entities: None,
+        total_authenticated_entities: Some(crate::state::RECORDED_SERVICE_ACCESS_ATTEMPTS),
         tracked_actions_last_accessed: None,
     }
 }

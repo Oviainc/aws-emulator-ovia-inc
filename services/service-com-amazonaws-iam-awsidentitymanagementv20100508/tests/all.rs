@@ -179,6 +179,8 @@ mod principal_policy_context_keys;
 mod protected_role_refusals;
 #[path = "all/published_managed_policy_reads.rs"]
 mod published_managed_policy_reads;
+#[path = "all/published_policy_families.rs"]
+mod published_policy_families;
 #[path = "all/range_refusal_wording.rs"]
 mod range_refusal_wording;
 #[path = "all/request_condition_context.rs"]

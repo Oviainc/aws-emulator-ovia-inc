@@ -4366,29 +4366,95 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         policy_id: "ANPA_POWERUSERACCESS",
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","NotAction":["iam:*","organizations:*","account:*"],"Resource":"*"},{"Effect":"Allow","Action":["iam:CreateServiceLinkedRole","iam:DeleteServiceLinkedRole","iam:ListRoles","organizations:DescribeOrganization","account:ListRegions","account:GetAccountInformation"],"Resource":"*"}]}"#,
     },
-    // The job-function policy a client most often resolves by name: "ReadOnlyAccess"
-    // grants the read verbs of every service. AWS's own default version enumerates
-    // them service by service and runs far past the managed-policy character quota
-    // ([`MAX_MANAGED_POLICY_CHARACTERS`]), so the document carried here is an
-    // EMULATOR-SCOPED approximation of it — the same read-only grant over the service
-    // namespaces this emulator serves, and a subset of AWS's where a client reasons
-    // about the grants `GetPolicyVersion` serves. The policy's identity — its path,
-    // name, ARN and attachability — is AWS's.
+    // The policy a client most often resolves by name: "ReadOnlyAccess" grants the read
+    // verbs of EVERY service. AWS's own default version enumerates them service by
+    // service and runs far past the character quota a managed policy's document is held
+    // to here ([`MAX_MANAGED_POLICY_CHARACTERS`]), so the document carried for it states
+    // the same grant in the form the IAM action grammar already has for "an action of
+    // every service": the read verb families AWS's document is built out of, each over
+    // the whole namespace position, beside the two policy-simulation actions AWS's names
+    // outside those families. A reader of this document therefore sees the services a
+    // read-only principal can reach as AWS's document puts them in reach — every one —
+    // rather than the handful a hand-written namespace list named. The policy's identity
+    // — its path, name, ARN and attachability — is AWS's.
     AwsManagedPolicy {
         path: "/",
         policy_name: "ReadOnlyAccess",
         policy_id: "ANPA_READONLYACCESS",
-        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudformation:Describe*","cloudformation:Get*","cloudformation:List*","cloudwatch:Describe*","cloudwatch:Get*","cloudwatch:List*","dynamodb:Describe*","dynamodb:Get*","dynamodb:List*","dynamodb:Query","dynamodb:Scan","ec2:Describe*","iam:Get*","iam:List*","iam:SimulateCustomPolicy","iam:SimulatePrincipalPolicy","kms:Describe*","kms:Get*","kms:List*","lambda:Get*","lambda:List*","logs:Describe*","logs:FilterLogEvents","logs:Get*","logs:List*","s3:Describe*","s3:Get*","s3:List*","sns:Get*","sns:List*","sqs:Get*","sqs:List*","sts:GetCallerIdentity"],"Resource":"*"}]}"#,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["*:BatchGet*","*:Describe*","*:Get*","*:List*","*:Lookup*","*:Query*","*:Scan*","*:Search*","*:View*"],"Resource":"*"},{"Effect":"Allow","Action":["iam:SimulateCustomPolicy","iam:SimulatePrincipalPolicy"],"Resource":"*"}]}"#,
     },
     // The policies AWS files under the path it reserves for service-linked roles.
     // Each belongs to the service-linked role it was written for, so every one of
     // them reports `IsAttachable` false ([`AwsManagedPolicy::is_attachable`]) and no
-    // identity can attach it or be bounded by it.
+    // identity can attach it or be bounded by it. A client provisioning a
+    // service-linked role resolves the policy of the service it is provisioning FOR by
+    // listing this family, so the family is carried rather than the one or two entries
+    // a single fixture happens to name.
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AWSBackupServiceLinkedRolePolicyForBackup",
+        policy_id: "ANPA_AWSSERVICEROLE_AWSBACKUPSERVICELINKEDROLEPOLICYFORBACKUP",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["backup:DescribeBackupVault","backup:ListBackupVaults","dynamodb:DescribeTable","ec2:CopySnapshot","ec2:CreateSnapshot","ec2:DeleteSnapshot","ec2:DescribeSnapshots","ec2:DescribeVolumes","elasticfilesystem:DescribeFilesystems","rds:DescribeDBInstances","rds:DescribeDBSnapshots","storagegateway:DescribeCachediSCSIVolumes","tag:GetResources"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AWSConfigServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AWSCONFIGSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudtrail:DescribeTrails","cloudtrail:GetTrailStatus","cloudwatch:DescribeAlarms","config:Put*","dynamodb:DescribeTable","ec2:Describe*","elasticloadbalancing:DescribeLoadBalancers","iam:GetRole","iam:ListRoles","lambda:GetFunction","lambda:ListFunctions","organizations:DescribeOrganization","rds:DescribeDBInstances","s3:GetBucketAcl","s3:GetBucketLocation","s3:ListAllMyBuckets","tag:GetResources"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AWSEC2SpotServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AWSEC2SPOTSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:CreateTags","ec2:DescribeInstances","ec2:DescribeInstanceStatus","ec2:RunInstances","ec2:StartInstances","ec2:StopInstances","ec2:TerminateInstances"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AWSElasticBeanstalkServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AWSELASTICBEANSTALKSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["autoscaling:Describe*","cloudformation:Describe*","cloudformation:Get*","cloudformation:List*","cloudwatch:DescribeAlarms","cloudwatch:PutMetricAlarm","ec2:Describe*","elasticloadbalancing:Describe*","logs:DescribeLogGroups","logs:DescribeLogStreams","s3:GetObject","s3:ListBucket","sns:ListSubscriptionsByTopic","sqs:GetQueueAttributes"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AWSLambdaReplicator",
+        policy_id: "ANPA_AWSSERVICEROLE_AWSLAMBDAREPLICATOR",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["lambda:CreateFunction","lambda:DeleteFunction","lambda:DisableReplication","lambda:EnableReplication","lambda:GetFunction","lambda:UpdateFunctionCode","lambda:UpdateFunctionConfiguration"],"Resource":"arn:aws:lambda:*:*:function:*"},{"Effect":"Allow","Action":["iam:PassRole"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AWSOrganizationsServiceTrustPolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AWSORGANIZATIONSSERVICETRUSTPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["organizations:DescribeAccount","organizations:DescribeOrganization","organizations:DescribeOrganizationalUnit","organizations:ListAccounts","organizations:ListAccountsForParent","organizations:ListChildren","organizations:ListParents","organizations:ListRoots"],"Resource":"*"},{"Effect":"Allow","Action":["iam:DeleteRole"],"Resource":"arn:aws:iam::*:role/aws-service-role/organizations.amazonaws.com/*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AWSSSOServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AWSSSOSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["iam:AttachRolePolicy","iam:CreateRole","iam:CreateSAMLProvider","iam:DeleteRole","iam:DeleteRolePolicy","iam:DeleteSAMLProvider","iam:DetachRolePolicy","iam:GetRole","iam:GetSAMLProvider","iam:ListAttachedRolePolicies","iam:ListRolePolicies","iam:PutRolePolicy","iam:UpdateSAMLProvider","organizations:DescribeAccount","organizations:DescribeOrganization","organizations:ListAccounts"],"Resource":"*"}]}"#,
+    },
     AwsManagedPolicy {
         path: "/aws-service-role/",
         policy_name: "AWSSupportServiceRolePolicy",
         policy_id: "ANPA_AWSSERVICEROLE_AWSSUPPORTSERVICEROLEPOLICY",
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["support:*","trustedadvisor:Describe*","trustedadvisor:Get*","trustedadvisor:List*","cloudformation:DescribeStacks","cloudwatch:DescribeAlarms","ec2:DescribeInstances","iam:GetRole","iam:ListRoles","s3:ListAllMyBuckets"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AWSTrustedAdvisorServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AWSTRUSTEDADVISORSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["autoscaling:Describe*","cloudformation:DescribeStacks","cloudtrail:DescribeTrails","cloudwatch:GetMetricStatistics","ec2:Describe*","elasticloadbalancing:Describe*","iam:GenerateCredentialReport","iam:GetAccountSummary","iam:ListAccessKeys","kms:DescribeKey","rds:DescribeDBInstances","route53:ListHostedZones","s3:GetBucketAcl","s3:GetBucketPolicy","s3:ListAllMyBuckets","trustedadvisor:Describe*"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AWSVPCTransitGatewayServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AWSVPCTRANSITGATEWAYSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:CreateNetworkInterface","ec2:DeleteNetworkInterface","ec2:DescribeNetworkInterfaces","ec2:DescribeSubnets","ec2:DescribeVpcs","ec2:ModifyNetworkInterfaceAttribute"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AmazonECSServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AMAZONECSSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:AttachNetworkInterface","ec2:CreateNetworkInterface","ec2:DeleteNetworkInterface","ec2:DescribeInstances","ec2:DescribeNetworkInterfaces","ec2:DescribeSubnets","ec2:DescribeVpcs","ec2:DetachNetworkInterface","elasticloadbalancing:DeregisterTargets","elasticloadbalancing:DescribeTargetGroups","elasticloadbalancing:RegisterTargets","logs:CreateLogStream","logs:PutLogEvents","route53:ChangeResourceRecordSets","route53:ListHostedZonesByName"],"Resource":"*"}]}"#,
     },
     AwsManagedPolicy {
         path: "/aws-service-role/",
@@ -4398,9 +4464,150 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
     },
     AwsManagedPolicy {
         path: "/aws-service-role/",
+        policy_name: "AmazonElasticFileSystemServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AMAZONELASTICFILESYSTEMSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["backup:DescribeBackupVault","ec2:CreateNetworkInterface","ec2:DeleteNetworkInterface","ec2:DescribeNetworkInterfaceAttribute","ec2:DescribeNetworkInterfaces","ec2:DescribeSecurityGroups","ec2:DescribeSubnets","ec2:ModifyNetworkInterfaceAttribute","tag:GetResources"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AmazonElasticsearchServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AMAZONELASTICSEARCHSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:CreateNetworkInterface","ec2:DeleteNetworkInterface","ec2:DescribeNetworkInterfaces","ec2:DescribeSecurityGroups","ec2:DescribeSubnets","ec2:DescribeVpcs","ec2:ModifyNetworkInterfaceAttribute","elasticloadbalancing:DescribeLoadBalancers"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AmazonGuardDutyServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AMAZONGUARDDUTYSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudtrail:DescribeTrails","cloudtrail:GetTrailStatus","ec2:DescribeInstances","ec2:DescribeNetworkInterfaces","ec2:DescribeSecurityGroups","ec2:DescribeSubnets","ec2:DescribeVpcs","iam:ListAccountAliases","organizations:DescribeAccount","organizations:DescribeOrganization","organizations:ListAccounts","s3:GetBucketPublicAccessBlock","s3:GetEncryptionConfiguration"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AmazonInspectorServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AMAZONINSPECTORSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["directconnect:DescribeConnections","directconnect:DescribeVirtualGateways","ec2:DescribeInstances","ec2:DescribeNetworkAcls","ec2:DescribeNetworkInterfaces","ec2:DescribeRouteTables","ec2:DescribeSecurityGroups","ec2:DescribeSubnets","ec2:DescribeTags","ec2:DescribeVpcs","elasticloadbalancing:DescribeLoadBalancers","elasticloadbalancing:DescribeTags"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AmazonMacieServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AMAZONMACIESERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudtrail:DescribeTrails","cloudtrail:GetTrailStatus","organizations:DescribeAccount","organizations:DescribeOrganization","s3:GetBucketAcl","s3:GetBucketLocation","s3:GetBucketPolicy","s3:GetBucketPublicAccessBlock","s3:GetEncryptionConfiguration","s3:GetObject","s3:ListAllMyBuckets","s3:ListBucket"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AmazonRDSServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AMAZONRDSSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudwatch:PutMetricData","ec2:CreateNetworkInterface","ec2:DeleteNetworkInterface","ec2:DescribeNetworkInterfaces","ec2:DescribeSecurityGroups","ec2:DescribeSubnets","ec2:DescribeVpcs","logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents","logs:PutRetentionPolicy","sns:Publish"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AmazonRedshiftServiceLinkedRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AMAZONREDSHIFTSERVICELINKEDROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:AssignIpv6Addresses","ec2:AssignPrivateIpAddresses","ec2:CreateNetworkInterface","ec2:DeleteNetworkInterface","ec2:DescribeAddresses","ec2:DescribeNetworkInterfaces","ec2:DescribeSecurityGroups","ec2:DescribeSubnets","ec2:DescribeVpcs","ec2:ModifyNetworkInterfaceAttribute","ec2:UnassignIpv6Addresses","ec2:UnassignPrivateIpAddresses"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AmazonSSMServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AMAZONSSMSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudformation:DescribeStacks","ec2:DescribeInstances","ec2:DescribeInstanceStatus","resource-groups:GetGroup","resource-groups:ListGroupResources","ssm:DescribeInstanceInformation","ssm:GetAutomationExecution","ssm:ListCommands","ssm:SendCommand","ssm:StartAutomationExecution","states:DescribeExecution","tag:GetResources"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AutoScalingServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AUTOSCALINGSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudwatch:DeleteAlarms","cloudwatch:DescribeAlarms","cloudwatch:PutMetricAlarm","ec2:AttachClassicLinkVpc","ec2:CreateTags","ec2:DescribeInstances","ec2:DescribeInstanceStatus","ec2:DescribeSubnets","ec2:RunInstances","ec2:TerminateInstances","elasticloadbalancing:DeregisterTargets","elasticloadbalancing:RegisterTargets"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "ConfigConformsServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_CONFIGCONFORMSSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudformation:CreateStack","cloudformation:DeleteStack","cloudformation:DescribeStackEvents","cloudformation:DescribeStacks","config:DescribeConfigRules","config:PutConfigRule","config:DeleteConfigRule","s3:GetObject","s3:ListBucket"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "DynamoDBReplicationServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_DYNAMODBREPLICATIONSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["dynamodb:DeleteItem","dynamodb:DescribeTable","dynamodb:GetItem","dynamodb:PutItem","dynamodb:Query","dynamodb:Scan","dynamodb:UpdateItem","dynamodb:DescribeStream","dynamodb:GetRecords","dynamodb:GetShardIterator","dynamodb:ListStreams"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
         policy_name: "ElasticLoadBalancingServiceRolePolicy",
         policy_id: "ANPA_AWSSERVICEROLE_ELASTICLOADBALANCINGSERVICEROLEPOLICY",
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:AssignIpv6Addresses","ec2:AssignPrivateIpAddresses","ec2:CreateNetworkInterface","ec2:DeleteNetworkInterface","ec2:DescribeAddresses","ec2:DescribeInstances","ec2:DescribeInternetGateways","ec2:DescribeNetworkInterfaces","ec2:DescribeSecurityGroups","ec2:DescribeSubnets","ec2:DescribeVpcs","ec2:ModifyNetworkInterfaceAttribute","ec2:UnassignIpv6Addresses","ec2:UnassignPrivateIpAddresses","logs:CreateLogDelivery","logs:DeleteLogDelivery","logs:GetLogDelivery","logs:ListLogDeliveries","logs:UpdateLogDelivery"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "LakeFormationDataAccessServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_LAKEFORMATIONDATAACCESSSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["glue:GetDatabase","glue:GetDatabases","glue:GetPartitions","glue:GetTable","glue:GetTables","s3:GetBucketLocation","s3:GetObject","s3:ListBucket"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "WAFRegionalLoggingServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_WAFREGIONALLOGGINGSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["firehose:DescribeDeliveryStream","firehose:PutRecord","firehose:PutRecordBatch"],"Resource":"arn:aws:firehose:*:*:deliverystream/aws-waf-logs-*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "WAFV2LoggingServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_WAFV2LOGGINGSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["firehose:DescribeDeliveryStream","firehose:PutRecord","firehose:PutRecordBatch"],"Resource":"arn:aws:firehose:*:*:deliverystream/aws-waf-logs-*"}]}"#,
+    },
+    // The policies AWS files under the path it reserves for JOB FUNCTIONS — the family
+    // a client provisioning a human role attaches, resolved by listing the catalog
+    // under that path. They are published to be attached, so each reports
+    // `IsAttachable` true like every other policy outside the service-linked-role path.
+    //
+    // AWS publishes the family as a whole, and this is all of it: one entry per job
+    // function the AWS Managed Policy Reference files under `/job-function/`. Each
+    // document states the grant that job function is published with, stated inside the
+    // character quota a carried document is held to
+    // ([`MAX_MANAGED_POLICY_CHARACTERS`]) — the services and verb families AWS's own
+    // default version names, rather than its full per-action enumeration.
+    AwsManagedPolicy {
+        path: "/job-function/",
+        policy_name: "Billing",
+        policy_id: "ANPA_JOBFUNCTION_BILLING",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["account:GetAccountInformation","aws-portal:*","billing:*","budgets:*","ce:*","consolidatedbilling:*","cur:*","freetier:*","invoicing:*","payments:*","pricing:*","purchase-orders:*","savingsplans:Describe*","tax:*"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/job-function/",
+        policy_name: "DataScientist",
+        policy_id: "ANPA_JOBFUNCTION_DATASCIENTIST",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["athena:*","cloudwatch:GetMetricData","cloudwatch:GetMetricStatistics","datapipeline:Describe*","datapipeline:GetPipelineDefinition","dynamodb:Describe*","dynamodb:List*","ec2:Describe*","elasticmapreduce:*","glue:Get*","glue:List*","iam:GetRole","iam:ListRoles","kinesis:Describe*","kinesis:List*","kms:ListAliases","lambda:ListFunctions","logs:Describe*","logs:Get*","machinelearning:*","rds:Describe*","redshift:Describe*","s3:Get*","s3:List*","sagemaker:*","sdb:*","sns:ListSubscriptions","sns:ListTopics","sqs:ListQueues","tag:GetResources"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/job-function/",
+        policy_name: "DatabaseAdministrator",
+        policy_id: "ANPA_JOBFUNCTION_DATABASEADMINISTRATOR",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudwatch:Describe*","cloudwatch:Get*","cloudwatch:List*","cloudwatch:PutMetricAlarm","datapipeline:*","dax:*","dynamodb:*","ec2:DescribeAccountAttributes","ec2:DescribeAvailabilityZones","ec2:DescribeSecurityGroups","ec2:DescribeSubnets","ec2:DescribeVpcs","elasticache:*","iam:GetRole","iam:ListRoles","kms:ListAliases","logs:Describe*","logs:Get*","rds:*","redshift:*","s3:GetBucketLocation","s3:ListAllMyBuckets","sns:ListSubscriptions","sns:ListTopics","sqs:ListQueues"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/job-function/",
+        policy_name: "NetworkAdministrator",
+        policy_id: "ANPA_JOBFUNCTION_NETWORKADMINISTRATOR",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["autoscaling:Describe*","cloudfront:ListDistributions","cloudwatch:DeleteAlarms","cloudwatch:DescribeAlarms","cloudwatch:GetMetricStatistics","cloudwatch:PutMetricAlarm","directconnect:*","ec2:AllocateAddress","ec2:AssociateAddress","ec2:AttachInternetGateway","ec2:AttachVpnGateway","ec2:AuthorizeSecurityGroupEgress","ec2:AuthorizeSecurityGroupIngress","ec2:CreateSecurityGroup","ec2:Describe*","elasticbeanstalk:Describe*","elasticloadbalancing:*","logs:Describe*","logs:Get*","route53:*","route53domains:*","sns:ListSubscriptions","sns:ListTopics"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/job-function/",
+        policy_name: "SupportUser",
+        policy_id: "ANPA_JOBFUNCTION_SUPPORTUSER",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["acm:Describe*","acm:Get*","acm:List*","autoscaling:Describe*","cloudformation:Describe*","cloudformation:List*","cloudwatch:Describe*","cloudwatch:Get*","cloudwatch:List*","ec2:Describe*","ecs:Describe*","ecs:List*","iam:Get*","iam:List*","logs:Describe*","logs:Get*","rds:Describe*","s3:Get*","s3:List*","support:*","trustedadvisor:Describe*"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/job-function/",
+        policy_name: "SystemAdministrator",
+        policy_id: "ANPA_JOBFUNCTION_SYSTEMADMINISTRATOR",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["autoscaling:*","cloudtrail:Describe*","cloudtrail:Get*","cloudtrail:List*","cloudwatch:*","ec2:*","ecs:*","elasticloadbalancing:*","events:*","iam:GetRole","iam:ListRoles","iam:PassRole","kms:ListAliases","logs:*","rds:Describe*","route53:Get*","route53:List*","s3:Get*","s3:List*","sns:*","ssm:*"],"Resource":"*"}]}"#,
+    },
+    // "This policy grants permissions to view resources and basic metadata across all
+    // Amazon Web Services services": the same whole-catalog reach as `ReadOnlyAccess`
+    // above, narrowed to the listing and describing verbs, which is what separates the
+    // two policies.
+    AwsManagedPolicy {
+        path: "/job-function/",
+        policy_name: "ViewOnlyAccess",
+        policy_id: "ANPA_JOBFUNCTION_VIEWONLYACCESS",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["*:Describe*","*:List*","*:View*"],"Resource":"*"},{"Effect":"Allow","Action":["s3:GetBucketLocation","s3:GetAccountPublicAccessBlock","tag:GetResources"],"Resource":"*"}]}"#,
     },
     AwsManagedPolicy {
         path: "/service-role/",
@@ -4957,6 +5164,18 @@ pub struct ReportedService {
     pub service_name: &'static str,
 }
 
+impl ReportedService {
+    /// One catalog row: the service's published prefix, and the name it is published
+    /// under. A constructor rather than a struct literal because the catalog is long
+    /// enough that the field names would hide the data.
+    const fn new(service_namespace: &'static str, service_name: &'static str) -> Self {
+        Self {
+            service_namespace,
+            service_name,
+        }
+    }
+}
+
 /// The services a service-last-accessed report reports on, ascending by namespace.
 ///
 /// SOURCE: the Service Authorization Reference ("Actions, resources, and condition keys for
@@ -4966,84 +5185,295 @@ pub struct ReportedService {
 /// each row is one service of that reference: its prefix, and the name it is published
 /// under.
 ///
-/// A SUBSET of it, and that is what the report covers: IAM reports last accessed data only
-/// for the services that report activity to it ("for more information about services and
-/// actions for which action last accessed information is displayed, see IAM action last
-/// accessed information services and actions", `GenerateServiceLastAccessedDetails`), so a
-/// namespace outside this catalog is a service no entry is reported for rather than one
-/// reported without a name. The rows are every namespace this emulator's own catalog of
-/// AWS-managed policies ([`AWS_MANAGED_POLICIES`]) grants actions under, plus the services
-/// a client's own policies are most likely to name.
+/// The reference's own breadth, not a shortlist: a last-accessed report is what a
+/// least-privilege review is built on, so the services it enumerates have to be the
+/// services an account's principals can actually be granted — every one a permissions
+/// policy can name an action of — and a report short of them reads as a principal that
+/// reaches a handful of services. A namespace this catalog does not carry is a service no
+/// entry is reported for rather than one reported without a name.
 ///
 /// Ascending by namespace, because "by default, the list is sorted by service namespace"
-/// (`GetServiceLastAccessedDetails`), so the catalog's own order IS the reported order.
+/// (`GetServiceLastAccessedDetails`), so the catalog's own order IS the reported order,
+/// and a report of it runs past one page of the default `MaxItems`
+/// ([`DEFAULT_MAX_ITEMS`]) — which is why the reads of it page.
 pub const REPORTED_SERVICES: &[ReportedService] = &[
-    ReportedService { service_namespace: "account", service_name: "AWS Account Management" },
-    ReportedService { service_namespace: "acm", service_name: "AWS Certificate Manager" },
-    ReportedService { service_namespace: "apigateway", service_name: "Amazon API Gateway" },
-    ReportedService { service_namespace: "athena", service_name: "Amazon Athena" },
-    ReportedService { service_namespace: "autoscaling", service_name: "Amazon EC2 Auto Scaling" },
-    ReportedService { service_namespace: "backup", service_name: "AWS Backup" },
-    ReportedService { service_namespace: "batch", service_name: "AWS Batch" },
-    ReportedService { service_namespace: "bedrock", service_name: "Amazon Bedrock" },
-    ReportedService { service_namespace: "cassandra", service_name: "Amazon Keyspaces" },
-    ReportedService { service_namespace: "cloudformation", service_name: "AWS CloudFormation" },
-    ReportedService { service_namespace: "cloudfront", service_name: "Amazon CloudFront" },
-    ReportedService { service_namespace: "cloudtrail", service_name: "AWS CloudTrail" },
-    ReportedService { service_namespace: "cloudwatch", service_name: "Amazon CloudWatch" },
-    ReportedService { service_namespace: "codebuild", service_name: "AWS CodeBuild" },
-    ReportedService { service_namespace: "codecommit", service_name: "AWS CodeCommit" },
-    ReportedService { service_namespace: "codepipeline", service_name: "AWS CodePipeline" },
-    ReportedService { service_namespace: "config", service_name: "AWS Config" },
-    ReportedService { service_namespace: "dynamodb", service_name: "Amazon DynamoDB" },
-    ReportedService { service_namespace: "ec2", service_name: "Amazon Elastic Compute Cloud" },
-    ReportedService { service_namespace: "ecr", service_name: "Amazon Elastic Container Registry" },
-    ReportedService { service_namespace: "ecs", service_name: "Amazon Elastic Container Service" },
-    ReportedService { service_namespace: "eks", service_name: "Amazon Elastic Kubernetes Service" },
-    ReportedService { service_namespace: "elasticache", service_name: "Amazon ElastiCache" },
-    ReportedService {
-        service_namespace: "elasticbeanstalk",
-        service_name: "AWS Elastic Beanstalk",
-    },
-    ReportedService {
-        service_namespace: "elasticfilesystem",
-        service_name: "Amazon Elastic File System",
-    },
-    ReportedService {
-        service_namespace: "elasticloadbalancing",
-        service_name: "Elastic Load Balancing",
-    },
-    ReportedService { service_namespace: "events", service_name: "Amazon EventBridge" },
-    ReportedService { service_namespace: "firehose", service_name: "Amazon Data Firehose" },
-    ReportedService { service_namespace: "glue", service_name: "AWS Glue" },
-    ReportedService { service_namespace: "iam", service_name: "AWS Identity and Access Management" },
-    ReportedService { service_namespace: "kinesis", service_name: "Amazon Kinesis" },
-    ReportedService { service_namespace: "kms", service_name: "AWS Key Management Service" },
-    ReportedService { service_namespace: "lakeformation", service_name: "AWS Lake Formation" },
-    ReportedService { service_namespace: "lambda", service_name: "AWS Lambda" },
-    ReportedService { service_namespace: "logs", service_name: "Amazon CloudWatch Logs" },
-    ReportedService { service_namespace: "organizations", service_name: "AWS Organizations" },
-    ReportedService { service_namespace: "rds", service_name: "Amazon Relational Database Service" },
-    ReportedService { service_namespace: "redshift", service_name: "Amazon Redshift" },
-    ReportedService { service_namespace: "route53", service_name: "Amazon Route 53" },
-    ReportedService { service_namespace: "s3", service_name: "Amazon Simple Storage Service" },
-    ReportedService {
-        service_namespace: "s3-object-lambda",
-        service_name: "Amazon S3 Object Lambda",
-    },
-    ReportedService { service_namespace: "sagemaker", service_name: "Amazon SageMaker" },
-    ReportedService { service_namespace: "secretsmanager", service_name: "AWS Secrets Manager" },
-    ReportedService { service_namespace: "ses", service_name: "Amazon Simple Email Service" },
-    ReportedService { service_namespace: "sns", service_name: "Amazon Simple Notification Service" },
-    ReportedService { service_namespace: "sqs", service_name: "Amazon Simple Queue Service" },
-    ReportedService { service_namespace: "ssm", service_name: "AWS Systems Manager" },
-    ReportedService { service_namespace: "states", service_name: "AWS Step Functions" },
-    ReportedService { service_namespace: "sts", service_name: "AWS Security Token Service" },
-    ReportedService { service_namespace: "support", service_name: "AWS Support" },
-    ReportedService { service_namespace: "swf", service_name: "Amazon Simple Workflow Service" },
-    ReportedService { service_namespace: "trustedadvisor", service_name: "AWS Trusted Advisor" },
-    ReportedService { service_namespace: "xray", service_name: "AWS X-Ray" },
+    ReportedService::new("a4b", "Alexa for Business"),
+    ReportedService::new("access-analyzer", "AWS IAM Access Analyzer"),
+    ReportedService::new("account", "AWS Account Management"),
+    ReportedService::new("acm", "AWS Certificate Manager"),
+    ReportedService::new("acm-pca", "AWS Private Certificate Authority"),
+    ReportedService::new("airflow", "Amazon Managed Workflows for Apache Airflow"),
+    ReportedService::new("amplify", "AWS Amplify"),
+    ReportedService::new("amplifybackend", "AWS Amplify Admin"),
+    ReportedService::new("amplifyuibuilder", "AWS Amplify UI Builder"),
+    ReportedService::new("apigateway", "Amazon API Gateway"),
+    ReportedService::new("appconfig", "AWS AppConfig"),
+    ReportedService::new("appflow", "Amazon AppFlow"),
+    ReportedService::new("appintegrations", "Amazon AppIntegrations"),
+    ReportedService::new("application-autoscaling", "Application Auto Scaling"),
+    ReportedService::new("application-cost-profiler", "AWS Application Cost Profiler Service"),
+    ReportedService::new("applicationinsights", "CloudWatch Application Insights"),
+    ReportedService::new("appmesh", "AWS App Mesh"),
+    ReportedService::new("apprunner", "AWS App Runner"),
+    ReportedService::new("appstream", "Amazon AppStream 2.0"),
+    ReportedService::new("appsync", "AWS AppSync"),
+    ReportedService::new("aps", "Amazon Managed Service for Prometheus"),
+    ReportedService::new("arsenal", "Application Discovery Arsenal"),
+    ReportedService::new("artifact", "AWS Artifact"),
+    ReportedService::new("athena", "Amazon Athena"),
+    ReportedService::new("auditmanager", "AWS Audit Manager"),
+    ReportedService::new("autoscaling", "Amazon EC2 Auto Scaling"),
+    ReportedService::new("autoscaling-plans", "AWS Auto Scaling"),
+    ReportedService::new("backup", "AWS Backup"),
+    ReportedService::new("backup-gateway", "AWS Backup Gateway"),
+    ReportedService::new("batch", "AWS Batch"),
+    ReportedService::new("bedrock", "Amazon Bedrock"),
+    ReportedService::new("billing", "AWS Billing"),
+    ReportedService::new("billingconductor", "AWS Billing Conductor"),
+    ReportedService::new("braket", "Amazon Braket"),
+    ReportedService::new("budgets", "AWS Budget Service"),
+    ReportedService::new("cases", "Amazon Connect Cases"),
+    ReportedService::new("cassandra", "Amazon Keyspaces"),
+    ReportedService::new("ce", "AWS Cost Explorer Service"),
+    ReportedService::new("chatbot", "AWS Chatbot"),
+    ReportedService::new("chime", "Amazon Chime"),
+    ReportedService::new("cleanrooms", "AWS Clean Rooms"),
+    ReportedService::new("cloud9", "AWS Cloud9"),
+    ReportedService::new("clouddirectory", "Amazon Cloud Directory"),
+    ReportedService::new("cloudformation", "AWS CloudFormation"),
+    ReportedService::new("cloudfront", "Amazon CloudFront"),
+    ReportedService::new("cloudhsm", "AWS CloudHSM"),
+    ReportedService::new("cloudsearch", "Amazon CloudSearch"),
+    ReportedService::new("cloudshell", "AWS CloudShell"),
+    ReportedService::new("cloudtrail", "AWS CloudTrail"),
+    ReportedService::new("cloudwatch", "Amazon CloudWatch"),
+    ReportedService::new("codeartifact", "AWS CodeArtifact"),
+    ReportedService::new("codebuild", "AWS CodeBuild"),
+    ReportedService::new("codecommit", "AWS CodeCommit"),
+    ReportedService::new("codedeploy", "AWS CodeDeploy"),
+    ReportedService::new("codeguru-profiler", "Amazon CodeGuru Profiler"),
+    ReportedService::new("codeguru-reviewer", "Amazon CodeGuru Reviewer"),
+    ReportedService::new("codepipeline", "AWS CodePipeline"),
+    ReportedService::new("codestar-connections", "AWS CodeStar Connections"),
+    ReportedService::new("codestar-notifications", "AWS CodeStar Notifications"),
+    ReportedService::new("cognito-identity", "Amazon Cognito Identity"),
+    ReportedService::new("cognito-idp", "Amazon Cognito User Pools"),
+    ReportedService::new("cognito-sync", "Amazon Cognito Sync"),
+    ReportedService::new("comprehend", "Amazon Comprehend"),
+    ReportedService::new("comprehendmedical", "Amazon Comprehend Medical"),
+    ReportedService::new("compute-optimizer", "AWS Compute Optimizer"),
+    ReportedService::new("config", "AWS Config"),
+    ReportedService::new("connect", "Amazon Connect"),
+    ReportedService::new("controltower", "AWS Control Tower"),
+    ReportedService::new("cur", "AWS Cost and Usage Report"),
+    ReportedService::new("databrew", "AWS Glue DataBrew"),
+    ReportedService::new("dataexchange", "AWS Data Exchange"),
+    ReportedService::new("datapipeline", "AWS Data Pipeline"),
+    ReportedService::new("datasync", "AWS DataSync"),
+    ReportedService::new("dax", "Amazon DynamoDB Accelerator (DAX)"),
+    ReportedService::new("detective", "Amazon Detective"),
+    ReportedService::new("devicefarm", "AWS Device Farm"),
+    ReportedService::new("devops-guru", "Amazon DevOps Guru"),
+    ReportedService::new("directconnect", "AWS Direct Connect"),
+    ReportedService::new("discovery", "AWS Application Discovery Service"),
+    ReportedService::new("dlm", "Amazon Data Lifecycle Manager"),
+    ReportedService::new("dms", "AWS Database Migration Service"),
+    ReportedService::new("drs", "AWS Elastic Disaster Recovery"),
+    ReportedService::new("ds", "AWS Directory Service"),
+    ReportedService::new("dynamodb", "Amazon DynamoDB"),
+    ReportedService::new("ebs", "Amazon Elastic Block Store"),
+    ReportedService::new("ec2", "Amazon Elastic Compute Cloud"),
+    ReportedService::new("ec2-instance-connect", "Amazon EC2 Instance Connect"),
+    ReportedService::new("ec2messages", "Amazon Message Delivery Service"),
+    ReportedService::new("ecr", "Amazon Elastic Container Registry"),
+    ReportedService::new("ecr-public", "Amazon Elastic Container Registry Public"),
+    ReportedService::new("ecs", "Amazon Elastic Container Service"),
+    ReportedService::new("eks", "Amazon Elastic Kubernetes Service"),
+    ReportedService::new("elasticache", "Amazon ElastiCache"),
+    ReportedService::new("elasticbeanstalk", "AWS Elastic Beanstalk"),
+    ReportedService::new("elasticfilesystem", "Amazon Elastic File System"),
+    ReportedService::new("elasticloadbalancing", "Elastic Load Balancing"),
+    ReportedService::new("elasticmapreduce", "Amazon EMR"),
+    ReportedService::new("elastictranscoder", "Amazon Elastic Transcoder"),
+    ReportedService::new("emr-containers", "Amazon EMR on EKS"),
+    ReportedService::new("emr-serverless", "Amazon EMR Serverless"),
+    ReportedService::new("es", "Amazon OpenSearch Service"),
+    ReportedService::new("events", "Amazon EventBridge"),
+    ReportedService::new("evidently", "Amazon CloudWatch Evidently"),
+    ReportedService::new("execute-api", "Amazon API Gateway"),
+    ReportedService::new("firehose", "Amazon Data Firehose"),
+    ReportedService::new("fis", "AWS Fault Injection Simulator"),
+    ReportedService::new("fms", "AWS Firewall Manager"),
+    ReportedService::new("forecast", "Amazon Forecast"),
+    ReportedService::new("frauddetector", "Amazon Fraud Detector"),
+    ReportedService::new("fsx", "Amazon FSx"),
+    ReportedService::new("gamelift", "Amazon GameLift"),
+    ReportedService::new("geo", "Amazon Location Service"),
+    ReportedService::new("glacier", "Amazon S3 Glacier"),
+    ReportedService::new("globalaccelerator", "AWS Global Accelerator"),
+    ReportedService::new("glue", "AWS Glue"),
+    ReportedService::new("grafana", "Amazon Managed Grafana"),
+    ReportedService::new("greengrass", "AWS IoT Greengrass"),
+    ReportedService::new("groundstation", "AWS Ground Station"),
+    ReportedService::new("guardduty", "Amazon GuardDuty"),
+    ReportedService::new("health", "AWS Health APIs and Notifications"),
+    ReportedService::new("healthlake", "AWS HealthLake"),
+    ReportedService::new("iam", "AWS Identity and Access Management"),
+    ReportedService::new("identitystore", "AWS Identity Store"),
+    ReportedService::new("imagebuilder", "EC2 Image Builder"),
+    ReportedService::new("inspector", "Amazon Inspector"),
+    ReportedService::new("inspector2", "Amazon Inspector2"),
+    ReportedService::new("internetmonitor", "Amazon CloudWatch Internet Monitor"),
+    ReportedService::new("iot", "AWS IoT"),
+    ReportedService::new("iotanalytics", "AWS IoT Analytics"),
+    ReportedService::new("iotdeviceadvisor", "AWS IoT Core Device Advisor"),
+    ReportedService::new("iotevents", "AWS IoT Events"),
+    ReportedService::new("iotfleethub", "AWS IoT Fleet Hub for Device Management"),
+    ReportedService::new("iotfleetwise", "AWS IoT FleetWise"),
+    ReportedService::new("iotsitewise", "AWS IoT SiteWise"),
+    ReportedService::new("iottwinmaker", "AWS IoT TwinMaker"),
+    ReportedService::new("iotwireless", "AWS IoT Core for LoRaWAN"),
+    ReportedService::new("ivs", "Amazon Interactive Video Service"),
+    ReportedService::new("kafka", "Amazon Managed Streaming for Apache Kafka"),
+    ReportedService::new("kafkaconnect", "Amazon Managed Streaming for Kafka Connect"),
+    ReportedService::new("kendra", "Amazon Kendra"),
+    ReportedService::new("kinesis", "Amazon Kinesis"),
+    ReportedService::new("kinesisanalytics", "Amazon Kinesis Analytics"),
+    ReportedService::new("kinesisvideo", "Amazon Kinesis Video Streams"),
+    ReportedService::new("kms", "AWS Key Management Service"),
+    ReportedService::new("lakeformation", "AWS Lake Formation"),
+    ReportedService::new("lambda", "AWS Lambda"),
+    ReportedService::new("launchwizard", "AWS Launch Wizard"),
+    ReportedService::new("lex", "Amazon Lex"),
+    ReportedService::new("license-manager", "AWS License Manager"),
+    ReportedService::new("lightsail", "Amazon Lightsail"),
+    ReportedService::new("logs", "Amazon CloudWatch Logs"),
+    ReportedService::new("lookoutequipment", "Amazon Lookout for Equipment"),
+    ReportedService::new("lookoutmetrics", "Amazon Lookout for Metrics"),
+    ReportedService::new("lookoutvision", "Amazon Lookout for Vision"),
+    ReportedService::new("m2", "AWS Mainframe Modernization Service"),
+    ReportedService::new("machinelearning", "Amazon Machine Learning"),
+    ReportedService::new("macie2", "Amazon Macie"),
+    ReportedService::new("managedblockchain", "Amazon Managed Blockchain"),
+    ReportedService::new("mediaconnect", "AWS Elemental MediaConnect"),
+    ReportedService::new("mediaconvert", "AWS Elemental MediaConvert"),
+    ReportedService::new("medialive", "AWS Elemental MediaLive"),
+    ReportedService::new("mediapackage", "AWS Elemental MediaPackage"),
+    ReportedService::new("mediapackage-vod", "AWS Elemental MediaPackage VOD"),
+    ReportedService::new("mediastore", "AWS Elemental MediaStore"),
+    ReportedService::new("mediatailor", "AWS Elemental MediaTailor"),
+    ReportedService::new("memorydb", "Amazon MemoryDB"),
+    ReportedService::new("mgh", "AWS Migration Hub"),
+    ReportedService::new("mgn", "AWS Application Migration Service"),
+    ReportedService::new("mobiletargeting", "Amazon Pinpoint"),
+    ReportedService::new("monitron", "Amazon Monitron"),
+    ReportedService::new("mq", "Amazon MQ"),
+    ReportedService::new("neptune-db", "Amazon Neptune"),
+    ReportedService::new("network-firewall", "AWS Network Firewall"),
+    ReportedService::new("networkmanager", "AWS Network Manager"),
+    ReportedService::new("nimble", "Amazon Nimble Studio"),
+    ReportedService::new("oam", "Amazon CloudWatch Observability Access Manager"),
+    ReportedService::new("omics", "Amazon Omics"),
+    ReportedService::new("opsworks", "AWS OpsWorks"),
+    ReportedService::new("organizations", "AWS Organizations"),
+    ReportedService::new("osis", "Amazon OpenSearch Ingestion"),
+    ReportedService::new("outposts", "AWS Outposts"),
+    ReportedService::new("panorama", "AWS Panorama"),
+    ReportedService::new("personalize", "Amazon Personalize"),
+    ReportedService::new("pi", "AWS Performance Insights"),
+    ReportedService::new("pipes", "Amazon EventBridge Pipes"),
+    ReportedService::new("polly", "Amazon Polly"),
+    ReportedService::new("pricing", "AWS Price List"),
+    ReportedService::new("profile", "Amazon Connect Customer Profiles"),
+    ReportedService::new("proton", "AWS Proton"),
+    ReportedService::new("qldb", "Amazon QLDB"),
+    ReportedService::new("quicksight", "Amazon QuickSight"),
+    ReportedService::new("ram", "AWS Resource Access Manager"),
+    ReportedService::new("rbin", "Amazon Recycle Bin"),
+    ReportedService::new("rds", "Amazon Relational Database Service"),
+    ReportedService::new("rds-data", "Amazon RDS Data API"),
+    ReportedService::new("redshift", "Amazon Redshift"),
+    ReportedService::new("redshift-data", "Amazon Redshift Data API"),
+    ReportedService::new("redshift-serverless", "Amazon Redshift Serverless"),
+    ReportedService::new("rekognition", "Amazon Rekognition"),
+    ReportedService::new("resiliencehub", "AWS Resilience Hub"),
+    ReportedService::new("resource-explorer-2", "AWS Resource Explorer"),
+    ReportedService::new("resource-groups", "AWS Resource Groups"),
+    ReportedService::new("robomaker", "AWS RoboMaker"),
+    ReportedService::new("route53", "Amazon Route 53"),
+    ReportedService::new("route53-recovery-control-config", "Amazon Route 53 Recovery Controls"),
+    ReportedService::new("route53domains", "Amazon Route 53 Domains"),
+    ReportedService::new("route53resolver", "Amazon Route 53 Resolver"),
+    ReportedService::new("rum", "Amazon CloudWatch RUM"),
+    ReportedService::new("s3", "Amazon Simple Storage Service"),
+    ReportedService::new("s3-object-lambda", "Amazon S3 Object Lambda"),
+    ReportedService::new("s3express", "Amazon S3 Express"),
+    ReportedService::new("s3outposts", "Amazon S3 on Outposts"),
+    ReportedService::new("sagemaker", "Amazon SageMaker"),
+    ReportedService::new("savingsplans", "AWS Savings Plans"),
+    ReportedService::new("scheduler", "Amazon EventBridge Scheduler"),
+    ReportedService::new("schemas", "Amazon EventBridge Schemas"),
+    ReportedService::new("sdb", "Amazon SimpleDB"),
+    ReportedService::new("secretsmanager", "AWS Secrets Manager"),
+    ReportedService::new("securityhub", "AWS Security Hub"),
+    ReportedService::new("serverlessrepo", "AWS Serverless Application Repository"),
+    ReportedService::new("servicecatalog", "AWS Service Catalog"),
+    ReportedService::new("servicediscovery", "AWS Cloud Map"),
+    ReportedService::new("servicequotas", "Service Quotas"),
+    ReportedService::new("ses", "Amazon Simple Email Service"),
+    ReportedService::new("shield", "AWS Shield"),
+    ReportedService::new("signer", "AWS Signer"),
+    ReportedService::new("simspaceweaver", "AWS SimSpace Weaver"),
+    ReportedService::new("sms", "AWS Server Migration Service"),
+    ReportedService::new("sms-voice", "Amazon Pinpoint SMS and Voice Service"),
+    ReportedService::new("snow-device-management", "AWS Snow Device Management"),
+    ReportedService::new("snowball", "AWS Snowball"),
+    ReportedService::new("sns", "Amazon Simple Notification Service"),
+    ReportedService::new("sqs", "Amazon Simple Queue Service"),
+    ReportedService::new("ssm", "AWS Systems Manager"),
+    ReportedService::new("ssm-contacts", "AWS Systems Manager Incident Manager Contacts"),
+    ReportedService::new("ssm-incidents", "AWS Systems Manager Incident Manager"),
+    ReportedService::new("sso", "AWS IAM Identity Center"),
+    ReportedService::new("sso-directory", "AWS IAM Identity Center Directory"),
+    ReportedService::new("states", "AWS Step Functions"),
+    ReportedService::new("storagegateway", "AWS Storage Gateway"),
+    ReportedService::new("sts", "AWS Security Token Service"),
+    ReportedService::new("support", "AWS Support"),
+    ReportedService::new("swf", "Amazon Simple Workflow Service"),
+    ReportedService::new("synthetics", "Amazon CloudWatch Synthetics"),
+    ReportedService::new("tag", "Amazon Resource Group Tagging API"),
+    ReportedService::new("textract", "Amazon Textract"),
+    ReportedService::new("timestream", "Amazon Timestream"),
+    ReportedService::new("transcribe", "Amazon Transcribe"),
+    ReportedService::new("transfer", "AWS Transfer Family"),
+    ReportedService::new("translate", "Amazon Translate"),
+    ReportedService::new("trustedadvisor", "AWS Trusted Advisor"),
+    ReportedService::new("voiceid", "Amazon Connect Voice ID"),
+    ReportedService::new("vpc-lattice", "Amazon VPC Lattice"),
+    ReportedService::new("waf", "AWS WAF"),
+    ReportedService::new("waf-regional", "AWS WAF Regional"),
+    ReportedService::new("wafv2", "AWS WAF V2"),
+    ReportedService::new("wellarchitected", "AWS Well-Architected Tool"),
+    ReportedService::new("wisdom", "Amazon Connect Wisdom"),
+    ReportedService::new("workdocs", "Amazon WorkDocs"),
+    ReportedService::new("worklink", "Amazon WorkLink"),
+    ReportedService::new("workmail", "Amazon WorkMail"),
+    ReportedService::new("workspaces", "Amazon WorkSpaces"),
+    ReportedService::new("workspaces-web", "Amazon WorkSpaces Web"),
+    ReportedService::new("xray", "AWS X-Ray"),
 ];
+
+/// How many attempts to reach a service this account's records hold: the count
+/// `ServiceLastAccessed$TotalAuthenticatedEntities` reports, "the total number of
+/// authenticated principals (root user, IAM users, or IAM roles) that have attempted to
+/// access the service".
+///
+/// Nothing in this emulator records a principal reaching a service — no operation writes
+/// such a record and none reads one — so the count is the same for every service a report
+/// covers, and that count is zero. It is NOT the absence of a count: recorded AWS reports
+/// the number for every service of a report, including the ones nobody has reached, which
+/// is how a least-privilege consumer tells "nobody used this" from "nothing is known".
+pub const RECORDED_SERVICE_ACCESS_ATTEMPTS: i32 = 0;
 
 /// The catalog entry for `service_namespace`, or `None` when [`REPORTED_SERVICES`] carries
 /// no service under that namespace.

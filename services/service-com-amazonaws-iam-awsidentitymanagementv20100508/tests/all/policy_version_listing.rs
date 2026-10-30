@@ -522,7 +522,7 @@ async fn an_arn_naming_no_readable_policy_is_refused_by_its_kind() {
         },
         MissCase {
             name: "an AWS-managed policy under /job-function/ the catalog does not carry",
-            arn: "arn:aws:iam::aws:policy/job-function/ViewOnlyAccess".to_string(),
+            arn: "arn:aws:iam::aws:policy/job-function/NoSuchJobFunctionHere".to_string(),
             status: 404,
             code: "NoSuchEntity",
         },
