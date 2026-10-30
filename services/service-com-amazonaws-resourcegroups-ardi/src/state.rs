@@ -37,7 +37,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AccountSettings, FailedResource, Group, GroupConfiguration, GroupConfigurationItem,
-    GroupIdentifier, GroupingStatusesItem, ListGroupResourcesItem, ResourceIdentifier,
+    GroupIdentifier, GroupingStatusesItem, ListGroupResourcesItem, QueryError, ResourceIdentifier,
     ResourceQuery, ResourceStatus, TagSyncTaskItem, GROUP_LIFECYCLE_EVENTS_DESIRED_STATUS_VALUES,
     QUERY_TYPE_VALUES,
 };
@@ -186,6 +186,63 @@ impl ComAmazonawsResourcegroupsArdiState {
             .range(GroupKey::first_in(region)..)
             .take_while(move |(key, _)| key.region == region)
             .map(|(_, record)| record)
+    }
+
+    /// The resources of `region` a resource query selects: those whose type the
+    /// query's limit admits ([`ResourceQueryRecord::resource_type_limit`]) and
+    /// whose tags satisfy every one of its filters, in ARN order and once each.
+    ///
+    /// Every resource of a region is one of two kinds, and a query runs over both:
+    ///
+    /// * each group stored in the region, whose own ARN names a resource
+    ///   ([`resource_type_of_arn`]) and whose stored tags are the tags this
+    ///   service reports for it (`GetTags`);
+    /// * every resource ARN recorded as a static membership of one of those
+    ///   groups, whose tags this service does not record — so only a query that
+    ///   matches on resource type alone selects one.
+    ///
+    /// Nothing else is matchable: this service records no other resource, so a
+    /// query runs over what the store holds rather than over a fabricated
+    /// catalog. The matches are keyed by ARN, so a resource several groups record
+    /// is one resource. One run is bounded by what the store holds
+    /// ([`MAX_GROUPS`] groups of at most [`MAX_MEMBERS_PER_GROUP`] memberships)
+    /// and allocates nothing for a resource the query does not select.
+    pub fn resources_matching(
+        &self,
+        region: &str,
+        limit: Option<&[String]>,
+        filters: &[QueryTagFilter],
+    ) -> Vec<MemberRecord> {
+        // A membership's tags are not recorded, and a tag filter is satisfied
+        // only by carrying its key, so a query that filters on any tag selects no
+        // membership at all. That is decided once here rather than per membership.
+        let memberships_can_match = filters.is_empty();
+        let mut matched: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for group in self.groups_in(region) {
+            let group_type = resource_type_of_arn(&group.group_arn);
+            if query_admits_type(group_type, limit) && carries_query_tags(&group.tags, filters) {
+                matched.insert(group.group_arn.clone(), group_type.map(str::to_string));
+            }
+            if !memberships_can_match {
+                continue;
+            }
+            for member in &group.members {
+                if query_admits_type(member.resource_type.as_deref(), limit) {
+                    matched.insert(member.resource_arn.clone(), member.resource_type.clone());
+                }
+            }
+        }
+        matched
+            .into_iter()
+            .map(|(resource_arn, resource_type)| MemberRecord {
+                resource_arn,
+                resource_type,
+                // A resource a query selects is selected NOW: there is no
+                // asynchronous addition left to report a modelled
+                // `ResourceStatusValue` for.
+                status: None,
+            })
+            .collect()
     }
 
     /// Drop every tag-sync task of the group `key` names, and report how many
@@ -575,6 +632,97 @@ pub fn tag_filters(document: &serde_json::Value) -> Result<Vec<QueryTagFilter>, 
         });
     }
     Ok(filters)
+}
+
+/// The modelled `QueryErrorCode` for a CloudFormation stack a query names that
+/// the account holds none of.
+///
+/// Source: `smithy_query(query="shape",shape="QueryErrorCode")`, which declares
+/// it beside the other codes in [`crate::ops::types::QUERY_ERROR_CODE_VALUES`].
+pub const STACK_NOT_EXISTING_QUERY_ERROR: &str = "CLOUDFORMATION_STACK_NOT_EXISTING";
+
+/// RUN `query` over the resources `store` records in `region`: the resources it
+/// selects, in ARN order, beside the modelled `QueryError` entries that running
+/// it produced.
+///
+/// The ONE place this service resolves a membership from a resource query, so a
+/// group's own membership listing and a search over the recorded resources
+/// resolve one the same way:
+///
+/// * a tag query selects the recorded resources whose type its
+///   [`RESOURCE_TYPE_FILTERS_ELEMENT`] admits and whose tags satisfy every one of
+///   its [`TAG_FILTERS_ELEMENT`] entries ([`ComAmazonawsResourcegroupsArdiState::resources_matching`]);
+/// * a [`STACK_QUERY_TYPE`] query names ONE CloudFormation stack, and this
+///   service records no stack and no stack's members, so no stack of the account
+///   answers it: that is the condition [`STACK_NOT_EXISTING_QUERY_ERROR`] names,
+///   reported beside no resource the way the model documents `QueryErrors`
+///   ("each error contains an ErrorCode and Message") rather than refused.
+///
+/// `Err` carries the message a refusal reports for a document that defines no
+/// membership for its type. A STORED query cannot reach it — the one place a
+/// query is accepted refuses such a document ([`check_resource_query`]) — so it
+/// is reached only by an operation that runs a query the request itself carries.
+pub fn run_resource_query(
+    store: &ComAmazonawsResourcegroupsArdiState,
+    region: &str,
+    query: &ResourceQueryRecord,
+) -> Result<(Vec<MemberRecord>, Vec<QueryError>), String> {
+    let document = query_document(&query.query)?;
+    if query.query_type == STACK_QUERY_TYPE {
+        let stack = stack_identifier(&document)?;
+        return Ok((
+            Vec::new(),
+            vec![QueryError {
+                error_code: Some(STACK_NOT_EXISTING_QUERY_ERROR.to_string()),
+                message: Some(format!("Stack with id {stack} does not exist")),
+            }],
+        ));
+    }
+    // The tag filters the query matches resources on, read out of the document;
+    // a document that carries none matches on resource type alone.
+    let filters = tag_filters(&document)?;
+    let limit = query.resource_type_limit();
+    Ok((
+        store.resources_matching(region, limit.as_deref(), &filters),
+        // A tag query runs over the recorded resources with nothing left to
+        // report: every error code the model declares is about a stack.
+        Vec::new(),
+    ))
+}
+
+/// Whether a resource of type `resource_type` is one a query admits: any type
+/// when the query names no limit, else one the limit lists. A resource whose type
+/// this emulator has no name for is admitted by no limit, since a limit lists type
+/// NAMES.
+///
+/// [`RESOURCE_TYPE_FILTERS_ELEMENT`] values are compared exactly: the modelled
+/// `ResourceType` pattern `^AWS::[a-zA-Z0-9]+::\w+$` admits one spelling of each
+/// type name.
+fn query_admits_type(resource_type: Option<&str>, limit: Option<&[String]>) -> bool {
+    match limit {
+        None => true,
+        Some(types) => resource_type
+            .is_some_and(|resource_type| types.iter().any(|named| named == resource_type)),
+    }
+}
+
+/// Whether a resource carrying `tags` satisfies every filter in `filters`.
+///
+/// The documented rule: "If you specify more than one tag key, only resources
+/// that match all tag keys, and at least one value of each specified tag key, are
+/// returned in your query. If you specify more than one value for a tag key, a
+/// resource matches the filter if it has a tag key value that matches any of the
+/// specified values" (`smithy_query(query="doc",shape="ResourceQuery",member="Query")`)
+/// — so the keys narrow and the values of one key widen. A filter that names no
+/// value at all is satisfied by carrying the key, whatever its value.
+///
+/// Tag keys and values are case-sensitive, so a tag is selected only by an
+/// identical key and value.
+fn carries_query_tags(tags: &BTreeMap<String, String>, filters: &[QueryTagFilter]) -> bool {
+    filters.iter().all(|filter| {
+        tags.get(&filter.key)
+            .is_some_and(|value| filter.values.is_empty() || filter.values.contains(value))
+    })
 }
 
 /// The modelled `GroupConfigurationStatus` of a service configuration that is in
@@ -1700,7 +1848,9 @@ impl ResourceQueryRecord {
     }
 }
 
-/// One static membership: a resource ARN added to a group by `GroupResources`.
+/// One resource a membership listing or a search reports: an ARN recorded as a
+/// static membership by `GroupResources`, or one a resource query selects
+/// ([`run_resource_query`]).
 #[derive(Debug, Clone)]
 pub struct MemberRecord {
     pub resource_arn: String,

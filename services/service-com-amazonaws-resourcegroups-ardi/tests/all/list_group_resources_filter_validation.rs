@@ -53,6 +53,12 @@ struct GroupCase {
     request: fn() -> Value,
     /// The types the group's query admits, or `None` when it admits any type.
     limit: Option<&'static [&'static str]>,
+    /// Whether the group's query selects every resource the region records: a
+    /// query with no type limit and no tag filter matches them all, and the
+    /// resources this emulator records in a region are the groups stored there
+    /// (the sibling `list_group_resources_query_membership` suite is the
+    /// query-membership rule itself).
+    selects_every_resource: bool,
 }
 
 fn group_cases() -> Vec<GroupCase> {
@@ -69,6 +75,7 @@ fn group_cases() -> Vec<GroupCase> {
                 })
             },
             limit: Some(&["AWS::S3::Bucket"]),
+            selects_every_resource: false,
         },
         GroupCase {
             name: "three-types",
@@ -86,6 +93,7 @@ fn group_cases() -> Vec<GroupCase> {
                 "AWS::EC2::Volume",
                 "AWS::DynamoDB::Table",
             ]),
+            selects_every_resource: false,
         },
         GroupCase {
             name: "one-string",
@@ -99,6 +107,7 @@ fn group_cases() -> Vec<GroupCase> {
                 })
             },
             limit: Some(&["AWS::Lambda::Function"]),
+            selects_every_resource: false,
         },
         GroupCase {
             name: "stack-query",
@@ -112,6 +121,7 @@ fn group_cases() -> Vec<GroupCase> {
                 })
             },
             limit: Some(&["AWS::EC2::Instance"]),
+            selects_every_resource: false,
         },
         GroupCase {
             name: "all-supported",
@@ -125,6 +135,8 @@ fn group_cases() -> Vec<GroupCase> {
                 })
             },
             limit: None,
+            // No type limit and no tag filter: every recorded resource.
+            selects_every_resource: true,
         },
         GroupCase {
             name: "all-supported-and-one",
@@ -138,6 +150,7 @@ fn group_cases() -> Vec<GroupCase> {
                 })
             },
             limit: None,
+            selects_every_resource: true,
         },
         GroupCase {
             name: "no-type-element",
@@ -151,6 +164,8 @@ fn group_cases() -> Vec<GroupCase> {
                 })
             },
             limit: None,
+            // A tag filter no fixture group's tags satisfy: no resource.
+            selects_every_resource: false,
         },
         GroupCase {
             // A group created with a service configuration instead of a query: no
@@ -158,6 +173,8 @@ fn group_cases() -> Vec<GroupCase> {
             name: "no-query",
             request: || static_group("no-query"),
             limit: None,
+            // Its membership is the static one, and nothing was recorded in it.
+            selects_every_resource: false,
         },
     ]
 }
@@ -173,13 +190,23 @@ const SOME_TYPES: [&str; 6] = [
     "AWS::SQS::Queue",
 ];
 
-/// An emulator holding every group of the table.
-async fn populated() -> Emulator {
+/// An emulator holding every group of the table, with the ARN each create
+/// reported for its group, in ARN order: those groups are every resource this
+/// emulator records in the region, so they are what a query with no limit selects.
+async fn populated() -> (Emulator, Vec<String>) {
     let emulator = Emulator::new();
+    let mut arns: Vec<String> = Vec::new();
     for case in group_cases() {
-        emulator.ok("/groups", &(case.request)()).await;
+        let created = emulator.ok("/groups", &(case.request)()).await;
+        arns.push(
+            created["Group"]["GroupArn"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {}: expected a GroupArn, got {created}", case.name))
+                .to_string(),
+        );
     }
-    emulator
+    arns.sort();
+    (emulator, arns)
 }
 
 /// A `ListGroupResources` request for `group` carrying one `resource-type` filter.
@@ -206,7 +233,7 @@ fn listed_arns(page: &Value) -> Vec<String> {
 /// the table happens to list first.
 #[tokio::test]
 async fn a_filter_value_is_answered_exactly_when_the_group_query_admits_it() {
-    let emulator = populated().await;
+    let (emulator, _) = populated().await;
     for case in group_cases() {
         for value in SOME_TYPES {
             let admitted = case
@@ -240,17 +267,23 @@ async fn a_filter_value_is_answered_exactly_when_the_group_query_admits_it() {
 
 /// A request carrying no `resource-type` filter at all is answered with a listing
 /// for every group, whatever its query says about resource types: there is nothing
-/// to validate.
+/// to validate. The listing it is answered with is the group's membership — what
+/// its query selects, which for these fixtures is every recorded resource or none.
 #[tokio::test]
 async fn a_request_without_filters_is_always_a_listing() {
-    let emulator = populated().await;
+    let (emulator, every_resource) = populated().await;
     for case in group_cases() {
+        let expected = if case.selects_every_resource {
+            every_resource.clone()
+        } else {
+            Vec::new()
+        };
         for body in [json!({ "Group": case.name }), json!({ "Group": case.name, "Filters": [] })] {
             let page = emulator.ok("/list-group-resources", &body).await;
             assert_eq!(
                 listed_arns(&page),
-                Vec::<String>::new(),
-                "case {} {body}: expected an empty listing, got {page}",
+                expected,
+                "case {} {body}: expected {expected:?}, got {page}",
                 case.name,
             );
         }
@@ -262,7 +295,7 @@ async fn a_request_without_filters_is_always_a_listing() {
 /// several filter entries, repeated values, and values that differ only in case.
 #[tokio::test]
 async fn the_refusal_reports_the_types_the_query_does_not_admit() {
-    let emulator = populated().await;
+    let (emulator, _) = populated().await;
     // (label, the whole Filters list, the types the refusal must name in order)
     let cases: Vec<(&str, Value, Vec<&str>)> = vec![
         (

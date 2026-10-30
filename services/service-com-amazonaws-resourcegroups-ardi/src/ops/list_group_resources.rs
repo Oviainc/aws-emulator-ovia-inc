@@ -2,10 +2,19 @@
 
 //! @op ListGroupResources
 //!
-//! Reports the group's static memberships — the ARNs `GroupResources` recorded, minus any
-//! removed — from [`crate::state`], in ARN order, as both `Resources` and the deprecated
-//! `ResourceIdentifiers`. A page carries at most `MaxResults` members and, when more
-//! remain, a `NextToken` the next call resumes after.
+//! Reports the membership of the addressed group from [`crate::state`], in ARN order,
+//! as both `Resources` and the deprecated `ResourceIdentifiers`. A page carries at
+//! most `MaxResults` members and, when more remain, a `NextToken` the next call
+//! resumes after.
+//!
+//! A group's membership comes from its DEFINITION: a group created with a
+//! `ResourceQuery` holds the resources that query selects NOW, so the stored query is
+//! RUN over the resources the service records in the group's region
+//! ([`crate::state::run_resource_query`]) — a `TAG_FILTERS_1_0` query selecting by
+//! resource type and tags, and a `CLOUDFORMATION_STACK_1_0` query naming a stack this
+//! service records none of, which is reported in `QueryErrors` beside no resource. A
+//! group created without a query holds the memberships `GroupResources` recorded
+//! against it, minus any removed.
 //!
 //! A `resource-type` filter is judged against the resource types the addressed
 //! group's stored query admits before any page is computed: a value that query does
@@ -286,14 +295,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        let mut remaining: Vec<&crate::state::MemberRecord> = group
-            .members
-            .iter()
-            .filter(|member| filters.iter().all(|filter| matches_filter(member, filter)))
-            .collect();
+        // A group's membership comes from its DEFINITION, and the two kinds of
+        // definition are exclusive: a group contains either a resource query or a
+        // service configuration, and only a configured group records a static
+        // membership at all.
+        let (members, query_errors) = match group.resource_query.as_ref() {
+            // A group created with a resource query is POPULATED BY that query, so
+            // its membership is what running the query answers now — which is why
+            // the model gives this listing a `QueryErrors` output at all. The query
+            // runs over the group's own region, where its resources live.
+            //
+            // A stored query cannot fail to define a membership: the one place a
+            // query is accepted refuses such a document, so the refusal here is
+            // unreachable for a group this store holds.
+            Some(query) => crate::state::run_resource_query(&store, &key.region, query)
+                .map_err(bad_request)?,
+            // A group with no query holds exactly the memberships recorded against
+            // it by `GroupResources`, minus any `UngroupResources` removed.
+            None => (group.members.clone(), Vec::new()),
+        };
+        drop(store);
+        let mut remaining = members;
+        remaining.retain(|member| filters.iter().all(|filter| matches_filter(member, filter)));
         // The listing order is ARN order, which is what the resume key below is
-        // compared against. The store keeps memberships sorted, and sorting here as
-        // well keeps this page correct whatever order it is handed.
+        // compared against. The store keeps memberships sorted, and a query answers
+        // its matches sorted, so sorting here as well keeps this page correct
+        // whatever order it is handed.
         remaining.sort_by(|left, right| left.resource_arn.cmp(&right.resource_arn));
         if let Some(resume) = resume_after.as_deref() {
             remaining.retain(|member| member.resource_arn.as_str() > resume);
@@ -323,11 +350,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the two cannot disagree.
             resource_identifiers: Some(page.iter().map(|member| member.to_identifier()).collect()),
             next_token,
-            // `QueryErrors` reports what went wrong while RUNNING a group's query;
-            // listing recorded memberships runs none. The member is always on the
-            // wire, so a listing with nothing to report says so with `[]` rather
-            // than by leaving it out: its target declares no length minimum.
-            query_errors: Some(Vec::new()),
+            // `QueryErrors` reports what went wrong while RUNNING the group's query,
+            // which is what running it answered above; a group with no query runs
+            // none. The member is always on the wire, so a listing with nothing to
+            // report says so with `[]` rather than by leaving it out: its target
+            // declares no length minimum.
+            query_errors: Some(query_errors),
         })
     }
 }

@@ -253,7 +253,14 @@ async fn the_refusal_follows_the_addressed_group_and_not_the_identifier_form() {
             "/groups",
             &json!({
                 "Name": "refused",
-                "ResourceQuery": { "Type": "TAG_FILTERS_1_0", "Query": "{\"TagFilters\":[]}" }
+                // A query no resource of this store satisfies — no group here
+                // carries a tag — so this group's membership is empty until
+                // something matches, which is what makes the listing below a
+                // reading of what the refused calls recorded.
+                "ResourceQuery": {
+                    "Type": "TAG_FILTERS_1_0",
+                    "Query": "{\"TagFilters\":[{\"Key\":\"Stage\",\"Values\":[\"Test\"]}]}"
+                }
             }),
         )
         .await["Group"]["GroupArn"]

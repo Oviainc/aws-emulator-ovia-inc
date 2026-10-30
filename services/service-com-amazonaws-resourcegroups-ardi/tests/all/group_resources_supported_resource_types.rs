@@ -21,8 +21,9 @@
 //! * a membership the group already holds is still removable whatever the
 //!   configuration in effect by then admits, since replacing a configuration
 //!   carries the memberships nowhere;
-//! * the two query-evaluating listings always carry their `QueryErrors` member,
-//!   as the empty list when the call raised no query error.
+//! * the two query-evaluating listings always carry their `QueryErrors` member, as
+//!   the empty list when the call raised no query error and as the error the call
+//!   raised when it did;
 //!
 //! The sibling `group_resources_supported_configuration` suite asserts the other,
 //! REQUEST-level rule: which GROUPS these operations serve at all.
@@ -484,8 +485,9 @@ async fn a_membership_recorded_before_the_configuration_narrowed_is_still_remova
 }
 
 /// `QueryErrors` is always on the wire: a call that raised no query error carries
-/// it as the empty list rather than leaving the member out — asserted over a table
-/// of groups and of searched queries.
+/// it as the empty list rather than leaving the member out, and a call that raised
+/// one carries that error — asserted over a table of groups and of searched
+/// queries.
 #[tokio::test]
 async fn the_query_evaluating_listings_always_carry_their_query_errors() {
     let emulator = Emulator::new();
@@ -500,6 +502,7 @@ async fn the_query_evaluating_listings_always_carry_their_query_errors() {
         )
         .await;
     created_with(&emulator, "empty", &json!([{ "Type": "AWS::EC2::HostManagement" }])).await;
+    let stack = "arn:aws:cloudformation:us-east-1:000000000000:stack/demo/0";
     for (name, document) in [
         (
             "tag-queried",
@@ -512,7 +515,7 @@ async fn the_query_evaluating_listings_always_carry_their_query_errors() {
             "stack-queried",
             json!({
                 "Type": "CLOUDFORMATION_STACK_1_0",
-                "Query": "{\"StackIdentifier\":\"arn:aws:cloudformation:us-east-1:000000000000:stack/demo/0\"}"
+                "Query": format!("{{\"StackIdentifier\":\"{stack}\"}}")
             }),
         ),
     ] {
@@ -521,15 +524,31 @@ async fn the_query_evaluating_listings_always_carry_their_query_errors() {
             .await;
     }
 
-    for name in ["holding", "empty", "tag-queried", "stack-queried"] {
+    // (the group, the QueryErrors its listing must carry) — a group that runs no
+    // query, and one whose query raises nothing, carry the empty list; a stack
+    // query names a stack this service records none of, so it carries that error.
+    // What the listing REPORTS for each kind of query is the sibling
+    // `list_group_resources_query_membership` suite's own rule.
+    for (name, expected) in [
+        ("holding", json!([])),
+        ("empty", json!([])),
+        ("tag-queried", json!([])),
+        (
+            "stack-queried",
+            json!([{
+                "ErrorCode": "CLOUDFORMATION_STACK_NOT_EXISTING",
+                "Message": format!("Stack with id {stack} does not exist")
+            }]),
+        ),
+    ] {
         let listed = emulator
             .ok("/list-group-resources", &json!({ "Group": name }))
             .await;
         assert_eq!(
             listed["QueryErrors"],
-            json!([]),
-            "case {name:?}: expected ListGroupResources to carry QueryErrors as [], \
-             got {listed}",
+            expected,
+            "case {name:?}: expected ListGroupResources to carry QueryErrors as \
+             {expected}, got {listed}",
         );
     }
 

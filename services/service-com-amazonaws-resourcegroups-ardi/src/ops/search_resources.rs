@@ -16,11 +16,11 @@
 //! those, so a query matches what the store holds rather than a fabricated catalog.
 //!
 //! A `TAG_FILTERS_1_0` query selects the resources whose type its
-//! `ResourceTypeFilters` admits ([`crate::state::ResourceQueryRecord::resource_type_limit`])
-//! and whose tags satisfy every one of its `TagFilters`. A
-//! `CLOUDFORMATION_STACK_1_0` query names a stack in `StackIdentifier`, and this
-//! service holds no CloudFormation stack at all, so such a query reports the modelled
-//! `CLOUDFORMATION_STACK_NOT_EXISTING` query error and no resource.
+//! `ResourceTypeFilters` admits and whose tags satisfy every one of its
+//! `TagFilters`, and a `CLOUDFORMATION_STACK_1_0` query names a stack this service
+//! holds none of, so such a query reports the modelled
+//! `CLOUDFORMATION_STACK_NOT_EXISTING` query error and no resource. Both are run
+//! through the one shared resolution ([`crate::state::run_resource_query`]).
 //!
 //! ## Shape of an operation
 //!
@@ -208,39 +208,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a modelled `QueryType`.
         crate::state::check_resource_query(&input.resource_query).map_err(bad_request)?;
         // The query is read through the record type the stored queries use, so a
-        // search reads `ResourceTypeFilters` exactly as a group's own query is read.
+        // search runs the request's query exactly as a group's own query is run.
         let query = crate::state::ResourceQueryRecord {
             query_type: input.resource_query.r#type.clone(),
             query: input.resource_query.query.clone(),
         };
-        // Read through the same shared parse the validation above used, so a search
-        // reads the document exactly as the validator judged it.
-        let document = crate::state::query_document(&query.query).map_err(bad_request)?;
-
-        // A stack query matches the members of ONE CloudFormation stack, and this
-        // service records no stack and no stack's members, so no stack of the account
-        // answers it. That is the condition the modelled `QueryErrorCode`
-        // `CLOUDFORMATION_STACK_NOT_EXISTING` names, reported beside an empty result
-        // the way the model documents `QueryErrors` ("a message that explains the
-        // ErrorCode"), rather than refused.
-        if query.query_type == crate::state::STACK_QUERY_TYPE {
-            let stack = crate::state::stack_identifier(&document).map_err(bad_request)?;
-            return Ok(SearchResourcesOutput {
-                resource_identifiers: Some(Vec::new()),
-                next_token: None,
-                query_errors: Some(vec![QueryError {
-                    error_code: Some(STACK_NOT_EXISTING.to_string()),
-                    message: Some(format!("Stack with id {stack} does not exist")),
-                }]),
-            });
-        }
-
-        // The tag filters the query matches resources on, read out of the stored
-        // document; a document that carries none matches on resource type alone.
-        let filters = crate::state::tag_filters(&document).map_err(bad_request)?;
-        // `ResourceTypeFilters` means here what it means on a group's query: the
-        // types a match is limited to, or no limit at all.
-        let type_limit = query.resource_type_limit();
 
         // A resource belongs to the region whose endpoint recorded it, so a search
         // runs over the request's own region and reaches no other region's resources.
@@ -264,26 +236,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         // ARN order is the search order, which is what the resume key above is
-        // compared against: the matches are collected into a map keyed by ARN, so a
-        // resource recorded by several groups is reported once. The matching is done
-        // while the groups are walked, so the work one search does is bounded by what
-        // the store holds (`crate::state::MAX_GROUPS` groups of at most
-        // `crate::state::MAX_MEMBERS_PER_GROUP` memberships) and nothing is allocated
-        // for a resource the query does not match.
-        let matched = matching(&store, &region, type_limit.as_deref(), &filters);
+        // compared against. Running the query is the ONE shared resolution every
+        // membership of this service is resolved by, so a search and a group's own
+        // listing select the same resources for the same query.
+        let (matched, query_errors) =
+            crate::state::run_resource_query(&store, &region, &query).map_err(bad_request)?;
         drop(store);
         let mut matched: Vec<ResourceIdentifier> = matched
             .into_iter()
             // The page resumes AFTER the ARN the previous one stopped at.
-            .filter(|(resource_arn, _)| {
+            .filter(|member| {
                 resume_after
                     .as_deref()
-                    .is_none_or(|resume| resource_arn.as_str() > resume)
+                    .is_none_or(|resume| member.resource_arn.as_str() > resume)
             })
-            .map(|(resource_arn, resource_type)| ResourceIdentifier {
-                resource_arn: Some(resource_arn),
-                resource_type,
-            })
+            .map(|member| member.to_identifier())
             .collect();
         // The page size rule is this service's one shared rule, so a search bounds a
         // page exactly as every listing of the service does.
@@ -306,104 +273,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(SearchResourcesOutput {
             resource_identifiers: Some(matched),
             next_token,
-            // `QueryErrors` reports what went wrong while running the query; a tag
-            // query runs over the recorded resources with nothing left to report.
-            // The member is always on the wire, so a search with nothing to report
-            // says so with `[]` rather than by leaving it out: its target declares
-            // no length minimum.
-            query_errors: Some(Vec::new()),
+            // `QueryErrors` reports what went wrong while running the query, which is
+            // what running it answered above. The member is always on the wire, so a
+            // search with nothing to report says so with `[]` rather than by leaving
+            // it out: its target declares no length minimum.
+            query_errors: Some(query_errors),
         })
     }
-}
-
-/// The modelled `QueryErrorCode` for a stack a query names that the account holds
-/// none of.
-///
-/// Source: `smithy_query(query="shape",shape="QueryErrorCode")`, which declares it
-/// beside the other codes in [`QUERY_ERROR_CODE_VALUES`].
-const STACK_NOT_EXISTING: &str = "CLOUDFORMATION_STACK_NOT_EXISTING";
-
-/// The ARNs of `region`'s resources the query matches, each mapped to the resource
-/// type reported for it, in ARN order — which is both the order a page reports them
-/// in and the order its resume key places a resource in.
-///
-/// Every resource of a region is one of two kinds, and both are searchable:
-///
-/// * each group stored in the region, whose own ARN names a resource and whose
-///   stored tags are the tags this service reports for it (`GetTags`);
-/// * every resource ARN recorded as a static membership of one of those groups,
-///   whose tags this service does not record — so only a query that matches on
-///   resource type alone selects one.
-///
-/// Nothing else is searchable: this service records no other resource, so a query
-/// runs over what the store holds. A resource recorded by several groups is one
-/// resource, since the matches are keyed by ARN.
-fn matching(
-    store: &crate::state::ComAmazonawsResourcegroupsArdiState,
-    region: &str,
-    limit: Option<&[String]>,
-    filters: &[crate::state::QueryTagFilter],
-) -> std::collections::BTreeMap<String, Option<String>> {
-    // A membership's tags are not recorded, and a tag filter is satisfied only by
-    // carrying its key, so a query that filters on any tag matches no membership at
-    // all. That is decided once here rather than per membership.
-    let memberships_can_match = filters.is_empty();
-    let mut matched: std::collections::BTreeMap<String, Option<String>> =
-        std::collections::BTreeMap::new();
-    for group in store.groups_in(region) {
-        let group_type = crate::state::resource_type_of_arn(&group.group_arn);
-        if admits_type(group_type, limit) && carries_tags(&group.tags, filters) {
-            matched.insert(
-                group.group_arn.clone(),
-                group_type.map(str::to_string),
-            );
-        }
-        if !memberships_can_match {
-            continue;
-        }
-        for member in &group.members {
-            if admits_type(member.resource_type.as_deref(), limit) {
-                matched.insert(member.resource_arn.clone(), member.resource_type.clone());
-            }
-        }
-    }
-    matched
-}
-
-/// Whether a resource of type `resource_type` is one the query admits: any type when
-/// the query names no limit, else one the limit lists. A resource whose type this
-/// emulator has no name for is admitted by no limit, since a limit lists type NAMES.
-///
-/// `ResourceTypeFilters` values are compared exactly: the modelled `ResourceType`
-/// pattern `^AWS::[a-zA-Z0-9]+::\w+$` admits one spelling of each type name.
-fn admits_type(resource_type: Option<&str>, limit: Option<&[String]>) -> bool {
-    match limit {
-        None => true,
-        Some(types) => resource_type
-            .is_some_and(|resource_type| types.iter().any(|named| named == resource_type)),
-    }
-}
-
-/// Whether a resource carrying `tags` satisfies every filter in `filters`.
-///
-/// The documented rule: "If you specify more than one tag key, only resources that
-/// match all tag keys, and at least one value of each specified tag key, are returned
-/// in your query. If you specify more than one value for a tag key, a resource matches
-/// the filter if it has a tag key value that matches any of the specified values"
-/// (`smithy_query(query="doc",shape="ResourceQuery",member="Query")`) — so the keys
-/// narrow and the values of one key widen. A filter that names no value at all is
-/// satisfied by carrying the key, whatever its value.
-///
-/// Tag keys and values are case-sensitive, so a tag is selected only by an identical
-/// key and value.
-fn carries_tags(
-    tags: &std::collections::BTreeMap<String, String>,
-    filters: &[crate::state::QueryTagFilter],
-) -> bool {
-    filters.iter().all(|filter| {
-        tags.get(&filter.key)
-            .is_some_and(|value| filter.values.is_empty() || filter.values.contains(value))
-    })
 }
 
 /// The listing one query's pagination tokens belong to: a token issued here resumes a

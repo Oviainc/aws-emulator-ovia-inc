@@ -45,6 +45,8 @@ mod group_untag;
 mod grouping_statuses;
 #[path = "all/list_group_resources_filter_validation.rs"]
 mod list_group_resources_filter_validation;
+#[path = "all/list_group_resources_query_membership.rs"]
+mod list_group_resources_query_membership;
 #[path = "all/list_groups_filters.rs"]
 mod list_groups_filters;
 #[path = "all/list_tag_sync_tasks.rs"]
