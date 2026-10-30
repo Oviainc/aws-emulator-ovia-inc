@@ -21,6 +21,8 @@ mod batch_and_transact_items;
 mod batch_execute_statement;
 #[path = "all/batch_write_capacity_residue.rs"]
 mod batch_write_capacity_residue;
+#[path = "all/batch_write_provisioned_budget.rs"]
+mod batch_write_provisioned_budget;
 #[path = "all/collection_cap_constraint_reports.rs"]
 mod collection_cap_constraint_reports;
 #[path = "all/continuous_backups.rs"]
