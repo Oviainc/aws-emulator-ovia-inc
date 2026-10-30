@@ -20,6 +20,8 @@ use crate::ops::types::{
 pub const STATUS_CREATING: &str = "CREATING";
 /// The ready state: a pipeline that is running and can be read, stopped or deleted.
 pub const STATUS_ACTIVE: &str = "ACTIVE";
+/// Transient state entered by `UpdatePipeline` while the change is being applied.
+pub const STATUS_UPDATING: &str = "UPDATING";
 /// Transient state entered by `StopPipeline`.
 pub const STATUS_STOPPING: &str = "STOPPING";
 /// Terminal state a stopped pipeline rests in.
@@ -27,8 +29,8 @@ pub const STATUS_STOPPED: &str = "STOPPED";
 /// Transient state entered by `StartPipeline`.
 pub const STATUS_STARTING: &str = "STARTING";
 
-/// How long a pipeline stays in a transient status (`CREATING`, `STARTING`, `STOPPING`)
-/// before the clock owes it the settled one.
+/// How long a pipeline stays in a transient status (`CREATING`, `UPDATING`, `STARTING`,
+/// `STOPPING`) before the clock owes it the settled one.
 ///
 /// A resource the service reports in a non-terminal status has a transition the clock
 /// owes. The span is the emulator's own choice (no AWS-documented duration applies to

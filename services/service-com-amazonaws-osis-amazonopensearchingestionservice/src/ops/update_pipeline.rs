@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePipeline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePipeline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePipeline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A MUTATION, and a PARTIAL one: `PipelineName` names the pipeline to change and every
+//! other member is optional, so only the members the request actually carries are
+//! written — anything it omits keeps the value the pipeline already holds. The change is
+//! persisted, the pipeline enters `UPDATING`, and the clock owes it the settled status it
+//! was in before the call, so a later `GetPipeline` / `ListPipelines` reports both.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +164,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePipeline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePipelineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePipeline"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+        store.settle(now);
+
+        let pipeline_name = input.pipeline_name.clone();
+        let stored = store
+            .pipelines
+            .get_mut(&pipeline_name)
+            .ok_or_else(|| not_found(&pipeline_name))?;
+
+        // A pipeline can only be updated from a settled status: one still moving between
+        // statuses already has a change in flight, which is what this operation's
+        // ConflictException reports.
+        if stored.status != crate::state::STATUS_ACTIVE
+            && stored.status != crate::state::STATUS_STOPPED
+        {
+            return Err(UpdatePipelineErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Pipeline {pipeline_name} cannot be updated while its status is {}",
+                    stored.status
+                )),
+            })
+            .into());
+        }
+
+        // Every member but the name is optional, so an absent one means "leave it alone",
+        // never "clear it": the effective capacity is what the request named, falling back
+        // to what the pipeline already carries.
+        let min_units = input.min_units.unwrap_or(stored.min_units);
+        let max_units = input.max_units.unwrap_or(stored.max_units);
+
+        // Both counts are `@range(1,)`, so the boundary validator already refused anything
+        // below one. The one rule the model cannot state is the relation between the two,
+        // and it holds over the values the update LEAVES on the pipeline — so naming only
+        // one of the pair cannot invert it.
+        if max_units < min_units {
+            return Err(UpdatePipelineErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "MaxUnits ({max_units}) must be greater than or equal to MinUnits ({min_units})"
+                )),
+            })
+            .into());
+        }
+
+        stored.min_units = min_units;
+        stored.max_units = max_units;
+        if let Some(configuration_body) = input.pipeline_configuration_body {
+            stored.pipeline_configuration_body = configuration_body;
+        }
+        if input.log_publishing_options.is_some() {
+            stored.log_publishing_options = input.log_publishing_options;
+        }
+        if input.buffer_options.is_some() {
+            stored.buffer_options = input.buffer_options;
+        }
+        if input.encryption_at_rest_options.is_some() {
+            stored.encryption_at_rest_options = input.encryption_at_rest_options;
+        }
+        if input.pipeline_role_arn.is_some() {
+            stored.pipeline_role_arn = input.pipeline_role_arn;
+        }
+
+        // Applying the change takes time, and it lands the pipeline back in the status it
+        // was already in: a running pipeline goes on running, a stopped one stays stopped.
+        let settles_to = stored.status.clone();
+        stored.status = crate::state::STATUS_UPDATING.to_string();
+        stored.status_reason = Some("The pipeline is being updated.".to_string());
+        stored.pending = Some(crate::state::PendingTransition {
+            to: settles_to,
+            due_at: now + crate::state::TRANSITION_SPAN,
+        });
+        stored.last_updated_at = now;
+
+        // Answer from the stored record, so this response cannot drift from the state a
+        // later GetPipeline / ListPipelines reads.
+        Ok(UpdatePipelineOutput {
+            pipeline: Some(stored.to_pipeline()),
+        })
     }
+}
+
+/// No pipeline of this name is stored — HTTP 404 `ResourceNotFoundException`.
+fn not_found(pipeline_name: &str) -> UpdatePipelineError {
+    UpdatePipelineErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("Pipeline {pipeline_name} could not be found")),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server-side fault, modelled as `InternalException`
+/// (HTTP 500). Never answered by constructing a private engine.
+fn store_unavailable() -> UpdatePipelineError {
+    UpdatePipelineErrorModeled::InternalException(InternalException {
+        message: Some("the OpenSearch Ingestion pipeline store is unavailable".to_string()),
+    })
+    .into()
 }
