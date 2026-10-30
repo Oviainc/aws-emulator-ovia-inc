@@ -80,28 +80,39 @@
 //! `AuthenticationMaterial`, `SerialNumber`, `Brand`, `Model`, `Classification`, `Tags`,
 //! `CaCertificate`, …), and an error body must not publish a value the model marks so.
 //!
-//! The ORDER an enum's value set is listed in is NOT this service's to choose: a Smithy
-//! enum's value set is a set, so the model fixes no order and AWS documents none, and the
-//! two recorded refusals enumerate their sets in an order that is neither the model's nor
-//! any other order a rule produces: `AuthMaterialType`, which the model declares as
+//! An enum clause states a MEMBERSHIP and an ORDER. The membership is the model's,
+//! always. The order is not: it is a property of the ENUM that the public model does not
+//! carry, and the only source for it is the order this service's refusals are recorded
+//! stating. Both enums whose refusal is recorded list their values in an order no order
+//! derivable from the model reproduces — `AuthMaterialType`, which the model declares as
 //! `[CUSTOM_PROTOCOL_QR_BAR_CODE, WIFI_SETUP_QR_BAR_CODE, ZWAVE_QR_BAR_CODE,
-//! ZIGBEE_QR_BAR_CODE, DISCOVERED_DEVICE, PRE_ONBOARDED_CLOUD]`, comes back as
+//! ZIGBEE_QR_BAR_CODE, DISCOVERED_DEVICE, PRE_ONBOARDED_CLOUD]`, is listed
 //! `[PRE_ONBOARDED_CLOUD, ZIGBEE_QR_BAR_CODE, ZWAVE_QR_BAR_CODE, WIFI_SETUP_QR_BAR_CODE,
-//! DISCOVERED_DEVICE, CUSTOM_PROTOCOL_QR_BAR_CODE]` — not the declaration order, not its
-//! reverse (which would list `DISCOVERED_DEVICE` second, where the recording lists it
-//! fifth), not sorted either way, and not a hash order (a `java.util.HashSet` of
-//! `[FLEET_PROVISIONING, JITR]` iterates `FLEET_PROVISIONING` first, where the recording
-//! lists `JITR` first). Reversing the declaration therefore reproduces the two-value
-//! recording and contradicts the six-value one, and reproducing both would mean storing
-//! one permutation per enum, taken from one recording. The set, the member path, the
-//! requirement, the code and the status are what a caller can act on, and all of those
-//! are the framework's; the listing order stays the framework's too rather than being
-//! fitted to one recording.
+//! DISCOVERED_DEVICE, CUSTOM_PROTOCOL_QR_BAR_CODE]`, and `ProvisioningType`, declared
+//! `[FLEET_PROVISIONING, JITR]`, is listed `[JITR, FLEET_PROVISIONING]`. So the listing is
+//! recorded per enum ([`VALUE_LISTINGS`], [`listed`]) beside the ONE renderer every
+//! enum-constrained member of every operation reaches ([`clause`]), rather than in a
+//! handler or per operation.
 //!
-//! What IS pinned, in `tests/all/enum_value_set_rendering.rs`, is the part of the clause a
-//! rule produces: an out-of-set enum member is stated with EXACTLY the value set the model
-//! declares for it — every declared value once, nothing undeclared, the same set whichever
-//! operation, binding or rejected value reached it — rendered `[a, b, c]`.
+//! A listing is identified by the SET it orders — which is what a violation carries, a
+//! clause having no shape id — and is applied only to an enum whose admitted set it is a
+//! permutation of. It therefore cannot add a value this model does not declare nor drop
+//! one it does; it reaches that enum through every operation, every binding (body, URI
+//! label, query string), a nested path and a handler's own second-line check alike; and an
+//! enum whose membership the model changes stops matching a stale listing and states the
+//! model's order rather than an outdated set. An enum with no recorded listing keeps the
+//! order the member schema carries, which is the model's declaration order: no order over
+//! the model reproduces both recorded listings — reversing the declaration gives the
+//! two-value one but lists `DISCOVERED_DEVICE` second where the recording lists it fifth,
+//! and a hashed set's bucket order (`java.util.HashSet` over `[FLEET_PROVISIONING, JITR]`)
+//! iterates `FLEET_PROVISIONING` first where the recording lists `JITR` first — so there
+//! is no rule to extend to an enum nothing recorded.
+//!
+//! `tests/all/enum_value_set_listing.rs` pins the order both halves state, and
+//! `tests/all/enum_value_set_rendering.rs` the membership: an out-of-set enum member is
+//! stated with EXACTLY the value set the model declares for it — every declared value
+//! once, nothing undeclared, the same set whichever operation, binding or rejected value
+//! reached it — rendered `[a, b, c]`.
 //!
 //! Everything else about the clause — which constraint classes exist and how each one
 //! words its requirement — stays the framework's, so a constraint class added there
@@ -393,6 +404,10 @@ fn validation_exception(
 /// clause's own opening. A violation with no value to echo (a `@required` member absent)
 /// is left exactly as the framework words it.
 fn clause(violation: &Violation) -> String {
+    // An enum clause lists the value set in the order THIS SERVICE lists that enum's
+    // values; every other class is worded exactly as the framework words it.
+    let relisted = relisted(violation);
+    let violation = relisted.as_ref().unwrap_or(violation);
     let clause = violation.message();
     match violation.value.as_deref() {
         Some(value) => clause.replacen(
@@ -402,6 +417,82 @@ fn clause(violation: &Violation) -> String {
         ),
         None => clause,
     }
+}
+
+/// The order this service states an enum's admitted values in, for the enums whose
+/// refusals are recorded publishing a listing.
+///
+/// This is service metadata the public model does not carry: a Smithy enum declares a
+/// membership, and the order a refusal lists it in is the service's own (see the module
+/// docs, which show that no order over the model — declaration, reversed, sorted, by
+/// length, by a hashed set's buckets — reproduces both recorded listings). So the only
+/// source for a listing is what the service's refusals state, and a listing is recorded
+/// here, beside the one renderer every enum-constrained member of every operation reaches,
+/// rather than in an operation handler.
+///
+/// A listing is identified by the SET it orders — the violation carries the set, not a
+/// shape id — and so is applied ONLY to an enum whose admitted set it is a permutation of:
+/// it can neither add a value this model does not declare nor drop one it does, and an
+/// enum whose membership the model changes stops matching a stale listing and states the
+/// model's order again. Each set below is declared by exactly one enum of this model, so a
+/// listing reaches the enum it was recorded for and no other.
+const VALUE_LISTINGS: &[&[&str]] = &[
+    // `AuthMaterialType` (`CreateManagedThing.AuthenticationMaterialType`), which the
+    // model declares `[CUSTOM_PROTOCOL_QR_BAR_CODE, WIFI_SETUP_QR_BAR_CODE,
+    // ZWAVE_QR_BAR_CODE, ZIGBEE_QR_BAR_CODE, DISCOVERED_DEVICE, PRE_ONBOARDED_CLOUD]`.
+    &[
+        "PRE_ONBOARDED_CLOUD",
+        "ZIGBEE_QR_BAR_CODE",
+        "ZWAVE_QR_BAR_CODE",
+        "WIFI_SETUP_QR_BAR_CODE",
+        "DISCOVERED_DEVICE",
+        "CUSTOM_PROTOCOL_QR_BAR_CODE",
+    ],
+    // `ProvisioningType` (`CreateProvisioningProfile.ProvisioningType`), which the model
+    // declares `[FLEET_PROVISIONING, JITR]`.
+    &["JITR", "FLEET_PROVISIONING"],
+];
+
+/// The same violation with its enum value set in the order this service lists that enum's
+/// values, or `None` when there is nothing to re-list: a violation of another class, or an
+/// enum this service publishes no listing for — which keeps the order the member schema
+/// carries, the model's.
+///
+/// The clause itself is still rendered by the framework ([`Violation::message`]), so only
+/// the ORDER of the set is this service's; the requirement's wording, the path and the
+/// envelope stay in one place.
+fn relisted(violation: &Violation) -> Option<Violation> {
+    let ViolationKind::EnumValue(allowed) = &violation.kind else {
+        return None;
+    };
+    let declared: Vec<&str> = allowed.iter().map(String::as_str).collect();
+    let listing = listed(&declared)?;
+    Some(Violation {
+        path: violation.path.clone(),
+        kind: ViolationKind::EnumValue(listing.iter().map(|value| (*value).to_string()).collect()),
+        value: violation.value.clone(),
+    })
+}
+
+/// The listing this service publishes for the enum admitting exactly `declared`, or `None`
+/// when it publishes none.
+fn listed(declared: &[&str]) -> Option<&'static [&'static str]> {
+    VALUE_LISTINGS
+        .iter()
+        .copied()
+        .find(|listing| orders_the_same_set(listing, declared))
+}
+
+/// Whether two value lists hold the same values, in whatever order each holds them.
+fn orders_the_same_set(one: &[&str], other: &[&str]) -> bool {
+    if one.len() != other.len() {
+        return false;
+    }
+    let mut one: Vec<&str> = one.to_vec();
+    let mut other: Vec<&str> = other.to_vec();
+    one.sort_unstable();
+    other.sort_unstable();
+    one == other
 }
 
 /// `violations` as this service states them, or `None` when there is nothing to state.
@@ -442,9 +533,9 @@ fn stated(violations: &[Violation]) -> Option<String> {
 /// published, which also keeps a `@sensitive` member's value out of the body.
 ///
 /// `member_path` is the wire (lowerCamel) path the clause names, and `allowed` is the
-/// member's declared value set. The ORDER `allowed` is listed in is not part of the
-/// contract (see the module docs), so a caller passes whatever list of the member's
-/// declared values it holds; the SET is what a caller acts on.
+/// member's declared value set, in whatever order the caller holds it: the clause states it
+/// in the order this service lists that enum's values ([`VALUE_LISTINGS`]), so a handler's
+/// second line and the walk in front of it state one refusal identically.
 pub(crate) fn enum_value_set_refusal(member_path: &str, allowed: &[&str], rejected: &str) -> String {
     let violation = Violation {
         path: member_path.to_string(),

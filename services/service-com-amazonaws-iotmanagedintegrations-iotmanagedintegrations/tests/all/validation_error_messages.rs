@@ -124,9 +124,9 @@ struct Case {
     rejected_value: Option<String>,
 }
 
-/// The opening of the requirement clause for an enum value set. The set's RENDERING is
-/// the framework's and its order is the model's declaration order, which a value set
-/// does not fix; that every declared value appears is asserted in
+/// The opening of the requirement clause for an enum value set. The set's RENDERING is the
+/// framework's and the order it lists is pinned in `tests/all/enum_value_set_listing.rs`;
+/// that every declared value appears is asserted in
 /// [`an_enum_refusal_names_every_value_the_model_declares`].
 const ENUM_VALUE_SET_CLAUSE: &str = "Member must satisfy enum value set: [";
 

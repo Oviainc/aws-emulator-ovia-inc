@@ -31,6 +31,8 @@ mod default_encryption_configuration;
 mod destination_lifecycle;
 #[path = "all/device_discovery_lifecycle.rs"]
 mod device_discovery_lifecycle;
+#[path = "all/enum_value_set_listing.rs"]
+mod enum_value_set_listing;
 #[path = "all/enum_value_set_rendering.rs"]
 mod enum_value_set_rendering;
 #[path = "all/event_log_configuration_lifecycle.rs"]

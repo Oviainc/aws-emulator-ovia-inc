@@ -10,17 +10,10 @@
 //! (body, URI label, query string) carried the member, not on how deeply nested the
 //! member is, not on the rejected value, and not on how many times the call is made.
 //!
-//! The ORDER inside the brackets is NOT part of the contract, so every assertion here
-//! compares the stated set as a SET. A Smithy enum's value set is a set: the model fixes
-//! no listing order, AWS documents none, and the two orders recorded from this service
-//! are not produced by any rule over the model —
-//! `AuthMaterialType`, declared `[CUSTOM_PROTOCOL_QR_BAR_CODE, WIFI_SETUP_QR_BAR_CODE,
-//! ZWAVE_QR_BAR_CODE, ZIGBEE_QR_BAR_CODE, DISCOVERED_DEVICE, PRE_ONBOARDED_CLOUD]`
-//! (`smithy_query(query="shape",shape="AuthMaterialType")`), was recorded as
-//! `[PRE_ONBOARDED_CLOUD, ZIGBEE_QR_BAR_CODE, ZWAVE_QR_BAR_CODE, WIFI_SETUP_QR_BAR_CODE,
-//! DISCOVERED_DEVICE, CUSTOM_PROTOCOL_QR_BAR_CODE]`, which is neither the declaration
-//! order, nor its reverse (that lists `DISCOVERED_DEVICE` second, the recording lists it
-//! fifth), nor sorted either way. See `src/service.rs`'s module docs.
+//! This suite is about the MEMBERSHIP a clause states, so every assertion here compares
+//! the stated set as a SET. The ORDER it is listed in is a property of the enum and is
+//! pinned by the sibling suite `tests/all/enum_value_set_listing.rs`, which this file
+//! lends its readers to.
 //!
 //! The rows below span the class the rule generalises over: fourteen enum-typed members
 //! on nine operations, with set sizes from one value to eleven, values in SCREAMING_SNAKE
@@ -91,17 +84,21 @@ const OTA_TYPE_VALUES: &[&str] = &["ONE_TIME", "CONTINUOUS"];
 const OTA_PROTOCOL_VALUES: &[&str] = &["HTTP"];
 
 /// One HTTP answer, reduced to what the assertions read.
-struct Reply {
-    status: u16,
+///
+/// `pub(crate)` because `tests/all/enum_value_set_listing.rs` — the suite for the ORDER a
+/// clause lists a set in — drives its rows through these same readers rather than through a
+/// second copy of them.
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     /// The restJson1 error code, from `x-amzn-errortype`.
-    error_type: Option<String>,
-    body: Value,
+    pub(crate) error_type: Option<String>,
+    pub(crate) body: Value,
 }
 
 /// A router holding one `iotmanagedintegrations` service over a fresh shared engine: the
 /// same assembly `core/router` performs, with one service mounted. Mirrors the harness
 /// the sibling suites in this crate use.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     // The signature itself is not under test here, so requests are unauthenticated.
     router.set_request_authentication(false);
@@ -111,7 +108,7 @@ fn emulator() -> MultiServiceRouter {
 
 /// Send one request and reduce the answer. The `Authorization` credential scope is what
 /// routes the request to this service.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     path_and_query: &str,
@@ -155,7 +152,7 @@ async fn call(
 }
 
 /// The refusal prose, from the member the model names `Message`.
-fn refusal_message(reply: &Reply, label: &str) -> String {
+pub(crate) fn refusal_message(reply: &Reply, label: &str) -> String {
     reply
         .body
         .get("Message")
@@ -173,7 +170,7 @@ fn refusal_message(reply: &Reply, label: &str) -> String {
 /// The value set the refusal states for `member_path`: the text between the `[` that opens
 /// that member's enum clause and the `]` that closes it, split on the `", "` the clause
 /// joins with. `None` when the message carries no enum clause for that member.
-fn stated_value_set(message: &str, member_path: &str) -> Option<Vec<String>> {
+pub(crate) fn stated_value_set(message: &str, member_path: &str) -> Option<Vec<String>> {
     let opening = format!(
         "at '{member_path}' failed to satisfy constraint: Member must satisfy enum value set: ["
     );
