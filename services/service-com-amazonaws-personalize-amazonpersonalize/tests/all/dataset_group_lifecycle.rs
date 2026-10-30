@@ -14,14 +14,16 @@
 
 use std::time::{Duration, Instant};
 
+use crate::refusal_wording::SCHEMA_IN_USE_MESSAGE;
+
 use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the test's SigV4 credential scope names; every minted ARN is scoped to it.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The statuses a dataset group or dataset reports before its create completes. Source:
 /// the model's own documentation for `CreateDatasetGroup` — "CREATE PENDING > CREATE
@@ -34,12 +36,12 @@ const ACTIVE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// One emulator over one shared engine, driven through the same `dispatch` the served
 /// socket path uses.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: std::sync::Arc<engine::InMemoryEngine> =
             std::sync::Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
@@ -54,7 +56,7 @@ impl Emulator {
     }
 
     /// Call `operation` with `body`, returning the HTTP status and the parsed response.
-    async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -84,7 +86,12 @@ impl Emulator {
     }
 
     /// Call an ARN-addressed operation, naming the ARN in `member`.
-    async fn call_with_arn(&self, operation: &str, member: &str, arn: &str) -> (u16, Value) {
+    pub(crate) async fn call_with_arn(
+        &self,
+        operation: &str,
+        member: &str,
+        arn: &str,
+    ) -> (u16, Value) {
         let mut body = Map::new();
         body.insert(member.to_string(), Value::String(arn.to_string()));
         self.call(operation, Value::Object(body)).await
@@ -92,7 +99,7 @@ impl Emulator {
 }
 
 /// The `__type` discriminator an awsJson error body carries, or `""`.
-fn error_code(body: &Value) -> &str {
+pub(crate) fn error_code(body: &Value) -> &str {
     body.get("__type").and_then(Value::as_str).unwrap_or("")
 }
 
@@ -159,7 +166,7 @@ async fn await_active(
 
 /// A minimal Avro record schema for `dataset_type`, in the Avro JSON format
 /// `CreateSchema` documents.
-fn avro_schema(dataset_type: &str) -> String {
+pub(crate) fn avro_schema(dataset_type: &str) -> String {
     json!({
         "type": "record",
         "name": dataset_type,
@@ -175,7 +182,12 @@ fn avro_schema(dataset_type: &str) -> String {
 }
 
 /// Create a schema and return its ARN.
-async fn create_schema(emulator: &Emulator, name: &str, schema: &str, case: &str) -> String {
+pub(crate) async fn create_schema(
+    emulator: &Emulator,
+    name: &str,
+    schema: &str,
+    case: &str,
+) -> String {
     let (status, body) = emulator
         .call("CreateSchema", json!({"name": name, "schema": schema}))
         .await;
@@ -190,7 +202,7 @@ async fn create_schema(emulator: &Emulator, name: &str, schema: &str, case: &str
 }
 
 /// Create a dataset group, wait for it to become `ACTIVE`, and return its ARN.
-async fn create_active_group(emulator: &Emulator, name: &str, case: &str) -> String {
+pub(crate) async fn create_active_group(emulator: &Emulator, name: &str, case: &str) -> String {
     let (status, body) = emulator
         .call("CreateDatasetGroup", json!({"name": name}))
         .await;
@@ -429,7 +441,7 @@ const SCHEMA_DELETE_CATALOG: &[SchemaDeleteRow] = &[
 ];
 
 /// The `message` an awsJson error body carries, or `""`.
-fn error_message(body: &Value) -> &str {
+pub(crate) fn error_message(body: &Value) -> &str {
     body.get("message")
         .or_else(|| body.get("Message"))
         .and_then(Value::as_str)
@@ -438,7 +450,7 @@ fn error_message(body: &Value) -> &str {
 
 /// Create a dataset of `dataset_type` against `schema_arn` in `group_arn`, and return its
 /// ARN.
-async fn create_dataset(
+pub(crate) async fn create_dataset(
     emulator: &Emulator,
     group_arn: &str,
     schema_arn: &str,
@@ -467,7 +479,13 @@ async fn create_dataset(
 }
 
 /// Assert `operation` on `arn` succeeds.
-async fn assert_deleted(emulator: &Emulator, operation: &str, member: &str, arn: &str, case: &str) {
+pub(crate) async fn assert_deleted(
+    emulator: &Emulator,
+    operation: &str,
+    member: &str,
+    arn: &str,
+    case: &str,
+) {
     let (status, body) = emulator.call_with_arn(operation, member, arn).await;
     assert_eq!(
         status, 200,
@@ -511,11 +529,9 @@ async fn a_schema_is_deleted_only_once_no_dataset_references_it() {
                 "case {case:?}: expected ResourceInUseException, got {body:?}"
             );
             let message = error_message(&body);
-            assert!(
-                message.contains(&schema_arn) && message.contains(&dataset_arn),
-                "case {case:?}: expected the message to name the schema {schema_arn} it \
-                 refused to delete and the dataset {dataset_arn} still referencing it, got \
-                 {message:?}"
+            assert_eq!(
+                message, SCHEMA_IN_USE_MESSAGE,
+                "case {case:?}: expected the service's fixed in-use wording, got {message:?}"
             );
 
             // The refused delete left the schema exactly where it was.

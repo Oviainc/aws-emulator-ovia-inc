@@ -156,10 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.schemas.contains_key(&input.schema_arn) {
             return Err(DeleteSchemaErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Resource not found: {schema_arn}",
-                        schema_arn = input.schema_arn
-                    )),
+                    message: Some(crate::state::schema_not_found_message(&input.schema_arn)),
                 },
             )
             .into());
@@ -169,24 +166,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // deleting a schema, you must delete all datasets referencing the schema": a
         // referenced schema is in use, so the delete is refused and leaves state
         // untouched rather than leaving those datasets naming a schema nobody can
-        // describe. The refusal names the schema and the datasets still holding it, both
-        // taken from the request and the store.
-        let referencing: Vec<&str> = state
+        // describe. Whether one dataset or many reference it, the refusal carries the one
+        // constant sentence this service words for the class
+        // ([`crate::state::SCHEMA_IN_USE_MESSAGE`]): the referencing ARNs stay out of the
+        // reply.
+        let referenced = state
             .datasets
             .values()
-            .filter(|record| record.schema_arn == input.schema_arn)
-            .map(|record| record.dataset_arn.as_str())
-            .collect();
-        if !referencing.is_empty() {
-            let message = format!(
-                "Schema {schema_arn} is in use by dataset(s) {referencing}. Before deleting a \
-                 schema, you must delete all datasets referencing the schema.",
-                schema_arn = input.schema_arn,
-                referencing = referencing.join(", ")
-            );
+            .any(|record| record.schema_arn == input.schema_arn);
+        if referenced {
             return Err(DeleteSchemaErrorModeled::ResourceInUseException(
                 ResourceInUseException {
-                    message: Some(message),
+                    message: Some(crate::state::SCHEMA_IN_USE_MESSAGE.to_string()),
                 },
             )
             .into());

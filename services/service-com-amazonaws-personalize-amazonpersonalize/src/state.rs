@@ -167,6 +167,31 @@ pub fn dataset_arn(region: &str, dataset_group_name: &str, dataset_type: &str) -
 }
 
 // ---------------------------------------------------------------------------
+// Refusal wording
+// ---------------------------------------------------------------------------
+//
+// Personalize words each refusal class itself, and the same class reads the same
+// whichever operation raised it, so the text lives here instead of being composed at the
+// rejection site. Only the parts the service itself varies are arguments.
+
+/// What a schema lookup that resolves to nothing answers, for the ARN the caller asked
+/// about: the one variable part of the sentence.
+pub fn schema_not_found_message(schema_arn: &str) -> String {
+    format!("Resource Arn {schema_arn} does not exist.")
+}
+
+/// What a schema delete still referenced by a dataset answers. The whole sentence is
+/// fixed: it names neither the schema nor the datasets holding it, however many there
+/// are, so a caller never learns the referencing ARNs from the refusal.
+pub const SCHEMA_IN_USE_MESSAGE: &str =
+    "The provided schema is being referenced by one or more datasets";
+
+/// What a dataset-group delete that still holds datasets answers — fixed in the same way,
+/// naming neither the group nor its datasets.
+pub const DATASET_GROUP_IN_USE_MESSAGE: &str =
+    "The provided dataset-group is being referenced by one or more datasets";
+
+// ---------------------------------------------------------------------------
 // The create-status clock
 // ---------------------------------------------------------------------------
 

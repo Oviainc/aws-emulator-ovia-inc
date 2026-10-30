@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/dataset_group_lifecycle.rs"]
 mod dataset_group_lifecycle;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

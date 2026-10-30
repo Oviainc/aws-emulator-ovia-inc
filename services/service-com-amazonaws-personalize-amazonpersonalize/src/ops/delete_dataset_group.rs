@@ -170,23 +170,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A group is a CONTAINER: "you must delete the datasets" it holds first, so a
         // group that still holds one is in use and the delete leaves state untouched
-        // rather than orphaning the datasets.
-        let held: Vec<&str> = state
+        // rather than orphaning the datasets. However many it holds, the refusal carries
+        // the one constant sentence this service words for the class
+        // ([`crate::state::DATASET_GROUP_IN_USE_MESSAGE`]).
+        let holds_datasets = state
             .datasets
             .values()
-            .filter(|record| record.dataset_group_arn == input.dataset_group_arn)
-            .map(|record| record.dataset_arn.as_str())
-            .collect();
-        if !held.is_empty() {
-            let message = format!(
-                "Dataset group {arn} still holds {count} dataset(s) ({held}); delete them first.",
-                arn = input.dataset_group_arn,
-                count = held.len(),
-                held = held.join(", ")
-            );
+            .any(|record| record.dataset_group_arn == input.dataset_group_arn);
+        if holds_datasets {
             return Err(DeleteDatasetGroupErrorModeled::ResourceInUseException(
                 ResourceInUseException {
-                    message: Some(message),
+                    message: Some(crate::state::DATASET_GROUP_IN_USE_MESSAGE.to_string()),
                 },
             )
             .into());

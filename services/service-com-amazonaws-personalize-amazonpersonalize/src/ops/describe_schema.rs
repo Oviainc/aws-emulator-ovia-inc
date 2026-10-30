@@ -144,10 +144,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = state.schemas.get(&input.schema_arn) else {
             return Err(DescribeSchemaErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Resource not found: {schema_arn}",
-                        schema_arn = input.schema_arn
-                    )),
+                    message: Some(crate::state::schema_not_found_message(&input.schema_arn)),
                 },
             )
             .into());
