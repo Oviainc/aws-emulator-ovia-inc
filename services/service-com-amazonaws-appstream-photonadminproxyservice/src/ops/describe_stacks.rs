@@ -148,7 +148,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     if !state.stacks.contains_key(name) {
                         return Err(DescribeStacksErrorModeled::ResourceNotFoundException(
                             ResourceNotFoundException {
-                                message: Some(format!("Stack not found: {name}")),
+                                message: Some(crate::state::resource_not_found_message(
+                                    crate::state::STACK_KIND,
+                                    name,
+                                )),
                             },
                         )
                         .into());

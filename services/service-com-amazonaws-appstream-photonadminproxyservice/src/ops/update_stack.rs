@@ -227,7 +227,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let record = state.stacks.get_mut(&input.name).ok_or_else(|| {
             UpdateStackErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("Stack not found: {}", input.name)),
+                message: Some(crate::state::resource_not_found_message(
+                    crate::state::STACK_KIND,
+                    &input.name,
+                )),
             })
         })?;
 

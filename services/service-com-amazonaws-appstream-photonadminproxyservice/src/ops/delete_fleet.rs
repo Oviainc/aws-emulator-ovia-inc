@@ -140,7 +140,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.fleets.contains_key(&input.name) {
             return Err(DeleteFleetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Fleet not found: {}", input.name)),
+                    message: Some(crate::state::resource_not_found_message(
+                        crate::state::FLEET_KIND,
+                        &input.name,
+                    )),
                 },
             )
             .into());
@@ -167,15 +170,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The refusal states the association and the remediation, and names no stack:
+        // AWS's sentence for a fleet a stack still uses does not enumerate the stacks.
         if state.fleet_is_associated(&input.name) {
-            let stacks = state.stacks_for_fleet(&input.name);
             return Err(DeleteFleetErrorModeled::ResourceInUseException(
                 ResourceInUseException {
-                    message: Some(format!(
-                        "Fleet {} is still associated with stack(s): {}",
-                        input.name,
-                        stacks.join(", ")
-                    )),
+                    message: Some(crate::state::fleet_in_use_by_stack_message(&input.name)),
                 },
             )
             .into());

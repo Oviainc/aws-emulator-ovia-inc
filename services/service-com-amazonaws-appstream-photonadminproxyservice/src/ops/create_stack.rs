@@ -201,7 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.stacks.contains_key(&input.name) {
             return Err(CreateStackErrorModeled::ResourceAlreadyExistsException(
                 ResourceAlreadyExistsException {
-                    message: Some(format!("Stack already exists: {}", input.name)),
+                    message: Some(crate::state::resource_already_exists_message(
+                        crate::state::STACK_KIND,
+                        &input.name,
+                    )),
                 },
             )
             .into());

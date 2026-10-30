@@ -141,7 +141,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.fleets.contains_key(&input.fleet_name) {
             return Err(DisassociateFleetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Fleet not found: {}", input.fleet_name)),
+                    message: Some(crate::state::resource_not_found_message(
+                        crate::state::FLEET_KIND,
+                        &input.fleet_name,
+                    )),
                 },
             )
             .into());
@@ -149,7 +152,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.stacks.contains_key(&input.stack_name) {
             return Err(DisassociateFleetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Stack not found: {}", input.stack_name)),
+                    message: Some(crate::state::resource_not_found_message(
+                        crate::state::STACK_KIND,
+                        &input.stack_name,
+                    )),
                 },
             )
             .into());

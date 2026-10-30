@@ -5,8 +5,9 @@
 //! The stack/fleet lifecycle lives here: `CreateStack`/`CreateFleet` write a record,
 //! `UpdateStack` applies the members it is given to the stored record and clears the
 //! fields its `AttributesToDelete` names, `DescribeStacks`/`DescribeFleets` render the
-//! stored record back, `AssociateFleet` records the fleet/stack edge, and
-//! `DeleteStack`/`DeleteFleet` refuse while an edge still names the resource.
+//! stored record back, `AssociateFleet` records the fleet/stack edge,
+//! `ListAssociatedFleets` reports the edges a stack has, and `DeleteStack`/`DeleteFleet`
+//! refuse while an edge still names the resource.
 //!
 //! Usage reporting lives here too: it is ONE account-and-Region-wide setting, so
 //! `CreateUsageReportSubscription` writes the single [`UsageReportSubscriptionRecord`]
@@ -69,6 +70,60 @@ pub fn limit_exceeded_message(store: &str) -> String {
     format!(
         "The requested limit exceeds the permitted limit for an account: \
          this emulator holds at most {MAX_RECORDS_PER_STORE} {store}"
+    )
+}
+
+/// The word AWS's refusal sentences use for a stack (`"stack"`), the `<kind>` slot of
+/// [`resource_not_found_message`] and [`resource_already_exists_message`].
+pub const STACK_KIND: &str = "stack";
+
+/// The word AWS's refusal sentences use for a fleet.
+pub const FLEET_KIND: &str = "fleet";
+
+/// AWS's `ResourceNotFoundException` sentence for a named control-plane resource:
+/// `The <kind> <name> for account <account id> does not exist.`
+///
+/// `kind` is the resource word ([`STACK_KIND`], [`FLEET_KIND`]) and `name` the name the
+/// request asked for; the account id is this emulator's own, so the sentence names the
+/// account that was searched rather than a value from any one run.
+pub fn resource_not_found_message(kind: &str, name: &str) -> String {
+    let account = ::emulator_server::emulator_account_id();
+    format!("The {kind} {name} for account {account} does not exist.")
+}
+
+/// AWS's `ResourceAlreadyExistsException` sentence for a name already taken:
+/// `The <kind> <name> for account <account id>  already exists. Use a unique name within
+/// an AWS region in your AWS account.`
+///
+/// The two spaces after the account id are AWS's: the sentence is built from a template
+/// whose slot between the account and `already exists` is empty, and the doubled space
+/// survives into the message clients see.
+pub fn resource_already_exists_message(kind: &str, name: &str) -> String {
+    let account = ::emulator_server::emulator_account_id();
+    format!(
+        "The {kind} {name} for account {account}  already exists. \
+         Use a unique name within an AWS region in your AWS account."
+    )
+}
+
+/// AWS's `ResourceInUseException` sentence for a fleet a stack still uses: it states the
+/// association and the remediation, and names no stack — AWS does not enumerate the
+/// stacks the fleet is associated with. The only variable part is the fleet name the
+/// request asked for.
+pub fn fleet_in_use_by_stack_message(fleet_name: &str) -> String {
+    format!(
+        "The fleet {fleet_name} is associated with a stack. To delete the fleet, \
+         you must dissociate it from the stack."
+    )
+}
+
+/// AWS's `ResourceInUseException` sentence for a stack that still has fleets associated
+/// with it: it states what blocks the delete and what makes a stack deletable, and names
+/// no fleet. The only variable part is the stack name the request asked for.
+pub fn stack_in_use_by_fleets_message(stack_name: &str) -> String {
+    format!(
+        "Cannot delete stack {stack_name}. This stack has fleets associated with it. \
+         Only stacks with no fleets associated with it can be deleted."
     )
 }
 
@@ -313,10 +368,9 @@ pub struct ComAmazonawsAppstreamPhotonadminproxyserviceState {
 }
 
 impl ComAmazonawsAppstreamPhotonadminproxyserviceState {
-    /// Whether any association still names this fleet. A predicate, so the common
-    /// (deletable) case walks the edges without allocating; the names themselves are
-    /// only materialised by [`stacks_for_fleet`](Self::stacks_for_fleet) on the
-    /// refusal path.
+    /// Whether any association still names this fleet. A predicate, not a list: an
+    /// in-use refusal states that the fleet is associated with a stack without naming
+    /// the stacks, so nothing needs the names materialised.
     pub fn fleet_is_associated(&self, fleet_name: &str) -> bool {
         self.fleet_stack_associations
             .range((fleet_name.to_string(), String::new())..)
@@ -332,17 +386,9 @@ impl ComAmazonawsAppstreamPhotonadminproxyserviceState {
             .any(|(_, stack)| stack == stack_name)
     }
 
-    /// The stacks the named fleet is associated with.
-    pub fn stacks_for_fleet(&self, fleet_name: &str) -> Vec<String> {
-        self.fleet_stack_associations
-            .range((fleet_name.to_string(), String::new())..)
-            .take_while(|(fleet, _)| fleet == fleet_name)
-            .map(|(_, stack)| stack.clone())
-            .collect()
-    }
-
-    /// The fleets associated with the named stack.
-    pub fn fleets_for_stack(&self, stack_name: &str) -> Vec<String> {
+    /// The fleets associated with the named stack, in the stable order a page of
+    /// `ListAssociatedFleets` walks.
+    pub fn fleets_for_stack(&self, stack_name: &str) -> BTreeSet<String> {
         self.fleet_stack_associations
             .iter()
             .filter(|(_, stack)| stack == stack_name)

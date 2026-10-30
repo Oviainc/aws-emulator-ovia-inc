@@ -143,21 +143,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.stacks.contains_key(&input.name) {
             return Err(DeleteStackErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Stack not found: {}", input.name)),
+                    message: Some(crate::state::resource_not_found_message(
+                        crate::state::STACK_KIND,
+                        &input.name,
+                    )),
                 },
             )
             .into());
         }
 
+        // The refusal states what blocks the delete and what makes a stack deletable,
+        // and names no fleet: AWS's sentence does not enumerate the associated fleets.
         if state.stack_is_associated(&input.name) {
-            let fleets = state.fleets_for_stack(&input.name);
             return Err(DeleteStackErrorModeled::ResourceInUseException(
                 ResourceInUseException {
-                    message: Some(format!(
-                        "Stack {} still has associated fleet(s): {}",
-                        input.name,
-                        fleets.join(", ")
-                    )),
+                    message: Some(crate::state::stack_in_use_by_fleets_message(&input.name)),
                 },
             )
             .into());

@@ -149,7 +149,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     if !state.fleets.contains_key(name) {
                         return Err(DescribeFleetsErrorModeled::ResourceNotFoundException(
                             ResourceNotFoundException {
-                                message: Some(format!("Fleet not found: {name}")),
+                                message: Some(crate::state::resource_not_found_message(
+                                    crate::state::FLEET_KIND,
+                                    name,
+                                )),
                             },
                         )
                         .into());

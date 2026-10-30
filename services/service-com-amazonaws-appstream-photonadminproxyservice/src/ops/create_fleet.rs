@@ -263,7 +263,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.fleets.contains_key(&input.name) {
             return Err(CreateFleetErrorModeled::ResourceAlreadyExistsException(
                 ResourceAlreadyExistsException {
-                    message: Some(format!("Fleet already exists: {}", input.name)),
+                    message: Some(crate::state::resource_already_exists_message(
+                        crate::state::FLEET_KIND,
+                        &input.name,
+                    )),
                 },
             )
             .into());
