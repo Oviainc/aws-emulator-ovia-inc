@@ -105,6 +105,8 @@ mod data_catalog;
 mod data_catalog_encryption_settings;
 #[path = "all/data_quality_rule_recommendation_runs.rs"]
 mod data_quality_rule_recommendation_runs;
+#[path = "all/data_quality_ruleset_updates.rs"]
+mod data_quality_ruleset_updates;
 #[path = "all/data_quality_rulesets.rs"]
 mod data_quality_rulesets;
 #[path = "all/database_listing.rs"]

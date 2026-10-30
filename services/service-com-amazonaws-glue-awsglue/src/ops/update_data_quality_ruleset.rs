@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDataQualityRuleset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDataQualityRuleset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDataQualityRuleset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Patches the data quality ruleset this account holds under the requested name
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::data_quality_rulesets`]), which is what
+//! `CreateDataQualityRuleset` stored: the members the request carries replace the stored
+//! ones, the members it omits are preserved, and the response projects the record as it
+//! now stands — which is what a later `GetDataQualityRuleset` of that name reports.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +159,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDataQualityRuleset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDataQualityRulesetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDataQualityRuleset"))
+        // Data quality rulesets live in one per-account namespace addressed by `Name`
+        // alone, so nothing here depends on the request's Region — exactly as
+        // `CreateDataQualityRuleset` and `GetDataQualityRuleset` read it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(
+                UpdateDataQualityRulesetErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the Glue data quality ruleset store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `Name` is `@required` with `length 1..255`, and the `Description` and `Ruleset`
+        // lengths are refused at the boundary — so the only question left is whether this
+        // account holds a ruleset under that name. That name is the whole address of one,
+        // and this request carries no member for it, so an update never moves it.
+        let Some(entry) = store.data_quality_rulesets.get_mut(&input.name) else {
+            return Err(
+                UpdateDataQualityRulesetErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        // The one wording this service gives a ruleset miss
+                        // ([`crate::state::messages::data_quality_ruleset_not_found`]),
+                        // shared with every operation that addresses a ruleset by name.
+                        message: Some(crate::state::messages::data_quality_ruleset_not_found(
+                            &input.name,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A request that names no member to change asks for no change, so nothing is
+        // written and the ruleset's `LastModifiedOn` stays where the last write that did
+        // change something put it.
+        if crate::state::data_quality_ruleset_update_names_a_change(&input) {
+            entry.apply_update(&input, now);
+            ::tracing::info!(
+                operation = "UpdateDataQualityRuleset",
+                ruleset = %input.name,
+                "updated a Glue data quality ruleset"
+            );
+        }
+
+        // Every member comes from the record as it now stands, so this response reports
+        // exactly what a later `GetDataQualityRuleset` of this name will: a ruleset no
+        // write has given a description reports none rather than an empty string.
+        Ok(UpdateDataQualityRulesetOutput {
+            name: Some(entry.name.clone()),
+            description: entry.description.clone(),
+            ruleset: Some(entry.ruleset.clone()),
+        })
     }
 }

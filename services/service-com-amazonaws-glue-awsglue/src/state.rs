@@ -293,7 +293,8 @@ use crate::ops::types::{
     Trigger, TriggerNodeDetails,
     Tag, TargetProcessingProperties, TargetTableConfig,
     TriggerUpdate,
-    UpdateClassifierInput, UpdateCrawlerInput, UpdateGlossaryInput, UpdateMLTransformInput,
+    UpdateClassifierInput, UpdateCrawlerInput, UpdateDataQualityRulesetInput, UpdateGlossaryInput,
+    UpdateMLTransformInput,
     UpdateWorkflowInput,
     Workflow, WorkflowGraph,
     WorkflowRun,
@@ -13946,6 +13947,42 @@ impl DataQualityRulesetEntry {
                 .as_ref()
                 .map_or(self.tags.is_empty(), |tags| &self.tags == tags)
     }
+
+    /// Apply an `UpdateDataQualityRuleset` request to this stored ruleset, member by
+    /// member, as served at `now`.
+    ///
+    /// Every member the request CARRIES replaces the stored one and every member it OMITS
+    /// is preserved: "updates the specified data quality ruleset"
+    /// (`UpdateDataQualityRuleset`) names no required member beyond the `Name` that
+    /// addresses the ruleset, so the request is a patch over the definition the create
+    /// registered rather than a replacement for it.
+    ///
+    /// The members `UpdateDataQualityRulesetRequest` has NO member for are not this
+    /// request's to change: the target table, the security configuration, the creation
+    /// instant, the recommendation run id, the create's client token and its tags all stay
+    /// as they are. `LastModifiedOn` becomes `now`, since it is "the last point in time
+    /// when this data quality ruleset was modified"
+    /// (`GetDataQualityRulesetResponse$LastModifiedOn`).
+    pub fn apply_update(&mut self, input: &UpdateDataQualityRulesetInput, now: SystemTime) {
+        if let Some(description) = input.description.as_ref() {
+            self.description = Some(description.clone());
+        }
+        if let Some(ruleset) = input.ruleset.as_ref() {
+            self.ruleset = ruleset.clone();
+        }
+        self.last_modified_on = now;
+    }
+}
+
+/// Whether an `UpdateDataQualityRuleset` request names a member to change at all.
+///
+/// `Description` and `Ruleset` are the only members of that request other than the `Name`
+/// addressing the ruleset, and both are optional, so a request carrying neither asks for no
+/// change: nothing is written, so the ruleset's `LastModifiedOn` stays where the last write
+/// that did change something put it — the same way an `UpdateMLTransform` naming no member
+/// leaves its transform's ([`ml_transform_update_names_a_change`]).
+pub fn data_quality_ruleset_update_names_a_change(input: &UpdateDataQualityRulesetInput) -> bool {
+    input.description.is_some() || input.ruleset.is_some()
 }
 
 /// Whether two optional `DataQualityTargetTable` values address the same Glue table. The
