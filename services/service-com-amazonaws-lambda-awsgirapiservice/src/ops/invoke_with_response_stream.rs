@@ -204,16 +204,27 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
     /// record is value-free: the signing name, the operation, the access-key id the
     /// request presented (the public half of a credential, never a secret) and the status
     /// answered — never a payload, a header value or a credential secret.
+    ///
+    /// An error this operation answers names the CLASS of its fault in the `Type` member
+    /// every error shape of this model declares, exactly as every other modelled operation
+    /// of this service does (`crate::service::fault_class`). The class is a property of the
+    /// failure rather than of the raise site, so it is named here — the one place this
+    /// operation's whole rendered response passes through, because the wrapper that names it
+    /// for the rest of the surface serves only operations the generated routing table holds,
+    /// which this `@streaming`-output one is not. A success (a dry run, an event stream)
+    /// reports no failure and is answered untouched.
     fn serve_request(
         &self,
         protocol: &dyn ServerHttpProtocol,
         req: &RtRequest,
         ctx: &OperationContext<'_>,
     ) -> RtResponse {
-        let response = match self.invoke(protocol, req, ctx) {
-            Ok(response) => response,
-            Err(error) => error_response(protocol, &error),
-        };
+        let response = crate::service::fault_class::with_fault_class(
+            match self.invoke(protocol, req, ctx) {
+                Ok(response) => response,
+                Err(error) => error_response(protocol, &error),
+            },
+        );
         tracing::info!(
             service = ctx.identity().signing_name(),
             operation = OPERATION_NAME,

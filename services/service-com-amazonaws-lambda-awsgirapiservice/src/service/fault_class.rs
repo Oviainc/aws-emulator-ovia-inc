@@ -44,25 +44,29 @@
 //! (`src/service/error_message_member.rs`) and
 //! `service-com-amazonaws-connecthealth-connecthealth` (`src/service/error_detail.rs`);
 //! only the member and the value differ. The structural home for it is the error renderer
-//! itself, which is in the agent-immutable `vendor/` tree, so this service states it at
-//! the one seam that can see a whole rendered response: the operation wrapper every
-//! modelled operation is served behind.
+//! itself, which is in the agent-immutable `vendor/` tree, so this service states it at the
+//! seams that can see a whole rendered response: the operation wrapper every generated
+//! modelled operation is served behind, and the one hand-written entry served outside that
+//! wrapper (see below).
 //!
 //! # What it does NOT reach
 //!
-//! That wrapper is this service's modelled-operation surface, so three answers are
+//! That wrapper is this service's GENERATED modelled-operation surface, so two answers are
 //! outside it and keep the envelope their own renderer wrote:
 //!
 //! * the DOWNLOAD plane (`crate::service::Downloads`), which serves a deployment package
 //!   or a layer archive rather than a modelled operation — its refusals are object-fetch
 //!   refusals, not Lambda API errors, so a Lambda error shape's member has no place in
 //!   them;
-//! * `InvokeWithResponseStream`, served by its own hand-written entry because its output
-//!   binds a `@streaming` union — its modelled errors would carry the class on the same
-//!   terms, and that entry is where the same call would go;
 //! * the routing-error and framework-error paths, which answer a request that named no
 //!   modelled operation or failed at the transport, so no error shape of this model is
 //!   what they render.
+//!
+//! `InvokeWithResponseStream` is a modelled operation the wrapper does not serve — its
+//! output binds a `@streaming` union, so it is served by its own hand-written entry — and
+//! its errors are error shapes of this model like any other, so that entry names the class
+//! on them through [`with_fault_class`] itself
+//! (`crate::ops::invoke_with_response_stream`).
 //!
 //! And one answer inside that surface is held back from it deliberately: the OPAQUE
 //! refusal of a service-minted token (`crate::service::opaque_members`), whose recorded

@@ -12,14 +12,21 @@
 //!
 //! The rows differ along what the rule generalises over: the status of the refusal (each
 //! one this service's modelled client errors are answered at), the operation that answers
-//! it, the error code it carries, and whether the refusal came from a handler or from the
-//! boundary walk that refuses a request before any handler runs.
+//! it, the error code it carries, whether the refusal came from a handler or from the
+//! boundary walk that refuses a request before any handler runs, and which of this
+//! service's two serving seams answered it — the wrapper every generated operation is
+//! served behind, and the hand-written entry that serves the one operation whose output
+//! binds a `@streaming` union.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine as _;
 use serde_json::{json, Value};
-use service_com_amazonaws_lambda_awsgirapiservice::service::fault_class::USER_FAULT;
+use service_com_amazonaws_lambda_awsgirapiservice::service::fault_class::{
+    SERVICE_FAULT, USER_FAULT,
+};
+use service_com_amazonaws_lambda_awsgirapiservice::state::ACTIVATION_DELAY;
 use service_com_amazonaws_lambda_awsgirapiservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -61,13 +68,32 @@ async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: &Value
     } else {
         serde_json::to_vec(body).expect("the test request body must serialize")
     };
-    let request = http::Request::builder()
+    dispatch(router, method, uri, &payload, &[]).await
+}
+
+/// Dispatch one request with the bytes and headers given, and answer its status and body.
+///
+/// The response-streaming route binds its `Payload` as the `@httpPayload`, so a row that
+/// drives it states the body as BYTES — which is also how a body that is not JSON at all
+/// reaches the handler — and names its invocation type in the modelled header.
+async fn dispatch(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    payload: &[u8],
+    headers: &[(&str, &str)],
+) -> (u16, Value) {
+    let mut builder = http::Request::builder()
         .method(method)
         .uri(format!("http://lambda.us-east-1.amazonaws.com{uri}"))
         .header("host", "lambda.us-east-1.amazonaws.com")
         .header("authorization", AUTHORIZATION)
-        .header("content-type", "application/json")
-        .body(bytes::Bytes::from(payload))
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder
+        .body(bytes::Bytes::from(payload.to_vec()))
         .expect("the test request must build");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
@@ -107,6 +133,22 @@ async fn create_function(router: &MultiServiceRouter, name: &str) {
         status, 201,
         "CreateFunction {name:?} must succeed, got {status} with {body}"
     );
+}
+
+/// One row driving the response-streaming entry: how the request addresses the function,
+/// what it carries, and the failure it must be answered with.
+struct StreamCase {
+    name: &'static str,
+    /// The `{FunctionName}` label the request addresses.
+    reference: String,
+    /// The `@httpPayload` bytes, which may be no JSON event at all.
+    payload: &'static [u8],
+    /// The `X-Amz-Invocation-Type` header the request carries, if any.
+    invocation_type: Option<&'static str>,
+    /// The status the answer must carry.
+    status: u16,
+    /// The class that status puts on the body.
+    class: &'static str,
 }
 
 /// One row: a request that is refused, and the status it is refused at.
@@ -215,6 +257,144 @@ async fn every_refusal_names_the_class_of_its_fault() {
             "case {label:?}: the refusal must still carry its message: {body}"
         );
     }
+}
+
+/// The OTHER serving seam of this service: `InvokeWithResponseStream`, whose
+/// `@streaming`-union output means it is served by its own hand-written entry rather than
+/// behind the wrapper every generated operation is served behind. Its errors are error
+/// shapes of this model like any other, so they name the class of their fault on the same
+/// terms — a 4xx the caller can fix is a `User` fault, and the 5xx this emulator answers
+/// for a run it cannot perform is a `Service` one.
+///
+/// The rows differ along what the rule generalises over: the status, the error code,
+/// whether the refusal was raised by the handler or by the boundary walk the entry drives
+/// before it, and the class the status puts on it.
+#[tokio::test]
+async fn the_response_streaming_entry_names_the_class_of_its_fault() {
+    /// How long past a due instant this test calls. The transition is owed by the CLOCK, so
+    /// nothing here sleeps on the emulator's behalf.
+    const SLACK: Duration = Duration::from_millis(100);
+
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+    let function = "fault-class-stream";
+    create_function(&router, function).await;
+
+    /// The route `InvokeWithResponseStream` is bound to, for the function `reference`.
+    fn invocations(reference: &str) -> String {
+        format!("/2021-11-15/functions/{reference}/response-streaming-invocations")
+    }
+
+    // Inside the provisioning window the invocation is refused on the function's state
+    // ("During this time, you can't invoke or modify the function"), which is the one row
+    // that has to run before the clock makes the function active.
+    let pending = dispatch(&router, "POST", &invocations(function), b"{}", &[]).await;
+    assert_eq!(
+        pending.0, 409,
+        "case an invocation inside the provisioning window: expected 409, got {} with {}",
+        pending.0, pending.1
+    );
+    assert_eq!(
+        pending.1.get(FAULT_CLASS).and_then(Value::as_str),
+        Some(USER_FAULT),
+        "case an invocation inside the provisioning window: expected the class {USER_FAULT}, \
+         got {}",
+        pending.1
+    );
+    tokio::time::sleep(ACTIVATION_DELAY + SLACK).await;
+
+    let rows = vec![
+        StreamCase {
+            name: "a response-streaming invocation of a function that does not exist",
+            reference: "absent-stream-function".to_string(),
+            payload: b"{}",
+            invocation_type: None,
+            status: 404,
+            class: USER_FAULT,
+        },
+        StreamCase {
+            name: "a payload that is not the JSON event the function takes",
+            reference: function.to_string(),
+            payload: b"not-json",
+            invocation_type: None,
+            status: 400,
+            class: USER_FAULT,
+        },
+        StreamCase {
+            // Refused by the boundary walk the entry drives against the model, before the
+            // handler reads anything: `ResponseStreamingInvocationType` is
+            // `RequestResponse | DryRun`.
+            name: "an invocation type outside the modelled enum",
+            reference: function.to_string(),
+            payload: b"{}",
+            invocation_type: Some("Event"),
+            status: 400,
+            class: USER_FAULT,
+        },
+        StreamCase {
+            // Running the deployment package is the one path this emulator cannot serve,
+            // and a failure inside the service names the other class.
+            name: "the run of a deployment package this emulator has no runtime for",
+            reference: function.to_string(),
+            payload: b"{}",
+            invocation_type: Some("RequestResponse"),
+            status: 501,
+            class: SERVICE_FAULT,
+        },
+    ];
+
+    for case in rows {
+        let label = case.name;
+        let headers: Vec<(&str, &str)> = case
+            .invocation_type
+            .map(|value| vec![("x-amz-invocation-type", value)])
+            .unwrap_or_default();
+        let (answered, body) = dispatch(
+            &router,
+            "POST",
+            &invocations(&case.reference),
+            case.payload,
+            &headers,
+        )
+        .await;
+        assert_eq!(
+            answered, case.status,
+            "case {label:?}: expected {}, got {answered} with {body}",
+            case.status
+        );
+        assert_eq!(
+            body.get(FAULT_CLASS).and_then(Value::as_str),
+            Some(case.class),
+            "case {label:?}: expected the class {}, got {body}",
+            case.class
+        );
+        // The class travels BESIDE the text, never instead of it.
+        assert!(
+            body.get("message")
+                .or_else(|| body.get("Message"))
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty()),
+            "case {label:?}: the refusal must still carry its message: {body}"
+        );
+    }
+
+    // And a success of the same entry names no class at all: a dry run reports no failure.
+    let (dry_run, body) = dispatch(
+        &router,
+        "POST",
+        &invocations(function),
+        b"{}",
+        &[("x-amz-invocation-type", "DryRun")],
+    )
+    .await;
+    assert_eq!(
+        dry_run, 204,
+        "case a dry run: expected the documented dry-run status, got {dry_run} with {body}"
+    );
+    assert!(
+        body.is_null(),
+        "case a dry run: nothing ran, so the answer carries no body at all, got {body}"
+    );
 }
 
 /// A success is not a failure: nothing adds a fault class to a body this service answered
