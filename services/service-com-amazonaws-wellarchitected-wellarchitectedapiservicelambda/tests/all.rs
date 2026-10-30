@@ -89,6 +89,9 @@ mod get_answer_reads;
 #[path = "all/get_lens.rs"]
 mod get_lens;
 
+#[path = "all/import_lens_token_parameters.rs"]
+mod import_lens_token_parameters;
+
 #[path = "all/lens_listing.rs"]
 mod lens_listing;
 
