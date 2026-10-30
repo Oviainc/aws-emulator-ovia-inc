@@ -124,8 +124,17 @@ fn encode_page_token(region_name: &str) -> String {
 /// The Region code a `NextToken` resumes after, or `None` when the token is not one
 /// this operation could have issued — one minted elsewhere resumes nothing here and is
 /// refused rather than silently ignored.
+///
+/// A token is accepted only when it is byte-for-byte the one
+/// [`encode_page_token`] would have minted for the Region it names: decoding alone is
+/// not enough, because `hex::decode` also accepts spellings this operation never emits
+/// (upper- and mixed-case digits), and any such spelling would otherwise resume a walk
+/// from a position the operation never offered.
 fn decode_page_token(token: &str) -> Option<String> {
     let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    if encode_page_token(&decoded) != token {
+        return None;
+    }
     crate::state::catalog_region_status(&decoded).map(|_| decoded)
 }
 

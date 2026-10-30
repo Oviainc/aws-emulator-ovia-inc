@@ -33,6 +33,8 @@ mod no_primary_email_update_refusal;
 mod one_time_passcode_confirmation;
 #[path = "all/own_account_target_refusal.rs"]
 mod own_account_target_refusal;
+#[path = "all/pagination_token_spelling.rs"]
+mod pagination_token_spelling;
 #[path = "all/pattern_validation_messages.rs"]
 mod pattern_validation_messages;
 #[path = "all/phone_number_verification.rs"]
