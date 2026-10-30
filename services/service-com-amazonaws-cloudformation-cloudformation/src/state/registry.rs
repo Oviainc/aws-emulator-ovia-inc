@@ -416,6 +416,25 @@ pub fn next_minor_version_number(latest: &str) -> Option<String> {
     Some(format!("{major}.{}.0", minor.checked_add(1)?))
 }
 
+/// Whether an ARN's ACCOUNT segment is this account's — the account every ARN this emulator
+/// mints carries ([`::emulator_server::emulator_account_id`]).
+///
+/// An ARN spells the account that owns what it addresses in its fifth colon-separated segment
+/// (`arn:<partition>:<service>:<region>:<account>:<resource>`), and the modelled
+/// `PrivateTypeArn` requires twelve digits there. An ARN carrying another account's id
+/// addresses nothing of THIS account, so it is not an ARN this registry reads any further —
+/// what it names cannot be resolved "in your account" at all. `false` for a public
+/// extension's ARN too, whose account segment is empty ([`public_type_arn`]).
+///
+/// What this is for: an account-scoped ARN of this account is one CloudFormation parses
+/// itself, so the rules about the segments it carries — the version a registry ARN pins past
+/// the extension's name ([`split_version_arn`]) — are read from the ARN alone, before the
+/// registry is consulted, while an ARN of another account only ever reaches the
+/// account-scoped existence refusal.
+pub fn arn_names_this_account(arn: &str) -> bool {
+    arn.split(':').nth(4) == Some(::emulator_server::emulator_account_id())
+}
+
 /// Split an ARN that MAY name one version of an extension into the extension's own ARN and
 /// that version id.
 ///

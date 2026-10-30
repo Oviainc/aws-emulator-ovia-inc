@@ -4,13 +4,13 @@
 //! public extension of this Region.
 //!
 //! The rule every case here holds the service to: **`PublishType` RESOLVES the extension a
-//! request identifies — by `Arn`, whatever the ARN carries after the extension it addresses,
-//! or by `Type` and `TypeName` — against the registry of THIS account and Region before it
-//! reads any rule about the caller or about which version may be published, refusing an
-//! identifier that resolves to no record of this account and Region with the registry's
-//! modelled `CFNRegistryException` (400) and its fixed not-registered sentence; for a record
-//! that DOES resolve it publishes the DEFAULT version of a PRIVATE registration — never a
-//! version the request picked, so an `Arn` that pins one is refused that same modelled 400 —
+//! request identifies — by `Arn`, or by `Type` and `TypeName` — against the registry of THIS
+//! account and Region before it reads any rule about the caller, refusing an identifier that
+//! resolves to no record of this account and Region with the registry's modelled
+//! `CFNRegistryException` (400) and its fixed not-registered sentence; for a record that DOES
+//! resolve it publishes the DEFAULT version of a PRIVATE registration — never a version the
+//! request picked, so an `Arn` of this account that pins one is refused that same modelled 400
+//! from the ARN alone (`publish_type_version_in_arn.rs` is the table for that rule) —
 //! for a CALLER that holds a CloudFormation extension-publisher registration, writing a
 //! PUBLIC extension record of that Region which carries the published version under the
 //! public version number the publication is assigned (`1.0.0` for a publisher's first
@@ -29,9 +29,8 @@
 //! registered in another), over each contract-test status a default version can carry, and
 //! over every way a publication's version number can be decided (assigned first, incremented,
 //! named by the request, already published). The recorded trace this suite was written for is
-//! ONE row of the ordering table: a publication addressed by a version ARN of an extension
-//! registered in no account, which is answered the not-registered refusal rather than the
-//! version-shape one.
+//! ONE row of the ordering table: a publication addressed by an ARN of an account other than
+//! this one, which is answered the not-registered refusal.
 //!
 //! `RegisterType`, the registry's one WRITER still a scaffold stub, has an issue of its own,
 //! so the records published here are the ones
@@ -212,10 +211,10 @@ fn hook_arn() -> String {
     type_arn(REGION, registry_type::HOOK, "My::Sample::Hook")
 }
 
-/// The refusal AWS answers a request whose `Arn` names a version is read against the record
-/// that ARN RESOLVES, so it holds for an extension this account registered whether or not the
-/// caller is a publisher: what a publication publishes is the extension's default version,
-/// never a version the request picked.
+/// The refusal AWS answers a request whose `Arn` names a version is read from the ARN itself
+/// where the ARN is one of THIS account, so it holds for an extension this account registered
+/// whether or not the caller is a publisher: what a publication publishes is the extension's
+/// default version, never a version the request picked.
 #[tokio::test]
 async fn an_arn_that_names_a_version_of_a_registered_extension_is_refused() {
     let (router, engine) = router_with_registry();
@@ -224,7 +223,9 @@ async fn an_arn_that_names_a_version_of_a_registered_extension_is_refused() {
     // One row per registered private record, and per position a version can hold in one: the
     // record's default version, a version that is not the default, and a record's only
     // version. An identifier that resolves NO record of this account is a different refusal
-    // and has its own table (`an_identifier_registered_in_no_account_is_refused_first`).
+    // and has its own table (`an_identifier_registered_in_no_account_is_refused_first`), and
+    // the account segment this rule is keyed on has its own suite
+    // (`publish_type_version_in_arn.rs`).
     let versioned = [
         (
             "the default version of a registered private resource type",
@@ -278,13 +279,21 @@ async fn an_arn_that_names_a_version_of_a_registered_extension_is_refused() {
 /// Every identifier that names no record of this account and Region, over both forms a
 /// request identifies an extension by and over the ways an identifier can be real somewhere
 /// else: a name nothing registered, a name registered under another kind, a record another
-/// Region's registry holds, and the ARN of a VERSION of each of those — the recorded row.
+/// Region's registry holds, and an ARN of ANOTHER account, which addresses nothing of this
+/// one.
+///
+/// A version segment past the extension an ARN of THIS account addresses is read from the ARN
+/// before existence is, so an in-account version ARN belongs to the version-in-Arn table
+/// (`publish_type_version_in_arn.rs`) rather than here.
 fn identifiers_registered_in_no_account() -> Vec<(&'static str, Vec<(&'static str, String)>)> {
     let unheld_arn = type_arn(REGION, registry_type::RESOURCE, "No::Such::Resource");
     let other_region_arn = type_arn(
         OTHER_REGION,
         registry_type::RESOURCE,
         "Other::Region::Resource",
+    );
+    let other_account_arn = format!(
+        "arn:aws:cloudformation:{REGION}:123456789012:type/resource/Another-Account-Resource"
     );
     vec![
         (
@@ -299,11 +308,14 @@ fn identifiers_registered_in_no_account() -> Vec<(&'static str, Vec<(&'static st
             vec![("Arn", unheld_arn.clone())],
         ),
         (
-            // The recorded row: the ARN of a VERSION of an extension registered in no
-            // account, which resolves nothing and so is answered before any rule about the
-            // version segment it carries.
-            "a version ARN of an extension no registry holds",
-            vec![("Arn", type_version_arn(&unheld_arn, "00000001"))],
+            // An ARN of ANOTHER account: nothing of this account is addressed, so existence
+            // in this account is all the call can be answered about.
+            "the ARN of an extension of another account",
+            vec![("Arn", other_account_arn.clone())],
+        ),
+        (
+            "a version ARN of an extension of another account",
+            vec![("Arn", type_version_arn(&other_account_arn, "00000001"))],
         ),
         (
             "a name this Region's registry holds under another kind",
@@ -323,17 +335,13 @@ fn identifiers_registered_in_no_account() -> Vec<(&'static str, Vec<(&'static st
             "a record another Region's registry holds, by ARN",
             vec![("Arn", other_region_arn.clone())],
         ),
-        (
-            "a version ARN of a record another Region's registry holds",
-            vec![("Arn", type_version_arn(&other_region_arn, "00000001"))],
-        ),
     ]
 }
 
 /// A publication resolves the extension against the registry of THIS account and Region
 /// FIRST: an identifier that resolves nothing is refused the not-registered sentence whatever
-/// else the request carries — the version segment of an ARN, a version number beside it, and
-/// whether the caller is a registered publisher are all read against a record that resolved.
+/// else the request carries — a version number beside it and whether the caller is a
+/// registered publisher are both read against a record that resolved.
 #[tokio::test]
 async fn an_identifier_registered_in_no_account_is_refused_first() {
     let (router, engine) = router_with_registry();
@@ -366,24 +374,32 @@ async fn an_identifier_registered_in_no_account_is_refused_first() {
     }
 
     // The ordering itself: one and the same ARN FORM — an extension ARN carrying a version
-    // segment — is answered the version-shape refusal where it resolves a registered record
-    // and the not-registered refusal where it resolves none, so the rule about which version
-    // may be published is read only once existence has been resolved.
-    let registered = type_version_arn(&resource_arn(), "00000002");
-    let (status_code, body) = publish_type(&router, &[("Arn", &registered)]).await;
-    assert_registry_refusal(
-        "a version ARN of a REGISTERED extension",
-        status_code,
-        &body,
-        ONLY_DEFAULT_VERSION,
+    // segment — is answered the version-shape refusal where the ARN's account segment is this
+    // account's, whether or not the extension it names is registered here, and the
+    // not-registered refusal where that segment is another account's, which addresses nothing
+    // of this account for either rule to be read against.
+    for (case, arn) in [
+        (
+            "a version ARN of a REGISTERED extension of this account",
+            type_version_arn(&resource_arn(), "00000002"),
+        ),
+        (
+            "a version ARN of an UNREGISTERED extension of this account",
+            type_version_arn(
+                &type_arn(REGION, registry_type::RESOURCE, "No::Such::Resource"),
+                "00000002",
+            ),
+        ),
+    ] {
+        let (status_code, body) = publish_type(&router, &[("Arn", &arn)]).await;
+        assert_registry_refusal(case, status_code, &body, ONLY_DEFAULT_VERSION);
+    }
+    let other_account = format!(
+        "arn:aws:cloudformation:{REGION}:123456789012:type/resource/My-Sample-Resource/00000002"
     );
-    let unregistered = type_version_arn(
-        &type_arn(REGION, registry_type::RESOURCE, "No::Such::Resource"),
-        "00000002",
-    );
-    let (status_code, body) = publish_type(&router, &[("Arn", &unregistered)]).await;
+    let (status_code, body) = publish_type(&router, &[("Arn", &other_account)]).await;
     assert_registry_refusal(
-        "the same version ARN form for an UNREGISTERED extension",
+        "the same version ARN form in ANOTHER account",
         status_code,
         &body,
         NOT_FOUND_IN_YOUR_ACCOUNT,
