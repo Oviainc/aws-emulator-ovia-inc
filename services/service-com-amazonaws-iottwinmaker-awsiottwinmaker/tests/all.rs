@@ -17,6 +17,9 @@ mod abstract_component_type_listing;
 #[path = "all/abstract_component_types.rs"]
 mod abstract_component_types;
 
+#[path = "all/batch_put_error_entries.rs"]
+mod batch_put_error_entries;
+
 #[path = "all/component_definition_refinement.rs"]
 mod component_definition_refinement;
 

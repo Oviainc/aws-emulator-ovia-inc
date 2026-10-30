@@ -33,6 +33,15 @@
 //! is PARTIALLY applied, one `BatchPutPropertyError` per failed entry carrying
 //! the entry itself.
 //!
+//! That member is a report of the failures there ARE: it holds exactly one entry
+//! per failed entry, and so is the present, EMPTY list on a batch every entry of
+//! which was stored. The modelled minimum of one element is what every entry the
+//! list DOES carry satisfies — each holding one `BatchPutPropertyError`, itself
+//! inside `Errors`' own minimum of one — and a batch nothing failed in cannot
+//! reach that minimum without reporting an error against an entry that earned
+//! none, which would tell a caller a value it sent was refused when it was
+//! written.
+//!
 //! A value is stored under the instant it was written FOR — `time`, else the
 //! deprecated `timestamp` — so the series is in time order however it was
 //! written and a second value for one instant replaces the first.
