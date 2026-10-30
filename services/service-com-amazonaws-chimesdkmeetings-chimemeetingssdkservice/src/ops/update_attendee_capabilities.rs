@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAttendeeCapabilities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAttendeeCapabilities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAttendeeCapabilities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updating capabilities is a MUTATION of one stored attendee: the request carries the
+//! WHOLE [`AttendeeCapabilities`] set (all three members are required on that shape), so
+//! the accepted set REPLACES the attendee's current one and a later `GetAttendee`,
+//! `ListAttendees` or `CreateAttendee` response reads back exactly what this call applied.
+//!
+//! The replacement is one assignment made while this service's store guard is held, so a
+//! caller never observes a set mixing members from two requests: whichever concurrent
+//! writer the store admits second overwrites the first's set whole. That is also why no
+//! racer is refused with the modelled `ConflictException` (HTTP 409) — the store admits
+//! one writer at a time and each one's set is applied in full, so there is no contention
+//! for a loser to be told about. `ConflictException` stays reachable in the error channel
+//! for a case that genuinely cannot be serialized; nothing here invents one.
+//!
+//! Three refusals come before the write, and none of them touches the attendee:
+//!
+//! 1. a `MeetingId` that names no live meeting is the modelled `NotFoundException`
+//!    (HTTP 404), worded by
+//!    [`crate::state::ComAmazonawsChimesdkmeetingsChimemeetingssdkserviceState::meeting_absent`]
+//!    so a meeting that has ENDED is reported as ended rather than as an unknown id;
+//! 2. an `AttendeeId` that names no attendee OF THAT MEETING is the same error, worded by
+//!    [`crate::state::attendee_not_found`];
+//! 3. a capability set the meeting's own `MeetingFeatures` do not admit is the modelled
+//!    `BadRequestException` (HTTP 400), judged by [`crate::state::capability_problem`] —
+//!    the same corner cases `CreateAttendee` applies, because they are rules about the
+//!    MEETING and the set, not about which call supplied the set.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +198,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAttendeeCapabilities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAttendeeCapabilitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAttendeeCapabilities"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAttendeeCapabilitiesErrorModeled::ServiceFailureException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        // ONE guard spans the whole call: the meeting's features are read, the set is
+        // judged against them and the attendee's set is replaced without releasing it, so
+        // no other writer can change the meeting or leave a half-applied set behind.
+        let mut store = state.lock();
+
+        // An attendee exists only inside a meeting, so a `MeetingId` that names none is
+        // refused before anything is written.
+        let Some(meeting) = store.meetings.get(&input.meeting_id) else {
+            return Err(UpdateAttendeeCapabilitiesErrorModeled::NotFoundException(
+                store.meeting_absent(&input.meeting_id),
+            )
+            .into());
+        };
+        // Looked up INSIDE its meeting, so one meeting's `AttendeeId` never updates
+        // another's attendee.
+        if !meeting.attendees.contains_key(&input.attendee_id) {
+            return Err(UpdateAttendeeCapabilitiesErrorModeled::NotFoundException(
+                crate::state::attendee_not_found(&input.attendee_id),
+            )
+            .into());
+        }
+
+        // Which sets are admissible is decided by the STORED meeting's features, never by
+        // this request.
+        if let Some(problem) =
+            crate::state::capability_problem(&input.capabilities, meeting.meeting.meeting_features.as_ref())
+        {
+            return Err(UpdateAttendeeCapabilitiesErrorModeled::BadRequestException(
+                crate::state::bad_request(problem),
+            )
+            .into());
+        }
+
+        let updated = store
+            .meetings
+            .get_mut(&input.meeting_id)
+            .and_then(|meeting| meeting.attendees.get_mut(&input.attendee_id))
+            .map(|attendee| {
+                // The whole set in one assignment: every member the request carried is
+                // applied, and none of the attendee's other members is touched.
+                attendee.capabilities = Some(input.capabilities);
+                attendee.clone()
+            });
+        // Project the response from the STORED record, so what the caller sees is exactly
+        // what a later `GetAttendee` reads back.
+        let Some(updated) = updated else {
+            return Err(UpdateAttendeeCapabilitiesErrorModeled::ServiceFailureException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+        Ok(UpdateAttendeeCapabilitiesOutput {
+            attendee: Some(updated),
+        })
     }
 }

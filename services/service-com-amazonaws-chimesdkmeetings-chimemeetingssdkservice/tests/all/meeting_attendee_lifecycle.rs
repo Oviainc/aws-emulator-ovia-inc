@@ -1124,7 +1124,8 @@ async fn deleting_removes_exactly_what_it_names() {
 ///
 /// The three `/tags` operations are NOT in the table: they are implemented, over the tag
 /// directory the Amazon Chime family shares, and pinned by `resource_tagging.rs` beside
-/// this suite.
+/// this suite. Neither is `UpdateAttendeeCapabilities`, which is implemented over the
+/// stored attendee and pinned by `attendee_capabilities.rs`.
 #[tokio::test]
 async fn the_operations_outside_this_slice_are_still_not_implemented() {
     let emulator = Emulator::new();
@@ -1148,12 +1149,18 @@ async fn the_operations_outside_this_slice_are_still_not_implemented() {
                 .await,
         ),
         (
-            "UpdateAttendeeCapabilities",
+            "BatchUpdateAttendeeCapabilitiesExcept",
             emulator
                 .call(
                     "PUT",
-                    &format!("/meetings/{meeting_id}/attendees/{attendee_id}/capabilities"),
-                    Some(&json!({ "Capabilities": capabilities })),
+                    &format!(
+                        "/meetings/{meeting_id}/attendees/capabilities\
+                         ?operation=batch-update-except"
+                    ),
+                    Some(&json!({
+                        "ExcludedAttendeeIds": [{ "AttendeeId": attendee_id }],
+                        "Capabilities": capabilities,
+                    })),
                 )
                 .await,
         ),
