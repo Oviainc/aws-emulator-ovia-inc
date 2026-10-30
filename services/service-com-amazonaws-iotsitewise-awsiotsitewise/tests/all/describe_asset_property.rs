@@ -587,6 +587,466 @@ async fn a_property_of_a_composite_model_is_reported_as_a_composite_model_proper
     );
 }
 
+/// Create an asset model of `model_type` carrying `properties`, and return its id.
+async fn create_typed_model(
+    router: &MultiServiceRouter,
+    name: &str,
+    model_type: &str,
+    properties: Value,
+) -> String {
+    let (status, body) = call(
+        router,
+        "POST",
+        "/asset-models",
+        Some(json!({
+            "assetModelName": name,
+            "assetModelType": model_type,
+            "assetModelProperties": properties,
+        })),
+    )
+    .await;
+    assert_eq!(status, 202, "create {model_type} {name}: got {status} {body}");
+    body["assetModelId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("create {model_type} {name}: no assetModelId in {body}"))
+        .to_string()
+}
+
+/// Add a composite model described by `request` to `model_id`, and return its id.
+async fn add_composite_model(
+    router: &MultiServiceRouter,
+    model_id: &str,
+    request: Value,
+) -> String {
+    let (status, body) = call(
+        router,
+        "POST",
+        &format!("/asset-models/{model_id}/composite-models"),
+        Some(request.clone()),
+    )
+    .await;
+    assert_eq!(
+        status, 202,
+        "CreateAssetModelCompositeModel {request}: got {status} {body}"
+    );
+    body["assetModelCompositeModelId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no assetModelCompositeModelId in {body}"))
+        .to_string()
+}
+
+/// `DescribeAssetModelCompositeModel`'s view of one composite model, which is
+/// where the test reads the property ids a composite model contributes.
+async fn describe_model_composite(
+    router: &MultiServiceRouter,
+    model_id: &str,
+    composite_id: &str,
+) -> Value {
+    let (status, body) = call(
+        router,
+        "GET",
+        &format!("/asset-models/{model_id}/composite-models/{composite_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "DescribeAssetModelCompositeModel {composite_id}: got {status} {body}"
+    );
+    body
+}
+
+/// One row of the composite-model table: a property one of the host model's
+/// composite models contributes, and what `DescribeAssetProperty` must report.
+struct CompositeCase {
+    case: &'static str,
+    /// The composite model on the host model that contributes the property.
+    composite: &'static str,
+    composite_type: &'static str,
+    /// The composite model's external id, when it was created with one.
+    composite_external_id: Option<&'static str>,
+    property: &'static str,
+    data_type: &'static str,
+    unit: Option<&'static str>,
+    type_key: &'static str,
+    default_value: Option<&'static str>,
+    /// The property definition's external id, when it declares one: the second
+    /// `CustomID` label form the same property is addressable by.
+    property_external_id: Option<&'static str>,
+}
+
+#[tokio::test]
+async fn a_property_a_composite_model_contributes_is_described_however_it_declares_it() {
+    let router = router();
+
+    // Two `COMPONENT_MODEL`s with properties of their own: a component-model-based
+    // composite model stores none, so every property it contributes comes from the
+    // component model it reuses.
+    let speed_component = create_typed_model(
+        &router,
+        "SpeedComponent",
+        "COMPONENT_MODEL",
+        json!([
+            {"name": "Speed", "dataType": "DOUBLE", "unit": "m/s", "type": {"measurement": {}}},
+            {"name": "Mode", "dataType": "STRING", "externalId": "component-mode-definition",
+             "type": {"attribute": {"defaultValue": "idle"}}},
+            {"name": "Revolutions", "dataType": "INTEGER", "type": {"measurement": {}}},
+        ]),
+    )
+    .await;
+    let pump_component = create_typed_model(
+        &router,
+        "PumpComponent",
+        "COMPONENT_MODEL",
+        json!([
+            {"name": "Pressure", "dataType": "DOUBLE", "unit": "Bar", "type": {"measurement": {}}},
+        ]),
+    )
+    .await;
+
+    // The host model: its own properties, plus three composite models that differ
+    // along WHERE their properties come from — two reusing a component model and
+    // one carrying inline definitions.
+    let model_id = create_typed_model(
+        &router,
+        "ComponentHostBoiler",
+        "ASSET_MODEL",
+        property_catalog(),
+    )
+    .await;
+    let composite_ids = [
+        (
+            "Reused",
+            add_composite_model(
+                &router,
+                &model_id,
+                json!({
+                    "assetModelCompositeModelName": "Reused",
+                    "assetModelCompositeModelType": "CUSTOM",
+                    "composedAssetModelId": &speed_component,
+                }),
+            )
+            .await,
+        ),
+        (
+            "Pump",
+            add_composite_model(
+                &router,
+                &model_id,
+                json!({
+                    "assetModelCompositeModelName": "Pump",
+                    "assetModelCompositeModelType": "CUSTOM",
+                    "assetModelCompositeModelExternalId": "pump-composite",
+                    "composedAssetModelId": &pump_component,
+                }),
+            )
+            .await,
+        ),
+        (
+            "Inline",
+            add_composite_model(
+                &router,
+                &model_id,
+                json!({
+                    "assetModelCompositeModelName": "Inline",
+                    "assetModelCompositeModelType": "CUSTOM",
+                    "assetModelCompositeModelProperties": [
+                        {"name": "Operator", "dataType": "STRING",
+                         "externalId": "inline-operator-definition",
+                         "type": {"attribute": {"defaultValue": "unassigned"}}},
+                    ],
+                }),
+            )
+            .await,
+        ),
+    ];
+    let composite_id_of = |name: &str| -> String {
+        composite_ids
+            .iter()
+            .find(|(composite, _)| *composite == name)
+            .map(|(_, id)| id.clone())
+            .unwrap_or_else(|| panic!("no composite model named {name} was created"))
+    };
+
+    let asset_id = create_asset(&router, "ComponentHostBoiler-1", &model_id).await;
+
+    // One row per property a composite model contributes, so the rows differ along
+    // the data type, the presence of a unit, the property type, whether the
+    // definition carries an external id, and — the dimension that matters here —
+    // whether the declaring composite model stores its own definitions or reuses a
+    // component model's.
+    let rows = [
+        CompositeCase {
+            case: "component model's DOUBLE measurement with a unit",
+            composite: "Reused",
+            composite_type: "CUSTOM",
+            composite_external_id: None,
+            property: "Speed",
+            data_type: "DOUBLE",
+            unit: Some("m/s"),
+            type_key: "measurement",
+            default_value: None,
+            property_external_id: None,
+        },
+        CompositeCase {
+            case: "component model's STRING attribute with an external id",
+            composite: "Reused",
+            composite_type: "CUSTOM",
+            composite_external_id: None,
+            property: "Mode",
+            data_type: "STRING",
+            unit: None,
+            type_key: "attribute",
+            default_value: Some("idle"),
+            property_external_id: Some("component-mode-definition"),
+        },
+        CompositeCase {
+            case: "component model's INTEGER measurement without a unit",
+            composite: "Reused",
+            composite_type: "CUSTOM",
+            composite_external_id: None,
+            property: "Revolutions",
+            data_type: "INTEGER",
+            unit: None,
+            type_key: "measurement",
+            default_value: None,
+            property_external_id: None,
+        },
+        CompositeCase {
+            case: "a second component model, reused by a composite model with an external id",
+            composite: "Pump",
+            composite_type: "CUSTOM",
+            composite_external_id: Some("pump-composite"),
+            property: "Pressure",
+            data_type: "DOUBLE",
+            unit: Some("Bar"),
+            type_key: "measurement",
+            default_value: None,
+            property_external_id: None,
+        },
+        CompositeCase {
+            case: "a composite model's own inline attribute definition",
+            composite: "Inline",
+            composite_type: "CUSTOM",
+            composite_external_id: None,
+            property: "Operator",
+            data_type: "STRING",
+            unit: None,
+            type_key: "attribute",
+            default_value: Some("unassigned"),
+            property_external_id: Some("inline-operator-definition"),
+        },
+    ];
+
+    // The properties `ListAssetProperties` reports for this asset, which must agree
+    // with what `DescribeAssetProperty` answers for each of them.
+    let (status, listed) = call(
+        &router,
+        "GET",
+        &format!("/assets/{asset_id}/properties?filter=ALL"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "ListAssetProperties: got {status} {listed}");
+    let summaries = listed["assetPropertySummaries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no assetPropertySummaries in {listed}"))
+        .clone();
+
+    for row in rows {
+        let CompositeCase {
+            case,
+            composite,
+            composite_type,
+            composite_external_id,
+            property: name,
+            data_type,
+            unit,
+            type_key,
+            default_value,
+            property_external_id,
+        } = row;
+        let composite_id = composite_id_of(composite);
+        // The property's id is read from the service's own view of the composite
+        // model, so the test addresses the id the store actually minted.
+        let described_composite = describe_model_composite(&router, &model_id, &composite_id).await;
+        let id = property_id(
+            &described_composite["assetModelCompositeModelProperties"],
+            name,
+        );
+
+        let (status, body) = describe_property(&router, &asset_id, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeAssetProperty got {status} {body}"
+        );
+        assert!(
+            body.get("assetProperty").is_none_or(Value::is_null),
+            "case {case:?}: a composite model's property is not reported as the asset's, got {body}"
+        );
+        assert_eq!(
+            body["assetId"].as_str(),
+            Some(asset_id.as_str()),
+            "case {case:?}: expected assetId {asset_id}, got {body}"
+        );
+        assert_eq!(
+            body["assetModelId"].as_str(),
+            Some(model_id.as_str()),
+            "case {case:?}: expected assetModelId {model_id}, got {body}"
+        );
+        assert_eq!(
+            body["assetName"].as_str(),
+            Some("ComponentHostBoiler-1"),
+            "case {case:?}: expected assetName ComponentHostBoiler-1, got {body}"
+        );
+
+        let reported = &body["compositeModel"];
+        assert_eq!(
+            reported["name"].as_str(),
+            Some(composite),
+            "case {case:?}: expected composite model {composite:?}, got {reported}"
+        );
+        assert_eq!(
+            reported["type"].as_str(),
+            Some(composite_type),
+            "case {case:?}: expected composite model type {composite_type:?}, got {reported}"
+        );
+        assert_eq!(
+            reported["id"].as_str(),
+            Some(composite_id.as_str()),
+            "case {case:?}: expected the declaring composite model's id {composite_id}, \
+             got {reported}"
+        );
+        assert_eq!(
+            reported.get("externalId").and_then(Value::as_str),
+            composite_external_id,
+            "case {case:?}: expected composite external id {composite_external_id:?}, \
+             got {reported}"
+        );
+
+        let property = &reported["assetProperty"];
+        assert_eq!(
+            property["id"].as_str(),
+            Some(id.as_str()),
+            "case {case:?}: expected the addressed property id {id}, got {property}"
+        );
+        assert_eq!(
+            property["name"].as_str(),
+            Some(name),
+            "case {case:?}: expected name {name:?}, got {property}"
+        );
+        assert_eq!(
+            property["dataType"].as_str(),
+            Some(data_type),
+            "case {case:?}: expected dataType {data_type:?}, got {property}"
+        );
+        assert_eq!(
+            property.get("unit").and_then(Value::as_str),
+            unit,
+            "case {case:?}: expected unit {unit:?}, got {property}"
+        );
+        assert_eq!(
+            property.get("externalId").and_then(Value::as_str),
+            property_external_id,
+            "case {case:?}: expected property external id {property_external_id:?}, got {property}"
+        );
+        assert_eq!(
+            property["type"][type_key]
+                .get("defaultValue")
+                .and_then(Value::as_str),
+            default_value,
+            "case {case:?}: expected defaultValue {default_value:?}, got {property}"
+        );
+
+        // The same property is listed by `ListAssetProperties` under the same
+        // composite model: the two views answer from one definition of what a
+        // composite model contributes, so they cannot disagree.
+        let summary = summaries
+            .iter()
+            .find(|summary| summary["id"].as_str() == Some(id.as_str()))
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: property {id} is not in {listed}")
+            });
+        assert_eq!(
+            summary["assetCompositeModelId"].as_str(),
+            Some(composite_id.as_str()),
+            "case {case:?}: ListAssetProperties and DescribeAssetProperty disagree on the \
+             declaring composite model: {summary} vs {reported}"
+        );
+
+        // Both `CustomID` label forms name the same property, so a definition with
+        // an external id answers the same body through either.
+        if let Some(external) = property_external_id {
+            let (status, by_external) =
+                describe_property(&router, &asset_id, &format!("externalId:{external}")).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the externalId label got {status} {by_external}"
+            );
+            assert_eq!(
+                by_external, body,
+                "case {case:?}: the externalId label must answer what the raw id answered"
+            );
+        }
+
+        // Describing a property reports the same thing twice: a read changes
+        // nothing a later caller sees.
+        let (status, again) = describe_property(&router, &asset_id, &id).await;
+        assert_eq!(status, 200, "case {case:?}: second read got {status} {again}");
+        assert_eq!(
+            again, body,
+            "case {case:?}: a read must not change what a later read reports"
+        );
+    }
+
+    // A property added to the reused component model AFTER the composite model was
+    // created is contributed too: what a composite model contributes is read from
+    // the component model's stored record, not copied when the composite model is
+    // created.
+    let component = describe_model(&router, &speed_component).await;
+    let mut definitions = component["assetModelProperties"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no assetModelProperties in {component}"))
+        .clone();
+    definitions.push(json!({
+        "name": "Torque", "dataType": "DOUBLE", "unit": "Nm", "type": {"measurement": {}},
+    }));
+    let (status, updated) = call(
+        &router,
+        "PUT",
+        &format!("/asset-models/{speed_component}"),
+        Some(json!({
+            "assetModelName": "SpeedComponent",
+            "assetModelProperties": definitions,
+        })),
+    )
+    .await;
+    assert_eq!(status, 202, "UpdateAssetModel: got {status} {updated}");
+
+    let reused_id = composite_id_of("Reused");
+    let added = property_id(
+        &describe_model_composite(&router, &model_id, &reused_id).await
+            ["assetModelCompositeModelProperties"],
+        "Torque",
+    );
+    let (status, body) = describe_property(&router, &asset_id, &added).await;
+    assert_eq!(
+        status, 200,
+        "a property added to the component model: got {status} {body}"
+    );
+    assert_eq!(
+        body["compositeModel"]["id"].as_str(),
+        Some(reused_id.as_str()),
+        "a property added to the component model must be reported under the composite model \
+         that reuses it, got {body}"
+    );
+    assert_eq!(
+        body["compositeModel"]["assetProperty"]["unit"].as_str(),
+        Some("Nm"),
+        "expected the added definition's unit Nm, got {body}"
+    );
+}
+
 #[tokio::test]
 async fn a_label_that_names_no_stored_property_is_a_modelled_refusal() {
     let router = router();
