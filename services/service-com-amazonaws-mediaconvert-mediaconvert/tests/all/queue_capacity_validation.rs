@@ -14,7 +14,9 @@
 //!   your existing commitment with a new 12-month commitment for the larger number." So a
 //!   plan stating fewer slots than the stored one is refused with `BadRequestException`
 //!   (400) and the stored plan is left exactly as it was, while one stating the same or
-//!   more is applied and restarts the 12-month term.
+//!   more is applied. WHEN the 12-month term then begins — only on a call that buys
+//!   capacity the standing plan does not cover — is the rule the sibling suite
+//!   `queue_reservation_term` covers.
 //! * A concurrency a REQUEST ENTERS is an allocation out of the Region's pool.
 //!   `ConcurrentJobs`: "Specify the maximum number of jobs your queue can process
 //!   concurrently. For on-demand queues, the value you enter is constrained by your service
@@ -76,7 +78,7 @@ fn reserved_update(slots: i32, renewal_type: &str) -> Value {
 /// What an update of a reserved queue's plan must answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SlotOutcome {
-    /// The plan is stored and the commitment restarts.
+    /// The plan is stored.
     Applied,
     /// Fewer slots than the queue already reserves: the one-way rule refuses it.
     Decrease,
@@ -159,9 +161,9 @@ fn slot_cases() -> Vec<SlotCase> {
     ]
 }
 
-/// `ReservedSlots` is one-way: an update may raise a reserved queue's slot count (which
-/// restarts its 12-month commitment) and may restate it, but one that would lower it is
-/// refused and the stored plan survives untouched.
+/// `ReservedSlots` is one-way: an update may raise a reserved queue's slot count and may
+/// restate it, but one that would lower it is refused and the stored plan survives
+/// untouched.
 #[tokio::test]
 async fn a_reserved_queues_slot_count_can_only_increase() {
     for case in slot_cases() {
@@ -206,10 +208,9 @@ async fn a_reserved_queues_slot_count_can_only_increase() {
                          got {}",
                         reply.body
                     );
-                    // "You can increase the number of RTS by extending your existing
-                    // commitment with a new 12-month commitment": the applied plan is a
-                    // fresh term, purchased no earlier than the one it replaced and
-                    // running the full commitment from there.
+                    // Whichever term the stored plan ends up under, it is a commitment
+                    // purchased no earlier than the one the create entered and running the
+                    // full 12 months from its purchase instant.
                     let purchased = reply
                         .at("/queue/reservationPlan/purchasedAt")
                         .as_i64()

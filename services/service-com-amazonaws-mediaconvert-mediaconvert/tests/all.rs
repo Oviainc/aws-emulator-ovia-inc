@@ -111,6 +111,8 @@ mod queue_name_identity;
 mod queue_pause_gating;
 #[path = "all/queue_reference_projection.rs"]
 mod queue_reference_projection;
+#[path = "all/queue_reservation_term.rs"]
+mod queue_reservation_term;
 #[path = "all/queue_reserved_concurrency.rs"]
 mod queue_reserved_concurrency;
 #[path = "all/queue_reserved_concurrency_member.rs"]

@@ -13,6 +13,10 @@
 //! `CreateQueue` applies to a plan it stores, shared through
 //! [`crate::state::concurrent_jobs_for`].
 //!
+//! A plan's 12-month TERM is a commitment, not a detail of the request: it begins again
+//! only when the call buys capacity the standing plan does not already cover, which is
+//! the rule [`crate::state::updated_reservation_plan`] holds.
+//!
 //! Two members are not free to take any value the wire accepts: a reservation plan's slot
 //! count is one-way (it may be raised or restated, never lowered), and a concurrency the
 //! request states is an allocation out of the Region's pool. Each is refused before the
@@ -311,9 +315,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if let Some(settings) = input.reservation_plan_settings.as_ref() {
             // "When you add capacity to your queue by increasing the number of RTS, you
-            // extend the term of your commitment to 12 months from when you add capacity":
-            // the term restarts from this call.
-            record.reservation_plan = Some(crate::state::reservation_plan(settings, now));
+            // extend the term of your commitment to 12 months from when you add capacity",
+            // and "the new commitment begins when you purchase the additional capacity":
+            // the term restarts from this call only when this call buys capacity the
+            // standing plan does not already cover (or replaces a plan whose term has run
+            // out). Every stated detail of the plan is replaced either way — one rule, in
+            // `state`, so nothing addressing a plan disagrees about when a commitment
+            // begins.
+            let plan = crate::state::updated_reservation_plan(
+                record.reservation_plan.as_ref(),
+                settings,
+                now,
+            );
+            record.reservation_plan = Some(plan);
         }
 
         // Each remaining member is "the new <member> ... if you are changing it": one the

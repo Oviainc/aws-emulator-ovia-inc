@@ -2466,6 +2466,54 @@ pub fn reservation_plan(
     }
 }
 
+/// The plan a reserved queue holds after a call states `settings` for it, given the plan
+/// `stored` it already holds.
+///
+/// A plan's TERM is a commitment, and `ReservationPlanSettings$ReservedSlots` says when a
+/// new one begins: "You can increase the number of RTS by extending your existing
+/// commitment with a new 12-month commitment for the larger number. The new commitment
+/// begins when you purchase the additional capacity." So the term a standing plan carries
+/// — the instant it was set up and the instant it runs out — is kept unless this call
+/// purchases capacity, which is a slot count ABOVE what that plan already reserves; a
+/// stated count the standing plan already covers buys nothing, whatever else the settings
+/// state. A plan whose term has already run out is no standing commitment either:
+/// `UpdateQueue$ReservationPlanSettings` is "when you set up a new pricing plan to replace
+/// an expired one, you enter into another 12-month commitment", so replacing one starts a
+/// term at this call as a first purchase does.
+///
+/// Every member the settings state — the commitment length, the renewal type and the slot
+/// count — replaces the stored one either way, because they are "the new details of your
+/// pricing plan".
+pub fn updated_reservation_plan(
+    stored: Option<&ReservationPlan>,
+    settings: &ReservationPlanSettings,
+    now: SystemTime,
+) -> ReservationPlan {
+    let standing = stored.filter(|plan| {
+        let term_in_force = plan.purchased_at.is_some()
+            && plan
+                .expires_at
+                .as_ref()
+                .is_some_and(|at| at.secs() > epoch_seconds(now).secs());
+        let covers_the_capacity = plan
+            .reserved_slots
+            .is_some_and(|slots| settings.reserved_slots <= slots);
+        term_in_force && covers_the_capacity
+    });
+    match standing {
+        // The queue keeps the commitment it is already under: only the stated details move.
+        Some(plan) => {
+            let mut plan = plan.clone();
+            plan.commitment = Some(settings.commitment.clone());
+            plan.renewal_type = Some(settings.renewal_type.clone());
+            plan.reserved_slots = Some(settings.reserved_slots);
+            plan
+        }
+        // Capacity is purchased here, so the 12-month term begins here.
+        None => reservation_plan(settings, now),
+    }
+}
+
 /// The output package a built-in job template's published name states: the
 /// `OutputGroupType` its one output group carries, the label that enum's own documentation
 /// gives that type, and the `ContainerType` each of the group's outputs is written in.
