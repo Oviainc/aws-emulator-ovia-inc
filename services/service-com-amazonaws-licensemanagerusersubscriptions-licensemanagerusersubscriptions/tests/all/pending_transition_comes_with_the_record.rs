@@ -162,7 +162,7 @@ fn held_instance(index: usize) -> String {
 
 /// The instant the store currently owes the clock a transition at, or `None` when it owes
 /// none — the O(1) guard every writer of a non-terminal record has to leave behind.
-fn guard(h: &Harness) -> Option<SystemTime> {
+pub(crate) fn guard(h: &Harness) -> Option<SystemTime> {
     let store = h.engine.state::<ServiceState>();
     let held = store.lock();
     held.pending_transition_due_at
@@ -173,7 +173,7 @@ fn guard(h: &Harness) -> Option<SystemTime> {
 /// Read off the RECORDS, through the same trait the writers schedule by, so the assertion
 /// below compares the guard with what the stored records actually owe rather than with a
 /// due instant this suite computed from a span of its own.
-fn owed(h: &Harness) -> Vec<(String, SystemTime)> {
+pub(crate) fn owed(h: &Harness) -> Vec<(String, SystemTime)> {
     let store = h.engine.state::<ServiceState>();
     let held = store.lock();
     let mut owed: Vec<(String, SystemTime)> = Vec::new();
@@ -264,7 +264,7 @@ async fn create(h: &Harness, row: &Row, provider_arn: &str) -> (String, String) 
 }
 
 /// The provisioning status `ListLicenseServerEndpoints` reports for `arn`.
-async fn endpoint_status(h: &Harness, arn: &str, case: &str) -> String {
+pub(crate) async fn endpoint_status(h: &Harness, arn: &str, case: &str) -> String {
     let reply = list_endpoints(h, &json!({})).await;
     let body = reply.ok(case);
     let endpoints = body["LicenseServerEndpoints"]
@@ -301,7 +301,13 @@ async fn reported_status(h: &Harness, row: &Row, arn: &str) -> String {
 }
 
 /// The `Status` the summary addressed by `arn` carries in a list reply.
-fn summary_status(reply: &Reply, list: &str, arn_member: &str, arn: &str, case: &str) -> String {
+pub(crate) fn summary_status(
+    reply: &Reply,
+    list: &str,
+    arn_member: &str,
+    arn: &str,
+    case: &str,
+) -> String {
     let body = reply.ok(case);
     let summaries = body[list]
         .as_array()

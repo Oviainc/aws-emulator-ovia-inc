@@ -71,6 +71,8 @@ mod settings_update_writes_at_write_time;
 mod state_roundtrip;
 #[path = "all/subscription_product_names_the_subscription.rs"]
 mod subscription_product_names_the_subscription;
+#[path = "all/the_sweep_reads_what_the_records_owe.rs"]
+mod the_sweep_reads_what_the_records_owe;
 #[path = "all/tag_validation.rs"]
 mod tag_validation;
 #[path = "all/update_settings_network_propagation.rs"]

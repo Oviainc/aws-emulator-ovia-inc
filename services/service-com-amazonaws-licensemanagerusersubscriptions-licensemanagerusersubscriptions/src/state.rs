@@ -673,7 +673,10 @@ pub struct LicenseServerEndpointRecord {
 /// [`schedule_record_transition`](ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::schedule_record_transition),
 /// which is the ONE place "store a record in a non-terminal status" is paired with
 /// "schedule the transition it owes": a new creating or teardown path gets the pending
-/// guard from the writer it stores through and cannot be written without it.
+/// guard from the writer it stores through and cannot be written without it. The sweep that
+/// materialises those transitions recomputes the guard through this same trait
+/// ([`fold_pending_transition`]), so a status or a due field added to an impl here is
+/// honoured by the writers and by the sweep alike.
 pub trait OwedTransition {
     /// When the clock next owes this record a status transition, or `None` when its status
     /// is terminal (nothing falls due for it).
@@ -723,6 +726,33 @@ impl OwedTransition for LicenseServerEndpointRecord {
         } else {
             None
         }
+    }
+}
+
+/// Whether the transition `record` owes the clock has already fallen due at `now`.
+///
+/// Asked of the RECORD through [`OwedTransition`], so "is anything owed, and when" is
+/// answered in one place: the sweep that calls this decides only how to APPLY a transition
+/// the clock has made due, never which statuses owe one.
+fn transition_is_due(record: &impl OwedTransition, now: SystemTime) -> bool {
+    record
+        .owed_transition_due_at()
+        .is_some_and(|due_at| now >= due_at)
+}
+
+/// Fold whatever transition `record` still owes the clock into `earliest`, keeping the
+/// earliest instant and leaving it untouched for a record that owes nothing.
+///
+/// The read half of [`transition_is_due`], over the same trait: this is how
+/// [`materialise_due`](ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::materialise_due)
+/// recomputes the pending guard
+/// ([`pending_transition_due_at`](ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::pending_transition_due_at))
+/// from the records it just visited, so the sweep and the writers
+/// ([`schedule_record_transition`](ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::schedule_record_transition))
+/// agree on that fact by construction instead of by two copies of the same branches.
+fn fold_pending_transition(record: &impl OwedTransition, earliest: &mut Option<SystemTime>) {
+    if let Some(due_at) = record.owed_transition_due_at() {
+        *earliest = Some(earliest.map_or(due_at, |held: SystemTime| held.min(due_at)));
     }
 }
 
@@ -811,7 +841,8 @@ pub struct ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscrip
     /// whatever the record it stores owes (the `schedule_record_transition` pairing over
     /// [`OwedTransition`]), so no creating or teardown path can store a record in a
     /// non-terminal status without this guard covering it; were one to, the transition
-    /// would be delayed until another record fell due, never corrupt a record.
+    /// would be delayed until another record fell due, never corrupt a record. The sweep
+    /// recomputes it from the records it leaves pending, asked through that same trait.
     pub pending_transition_due_at: Option<SystemTime>,
     /// Source of the resource ids this service mints.
     pub next_id: u64,
@@ -923,92 +954,76 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             _ => return,
         }
 
-        // The sweep also recomputes the guard, from the records that are still pending.
+        // The sweep also recomputes the guard, from the records that are still pending —
+        // and it asks each record what it still owes ([`fold_pending_transition`]) rather
+        // than restating, per kind, which statuses are non-terminal and which field carries
+        // the due instant. The branches below therefore decide one thing only: how to APPLY
+        // a transition the clock has already made due ([`transition_is_due`]). A record the
+        // sweep just advanced owes nothing, and one not yet due owes the same instant it
+        // owed before, so the guard is exactly the earliest transition the records left in
+        // the store owe.
         let mut next: Option<SystemTime> = None;
-        let still_pending = |due_at: SystemTime, next: &mut Option<SystemTime>| {
-            *next = Some(next.map_or(due_at, |earliest: SystemTime| earliest.min(due_at)));
-        };
         // A registration whose deregistration has completed is dropped from the store,
         // which cannot happen while `identity_providers` is borrowed: the sweep collects
         // them and the drops run below.
         let mut deregistered: Vec<String> = Vec::new();
         for record in self.identity_providers.values_mut() {
-            if record.status == STATUS_REGISTERING {
-                if now >= record.registered_due_at {
+            if transition_is_due(record, now) {
+                if record.status == STATUS_REGISTERING {
                     record.status = STATUS_REGISTERED.to_string();
                 } else {
-                    still_pending(record.registered_due_at, &mut next);
-                }
-            } else if record.status == STATUS_DEREGISTERING {
-                // The teardown the clock owes: a `DEREGISTERING` registration stops being
-                // reported once its span has elapsed, whether or not anybody called.
-                if let Some(due_at) = record.deregistered_due_at {
-                    if now >= due_at {
-                        deregistered.push(record.arn.clone());
-                    } else {
-                        still_pending(due_at, &mut next);
-                    }
+                    // The teardown the clock owes: a `DEREGISTERING` registration stops
+                    // being reported once its span has elapsed, whether or not anybody
+                    // called. It leaves the store below, so it owes the guard nothing.
+                    deregistered.push(record.arn.clone());
+                    continue;
                 }
             }
+            fold_pending_transition(record, &mut next);
         }
         // The associations whose teardown the clock has made due, collected while the
         // records are borrowed and dropped once the sweep is over.
         let mut torn_down: Vec<String> = Vec::new();
         for record in self.instance_users.values_mut() {
-            if record.status == STATUS_ASSOCIATING {
-                if now >= record.associated_due_at {
+            if transition_is_due(record, now) {
+                if record.status == STATUS_ASSOCIATING {
                     record.status = STATUS_ASSOCIATED.to_string();
                 } else {
-                    still_pending(record.associated_due_at, &mut next);
-                }
-            } else if disassociation_started(&record.status) {
-                // The teardown the clock owes: a `DISASSOCIATING` association has
-                // finished being torn down once its span has elapsed, whether or not
-                // anybody called.
-                if let Some(due_at) = record.disassociated_due_at {
-                    if now >= due_at {
-                        torn_down.push(record.arn.clone());
-                    } else {
-                        still_pending(due_at, &mut next);
-                    }
+                    // The teardown the clock owes: a `DISASSOCIATING` association has
+                    // finished being torn down once its span has elapsed, whether or not
+                    // anybody called. It leaves the store below.
+                    torn_down.push(record.arn.clone());
+                    continue;
                 }
             }
+            fold_pending_transition(record, &mut next);
         }
         // The product subscriptions whose teardown the clock has made due, collected while
         // the records are borrowed and dropped once the sweep is over.
         let mut unsubscribed: Vec<String> = Vec::new();
         for record in self.product_users.values() {
-            if !unsubscribe_started(&record.status) {
-                continue;
-            }
-            // The teardown the clock owes: a subscription that was ended has finished being
-            // torn down once its span has elapsed, whether or not anybody called.
-            if let Some(due_at) = record.unsubscribed_due_at {
-                if now >= due_at {
-                    unsubscribed.push(record.arn.clone());
-                } else {
-                    still_pending(due_at, &mut next);
-                }
+            if transition_is_due(record, now) {
+                // The only transition a subscription owes is the end of its teardown: a
+                // subscription that was ended has finished being torn down once its span
+                // has elapsed, whether or not anybody called. It leaves the store below.
+                unsubscribed.push(record.arn.clone());
+            } else {
+                fold_pending_transition(record, &mut next);
             }
         }
         for record in self.license_server_endpoints.values_mut() {
-            if record.provisioning_status == PROVISIONING_STATUS_PROVISIONING {
-                if now >= record.provisioned_due_at {
-                    record.provisioning_status = PROVISIONING_STATUS_PROVISIONED.to_string();
-                } else {
-                    still_pending(record.provisioned_due_at, &mut next);
-                }
-            } else if record.provisioning_status == PROVISIONING_STATUS_DELETING {
-                // The deletion the clock owes: a `DELETING` endpoint reaches the terminal
-                // `DELETED` once its span has elapsed, whether or not anybody called.
-                if let Some(due_at) = record.deleted_due_at {
-                    if now >= due_at {
-                        record.provisioning_status = PROVISIONING_STATUS_DELETED.to_string();
+            if transition_is_due(record, now) {
+                record.provisioning_status =
+                    if record.provisioning_status == PROVISIONING_STATUS_PROVISIONING {
+                        PROVISIONING_STATUS_PROVISIONED.to_string()
                     } else {
-                        still_pending(due_at, &mut next);
-                    }
-                }
+                        // The deletion the clock owes: a `DELETING` endpoint reaches the
+                        // terminal `DELETED` once its span has elapsed, whether or not
+                        // anybody called.
+                        PROVISIONING_STATUS_DELETED.to_string()
+                    };
             }
+            fold_pending_transition(record, &mut next);
         }
         let mut dropped = false;
         let mut dropped_keys: Vec<String> = Vec::new();
