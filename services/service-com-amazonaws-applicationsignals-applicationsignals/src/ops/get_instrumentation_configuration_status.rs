@@ -95,6 +95,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// This operation's `ResourceNotFoundException` is the copy of the shape that serializes
+// `Message` alone: the request already names the identity it asked about, so the refusal
+// adds no ARN and no type name to it. The explicit import SHADOWS the glob above, which
+// brings in the copy the SLO and tagging refusals use, and the schema comes with it so the
+// error channel describes the shape exactly as this operation puts it on the wire.
+use super::types::instrumentation_not_found_types::{
+    ResourceNotFoundException, SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -180,7 +189,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // Every value this read answers comes from the stored record and the events reported
+        // against it, so none of the request's metadata is read — hence the unused `_ctx`.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
@@ -280,14 +291,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // also the only form the modelled `Location` union carries: a request naming the
         // pre-computed hash has no location of its own to echo.
         let Some(configuration) = store.instrumentation_configuration(&scope, &key) else {
-            let region = crate::state::region_of(ctx.parts());
+            // A status read is a READ of the configuration, so it reports which not-found
+            // state the location is in, exactly as the configuration read does: removed from,
+            // or never stored at.
             return Err(
                 GetInstrumentationConfigurationStatusErrorModeled::ResourceNotFoundException(
-                    crate::state::instrumentation_configuration_not_found(
-                        &region,
-                        &scope,
-                        &input.signal_type,
-                        &location_hash,
+                    crate::state::read_instrumentation_configuration_not_found(
+                        store.instrumentation_configuration_was_removed(&scope, &key),
                     ),
                 )
                 .into(),

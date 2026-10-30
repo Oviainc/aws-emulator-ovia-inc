@@ -192,9 +192,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::region_of(ctx.parts());
         let mut store = state.lock();
         let Some(slo) = store.resolve_mut(&input.id) else {
+            // This operation resolves the SLO through the work item that holds it, so its
+            // refusal identifies that work item rather than the resource's ARN — the
+            // `slo_work_item_not_found` wording, not the resource-layer one every other read
+            // of an SLO reports.
             return Err(
                 UpdateServiceLevelObjectiveErrorModeled::ResourceNotFoundException(
-                    crate::state::slo_not_found(&region, &input.id),
+                    crate::state::slo_work_item_not_found(&region, &input.id),
                 )
                 .into(),
             );

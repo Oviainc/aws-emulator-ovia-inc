@@ -35,6 +35,9 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::resource_tags::{expected_map, list_tags_raw, reported_tags, tag, tag_list};
 use crate::slo_lifecycle::{arn_uri_segment, call, router};
+// The conflict sentence, written once for this crate's tests in the suite that owns the
+// rule wording it.
+use crate::refusal_wording::CONFIGURATION_CONFLICT;
 
 /// The only `DynamicInstrumentationSignalType` the model declares
 /// (`smithy_query(query="shape",shape="DynamicInstrumentationSignalType")` -> `["SNAPSHOT"]`).
@@ -288,13 +291,16 @@ async fn a_create_at_an_occupied_identity_conflicts_whatever_the_instrumentation
             Some("ConflictException"),
             "case {label:?}: expected a ConflictException, got {refused}"
         );
+        assert_eq!(
+            refused["Message"].as_str(),
+            Some(CONFIGURATION_CONFLICT),
+            "case {label:?}: expected the conflict to name the identity dimensions, got {refused}"
+        );
         assert!(
-            refused["Message"]
+            !refused["Message"]
                 .as_str()
-                .or_else(|| refused["message"].as_str())
                 .is_some_and(|message| message.contains(&arn)),
-            "case {label:?}: expected the conflict to identify the stored configuration by its \
-             ARN {arn:?}, got {refused}"
+            "case {label:?}: expected the conflict to name no ARN, got {refused}"
         );
 
         // The refusal wrote nothing: the stored record is still served under the type it was

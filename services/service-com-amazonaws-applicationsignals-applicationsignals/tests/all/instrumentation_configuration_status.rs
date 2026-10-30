@@ -39,6 +39,10 @@ use service_com_amazonaws_applicationsignals_applicationsignals::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+// The two fixed sentences an instrumentation-configuration refusal states, written once for
+// this crate's tests in the suite that asserts the rule choosing between them.
+use crate::refusal_wording::{CONFIGURATION_ABSENT, CONFIGURATION_DELETED};
+
 /// The SigV4 credential scope routes the request to this service. Signature verification is
 /// off (see `set_request_authentication`), so the signature bytes are never read.
 const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
@@ -625,9 +629,9 @@ async fn reports_of_unknown_identities_are_unprocessed_and_the_rest_are_recorded
         "expected a ResourceNotFoundException, got {error}"
     );
     assert_eq!(
-        error["ResourceType"].as_str(),
-        Some("InstrumentationConfiguration"),
-        "expected the configuration type name, got {error}"
+        error["Message"].as_str(),
+        Some(CONFIGURATION_ABSENT),
+        "expected the sentence for a configuration that never existed, got {error}"
     );
 }
 
@@ -1445,9 +1449,9 @@ async fn a_lapsed_configuration_serves_no_status_history() {
         "expected a ResourceNotFoundException, got {error}"
     );
     assert_eq!(
-        error["ResourceType"].as_str(),
-        Some("InstrumentationConfiguration"),
-        "expected the configuration type name, got {error}"
+        error["Message"].as_str(),
+        Some(CONFIGURATION_DELETED),
+        "expected the sentence for a configuration the lapse took away, got {error}"
     );
 
     // The lapse was materialised rather than merely hidden, and the history went with the

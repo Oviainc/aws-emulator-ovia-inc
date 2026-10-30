@@ -23,11 +23,15 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::slo_lifecycle::{arn_uri_segment, call, router, ACCOUNT, REGION};
+// The two fixed sentences an instrumentation-configuration refusal states, written once for
+// this crate's tests in the suite that asserts the rule choosing between them.
+use crate::refusal_wording::{CONFIGURATION_ABSENT, CONFIGURATION_DELETED};
 
-/// The `ResourceType` every failure about an instrumentation configuration reports: the
-/// resource's type NAME, capitalised
-/// (`smithy_query(query="shape",shape="ResourceNotFoundException")` makes both
-/// `ResourceType` and `ResourceId` `@required`).
+/// The `ResourceType` a failure about an instrumentation configuration reports when it is
+/// about a resource the request named by ARN: the resource's type NAME, capitalised. The
+/// instrumentation operations themselves report neither member (see
+/// [`assert_configuration_not_found`]); the tagging operations, which address a resource by
+/// its ARN, do.
 const RESOURCE_TYPE: &str = "InstrumentationConfiguration";
 
 /// The only `DynamicInstrumentationDeletionStatus` the model declares
@@ -372,9 +376,40 @@ async fn create_all(router: &MultiServiceRouter, cases: &[Case]) -> Vec<String> 
     hashes
 }
 
-/// Assert that `answer` is the modelled `ResourceNotFoundException` for the configuration
-/// `arn` names.
-fn assert_not_found(case: &str, what: &str, status: u16, answer: &Value, arn: &str) {
+/// Assert that `answer` is the modelled `ResourceNotFoundException` an instrumentation
+/// operation refuses an identity it cannot resolve with: `message` and nothing else, with no
+/// `ResourceId` and no `ResourceType` beside it.
+fn assert_configuration_not_found(
+    case: &str,
+    what: &str,
+    status: u16,
+    answer: &Value,
+    message: &str,
+) {
+    assert_eq!(
+        status, 404,
+        "case {case:?}: expected HTTP 404 from {what}, got {status} with {answer}"
+    );
+    assert_eq!(
+        answer["__type"].as_str(),
+        Some("ResourceNotFoundException"),
+        "case {case:?}: expected a ResourceNotFoundException from {what}, got {answer}"
+    );
+    assert_eq!(
+        answer["Message"].as_str(),
+        Some(message),
+        "case {case:?}: expected {what} to answer {message:?}, got {answer}"
+    );
+    assert!(
+        answer["ResourceId"].is_null() && answer["ResourceType"].is_null(),
+        "case {case:?}: expected {what} to carry Message alone, got {answer}"
+    );
+}
+
+/// Assert that `answer` is the modelled `ResourceNotFoundException` a TAGGING call reports
+/// for the configuration `arn` names: the tagging operations address a resource by its ARN,
+/// so their refusal reports that ARN and the resource's type name.
+fn assert_tagged_not_found(case: &str, what: &str, status: u16, answer: &Value, arn: &str) {
     assert_eq!(
         status, 404,
         "case {case:?}: expected HTTP 404 from {what}, got {status} with {answer}"
@@ -480,17 +515,29 @@ async fn a_delete_removes_only_the_configuration_it_names() {
             case.read_body(case.instrumentation_type, identifier.clone()),
         )
         .await;
-        assert_not_found(case.label, "a read after the delete", status, &error, &arn);
+        assert_configuration_not_found(
+            case.label,
+            "a read after the delete",
+            status,
+            &error,
+            CONFIGURATION_DELETED,
+        );
         let (status, error) = delete(
             &router,
             case.read_body(case.instrumentation_type, identifier.clone()),
         )
         .await;
-        assert_not_found(case.label, "a second delete", status, &error, &arn);
+        assert_configuration_not_found(
+            case.label,
+            "a second delete",
+            status,
+            &error,
+            CONFIGURATION_ABSENT,
+        );
 
         // The tag set went with the record: nothing is addressed by that ARN any more.
         let (status, error) = list_tags(&router, &arn).await;
-        assert_not_found(
+        assert_tagged_not_found(
             case.label,
             "a tag read after the delete",
             status,

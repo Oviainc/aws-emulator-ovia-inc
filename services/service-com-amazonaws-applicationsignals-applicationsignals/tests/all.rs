@@ -85,6 +85,8 @@ mod page_bounds;
 mod paged_cursor_selection_binding;
 #[path = "all/paged_cursor_subject_binding.rs"]
 mod paged_cursor_subject_binding;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/resource_entity_metric_dimensions.rs"]
 mod resource_entity_metric_dimensions;
 #[path = "all/resource_tags.rs"]

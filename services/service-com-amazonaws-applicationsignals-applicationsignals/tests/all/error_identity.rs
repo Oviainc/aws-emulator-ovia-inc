@@ -20,6 +20,9 @@ use serde_json::{json, Value};
 use crate::slo_lifecycle::{
     arn_path_segment, call, create, name_path_segment, router, sli_config, ACCOUNT, REGION,
 };
+// The work-item wording the update path answers, asserted over more inputs in the suite that
+// owns that rule.
+use crate::refusal_wording::assert_work_item_wording;
 
 /// The `ResourceType` every SLO failure reports: the resource's type NAME, capitalised.
 const SLO_RESOURCE_TYPE: &str = "Slo";
@@ -35,6 +38,10 @@ fn slo_arn(name: &str) -> String {
 /// `UpdateServiceLevelObjective` and `DeleteServiceLevelObjective` all report
 /// `ResourceType` = the capitalised type name and `ResourceId` = the SLO's ARN, whichever
 /// of the two id forms the modelled `ServiceLevelObjectiveId` admits the caller used.
+///
+/// The MESSAGE is the reading layer's, not the shape's: the two reads state the resource and
+/// its ARN, while the update — which resolves the SLO through the work item that holds it —
+/// states that work item. `slo_work_item_wording` is where that form is asserted.
 ///
 /// The rows differ along the name's form (the character classes the modelled
 /// `ServiceLevelObjectiveName` pattern admits: plain, dotted, underscored, spaced, and the
@@ -123,12 +130,16 @@ async fn a_missing_slo_is_identified_by_its_arn_on_every_read_write_and_delete()
                 "case {label}: expected ResourceId {arn:?}, got {:?}",
                 error["ResourceId"]
             );
-            assert_eq!(
-                error["Message"].as_str(),
-                Some(format!("{SLO_RESOURCE_TYPE} with arn '{arn}' does not exist.").as_str()),
-                "case {label}: expected the message to name the ARN, got {:?}",
-                error["Message"]
-            );
+            let message = error["Message"].as_str().unwrap_or_default();
+            if method == "PATCH" {
+                assert_work_item_wording(&label, case.name, message);
+            } else {
+                assert_eq!(
+                    message,
+                    format!("{SLO_RESOURCE_TYPE} with arn '{arn}' does not exist."),
+                    "case {label}: expected the message to name the ARN, got {message:?}"
+                );
+            }
         }
     }
 }

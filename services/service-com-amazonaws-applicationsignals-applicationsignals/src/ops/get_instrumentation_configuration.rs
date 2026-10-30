@@ -75,6 +75,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// This operation's `ResourceNotFoundException` is the copy of the shape that serializes
+// `Message` alone: the request already names the identity it asked about, so the refusal
+// adds no ARN and no type name to it. The explicit import SHADOWS the glob above, which
+// brings in the copy the SLO and tagging refusals use, and the schema comes with it so the
+// error channel describes the shape exactly as this operation puts it on the wire.
+use super::types::instrumentation_not_found_types::{
+    ResourceNotFoundException, SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,10 +169,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// "the timestamp after which this configuration is no longer served to clients", so an
     /// expired BREAKPOINT configuration is gone and reported as not found — the same answer
     /// this call would give had nobody ever made it.
+    ///
+    /// A read that resolves nothing reports WHICH of the two not-found states the location is
+    /// in: a configuration that was removed from it — by a delete or by the lapse above — has
+    /// been deleted, and a location nothing was ever stored at holds no configuration at all.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // Nothing this read answers is drawn from the request's metadata: the record it
+        // reports was stored with its own ARN, and the refusal below states a fact about the
+        // identity the request carries rather than minting an identifier for it — hence the
+        // unused `_ctx`.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetInstrumentationConfigurationErrorModeled::ThrottlingException(
@@ -174,7 +191,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let region = crate::state::region_of(ctx.parts());
         let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
 
         // `CodeLocation.ClassName` is required for one value of its sibling `Language`, a
@@ -207,11 +223,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             None => Err(
                 GetInstrumentationConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::instrumentation_configuration_not_found(
-                        &region,
-                        &scope,
-                        &input.signal_type,
-                        &location_hash,
+                    crate::state::read_instrumentation_configuration_not_found(
+                        store.instrumentation_configuration_was_removed(&scope, &key),
                     ),
                 )
                 .into(),

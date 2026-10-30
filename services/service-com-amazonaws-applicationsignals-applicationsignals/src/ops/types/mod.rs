@@ -8,6 +8,13 @@
 //! lives in `<operation>_types`. Every submodule is re-exported here, so
 //! `use super::types::*` resolves a type wherever it lives.
 //!
+//! The ONE exception is `instrumentation_not_found_types`, declared below but NOT
+//! re-exported: it declares a second copy of `ResourceNotFoundException` — the one the
+//! instrumentation-configuration operations serialize, with the members those refusals do
+//! not carry declared unsupported — and that copy must carry the shape's own Rust name, so
+//! a glob re-export of it would make every use of that name ambiguous. An operation that
+//! serializes it imports it by path, which shadows the glob.
+//!
 //! The `_types` suffix keeps these submodule names disjoint from the operation
 //! module names: `ops/mod.rs` declares `pub mod types;` beside one
 //! `pub mod <operation>;` per operation and glob-re-exports both, so a submodule
@@ -26,6 +33,7 @@ pub mod get_instrumentation_configuration_status_types;
 pub mod get_instrumentation_configuration_types;
 pub mod get_service_level_objective_types;
 pub mod get_service_types;
+pub mod instrumentation_not_found_types;
 pub mod list_audit_findings_types;
 pub mod list_entity_events_types;
 pub mod list_grouping_attribute_definitions_types;

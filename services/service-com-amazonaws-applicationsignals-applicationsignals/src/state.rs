@@ -43,6 +43,12 @@ use crate::ops::types::{
 use crate::ops::types::{
     AuditFinding, AuditTarget, AuditTargetEntity, AuditorResult, MetricGraph, ServiceEntity,
 };
+// `ResourceNotFoundException` as the instrumentation-configuration operations serialize it:
+// the same shape, with the members those refusals do not put on the wire declared
+// unsupported (`crate::ops::types::instrumentation_not_found_types`). Imported under a
+// second name because the shape's own name is already taken here by the copy the SLO and
+// tagging refusals serialize, which DOES carry those members.
+use crate::ops::types::instrumentation_not_found_types::ResourceNotFoundException as InstrumentationNotFound;
 
 /// This service's SigV4 signing name, which is also its ARN namespace
 /// (`OPERATIONS.md`: `sigv4 signing name: application-signals`, `ARN namespace:
@@ -263,6 +269,25 @@ pub struct ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// [`Self::instrumentation_configuration_at_location`]) — so at most one scope of a
     /// given service and environment holds a record under any one [`instrumentation_key`].
     pub instrumentation_configurations: BTreeMap<InstrumentationScope, InstrumentationConfigurationSet>,
+    /// When a configuration was last removed from a location the store has removed one from,
+    /// keyed by the [`InstrumentationScope`] it lived in and the [`instrumentation_key`] it
+    /// was stored under.
+    ///
+    /// A READ of a location this store once held a configuration for answers differently from
+    /// a read of one it never held ([`read_instrumentation_configuration_not_found`]), so the
+    /// removal has to be remembered after the record and even after the scope's set are gone —
+    /// which is why this is its own map rather than a field of
+    /// [`InstrumentationConfigurationSet`], whose entry is dropped once it has emptied and
+    /// stopped being news ([`EMPTY_SCOPE_RETENTION`]). Both removal paths write it, the
+    /// explicit delete and the lapse the clock makes due, because both leave the location
+    /// holding a configuration it once held.
+    ///
+    /// A create at the location clears the entry: the record it writes is a NEW resource, not
+    /// a removed one. Bounded at [`MAX_REMEMBERED_INSTRUMENTATION_REMOVALS`] entries, past
+    /// which the OLDEST removal is forgotten, so a caller that creates and deletes for ever
+    /// does not grow the store for ever.
+    removed_instrumentation_configurations:
+        BTreeMap<InstrumentationScope, BTreeMap<String, DateTime>>,
     /// The next instant [`ComAmazonawsApplicationsignalsApplicationsignalsState::expire_instrumentation_configurations`]
     /// has anything to do, or `None` while it owes nothing — so the pass every create and
     /// list makes walks the store only when the clock has actually made a lapse or a scope
@@ -754,6 +779,64 @@ pub fn slo_not_found(region: &str, id: &str) -> ResourceNotFoundException {
         resource_type: SLO_RESOURCE_TYPE.to_string(),
         resource_id: arn,
     }
+}
+
+/// The namespace the work-item layer that serves `UpdateServiceLevelObjective` addresses an
+/// SLO in, as its refusal names it: the same token the modelled `ServiceLevelObjectiveArn`
+/// pattern spells the resource segment with ([`SLO_ARN_RESOURCE`]).
+const SLO_WORK_ITEM_NAMESPACE: &str = SLO_ARN_RESOURCE;
+
+/// How many digits a work-item discriminator carries.
+const WORK_ITEM_DISCRIMINATOR_DIGITS: u32 = 12;
+
+/// The modelled `ResourceNotFoundException` `UpdateServiceLevelObjective` refuses an `Id`
+/// that names no stored SLO with.
+///
+/// The update resolves the SLO through the WORK ITEM that holds it, so its message identifies
+/// that work item rather than the resource: the account the item belongs to, the SLO NAME the
+/// request named (the name half of either form the modelled `ServiceLevelObjectiveId` admits,
+/// so an `Id` given as an ARN is reported by its name all the same), the item's own
+/// discriminator and the namespace it lives in — and it states no ARN, which is not how the
+/// work-item layer addresses anything.
+///
+/// `ResourceType` and `ResourceId` stay the RESOURCE's, as every other refusal about an SLO
+/// reports them ([`slo_not_found`]): they are what a client branches on to learn which
+/// resource it asked about, and that is the SLO either way.
+pub fn slo_work_item_not_found(region: &str, id: &str) -> ResourceNotFoundException {
+    let name = slo_name_of(id);
+    let account = ::engine::emulator_account_id();
+    ResourceNotFoundException {
+        message: format!(
+            "Work item with id: {account}:{name}:{} and namespace: {SLO_WORK_ITEM_NAMESPACE} \
+             does not exist",
+            work_item_discriminator(account, name)
+        ),
+        resource_type: SLO_RESOURCE_TYPE.to_string(),
+        resource_id: slo_arn_of(region, id),
+    }
+}
+
+/// The discriminator of the work item that would hold the SLO called `name` in `account`:
+/// [`WORK_ITEM_DISCRIMINATOR_DIGITS`] decimal digits, server-minted.
+///
+/// It is the server's own id for the item, so it comes from nothing the caller sent beyond
+/// the item's identity — and from that identity alone, which is what makes it STABLE: two
+/// calls about one work item report one discriminator, and two work items get two. A value
+/// drawn from the clock or a counter would change under a client that retries, and there is
+/// no stored record to read one off, since the whole refusal is that the item is not there.
+///
+/// [`stable_hash`] renders exactly 16 hex characters, which is what a `u64` holds, so the
+/// parse cannot fail; it falls back to a value rather than panicking all the same, because
+/// this runs on a request path, where an unwind would turn a modelled 404 into a 500.
+fn work_item_discriminator(account: &str, name: &str) -> String {
+    let digest = stable_hash(&[Some(account), Some(name)]);
+    let value = u64::from_str_radix(&digest, 16).unwrap_or_default();
+    let digits = u64::pow(10, WORK_ITEM_DISCRIMINATOR_DIGITS);
+    format!(
+        "{:0>width$}",
+        value % digits,
+        width = WORK_ITEM_DISCRIMINATOR_DIGITS as usize
+    )
 }
 
 /// The modelled `ResourceNotFoundException` for a tagging operation's `ResourceArn` that
@@ -4168,6 +4251,17 @@ pub const EMPTY_SCOPE_RETENTION: Duration =
 /// How many advertised sync intervals [`EMPTY_SCOPE_RETENTION`] spans.
 const EMPTY_SCOPE_RETENTION_INTERVALS: u64 = 10;
 
+/// The most REMOVALS of instrumentation configurations this store remembers, past which the
+/// oldest it holds is forgotten.
+///
+/// A remembered removal is what lets a read report a configuration as deleted rather than as
+/// one that never existed, so it outlives the record it is about and needs a bound of its
+/// own. The bound is the one that already caps the live records
+/// ([`MAX_INSTRUMENTATION_CONFIGURATIONS`]): the store remembers at most as many removals as
+/// configurations it would hold, so the memory cannot cost more than the records it is about,
+/// and the caller that fills it is the one that created and removed that many.
+const MAX_REMEMBERED_INSTRUMENTATION_REMOVALS: usize = MAX_INSTRUMENTATION_CONFIGURATIONS;
+
 /// The set of instrumentation configurations one list call reports over: the service, the
 /// environment it runs in and the instrumentation type, which is every selector the
 /// instrumentation operations take beside the location.
@@ -4634,11 +4728,84 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     ) {
         let key = instrumentation_key(&configuration.signal_type, &configuration.location_hash);
         let expires_at = configuration.expires_at;
+        // What this writes is a NEW resource, so the location is no longer one the store
+        // remembers removing a configuration from: a later read of it resolves this record,
+        // and a read after THIS record is removed reports that removal, not the earlier one.
+        self.forget_instrumentation_removal(&scope, &key);
         let set = self.instrumentation_configurations.entry(scope).or_default();
         set.configurations.insert(key, configuration);
         set.record_change(at);
         if let Some(expires_at) = expires_at {
             self.schedule_instrumentation_pass(expires_at);
+        }
+    }
+
+    /// Whether the store remembers a configuration being removed from `scope` at `key`
+    /// ([`instrumentation_key`]) — by a delete or by a lapse — and holds none there now.
+    pub fn instrumentation_configuration_was_removed(
+        &self,
+        scope: &InstrumentationScope,
+        key: &str,
+    ) -> bool {
+        self.removed_instrumentation_configurations
+            .get(scope)
+            .is_some_and(|removals| removals.contains_key(key))
+    }
+
+    /// Remember that the configuration stored in `scope` at `key` was removed at `at`.
+    ///
+    /// Called by BOTH removal paths — the explicit delete and the expiry pass — since each
+    /// leaves the location one the store once held a configuration for.
+    fn remember_instrumentation_removal(
+        &mut self,
+        scope: &InstrumentationScope,
+        key: &str,
+        at: DateTime,
+    ) {
+        self.removed_instrumentation_configurations
+            .entry(scope.clone())
+            .or_default()
+            .insert(key.to_string(), at);
+        self.forget_oldest_instrumentation_removals();
+    }
+
+    /// Forget that `scope` ever lost a configuration at `key`, dropping the scope's entry
+    /// once it remembers no removal at all.
+    fn forget_instrumentation_removal(&mut self, scope: &InstrumentationScope, key: &str) {
+        let Some(removals) = self.removed_instrumentation_configurations.get_mut(scope) else {
+            return;
+        };
+        removals.remove(key);
+        if removals.is_empty() {
+            self.removed_instrumentation_configurations.remove(scope);
+        }
+    }
+
+    /// Forget the OLDEST removals until the store remembers no more than
+    /// [`MAX_REMEMBERED_INSTRUMENTATION_REMOVALS`] of them.
+    ///
+    /// The oldest goes first because the most recent removals are the ones a client is still
+    /// reading back after; the walk is over a map that is at most one entry past its own cap.
+    fn forget_oldest_instrumentation_removals(&mut self) {
+        while self
+            .removed_instrumentation_configurations
+            .values()
+            .map(BTreeMap::len)
+            .sum::<usize>()
+            > MAX_REMEMBERED_INSTRUMENTATION_REMOVALS
+        {
+            let oldest = self
+                .removed_instrumentation_configurations
+                .iter()
+                .flat_map(|(scope, removals)| {
+                    removals.iter().map(move |(key, at)| (scope, key, at))
+                })
+                .min_by_key(|(_, _, at)| instant_nanos(at))
+                .map(|(scope, key, _)| (scope.clone(), key.clone()));
+            let Some((scope, key)) = oldest else {
+                return;
+            };
+            self.forget_instrumentation_removal(&scope, &key);
         }
     }
 
@@ -4728,6 +4895,10 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
                 set.status_history.remove(&key);
                 set.record_change(expires_at);
             }
+            // A lapse takes the configuration away exactly as a delete does, so the location
+            // is remembered as one a configuration was removed from — dated at the instant
+            // the lapse fell due, which is when the record went.
+            self.remember_instrumentation_removal(&scope, &key, expires_at);
             // Tags are addressed by resource ARN, so a record that is gone takes its tags
             // with it rather than leaving them for the next resource minted at that ARN.
             self.tags.remove(&arn);
@@ -5150,12 +5321,18 @@ fn expiry_window_refusal(comparison: &str, bound_secs: u64) -> String {
 
 /// The modelled `ConflictException` for a create that names a configuration already stored.
 ///
-/// `ConflictException` carries only `Message`, so the message is the only place the
-/// conflicting resource can be identified \u2014 and it identifies it by the ARN read off the
-/// STORED record, which is what a client resolves or adopts the existing configuration by.
-pub fn instrumentation_configuration_already_exists(arn: &str) -> ConflictException {
+/// The sentence states the identity DIMENSIONS the uniqueness rule is on and no VALUE of
+/// any of them. The create's own doc is what those dimensions are — "if a configuration
+/// already exists for the same service, environment, signal type, and location, this
+/// operation returns a conflict instead of overwriting it" — and they are what the caller
+/// has to change to get a create through; the ARN of the stored record is not, and
+/// `ConflictException` carries only `Message`, so putting it there would disclose an
+/// identifier the caller never named in the one field it reads.
+pub fn instrumentation_configuration_already_exists() -> ConflictException {
     ConflictException {
-        message: format!("Instrumentation configuration with arn '{arn}' already exists."),
+        message: "An instrumentation configuration already exists for this service, \
+                  environment, signalType and location."
+            .to_string(),
     }
 }
 
@@ -5179,30 +5356,71 @@ pub const BATCH_DELETE_ERROR_RESOURCE_NOT_FOUND: &str = "ResourceNotFoundExcepti
 /// compares against.
 pub const INSTRUMENTATION_CONFIG_RESOURCE_TYPE: &str = "InstrumentationConfiguration";
 
-/// The modelled `ResourceNotFoundException` for an identity that names no stored
-/// configuration.
+/// The sentence a read of a location this store once held a configuration for, and holds
+/// none at now, is refused with: the configuration the request named has been taken away.
 ///
-/// `ResourceType` and `ResourceId` are both `@required` members a client branches on, so the
-/// failure reports the type name and the full resource identifier. There is no record to
-/// read an ARN off, so the ARN is derived from the identity the REQUEST named — exactly as
-/// [`slo_not_found`] does for an SLO — and the message states the same two facts.
-pub fn instrumentation_configuration_not_found(
-    region: &str,
-    scope: &InstrumentationScope,
-    signal_type: &str,
-    location_hash: &str,
-) -> ResourceNotFoundException {
-    let arn = instrumentation_configuration_arn(region, scope, signal_type, location_hash);
-    ResourceNotFoundException {
-        message: instrumentation_configuration_missing(&arn),
-        resource_type: INSTRUMENTATION_CONFIG_RESOURCE_TYPE.to_string(),
-        resource_id: arn,
+/// Entirely fixed text. The refusal states the FACT about the configuration the request
+/// identified, so it names no identifier of its own: the request already carries the service,
+/// the environment, the signal type and the location it asked about, and the body a client
+/// gets back adds nothing it did not send.
+pub const INSTRUMENTATION_CONFIGURATION_DELETED: &str =
+    "The requested instrumentation configuration has been deleted.";
+
+/// The sentence a refusal about a location this store holds no configuration at and
+/// remembers removing none from states, and the sentence EVERY delete of an identity it
+/// cannot resolve states. Fixed text, for the same reason as
+/// [`INSTRUMENTATION_CONFIGURATION_DELETED`].
+pub const INSTRUMENTATION_CONFIGURATION_ABSENT: &str =
+    "The requested instrumentation configuration does not exist.";
+
+/// The modelled `ResourceNotFoundException` an instrumentation-configuration operation
+/// refuses an identity it cannot resolve with: `Message` alone.
+///
+/// The shape this builds is the one with `ResourceType` and `ResourceId` declared unsupported
+/// (`crate::ops::types::instrumentation_not_found_types`), so the body carries the sentence
+/// and nothing else — unlike [`slo_not_found`], whose refusal is about a resource the request
+/// named by an id it may not hold the full form of, and which therefore reports that id and
+/// its type.
+fn instrumentation_configuration_not_found(message: &str) -> InstrumentationNotFound {
+    InstrumentationNotFound {
+        message: message.to_string(),
     }
 }
 
-/// What a failure states about an ARN that names no stored configuration, shared by the
-/// single-resource `ResourceNotFoundException` above and the per-item error a batch delete
-/// reports, so the two agree on one wording for one fact.
+/// What a READ of an instrumentation configuration answers for an identity that resolves no
+/// stored record: the configuration has been deleted when the store remembers one being
+/// removed from that location
+/// ([`ComAmazonawsApplicationsignalsApplicationsignalsState::instrumentation_configuration_was_removed`]),
+/// and no such configuration exists when it remembers none.
+///
+/// The distinction is the one a client reading back after a delete asks about: whether what
+/// it created is gone, or whether it is asking about a location nothing was ever stored at —
+/// two different answers, which one sentence for both would collapse.
+pub fn read_instrumentation_configuration_not_found(removed: bool) -> InstrumentationNotFound {
+    instrumentation_configuration_not_found(if removed {
+        INSTRUMENTATION_CONFIGURATION_DELETED
+    } else {
+        INSTRUMENTATION_CONFIGURATION_ABSENT
+    })
+}
+
+/// What a DELETE answers for an identity that resolves no stored configuration, whether or
+/// not the store remembers removing one from that location.
+///
+/// The delete path states what it could not do — there is no configuration there to remove —
+/// rather than what became of an earlier one, so a repeat of a successful delete and a delete
+/// of a location nothing was ever stored at are refused with ONE sentence. The read path's
+/// sentence is the one that distinguishes those two ([`read_instrumentation_configuration_not_found`]).
+pub fn delete_instrumentation_configuration_not_found() -> InstrumentationNotFound {
+    instrumentation_configuration_not_found(INSTRUMENTATION_CONFIGURATION_ABSENT)
+}
+
+/// What the per-item error of a batch delete states about an ARN that names no stored
+/// configuration.
+///
+/// The batch reports one error per ARN of the request ("Errors": one entry per ARN it could
+/// not delete), so the entry names the ARN it is about: that is which item of the batch
+/// failed, which a single-resource refusal has no need to state.
 pub fn instrumentation_configuration_missing(arn: &str) -> String {
     format!("{INSTRUMENTATION_CONFIG_RESOURCE_TYPE} with arn '{arn}' does not exist.")
 }
@@ -5218,6 +5436,9 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// whose set this empties keeps that instant for [`EMPTY_SCOPE_RETENTION`] so a slower
     /// caller still learns of the change, and the expiry pass is scheduled for the end of
     /// that horizon so the emptied record is dropped once it has nothing left to tell.
+    ///
+    /// The location is also remembered as one a configuration was removed from, which is what
+    /// a later READ of it reports ([`read_instrumentation_configuration_not_found`]).
     pub fn remove_instrumentation_configuration(
         &mut self,
         scope: &InstrumentationScope,
@@ -5234,6 +5455,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             set.record_change(at);
             (removed, set.configurations.is_empty())
         };
+        self.remember_instrumentation_removal(scope, key, at);
         // Tags are addressed by resource ARN, so a record that is gone takes its tags with
         // it rather than leaving them for the next resource minted at that ARN.
         self.tags.remove(&removed.arn);

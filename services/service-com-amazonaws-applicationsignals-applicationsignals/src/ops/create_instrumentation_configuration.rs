@@ -256,16 +256,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what makes the ARN those four parts mint name a single record, and the tag set
         // stored under it a single record's).
         //
-        // The conflicting resource is identified by ITS OWN ARN, read off the stored record
-        // rather than minted from this request.
-        if let Some(existing) = store.instrumentation_configuration_at_location(
-            &input.service,
-            &input.environment,
-            &key,
-        ) {
+        // The refusal states those four identity dimensions and no value of any of them: what
+        // the caller must change to get a create through is one of the four, not the id of a
+        // resource it never named.
+        if store
+            .instrumentation_configuration_at_location(&input.service, &input.environment, &key)
+            .is_some()
+        {
             return Err(
                 CreateInstrumentationConfigurationErrorModeled::ConflictException(
-                    crate::state::instrumentation_configuration_already_exists(&existing.arn),
+                    crate::state::instrumentation_configuration_already_exists(),
                 )
                 .into(),
             );

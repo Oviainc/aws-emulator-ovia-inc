@@ -72,6 +72,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// This operation's `ResourceNotFoundException` is the copy of the shape that serializes
+// `Message` alone: the request already names the identity it asked about, so the refusal
+// adds no ARN and no type name to it. The explicit import SHADOWS the glob above, which
+// brings in the copy the SLO and tagging refusals use, and the schema comes with it so the
+// error channel describes the shape exactly as this operation puts it on the wire.
+use super::types::instrumentation_not_found_types::{
+    ResourceNotFoundException, SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -148,14 +157,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// `ResourceNotFoundException` and the operation is not `@idempotent`, so a repeat of a
     /// successful delete is refused rather than answered DELETED a second time. A
     /// configuration whose lifetime has already run out is gone for the same reason it is
-    /// gone for a reader — the clock, not this call — so deleting it is that same 404.
+    /// gone for a reader — the clock, not this call — so deleting it is that same 404. All
+    /// three cases get ONE sentence, which states what this call could not do: the delete
+    /// path says nothing about what became of an earlier configuration, which is the read
+    /// path's answer to make.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // The delete answers a status and, on failure, a sentence about the identity the
+        // request carries, so nothing here is minted from the request's metadata — hence the
+        // unused `_ctx`.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
-        let region = crate::state::region_of(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 DeleteInstrumentationConfigurationErrorModeled::ThrottlingException(
@@ -197,12 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(
                 DeleteInstrumentationConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::instrumentation_configuration_not_found(
-                        &region,
-                        &scope,
-                        &input.signal_type,
-                        &location_hash,
-                    ),
+                    crate::state::delete_instrumentation_configuration_not_found(),
                 )
                 .into(),
             );

@@ -37,6 +37,10 @@ use service_com_amazonaws_applicationsignals_applicationsignals::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+// The fixed sentence a refusal about a configuration that was never stored states, written
+// once for this crate's tests in the suite that asserts the rule choosing it.
+use crate::refusal_wording::CONFIGURATION_ABSENT;
+
 /// The SigV4 credential scope routes the request to this service. Signature verification is
 /// off (see `set_request_authentication`), so the signature bytes are never read.
 const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
@@ -318,8 +322,9 @@ async fn a_get_reports_the_stored_configuration_under_either_location_identifier
 }
 
 /// An identity that names no stored configuration is the modelled
-/// `ResourceNotFoundException` (404), which identifies the resource by the type name and by
-/// the ARN that identity would carry — and the stored configuration survives every miss.
+/// `ResourceNotFoundException` (404). Nothing was ever stored at any of these identities, so
+/// each is refused with the sentence for a configuration that does not exist, carrying
+/// `Message` alone — and the stored configuration survives every miss.
 #[tokio::test]
 async fn a_get_of_an_identity_that_names_nothing_is_not_found() {
     for case in cases() {
@@ -404,14 +409,13 @@ async fn a_get_of_an_identity_that_names_nothing_is_not_found() {
                 "case {label:?} with {why}: expected a ResourceNotFoundException, got {error}"
             );
             assert_eq!(
-                error["ResourceType"].as_str(),
-                Some("InstrumentationConfiguration"),
-                "case {label:?} with {why}: expected the resource type name, got {error}"
+                error["Message"].as_str(),
+                Some(CONFIGURATION_ABSENT),
+                "case {label:?} with {why}: expected {CONFIGURATION_ABSENT:?}, got {error}"
             );
-            let reported = error["ResourceId"].as_str().unwrap_or_default();
             assert!(
-                reported.contains(":instrumentationConfig/"),
-                "case {label:?} with {why}: expected ResourceId to be a configuration ARN, got {reported:?}"
+                error["ResourceId"].is_null() && error["ResourceType"].is_null(),
+                "case {label:?} with {why}: expected Message alone, got {error}"
             );
         }
 

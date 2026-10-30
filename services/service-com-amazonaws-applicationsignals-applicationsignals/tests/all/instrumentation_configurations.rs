@@ -39,6 +39,10 @@ use service_com_amazonaws_applicationsignals_applicationsignals::state::{
     EMPTY_SCOPE_RETENTION, MAX_INSTRUMENTATION_CONFIGURATIONS,
 };
 
+// The conflict sentence, written once for this crate's tests in the suite that owns the rule
+// wording it.
+use crate::refusal_wording::CONFIGURATION_CONFLICT;
+
 /// The SigV4 credential scope routes the request to this service. Signature verification is
 /// off (see `set_request_authentication`), so the signature bytes are never read.
 const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
@@ -850,7 +854,8 @@ async fn a_second_create_at_the_same_identity_conflicts() {
     // The documented conflict key is the service, the environment, the signal type and the
     // location — the four parts the ARN spells, and NOT the instrumentation type: so the
     // same create repeated and a create of the other type at that same location are both
-    // refused, each identifying the one stored record by its own ARN.
+    // refused, each with the conflict worded over those four dimensions and over no value of
+    // them (`refusal_wording` owns that rule).
     let mut other_type = case.create_body();
     other_type["InstrumentationType"] = json!(PROBE);
     // `ExpiresAt` is not supported for PROBE, and the default-expiring row carries none.
@@ -863,13 +868,16 @@ async fn a_second_create_at_the_same_identity_conflicts() {
             status, 409,
             "case {label:?}: expected the create to conflict with 409, got {status} with {answer:?}"
         );
+        assert_eq!(
+            answer["Message"].as_str(),
+            Some(CONFIGURATION_CONFLICT),
+            "case {label:?}: expected the conflict to name the identity dimensions, got {answer:?}"
+        );
         assert!(
-            answer["Message"]
+            !answer["Message"]
                 .as_str()
-                .or_else(|| answer["message"].as_str())
                 .is_some_and(|message| message.contains(&arn)),
-            "case {label:?}: expected the conflict to identify the stored configuration by its \
-             ARN {arn:?}, got {answer:?}"
+            "case {label:?}: expected the conflict to name no ARN, got {answer:?}"
         );
     }
 
