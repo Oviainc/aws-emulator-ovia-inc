@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDirectoryRegistrations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDirectoryRegistrations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDirectoryRegistrations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +156,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDirectoryRegistrations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDirectoryRegistrationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDirectoryRegistrations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListDirectoryRegistrationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the pca-connector-ad state store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The page this call asks for: the bounds every list operation of this
+        // service pages by. `None` is a `NextToken` this service never issued,
+        // refused rather than honoured as a cursor.
+        let (page_size, after) =
+            crate::state::page_bounds(input.max_results, input.next_token.as_deref()).ok_or_else(
+                || {
+                    ListDirectoryRegistrationsError::from(
+                        ListDirectoryRegistrationsErrorModeled::ValidationException(
+                            ValidationException {
+                                message: crate::state::pagination_token_message(Self::NAME),
+                                reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                            },
+                        ),
+                    )
+                },
+            )?;
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising the CREATING ->
+        // ACTIVE moves the clock already owed, which were due whether or not
+        // anybody called.
+        store.settle(::std::time::SystemTime::now());
+
+        let remaining = store.directory_registrations_after(after);
+        let page: Vec<&crate::state::DirectoryRegistrationRecord> =
+            remaining.iter().copied().take(page_size).collect();
+        // A token only on a page that does not exhaust the store, so the last page
+        // carries none.
+        let has_more = remaining.len() > page.len();
+        let directory_registrations: Vec<DirectoryRegistrationSummary> = page
+            .iter()
+            .map(|record| DirectoryRegistrationSummary {
+                arn: Some(record.arn.clone()),
+                directory_id: Some(record.directory_id.clone()),
+                status: Some(record.status.clone()),
+                status_reason: record.status_reason.clone(),
+                created_at: Some(::aws_smithy_types::DateTime::from(record.created_at)),
+                updated_at: Some(::aws_smithy_types::DateTime::from(record.updated_at)),
+            })
+            .collect();
+
+        // The cursor is the `seq` of the last record this page served, taken from
+        // that record rather than computed as an index into the collection.
+        let next_token = if has_more {
+            page.last()
+                .map(|record| crate::state::encode_page_token(record.seq))
+        } else {
+            None
+        };
+
+        Ok(ListDirectoryRegistrationsOutput {
+            directory_registrations: Some(directory_registrations),
+            next_token,
+        })
     }
 }

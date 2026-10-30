@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDirectoryRegistration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDirectoryRegistration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDirectoryRegistration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +79,10 @@
 //!   exceeded.
 //! * `ValidationException` (HTTP 400) — An input validation error occurred. For example,
 //!   invalid characters in a template name, or if a pagination token is invalid.
+//! * `ServiceQuotaExceededException` (HTTP 402) — widened in through `extra_errors` (see
+//!   below): the model's `errors` list for this operation omits it, but this SERVICE
+//!   models the shape (and `CreateConnector` declares it), so the refusal past this
+//!   emulator's store bound is a modelled quota error rather than some other status.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -103,13 +98,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-pcaconnectorad-pcaconne
 // here — hence the `CreateDirectoryRegistrationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.pcaconnectorad#CreateDirectoryRegistration")]
+// `ServiceQuotaExceededException` is widened in through `extra_errors`: this SERVICE
+// models the shape and `CreateConnector` lists it, so the refusal once this emulator's
+// directory-registration store reaches its bound is a modelled quota error.
+#[smithy_macros::operation_error(
+    "com.amazonaws.pcaconnectorad#CreateDirectoryRegistration",
+    extra_errors = ["ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum CreateDirectoryRegistrationErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -165,18 +167,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDirectoryRegistration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDirectoryRegistrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDirectoryRegistration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateDirectoryRegistrationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the pca-connector-ad state store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // @idempotencyToken: a retry carrying the ClientToken of an earlier call
+        // names the registration that call minted, instead of refusing it as a
+        // duplicate. The key carries the DIRECTORY the request addressed too, so a
+        // token reused against a different directory cannot answer with the ARN of
+        // a registration the caller did not ask about.
+        let token_key = input
+            .client_token
+            .as_ref()
+            .map(|token| format!("{}:{}:{token}", Self::NAME, input.directory_id));
+        if let Some(arn) = token_key.as_ref().and_then(|key| store.idempotency.get(key)) {
+            return Ok(CreateDirectoryRegistrationOutput {
+                directory_registration_arn: Some(arn.clone()),
+            });
+        }
+
+        // A directory carries at most one registration: the modelled
+        // `DirectoryRegistrationArn` names the directory itself, so a second
+        // registration of one directory has no identity of its own to answer with.
+        if let Some(existing) = store.registration_by_directory_id(&input.directory_id) {
+            let resource_id = existing.arn.clone();
+            return Err(CreateDirectoryRegistrationErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "DirectoryRegistration already exists: {}.",
+                        input.directory_id
+                    ),
+                    resource_id,
+                    resource_type: "DirectoryRegistration".to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded: past the cap the create is refused rather than
+        // growing the map, so no number of requests carrying fresh directory ids
+        // grows this process without limit.
+        if store.directory_registrations.len() >= crate::state::MAX_DIRECTORY_REGISTRATIONS {
+            return Err(
+                CreateDirectoryRegistrationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this directory registration store has reached its bound of {} registrations",
+                            crate::state::MAX_DIRECTORY_REGISTRATIONS
+                        ),
+                        resource_id: crate::state::directory_registration_collection_arn(&region),
+                        resource_type: "DirectoryRegistration".to_string(),
+                        service_code: crate::state::ARN_NAMESPACE.to_string(),
+                        quota_code: crate::state::QUOTA_CODE_DIRECTORY_REGISTRATIONS_PER_STORE
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let arn = crate::state::directory_registration_arn(&region, &input.directory_id);
+        let seq = store.next_seq();
+        let record = crate::state::DirectoryRegistrationRecord {
+            arn: arn.clone(),
+            directory_id: input.directory_id,
+            // A registration AWS answers 202 for is not authorized yet; the clock
+            // owes it the move to ACTIVE at `active_at`.
+            status: crate::state::DIRECTORY_REGISTRATION_STATUS_CREATING.to_string(),
+            status_reason: None,
+            created_at: now,
+            updated_at: now,
+            active_at: now + crate::state::DIRECTORY_REGISTRATION_ACTIVATION_DELAY,
+            tags: input.tags.unwrap_or_default(),
+            seq,
+        };
+        store.directory_registrations.insert(arn.clone(), record);
+        if let Some(key) = token_key {
+            store.record_idempotency(key, arn.clone());
+        }
+
+        Ok(CreateDirectoryRegistrationOutput {
+            directory_registration_arn: Some(arn),
+        })
     }
 }

@@ -166,30 +166,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `MaxResults` is modelled `range 1..1000` and the boundary validator has
-        // already refused anything outside it, so a value arriving here is in
-        // range; an absent one means "everything", which is that same modelled
-        // maximum. A value the validator cannot let through (zero or negative)
-        // falls back to the maximum rather than silently serving one-item pages.
-        let modelled_max = usize::try_from(crate::state::MAX_LIST_RESULTS).unwrap_or(usize::MAX);
-        let page_size =
-            usize::try_from(input.max_results.unwrap_or(crate::state::MAX_LIST_RESULTS))
-                .ok()
-                .filter(|&requested| requested > 0)
-                .unwrap_or(modelled_max);
-
-        let after = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => crate::state::decode_page_token(token).ok_or_else(|| {
-                ListConnectorsError::from(ListConnectorsErrorModeled::ValidationException(
-                    ValidationException {
-                        message: "NextToken is not a pagination token this service issued"
-                            .to_string(),
-                        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
-                    },
-                ))
-            })?,
-        };
+        // The page this call asks for: the shared bounds every list operation of
+        // this service serves pages by. `None` is a `NextToken` the service never
+        // issued, which is refused rather than honoured as a cursor.
+        let (page_size, after) =
+            crate::state::page_bounds(input.max_results, input.next_token.as_deref()).ok_or_else(
+                || {
+                    ListConnectorsError::from(ListConnectorsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: crate::state::pagination_token_message(Self::NAME),
+                            reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                        },
+                    ))
+                },
+            )?;
 
         let mut store = state.lock();
         // Reporting operation: the only write is materialising the CREATING ->
@@ -197,9 +187,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(::std::time::SystemTime::now());
 
         let remaining = store.connectors_after(after);
-        let connectors: Vec<ConnectorSummary> = remaining
+        let page: Vec<&crate::state::ConnectorRecord> =
+            remaining.iter().copied().take(page_size).collect();
+        // A token only on a page that does not exhaust the store, so the last page
+        // carries none.
+        let has_more = remaining.len() > page.len();
+        let connectors: Vec<ConnectorSummary> = page
             .iter()
-            .take(page_size)
             .map(|record| ConnectorSummary {
                 arn: Some(record.arn.clone()),
                 certificate_authority_arn: Some(record.certificate_authority_arn.clone()),
@@ -215,10 +209,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // A token only on a page that does not exhaust the store, so the last page
-        // carries none. The cursor is the `seq` of the last record served.
-        let next_token = if remaining.len() > page_size {
-            Some(crate::state::encode_page_token(remaining[page_size - 1].seq))
+        // The cursor is the `seq` of the last record this page served, taken from
+        // that record rather than computed as an index into the collection.
+        let next_token = if has_more {
+            page.last()
+                .map(|record| crate::state::encode_page_token(record.seq))
         } else {
             None
         };

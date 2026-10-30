@@ -5,26 +5,22 @@
 //! Every case drives the real wire path: a `restJson1` request through the same
 //! `MultiServiceRouter::dispatch` the production front door uses, so routing,
 //! `@httpLabel` binding, constraint validation, the handler and serialization are
-//! all exercised. Nothing reaches into the state struct.
+//! all exercised. Nothing reaches into the state struct. The request path itself
+//! — the router, the request builder, the `@httpLabel` encoding and the error-code
+//! read — comes from [`super::harness`], which every suite in this crate shares.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
+
+use super::harness::{call as dispatch, encode_label, router, ACCOUNT, REGION};
 
 // The store bounds the handlers refuse past, imported from the crate so these
 // tests cannot drift from the caps the handlers enforce.
 use service_com_amazonaws_pcaconnectorad_pcaconnectorad::state::{
     CONNECTOR_ACTIVATION_DELAY, MAX_CONNECTORS, MAX_TEMPLATES_PER_CONNECTOR,
 };
-
-/// The region the test's SigV4 credential scope names, so every minted ARN must
-/// carry it.
-const REGION: &str = "us-west-2";
-
-/// The canonical emulator account id every ARN carries.
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// The Microsoft AD certificate-template OID arc a template's `ObjectIdentifier`
 /// sits under (see `state::template_object_identifier`).
@@ -36,114 +32,25 @@ const AD_TEMPLATE_OID_ARC: &str = "1.3.6.1.4.1.311.21.8";
 const PAST_ACTIVATION: std::time::Duration =
     CONNECTOR_ACTIVATION_DELAY.saturating_add(std::time::Duration::from_millis(750));
 
-fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_pcaconnectorad_pcaconnectorad::EmulatedService::new(engine),
-    );
-    router
-}
-
-/// Percent-encode one path segment the way an AWS SDK encodes a non-greedy
-/// `@httpLabel`: everything but the unreserved set, so an ARN's `:` and `/`
-/// arrive as `%3A` / `%2F` and the value stays a single segment.
-fn encode_label(value: &str) -> String {
-    value
-        .bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                char::from(b).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect()
-}
-
-fn request(
-    method: &str,
-    path_and_query: &str,
-    body: Option<&Value>,
-) -> http::Request<bytes::Bytes> {
-    let payload = match body {
-        Some(value) => bytes::Bytes::from(serde_json::to_vec(value).expect("serialize body")),
-        None => bytes::Bytes::new(),
-    };
-    http::Request::builder()
-        .method(method)
-        .uri(format!(
-            "https://pca-connector-ad.{REGION}.amazonaws.com{path_and_query}"
-        ))
-        .header("host", format!("pca-connector-ad.{REGION}.amazonaws.com"))
-        .header("content-type", "application/json")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/pca-connector-ad/aws4_request, \
-                 SignedHeaders=host, Signature=0123456789abcdef"
-            ),
-        )
-        .body(payload)
-        .expect("build request")
-}
-
-/// Status plus parsed JSON body of a dispatched request.
+/// Status plus parsed JSON body of a dispatched request, with the wire error code
+/// surfaced as `__code` so a case can assert it without caring whether the
+/// protocol put it in the header or the body.
 async fn call(
     router: &MultiServiceRouter,
     method: &str,
     path_and_query: &str,
     body: Option<&Value>,
 ) -> (u16, Value) {
-    let response = router.dispatch(request(method, path_and_query, body)).await;
-    let status = response.status().as_u16();
-    let code = error_code(&response);
-    let parsed: Value = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    // Surface the wire error code as `__code` so a case can assert it without
-    // caring whether the protocol put it in the header or the body.
-    let parsed = match (code, parsed) {
-        (Some(code), Value::Object(mut map)) => {
+    let (status, code, parsed) = dispatch(router, method, path_and_query, body).await;
+    let parsed = match (code.is_empty(), parsed) {
+        (true, parsed) => parsed,
+        (false, Value::Object(mut map)) => {
             map.insert("__code".to_string(), Value::String(code));
             Value::Object(map)
         }
-        (Some(code), _) => json!({ "__code": code }),
-        (None, parsed) => parsed,
+        (false, _) => json!({ "__code": code }),
     };
     (status, parsed)
-}
-
-/// The modelled error shape name of a failure response, from the
-/// `x-amzn-errortype` header or the body's `__type`, with any namespace prefix
-/// and URL suffix stripped.
-fn error_code(response: &http::Response<bytes::Bytes>) -> Option<String> {
-    if response.status().is_success() {
-        return None;
-    }
-    let from_header = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let from_body = || {
-        let parsed: Value = serde_json::from_slice(response.body()).ok()?;
-        parsed
-            .get("__type")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    };
-    let raw = from_header.or_else(from_body)?;
-    let no_url = raw.split(':').next().unwrap_or(&raw).to_string();
-    Some(
-        no_url
-            .split('#')
-            .next_back()
-            .unwrap_or(&no_url)
-            .to_string(),
-    )
 }
 
 /// Whether `value` is a lowercase hyphenated random (version 4) UUID, the form
@@ -553,6 +460,17 @@ async fn list_connectors_refuses_a_next_token_it_never_issued() {
             parsed["__code"].as_str(),
             Some("ValidationException"),
             "case {token}: expected ValidationException, got {parsed}"
+        );
+        // One wording for this error class across this service's list operations
+        // (`state::pagination_token_message`): the fixed sentence, the operation
+        // from the request, then the decoder's reason.
+        assert!(
+            parsed["Message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("Pagination token exception in operation 'ListConnectors': "),
+            "case {token}: the refusal must read as a pagination-token failure of this \
+             operation, got {parsed}"
         );
     }
 }

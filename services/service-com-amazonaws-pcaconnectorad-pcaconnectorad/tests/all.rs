@@ -13,5 +13,11 @@
 // points it into `tests/all/`.
 #[path = "all/connector_lifecycle.rs"]
 mod connector_lifecycle;
+#[path = "all/directory_registration_lifecycle.rs"]
+mod directory_registration_lifecycle;
+// The shared harness every suite drives the service through: one copy of the
+// router, the request builder, the `@httpLabel` encoding and the error-code read.
+#[path = "all/harness.rs"]
+mod harness;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

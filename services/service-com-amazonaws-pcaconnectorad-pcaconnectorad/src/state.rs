@@ -31,6 +31,12 @@ pub const CONNECTOR_STATUS_CREATING: &str = "CREATING";
 /// See [`CONNECTOR_STATUS_CREATING`].
 pub const CONNECTOR_STATUS_ACTIVE: &str = "ACTIVE";
 
+/// `DirectoryRegistrationStatus` values, spelled as
+/// `types::DIRECTORY_REGISTRATION_STATUS_VALUES` holds them.
+pub const DIRECTORY_REGISTRATION_STATUS_CREATING: &str = "CREATING";
+/// See [`DIRECTORY_REGISTRATION_STATUS_CREATING`].
+pub const DIRECTORY_REGISTRATION_STATUS_ACTIVE: &str = "ACTIVE";
+
 /// `TemplateStatus` values, spelled as `types::TEMPLATE_STATUS_VALUES` holds them.
 /// The enum has only `ACTIVE` and `DELETING`, so a created template is `ACTIVE`.
 pub const TEMPLATE_STATUS_ACTIVE: &str = "ACTIVE";
@@ -44,6 +50,15 @@ pub const TEMPLATE_STATUS_ACTIVE: &str = "ACTIVE";
 /// that reads the connector straight after creating it reliably observes
 /// `CREATING` — and it is never zero.
 pub const CONNECTOR_ACTIVATION_DELAY: Duration = Duration::from_millis(750);
+
+/// How long after `CreateDirectoryRegistration` the registration settles from
+/// `CREATING` to `ACTIVE`.
+///
+/// A CHOSEN span, not a documented one: AWS publishes no duration for directory
+/// registration. It is a few seconds and never zero, so a caller (or a test) that
+/// reads the registration straight after creating it reliably observes the
+/// `CREATING` the 202 reported.
+pub const DIRECTORY_REGISTRATION_ACTIVATION_DELAY: Duration = Duration::from_secs(3);
 
 /// `MaxResults` for a list call that supplies none: the modelled maximum of the
 /// `MaxResults` member (`range 1..1000`), so an un-paged call returns everything.
@@ -67,6 +82,11 @@ pub const MAX_LIST_RESULTS: i32 = 1000;
 pub const MAX_CONNECTORS: usize = 100;
 /// See [`MAX_CONNECTORS`].
 pub const MAX_TEMPLATES_PER_CONNECTOR: usize = 200;
+/// See [`MAX_CONNECTORS`]: the same kind of store bound, for the directory
+/// registrations this emulator holds AT ALL. A directory id is caller-chosen, so
+/// without it an unlimited number of distinct ids could grow the store without
+/// limit.
+pub const MAX_DIRECTORY_REGISTRATIONS: usize = 100;
 
 /// How many `ClientToken` -> ARN records the store keeps. An idempotency record
 /// is a cache, not a resource: AWS honours a token for a bounded window and
@@ -82,6 +102,8 @@ pub const MAX_IDEMPOTENCY_RECORDS: usize = 4096;
 pub const QUOTA_CODE_CONNECTORS_PER_STORE: &str = "ConnectorsPerStore";
 /// See [`QUOTA_CODE_CONNECTORS_PER_STORE`].
 pub const QUOTA_CODE_TEMPLATES_PER_CONNECTOR: &str = "TemplatesPerConnector";
+/// See [`QUOTA_CODE_CONNECTORS_PER_STORE`].
+pub const QUOTA_CODE_DIRECTORY_REGISTRATIONS_PER_STORE: &str = "DirectoryRegistrationsPerStore";
 
 /// The tag every pagination cursor this service issues carries, so a token the
 /// service did not mint is refused instead of being honoured as a cursor. Four
@@ -119,6 +141,25 @@ pub struct ConnectorRecord {
     pub seq: u64,
 }
 
+/// One persisted directory registration. Mirrors the modelled
+/// `DirectoryRegistration`/`DirectoryRegistrationSummary` members, plus the
+/// bookkeeping the wire shapes do not carry (`seq` for stable list ordering,
+/// `active_at` for the clock-due settle, `tags`).
+#[derive(Debug, Clone)]
+pub struct DirectoryRegistrationRecord {
+    pub arn: String,
+    pub directory_id: String,
+    pub status: String,
+    pub status_reason: Option<String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    /// The instant the clock owes this registration its `CREATING` -> `ACTIVE` move.
+    pub active_at: SystemTime,
+    pub tags: HashMap<String, String>,
+    /// Monotonic creation sequence: the stable list order and paging cursor.
+    pub seq: u64,
+}
+
 /// One persisted template, a child of exactly one connector.
 #[derive(Debug, Clone)]
 pub struct TemplateRecord {
@@ -144,6 +185,9 @@ pub struct ComAmazonawsPcaconnectoradPcaconnectoradState {
     pub connectors: HashMap<String, ConnectorRecord>,
     /// Templates by their own ARN; `TemplateRecord::connector_arn` is the parent link.
     pub templates: HashMap<String, TemplateRecord>,
+    /// Directory registrations by their own ARN. A directory is registered at most
+    /// once (see [`Self::registration_by_directory_id`]).
+    pub directory_registrations: HashMap<String, DirectoryRegistrationRecord>,
     /// `<operation>:<ClientToken>` -> the ARN the first call with that token minted,
     /// so a retried create returns the original resource instead of a second one.
     /// Bounded at [`MAX_IDEMPOTENCY_RECORDS`]; write it through
@@ -164,7 +208,8 @@ impl ComAmazonawsPcaconnectoradPcaconnectoradState {
         self.next_seq
     }
 
-    /// Materialise every `CREATING` -> `ACTIVE` move the clock already owes at `now`.
+    /// Materialise every `CREATING` -> `ACTIVE` move the clock already owes at `now`,
+    /// for every resource of this service that has one.
     ///
     /// A reporting operation calls this before it reads: the transition was due at
     /// `active_at` whether or not anybody called, so applying it is not a mutation
@@ -173,6 +218,13 @@ impl ComAmazonawsPcaconnectoradPcaconnectoradState {
         for connector in self.connectors.values_mut() {
             if connector.status == CONNECTOR_STATUS_CREATING && now >= connector.active_at {
                 connector.status = CONNECTOR_STATUS_ACTIVE.to_string();
+            }
+        }
+        for registration in self.directory_registrations.values_mut() {
+            if registration.status == DIRECTORY_REGISTRATION_STATUS_CREATING
+                && now >= registration.active_at
+            {
+                registration.status = DIRECTORY_REGISTRATION_STATUS_ACTIVE.to_string();
             }
         }
     }
@@ -186,6 +238,33 @@ impl ComAmazonawsPcaconnectoradPcaconnectoradState {
             .collect();
         found.sort_by_key(|connector| connector.seq);
         found
+    }
+
+    /// Every directory registration whose `seq` is past `after`, in creation order.
+    pub fn directory_registrations_after(&self, after: u64) -> Vec<&DirectoryRegistrationRecord> {
+        let mut found: Vec<&DirectoryRegistrationRecord> = self
+            .directory_registrations
+            .values()
+            .filter(|registration| registration.seq > after)
+            .collect();
+        found.sort_by_key(|registration| registration.seq);
+        found
+    }
+
+    /// The registration of `directory_id`, if the directory is registered.
+    ///
+    /// A directory carries at most one registration: the modelled
+    /// `DirectoryRegistrationArn` names the directory itself rather than a minted
+    /// id, so a second registration of one directory has no distinct identity.
+    /// The lookup is on the directory id and not on an ARN because this store is
+    /// region-agnostic (see the module header).
+    pub fn registration_by_directory_id(
+        &self,
+        directory_id: &str,
+    ) -> Option<&DirectoryRegistrationRecord> {
+        self.directory_registrations
+            .values()
+            .find(|registration| registration.directory_id == directory_id)
     }
 
     /// The template called `name` on `connector_arn`, if there is one. Template
@@ -288,6 +367,26 @@ pub fn connector_collection_arn(region: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, "connector")
 }
 
+/// A directory registration's ARN, of the modelled form
+/// `arn:aws:pca-connector-ad:<region>:<account>:directory-registration/<directory id>`.
+/// The resource segment is the directory's own id: the registration is named by
+/// the directory it authorizes, not by a minted id.
+pub fn directory_registration_arn(region: &str, directory_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("directory-registration/{directory_id}"),
+    )
+}
+
+/// The ARN of the directory-registration collection this store holds —
+/// `arn:aws:pca-connector-ad:<region>:<account>:directory-registration` — the
+/// resource a registration-count refusal is about, since no registration was
+/// minted. Mirrors [`connector_collection_arn`].
+pub fn directory_registration_collection_arn(region: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, "directory-registration")
+}
+
 /// A template ARN: the modelled child form, the parent connector ARN plus
 /// `/template/<uuid>`.
 pub fn template_arn(connector_arn: &str, template_id: &str) -> String {
@@ -355,4 +454,44 @@ pub fn decode_page_token(token: &str) -> Option<u64> {
         return None;
     }
     u64::from_str_radix(cursor, 16).ok()
+}
+
+/// Why [`decode_page_token`] refuses a value: this decoder's own reason, which the
+/// service's pagination-token sentence carries (see [`pagination_token_message`]).
+const PAGE_TOKEN_REFUSAL_REASON: &str = "the token was not issued by this service";
+
+/// The message this service answers a pagination-token failure with: the fixed
+/// sentence `Pagination token exception in operation '<operation>': `, the
+/// operation taken from the request, then the reason the cursor was refused.
+///
+/// One wording for every list operation of this service, so a client matching on
+/// the text of this error class does not meet two sentences for it.
+pub fn pagination_token_message(operation: &str) -> String {
+    format!("Pagination token exception in operation '{operation}': {PAGE_TOKEN_REFUSAL_REASON}")
+}
+
+/// The page a list operation of this service must serve: how many records it may
+/// return, and the `seq` it starts past.
+///
+/// `MaxResults` is modelled `range 1..1000` and the boundary validator has already
+/// refused anything outside it, so a value arriving here is in range; an absent one
+/// means "everything", which is that same modelled maximum. The value is clamped
+/// into the modelled range all the same, so a page size reaching a caller of this
+/// helper is always at least one record and never more than the modelled maximum —
+/// the invariant a cursor and a page bound both rest on — whatever the validator
+/// let through.
+///
+/// `None` for a `NextToken` [`decode_page_token`] refuses, so a token this service
+/// never issued is not honoured as a cursor; the caller answers it with its own
+/// operation's `ValidationException`.
+pub fn page_bounds(max_results: Option<i32>, next_token: Option<&str>) -> Option<(usize, u64)> {
+    let modelled_max = usize::try_from(MAX_LIST_RESULTS).unwrap_or(usize::MAX);
+    let page_size = usize::try_from(max_results.unwrap_or(MAX_LIST_RESULTS))
+        .unwrap_or(modelled_max)
+        .clamp(1, modelled_max);
+    let after = match next_token {
+        None => 0,
+        Some(token) => decode_page_token(token)?,
+    };
+    Some((page_size, after))
 }
