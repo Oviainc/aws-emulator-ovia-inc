@@ -11,6 +11,8 @@
 //!   applies to it.
 //! * [`RecoveryPoint`] — what `StartBackupJob` stores inside the named vault.
 //! * [`BackupJob`] — the job that produced that recovery point.
+//! * [`CopyJobRecord`] — the job `StartCopyJob` starts to put a COPY of one
+//!   vault's recovery point into another vault, and the copy it writes there.
 //! * [`BackupPlanRecord`] — the plan `CreateBackupPlan` inserts, whose body
 //!   every plan read projects through [`BackupPlanRecord::backup_plan`].
 //! * [`BackupSelectionRecord`] — one resource selection of such a plan.
@@ -35,8 +37,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     AdvancedBackupSetting, AlreadyExistsException, BackupPlan, BackupRule, BackupRuleInput,
-    BackupSelection, FrameworkControl, InvalidParameterValueException, InvalidRequestException,
-    Lifecycle, ResourceNotFoundException, ScanSetting,
+    BackupSelection, CopyJob, FrameworkControl, InvalidParameterValueException,
+    InvalidRequestException, Lifecycle, ResourceNotFoundException, ScanSetting,
 };
 
 /// The ARN namespace this service stamps into every ARN it mints
@@ -89,6 +91,15 @@ pub const MAX_LOCK_RETENTION_DAYS: i64 = 36_500;
 pub const BACKUP_JOB_STATE_CREATED: &str = "CREATED";
 /// `BackupJobState` a settled job is in.
 pub const BACKUP_JOB_STATE_COMPLETED: &str = "COMPLETED";
+/// `CopyJobState` a freshly started copy job is in (model enum `CopyJobState`,
+/// `CREATED | RUNNING | COMPLETED | FAILED | PARTIAL`).
+pub const COPY_JOB_STATE_CREATED: &str = "CREATED";
+/// `CopyJobState` a settled copy job is in.
+pub const COPY_JOB_STATE_COMPLETED: &str = "COMPLETED";
+/// `DestinationVaultLockState` of a destination vault a Backup Vault Lock has
+/// been applied to (`CopyJob$DestinationVaultLockState`: "Valid values include
+/// LOCKED and UNLOCKED").
+pub const VAULT_LOCK_STATE_LOCKED: &str = "LOCKED";
 /// `RecoveryPointStatus` of a recovery point whose job has not settled yet.
 pub const RECOVERY_POINT_STATUS_CREATING: &str = "CREATING";
 /// `RecoveryPointStatus` of a recovery point whose job has settled.
@@ -158,6 +169,11 @@ pub const MAX_RECOVERY_POINTS: usize = 10_000;
 /// The most backup jobs this emulator keeps. An EMULATOR-CHOSEN ceiling, for
 /// the reason given on [`MAX_VAULTS`].
 pub const MAX_BACKUP_JOBS: usize = 10_000;
+
+/// The most copy jobs this emulator keeps. An EMULATOR-CHOSEN ceiling, for the
+/// reason given on [`MAX_VAULTS`]; AWS caps concurrent copy jobs per account and
+/// answers `LimitExceededException` too.
+pub const MAX_COPY_JOBS: usize = 10_000;
 
 /// The most backup plans this emulator keeps. An EMULATOR-CHOSEN ceiling, for
 /// the reason given on [`MAX_VAULTS`]; AWS caps the backup plans an account may
@@ -418,6 +434,54 @@ pub fn is_arn(value: &str) -> bool {
     !partition.is_empty() && !service.is_empty() && !resource.is_empty()
 }
 
+/// The fields a backup-vault ARN names, as [`backup_vault_arn_parts`] reads them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupVaultArnParts {
+    /// The region the vault, and anything stored in it, belongs to — which is
+    /// not this request's region when the ARN names a vault in another one.
+    pub region: String,
+    /// The account that owns the vault.
+    pub account_id: String,
+    /// The `BackupVaultName`, in a form this service could have stored it under
+    /// ([`is_modelled_vault_name`]).
+    pub name: String,
+}
+
+/// The fields a backup-vault ARN names, or `None` when `value` is not one:
+/// `arn:<partition>:backup:<region>:<account>:backup-vault:<name>`, the form
+/// [`backup_vault_arn`] mints and the form the model's own doc gives for every
+/// member that carries a vault ARN ("for example,
+/// `arn:aws:backup:us-east-1:123456789012:backup-vault:aBackupVault`").
+pub fn backup_vault_arn_parts(value: &str) -> Option<BackupVaultArnParts> {
+    let mut fields = value.splitn(6, ':');
+    let (
+        Some("arn"),
+        Some(partition),
+        Some(ARN_NAMESPACE),
+        Some(region),
+        Some(account_id),
+        Some(resource),
+    ) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    )
+    else {
+        return None;
+    };
+    let name = resource.strip_prefix("backup-vault:")?;
+    (!partition.is_empty() && is_region_like(region) && is_modelled_vault_name(name)).then(|| {
+        BackupVaultArnParts {
+            region: region.to_string(),
+            account_id: account_id.to_string(),
+            name: name.to_string(),
+        }
+    })
+}
+
 // ===========================================================================
 // This service's error vocabulary
 // ===========================================================================
@@ -443,6 +507,13 @@ pub const ERROR_CODE_BACKUP_JOB_NOT_FOUND: &str = "ERROR_2403";
 /// The sentence AWS states for that condition. A FIXED string: it names no part
 /// of the request, so the id asked about does not appear in it.
 pub const MESSAGE_BACKUP_JOB_NOT_FOUND: &str = "Cannot find Backup job";
+
+/// The sentence AWS states for "the copy job asked about is not one this account
+/// holds" — fixed, and worded as this service words the same condition for a
+/// backup job ([`MESSAGE_BACKUP_JOB_NOT_FOUND`]): it names no part of the
+/// request, so the id asked about does not appear in it. No `Code`: this
+/// condition has no observed token.
+pub const MESSAGE_COPY_JOB_NOT_FOUND: &str = "Cannot find copy job";
 
 /// `Code` for "a backup vault of this name already exists".
 pub const ERROR_CODE_VAULT_ALREADY_EXISTS: &str = "ERROR_1101";
@@ -529,6 +600,26 @@ pub fn vault_already_exists() -> AlreadyExistsException {
     AlreadyExistsException {
         code: Some(ERROR_CODE_VAULT_ALREADY_EXISTS.to_string()),
         message: Some(MESSAGE_VAULT_ALREADY_EXISTS.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a copy job id this account does not hold.
+pub fn copy_job_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(MESSAGE_COPY_JOB_NOT_FOUND.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a backup vault this account does not hold, named by
+/// the vault the request addressed.
+///
+/// ONE sentence for every call that resolves a vault it is asked to write into —
+/// the backup it starts and the copy it starts — so the two cannot drift.
+pub fn backup_vault_not_found(vault_name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Backup vault {vault_name} not found")),
         ..Default::default()
     }
 }
@@ -708,6 +799,30 @@ pub fn rejected_arn(member: &str, value: &str) -> Option<InvalidParameterValueEx
         message: Some(format!(
             "{member} must be an ARN of the form \
              arn:<partition>:<service>:<region>:<account>:<resource>"
+        )),
+        ..Default::default()
+    })
+}
+
+/// The modelled refusal for a member that names a BACKUP VAULT by ARN whose
+/// value is not a backup vault's ARN, or `None` when it is.
+///
+/// A sibling of [`rejected_arn`] for the narrower rule such a member carries: the
+/// model types it as `ARN` with no pattern, but only one resource of one service
+/// can be named by it, so a value that is an ARN of something else is a parameter
+/// value AWS refuses rather than a resource it looks for. See
+/// [`backup_vault_arn_parts`] for the form.
+pub fn rejected_backup_vault_arn(
+    member: &str,
+    value: &str,
+) -> Option<InvalidParameterValueException> {
+    if backup_vault_arn_parts(value).is_some() {
+        return None;
+    }
+    Some(InvalidParameterValueException {
+        message: Some(format!(
+            "{member} must be the ARN of a backup vault, of the form \
+             arn:<partition>:backup:<region>:<account>:backup-vault:<name>"
         )),
         ..Default::default()
     })
@@ -976,7 +1091,9 @@ pub struct RecoveryPoint {
     /// (`Index: ENABLED`); it settles from `PENDING` to `ACTIVE` alongside the
     /// job that built it.
     pub index_status: Option<String>,
-    /// The id of the `StartBackupJob` that created it.
+    /// The id of the job that created it: the `StartBackupJob` that backed the
+    /// protected resource up, or the `StartCopyJob` that copied it into this
+    /// vault.
     pub created_by_job_id: String,
 }
 
@@ -1049,6 +1166,49 @@ pub struct BackupJob {
 pub struct IdempotencyRecord {
     pub job_id: String,
     pub recorded_at: SystemTime,
+}
+
+/// A copy job: what `StartCopyJob` starts and `DescribeCopyJob` reports.
+///
+/// A copy job is the job that puts a COPY of one vault's recovery point into
+/// another vault, so it records both ends: the recovery point it reads and the
+/// one it writes ([`Self::destination_recovery_point_arn`], a
+/// [`RecoveryPoint`] stored in the destination vault), which is why a read of
+/// the destination vault reports the copy and the copy job agrees with it.
+#[derive(Debug, Clone)]
+pub struct CopyJobRecord {
+    pub copy_job_id: String,
+    pub source_backup_vault_name: String,
+    pub source_backup_vault_arn: String,
+    pub source_recovery_point_arn: String,
+    /// The destination vault's `BackupVaultName`, the key its record is stored
+    /// under.
+    pub destination_backup_vault_name: String,
+    /// The destination vault's ARN as the request named it, which carries the
+    /// destination region — not this request's — for a copy across regions.
+    pub destination_backup_vault_arn: String,
+    pub destination_recovery_point_arn: String,
+    /// The key the copy in the destination vault is stored under, when that
+    /// vault was created with one of its own; see [`BackupVault::named_encryption_key_arn`].
+    pub destination_encryption_key_arn: Option<String>,
+    /// The lifecycle the request asked the COPY to be kept under; the source
+    /// recovery point keeps its own.
+    pub destination_recovery_point_lifecycle: Option<Lifecycle>,
+    pub resource_arn: String,
+    pub resource_type: Option<String>,
+    pub iam_role_arn: String,
+    pub state: String,
+    pub status_message: Option<String>,
+    /// The emulator copies no bytes, so a copy job it ran moved nothing: this
+    /// stays 0 rather than reporting a size no copy produced.
+    pub backup_size_in_bytes: i64,
+    pub creation_date: SystemTime,
+    /// When the clock owes this copy job its `CREATED` -> `COMPLETED`
+    /// transition. See [`JOB_SETTLE_AFTER`].
+    pub settles_at: SystemTime,
+    pub completion_date: Option<SystemTime>,
+    pub is_parent: bool,
+    pub idempotency_token: Option<String>,
 }
 
 /// A backup plan as `CreateBackupPlan` stored it: the plan body the caller gave,
@@ -1213,6 +1373,8 @@ pub struct ComAmazonawsBackupCryocontrollerusermanagerState {
     pub recovery_points_by_vault: BTreeMap<String, Vec<String>>,
     /// Backup jobs by `BackupJobId`. Bounded by [`MAX_BACKUP_JOBS`].
     pub backup_jobs: BTreeMap<String, BackupJob>,
+    /// Copy jobs by `CopyJobId`. Bounded by [`MAX_COPY_JOBS`].
+    pub copy_jobs: BTreeMap<String, CopyJobRecord>,
     /// Backup plans by `BackupPlanId`. Bounded by [`MAX_BACKUP_PLANS`].
     pub backup_plans: BTreeMap<String, BackupPlanRecord>,
     /// Resource selections by the (`BackupPlanId`, `SelectionId`) pair AWS Backup
@@ -1225,6 +1387,12 @@ pub struct ComAmazonawsBackupCryocontrollerusermanagerState {
     /// `StartBackupJob`'s `IdempotencyToken` -> what it replays. Bounded by
     /// [`MAX_IDEMPOTENCY_TOKENS`] and [`IDEMPOTENCY_TOKEN_TTL`].
     pub idempotency_tokens: BTreeMap<String, IdempotencyRecord>,
+    /// `StartCopyJob`'s `IdempotencyToken` -> what it replays, bounded the same
+    /// way. A token distinguishes "otherwise identical calls to" ONE operation
+    /// (the model's doc for each `IdempotencyToken` member), so a copy job's
+    /// tokens are their own namespace: a token a caller used to start a backup
+    /// says nothing about a copy.
+    pub copy_job_idempotency_tokens: BTreeMap<String, IdempotencyRecord>,
     /// The KMS key this service created for the account per region, for vaults
     /// whose create request named none. One key per region, minted on first
     /// use, so every default-key vault in a region reports the same key on
@@ -1637,6 +1805,72 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
         }
     }
 
+    /// The same for a COPY job, which the clock owes its `CREATED` ->
+    /// `COMPLETED` transition in the same way, and for the recovery point that
+    /// copy writes into the destination vault, so the job and the vault holding
+    /// its copy can never disagree about whether the copy is there.
+    pub fn settle_copy_job(&mut self, copy_job_id: &str, now: SystemTime) {
+        let Some(job) = self.copy_jobs.get_mut(copy_job_id) else {
+            return;
+        };
+        if job.state != COPY_JOB_STATE_CREATED || now < job.settles_at {
+            return;
+        }
+        job.state = COPY_JOB_STATE_COMPLETED.to_string();
+        job.completion_date = Some(job.settles_at);
+        let destination_vault = job.destination_backup_vault_name.clone();
+        self.settle_recovery_points_in(&destination_vault, now);
+    }
+
+    /// The members a copy-job read reports, computed ONCE from the stored job
+    /// and the stored destination vault, so two readers of one copy job can
+    /// never report two different bodies.
+    ///
+    /// The destination vault's type and lock state are read off that vault
+    /// rather than stored on the job: they are the vault's own facts, and a lock
+    /// applied after the copy started is in force for the copy it holds. A
+    /// destination vault with no lock reports no lock state at all, as a vault
+    /// read reports no `VaultState` for a type that carries none.
+    pub fn copy_job_view(&self, job: &CopyJobRecord) -> CopyJob {
+        let destination_vault = self.vaults.get(&job.destination_backup_vault_name);
+        CopyJob {
+            account_id: Some(::engine::emulator_account_id().to_string()),
+            copy_job_id: Some(job.copy_job_id.clone()),
+            source_backup_vault_arn: Some(job.source_backup_vault_arn.clone()),
+            source_recovery_point_arn: Some(job.source_recovery_point_arn.clone()),
+            destination_backup_vault_arn: Some(job.destination_backup_vault_arn.clone()),
+            destination_vault_type: destination_vault.map(|vault| vault.vault_type.clone()),
+            destination_vault_lock_state: destination_vault
+                .filter(|vault| vault.lock.is_some())
+                .map(|_| VAULT_LOCK_STATE_LOCKED.to_string()),
+            destination_recovery_point_arn: Some(job.destination_recovery_point_arn.clone()),
+            destination_encryption_key_arn: job.destination_encryption_key_arn.clone(),
+            destination_recovery_point_lifecycle: job
+                .destination_recovery_point_lifecycle
+                .clone(),
+            resource_arn: Some(job.resource_arn.clone()),
+            resource_type: job.resource_type.clone(),
+            creation_date: Some(::aws_smithy_types::DateTime::from(job.creation_date)),
+            completion_date: job.completion_date.map(::aws_smithy_types::DateTime::from),
+            state: Some(job.state.clone()),
+            status_message: job.status_message.clone(),
+            backup_size_in_bytes: Some(job.backup_size_in_bytes),
+            iam_role_arn: Some(job.iam_role_arn.clone()),
+            is_parent: job.is_parent,
+            // A copy a caller asked for has no backup plan behind it and no
+            // parent or child jobs, and this slice stores no resource name or
+            // message category for one.
+            created_by: None,
+            created_by_backup_job_id: None,
+            parent_job_id: None,
+            composite_member_identifier: None,
+            number_of_child_jobs: None,
+            child_jobs_in_state: None,
+            resource_name: None,
+            message_category: None,
+        }
+    }
+
     /// The `VaultType` of the vault a job or recovery point was stored in, or
     /// `None` when the account no longer holds that vault. Derived from the
     /// stored vault, so a job read never states a type the vault disagrees
@@ -1679,21 +1913,28 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
     /// This is one of the two stores whose KEYS the caller chooses, so it is
     /// pruned on
     /// every `StartBackupJob` rather than left to grow with the request count.
+    /// Both token namespaces are pruned by the one rule, so neither grows
+    /// because the other operation is the one being called.
     pub fn prune_idempotency_tokens(&mut self, now: SystemTime) {
-        self.idempotency_tokens.retain(|_, record| {
+        Self::prune_token_store(&mut self.idempotency_tokens, now);
+        Self::prune_token_store(&mut self.copy_job_idempotency_tokens, now);
+    }
+
+    /// The pruning rule itself, applied to one token namespace.
+    fn prune_token_store(tokens: &mut BTreeMap<String, IdempotencyRecord>, now: SystemTime) {
+        tokens.retain(|_, record| {
             record
                 .recorded_at
                 .checked_add(IDEMPOTENCY_TOKEN_TTL)
                 .is_none_or(|expires_at| now < expires_at)
         });
-        while self.idempotency_tokens.len() > MAX_IDEMPOTENCY_TOKENS {
-            let oldest = self
-                .idempotency_tokens
+        while tokens.len() > MAX_IDEMPOTENCY_TOKENS {
+            let oldest = tokens
                 .iter()
                 .min_by_key(|(_, record)| record.recorded_at)
                 .map(|(token, _)| token.clone());
             let Some(oldest) = oldest else { break };
-            self.idempotency_tokens.remove(&oldest);
+            tokens.remove(&oldest);
         }
     }
 }

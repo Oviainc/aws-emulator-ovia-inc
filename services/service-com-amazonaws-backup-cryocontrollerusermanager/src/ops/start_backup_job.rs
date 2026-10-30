@@ -281,13 +281,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(vault) = store.vaults.get(&input.backup_vault_name).cloned() else {
             return Err(StartBackupJobErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Backup vault {} not found",
-                        input.backup_vault_name
-                    )),
-                    ..Default::default()
-                },
+                crate::state::backup_vault_not_found(&input.backup_vault_name),
             )
             .into());
         };

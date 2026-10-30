@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartCopyJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartCopyJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartCopyJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a copy job and stores BOTH the job and the recovery point the copy
+//! writes into the destination vault, so `DescribeCopyJob`,
+//! `ListRecoveryPointsByBackupVault` and `DescribeBackupVault` all read the one
+//! stored pair. A replayed `IdempotencyToken` returns the copy job it already
+//! created rather than minting a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +179,256 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartCopyJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartCopyJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartCopyJob"))
+        // `RecoveryPointArn`, `SourceBackupVaultName`, `DestinationBackupVaultArn`
+        // and `IamRoleArn` are `@required`, so an absent one is refused before
+        // this handler runs; `crate::service` words that refusal as
+        // `MissingParameterValueException`. `SourceBackupVaultName` carries the
+        // `BackupVaultName` pattern, so a name this service could not have
+        // stored is refused there too. Every ARN this handler mints carries the
+        // region of the vault the resource belongs to, which is read off the
+        // destination ARN rather than from `ctx`.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartCopyJobErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the backup vault store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // The model types these members as `ARN` with no pattern, so the
+        // framework cannot refuse a malformed one; AWS does. The check and its
+        // sentence are `crate::state`'s, shared with every other member this
+        // service types as an ARN.
+        for (member, value) in [
+            ("RecoveryPointArn", input.recovery_point_arn.as_str()),
+            ("IamRoleArn", input.iam_role_arn.as_str()),
+        ] {
+            if let Some(refusal) = crate::state::rejected_arn(member, value) {
+                return Err(
+                    StartCopyJobErrorModeled::InvalidParameterValueException(refusal).into(),
+                );
+            }
+        }
+        // `DestinationBackupVaultArn` carries the narrower rule: it names a
+        // BACKUP VAULT, so a value that is the ARN of something else is a bad
+        // parameter value rather than a vault to look for.
+        if let Some(refusal) = crate::state::rejected_backup_vault_arn(
+            "DestinationBackupVaultArn",
+            &input.destination_backup_vault_arn,
+        ) {
+            return Err(StartCopyJobErrorModeled::InvalidParameterValueException(refusal).into());
+        }
+        let Some(destination) =
+            crate::state::backup_vault_arn_parts(&input.destination_backup_vault_arn)
+        else {
+            // Unreachable: the refusal above accepted the ARN by reading the
+            // same parts. Answered as a bad parameter value rather than
+            // panicking on a value a caller controls.
+            return Err(StartCopyJobErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(
+                        "DestinationBackupVaultArn must be the ARN of a backup vault".to_string(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The one store whose KEYS a caller chooses: forget expired records and
+        // the oldest beyond the ceiling before recording another.
+        store.prune_idempotency_tokens(now);
+
+        // The SOURCE end: the recovery point the copy reads, resolved by the
+        // (vault, ARN) pair that addresses one. Every way that pair can fail to
+        // name a stored recovery point — a vault this account does not hold, an
+        // ARN nothing answers to, an ARN another vault holds, one whose backup
+        // has not finished — is the ONE condition `crate::state` already words.
+        // The backup the clock has already finished is materialised first, so a
+        // copy of it is not refused for a completion that was already due.
+        store.settle_recovery_points_in(&input.source_backup_vault_name, now);
+        let source_point = store
+            .stored_recovery_point(&input.source_backup_vault_name, &input.recovery_point_arn)
+            .cloned()
+            .map_err(StartCopyJobErrorModeled::ResourceNotFoundException)?;
+
+        // The DESTINATION end: the vault the ARN names, which this account has
+        // to hold for a copy to be put into it. This emulator holds exactly one
+        // account's vaults (`engine::emulator_account_id`), so an ARN naming
+        // another account's vault names none of them.
+        let own_account = destination.account_id == ::engine::emulator_account_id();
+        let destination_vault = store
+            .vaults
+            .get(&destination.name)
+            .filter(|_| own_account)
+            .cloned()
+            .ok_or_else(|| {
+                StartCopyJobErrorModeled::ResourceNotFoundException(
+                    crate::state::backup_vault_not_found(&destination.name),
+                )
+            })?;
+        // A vault receives a copy only once it is available, exactly as it
+        // receives a backup: the transition the clock owes is materialised
+        // first, and a vault still in a non-terminal state is refused for its
+        // STATE rather than reported as absent. A standard vault reports no
+        // state at all and is ready from creation.
+        store.settle_vault(&destination.name, now);
+        let pending_state = store
+            .vaults
+            .get(&destination.name)
+            .and_then(|vault| vault.vault_state.clone())
+            .filter(|state| state != crate::state::VAULT_STATE_AVAILABLE);
+        if let Some(pending_state) = pending_state {
+            return Err(StartCopyJobErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "Backup vault {} is in {pending_state} state and cannot \
+                         receive a backup",
+                        destination.name
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // A replayed idempotency token answers with the copy job it already
+        // created: no second job, no second copy. The token identifies ONE
+        // call, so the replay has to name the same recovery point, source
+        // vault, destination vault and role; reused on a different call it is
+        // not a retry of the stored one, and both ends are resolved first so a
+        // replay naming a resource that is no longer there is still refused.
+        if let Some(token) = input.idempotency_token.as_deref() {
+            let replay = store
+                .copy_job_idempotency_tokens
+                .get(token)
+                .and_then(|record| store.copy_jobs.get(&record.job_id))
+                .filter(|job| {
+                    job.source_recovery_point_arn == input.recovery_point_arn
+                        && job.source_backup_vault_name == input.source_backup_vault_name
+                        && job.destination_backup_vault_arn == input.destination_backup_vault_arn
+                        && job.iam_role_arn == input.iam_role_arn
+                });
+            if let Some(job) = replay {
+                return Ok(StartCopyJobOutput {
+                    copy_job_id: Some(job.copy_job_id.clone()),
+                    creation_date: Some(::aws_smithy_types::DateTime::from(job.creation_date)),
+                    is_parent: job.is_parent,
+                });
+            }
+        }
+
+        // The stores are in memory and every request adds to them, so the
+        // number of jobs and recovery points they keep is bounded. AWS caps
+        // concurrent copy jobs per account and answers the same modelled error.
+        if store.copy_jobs.len() >= crate::state::MAX_COPY_JOBS
+            || store.recovery_points.len() >= crate::state::MAX_RECOVERY_POINTS
+        {
+            return Err(StartCopyJobErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this emulator keeps at most {} copy jobs and {} recovery points",
+                        crate::state::MAX_COPY_JOBS,
+                        crate::state::MAX_RECOVERY_POINTS
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let copy_job_id = store.next_id(now);
+        let point_id = store.next_id(now);
+        // The copy is stored in the DESTINATION vault, so its ARN carries that
+        // vault's region — which is not this request's region for a copy across
+        // regions.
+        let point_arn = crate::state::recovery_point_arn(&destination.region, &point_id);
+        // Checked arithmetic: a clock that cannot express the due instant
+        // settles the job at once rather than panicking.
+        let settles_at = now
+            .checked_add(crate::state::JOB_SETTLE_AFTER)
+            .unwrap_or(now);
+        // The copy is encrypted by the key the DESTINATION vault is stored
+        // under, reported only when that vault was created with a key of its
+        // own — as a backup into such a vault is.
+        let destination_encryption_key_arn = destination_vault
+            .named_encryption_key_arn()
+            .map(ToString::to_string);
+        let is_encrypted = destination_encryption_key_arn.is_some();
+
+        // The copy itself: the same protected resource, in the destination
+        // vault, kept under the lifecycle THIS request asked for (the source
+        // recovery point keeps its own), and still being written until the copy
+        // job settles.
+        let point = crate::state::RecoveryPoint {
+            arn: point_arn.clone(),
+            backup_vault_name: destination_vault.name.clone(),
+            backup_vault_arn: destination_vault.arn.clone(),
+            resource_arn: source_point.resource_arn.clone(),
+            resource_type: source_point.resource_type.clone(),
+            iam_role_arn: input.iam_role_arn.clone(),
+            status: crate::state::RECOVERY_POINT_STATUS_CREATING.to_string(),
+            creation_date: now,
+            settles_at,
+            completion_date: None,
+            backup_size_in_bytes: source_point.backup_size_in_bytes,
+            lifecycle: input.lifecycle.clone(),
+            encryption_key_arn: destination_encryption_key_arn.clone(),
+            is_encrypted,
+            is_parent: false,
+            tags: source_point.tags.clone(),
+            // An index belongs to the recovery point it was built for, so the
+            // copy carries none until something asks for one.
+            index_status: None,
+            created_by_job_id: copy_job_id.clone(),
+        };
+        let job = crate::state::CopyJobRecord {
+            copy_job_id: copy_job_id.clone(),
+            source_backup_vault_name: source_point.backup_vault_name.clone(),
+            source_backup_vault_arn: source_point.backup_vault_arn.clone(),
+            source_recovery_point_arn: source_point.arn.clone(),
+            destination_backup_vault_name: destination_vault.name.clone(),
+            destination_backup_vault_arn: input.destination_backup_vault_arn.clone(),
+            destination_recovery_point_arn: point_arn.clone(),
+            destination_encryption_key_arn,
+            destination_recovery_point_lifecycle: input.lifecycle,
+            resource_arn: source_point.resource_arn.clone(),
+            resource_type: source_point.resource_type.clone(),
+            iam_role_arn: input.iam_role_arn,
+            state: crate::state::COPY_JOB_STATE_CREATED.to_string(),
+            status_message: None,
+            backup_size_in_bytes: source_point.backup_size_in_bytes,
+            creation_date: now,
+            settles_at,
+            completion_date: None,
+            is_parent: false,
+            idempotency_token: input.idempotency_token.clone(),
+        };
+
+        let output = StartCopyJobOutput {
+            copy_job_id: Some(job.copy_job_id.clone()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(job.creation_date)),
+            is_parent: job.is_parent,
+        };
+
+        store
+            .recovery_points_by_vault
+            .entry(destination_vault.name.clone())
+            .or_default()
+            .push(point.arn.clone());
+        store.recovery_points.insert(point.arn.clone(), point);
+        if let Some(token) = input.idempotency_token {
+            store.copy_job_idempotency_tokens.insert(
+                token,
+                crate::state::IdempotencyRecord {
+                    job_id: copy_job_id.clone(),
+                    recorded_at: now,
+                },
+            );
+        }
+        store.copy_jobs.insert(copy_job_id, job);
+        Ok(output)
     }
 }

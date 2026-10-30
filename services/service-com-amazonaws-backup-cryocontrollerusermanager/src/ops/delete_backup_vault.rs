@@ -197,13 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if !store.vaults.contains_key(&input.backup_vault_name) {
             return Err(DeleteBackupVaultErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Backup vault {} not found",
-                        input.backup_vault_name
-                    )),
-                    ..Default::default()
-                },
+                crate::state::backup_vault_not_found(&input.backup_vault_name),
             )
             .into());
         }

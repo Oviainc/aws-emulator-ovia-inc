@@ -17,6 +17,8 @@ mod backup_job_listing;
 mod backup_plan;
 #[path = "all/backup_selection.rs"]
 mod backup_selection;
+#[path = "all/copy_job.rs"]
+mod copy_job;
 #[path = "all/error_bodies.rs"]
 mod error_bodies;
 #[path = "all/framework.rs"]
