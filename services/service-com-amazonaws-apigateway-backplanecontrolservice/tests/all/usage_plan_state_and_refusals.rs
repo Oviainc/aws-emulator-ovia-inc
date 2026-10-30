@@ -14,10 +14,12 @@
 //!
 //! The RULES under test, each asserted over a SET of inputs rather than one recorded call:
 //!
-//! * an `apiStages` entry covers ONE stage of ONE API, so the pair is resolved as a unit
-//!   and an entry no stored stage of a stored API answers to is 404 `NotFoundException`
-//!   naming that pair — whichever half of it does not resolve, and whichever operation
-//!   (the create or the update) was asked to associate it;
+//! * an `apiStages` entry names ONE stage OF ONE API, so the API identifier is resolved
+//!   first: an entry naming no stored API is 404 `NotFoundException` stating that
+//!   identifier alone, account-qualified, and an entry whose API resolves but whose stage
+//!   it does not carry is 404 `NotFoundException` naming the association — whichever
+//!   operation (the create or the update) was asked to associate it (the ORDER of the two
+//!   lookups is `usage_plan_api_stage_resolution`'s own suite);
 //! * an `apiStages` association makes the plan gate traffic on that stage, so it stands in
 //!   the way of the plan's delete: the delete is 400 `BadRequestException` naming the plan
 //!   and one association in the way until the associations are removed, and 202 after;
@@ -35,6 +37,7 @@ use serde_json::{json, Value};
 
 use crate::api_key_lifecycle::{create_key, get_key};
 use crate::patch_updates::op;
+use crate::rest_api_identifier_refusals::no_such_api;
 use crate::rest_api_lifecycle::{
     assert_failure, create_api, page_items, string_member, Answer, Gateway,
 };
@@ -70,8 +73,11 @@ const NO_SUCH_USAGE_PLAN_KEY: &str = "Invalid Usage Plan ID specified";
 /// that does not resolve is the API key's, whichever plan the request addressed.
 const NO_SUCH_API_KEY: &str = "Invalid API Key identifier specified";
 
-/// The refusal for an `apiStages` entry that names no stored stage of a stored API.
-fn api_stage_not_found(api_id: &str, stage: &str) -> String {
+/// The refusal for an `apiStages` entry whose API resolves and that names no stage OF
+/// that API. An entry whose API identifier resolves to nothing is stated by the service's
+/// account-qualified identifier sentence ([`no_such_api`]) instead, which is what the
+/// `usage_plan_api_stage_resolution` suite asserts the ordering of.
+pub(crate) fn api_stage_not_found(api_id: &str, stage: &str) -> String {
     format!("API Stage not found: {api_id}:{stage}")
 }
 
@@ -195,7 +201,7 @@ fn reported_stage(body: &Value, index: usize, case: &str) -> (String, String) {
 }
 
 #[tokio::test]
-async fn an_api_stage_entry_naming_no_stored_stage_is_refused_with_the_pair_it_names() {
+async fn an_api_stage_entry_naming_no_stored_stage_is_refused_with_the_identifier_at_fault() {
     let gateway = Gateway::new();
     let (first, _) = create_api(&gateway, "api-stage-refusals-first").await;
     create_deployed_stage(&gateway, &first, "prod").await;
@@ -216,49 +222,55 @@ async fn an_api_stage_entry_naming_no_stored_stage_is_refused_with_the_pair_it_n
     .await;
     let plan_id = string_member(&created, "id", "the patched plan");
 
-    // Rows differ in WHICH half of the pair does not resolve and in the form it takes: a
-    // stage name no stage of the named API has, a stage name that is a stage of ANOTHER
-    // API, an API that was never minted, a near miss of a stored API's id, and neither
-    // half resolving.
     let mut near_miss: Vec<char> = first.chars().collect();
     near_miss[0] = if near_miss[0] == 'a' { 'b' } else { 'a' };
     let near_miss: String = near_miss.into_iter().collect();
-    let rows: Vec<(String, String, String)> = vec![
+    // Rows differ in WHICH half of the pair does not resolve and in the form it takes: a
+    // stage name no stage of the named API has, a stage name that is a stage of ANOTHER
+    // API, an API that was never minted, a near miss of a stored API's id, and neither
+    // half resolving. Each carries the sentence the rule gives it: the association for a
+    // row whose API resolves, and the account-qualified API identifier for a row whose
+    // does not.
+    let rows: Vec<(String, String, String, String)> = vec![
         (
             "a stage the named api does not have".to_string(),
             first.clone(),
             "no-such-stage".to_string(),
+            api_stage_not_found(&first, "no-such-stage"),
         ),
         (
             "a stage of another api".to_string(),
             first.clone(),
             "canary".to_string(),
+            api_stage_not_found(&first, "canary"),
         ),
         (
             "a stage of the first api named on the second".to_string(),
             second.clone(),
             "beta".to_string(),
+            api_stage_not_found(&second, "beta"),
         ),
         (
             "an api that was never minted".to_string(),
             "zzzzzzzzzz".to_string(),
             "prod".to_string(),
+            no_such_api("zzzzzzzzzz"),
         ),
         (
             "a near miss of a stored api id".to_string(),
             near_miss.clone(),
             "prod".to_string(),
+            no_such_api(&near_miss),
         ),
         (
             "neither the api nor the stage".to_string(),
             "zzzzzzzzzz".to_string(),
             "no-such-stage".to_string(),
+            no_such_api("zzzzzzzzzz"),
         ),
     ];
 
-    for (case, api_id, stage) in &rows {
-        let expected = api_stage_not_found(api_id, stage);
-
+    for (case, api_id, stage, expected) in &rows {
         // The create is refused, and nothing is stored: the account's collection is the
         // one plan created above.
         let answer = create_plan(
@@ -272,7 +284,7 @@ async fn an_api_stage_entry_naming_no_stored_stage_is_refused_with_the_pair_it_n
         assert_refusal(
             &answer,
             (404, "NotFoundException"),
-            &expected,
+            expected,
             &format!("CreateUsagePlan / {case}"),
         );
 
@@ -287,7 +299,7 @@ async fn an_api_stage_entry_naming_no_stored_stage_is_refused_with_the_pair_it_n
         assert_refusal(
             &answer,
             (404, "NotFoundException"),
-            &expected,
+            expected,
             &format!("UpdateUsagePlan / {case}"),
         );
 

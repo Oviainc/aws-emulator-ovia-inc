@@ -295,20 +295,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every API stage must name a stored stage of a stored API: the plan's limits
         // apply to that stage, so an entry naming no stage associates the plan with
-        // nothing. The entry addresses ONE stage of ONE API, so the pair is resolved as a
-        // unit and either half unresolvable is the modelled `NotFoundException` naming
-        // that pair, rather than a dangling association no later read could justify.
+        // nothing. The entry names a stage OF an API, so the shared resolution resolves
+        // the API identifier first and states whichever of the two the store could not
+        // reach, as the modelled `NotFoundException`, rather than storing a dangling
+        // association no later read could justify.
         for stage in &requested_stages {
             let api_id = stage.api_id.as_deref().unwrap_or_default();
             let stage_name = stage.stage.as_deref().unwrap_or_default();
-            let resolved = store
-                .rest_apis
-                .get(api_id)
-                .is_some_and(|api| api.stages.contains_key(stage_name));
-            if !resolved {
+            if let Err(message) =
+                crate::state::resolve_api_stage(&store.rest_apis, api_id, stage_name)
+            {
                 return Err(CreateUsagePlanErrorModeled::NotFoundException(
                     NotFoundException {
-                        message: Some(crate::state::no_such_api_stage(api_id, stage_name)),
+                        message: Some(message),
                     },
                 )
                 .into());

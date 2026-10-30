@@ -189,22 +189,15 @@ fn split_api_stage(patch: &Patch, key: &str) -> Result<(String, String), PatchFa
 /// Refuse an association that names no stored stage of a stored API.
 ///
 /// The plan's limits apply to that stage, so an association naming no stage meters
-/// nothing; the entry addresses ONE stage of ONE API, so either identifier unresolvable is
-/// the modelled not-found naming that pair, exactly as it is on the create.
+/// nothing; the entry names a stage OF an API, so the SHARED resolution the create runs
+/// resolves the API identifier first and states whichever of the two the store could not
+/// reach, exactly as it is on the create.
 fn require_stage(
     apis: &BTreeMap<String, RestApiEntry>,
     api_id: &str,
     stage: &str,
 ) -> Result<(), PatchFailure> {
-    if !apis
-        .get(api_id)
-        .is_some_and(|api| api.stages.contains_key(stage))
-    {
-        return Err(PatchFailure::NotFound(crate::state::no_such_api_stage(
-            api_id, stage,
-        )));
-    }
-    Ok(())
+    crate::state::resolve_api_stage(apis, api_id, stage).map_err(PatchFailure::NotFound)
 }
 
 /// Apply one patch to a `ThrottleSettings`, whether it is the plan's own or the one an

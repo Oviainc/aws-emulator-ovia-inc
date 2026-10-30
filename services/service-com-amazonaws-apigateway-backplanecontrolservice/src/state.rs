@@ -3829,16 +3829,39 @@ pub fn tagged_usage_plan_not_found(usage_plan_id: &str) -> String {
     format!("UsagePlan {usage_plan_id} was not found")
 }
 
-/// The `NotFoundException` message for an `apiStages` entry that names no stored stage of
-/// a stored API.
+/// The `NotFoundException` message for an `apiStages` entry whose API resolves and that
+/// names no stage OF that API.
 ///
-/// An association covers ONE stage of ONE API, so the pair is resolved as a unit and the
-/// refusal names that pair — `<apiId>:<stageName>`, the spelling an `apiStages` entry is
-/// addressed by — whichever half of it the store could not resolve. Shared by every
-/// operation that associates a plan with a stage, so the create and the update say the
-/// same thing about the same unresolvable pair.
+/// The entry addresses one stage of one API, so this refusal names the association that
+/// does not exist — `<apiId>:<stageName>`, the spelling an `apiStages` entry is addressed
+/// by. Reached only through [`resolve_api_stage`], which resolves the API identifier
+/// first, so the pair is never named for an identifier that resolves to no API at all.
 pub fn no_such_api_stage(api_id: &str, stage_name: &str) -> String {
     format!("API Stage not found: {api_id}:{stage_name}")
+}
+
+/// Resolve one `apiStages` entry against the account's stored REST APIs, in the order the
+/// pair's two identifiers are nested in.
+///
+/// An entry names a stage OF an API, so the API identifier is what is resolved first: an
+/// identifier no stored API answers to is refused as the account-qualified identifier
+/// sentence this service states for one wherever it resolves an API ([`no_such_rest_api`]),
+/// naming that identifier alone; only an API that DOES resolve has its stages looked at,
+/// and a stage it does not carry is [`no_such_api_stage`]. Shared by every operation that
+/// associates a usage plan with a stage, so the create and the update say the same thing
+/// about the same unresolvable entry.
+pub fn resolve_api_stage(
+    rest_apis: &BTreeMap<String, RestApiEntry>,
+    api_id: &str,
+    stage_name: &str,
+) -> Result<(), String> {
+    let api = rest_apis
+        .get(api_id)
+        .ok_or_else(|| no_such_rest_api(api_id))?;
+    if !api.stages.contains_key(stage_name) {
+        return Err(no_such_api_stage(api_id, stage_name));
+    }
+    Ok(())
 }
 
 /// The `BadRequestException` message for a `DeleteUsagePlan` of a plan that is still

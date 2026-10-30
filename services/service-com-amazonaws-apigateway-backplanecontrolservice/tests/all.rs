@@ -308,3 +308,7 @@ mod api_key_import_enablement;
 // until the entry the cluster holds expires, is flushed or is reloaded.
 #[path = "all/stage_response_cache.rs"]
 mod stage_response_cache;
+// Appended for the reason the note above gives: the ORDER an `apiStages` entry's two
+// identifiers are resolved in.
+#[path = "all/usage_plan_api_stage_resolution.rs"]
+mod usage_plan_api_stage_resolution;
