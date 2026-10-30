@@ -17,6 +17,13 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `DisassociateSubnetCidrBlock` lets go of: the association it names, wherever in the
+// account's subnets it is held, the transient state it answers, the clock-owed terminal
+// state, and what it refuses. Declared beside `prefix_lists` for the reason the note above
+// gives: the sorted neighbourhood and the tail of this file are where every new ec2 suite
+// inserts its lines.
+#[path = "all/disassociate_subnet_cidr_block.rs"]
+mod disassociate_subnet_cidr_block;
 // The sentence this service refuses a request with, per refusal CLASS: the resource named in
 // that class's own words, the request's value interpolated in that class's own quoting and
 // position, and nothing repeated back by a class whose sentence interpolates nothing.

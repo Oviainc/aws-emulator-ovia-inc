@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateSubnetCidrBlock
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateSubnetCidrBlock`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: lets go of the IPv6 CIDR block association the request names, wherever in
+//! the account's subnets it is held, and answers it in `disassociating` with the instant
+//! the clock owes it the terminal `disassociated` recorded beside it (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::subnet_ipv6_disassociated_at`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateSubnetCidrBlock::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -134,18 +131,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateSubnetCidrBlock` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateSubnetCidrBlockErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateSubnetCidrBlock"))
+        use crate::state;
+
+        // `ctx` carries request metadata only, and this operation reads none of it: the
+        // association is named by the request, and the subnet holding it is a fact of the
+        // store. This operation models no `DryRun` member.
+        let _ = ctx;
+
+        let store = state::require_service_state(&*self.engine)?;
+        let mut store = store.lock();
+        // The clock-owed moves every path that reads a subnet's associations applies: an
+        // association answered as `associating` is `associated`, and one answered as
+        // `disassociating` is `disassociated`, once the due instant has passed — whether or
+        // not anybody called.
+        store.materialize_due_transitions();
+
+        // "Disassociates a CIDR block from a subnet": the request names the association and
+        // nothing else, so an id the account holds no association for is a refusal, not a
+        // no-op — a caller that disassociates twice has to be able to tell the call that did
+        // it from one that did not.
+        let Some((subnet_id, association)) = store.subnet_ipv6_association(&input.association_id)
+        else {
+            return Err(state::invalid_subnet_cidr_block_association_id_not_found(
+                &input.association_id,
+            ));
+        };
+
+        // "You must detach or delete all gateways and resources that are associated with the
+        // CIDR block before you can disassociate it" (`DisassociateSubnetCidrBlock`): while
+        // anything still holds an address out of the block, the block cannot be let go of.
+        // Asked of the block THIS association names and of the subnet that holds it, so an
+        // address out of the same block in another subnet is not a dependency of this one.
+        // Asked only of an association that still HOLDS its block: one already on its way
+        // out is answered as it stands below, so a repeat of the call cannot be refused what
+        // the first call was granted.
+        let holds_its_block = state::cidr_association_holds_its_block(
+            association
+                .ipv6_cidr_block_state
+                .as_ref()
+                .and_then(|state| state.state.as_deref()),
+        );
+        if let Some(ipv6_cidr_block) = association
+            .ipv6_cidr_block
+            .as_deref()
+            .filter(|_| holds_its_block)
+        {
+            let dependencies =
+                store.subnet_ipv6_cidr_block_dependencies(&subnet_id, ipv6_cidr_block);
+            if !dependencies.is_empty() {
+                // EC2 words this error class as "The <resource> '<id>' has dependencies and
+                // cannot be <what was asked>." — the sentence `DeleteSubnet` answers for a
+                // subnet something still sits in — with the resource THE REQUEST NAMED and
+                // nothing else: which resource still holds an address out of the block is
+                // not part of it.
+                return Err(state::dependency_violation(format!(
+                    "The subnet CIDR block association '{association_id}' has dependencies \
+                     and cannot be disassociated.",
+                    association_id = input.association_id,
+                )));
+            }
+        }
+
+        // The one writer of a disassociation, so this operation and `DescribeSubnets` cannot
+        // report the association differently: it records `disassociating` — the block is on
+        // its way out, so the subnet no longer holds it — and leaves the terminal
+        // `disassociated` to the clock. The association was read a moment ago under this same
+        // lock, so a `None` here is the store losing it between two reads.
+        let Some((subnet_id, association)) =
+            store.begin_subnet_ipv6_disassociation(&input.association_id)
+        else {
+            return Err(state::internal_error(format!(
+                "the IPv6 CIDR block association '{association_id}' of subnet '{subnet_id}' \
+                 could not be read back to disassociate it",
+                association_id = input.association_id,
+            )));
+        };
+        Ok(DisassociateSubnetCidrBlockOutput {
+            ipv6_cidr_block_association: Some(association),
+            subnet_id: Some(subnet_id),
+        })
     }
 }
+

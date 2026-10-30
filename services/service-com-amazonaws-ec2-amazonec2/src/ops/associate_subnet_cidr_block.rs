@@ -163,9 +163,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The block already associated with this subnet, if any, which decides whether
         // another one may be added at all. An association only HOLDS its block while its
         // state says so: one on its way in or already in does, and one on its way out or
-        // gone does not — nothing writes those two states today
-        // (`DisassociateSubnetCidrBlock` is still a scaffold), so the filter is what keeps
-        // this rule true the moment one does.
+        // gone does not — which is what lets a subnet whose block `DisassociateSubnetCidrBlock`
+        // has started letting go of take another one straight away.
         let held_block: Option<String> = subnet
             .ipv6_cidr_block_association_set
             .iter()

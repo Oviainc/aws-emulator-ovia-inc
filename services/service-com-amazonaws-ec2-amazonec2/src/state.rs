@@ -2290,6 +2290,17 @@ pub const INVALID_SUBNET_ID_NOT_FOUND: &str = "InvalidSubnetID.NotFound";
 pub const INVALID_SUBNET_CIDR_RESERVATION_ID_NOT_FOUND: &str =
     "InvalidSubnetCidrReservationID.NotFound";
 
+/// EC2's error code for a request that named a subnet CIDR block association id no
+/// association of the account has.
+///
+/// The same `Invalid<Resource>ID.NotFound` spelling the subnet surface answers an unknown
+/// `SubnetId` with ([`INVALID_SUBNET_ID_NOT_FOUND`]), built from the id member's own name
+/// (`DisassociateSubnetCidrBlockRequest$AssociationId`, a `SubnetCidrAssociationId`) — an
+/// association is part of a subnet and is named by one id, so it is reported absent the
+/// way its subnet is.
+pub const INVALID_SUBNET_CIDR_BLOCK_ASSOCIATION_ID_NOT_FOUND: &str =
+    "InvalidSubnetCidrBlockAssociationID.NotFound";
+
 /// EC2's error code for a request that named a DHCP options id no option set of the
 /// account has (EC2 API "Error codes": `InvalidDhcpOptionID.NotFound`).
 pub const INVALID_DHCP_OPTION_ID_NOT_FOUND: &str = "InvalidDhcpOptionID.NotFound";
@@ -3035,6 +3046,19 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// CIDR block with your subnet" (`AssociateSubnetCidrBlock`), so one subnet has at
     /// most one such move owed, and [`Self::remove_subnet`] drops it with the subnet.
     pub subnet_ipv6_associated_at: BTreeMap<String, Instant>,
+    /// When each subnet IPv6 CIDR block association that is on its way OUT reaches the
+    /// terminal [`CIDR_BLOCK_STATE_DISASSOCIATED`], for the associations that have such a
+    /// move owed.
+    ///
+    /// `DisassociateSubnetCidrBlock` answers an association in the non-terminal
+    /// [`CIDR_BLOCK_STATE_DISASSOCIATING`] state, so the clock owes it `disassociated` one
+    /// [`TRANSITION_DELAY`] later whether or not anybody calls again — the move an
+    /// `associating` association makes to `associated` ([`Self::subnet_ipv6_associated_at`]),
+    /// in the other direction. Keyed by `AssociationId`, which is what the request names and
+    /// what [`Self::associate_subnet_ipv6_cidr_block`] mints out of the store's own counter,
+    /// so one entry names one association whichever subnet holds it;
+    /// [`Self::remove_subnet`] drops the entries of the associations that go with the subnet.
+    pub subnet_ipv6_disassociated_at: BTreeMap<String, Instant>,
     /// Every subnet CIDR reservation the account holds, by `SubnetCidrReservationId`, as
     /// the modelled [`SubnetCidrReservation`] shape itself — so a member a writer sets
     /// round-trips through `GetSubnetCidrReservations` without a field-by-field copy.
@@ -4084,6 +4108,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             subnets: BTreeMap::new(),
             subnet_available_at: BTreeMap::new(),
             subnet_ipv6_associated_at: BTreeMap::new(),
+            subnet_ipv6_disassociated_at: BTreeMap::new(),
             // A fresh account has reserved no part of any subnet's CIDR range.
             subnet_cidr_reservations: BTreeMap::new(),
             carrier_gateways: BTreeMap::new(),
@@ -4764,6 +4789,127 @@ impl ComAmazonawsEc2Amazonec2State {
                 .map_or(0, <[SubnetIpv6CidrBlockAssociation]>::len)
                 < MAX_IPV6_ASSOCIATIONS_PER_SUBNET
         })
+    }
+
+    /// The subnet IPv6 CIDR block association `association_id` names, as the id of the
+    /// subnet that holds it and the association itself — or `None` when no subnet of the
+    /// account holds one with that id.
+    ///
+    /// An association of this kind is named by its own id and nothing else
+    /// (`DisassociateSubnetCidrBlockRequest$AssociationId`), so the lookup walks the
+    /// subnets' association sets rather than asking for a subnet first. The id is minted
+    /// from the store's own counter ([`Self::associate_subnet_ipv6_cidr_block`]), so at most
+    /// one association of one subnet carries it.
+    pub fn subnet_ipv6_association(
+        &self,
+        association_id: &str,
+    ) -> Option<(String, SubnetIpv6CidrBlockAssociation)> {
+        self.subnets.iter().find_map(|(subnet_id, subnet)| {
+            subnet
+                .ipv6_cidr_block_association_set
+                .iter()
+                .flatten()
+                .find(|association| association.association_id.as_deref() == Some(association_id))
+                .map(|association| (subnet_id.clone(), association.clone()))
+        })
+    }
+
+    /// Start the disassociation of the subnet IPv6 CIDR block association `association_id`,
+    /// and answer the subnet that holds it with the association as it now stands — or `None`
+    /// when no subnet of the account holds one with that id.
+    ///
+    /// The one writer of a disassociation, so `DisassociateSubnetCidrBlock` and
+    /// `DescribeSubnets` cannot report one differently. The association is recorded
+    /// [`CIDR_BLOCK_STATE_DISASSOCIATING`], which is what the caller is answered: the block
+    /// is on its way out, so it is no longer HELD ([`cidr_association_holds_its_block`]) and
+    /// the subnet may be given another one straight away. The terminal
+    /// [`CIDR_BLOCK_STATE_DISASSOCIATED`] is owed to the clock one [`TRANSITION_DELAY`] out
+    /// ([`Self::subnet_ipv6_disassociated_at`]) — the arrangement the `associating` ->
+    /// `associated` move has, in the other direction. The record itself STAYS in the
+    /// subnet's association set, reporting the block the subnet let go of and the state it
+    /// ended in, so the bytes it was charged stay charged too.
+    ///
+    /// Idempotent: an association already on its way out keeps the instant already recorded
+    /// for it, so repeating the call cannot hold the move open indefinitely.
+    pub fn begin_subnet_ipv6_disassociation(
+        &mut self,
+        association_id: &str,
+    ) -> Option<(String, SubnetIpv6CidrBlockAssociation)> {
+        let (subnet_id, _) = self.subnet_ipv6_association(association_id)?;
+        let association = self
+            .subnets
+            .get_mut(&subnet_id)?
+            .ipv6_cidr_block_association_set
+            .iter_mut()
+            .flatten()
+            .find(|association| association.association_id.as_deref() == Some(association_id))?;
+        let was_held = cidr_association_holds_its_block(
+            association
+                .ipv6_cidr_block_state
+                .as_ref()
+                .and_then(|state| state.state.as_deref()),
+        );
+        // An association that is already on its way out, or already out, is answered exactly
+        // as it stands: its state is not walked backwards and the instant recorded for its
+        // move is not pushed out, so repeating the call cannot hold one open indefinitely or
+        // revive one the clock has already finished with.
+        if was_held {
+            association.ipv6_cidr_block_state = Some(SubnetCidrBlockState {
+                state: Some(CIDR_BLOCK_STATE_DISASSOCIATING.to_string()),
+                status_message: None,
+            });
+        }
+        let association = association.clone();
+        if was_held {
+            self.subnet_ipv6_disassociated_at
+                .insert(association_id.to_string(), Instant::now() + TRANSITION_DELAY);
+        }
+        Some((subnet_id, association))
+    }
+
+    /// What still depends on the IPv6 CIDR block `ipv6_cidr_block` OF THE SUBNET `subnet_id`,
+    /// as the ids of the depending resources.
+    ///
+    /// "You must detach or delete all gateways and resources that are associated with the
+    /// CIDR block before you can disassociate it" (`DisassociateSubnetCidrBlock`) — and what
+    /// is associated with a subnet's IPv6 block is every network interface OF THAT SUBNET
+    /// holding an address or a delegated prefix out of it (`NetworkInterface$Ipv6Addresses`,
+    /// `NetworkInterface$Ipv6Prefixes`). Those records ARE the in-use pool
+    /// ([`Self::assigned_ipv6_addresses`]), so there is no second copy of them to drift from,
+    /// and an instance holds its addresses THROUGH an interface — the same reading
+    /// [`Self::subnet_dependencies`] has of what occupies a subnet.
+    ///
+    /// Scoped to the subnet because an address is an address OF A SUBNET: two subnets of two
+    /// VPCs may hold the same block, and an interface in one of them holds nothing of the
+    /// other's — the same reason the overlap `AssociateSubnetCidrBlock` refuses is asked per
+    /// VPC.
+    pub fn subnet_ipv6_cidr_block_dependencies(
+        &self,
+        subnet_id: &str,
+        ipv6_cidr_block: &str,
+    ) -> Vec<String> {
+        let mut found: Vec<String> = self
+            .network_interfaces
+            .iter()
+            .filter(|(_, interface)| interface.subnet_id.as_deref() == Some(subnet_id))
+            .filter(|(_, interface)| {
+                interface
+                    .ipv6_addresses
+                    .iter()
+                    .flatten()
+                    .filter_map(|address| address.ipv6_address.as_deref())
+                    .any(|address| cidr_block_contains_address(ipv6_cidr_block, address))
+                    || interface
+                        .ipv6_prefixes
+                        .iter()
+                        .flatten()
+                        .filter_map(|prefix| prefix.ipv6_prefix.as_deref())
+                        .any(|prefix| cidr_block_contains_block(ipv6_cidr_block, prefix))
+            })
+            .map(|(network_interface_id, _)| network_interface_id.clone())
+            .collect();
+        found.sort();
+        found
     }
 
     /// Whether another subnet CIDR reservation fits inside the store's ceiling
@@ -7090,7 +7236,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// its IPv6 association moving `associating` -> `associated`, a `pending` carrier
     /// gateway becoming `available`, a subnet another service
     /// handed over `pending` becoming `available` and a subnet's own IPv6 association
-    /// making that same `associating` -> `associated` move, a `pending` transit
+    /// making that same `associating` -> `associated` move (and the `disassociating` ->
+    /// `disassociated` one, in the other direction, for a block
+    /// `DisassociateSubnetCidrBlock` started letting go of), a `pending` transit
     /// gateway with the route tables that come up
     /// with it (a route table a create ADDED to a gateway comes up on its own due instant),
     /// a `pending` route server endpoint or route server peer becoming
@@ -7259,6 +7407,40 @@ impl ComAmazonawsEc2Amazonec2State {
             // The transition is applied once; nothing is owed on this association any more.
             false
         });
+        // And the move the other way: an association `DisassociateSubnetCidrBlock` left
+        // `disassociating` has reached the terminal `disassociated` at the instant that
+        // write recorded for it, whether or not anybody called again — the same contract as
+        // the `associating` -> `associated` move above, in the other direction.
+        let subnets = &mut self.subnets;
+        self.subnet_ipv6_disassociated_at
+            .retain(|association_id, due_at| {
+                if now < *due_at {
+                    return true;
+                }
+                for subnet in subnets.values_mut() {
+                    let Some(association) = subnet
+                        .ipv6_cidr_block_association_set
+                        .iter_mut()
+                        .flatten()
+                        .find(|association| {
+                            association.association_id.as_deref() == Some(association_id.as_str())
+                        })
+                    else {
+                        continue;
+                    };
+                    if let Some(state) = association.ipv6_cidr_block_state.as_mut() {
+                        if state.state.as_deref() == Some(CIDR_BLOCK_STATE_DISASSOCIATING) {
+                            state.state = Some(CIDR_BLOCK_STATE_DISASSOCIATED.to_string());
+                        }
+                    }
+                    // An association id names ONE association of ONE subnet (it is minted
+                    // from the store's own counter), so the walk stops at the one it found.
+                    break;
+                }
+                // The transition is applied once; nothing is owed on this association any
+                // more.
+                false
+            });
         // A VPN static route `CreateVpnConnectionRoute` answered as `pending` is
         // `available` once its due instant has passed, whether or not anybody called — the
         // same contract as a `pending` VPC's move above.
@@ -11689,6 +11871,23 @@ pub fn invalid_subnet_cidr_reservation_id_not_found<E>(
         INVALID_SUBNET_CIDR_RESERVATION_ID_NOT_FOUND,
         &format!("{RESOURCE_TYPE_SUBNET_CIDR_RESERVATION} ID"),
         reservation_id,
+    )
+}
+
+/// Refuse a request that named a subnet CIDR block association id no association of the
+/// account has: HTTP 400 [`INVALID_SUBNET_CIDR_BLOCK_ASSOCIATION_ID_NOT_FOUND`], naming the
+/// id the REQUEST named.
+///
+/// The sentence is this resource's own rather than the one [`id_not_found`] builds: EC2
+/// words a missing association of this kind as the subnet CIDR BLOCK that the association
+/// id names, not as a missing id.
+pub fn invalid_subnet_cidr_block_association_id_not_found<E>(
+    association_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_SUBNET_CIDR_BLOCK_ASSOCIATION_ID_NOT_FOUND,
+        400,
+        format!("The subnet CIDR block with association ID '{association_id}' does not exist"),
     )
 }
 
@@ -16388,6 +16587,20 @@ pub const VPC_STATE_PENDING: &str = "pending";
 /// enum's `associating` member.
 pub const CIDR_BLOCK_STATE_ASSOCIATING: &str = "associating";
 
+/// An IPv6 CIDR block on its way OUT of the subnet or VPC that holds it: the
+/// `SubnetCidrBlockStateCode` / `VpcCidrBlockStateCode` enums' `disassociating` member,
+/// which both spell the same way
+/// (`smithy_query(query="shape",shape="SubnetCidrBlockStateCode,VpcCidrBlockStateCode")`)
+/// — what `DisassociateSubnetCidrBlock` answers, and a state in which the block is no
+/// longer held ([`cidr_association_holds_its_block`]).
+pub const CIDR_BLOCK_STATE_DISASSOCIATING: &str = "disassociating";
+
+/// An IPv6 CIDR block the subnet or VPC that held it has let go of: the
+/// `SubnetCidrBlockStateCode` / `VpcCidrBlockStateCode` enums' `disassociated` member, the
+/// terminal state of a disassociation and the one the clock owes a `disassociating`
+/// association ([`ComAmazonawsEc2Amazonec2State::subnet_ipv6_disassociated_at`]).
+pub const CIDR_BLOCK_STATE_DISASSOCIATED: &str = "disassociated";
+
 /// The tenancy a VPC may be created with beside [`DEFAULT_INSTANCE_TENANCY`]: the
 /// `Tenancy` enum's `dedicated` member. Its third member, `host`, is excluded by
 /// `CreateVpcRequest$InstanceTenancy`'s own documentation.
@@ -20777,13 +20990,22 @@ impl ComAmazonawsEc2Amazonec2State {
 
     /// Remove the subnet `subnet_id` and answer it as it was last reported, or `None` when
     /// the store holds no such subnet. The bytes the record held go back to the store's
-    /// budget, and every transition the clock may still owe it — its `available` move and
-    /// its IPv6 association's `associated` one — goes with it, so a later materialisation
-    /// cannot resurrect a deleted subnet's state.
+    /// budget, and every transition the clock may still owe it — its `available` move, its
+    /// IPv6 association's `associated` one, and the `disassociated` one owed to an
+    /// association it is part way through letting go of — goes with it, so a later
+    /// materialisation cannot resurrect a deleted subnet's state.
     pub fn remove_subnet(&mut self, subnet_id: &str) -> Option<Subnet> {
         let subnet = self.subnets.remove(subnet_id)?;
         self.subnet_available_at.remove(subnet_id);
         self.subnet_ipv6_associated_at.remove(subnet_id);
+        // A move owed to an association OF THIS SUBNET is owed no longer: the association
+        // went with the subnet, and the bytes it retained are given back below with the rest
+        // of the record's.
+        for association in subnet.ipv6_cidr_block_association_set.iter().flatten() {
+            if let Some(association_id) = association.association_id.as_deref() {
+                self.subnet_ipv6_disassociated_at.remove(association_id);
+            }
+        }
         // An association between a network ACL and THIS subnet cannot outlive the subnet:
         // it goes here rather than being left behind for `DescribeNetworkAcls` to report an
         // ACL associated with a subnet that no longer exists.
