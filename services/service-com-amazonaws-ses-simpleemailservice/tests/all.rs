@@ -69,6 +69,8 @@ mod ses_list_identities_cursor;
 mod ses_missing_custom_verification_template_wording;
 #[path = "all/ses_production_access_gate_wording.rs"]
 mod ses_production_access_gate_wording;
+#[path = "all/ses_query_error_envelope.rs"]
+mod ses_query_error_envelope;
 #[path = "all/ses_receipt_filters.rs"]
 mod ses_receipt_filters;
 #[path = "all/ses_receipt_rule_set_creation.rs"]

@@ -39,9 +39,21 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! Two of those seams are taken here. One is `can_handle` (this service's signing name is
+//! shared — see that method). The other is the `awsQuery` ERROR ENVELOPE: a refusal of
+//! this API answers `<ErrorResponse>` with a `<RequestId>` beside its `<Error>`, naming
+//! the request it refused, which no model declares and the framework's error renderers do
+//! not write. So the generated definition and every routable operation are served behind
+//! `service_common::query_error_envelope`'s two wrappers, which leave every status, code
+//! and message where they are and add that one element — the error-path counterpart of
+//! the `ResponseMetadata/RequestId` a successful response already carries.
 
+use service_common::query_error_envelope::{
+    RequestIdEnvelopeDefinition, RequestIdEnvelopeOperation,
+};
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -75,7 +87,17 @@ const WIRE_PATH_SEGMENTS: &[&str] = &[emulator_server::ROOT_PATH_SEGMENT];
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, behind the `awsQuery` error-envelope wrapper: the failures the
+    /// router renders OUTSIDE the dispatch path — a routing failure, a transport failure
+    /// and a pre-dispatch refusal — name the request they answer in the envelope's
+    /// `<RequestId>`, as every other error of this service does. Identity, the protocol
+    /// and the routing table are the generated entry's, untouched.
+    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
+    /// The envelope wrapper every modelled operation of this service is served through,
+    /// so a handler-returned modelled error and a constraint refusal raised while an
+    /// operation was being served carry that same element. Held in a field because
+    /// [`Service::override_operation`] hands back a reference borrowed from `&self`.
+    envelope: RequestIdEnvelopeOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -84,16 +106,23 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: RequestIdEnvelopeDefinition::new(crate::ServiceDefinition::new(engine)),
+            envelope: RequestIdEnvelopeOperation,
         }
     }
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
-    fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
+    fn definition(&self) -> &dyn ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
         // The router reads it through this one accessor. Do not edit the entry.
+        //
+        // It is reached through the `awsQuery` envelope wrapper, which leaves identity,
+        // the protocol and the routing table exactly as the entry carries them and adds
+        // the `<RequestId>` element to the framework-level error envelopes it renders, so
+        // they carry what a modelled error served through [`RequestIdEnvelopeOperation`]
+        // carries.
         &self.entry
     }
 
@@ -129,12 +158,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: every request the generated routing table resolves is served by
+        // the operation THAT table names, through the wrapper that adds the `<RequestId>`
+        // an `awsQuery` error envelope carries. The framework still owns the whole
+        // deserialize → validate → handle → serialize sequence and every status, code and
+        // message it answers with.
+        //
+        // An `Action` naming no modelled operation is declined here (the wrapper claims
+        // only what the routing table holds), so it stays the router's routing failure,
+        // whose envelope the wrapped definition names the request in.
+        self.entry.routes(req).then_some(&self.envelope as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
