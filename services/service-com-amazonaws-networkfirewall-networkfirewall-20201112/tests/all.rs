@@ -17,6 +17,8 @@ mod error_messages;
 mod firewall_lifecycle;
 #[path = "all/firewall_policy_associations.rs"]
 mod firewall_policy_associations;
+#[path = "all/firewall_protection_settings.rs"]
+mod firewall_protection_settings;
 #[path = "all/flow_operations.rs"]
 mod flow_operations;
 #[path = "all/harness.rs"]

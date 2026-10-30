@@ -240,9 +240,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     AssociateFirewallPolicyErrorModeled::InvalidOperationException(
                         InvalidOperationException {
-                            message: Some(
-                                crate::state::FIREWALL_POLICY_CHANGE_PROTECTED_MESSAGE.to_string(),
-                            ),
+                            // The refusal names the call it refused and the
+                            // setting that refused it, and nothing else.
+                            message: Some(crate::state::change_protected_message(
+                                Self::NAME,
+                                crate::state::FIREWALL_POLICY_CHANGE_PROTECTION_MEMBER,
+                            )),
                         },
                     )
                     .into(),

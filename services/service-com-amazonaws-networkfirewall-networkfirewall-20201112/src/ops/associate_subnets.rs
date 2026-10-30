@@ -242,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let attached = record
             .associate_subnets(&region, &input.subnet_mappings, now)
-            .map_err(associate_breach_error)?;
+            .map_err(|breach| associate_breach_error(breach, Self::NAME))?;
         // The token "marks the state of the firewall resource at the time of the
         // request", so it is re-minted exactly when this call moved that state: a
         // request naming only subnets the firewall already carries associated
@@ -272,12 +272,21 @@ crate::state::impl_resolve_error!(
 /// valid"), while a request that names no subnet, names one twice, or would need
 /// more Availability Zones than a firewall spans is a bad request
 /// (`InvalidRequestException`).
-fn associate_breach_error(breach: crate::state::SubnetAssociationBreach) -> AssociateSubnetsError {
+///
+/// `operation` is the name of the call being served, which the protection
+/// refusal names (see [`crate::state::change_protected_message`]).
+fn associate_breach_error(
+    breach: crate::state::SubnetAssociationBreach,
+    operation: &str,
+) -> AssociateSubnetsError {
     use crate::state::SubnetAssociationBreach as Breach;
     match breach {
         Breach::Protected => AssociateSubnetsErrorModeled::InvalidOperationException(
             InvalidOperationException {
-                message: Some(crate::state::SUBNET_CHANGE_PROTECTED_MESSAGE.to_string()),
+                message: Some(crate::state::change_protected_message(
+                    operation,
+                    crate::state::SUBNET_CHANGE_PROTECTION_MEMBER,
+                )),
             },
         ),
         Breach::NoSubnets => {

@@ -1394,40 +1394,42 @@ pub enum SubnetAssociationBreach {
     ZoneCapacity,
 }
 
-/// What a change to a protected firewall's subnet associations is refused with.
+/// What a change one of a firewall's change-protection settings blocks is
+/// refused with: `Cannot <Operation> because <Member> is on`.
 ///
-/// The rule is documented on `Firewall$SubnetChangeProtection`: "A setting
-/// indicating whether the firewall is protected against changes to the subnet
-/// associations. Use this setting to protect against accidentally modifying the
-/// subnet associations for a firewall that is in use", so while the flag is set
-/// the change is not a valid operation on this firewall
-/// (`InvalidOperationException`, client, HTTP 400). The model does not fix the
-/// text, and the refusal is a property of the setting rather than of the
-/// request, so the message is one constant carrying nothing from the request —
-/// the shape every resource-agnostic refusal this service answers takes (see
-/// [`RESOURCE_NOT_FOUND_MESSAGE`]).
-pub const SUBNET_CHANGE_PROTECTED_MESSAGE: &str =
-    "Unable to change the subnet associations because the firewall is protected against subnet \
-     changes";
+/// Each setting is documented the same way on `Firewall`
+/// (`Firewall$SubnetChangeProtection`: "A setting indicating whether the
+/// firewall is protected against changes to the subnet associations. Use this
+/// setting to protect against accidentally modifying the subnet associations for
+/// a firewall that is in use"; `Firewall$FirewallPolicyChangeProtection` says
+/// the same of the firewall policy association), so while the setting is on the
+/// requested change is not a valid operation on this firewall
+/// (`InvalidOperationException`, client, HTTP 400).
+///
+/// The model does not fix the text, so the wording is the recorded one, and it
+/// is a FRAME rather than a constant: the refusal is the same whatever the
+/// request asked to change, and the two things the error code alone cannot tell
+/// a client are which call was refused and which setting refused it. Those are
+/// its only variable parts — `operation` is the operation being served (so
+/// `AssociateSubnets` and `DisassociateSubnets` each name themselves on their
+/// own call) and `protection_member` is the `Firewall` member carrying the flag.
+/// Nothing from the request body appears in it: no subnet id, ARN, account id or
+/// firewall name (the same discipline as [`RESOURCE_NOT_FOUND_MESSAGE`]).
+pub fn change_protected_message(operation: &str, protection_member: &str) -> String {
+    format!("Cannot {operation} because {protection_member} is on")
+}
+
+/// How [`change_protected_message`] names the setting that protects a firewall's
+/// subnet associations: the `Firewall` member carrying it.
+pub const SUBNET_CHANGE_PROTECTION_MEMBER: &str = "SubnetChangeProtection";
+
+/// How [`change_protected_message`] names the setting that protects a firewall's
+/// policy association.
+pub const FIREWALL_POLICY_CHANGE_PROTECTION_MEMBER: &str = "FirewallPolicyChangeProtection";
 
 /// What a subnet-association change naming no subnet is refused with: the
 /// request asks for no association at all, which no mapping can satisfy.
 pub const NO_SUBNETS_MESSAGE: &str = "Specify at least one subnet.";
-
-/// What a change to a protected firewall's POLICY association is refused with.
-///
-/// The rule is documented on `Firewall$FirewallPolicyChangeProtection`: "A
-/// setting indicating whether the firewall is protected against a change to the
-/// firewall policy association. Use this setting to protect against
-/// accidentally modifying the firewall policy for a firewall that is in use",
-/// so while the flag is set the change is not a valid operation on this firewall
-/// (`InvalidOperationException`, client, HTTP 400). Same shape as
-/// [`SUBNET_CHANGE_PROTECTED_MESSAGE`]: the model does not fix the text, and the
-/// refusal is a property of the setting rather than of the request, so the
-/// message is one constant carrying nothing from the request.
-pub const FIREWALL_POLICY_CHANGE_PROTECTED_MESSAGE: &str =
-    "Unable to change the firewall policy because the firewall is protected against firewall \
-     policy changes";
 
 /// What a subnet-association change past [`MAX_AVAILABILITY_ZONES`] is refused
 /// with: `AssociateSubnets` is documented "You can specify one subnet for each
