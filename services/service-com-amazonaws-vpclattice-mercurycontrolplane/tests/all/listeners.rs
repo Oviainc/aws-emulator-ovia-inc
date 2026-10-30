@@ -46,7 +46,7 @@ pub(crate) fn target_group(suffix: &str) -> String {
 }
 
 /// The ARN kind of a listener of `service_id`: a listener ARN nests under its service's.
-fn listener_kind(service_id: &str) -> String {
+pub(crate) fn listener_kind(service_id: &str) -> String {
     format!("service/{service_id}/listener")
 }
 

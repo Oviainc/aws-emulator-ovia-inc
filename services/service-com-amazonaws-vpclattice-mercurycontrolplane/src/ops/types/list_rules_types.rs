@@ -27,7 +27,14 @@ pub struct ListRulesOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#RuleSummary")]
+/// `RuleSummary`, with its schema written out instead of derived because `createdAt`
+/// and `lastUpdatedAt` are `@timestampFormat("date-time")`; the note in `shared_types`
+/// says why that cannot be derived here. Member for member this is the model's shape:
+/// same ids, same order, same indices.
+///
+/// Unlike the hand-written OUTPUT shapes of this service, the deserializer is reproduced
+/// too: `ListRulesOutput` above is derived, and its generated read path for `items`
+/// calls `<RuleSummary as DeserializableStruct>::deserialize`.
 #[derive(Debug, Clone, Default)]
 pub struct RuleSummary {
     pub arn: Option<String>,
@@ -37,5 +44,100 @@ pub struct RuleSummary {
     pub priority: Option<i32>,
     pub created_at: Option<::aws_smithy_types::DateTime>,
     pub last_updated_at: Option<::aws_smithy_types::DateTime>,
+}
+
+#[allow(non_upper_case_globals)]
+impl RuleSummary {
+    const M_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("RuleSummary", "arn", String, 0);
+    const M_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("RuleSummary", "id", String, 1);
+    const M_NAME: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("RuleSummary", "name", String, 2);
+    const M_IS_DEFAULT: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("RuleSummary", "isDefault", Boolean, 3);
+    const M_PRIORITY: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("RuleSummary", "priority", Integer, 4);
+    const M_CREATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("RuleSummary", "createdAt", 5);
+    const M_LAST_UPDATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("RuleSummary", "lastUpdatedAt", 6);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.vpclattice#RuleSummary",
+            shared_types::NAMESPACE,
+            "RuleSummary",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ARN,
+            &Self::M_ID,
+            &Self::M_NAME,
+            &Self::M_IS_DEFAULT,
+            &Self::M_PRIORITY,
+            &Self::M_CREATED_AT,
+            &Self::M_LAST_UPDATED_AT,
+        ],
+    );
+}
+
+pub static RULE_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema = &RuleSummary::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for RuleSummary {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.arn.as_ref() {
+            serializer.write_string(&Self::M_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.id.as_ref() {
+            serializer.write_string(&Self::M_ID, value.as_str())?;
+        }
+        if let Some(value) = self.name.as_ref() {
+            serializer.write_string(&Self::M_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.is_default.as_ref() {
+            serializer.write_boolean(&Self::M_IS_DEFAULT, *value)?;
+        }
+        if let Some(value) = self.priority.as_ref() {
+            serializer.write_integer(&Self::M_PRIORITY, *value)?;
+        }
+        if let Some(value) = self.created_at.as_ref() {
+            serializer.write_timestamp(&Self::M_CREATED_AT, value)?;
+        }
+        if let Some(value) = self.last_updated_at.as_ref() {
+            serializer.write_timestamp(&Self::M_LAST_UPDATED_AT, value)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for RuleSummary {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut summary = Self::default();
+        deserializer.read_struct(&Self::SCHEMA, &mut |member, value| {
+            match member.member_index() {
+                Some(0) => summary.arn = Some(value.read_string(&Self::M_ARN)?),
+                Some(1) => summary.id = Some(value.read_string(&Self::M_ID)?),
+                Some(2) => summary.name = Some(value.read_string(&Self::M_NAME)?),
+                Some(3) => summary.is_default = Some(value.read_boolean(&Self::M_IS_DEFAULT)?),
+                Some(4) => summary.priority = Some(value.read_integer(&Self::M_PRIORITY)?),
+                Some(5) => {
+                    summary.created_at = Some(value.read_timestamp(&Self::M_CREATED_AT)?);
+                }
+                Some(6) => {
+                    summary.last_updated_at =
+                        Some(value.read_timestamp(&Self::M_LAST_UPDATED_AT)?);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(summary)
+    }
 }
 

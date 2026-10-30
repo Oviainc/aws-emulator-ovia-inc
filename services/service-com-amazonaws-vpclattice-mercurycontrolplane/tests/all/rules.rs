@@ -44,7 +44,7 @@ use crate::vpclattice_service_slice::{
 
 /// The ARN kind of a rule of `listener_id`: a rule ARN nests under its listener's,
 /// which nests under its service's (`RuleArn`'s modelled pattern).
-fn rule_kind(service_id: &str, listener_id: &str) -> String {
+pub(crate) fn rule_kind(service_id: &str, listener_id: &str) -> String {
     format!("service/{service_id}/listener/{listener_id}/rule")
 }
 
@@ -56,7 +56,7 @@ fn next_fixture_port() -> i64 {
 }
 
 /// Create a listener to hang rules off, answering its id.
-async fn a_listener(lattice: &Lattice, service_identifier: &str, name: &str) -> String {
+pub(crate) async fn a_listener(lattice: &Lattice, service_identifier: &str, name: &str) -> String {
     let created = create_listener(
         lattice,
         service_identifier,
@@ -80,7 +80,7 @@ async fn a_listener(lattice: &Lattice, service_identifier: &str, name: &str) -> 
 }
 
 /// `POST /services/{serviceIdentifier}/listeners/{listenerIdentifier}/rules`.
-async fn create_rule(
+pub(crate) async fn create_rule(
     lattice: &Lattice,
     service_identifier: &str,
     listener_identifier: &str,
@@ -96,7 +96,7 @@ async fn create_rule(
 }
 
 /// `GET /services/{serviceIdentifier}/listeners/{listenerIdentifier}/rules/{ruleIdentifier}`.
-async fn get_rule(
+pub(crate) async fn get_rule(
     lattice: &Lattice,
     service_identifier: &str,
     listener_identifier: &str,
@@ -115,7 +115,7 @@ async fn get_rule(
 
 /// A rule body with a fixed-response action, for the cases where only the priority or
 /// the name is under test.
-fn fixed_response_rule(name: &str, priority: i64) -> serde_json::Value {
+pub(crate) fn fixed_response_rule(name: &str, priority: i64) -> serde_json::Value {
     serde_json::json!({
         "name": name,
         "priority": priority,

@@ -67,7 +67,8 @@ fn expected_message(label: &str, identifier: &str) -> String {
 /// A well-formed identifier of `prefix`'s kind that nothing ever created: the prefix plus
 /// 17 `[0-9a-z]` characters, which is what every modelled id pattern of this service
 /// demands (so the request reaches the handler instead of being refused at the boundary).
-fn absent_id(prefix: &str, fill: &str) -> String {
+/// Shared with the suites beside this file, so the construction has one spelling.
+pub(crate) fn absent_id(prefix: &str, fill: &str) -> String {
     let suffix: String = fill.chars().cycle().take(17).collect();
     format!("{prefix}{suffix}")
 }

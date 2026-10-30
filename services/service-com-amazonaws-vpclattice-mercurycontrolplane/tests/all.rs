@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/error_payload_construction.rs"]
 mod error_payload_construction;
+#[path = "all/list_rules.rs"]
+mod list_rules;
 #[path = "all/list_service_network_service_associations.rs"]
 mod list_service_network_service_associations;
 #[path = "all/listener_conflict_deletion_and_error_shape.rs"]
