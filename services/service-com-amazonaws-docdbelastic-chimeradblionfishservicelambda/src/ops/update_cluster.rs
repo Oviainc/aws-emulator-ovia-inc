@@ -5,6 +5,11 @@
 //! keeps its previous value — and returns the updated cluster. The change is visible
 //! to the next `GetCluster`.
 //!
+//! An applied change leaves the cluster in a transient `UPDATING` status until the
+//! clock settles it back to `ACTIVE`, and a cluster is modifiable only from a settled
+//! status: a request arriving while a change is still in flight is refused with
+//! `ConflictException` (409) rather than applied on top of it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -228,6 +233,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         record.settle_due();
+        // A cluster takes one modification at a time: while the change a previous call
+        // started is still in flight the cluster is not in a modifiable status, so this
+        // request is refused instead of overwriting it. The store is locked across the
+        // check and the write below, so of two overlapping modifications exactly one is
+        // accepted.
+        state::ensure_modifiable(record).map_err(UpdateClusterErrorModeled::ConflictException)?;
 
         // Only the members present are applied; every other one keeps its value.
         let mut applied = false;

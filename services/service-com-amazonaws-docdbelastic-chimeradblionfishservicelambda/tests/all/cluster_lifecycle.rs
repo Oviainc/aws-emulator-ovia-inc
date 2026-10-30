@@ -244,6 +244,22 @@ async fn get_ok(router: &MultiServiceRouter, cluster_arn: &str) -> Value {
         .unwrap_or_else(|| panic!("case {cluster_arn}: no `cluster` member in {response}"))
 }
 
+/// Read one cluster back until it reports `ACTIVE`, and return it.
+///
+/// A cluster is modifiable only from a settled status, so a suite that updates a
+/// cluster it has just created waits here first: the move to `ACTIVE` is owed by the
+/// clock, so polling a read is all it takes.
+async fn wait_until_active(router: &MultiServiceRouter, cluster_arn: &str) -> Value {
+    for _ in 0..100 {
+        let cluster = get_ok(router, cluster_arn).await;
+        if cluster["status"].as_str() == Some("ACTIVE") {
+            return cluster;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("case {cluster_arn}: the cluster never settled to ACTIVE");
+}
+
 #[tokio::test]
 async fn a_created_cluster_round_trips_through_get_cluster() {
     // The rows differ along everything the create persists: the published shard
@@ -651,6 +667,9 @@ async fn update_cluster_applies_only_the_members_the_request_carries() {
         )
         .await;
         let cluster_arn = before["clusterArn"].as_str().expect("clusterArn").to_string();
+        // A cluster accepts a modification only from a settled status, so the suite
+        // waits out the create before it updates.
+        wait_until_active(&router, &cluster_arn).await;
 
         let path = format!("/cluster/{}", label(&cluster_arn));
         let (status, response) = call(&router, "PUT", &path, Some(patch.clone())).await;

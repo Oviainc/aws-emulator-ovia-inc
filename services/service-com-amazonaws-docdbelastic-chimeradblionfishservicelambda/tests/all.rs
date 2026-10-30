@@ -15,6 +15,8 @@
 mod cluster_lifecycle;
 #[path = "all/cluster_snapshot_listing.rs"]
 mod cluster_snapshot_listing;
+#[path = "all/concurrent_cluster_modification.rs"]
+mod concurrent_cluster_modification;
 #[path = "all/error_resource_identity.rs"]
 mod error_resource_identity;
 #[path = "all/maintenance_and_restore.rs"]

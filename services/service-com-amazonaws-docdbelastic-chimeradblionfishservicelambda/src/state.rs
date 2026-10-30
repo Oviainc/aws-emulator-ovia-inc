@@ -838,6 +838,34 @@ pub fn conflict(kind: ResourceKind, arn: &str, message: String) -> ConflictExcep
     }
 }
 
+/// Refuse a modification of a cluster whose status does not admit one.
+///
+/// An elastic cluster carries out one change at a time. A change the service is still
+/// applying leaves the cluster in a transient status — [`STATUS_CREATING`],
+/// [`STATUS_UPDATING`], [`STATUS_DELETING`] and the rest of the modelled `Status`
+/// values that are not [`STATUS_ACTIVE`] — until the clock settles it, and only a
+/// settled cluster takes the next one: a second modification arriving while one is
+/// still in flight is the access conflict `ConflictException` (HTTP 409) reports, not
+/// a second write. That is what makes the outcome of two overlapping modifications
+/// decided rather than a race: exactly one is accepted.
+///
+/// Call [`ClusterRecord::settle_due`] first, so a cluster whose transition the clock
+/// has already made due is judged by the status it is owed and not by the one it was
+/// left in.
+pub fn ensure_modifiable(record: &ClusterRecord) -> Result<(), ConflictException> {
+    if record.status == STATUS_ACTIVE {
+        return Ok(());
+    }
+    Err(conflict(
+        ResourceKind::Cluster,
+        &record.cluster_arn,
+        format!(
+            "The elastic cluster {} is in {} status and cannot be modified until it is {}",
+            record.cluster_name, record.status, STATUS_ACTIVE
+        ),
+    ))
+}
+
 /// Refuse a create that would take the cluster count past [`MAX_CLUSTERS`].
 pub fn ensure_cluster_capacity(current: usize) -> Result<(), ServiceQuotaExceededException> {
     if current < MAX_CLUSTERS {
