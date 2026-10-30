@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePartnership
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePartnership`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Applies the members a request names to a stored partnership and reports the record it
+//! leaves behind.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePartnership::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every `capabilityId` the request lists is resolved against this service's capability
+//! store BEFORE anything is written, so an update naming an id that resolves to no
+//! capability is refused whole (the modelled `ResourceNotFoundException`) and the stored
+//! partnership is left exactly as it was — never partially written with the ids that did
+//! resolve. A `capabilities` list replaces the stored one wholesale.
 //!
 //! ## Shape of an operation
 //!
@@ -153,6 +152,16 @@ impl From<UpdatePartnershipErrorModeled> for UpdatePartnershipError {
     }
 }
 
+/// The modelled refusal for a `partnershipId` this service holds no partnership for, in
+/// the wording every handler of this service reports a missing partnership with
+/// ([`crate::state::partnership_not_found`]).
+fn partnership_not_found(partnership_id: &str) -> UpdatePartnershipError {
+    UpdatePartnershipErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::partnership_not_found(partnership_id),
+    })
+    .into()
+}
+
 /// The `UpdatePartnership` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -189,18 +198,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePartnership` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePartnershipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePartnership"))
+        if let Err(denied) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::resource_arn(
+                &crate::state::request_region(ctx.parts()),
+                "partnership",
+                &input.partnership_id,
+            ),
+        ) {
+            return Err(UpdatePartnershipErrorModeled::AccessDeniedException(denied).into());
+        }
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdatePartnershipErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+
+        // The resolution verdict comes first: a `partnershipId` this service does not
+        // hold names no partnership to update, which is the modelled 404 — never a
+        // create.
+        if !state.partnerships.contains_key(&input.partnership_id) {
+            return Err(partnership_not_found(&input.partnership_id));
+        }
+
+        // Then every reference the request carries, BEFORE any mutation: a partnership is
+        // bound to capabilities by id, so an id that resolves to no stored capability
+        // refuses the whole call and leaves the record untouched, rather than binding a
+        // dangling reference or writing the entries that did resolve.
+        if let Some(unknown) = state.first_unknown_capability(
+            input
+                .capabilities
+                .iter()
+                .flatten()
+                .map(::std::string::String::as_str),
+        ) {
+            return Err(UpdatePartnershipErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::capability_not_found(unknown),
+                },
+            )
+            .into());
+        }
+
+        let Some(partnership) = state.partnerships.get_mut(&input.partnership_id) else {
+            return Err(partnership_not_found(&input.partnership_id));
+        };
+
+        // Only the members the request names are applied; the rest keep the stored value.
+        // A `capabilities` list REPLACES the stored one wholesale — it is the
+        // partnership's whole binding rather than a delta — so an element the request
+        // leaves out is no longer bound. `profileId`, `email`, `phone` and
+        // `tradingPartnerId` are not input members of this operation, so they are never
+        // re-pointed here.
+        if let Some(name) = input.name {
+            partnership.name = name;
+        }
+        if let Some(capabilities) = input.capabilities {
+            partnership.capabilities = capabilities;
+        }
+        if let Some(capability_options) = input.capability_options {
+            partnership.capability_options = Some(capability_options);
+        }
+        partnership.modified_at = Some(crate::state::now());
+
+        Ok(UpdatePartnershipOutput {
+            profile_id: partnership.profile_id.clone(),
+            partnership_id: partnership.partnership_id.clone(),
+            partnership_arn: partnership.partnership_arn.clone(),
+            name: Some(partnership.name.clone()),
+            email: Some(partnership.email.clone()),
+            phone: partnership.phone.clone(),
+            capabilities: Some(partnership.capabilities.clone()),
+            capability_options: partnership.capability_options.clone(),
+            trading_partner_id: Some(partnership.trading_partner_id.clone()),
+            created_at: partnership.created_at,
+            modified_at: partnership.modified_at,
+        })
     }
 }

@@ -349,13 +349,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // `capabilities` is required, so the list is walked in order and the FIRST
-        // unknown element is what the refusal names. The modelled list carries no
-        // `@length`, so the walk is kept cheap: one hash lookup per element, and it
-        // stops at the first element that does not resolve.
-        if let Some(unknown) = input
-            .capabilities
-            .iter()
-            .find(|capability_id| !state.capabilities.contains_key(*capability_id))
+        // unknown element is what the refusal names — the same resolution
+        // `UpdatePartnership` applies to the list it is handed
+        // ([`crate::state::ComAmazonawsB2biB2biState::first_unknown_capability`]).
+        if let Some(unknown) =
+            state.first_unknown_capability(input.capabilities.iter().map(String::as_str))
         {
             return Err(CreatePartnershipErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

@@ -398,6 +398,23 @@ impl ComAmazonawsB2biB2biState {
         self.transformers.len() < MAX_RECORDS_PER_STORE
     }
 
+    /// The first id in `capability_ids` this store holds no capability for, in the order
+    /// the caller listed them — or `None` when every one of them resolves.
+    ///
+    /// The ONE place a list of `capabilityId` references is resolved, so every operation
+    /// that binds capabilities to a partnership (the create and the update) refuses the
+    /// same unknown reference the same way. The walk is one hash lookup per element and
+    /// stops at the first element that does not resolve, which is the id the refusal
+    /// names.
+    pub fn first_unknown_capability<'ids>(
+        &self,
+        capability_ids: impl IntoIterator<Item = &'ids str>,
+    ) -> Option<&'ids str> {
+        capability_ids
+            .into_iter()
+            .find(|capability_id| !self.capabilities.contains_key(*capability_id))
+    }
+
     /// Remember that `key` minted `id`, evicting the oldest remembered token once
     /// [`MAX_IDEMPOTENCY_ENTRIES`] are held — so a caller cannot grow this map without
     /// limit by sending a fresh `clientToken` on every request.
