@@ -160,29 +160,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let report_name = input.report_definition.report_name.clone();
         if store.position(&report_name).is_some() {
+            // No `Message`: the modelled exception's only member is an optional
+            // `Message`, and the error shape's documentation describes the error class
+            // rather than being text the service sends, so this refusal is its code and
+            // status alone and the requested name is not echoed back.
             return Err(PutReportDefinitionErrorModeled::DuplicateReportNameException(
-                DuplicateReportNameException {
-                    message: Some(format!(
-                        "A report with the name {report_name} already exists in the account. \
-                         Specify a different report name."
-                    )),
-                },
+                DuplicateReportNameException { message: None },
             )
             .into());
         }
 
         // The account-wide cap, per the modelled `ReportLimitReachedException` doc
         // ("This account already has five reports defined"). Checked against the count
-        // actually stored, so deleting a report frees a slot.
+        // actually stored, so deleting a report frees a slot. The refusal carries no
+        // `Message`, for the same reason as the duplicate-name one above: that doc is
+        // the model's description of the error class, not wire text.
         if store.reports.len() >= crate::state::MAX_REPORTS {
-            let limit = crate::state::MAX_REPORTS;
             return Err(PutReportDefinitionErrorModeled::ReportLimitReachedException(
-                ReportLimitReachedException {
-                    message: Some(format!(
-                        "This account already has {limit} reports defined. To define a new \
-                         report, you must delete an existing report."
-                    )),
-                },
+                ReportLimitReachedException { message: None },
             )
             .into());
         }

@@ -152,12 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(report) = store.get_mut(&input.report_name) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "The report {} in the request doesn't exist.",
-                        input.report_name
-                    )),
-                },
+                crate::state::report_not_found(),
             )
             .into());
         };

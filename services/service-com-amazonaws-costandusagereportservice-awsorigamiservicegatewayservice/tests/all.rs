@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/modelled_constraints.rs"]
 mod modelled_constraints;
+#[path = "all/refusal_envelope.rs"]
+mod refusal_envelope;
 #[path = "all/report_definition_lifecycle.rs"]
 mod report_definition_lifecycle;
 #[path = "all/state_roundtrip.rs"]

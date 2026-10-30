@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
-use crate::ops::types::{ReportDefinition, Tag};
+use crate::ops::types::{ReportDefinition, ResourceNotFoundException, Tag};
 
 /// How many report definitions one account may hold.
 ///
@@ -31,6 +31,20 @@ pub const MAX_REPORTS: usize = 5;
 /// Enforced by every path that attaches tags — `PutReportDefinition` and `TagResource`
 /// — through [`StoredReport::merge_tags`].
 pub const MAX_TAGS_PER_REPORT: usize = 50;
+
+/// The refusal for a `ReportName` the account does not hold, shared by every operation
+/// that looks a report up by name before touching its tags.
+///
+/// Built with NO `Message`. The modelled exception's only member is an OPTIONAL
+/// `Message`, documented as "A message to show the detail of the exception"
+/// (`smithy_query(shape="ErrorMessage")`), and the error shape's own documentation
+/// describes the error CLASS rather than being text this service puts on the wire — so
+/// the refusal carries its error code and HTTP status alone, and nothing from the
+/// request (least of all the report name) is echoed back in it. One constructor so the
+/// handlers that answer this refusal cannot drift apart.
+pub fn report_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException { message: None }
+}
 
 /// Why a tag merge was refused: it would leave the report holding more tags than
 /// [`MAX_TAGS_PER_REPORT`].
