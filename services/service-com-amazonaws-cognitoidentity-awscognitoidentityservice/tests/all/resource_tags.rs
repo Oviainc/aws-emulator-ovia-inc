@@ -15,7 +15,7 @@
 //!   `ResourceArn` names — an EMPTY map when the resource carries none — and leaves that
 //!   set unchanged.
 //! * Either operation refuses an ARN that is not an identity-pool ARN of this service with
-//!   the modelled 400 `InvalidParameterException`, and answers the modelled 404
+//!   the modelled 400 `InvalidParameterException`, and answers the modelled
 //!   `ResourceNotFoundException` for one naming a pool this service does not hold.
 //!
 //! The harness is `identity_pool_flow`'s: one shared engine behind the same
@@ -243,7 +243,7 @@ async fn every_well_formed_arn_for_a_pool_reads_that_pools_tags() {
 }
 
 /// RULE: a `ResourceArn` naming a pool this service does not hold — one never created, or
-/// one already deleted — is the modelled 404 `ResourceNotFoundException`.
+/// one already deleted — is the modelled `ResourceNotFoundException`.
 #[tokio::test]
 async fn an_arn_naming_a_pool_that_is_not_stored_is_not_found() {
     let emulator = Emulator::new();
@@ -289,8 +289,8 @@ async fn an_arn_naming_a_pool_that_is_not_stored_is_not_found() {
             .call("ListTagsForResource", &json!({"ResourceArn": arn.clone()}))
             .await;
         assert_eq!(
-            status, 404,
-            "case {case:?} ({arn}): expected HTTP 404, got {status} with {body}"
+            status, 400,
+            "case {case:?} ({arn}): expected HTTP 400, got {status} with {body}"
         );
         assert!(
             error_code(&body).contains("ResourceNotFoundException"),
@@ -936,7 +936,7 @@ async fn tag_resource_tags_the_pool_any_well_formed_arn_for_it_names() {
 }
 
 /// RULE: a `TagResource` whose `ResourceArn` names a pool this service does not hold — one
-/// never created, or one already deleted — is the modelled 404 `ResourceNotFoundException`,
+/// never created, or one already deleted — is the modelled `ResourceNotFoundException`,
 /// and one that is not an identity-pool ARN of this service at all is the modelled 400
 /// `InvalidParameterException`.
 #[tokio::test]
@@ -977,8 +977,8 @@ async fn tag_resource_refuses_an_arn_that_names_no_stored_pool() {
     for (case, arn) in missing {
         let (status, body) = tag_call(&emulator, &arn, &assigned).await;
         assert_eq!(
-            status, 404,
-            "case {case:?} ({arn}): expected HTTP 404, got {status} with {body}"
+            status, 400,
+            "case {case:?} ({arn}): expected HTTP 400, got {status} with {body}"
         );
         assert!(
             error_code(&body).contains("ResourceNotFoundException"),

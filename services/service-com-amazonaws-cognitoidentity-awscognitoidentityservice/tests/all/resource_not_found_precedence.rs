@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for WHICH resource a 404 `ResourceNotFoundException` names when a
+//! End-to-end cover for WHICH resource a `ResourceNotFoundException` names when a
 //! request carries more than one.
 //!
 //! The rule asserted over a table of inputs, not one recorded call: an operation that
@@ -151,8 +151,8 @@ async fn unlink_developer_identity_reports_the_identity_it_cannot_resolve() {
         let request = unlink_developer_request(pool, identity, provider, identifier);
         let (status, body) = emulator.call("UnlinkDeveloperIdentity", &request).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404 for an identity this service does not hold, got \
+            status, 400,
+            "case {case:?}: expected HTTP 400 for an identity this service does not hold, got \
              {status} with {body}"
         );
         assert!(
@@ -188,8 +188,8 @@ async fn unlink_developer_identity_reports_the_pool_when_the_identity_resolves()
             unlink_developer_request(pool, &identity_id, developer_provider, "user-1");
         let (status, body) = emulator.call("UnlinkDeveloperIdentity", &request).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404 for a pool this service does not hold, got {status} \
+            status, 400,
+            "case {case:?}: expected HTTP 400 for a pool this service does not hold, got {status} \
              with {body}"
         );
         assert!(
@@ -302,8 +302,8 @@ async fn each_operation_reports_the_resource_it_resolves_first() {
     for (case, operation, request, expected) in cases {
         let (status, body) = emulator.call(operation, &request).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404 from {operation}, got {status} with {body}"
+            status, 400,
+            "case {case:?}: expected HTTP 400 from {operation}, got {status} with {body}"
         );
         assert!(
             error_code(&body).contains("ResourceNotFoundException"),

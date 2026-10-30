@@ -18,7 +18,8 @@
 //! * a call that removes no link changes nothing a later caller sees, so unlinking is
 //!   idempotent;
 //! * a call the store cannot act on is refused with the modelled error for what is wrong
-//!   with it — an identity this service does not hold is a 404, a login already linked to
+//!   with it — an identity this service does not hold is the modelled
+//!   `ResourceNotFoundException`, a login already linked to
 //!   another identity is a 409, a `Logins` entry the pool does not accept is a 403 — and a
 //!   value outside a constraint the MODEL states is refused ahead of the operation with a
 //!   400 `ValidationException`.
@@ -514,7 +515,7 @@ async fn a_call_the_store_cannot_act_on_is_refused() {
                 Some(logins_map(&own_login)),
                 Some(one_provider.clone()),
             ),
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (
@@ -524,7 +525,7 @@ async fn a_call_the_store_cannot_act_on_is_refused() {
                 Some(logins_map(&own_login)),
                 Some(one_provider.clone()),
             ),
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (

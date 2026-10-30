@@ -15,7 +15,7 @@
 //!   no `IdentityPoolTags` leaves the tag set the pool holds, and one that carries the
 //!   member states the pool's whole tag set.
 //! * An update naming a pool this service does not hold — one never created, or one
-//!   already deleted — is the modelled 404 `ResourceNotFoundException`, and writes nothing:
+//!   already deleted — is the modelled `ResourceNotFoundException`, and writes nothing:
 //!   every other pool keeps the configuration it had.
 //!
 //! The harness is `identity_pool_flow`'s: one shared engine behind the same
@@ -234,7 +234,7 @@ async fn an_update_replaces_the_stored_configuration() {
     }
 }
 
-/// RULE: an update naming a pool this service does not hold is the modelled 404
+/// RULE: an update naming a pool this service does not hold is the modelled
 /// `ResourceNotFoundException` and writes nothing.
 #[tokio::test]
 async fn an_update_of_a_pool_this_service_does_not_hold_is_not_found() {
@@ -274,8 +274,8 @@ async fn an_update_of_a_pool_this_service_does_not_hold_is_not_found() {
             )
             .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404 for {identity_pool_id:?}, got {status} with \
+            status, 400,
+            "case {case:?}: expected HTTP 400 for {identity_pool_id:?}, got {status} with \
              {body}"
         );
         let code = error_code(&body);
@@ -292,9 +292,13 @@ async fn an_update_of_a_pool_this_service_does_not_hold_is_not_found() {
             )
             .await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {case:?}: a refused update must not create {identity_pool_id:?}, got \
              {status} with {body}"
+        );
+        assert!(
+            error_code(&body).contains("ResourceNotFoundException"),
+            "case {case:?}: a refused update must not create {identity_pool_id:?}, got {body}"
         );
     }
 

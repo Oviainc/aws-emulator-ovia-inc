@@ -5,7 +5,8 @@
 //!
 //! Every case asserts a RULE over a table of inputs rather than one recorded call:
 //!
-//! * each named identity is deleted with everything that named it — a read of it is a 404,
+//! * each named identity is deleted with everything that named it — a read of it is the
+//!   modelled `ResourceNotFoundException`,
 //!   the pool's listing no longer reports it, and the login the pool had indexed against it
 //!   resolves nothing, so presenting that login again mints a NEW identity — while an
 //!   identity the batch did not name is untouched;
@@ -262,7 +263,7 @@ async fn every_named_identity_is_deleted_with_everything_that_named_it() {
                 .await;
             assert_eq!(
                 (status, error_code(&body).as_str()),
-                (404, "ResourceNotFoundException"),
+                (400, "ResourceNotFoundException"),
                 "case {name:?}: a deleted identity is not found, got {status} with {body}"
             );
             assert_eq!(
@@ -473,7 +474,7 @@ async fn a_deleted_identity_can_no_longer_be_issued_credentials_or_a_token() {
             .await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
             "case {operation:?}: a deleted identity is issued nothing, got {status} with {body}"
         );
         let (status, body) = emulator

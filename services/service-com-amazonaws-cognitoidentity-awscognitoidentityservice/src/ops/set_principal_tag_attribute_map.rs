@@ -13,7 +13,7 @@
 //! (username and clientID) attribute mappings configures THOSE, and a custom map the same
 //! call carried is not applied — so carrying both is accepted rather than refused.
 //!
-//! A pool this service does not store is a `ResourceNotFoundException` (HTTP 404). A
+//! A pool this service does not store is a `ResourceNotFoundException`. A
 //! principal tag key that no IAM policy could reference as a session tag of the federated
 //! principal — one in the Amazon Web Services reserved namespace, or spelled with
 //! characters a tag key does not admit — is an `InvalidParameterException` (HTTP 400), and

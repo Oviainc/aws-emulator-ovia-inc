@@ -17,7 +17,7 @@
 //! * The pool a `ResourceArn` names is the `IdentityPoolId` inside it, so any well-formed
 //!   identity-pool ARN for one pool untags THAT pool; an ARN that is not an identity-pool
 //!   ARN of this service is the modelled 400 `InvalidParameterException` and one naming a
-//!   pool this service does not hold is the modelled 404 `ResourceNotFoundException`.
+//!   pool this service does not hold is the modelled `ResourceNotFoundException`.
 //!
 //! The harness is `identity_pool_flow`'s: one shared engine behind the same
 //! `MultiServiceRouter` the production router builds.
@@ -544,7 +544,7 @@ async fn untag_resource_refuses_an_arn_that_names_no_identity_pool() {
 }
 
 /// RULE: a `ResourceArn` naming a pool this service does not hold — one never created, or
-/// one already deleted — is the modelled 404 `ResourceNotFoundException`.
+/// one already deleted — is the modelled `ResourceNotFoundException`.
 #[tokio::test]
 async fn untag_resource_refuses_an_arn_naming_a_pool_that_is_not_stored() {
     let emulator = Emulator::new();
@@ -578,8 +578,8 @@ async fn untag_resource_refuses_an_arn_naming_a_pool_that_is_not_stored() {
     for (case, arn) in cases {
         let (status, body) = untag_call(&emulator, &arn, &["Environment"]).await;
         assert_eq!(
-            status, 404,
-            "case {case:?} ({arn}): expected HTTP 404, got {status} with {body}"
+            status, 400,
+            "case {case:?} ({arn}): expected HTTP 400, got {status} with {body}"
         );
         assert!(
             error_code(&body).contains("ResourceNotFoundException"),

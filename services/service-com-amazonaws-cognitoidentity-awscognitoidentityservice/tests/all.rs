@@ -79,3 +79,5 @@ mod untag_resource;
 mod update_identity_pool;
 #[path = "all/vended_role_session.rs"]
 mod vended_role_session;
+#[path = "all/wire_error_envelope.rs"]
+mod wire_error_envelope;

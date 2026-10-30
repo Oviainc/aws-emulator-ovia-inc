@@ -8,7 +8,8 @@
 //! the get reports back exactly that mapping — the custom map it was given, with every key
 //! mapped to the attribute it names whatever characters either is spelled with, or the
 //! DEFAULT mapping when the call asked for the defaults instead; a pool this service does
-//! not store, and a provider nobody has mapped, are 404s; and a tag key no IAM policy could
+//! not store, and a provider nobody has mapped, are the modelled
+//! `ResourceNotFoundException`; and a tag key no IAM policy could
 //! reference is refused with HTTP 400, leaving the mapping the pair already had.
 //!
 //! The harness is `identity_pool_flow`'s: one shared engine behind the same
@@ -311,7 +312,7 @@ async fn a_mapping_belongs_to_one_pool_and_provider() {
             )
             .await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "provider {provider:?}: a deleted pool's mappings are gone with it, got {status} \
              with {body}"
         );
@@ -330,7 +331,7 @@ async fn a_mapping_belongs_to_one_pool_and_provider() {
 }
 
 /// RULE: a mapping operation names a pool this service stores, and a read names a provider
-/// some call has mapped, or it is a 404 `ResourceNotFoundException`.
+/// some call has mapped, or it is the modelled `ResourceNotFoundException`.
 #[tokio::test]
 async fn a_mapping_that_is_not_stored_is_not_found() {
     let emulator = Emulator::new();
@@ -391,8 +392,8 @@ async fn a_mapping_that_is_not_stored_is_not_found() {
     for (case, operation, request) in cases {
         let (status, body) = emulator.call(operation, &request).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404, got {status} with {body}"
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body}"
         );
         assert!(
             error_code(&body).contains("ResourceNotFoundException"),
@@ -505,8 +506,12 @@ async fn a_map_past_the_modelled_maximum_is_refused() {
         )
         .await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "fifty-one tags: the refused mapping is not stored, got {status} with {body}"
+    );
+    assert!(
+        error_code(&body).contains("ResourceNotFoundException"),
+        "fifty-one tags: the refused mapping is not stored, got {body}"
     );
 }
 
@@ -739,9 +744,13 @@ async fn a_pool_holds_a_bounded_number_of_provider_mappings() {
         )
         .await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "a provider past the ceiling: the refused mapping is not stored, got {status} with \
          {body}"
+    );
+    assert!(
+        error_code(&body).contains("ResourceNotFoundException"),
+        "a provider past the ceiling: the refused mapping is not stored, got {body}"
     );
 
     // Replacing a mapping the pool already holds grows nothing, so it is never refused.
@@ -810,11 +819,17 @@ async fn an_invalid_request_is_refused_before_the_pool_is_looked_up() {
                 "case {case:?} on {pool_case}: expected HTTP 400 for the invalid request, got \
                  {status} with {body}"
             );
+            assert!(
+                !error_code(&body).contains("ResourceNotFoundException"),
+                "case {case:?} on {pool_case}: expected the request's own invalidity to be \
+                 reported rather than the pool's absence, got {body}"
+            );
         }
     }
 
-    // A well-formed request naming a pool that is not stored is the 404 instead: it is the
-    // request's validity, not the operation, that decides which refusal comes first.
+    // A well-formed request naming a pool that is not stored reports the pool's absence
+    // instead: it is the request's validity, not the operation, that decides which refusal
+    // comes first.
     let (status, body) = emulator
         .call(
             "SetPrincipalTagAttributeMap",
@@ -822,9 +837,14 @@ async fn an_invalid_request_is_refused_before_the_pool_is_looked_up() {
         )
         .await;
     assert_eq!(
-        status, 404,
-        "a well-formed request on a pool that is not stored: expected HTTP 404, got {status} \
+        status, 400,
+        "a well-formed request on a pool that is not stored: expected HTTP 400, got {status} \
          with {body}"
+    );
+    assert!(
+        error_code(&body).contains("ResourceNotFoundException"),
+        "a well-formed request on a pool that is not stored: expected the pool's absence to be \
+         reported, got {body}"
     );
 }
 

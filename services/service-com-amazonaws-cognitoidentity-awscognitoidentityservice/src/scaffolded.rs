@@ -249,13 +249,52 @@ impl SerializableStruct for AccessDeniedException {
     }
 }
 
+/// The HTTP status this service puts on the wire for a refusal that says the resource the
+/// request names does not exist.
+///
+/// This service speaks `awsJson1_1` (see `OPERATIONS.md`), whose envelope discriminates a
+/// failure by the error TYPE in the body (`__type`) and not by the transport status, and
+/// whose 404 belongs to the transport: it is what an `awsJson` endpoint answers a request
+/// that addressed no operation at all. So a modelled "no such resource" refusal of this
+/// service travels with the ordinary client-error status instead, which is what its
+/// recorded responses carry — a pool id no pool has answers HTTP 400 with
+/// `ResourceNotFoundException` — and it is the status its boundary validator already
+/// refuses a malformed request with, so a handler-returned client error and a boundary
+/// refusal agree.
+pub const CLIENT_ERROR_STATUS: u16 = 400;
+
+/// The status the shape annotation [`wire_status`] rewrites: the one 4xx an `awsJson`
+/// transport claims for itself.
+const TRANSPORT_NOT_FOUND_STATUS: u16 = 404;
+
+/// The status a modeled error travels with on this service's wire, given the `@httpError`
+/// status its shape is annotated with.
+///
+/// A client error annotated [`TRANSPORT_NOT_FOUND_STATUS`] — `ResourceNotFoundException`,
+/// the only shape of this model that carries it — collapses onto
+/// [`CLIENT_ERROR_STATUS`], because a client classifying by HTTP status would otherwise
+/// read a transport or routing failure where the service reported a modelled API error.
+/// Every other status is left exactly as the model annotates it, so the refusals this
+/// service does answer with their own status — a 403 for a caller it does not authorize, a
+/// 409 for a login already claimed, a 5xx server fault — keep it, and a retry classifier
+/// still tells a server fault from a client one.
+pub fn wire_status(modeled_status: u16) -> u16 {
+    if modeled_status == TRANSPORT_NOT_FOUND_STATUS {
+        CLIENT_ERROR_STATUS
+    } else {
+        modeled_status
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
 pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
-    /// A modeled error the operation declares. Renders with the model's own status.
+    /// A modeled error the operation declares. Renders with the status [`wire_status`]
+    /// gives it — this service's client-error status for a shape the model annotates with
+    /// the transport's 404, the shape's own status otherwise.
     Modeled(E),
     /// The caller's identity-based policies do not allow this operation's action on what
     /// the request names. Renders at [`ACCESS_DENIED_STATUS`] with the error code
@@ -266,16 +305,12 @@ pub enum Scaffolded<E> {
     /// answered by [`crate::state::authorization`], the one gate every
     /// developer-credentials operation of this service consults.
     AccessDenied(AccessDeniedException),
-    /// The request was refused as invalid. Renders as HTTP 400 with the error code
-    /// `ValidationException`.
+    /// The request was refused as invalid. Renders as [`CLIENT_ERROR_STATUS`] with the
+    /// error code `ValidationException`.
     ///
-    /// On the JSON and CBOR protocols that is the same status and code the boundary
-    /// validator answers with. Two differences are worth knowing, and neither is
-    /// specific to this variant — every handler-returned error shares them:
-    /// the awsJson families omit the `x-amzn-errortype` header that the boundary
-    /// path sets, and the query protocols render a boundary refusal as
-    /// `MalformedQueryString` rather than `ValidationException`, so a client
-    /// matching on the error code there sees two codes for one logical failure.
+    /// That is the same status and code the boundary validator answers with, and
+    /// `crate::service::error_type_header` names the shape in `x-amzn-errortype` on either,
+    /// so a handler-returned refusal and a boundary one are indistinguishable to a client.
     ValidationException(ValidationException),
 }
 
@@ -285,7 +320,7 @@ impl<E> Scaffolded<E> {
         Self::NotImplemented(NotImplemented::new(operation))
     }
 
-    /// Refuse the request as invalid, with HTTP 400 `ValidationException`.
+    /// Refuse the request as invalid, with [`CLIENT_ERROR_STATUS`] `ValidationException`.
     ///
     /// Reach for this when the request is wrong in a way the model cannot express,
     /// so the boundary validator passed it: a value outside a rule the service
@@ -373,16 +408,19 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         }
     }
 
-    /// 501 for the scaffold signal.
+    /// 501 for the scaffold signal, and [`wire_status`] for a modeled error.
     ///
     /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
-    /// retryable, so a client would retry an operation that can never succeed.
+    /// retryable, so a client would retry an operation that can never succeed. A modeled
+    /// error goes through [`wire_status`], which puts a refusal the model annotates with
+    /// the transport's 404 on this service's own [`CLIENT_ERROR_STATUS`]; every other
+    /// modelled status is the model's.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
+            Self::Modeled(e) => wire_status(e.http_status()),
             Self::AccessDenied(_) => ACCESS_DENIED_STATUS,
-            Self::ValidationException(_) => 400,
+            Self::ValidationException(_) => CLIENT_ERROR_STATUS,
         }
     }
 

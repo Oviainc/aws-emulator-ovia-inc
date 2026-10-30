@@ -12,7 +12,7 @@
 //! * a page carries at most `MaxResults` identifiers in a stable order and resumes where
 //!   the previous page ended, with no token on the last page;
 //! * a pair the mapping does not verify is a 409 `ResourceConflictException`, a resource
-//!   this service does not hold is a 404 `ResourceNotFoundException`, an identifier the
+//!   this service does not hold is the modelled `ResourceNotFoundException`, an identifier the
 //!   pool holds no mapping for, an identity of ANOTHER pool and an identity every login has
 //!   been taken off (a DISABLED one, which no provider's user reaches any more) are all a 403
 //!   `NotAuthorizedException` — the pair is verified first, so a request supplying both values
@@ -377,13 +377,13 @@ async fn a_request_the_mapping_cannot_answer_is_refused() {
         (
             "a pool this service does not hold",
             lookup_request(ABSENT_POOL_ID, None, Some("user-1"), None, None),
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (
             "an identity nothing ever minted",
             lookup_request(&pool_id, Some(ABSENT_IDENTITY_ID), None, None, None),
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (

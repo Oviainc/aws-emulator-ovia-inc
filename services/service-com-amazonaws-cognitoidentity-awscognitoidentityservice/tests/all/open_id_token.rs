@@ -17,7 +17,8 @@
 //!   the same way;
 //! * the logins presented are additional logins OF that identity, persisted, so a later
 //!   `GetId` presenting one resolves to the same identity and a reader reports it;
-//! * an identity this service does not hold (404), a login the identity's pool does not
+//! * an identity this service does not hold (the modelled `ResourceNotFoundException`), a
+//!   login the identity's pool does not
 //!   accept (403) and a login already linked to another identity (409) are each refused
 //!   and change nothing.
 //!
@@ -358,14 +359,14 @@ async fn a_call_this_service_cannot_serve_is_refused_and_changes_nothing() {
             "an identity this service never minted",
             ABSENT_IDENTITY_ID,
             vec![],
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (
             "an absent identity presenting a login",
             ABSENT_IDENTITY_ID,
             vec![("graph.facebook.com", "a-facebook-access-token")],
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (

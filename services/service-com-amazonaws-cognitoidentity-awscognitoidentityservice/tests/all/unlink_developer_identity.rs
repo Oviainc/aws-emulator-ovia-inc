@@ -18,7 +18,8 @@
 //!   `NotAuthorizedException`,
 //!   one naming a mapping held against another identity is a 409
 //!   `ResourceConflictException`, one naming a pool or an identity this service does not
-//!   hold is a 404 `ResourceNotFoundException`, one naming an identity of ANOTHER pool is a
+//!   hold is the modelled `ResourceNotFoundException`, one naming an identity of ANOTHER
+//!   pool is a
 //!   403 `NotAuthorizedException`, and a value outside a constraint the MODEL states is
 //!   refused ahead of the operation with a 400 `ValidationException` — and every refusal
 //!   writes nothing;
@@ -484,7 +485,7 @@ async fn a_call_the_mapping_cannot_act_on_is_refused() {
                 Some(developer_provider),
                 Some("user-1"),
             ),
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (
@@ -495,7 +496,7 @@ async fn a_call_the_mapping_cannot_act_on_is_refused() {
                 Some(developer_provider),
                 Some("user-1"),
             ),
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (

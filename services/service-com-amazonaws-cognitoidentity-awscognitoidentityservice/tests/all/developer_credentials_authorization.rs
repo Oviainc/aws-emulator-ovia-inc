@@ -685,7 +685,7 @@ async fn the_refusal_of_a_delete_is_the_authorization_boundary() {
         let (status, body) = emulator.call(ACCOUNT_KEY, operation, &request).await;
         assert_eq!(
             (status, code_of(&body).as_str()),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
             "case {operation:?}: a deleted pool is not found, got {status} with {body}"
         );
         assert_eq!(
@@ -1124,8 +1124,9 @@ async fn describe_identity_is_authorized_on_the_pool_its_identity_belongs_to() {
         }
     }
 
-    // The 404 the refusal above withheld: a caller the decision DOES allow reaches the read
-    // itself, where an identity this service does not hold is the modelled not-found.
+    // The not-found the refusal above withheld: a caller the decision DOES allow reaches
+    // the read itself, where an identity this service does not hold is the modelled
+    // not-found.
     let (status, body) = emulator
         .call(
             &account_wide.access_key_id,
@@ -1135,7 +1136,7 @@ async fn describe_identity_is_authorized_on_the_pool_its_identity_belongs_to() {
         .await;
     assert_eq!(
         (status, code_of(&body).as_str()),
-        (404, "ResourceNotFoundException"),
+        (400, "ResourceNotFoundException"),
         "case \"an allowed principal, on an identity nothing minted\": expected the modelled \
          not-found, got {status} with {body}"
     );

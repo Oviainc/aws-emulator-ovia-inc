@@ -10,7 +10,8 @@
 //! stamped with the instant the merge changed it, and reached by no developer user of the
 //! pool any more (so resolving which developer user it is is refused as access the caller
 //! does not have) — while removing the record is
-//! `DeleteIdentities`' own effect, after which a read of that id is the modelled 404
+//! `DeleteIdentities`' own effect, after which a read of that id is the modelled
+//! `ResourceNotFoundException`
 //! `ResourceNotFoundException`.
 //!
 //! Each case asserts that rule over a TABLE of inputs rather than one recorded call: the rows
@@ -357,8 +358,8 @@ async fn a_merge_leaves_the_merged_away_identity_stored_as_a_disabled_one() {
         );
 
         // Deleting the record IS what removes it, and that is the only thing that does: the
-        // read that was served a moment ago is the modelled 404 afterwards, worded as this
-        // service words a read of an identity it does not hold, while the survivor is
+        // read that was served a moment ago is the modelled not-found afterwards, worded as
+        // this service words a read of an identity it does not hold, while the survivor is
         // untouched.
         emulator
             .ok(
@@ -368,8 +369,8 @@ async fn a_merge_leaves_the_merged_away_identity_stored_as_a_disabled_one() {
             .await;
         let (status, body) = describe(&emulator, &merged_away).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected the deleted {merged_away} to be a 404, got {status} with \
+            status, 400,
+            "case {case:?}: expected the deleted {merged_away} to be refused, got {status} with \
              {body}"
         );
         let code = error_code(&body);

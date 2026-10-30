@@ -18,7 +18,8 @@
 //!   `DeveloperUserAlreadyRegisteredException`) and changes nothing;
 //! * `Logins` that names no developer provider of the pool is a bad input parameter (400
 //!   `InvalidParameterException`) and changes nothing;
-//! * a pool or an identity this service does not hold is a 404 `ResourceNotFoundException`.
+//! * a pool or an identity this service does not hold is the modelled
+//!   `ResourceNotFoundException`.
 //!
 //! The harness is `identity_pool_flow`'s: one shared engine behind the same
 //! `MultiServiceRouter` the production router builds.
@@ -595,7 +596,7 @@ async fn logins_that_name_no_developer_provider_of_the_pool_are_invalid() {
 }
 
 /// RULE: the call names two resources — the pool and, optionally, the identity — and one
-/// this service does not hold is a 404 `ResourceNotFoundException`.
+/// this service does not hold is the modelled `ResourceNotFoundException`.
 #[tokio::test]
 async fn a_pool_or_identity_this_service_does_not_hold_is_not_found() {
     let emulator = Emulator::new();
@@ -639,8 +640,8 @@ async fn a_pool_or_identity_this_service_does_not_hold_is_not_found() {
     for (case, request) in cases {
         let (status, body) = emulator.call(OPERATION, &request).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404, got {status} with {body}"
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body}"
         );
         assert_eq!(
             error_code(&body),

@@ -6,7 +6,8 @@
 //! mappings. A pool with no role of either kind — one nobody set roles for, or one whose
 //! last call stored none — has no role configuration to report, so the optional `Roles`
 //! and `RoleMappings` members are left out of the 200 rather than written as empty maps;
-//! that is not a missing pool, while a pool this service does not store is a 404.
+//! that is not a missing pool, while a pool this service does not store is the modelled
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!

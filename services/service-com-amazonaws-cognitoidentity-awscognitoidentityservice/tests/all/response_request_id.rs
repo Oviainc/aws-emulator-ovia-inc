@@ -47,8 +47,11 @@ const EMULATOR_HOST: &str = "127.0.0.1:9297";
 /// How a call is credentialed. This service's credential exchange (`GetId`,
 /// `GetOpenIdToken`, `GetCredentialsForIdentity`) is modelled anonymous and is called
 /// before the client holds any credential, so both forms have to be covered.
+///
+/// `pub(crate)` so a sibling suite in this test target that asserts on response HEADERS
+/// drives the service through this harness rather than a second copy of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Caller {
+pub(crate) enum Caller {
     /// A SigV4-signed call, as the SDK sends every credentialed operation.
     Signed,
     /// An unsigned call, as the SDK sends the credential exchange.
@@ -56,14 +59,15 @@ enum Caller {
 }
 
 /// One emulator holding this service, reached exactly as the production router reaches it.
-struct Emulator {
+/// `pub(crate)` for the same reason as [`Caller`].
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
     /// A router with this service mounted, with request authentication off (the default
     /// for a test) or on (how the emulator serves traffic for real).
-    fn new(authenticating: bool) -> Self {
+    pub(crate) fn new(authenticating: bool) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(engine));
@@ -72,7 +76,7 @@ impl Emulator {
     }
 
     /// Call `operation` with `body` and answer the WHOLE response, headers included.
-    async fn dispatch(
+    pub(crate) async fn dispatch(
         &self,
         caller: Caller,
         operation: &str,
@@ -113,7 +117,7 @@ impl Emulator {
     }
 
     /// Call a signed operation that must succeed, answering its parsed output.
-    async fn ok(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: &Value) -> Value {
         let response = self.dispatch(Caller::Signed, operation, body).await;
         let status = response.status().as_u16();
         let bytes = response.into_body();
@@ -273,14 +277,14 @@ async fn every_response_names_the_request_it_answers() {
             Caller::Signed,
             "DescribeIdentityPool",
             json!({ "IdentityPoolId": ABSENT_POOL_ID }),
-            Some(404),
+            Some(400),
         ),
         (
             "a handler-returned modelled error on an unsigned call",
             Caller::Anonymous,
             "GetId",
             json!({ "IdentityPoolId": ABSENT_POOL_ID }),
-            Some(404),
+            Some(400),
         ),
         (
             "a constraint refusal raised before any handler ran: a required member absent",

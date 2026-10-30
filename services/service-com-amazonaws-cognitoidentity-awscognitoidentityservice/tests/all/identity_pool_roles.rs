@@ -9,7 +9,7 @@
 //! `GetIdentityPoolRoles` reports back exactly that; a configuration naming something
 //! other than an IAM role, or a role mapping missing what the model documents as
 //! required for its `Type`, is refused and changes nothing; and a pool this service does
-//! not store is a 404.
+//! not store is the modelled `ResourceNotFoundException`.
 //!
 //! The harness is `identity_pool_flow`'s: one shared engine behind the same
 //! `MultiServiceRouter` the production router builds.
@@ -190,8 +190,8 @@ async fn get_identity_pool_roles_reports_what_the_last_set_stored() {
 }
 
 /// RULE: a stored pool nobody set roles for has NO role configuration — which is a 200
-/// naming the pool and carrying neither optional member, not a 404 and not a role it was
-/// never given.
+/// naming the pool and carrying neither optional member, not a not-found and not a role it
+/// was never given.
 #[tokio::test]
 async fn a_pool_nobody_set_roles_for_reports_no_role_configuration() {
     let emulator = Emulator::new();
@@ -257,7 +257,7 @@ async fn roles_belong_to_one_pool() {
         .call("GetIdentityPoolRoles", &json!({"IdentityPoolId": &pools[0]}))
         .await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "a deleted pool's roles are gone with it, got {status} with {body}"
     );
     let got = emulator
@@ -270,7 +270,7 @@ async fn roles_belong_to_one_pool() {
     );
 }
 
-/// RULE: a role operation names a pool this service stores, or it is a 404
+/// RULE: a role operation names a pool this service stores, or it is the modelled
 /// `ResourceNotFoundException` — for the write as much as for the read.
 #[tokio::test]
 async fn roles_of_a_pool_that_is_not_stored_are_not_found() {
@@ -314,8 +314,8 @@ async fn roles_of_a_pool_that_is_not_stored_are_not_found() {
         ] {
             let (status, body) = emulator.call(operation, &request).await;
             assert_eq!(
-                status, 404,
-                "case {case:?} on {pool_id}: expected HTTP 404, got {status} with {body}"
+                status, 400,
+                "case {case:?} on {pool_id}: expected HTTP 400, got {status} with {body}"
             );
             assert!(
                 error_code(&body).contains("ResourceNotFoundException"),

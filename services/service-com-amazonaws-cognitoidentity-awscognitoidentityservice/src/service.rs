@@ -66,7 +66,18 @@
 //!
 //! Nothing else about a response changes: the status, the other headers and every byte
 //! of the body stay as the renderer wrote them.
+//!
+//! ## Naming the exception a failure is refused with
+//!
+//! Every failure AWS answers for this service names its exception shape in the
+//! `x-amzn-errortype` header as well as in the body, and the framework's `awsJson`
+//! renderers write the body alone. [`error_type_header`] owns that header, at the same two
+//! layers and wrapped around the same two request-id reporters, so one response names both
+//! the request it answers and the exception it answers with.
 
+pub mod error_type_header;
+
+use error_type_header::{ErrorTypeHeaderDefinition, ErrorTypeHeaderOperation};
 use service_common::query_error_envelope::{RequestIdEnvelopeDefinition, RequestIdHeaderOperation};
 use smithy_server_runtime::{
     http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service, Violation,
@@ -81,12 +92,13 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The generated entry, with its three framework-level error renderers wrapped so a
-    /// response no operation produced still names the request it answers.
-    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
+    /// response no operation produced still names the request it answers and the exception
+    /// it is refused with.
+    entry: ErrorTypeHeaderDefinition<RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>>,
     /// Serves every modelled operation, so each response an operation produced names the
-    /// request it answers. Held, not built per request: `override_operation` hands back a
-    /// borrow of it.
-    request_id: RequestIdHeaderOperation,
+    /// request it answers and, when it is a failure, the exception shape it names in its
+    /// body. Held, not built per request: `override_operation` hands back a borrow of it.
+    request_id: ErrorTypeHeaderOperation<RequestIdHeaderOperation>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -95,8 +107,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(engine)),
-            request_id: RequestIdHeaderOperation,
+            entry: ErrorTypeHeaderDefinition::new(RequestIdEnvelopeDefinition::header_only(
+                crate::ServiceDefinition::new(engine),
+            )),
+            request_id: ErrorTypeHeaderOperation::new(RequestIdHeaderOperation),
         }
     }
 }
@@ -106,9 +120,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
         // The router reads it through this one accessor. Do not edit the entry: what
-        // is handed back is the shared `RequestIdEnvelopeDefinition`, which reads
-        // identity, protocol and the routing table straight off that entry and adds
-        // the request-id header to the three error renderers (see the module docs).
+        // is handed back is the shared `RequestIdEnvelopeDefinition` under this
+        // service's `ErrorTypeHeaderDefinition`, which read identity, protocol and
+        // the routing table straight off that entry and add the request-id and
+        // error-type headers to the three error renderers (see the module docs).
         &self.entry
     }
 
@@ -154,6 +169,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // own, so the modelled operation's still decide and this service's anonymous
         // credential exchange stays anonymous.
         self.entry
+            .inner()
             .routes(req)
             .then_some(&self.request_id as &dyn ErasedOperation)
     }

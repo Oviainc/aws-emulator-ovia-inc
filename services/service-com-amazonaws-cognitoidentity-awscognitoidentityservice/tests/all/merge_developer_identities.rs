@@ -16,7 +16,8 @@
 //! * the call's effect is idempotent — repeating it answers the same identity and changes
 //!   nothing, because the two identifiers are one user by then;
 //! * a call the pool cannot act on is refused with the modelled error for what is wrong with
-//!   it and writes nothing: a pool this service does not hold is a 404, a developer user
+//!   it and writes nothing: a pool this service does not hold is the modelled
+//!   `ResourceNotFoundException`, a developer user
 //!   identifier the pool has not registered (or a developer provider that is not the pool's)
 //!   is a 403, two users reached through one public provider are a 409, a pair whose linked
 //!   logins together pass the service's documented limit is a 400 `InvalidParameterException`,
@@ -527,7 +528,7 @@ async fn a_merge_the_pool_cannot_act_on_is_refused_and_writes_nothing() {
         (
             "a pool this service does not hold",
             Broken::AbsentPool,
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (

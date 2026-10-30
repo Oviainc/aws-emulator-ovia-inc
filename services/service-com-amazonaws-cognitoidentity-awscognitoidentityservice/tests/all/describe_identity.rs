@@ -7,7 +7,7 @@
 //! was minted, the instant it last changed and the login providers it is linked to, the
 //! very record a listing of its pool reports for it — and changes nothing, so two reads
 //! answer alike and a read is never what moves the identity's last-modified instant. An
-//! identity this service does not hold is the modelled 404 `ResourceNotFoundException`.
+//! identity this service does not hold is the modelled `ResourceNotFoundException`.
 //!
 //! The rows differ along what the rule generalises over: how the identity came to be (an
 //! unauthenticated `GetId`, a federated one, one that gained a provider through the
@@ -195,10 +195,11 @@ async fn a_describe_reports_the_stored_identity_and_changes_nothing() {
     }
 }
 
-/// RULE: an identity this service does not hold is the modelled 404, and the identities it
-/// does hold are untouched by that refusal.
+/// RULE: an identity this service does not hold is the modelled
+/// `ResourceNotFoundException`, and the identities it does hold are untouched by that
+/// refusal.
 #[tokio::test]
-async fn an_identity_this_service_does_not_hold_is_a_404() {
+async fn an_identity_this_service_does_not_hold_is_not_found() {
     let emulator = Emulator::new();
     let pool_id = pool(&emulator, "described-absent").await;
     let held = emulator.identity(&pool_id, None).await;
@@ -215,8 +216,8 @@ async fn an_identity_this_service_does_not_hold_is_a_404() {
     ] {
         let (status, body) = describe(&emulator, identity_id).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404, got {status} with {body}"
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body}"
         );
         let code = error_code(&body);
         assert!(

@@ -8,7 +8,8 @@
 //! Every case asserts a RULE over a table of inputs rather than one recorded call:
 //! what `CreateIdentityPool` stores is what `DescribeIdentityPool` reports, `GetId` is
 //! idempotent per federated login, credentials belong to one identity, a page resumes
-//! where the previous one ended, and a resource that is not stored is a 404.
+//! where the previous one ended, and a resource that is not stored is the modelled
+//! `ResourceNotFoundException`.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -1084,7 +1085,7 @@ async fn minted_ids_are_distinct_and_well_formed() {
     }
 }
 
-/// RULE: an operation naming a resource this service does not hold answers 404
+/// RULE: an operation naming a resource this service does not hold answers the modelled
 /// `ResourceNotFoundException` — for every operation that names one.
 #[tokio::test]
 async fn an_unknown_resource_is_not_found() {
@@ -1112,8 +1113,8 @@ async fn an_unknown_resource_is_not_found() {
     for (operation, request) in cases {
         let (status, body) = emulator.call(operation, &request).await;
         assert_eq!(
-            status, 404,
-            "operation {operation}: expected HTTP 404 for an absent resource, got {status} with {body}"
+            status, 400,
+            "operation {operation}: expected HTTP 400 for an absent resource, got {status} with {body}"
         );
         assert!(
             error_code(&body).contains("ResourceNotFoundException"),
@@ -1181,8 +1182,13 @@ async fn an_id_outside_its_modelled_constraint_is_a_validation_error() {
         )
         .await;
     assert_eq!(
-        status, 404,
-        "an id at the maximum modelled length ({at_max_length}) expected HTTP 404, got {status} with {body}"
+        status, 400,
+        "an id at the maximum modelled length ({at_max_length}) expected HTTP 400, got {status} with {body}"
+    );
+    assert!(
+        error_code(&body).contains("ResourceNotFoundException"),
+        "an id at the maximum modelled length ({at_max_length}) expected the resource to be \
+         looked up and not found, got {body}"
     );
 }
 
@@ -1218,8 +1224,8 @@ async fn deleting_a_pool_removes_it_with_its_identities() {
     for (operation, request) in gone {
         let (status, body) = emulator.call(operation, &request).await;
         assert_eq!(
-            status, 404,
-            "operation {operation} after the delete: expected HTTP 404, got {status} with {body}"
+            status, 400,
+            "operation {operation} after the delete: expected HTTP 400, got {status} with {body}"
         );
         assert!(
             error_code(&body).contains("ResourceNotFoundException"),

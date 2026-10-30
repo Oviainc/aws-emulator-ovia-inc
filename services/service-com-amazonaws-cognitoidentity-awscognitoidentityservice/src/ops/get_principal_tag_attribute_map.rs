@@ -7,7 +7,7 @@
 //! from which user attribute.
 //!
 //! A pool this service does not store, and a provider of a stored pool nobody has set a
-//! mapping for, are both `ResourceNotFoundException` (HTTP 404): the mapping is a resource
+//! mapping for, are both `ResourceNotFoundException`: the mapping is a resource
 //! of the `(IdentityPoolId, IdentityProviderName)` pair, and until a call writes one there
 //! is no mapping to list.
 //!
@@ -247,7 +247,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetPrincipalTagAt
     }
 }
 
-/// The modelled refusal for a resource this service does not hold (HTTP 404), naming what
+/// The modelled refusal for a resource this service does not hold (see
+/// [`crate::scaffolded::wire_status`] for the status it travels with), naming what
 /// was not found.
 fn not_found(message: String) -> GetPrincipalTagAttributeMapError {
     GetPrincipalTagAttributeMapErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
