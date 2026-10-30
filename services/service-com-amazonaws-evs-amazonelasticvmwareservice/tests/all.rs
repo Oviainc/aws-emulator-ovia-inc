@@ -17,6 +17,8 @@ mod account_settings;
 mod authorization;
 #[path = "all/check_impairment_onset.rs"]
 mod check_impairment_onset;
+#[path = "all/child_record_create_stamp.rs"]
+mod child_record_create_stamp;
 #[path = "all/connector_appliance_fqdn_case.rs"]
 mod connector_appliance_fqdn_case;
 #[path = "all/connector_create_while_deleting.rs"]

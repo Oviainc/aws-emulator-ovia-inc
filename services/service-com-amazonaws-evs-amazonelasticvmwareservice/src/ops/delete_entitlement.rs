@@ -207,16 +207,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(denied);
         }
-        // The instant tracking stops, read once so every record this call stops carries
-        // the same `stoppedAt`.
-        let stopped_at_ms = crate::state::now_ms();
-
         let mut state = state.lock();
         // Reporting only: this materialises the state changes the clock already owed,
         // which were due whether or not anybody called, so the environment and its
         // entitlements are in the state that is due at this instant before the delete is
         // evaluated.
         state.materialise_due_transitions();
+        // The instant tracking stops, read once so every record this call stops carries
+        // the same `stoppedAt` and the environment that holds them is stamped with it.
+        // Read with the store lock HELD and after the materialisation above: tracking
+        // stops at this instant, not at the one the request arrived at, so the stamp
+        // cannot predate a transition the same call just materialised onto the environment
+        // and its VLANs — and the re-stamp of the environment below is not dropped by the
+        // guard that keeps a stamp from going backwards.
+        let stopped_at_ms = crate::state::now_ms();
 
         // The environment this call addresses, resolved through the rule every handler
         // that acts on an environment shares (`live_environment_in_region_mut`): an

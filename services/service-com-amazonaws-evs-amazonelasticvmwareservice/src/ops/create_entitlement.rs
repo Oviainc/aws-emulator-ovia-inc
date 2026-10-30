@@ -200,13 +200,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(denied);
         }
-        let created_at_ms = crate::state::now_ms();
-
         let mut state = state.lock();
         // Reporting only: this materialises the state changes the clock already owed,
         // which were due whether or not anybody called, so the environment is in the
         // state that is due at this instant before the create is evaluated.
         state.materialise_due_transitions();
+        // One instant for everything this call changes, so the new entitlement records and
+        // the environment that holds them are stamped alike. Read with the store lock HELD
+        // and after the materialisation above: the entitlements are added at this instant,
+        // not at the one the request arrived at, so their stamp cannot predate a transition
+        // the same call just materialised onto the environment and its VLANs — and the
+        // re-stamp of the environment below is not dropped by the guard that keeps a stamp
+        // from going backwards.
+        let created_at_ms = crate::state::now_ms();
 
         // The environment this create addresses, resolved through the rule every handler
         // that acts on an environment shares (`live_environment_in_region_mut`): an

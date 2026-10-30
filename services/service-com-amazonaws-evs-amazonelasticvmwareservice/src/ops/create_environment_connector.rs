@@ -246,14 +246,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &input.secret_identifier,
         );
-        let created_at_ms = crate::state::now_ms();
-
         let mut state = state.lock();
         // Reporting only: this materialises the state changes the clock already owed,
         // which were due whether or not anybody called, so the environment and its
         // connectors are in the state that is due at this instant before the create is
         // evaluated.
         state.materialise_due_transitions();
+        // One instant for everything this call changes, so the new connector record and
+        // the environment whose inventory it joins are stamped alike. Read with the store
+        // lock HELD and after the materialisation above: the connector is added at this
+        // instant, not at the one the request arrived at, so its stamp cannot predate a
+        // transition the same call just materialised onto the environment and its VLANs —
+        // and the re-stamp of the environment below is not dropped by the guard that keeps
+        // a stamp from going backwards.
+        let created_at_ms = crate::state::now_ms();
         let connector_id = state.mint_connector_id();
 
         // The environment this create addresses, resolved through the rule every handler

@@ -69,7 +69,7 @@ const TAG_VALUE: &str = "platform";
 /// past the instant the record's transition is due
 /// ([`evs::state::TRANSITION_DELAY`], the span this service owes a transition in),
 /// so the transition is the call's to materialise.
-fn held_for() -> Duration {
+pub(crate) fn held_for() -> Duration {
     evs::state::TRANSITION_DELAY + Duration::from_millis(200)
 }
 
@@ -199,12 +199,12 @@ async fn prepare(router: &Emulator, case: &str, index: usize, change: Change) ->
 /// When the transition a record created at `created_ms` is owed comes due: the span this
 /// service owes a transition in, from the instant the record was created
 /// ([`evs::state::TRANSITION_DELAY`]).
-fn due_from(created_ms: i64) -> i64 {
+pub(crate) fn due_from(created_ms: i64) -> i64 {
     created_ms + evs::state::TRANSITION_DELAY.as_millis() as i64
 }
 
 /// One required member of a response, as a string.
-fn member(case: &str, record: &Value, name: &str) -> String {
+pub(crate) fn member(case: &str, record: &Value, name: &str) -> String {
     record[name]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: no {name} in {record}"))
@@ -292,7 +292,7 @@ fn stored_stamp(router: &Emulator, case: &str, subject: &Subject) -> i64 {
 }
 
 /// The `modifiedAt` the store holds for one environment, in epoch milliseconds.
-fn environment_stamp(router: &Emulator, case: &str, environment_id: &str) -> i64 {
+pub(crate) fn environment_stamp(router: &Emulator, case: &str, environment_id: &str) -> i64 {
     let state = evs::state::service_state(&*router.engine)
         .expect("the in-memory engine carries this service's store");
     let store = state.lock();
@@ -404,7 +404,7 @@ async fn listed_stamp(
 
 /// A timestamp the wire carries (epoch seconds) in the epoch milliseconds the store holds
 /// it as.
-fn wire_ms(case: &str, label: &str, value: &Value) -> i64 {
+pub(crate) fn wire_ms(case: &str, label: &str, value: &Value) -> i64 {
     let seconds = value
         .as_f64()
         .unwrap_or_else(|| panic!("case {case:?}: {label} carries no timestamp, got {value}"));
