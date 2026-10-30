@@ -99,6 +99,8 @@ mod rule_fan_out_and_target_repointing;
 mod rule_invocation_metrics;
 #[path = "all/rule_lifecycle.rs"]
 mod rule_lifecycle;
+#[path = "all/rule_match_metrics.rs"]
+mod rule_match_metrics;
 #[path = "all/rule_state_control.rs"]
 mod rule_state_control;
 #[path = "all/state_machine_execution_naming.rs"]

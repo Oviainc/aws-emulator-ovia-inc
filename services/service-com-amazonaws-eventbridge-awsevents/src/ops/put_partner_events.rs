@@ -308,6 +308,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deliveries.push(publication.delivery);
         }
 
+        // A partner's event is matched by the customer bus's own rules, so each
+        // match is counted on the matched rule's `MatchedEvents` and
+        // `TriggeredRules` metrics, as a publication through `PutEvents` is.
+        let cloudwatch = crate::state::cloudwatch_state(&*self.engine);
+        crate::state::count_rule_matches(cloudwatch.as_ref(), &deliveries).await;
+
         // PASS 4 — back under the lock, briefly, to append the routing log: what
         // the customer's bus did with each event the partner published.
         if !deliveries.is_empty() {

@@ -452,6 +452,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A replayed event is matched by the destination bus's rules, so each
+        // match is counted on the matched rule's `MatchedEvents` and
+        // `TriggeredRules` metrics, as a publication through `PutEvents` is.
+        crate::state::count_rule_matches(cloudwatch.as_ref(), &deliveries).await;
+
         // Back under the lock, briefly: how far the replay got is part of what
         // `DescribeReplay` reports, and the routing and invocation logs are how a
         // client observes where the replayed events went.

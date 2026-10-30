@@ -20,7 +20,9 @@
 //! [`ComAmazonawsEventbridgeAwseventsState::invocations`]. Whether EventBridge
 //! may invoke a target at all is decided against the account's OWN IAM records
 //! ([`delivery_refusal`]) and, for a publication onto an event bus, against that
-//! bus's own resource policy ([`publication_refusal`]), and what came of each
+//! bus's own resource policy ([`publication_refusal`]). Each match is counted on
+//! the matched rule's own `MatchedEvents` and `TriggeredRules` metrics
+//! ([`count_rule_matches`]) and what came of each
 //! handover is counted on the
 //! rule's own `Invocations` or `FailedInvocations` metric in the CloudWatch store
 //! ([`count_invocation`], [`count_failed_invocation`]) — both reached through the
@@ -862,13 +864,20 @@ pub const FAILED_INVOCATIONS_METRIC: &str = "FailedInvocations";
 /// The EventBridge metric counting the target invocations a rule made.
 pub const INVOCATIONS_METRIC: &str = "Invocations";
 
-/// One of the two dimensions a rule's invocation metrics are reported per: the
-/// rule whose target was invoked.
+/// The EventBridge metric counting the events a rule's `EventPattern` matched.
+pub const MATCHED_EVENTS_METRIC: &str = "MatchedEvents";
+
+/// The EventBridge metric counting the times a rule ran because an event matched
+/// it.
+pub const TRIGGERED_RULES_METRIC: &str = "TriggeredRules";
+
+/// The dimension every per-rule metric is reported per: the rule the count
+/// belongs to.
 pub const RULE_NAME_DIMENSION: &str = "RuleName";
 
-/// The other: the event bus that rule is on, without which the series would not
-/// name one rule — a rule's identity is the bus it belongs to plus its name
-/// (`rule_arn`), so two buses may each hold a rule of the same name.
+/// The dimension that narrows a rule name to ONE rule: the event bus the rule is
+/// on — a rule's identity is the bus it belongs to plus its name (`rule_arn`),
+/// so two buses may each hold a rule of the same name.
 pub const EVENT_BUS_NAME_DIMENSION: &str = "EventBusName";
 
 /// The `StandardUnit` a count of invocations is published in.
@@ -877,6 +886,15 @@ pub const METRIC_UNIT_COUNT: &str = "Count";
 /// The `StorageResolution` a standard-resolution metric is published at, in
 /// seconds: "the default is 60" (`MetricDatum$StorageResolution`).
 pub const STANDARD_STORAGE_RESOLUTION_SECONDS: i32 = 60;
+
+/// The most rule matches ONE request counts on the AWS/Events metrics.
+///
+/// This emulator's OWN bound, like [`MAX_DELIVERED_EVENTS`]: what counting costs
+/// is the (events x matched rules) PRODUCT, and both factors come from the
+/// request, so the product itself is capped rather than each factor. A request
+/// that reaches it counts no further match and says so once in the log
+/// ([`count_rule_matches`]).
+pub const MAX_COUNTED_MATCHES_PER_REQUEST: usize = 1_000;
 
 /// Largest number of target invocations the log holds.
 ///
@@ -3323,12 +3341,17 @@ pub fn cloudwatch_state<Eng: Send + Sync + 'static>(
     ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::service_state(engine)
 }
 
+/// The identity of ONE CloudWatch series, as CloudWatch's own store keys it: the
+/// namespace, the metric name and the dimension set together.
+pub type MetricSeriesKey =
+    ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::MetricKey;
+
 /// Count ONE undeliverable event on the rule's `FailedInvocations` metric.
 ///
 /// "FailedInvocations: the number of invocations that failed permanently"
 /// (EventBridge's published metrics).
 pub fn count_failed_invocation(cloudwatch: &mut CloudWatchState, bus: &str, rule: &str) {
-    count_rule_invocation(cloudwatch, FAILED_INVOCATIONS_METRIC, bus, rule);
+    count_handover(cloudwatch, FAILED_INVOCATIONS_METRIC, bus, rule);
 }
 
 /// Count ONE invocation a rule's target accepted on the rule's `Invocations`
@@ -3339,17 +3362,131 @@ pub fn count_failed_invocation(cloudwatch: &mut CloudWatchState, bus: &str, rule
 /// [`count_failed_invocation`], so a rule that is delivering and one that is
 /// failing are both visible in the same namespace.
 pub fn count_invocation(cloudwatch: &mut CloudWatchState, bus: &str, rule: &str) {
-    count_rule_invocation(cloudwatch, INVOCATIONS_METRIC, bus, rule);
+    count_handover(cloudwatch, INVOCATIONS_METRIC, bus, rule);
+}
+
+/// Count what came of ONE handover on `metric` for the rule `rule` of `bus`.
+///
+/// A handover is counted on its own, under a guard its caller holds for that one
+/// write, so the series it wrote is not carried out for a batched alarm pass the
+/// way a round of matches is ([`count_rule_matches`]): an alarm over these two
+/// counters keeps the evaluation instant it already carries, which is what these
+/// counters have done since they were introduced and is left unchanged here.
+fn count_handover(cloudwatch: &mut CloudWatchState, metric: &str, bus: &str, rule: &str) {
+    let mut written = ::std::collections::BTreeSet::new();
+    count_rule_metric(cloudwatch, metric, bus, rule, &mut written);
+}
+
+/// Count ONE event a rule's `EventPattern` matched on that rule's own
+/// `MatchedEvents` and `TriggeredRules` metrics.
+///
+/// The MATCH is what these two count, not what became of it: "MatchedEvents: the
+/// number of events that matched with any rule" and "TriggeredRules: the number
+/// of rules that have run" (EventBridge's published metrics) are both facts about
+/// routing, so a rule carrying no target at all, and one whose every delivery was
+/// refused, each count the events their pattern selected — which is what tells a
+/// rule that stopped matching apart from a target that stopped accepting
+/// ([`count_invocation`] / [`count_failed_invocation`]).
+pub fn count_rule_match(
+    cloudwatch: &mut CloudWatchState,
+    bus: &str,
+    rule: &str,
+    written: &mut ::std::collections::BTreeSet<MetricSeriesKey>,
+) {
+    count_rule_metric(cloudwatch, MATCHED_EVENTS_METRIC, bus, rule, written);
+    count_rule_metric(cloudwatch, TRIGGERED_RULES_METRIC, bus, rule, written);
+}
+
+/// Count every match the routing log `deliveries` records, on the metrics of the
+/// rule each one matched ([`count_rule_match`]).
+///
+/// The one place routing becomes telemetry, so every path that publishes an event
+/// onto a bus — a client's publication, a partner's, a forward onto another bus,
+/// an archive replayed back onto one — counts its matches the same way and under
+/// the bus the matched rule belongs to. `None` is a deployment with no CloudWatch
+/// mounted, which is nothing to count on.
+///
+/// What one call does is bounded and interruptible, because the work is the
+/// (events x matched rules) PRODUCT and both factors come from the request: at
+/// most [`MAX_COUNTED_MATCHES_PER_REQUEST`] matches are counted, the CloudWatch
+/// guard is taken and released per EVENT rather than held across the whole
+/// product, and the loop yields between events so a cancellation or a shutdown
+/// signal has somewhere to land — as the replay loop that calls this does for the
+/// same reason. The alarms watching what was written are made due in ONE pass
+/// over the DISTINCT series at the end, rather than once per datapoint: a series
+/// is the same series however many events landed in it.
+pub async fn count_rule_matches(
+    cloudwatch: Option<&::engine::ServiceState<CloudWatchState>>,
+    deliveries: &[DeliveredEvent],
+) {
+    let Some(cloudwatch) = cloudwatch else {
+        return;
+    };
+    let mut written: ::std::collections::BTreeSet<MetricSeriesKey> =
+        ::std::collections::BTreeSet::new();
+    let mut budget = MAX_COUNTED_MATCHES_PER_REQUEST;
+    for delivery in deliveries {
+        if delivery.matched_rules.is_empty() {
+            continue;
+        }
+        // One yield per event, so counting the matches of a whole batch stays
+        // interruptible however many events and rules the request matched.
+        ::tokio::task::yield_now().await;
+        let counted = delivery.matched_rules.len().min(budget);
+        // Said where the matches are DROPPED rather than on a later turn of this
+        // loop, which an exhausted budget may never reach: a count nobody can see
+        // is a count a client would read as a rule that did not match.
+        if counted < delivery.matched_rules.len() {
+            ::tracing::warn!(
+                bus = %delivery.bus,
+                event_id = %delivery.event_id,
+                bound = MAX_COUNTED_MATCHES_PER_REQUEST,
+                dropped = delivery.matched_rules.len() - counted,
+                "this request reached the emulator's bound on the rule matches one \
+                 request counts; the matches past it are not counted"
+            );
+        }
+        if counted == 0 {
+            break;
+        }
+        budget -= counted;
+        let mut store = cloudwatch.lock();
+        for rule in delivery.matched_rules.iter().take(counted) {
+            count_rule_match(&mut store, &delivery.bus, rule, &mut written);
+        }
+        drop(store);
+    }
+    if written.is_empty() {
+        return;
+    }
+    // An alarm watching one of these series is owed its evaluation from this
+    // write on, exactly as it is for a datapoint a client published: an alarm
+    // cannot tell a service's own metric from one `PutMetricData` ingested, so a
+    // rule that stopped matching is what takes such an alarm out of
+    // `INSUFFICIENT_DATA`.
+    let watched: Vec<_> = written
+        .into_iter()
+        .map(
+            |key| ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::WrittenSeries {
+                key,
+                units: vec![METRIC_UNIT_COUNT.to_string()],
+            },
+        )
+        .collect();
+    let at_secs =
+        ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::now_secs();
+    cloudwatch.lock().make_alarms_due(&watched, at_secs);
 }
 
 /// Append one observation of the value 1 to `metric` for the rule `rule` of the
 /// bus `bus`.
 ///
-/// The series is in the `AWS/Events` namespace and dimensioned by BOTH
-/// [`EVENT_BUS_NAME_DIMENSION`] and [`RULE_NAME_DIMENSION`], which is the rule's
-/// whole identity: "CloudWatch treats each unique combination of dimensions as a
-/// separate metric" (`GetMetricStatistics$Dimensions`), so a series keyed on the
-/// name alone would merge the rules of two buses into one.
+/// The series live in the `AWS/Events` namespace, and the observation is appended
+/// to EACH of the dimension sets a rule's counters are published under
+/// ([`rule_dimension_sets`]), because "CloudWatch treats each unique combination
+/// of dimensions as a separate metric" (`GetMetricStatistics$Dimensions`): a
+/// reader naming the rule's whole identity and one naming the rule alone ask for
+/// two different series, and EventBridge answers both.
 ///
 /// The datapoint is appended to the CloudWatch store directly rather than sent
 /// through `PutMetricData`: CloudWatch reserves the `AWS/` namespaces for the
@@ -3358,44 +3495,71 @@ pub fn count_invocation(cloudwatch: &mut CloudWatchState, bus: &str, rule: &str)
 /// over that API. It goes into the very store `ListMetrics` and
 /// `GetMetricStatistics` read, through CloudWatch's own bounded append, so one
 /// metric and its reader cannot disagree.
-fn count_rule_invocation(
+///
+/// Every series this appended to is collected into `written` — the identity only,
+/// so one series the whole request wrote is one entry — which is what lets a
+/// caller make the alarms watching them due in one pass instead of per datapoint.
+fn count_rule_metric(
     cloudwatch: &mut CloudWatchState,
     metric: &str,
     bus: &str,
     rule: &str,
+    written: &mut ::std::collections::BTreeSet<MetricSeriesKey>,
 ) {
     use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state as metrics;
 
-    let key = metrics::MetricKey {
-        namespace: METRIC_NAMESPACE.to_string(),
-        metric_name: metric.to_string(),
-        dimensions: [
-            (EVENT_BUS_NAME_DIMENSION.to_string(), bus.to_string()),
-            (RULE_NAME_DIMENSION.to_string(), rule.to_string()),
-        ]
-        .into_iter()
-        .collect(),
-    };
-    // One invocation: a single observation of the value 1, at standard
-    // (60-second) storage resolution, counted in `Count` — the unit the metric
-    // is published in.
-    let datum = metrics::StoredDatum {
-        timestamp_secs: metrics::now_secs(),
-        sample_count: 1.0,
-        sum: 1.0,
-        minimum: 1.0,
-        maximum: 1.0,
-        unit: Some(METRIC_UNIT_COUNT.to_string()),
-        storage_resolution: STANDARD_STORAGE_RESOLUTION_SECONDS,
-    };
-    if cloudwatch.append_datapoints(key, vec![datum]).is_err() {
-        ::tracing::warn!(
-            %bus,
-            %rule,
-            "the CloudWatch store is at capacity; an EventBridge target invocation \
-             could not be counted on {metric}"
-        );
+    for dimensions in rule_dimension_sets(bus, rule) {
+        let key = metrics::MetricKey {
+            namespace: METRIC_NAMESPACE.to_string(),
+            metric_name: metric.to_string(),
+            dimensions,
+        };
+        // One occurrence: a single observation of the value 1, at standard
+        // (60-second) storage resolution, counted in `Count` — the unit the
+        // metric is published in.
+        let datum = metrics::StoredDatum {
+            timestamp_secs: metrics::now_secs(),
+            sample_count: 1.0,
+            sum: 1.0,
+            minimum: 1.0,
+            maximum: 1.0,
+            unit: Some(METRIC_UNIT_COUNT.to_string()),
+            storage_resolution: STANDARD_STORAGE_RESOLUTION_SECONDS,
+        };
+        if cloudwatch.append_datapoints(key.clone(), vec![datum]).is_err() {
+            ::tracing::warn!(
+                %bus,
+                %rule,
+                "the CloudWatch store is at capacity; an EventBridge occurrence \
+                 could not be counted on {metric}"
+            );
+            continue;
+        }
+        written.insert(key);
     }
+}
+
+/// The dimension sets ONE per-rule series of a rule is published under: the
+/// rule's whole identity (the bus it belongs to and its name) and the rule name
+/// on its own.
+///
+/// Both are how a client reads one rule's counters: the name alone is what the
+/// metric is dimensioned by where the bus is implied, and the pair is what tells
+/// two buses' rules of the same name apart. They are separate series, so the two
+/// are published side by side rather than one standing in for the other.
+fn rule_dimension_sets(
+    bus: &str,
+    rule: &str,
+) -> [::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::DimensionSet; 2] {
+    let by_rule_name = [(RULE_NAME_DIMENSION.to_string(), rule.to_string())];
+    let whole_identity = [
+        (EVENT_BUS_NAME_DIMENSION.to_string(), bus.to_string()),
+        (RULE_NAME_DIMENSION.to_string(), rule.to_string()),
+    ];
+    [
+        whole_identity.into_iter().collect(),
+        by_rule_name.into_iter().collect(),
+    ]
 }
 
 /// The most policy documents the delivery gate reads for ONE role.

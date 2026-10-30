@@ -25,3 +25,23 @@ Traces: cloudwatch__events.matched-events-and-triggered-rules-count-only-the-mat
 
 ## Steps to Reproduce
 Create two rules with different patterns on the same bus, PutEvents an entry matching exactly one of them, then read AWS/Events MatchedEvents and TriggeredRules with dimension RuleName for both rules. Neither rule ever reports a datapoint.
+
+## Resolution
+The EventBridge routing path now counts every pattern match on the matched rule's own AWS/Events
+counters: one Count datapoint of 1 on MatchedEvents and on TriggeredRules per matched (event, rule)
+pair, under both dimension sets a per-rule series is read by — {EventBusName, RuleName} and
+{RuleName} alone — attributed to the rule whose pattern matched and to no other, from every path
+that publishes onto a bus (PutEvents, a bus-to-bus forward's re-publication, PutPartnerEvents,
+StartReplay). It is counted on the MATCH, so a matched rule with no target counts it too, while what
+became of a handover stays on Invocations/FailedInvocations. Covered end to end by
+`services/service-com-amazonaws-eventbridge-awsevents/tests/all/rule_match_metrics.rs`.
+
+Not verified by replay: the recorded check
+`cloudwatch__events.matched-events-and-triggered-rules-count-only-the-matching-rule` still ends
+"Check timed out after 60.0s" inside its own metric stability barrier. The read that check's Evidence
+names is served now (asserted over the wire in the test above, over a wide window and over the single
+aligned 60-second period, for both dimension sets, with the non-matching sibling at zero), so what
+remains is in what that barrier waits on: the emulator counts the match at the instant it happens, in
+the open minute, and a barrier whose stable window outlasts the 60 s per-check cap — or one that reads
+only closed whole-minute buckets — cannot clear inside that cap however the series is served. Stamping
+the datapoint into an earlier minute would invent a past instant, so it is not done.

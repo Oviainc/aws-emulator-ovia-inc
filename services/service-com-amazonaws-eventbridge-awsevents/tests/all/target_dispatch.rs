@@ -35,8 +35,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
     ComAmazonawsEventbridgeAwseventsState, InvocationOutcome, DEFAULT_EVENT_BUS_NAME,
-    EVENT_BUS_NAME_DIMENSION, FAILED_INVOCATIONS_METRIC, INVOCATIONS_METRIC, METRIC_NAMESPACE,
-    RULE_NAME_DIMENSION, SERVICE_PRINCIPAL,
+    EVENT_BUS_NAME_DIMENSION, FAILED_INVOCATIONS_METRIC, INVOCATIONS_METRIC, MATCHED_EVENTS_METRIC,
+    METRIC_NAMESPACE, RULE_NAME_DIMENSION, SERVICE_PRINCIPAL, TRIGGERED_RULES_METRIC,
 };
 use service_com_amazonaws_eventbridge_awsevents::EmulatedService;
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
@@ -845,13 +845,44 @@ pub(crate) async fn read_shards_until(
     }
 }
 
-/// The dimensions a rule's invocation metrics are reported under: the bus the
-/// rule is on and the rule's name.
+/// The dimensions a rule's metrics are reported under where the rule's WHOLE
+/// identity is named: the bus the rule is on and the rule's name.
 pub(crate) fn rule_dimensions(bus: &str, rule: &str) -> Value {
     json!([
         { "Name": EVENT_BUS_NAME_DIMENSION, "Value": bus },
         { "Name": RULE_NAME_DIMENSION, "Value": rule },
     ])
+}
+
+/// The other dimension set the same metrics are reported under: the rule's name
+/// on its own.
+pub(crate) fn rule_name_dimensions(rule: &str) -> Value {
+    json!([{ "Name": RULE_NAME_DIMENSION, "Value": rule }])
+}
+
+/// Every series the metrics `metrics` of the rule `rule` on `bus` are published
+/// as: each metric under the rule's whole identity AND under its name alone, so
+/// each one is two series.
+pub(crate) fn rule_series(bus: &str, rule: &str, metrics: &[&str]) -> Vec<Value> {
+    let mut series = Vec::new();
+    for metric in metrics {
+        for dimensions in [rule_dimensions(bus, rule), rule_name_dimensions(rule)] {
+            series.push(json!({
+                "Namespace": METRIC_NAMESPACE,
+                "MetricName": metric,
+                "Dimensions": dimensions,
+            }));
+        }
+    }
+    series
+}
+
+/// `series` rendered in a stable order, so a listing is compared as the SET of
+/// series it is.
+pub(crate) fn ordered(series: &[Value]) -> Vec<String> {
+    let mut rendered: Vec<String> = series.iter().map(Value::to_string).collect();
+    rendered.sort();
+    rendered
 }
 
 /// The `Sum` of `metric` for the rule `rule` of the bus `bus`, over a window
@@ -862,17 +893,52 @@ pub(crate) async fn metric_sum(
     bus: &str,
     rule: &str,
 ) -> f64 {
+    metric_sum_over(emulator, metric, &rule_dimensions(bus, rule)).await
+}
+
+/// The `Sum` of `metric` over the ONE series `dimensions` names, over a window
+/// around now, in EventBridge's own namespace.
+pub(crate) async fn metric_sum_over(
+    emulator: &Emulator,
+    metric: &str,
+    dimensions: &Value,
+) -> f64 {
     let now = epoch_seconds();
+    metric_sum_in_window(emulator, metric, dimensions, now - 300.0, now + 300.0, 600).await
+}
+
+/// The same sum read the way a client watching a LIVE series reads it: the one
+/// `Period`-wide minute ending now, so the read is aligned to the period it asks
+/// for instead of spanning a window far wider than the series.
+pub(crate) async fn metric_sum_over_last_minute(
+    emulator: &Emulator,
+    metric: &str,
+    dimensions: &Value,
+) -> f64 {
+    let now = epoch_seconds();
+    metric_sum_in_window(emulator, metric, dimensions, now - 60.0, now, 60).await
+}
+
+/// The `Sum` of `metric` for the series `dimensions` names over
+/// `[start, end)`, folded into `period`-wide windows.
+async fn metric_sum_in_window(
+    emulator: &Emulator,
+    metric: &str,
+    dimensions: &Value,
+    start: f64,
+    end: f64,
+    period: i64,
+) -> f64 {
     let (status, stats) = cloudwatch(
         emulator,
         "GetMetricStatistics",
         &json!({
             "Namespace": METRIC_NAMESPACE,
             "MetricName": metric,
-            "Dimensions": rule_dimensions(bus, rule),
-            "StartTime": now - 300.0,
-            "EndTime": now + 300.0,
-            "Period": 600,
+            "Dimensions": dimensions,
+            "StartTime": start,
+            "EndTime": end,
+            "Period": period,
             "Statistics": ["Sum"],
         }),
     )
@@ -1059,13 +1125,18 @@ async fn a_delivery_the_targets_role_bars_is_dead_lettered_and_counted() {
                     row.case
                 );
                 assert_eq!(
-                    series,
-                    vec![json!({
-                        "Namespace": METRIC_NAMESPACE,
-                        "MetricName": INVOCATIONS_METRIC,
-                        "Dimensions": rule_dimensions(DEFAULT_EVENT_BUS_NAME, "guarded"),
-                    })],
-                    "case {:?}: expected the rule's own Invocations series, got {series:?}",
+                    ordered(&series),
+                    ordered(&rule_series(
+                        DEFAULT_EVENT_BUS_NAME,
+                        "guarded",
+                        &[
+                            INVOCATIONS_METRIC,
+                            MATCHED_EVENTS_METRIC,
+                            TRIGGERED_RULES_METRIC,
+                        ],
+                    )),
+                    "case {:?}: expected the rule's own match and Invocations series, \
+                     got {series:?}",
                     row.case
                 );
                 let delivered = observe.read(&emulator).await;
@@ -1143,13 +1214,18 @@ async fn a_delivery_the_targets_role_bars_is_dead_lettered_and_counted() {
                     row.case
                 );
                 assert_eq!(
-                    series,
-                    vec![json!({
-                        "Namespace": METRIC_NAMESPACE,
-                        "MetricName": FAILED_INVOCATIONS_METRIC,
-                        "Dimensions": rule_dimensions(DEFAULT_EVENT_BUS_NAME, "guarded"),
-                    })],
-                    "case {:?}: expected the rule's own FailedInvocations series, got {series:?}",
+                    ordered(&series),
+                    ordered(&rule_series(
+                        DEFAULT_EVENT_BUS_NAME,
+                        "guarded",
+                        &[
+                            FAILED_INVOCATIONS_METRIC,
+                            MATCHED_EVENTS_METRIC,
+                            TRIGGERED_RULES_METRIC,
+                        ],
+                    )),
+                    "case {:?}: expected the rule's own match and FailedInvocations series, \
+                     got {series:?}",
                     row.case
                 );
                 if row.kind == Kind::StateMachine {

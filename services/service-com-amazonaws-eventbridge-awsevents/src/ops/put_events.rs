@@ -394,6 +394,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The other stores of this same engine this request reaches: the
+        // account's IAM records, which decide what a delivery may do, and the
+        // CloudWatch store this service's own metrics live in.
+        let iam = crate::state::iam_state(&*self.engine);
+        let cloudwatch = crate::state::cloudwatch_state(&*self.engine);
+
+        // Every pattern match is counted on the matched rule's own
+        // `MatchedEvents` and `TriggeredRules` metrics: the match is a fact about
+        // ROUTING, so it is counted here, where routing decided it, rather than
+        // from the delivery pass below — a matched rule carrying no target at all
+        // triggered just as much as one whose targets were invoked.
+        crate::state::count_rule_matches(cloudwatch.as_ref(), &deliveries).await;
+
         // PASS 4 — back under the lock, briefly, to append the routing log and
         // what the archives of each bus captured.
         if !deliveries.is_empty() || !captures.is_empty() {
@@ -420,8 +433,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // works from GROWS as such a target is reached ([`republish`]); every
         // copy spends the same request budget, and the chain is bounded by
         // [`MAX_BUS_HOPS`].
-        let iam = crate::state::iam_state(&*self.engine);
-        let cloudwatch = crate::state::cloudwatch_state(&*self.engine);
         let mut budget = DeliveryBudget::new();
         let mut clients = Clients::default();
         let mut invocations: Vec<crate::state::TargetInvocation> = Vec::new();
@@ -513,6 +524,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         }
+
+        // A copy re-published onto another bus was matched by THAT bus's rules,
+        // so those rules triggered too, and are counted the same way.
+        crate::state::count_rule_matches(cloudwatch.as_ref(), &republished).await;
 
         // PASS 6 — under the lock once more, to append what came of each
         // handover: the invocation log is how a client observes a delivery that

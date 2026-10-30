@@ -27,15 +27,16 @@
 //! The harness (the router with EventBridge, SQS, Step Functions, IAM and
 //! CloudWatch on one engine) is the one `target_dispatch` owns.
 
-use serde_json::{json, Value};
+use serde_json::json;
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    DEFAULT_EVENT_BUS_NAME, FAILED_INVOCATIONS_METRIC, INVOCATIONS_METRIC, METRIC_NAMESPACE,
-    NO_PERMISSIONS, SERVICE_PRINCIPAL,
+    DEFAULT_EVENT_BUS_NAME, FAILED_INVOCATIONS_METRIC, INVOCATIONS_METRIC, MATCHED_EVENTS_METRIC,
+    NO_PERMISSIONS, SERVICE_PRINCIPAL, TRIGGERED_RULES_METRIC,
 };
 
 use crate::target_dispatch::{
-    drain, emulator, events, given_queue, given_state_machine, iam, metric_sum, published_series,
-    rule_dimensions, sfn, trust_policy, xml_text, Emulator, DETAIL_TYPE, REGION, SOURCE,
+    drain, emulator, events, given_queue, given_state_machine, iam, metric_sum, ordered,
+    published_series, rule_series, sfn, trust_policy, xml_text, Emulator, DETAIL_TYPE, REGION,
+    SOURCE,
 };
 
 /// The rule whose target role lets the invocation through, and the one whose
@@ -418,32 +419,35 @@ async fn each_delivery_is_counted_on_its_own_rules_invocation_metric() {
             );
         }
 
-        // And the series themselves: each is dimensioned by the bus AND the
-        // rule, so the two rules of one bus — and the same rule name on another
-        // bus — are separate metrics.
+        // And the series themselves: each metric is published under the bus AND
+        // the rule and under the rule name alone, so the two rules of one bus —
+        // and the same rule name on another bus — are separate metrics. Both
+        // rules matched every event, so both carry the match series; only the
+        // delivery series differ.
         let series = published_series(&emulator).await;
-        let expected_series: Vec<Value> = vec![
-            json!({
-                "Namespace": METRIC_NAMESPACE,
-                "MetricName": FAILED_INVOCATIONS_METRIC,
-                "Dimensions": rule_dimensions(row.bus, REFUSED_RULE),
-            }),
-            json!({
-                "Namespace": METRIC_NAMESPACE,
-                "MetricName": INVOCATIONS_METRIC,
-                "Dimensions": rule_dimensions(row.bus, DELIVERING_RULE),
-            }),
-        ];
-        assert_eq!(
-            series.len(),
-            expected_series.len(),
-            "case {case:?}: expected one series per rule that delivered or failed, got {series:?}"
+        let mut expected_series = rule_series(
+            row.bus,
+            DELIVERING_RULE,
+            &[
+                INVOCATIONS_METRIC,
+                MATCHED_EVENTS_METRIC,
+                TRIGGERED_RULES_METRIC,
+            ],
         );
-        for expected in &expected_series {
-            assert!(
-                series.contains(expected),
-                "case {case:?}: expected the series {expected} among {series:?}"
-            );
-        }
+        expected_series.extend(rule_series(
+            row.bus,
+            REFUSED_RULE,
+            &[
+                FAILED_INVOCATIONS_METRIC,
+                MATCHED_EVENTS_METRIC,
+                TRIGGERED_RULES_METRIC,
+            ],
+        ));
+        assert_eq!(
+            ordered(&series),
+            ordered(&expected_series),
+            "case {case:?}: expected one series per metric per dimension set of each rule, \
+             got {series:?}"
+        );
     }
 }
