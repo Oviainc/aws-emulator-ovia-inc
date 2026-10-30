@@ -31,8 +31,8 @@ use service_com_amazonaws_dsql_dsql::state::{
 };
 
 use crate::harness::{
-    expected_arn, expected_stream_arn, is_cluster_id, wait_for_the_clock, Answer, Dsql,
-    TAG_MAP_MAX,
+    account_of, expected_arn, expected_stream_arn, is_cluster_id, names_a_resource_of_its_own_type,
+    wait_for_the_clock, Answer, Dsql, TAG_MAP_MAX,
 };
 use crate::stream_lifecycle::kinesis_target;
 
@@ -221,32 +221,6 @@ fn stream_request(region: &str, ordinal: usize) -> Value {
     })
 }
 
-/// The account segment of an ARN this service mints
-/// (`arn:{partition}:dsql:{region}:{account}:{resource}`).
-fn account_of(arn: &str) -> String {
-    arn.split(':').nth(4).unwrap_or_default().to_string()
-}
-
-/// Whether `resource_id` really is an identifier of a `resource_type` this
-/// emulator holds, asked the way a client would ask: a cluster through
-/// `GetCluster`, a stream of `cluster` through `GetStream`, and the account
-/// through the account segment of an ARN this service minted.
-async fn names_a_resource_of_its_own_type(
-    dsql: &Dsql,
-    refused: &Refused,
-    resource_type: &str,
-    resource_id: &str,
-) -> bool {
-    match resource_type {
-        RESOURCE_TYPE_CLUSTER => dsql.get(resource_id).await.status == 200,
-        RESOURCE_TYPE_STREAM => {
-            dsql.get_stream(&refused.cluster, resource_id).await.status == 200
-        }
-        RESOURCE_TYPE_ACCOUNT => resource_id == account_of(&refused.cluster_arn),
-        _ => false,
-    }
-}
-
 /// RULE (see the module docs): every ceiling reports the holder of the collection
 /// at that ceiling, by that holder's own type segment and own identifier, beside
 /// the service and quota codes that name the ceiling.
@@ -293,7 +267,8 @@ async fn every_ceiling_names_the_resource_that_holds_the_collection() {
             assert!(
                 names_a_resource_of_its_own_type(
                     &dsql,
-                    &refused,
+                    &refused.cluster,
+                    &refused.cluster_arn,
                     &answer.str("resourceType"),
                     &answer.str("resourceId"),
                 )

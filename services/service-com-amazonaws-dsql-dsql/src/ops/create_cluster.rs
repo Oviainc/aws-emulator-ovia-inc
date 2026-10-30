@@ -324,14 +324,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
                 crate::state::TokenVerdict::Mismatch => {
-                    // No cluster of this request exists to name: the token belongs
-                    // to another request, and the identifier this one would have
-                    // minted was never minted.
-                    return Err(CreateClusterErrorModeled::ConflictException(ConflictException {
-                        message: crate::state::CLIENT_TOKEN_MISMATCH_MESSAGE.to_string(),
-                        resource_id: None,
-                        resource_type: Some(crate::state::RESOURCE_TYPE_CLUSTER.to_string()),
-                    })
+                    // The token belongs to another request, so this one minted no
+                    // cluster to name: the refusal reports the resource a create
+                    // addresses, which is the account that holds the clusters.
+                    return Err(CreateClusterErrorModeled::ConflictException(
+                        crate::state::ResourceIdentity::account().client_token_mismatch(),
+                    )
                     .into());
                 }
                 crate::state::TokenVerdict::Unused => {}

@@ -37,7 +37,10 @@ use service_com_amazonaws_dsql_dsql::state::{
     RESOURCE_TYPE_STREAM,
 };
 
-use crate::harness::{absent_identifier, wait_for_the_clock, Answer, Dsql};
+use crate::harness::{
+    absent_identifier, expected_arn, names_a_resource_of_its_own_type, wait_for_the_clock, Answer,
+    Dsql,
+};
 use crate::stream_lifecycle::kinesis_target;
 
 /// The `serviceCode` every ceiling of this service names: the Service Quotas code
@@ -51,28 +54,11 @@ fn identity_of(answer: &Answer) -> (String, String) {
     (answer.str("resourceType"), answer.str("resourceId"))
 }
 
-/// Whether `resource_id` really is an identifier of a `resource_type` this store
-/// holds, asked through the operation that READS a resource of that type: a
-/// cluster by `GetCluster` and a stream of `cluster` by `GetStream`.
-///
-/// This is the rule's own test rather than a re-assertion of a literal: a pair
-/// that names one resource resolves, and one that pairs a type with another
-/// resource's identifier cannot.
-async fn names_a_resource_of_its_own_type(
-    dsql: &Dsql,
-    cluster: &str,
-    resource_type: &str,
-    resource_id: &str,
-) -> bool {
-    match resource_type {
-        RESOURCE_TYPE_CLUSTER => dsql.get(resource_id).await.status == 200,
-        RESOURCE_TYPE_STREAM => dsql.get_stream(cluster, resource_id).await.status == 200,
-        _ => false,
-    }
-}
-
 /// Assert the pair `answer` carries is `(resource_type, resource_id)` and that it
-/// names a resource of that very type.
+/// names a resource of that very type — the rule's own test rather than a
+/// re-assertion of a literal: a pair that names one resource resolves, and one
+/// that pairs a type with another resource's identifier cannot
+/// ([`names_a_resource_of_its_own_type`]).
 async fn assert_identity(
     case: &str,
     dsql: &Dsql,
@@ -83,7 +69,14 @@ async fn assert_identity(
     assert_reported_identity(case, answer, expected);
     let (reported_type, reported_id) = identity_of(answer);
     assert!(
-        names_a_resource_of_its_own_type(dsql, cluster, &reported_type, &reported_id).await,
+        names_a_resource_of_its_own_type(
+            dsql,
+            cluster,
+            &expected_arn(dsql.region(), cluster),
+            &reported_type,
+            &reported_id
+        )
+        .await,
         "case {case:?}: resourceId {reported_id:?} must be an identifier of a {reported_type:?} \
          this service holds, got {:?}",
         answer.body

@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_dsql_dsql::state::SETTLE_AFTER;
+use service_com_amazonaws_dsql_dsql::state::{
+    RESOURCE_TYPE_ACCOUNT, RESOURCE_TYPE_CLUSTER, RESOURCE_TYPE_STREAM, SETTLE_AFTER,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// One emulator plus the region its requests are signed for.
@@ -324,6 +326,38 @@ pub fn expected_stream_arn(region: &str, cluster: &str, stream: &str) -> String 
         "arn:aws:dsql:{region}:{}:cluster/{cluster}/stream/{stream}",
         engine::EMULATOR_ACCOUNT_ID
     )
+}
+
+/// The account segment of an ARN this service minted
+/// (`arn:{partition}:dsql:{region}:{account}:{resource}`) — how a suite reads the
+/// account id a refusal about a per-account collection reports, from an ARN the
+/// service itself answered with rather than from a literal.
+pub fn account_of(arn: &str) -> String {
+    arn.split(':').nth(4).unwrap_or_default().to_string()
+}
+
+/// Whether `resource_id` really is an identifier of a `resource_type` this
+/// emulator holds, asked the way a client would ask rather than by re-reading a
+/// literal: a cluster through `GetCluster`, a stream of `cluster` through
+/// `GetStream`, and the account through the account segment of `cluster_arn`, an
+/// ARN this service minted for a resource it holds.
+///
+/// The one place the identity pair of a refusal is resolved, so every suite that
+/// asserts the rule — one resource's own type beside that same resource's own
+/// identifier — asks it the same way.
+pub async fn names_a_resource_of_its_own_type(
+    dsql: &Dsql,
+    cluster: &str,
+    cluster_arn: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> bool {
+    match resource_type {
+        RESOURCE_TYPE_CLUSTER => dsql.get(resource_id).await.status == 200,
+        RESOURCE_TYPE_STREAM => dsql.get_stream(cluster, resource_id).await.status == 200,
+        RESOURCE_TYPE_ACCOUNT => resource_id == account_of(cluster_arn),
+        _ => false,
+    }
 }
 
 /// A syntactically valid cluster id for a cluster that was never created.

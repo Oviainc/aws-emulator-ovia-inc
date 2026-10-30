@@ -101,6 +101,8 @@ mod tag_resource;
 mod tagging_arn_refusal_body;
 #[path = "all/tagging_arn_scope.rs"]
 mod tagging_arn_scope;
+#[path = "all/token_conflict_resource_identity.rs"]
+mod token_conflict_resource_identity;
 #[path = "all/update_cluster_pending_setup_exemption.rs"]
 mod update_cluster_pending_setup_exemption;
 #[path = "all/vpc_endpoint_service_name.rs"]
