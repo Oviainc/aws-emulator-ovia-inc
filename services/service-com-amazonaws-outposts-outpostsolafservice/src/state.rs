@@ -1135,6 +1135,41 @@ pub fn compute_runs(compute: &ComputeAttributes, family: Option<&str>, vcpus: Op
     in_recorded_family && within_vcpu_ceiling
 }
 
+/// One instance family a piece of hardware carries EC2 capacity of, and how large an
+/// instance of that family it runs: the pair one `EC2Capacity` the catalog publishes
+/// for a hardware configuration states.
+///
+/// The same two facts about hardware [`compute_runs`] reads off the
+/// `ComputeAttributes` one installed compute asset records, as the published catalog
+/// states them about a configuration — which is what lets a report scoped to ordered
+/// hardware be narrowed by the same rule as one scoped to installed hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FamilyCapacity<'a> {
+    /// The instance family this capacity is of, as `EC2Capacity$Family` names it.
+    pub family: &'a str,
+    /// The number of default vCPUs in "the maximum size of the EC2 capacity"
+    /// (`EC2Capacity$MaxSize`), read off the one orderable-instance-type catalog
+    /// ([`ComAmazonawsOutpostsOutpostsolafserviceState::published_vcpus`]) so no
+    /// report of this service can disagree with it about a size.
+    ///
+    /// `None` for a size that catalog publishes no vCPU count for: a ceiling the
+    /// store does not hold, which narrows nothing.
+    pub max_vcpus: Option<i32>,
+}
+
+impl FamilyCapacity<'_> {
+    /// Whether hardware carrying this capacity RUNS an instance type of `family`
+    /// whose default size is `vcpus` vCPUs: one OF this family, and no larger than
+    /// the largest size of it this capacity names. The two questions
+    /// [`compute_runs`] asks of an installed asset, asked of published capacity.
+    pub fn runs(&self, family: Option<&str>, vcpus: Option<i32>) -> bool {
+        family == Some(self.family)
+            && self
+                .max_vcpus
+                .is_none_or(|max| vcpus.is_none_or(|vcpus| vcpus <= max))
+    }
+}
+
 /// Whether a capacity task that excludes `exclude` would need `instance` STOPPED —
 /// so the capacity that instance holds is capacity the task can free.
 ///
@@ -3341,6 +3376,55 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             .iter()
             .find(|record| record.instance_type.instance_type.as_deref() == Some(instance_type))
             .and_then(|record| record.instance_type.vcp_us)
+    }
+
+    /// The EC2 capacity the hardware the order `order` is for carries: one entry per
+    /// instance family a configuration its line items subscribe to publishes capacity
+    /// of, each naming the largest size of that family that hardware runs, in the
+    /// order the order's line items name them.
+    ///
+    /// What an order is FOR is the hardware configurations its line items name, and
+    /// what such a configuration carries capacity of is what this service publishes
+    /// for it ([`ec2_capacities`]) — the same records the configuration an Outpost
+    /// arrived carrying is read off ([`Self::ordered_instance_type_names`]). A line
+    /// item naming a catalog item this service publishes no configuration for
+    /// contributes nothing, exactly as it contributes nothing to
+    /// [`Self::subscribed_capacity_vcpus`]: the capacity of hardware the catalog does
+    /// not describe is not a figure the emulator has, and never one it invents — so an
+    /// order whose every line item names one carries no published capacity at all, and
+    /// the store holds no hardware fact about the order to narrow anything by.
+    ///
+    /// Asked of ONE named order rather than of an Outpost's inventory, which is why it
+    /// does not skip a cancelled order as [`Self::ordered_instance_type_names`] and
+    /// [`Self::subscribed_capacity_vcpus`] do: those two are about the hardware an
+    /// Outpost HOLDS or pays for, and nothing was ever delivered for a cancelled order,
+    /// while what a named order IS FOR is its own line items whatever status it reached.
+    pub fn ordered_ec2_capacity(&self, order: &Order) -> Vec<FamilyCapacity<'_>> {
+        let mut capacities: Vec<FamilyCapacity<'_>> = Vec::new();
+        for capacity in order
+            .line_items
+            .iter()
+            .flatten()
+            .filter_map(|item| self.catalog_item(item.catalog_item_id.as_deref()?))
+            .flat_map(|record| record.item.ec2_capacities.iter().flatten())
+        {
+            let Some(family) = capacity.family.as_deref() else {
+                continue;
+            };
+            let entry = FamilyCapacity {
+                family,
+                max_vcpus: capacity
+                    .max_size
+                    .as_deref()
+                    .and_then(|max_size| self.published_vcpus(max_size)),
+            };
+            // Two line items can name configurations that carry capacity of one
+            // family, which is one fact about that hardware rather than two.
+            if !capacities.contains(&entry) {
+                capacities.push(entry);
+            }
+        }
+        capacities
     }
 
     /// The instance types the EC2 capacity of the Outpost `outpost_id` names in

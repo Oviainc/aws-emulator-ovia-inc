@@ -692,9 +692,12 @@ async fn an_outstanding_order_is_read_by_the_operations_that_name_one() {
         );
     }
 
-    // The scoping half: an `OrderId` of the Outpost is an order the report knows,
-    // and answers exactly what the unscoped report answers; one of another Outpost,
-    // or one nothing holds, names no hardware here.
+    // The scoping half: an `OrderId` of the Outpost is an order the report knows and
+    // is scoped by — these line items name SKUs this service publishes no
+    // configuration under, so they record no hardware fact and narrow nothing (what an
+    // order of published configurations scopes the report to is
+    // [`crate::supported_instance_types_order_scope`]); one of another Outpost, or one
+    // nothing holds, names no hardware here.
     let unscoped = outposts
         .ok(
             "GET",
@@ -714,7 +717,8 @@ async fn an_outstanding_order_is_read_by_the_operations_that_name_one() {
         .await;
     assert_eq!(
         scoped, unscoped,
-        "an order of the Outpost narrows the report by nothing this emulator can know"
+        "an order whose line items name no published configuration records no hardware \
+         fact, so it narrows the report by nothing"
     );
     for (case, outpost_id, order) in [
         ("an order of another Outpost", &bare, order_id.as_str()),

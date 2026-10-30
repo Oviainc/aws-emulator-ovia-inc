@@ -20,7 +20,14 @@
 //!   (an entry of another family is not hardware it can host) and by its recorded
 //!   `MaxVcpus` ("the maximum number of vCPUs possible for the specified asset", so
 //!   an entry needing more than that cannot run on it). A fact the asset did not
-//!   record narrows nothing.
+//!   record narrows nothing;
+//! * an `OrderId` scopes the report to the hardware THAT order is for, which is the
+//!   configurations its line items subscribe to: each publishes the instance families
+//!   it carries EC2 capacity of and "the maximum size of the EC2 capacity" of each
+//!   ([`crate::state::FamilyCapacity`]), so an entry of a family none of them carries
+//!   capacity of — or one larger than the largest size of its family they do — is not
+//!   hardware that order brings. An order whose line items name no configuration this
+//!   service publishes records no hardware fact, so it narrows nothing.
 //!
 //! What is reported is the CAPABILITY of that hardware, not its current
 //! configuration: "this will generally include instance types that are not currently
@@ -28,14 +35,17 @@
 //! configuration", so the per-type counts an asset's `InstanceTypeCapacities` records
 //! are deliberately not consulted.
 //!
-//! An `OrderId` names an Amazon Web Services Outposts ORDER, which scopes the report
-//! to the hardware that order is for: an order this store holds — `CreateOrder`
-//! persists one against the Outpost it names — has to be an order of THIS Outpost,
-//! and one that is not, or one the store holds no record of at all, is answered with
-//! the not-found error this operation models, exactly as an `OutpostIdentifier` the
-//! store does not hold is. An order of this Outpost narrows the report by nothing: what
-//! it would narrow by is the catalog items its line items name, and this emulator has
-//! no catalog behind those SKUs.
+//! An `OrderId` names an Amazon Web Services Outposts ORDER, so an order this store
+//! holds — `CreateOrder` persists one against the Outpost it names — has to be an
+//! order of THIS Outpost, and one that is not, or one the store holds no record of at
+//! all, names no hardware here and is answered with the not-found error this
+//! operation models, exactly as an `OutpostIdentifier` the store does not hold is.
+//! What an order of this Outpost narrows by is stated in the rule above: the hardware
+//! it is for is whatever its line items subscribe to, and which instance types a
+//! published configuration runs is a fact this service publishes about it. The report
+//! is the CAPABILITY of that hardware, so it is the order's own line items that say
+//! what it is for, whatever status the order has reached and whether or not its
+//! hardware has been installed yet.
 //!
 //! ## Shape of an operation
 //!
@@ -250,28 +260,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // be an order of this Outpost: one this store holds no record of, or one
         // placed against another Outpost, names no hardware here and is the
         // not-found error, worded as every refusal about an order this service holds
-        // none of is. An order it does hold
-        // narrows nothing — what an order would narrow by is the catalog items its
-        // line items name, and the published catalog reports which instance FAMILIES
-        // a configuration carries capacity of rather than the instance types the
-        // hardware of one order supports — so the report is the Outpost's own.
-        // Checked before the asset, so a request
-        // naming both is answered about the coarser scope it could not resolve.
-        if let Some(order_id) = input.order_id.as_deref().filter(|id| !id.is_empty()) {
-            let places_this_outpost = store
-                .order(&region, order_id)
-                .is_some_and(|record| record.order.outpost_id.as_deref() == Some(&outpost_id));
-            if !places_this_outpost {
-                return Err(
-                    GetOutpostSupportedInstanceTypesErrorModeled::NotFoundException(
-                        NotFoundException {
-                            message: Some(crate::state::order_not_found(order_id)),
-                        },
-                    )
-                    .into(),
-                );
+        // none of is. Resolved before the asset, so a request naming both is answered
+        // about the coarser scope it could not resolve.
+        //
+        // The hardware an order it does hold is for is the configurations its line
+        // items subscribe to, and what each of those carries EC2 capacity of is a fact
+        // this service publishes about it — so that published capacity is what the
+        // report is narrowed by, exactly as the configuration an Outpost arrived
+        // carrying is derived from those same records.
+        let ordered = match input.order_id.as_deref().filter(|id| !id.is_empty()) {
+            Some(order_id) => {
+                let order = store
+                    .order(&region, order_id)
+                    .filter(|record| record.order.outpost_id.as_deref() == Some(&outpost_id))
+                    .ok_or_else(|| {
+                        GetOutpostSupportedInstanceTypesErrorModeled::NotFoundException(
+                            NotFoundException {
+                                message: Some(crate::state::order_not_found(order_id)),
+                            },
+                        )
+                    })?;
+                store.ordered_ec2_capacity(&order.order)
             }
-        }
+            None => Vec::new(),
+        };
         // The hardware the request scopes the report to: one named asset of this
         // Outpost, or the Outpost itself. An `AssetId` is resolved among the assets
         // of the Outpost in hand, and one that names none of them is the not-found
@@ -302,7 +314,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store
                 .orderable_instance_types
                 .iter()
-                .filter(|entry| supports(&entry.instance_type, form_factor, hardware))
+                .filter(|entry| supports(&entry.instance_type, form_factor, hardware, &ordered))
                 .map(|entry| {
                     (
                         entry.sequence,
@@ -344,6 +356,7 @@ fn supports(
     entry: &DetailedInstanceTypeItem,
     form_factor: Option<&str>,
     hardware: Hardware<'_>,
+    ordered: &[crate::state::FamilyCapacity<'_>],
 ) -> bool {
     // An entry's `FormFactorConfigs` names every form factor it is offered in, so an
     // Outpost of one form factor can support the entries offered in that one. An
@@ -356,6 +369,18 @@ fn supports(
             .any(|config| config.form_factor.as_deref() == Some(form_factor))
     });
     if !offered_in_form_factor {
+        return false;
+    }
+    // The EC2 capacity the order in scope bought, if the request named one: hardware
+    // that carries capacity of an entry's family, at a size that admits it, runs that
+    // entry. An empty list is a scope the store holds no published capacity for — the
+    // request named no order, or one whose line items name no published configuration
+    // — and narrows nothing.
+    let brought_by_order = ordered.is_empty()
+        || ordered
+            .iter()
+            .any(|capacity| capacity.runs(instance_family(entry), entry.vcp_us));
+    if !brought_by_order {
         return false;
     }
     match hardware {
