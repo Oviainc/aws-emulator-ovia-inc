@@ -313,26 +313,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of the hash map it was deserialized into.
         let components = crate::state::requested_in_key_order(input.components);
         let composite_components = crate::state::requested_in_key_order(input.composite_components);
-        // Every property a `CreateEntity` declares is a NEW property, so its
-        // definition must carry the `dataType` the modelled
-        // `PropertyDefinitionResponse` requires back — in a component and in a
-        // composite component alike. Walked in component-name then
-        // component-path order, each component's properties in property-name
-        // order ([`require_data_types`]).
+        // Every declared property definition must leave the property with the
+        // `dataType` the modelled `PropertyDefinitionResponse` requires back —
+        // its own, or the one it INHERITS from the component type the component
+        // instantiates ([`require_data_types`], the rule
+        // `crate::state::Workspace::component_property_definition_needs_data_type`
+        // holds for every writer of a component's definition). Walked in
+        // component-name then component-path order, each component's properties
+        // in property-name order.
         for (component_name, component) in &components {
             require_data_types(
+                workspace,
+                component.component_type_id.as_deref(),
                 &format!("components.{component_name}"),
                 component.properties.as_ref(),
             )?;
         }
+
+        let mut component_records = components_from_request(components);
+
+        // A composite component inherits from the component type the
+        // declaration its path resolves to names, so the rule above is applied
+        // to the path's own component type. The resolution is the one the loop
+        // below REFUSES an unresolvable path with
+        // (`crate::state::resolve_composite_component_path`); taken leniently
+        // here, so this pass decides nothing but the `dataType` rule and a path
+        // that resolves to no component type simply inherits nothing.
         for (component_path, composite) in &composite_components {
+            let resolved = crate::state::resolve_composite_component_path(
+                &component_records,
+                &workspace.component_types,
+                "compositeComponents",
+                component_path,
+            )
+            .ok();
             require_data_types(
+                workspace,
+                resolved
+                    .as_ref()
+                    .map(|resolved| resolved.component_type_id.as_str()),
                 &format!("compositeComponents.{component_path}"),
                 composite.properties.as_ref(),
             )?;
         }
-
-        let mut component_records = components_from_request(components);
 
         // A component INSTANTIATES the component type its `componentTypeId`
         // names, so that type has to be one that can be instantiated at all.
@@ -577,28 +600,42 @@ fn validation(message: String) -> CreateEntityErrorModeled {
     })
 }
 
-/// Refuse a requested property whose definition carries no `dataType`.
+/// Refuse a requested property whose definition would leave the property with
+/// no `dataType` at all.
+///
+/// `component_type_id` is the component type the properties' holder — a
+/// component or a composite component — instantiates, which is where a
+/// definition that carries no `dataType` of its own inherits one from: the rule
+/// is `crate::state::Workspace::component_property_definition_needs_data_type`,
+/// the one every writer of a component's definition shares, so a definition
+/// that REFINES an inherited one (every member of `PropertyDefinitionRequest`
+/// is optional) is accepted here exactly where a read can report it.
 ///
 /// `member_path` is the request member the map hangs off (`components.<name>`,
 /// `compositeComponents.<path>`), so the refusal names the exact member the
 /// caller has to fix.
 ///
 /// The requested properties are walked in property-NAME order, so a request
-/// carrying more than one definition without a `dataType` is always refused for
+/// carrying more than one definition the rule refuses is always refused for
 /// the first of them in key order rather than for whichever one the hash map's
 /// iteration order reached first.
 fn require_data_types(
+    workspace: &crate::state::Workspace,
+    component_type_id: Option<&str>,
     member_path: &str,
     properties: Option<&::std::collections::HashMap<String, PropertyRequest>>,
 ) -> Result<(), CreateEntityErrorModeled> {
     let properties: ::std::collections::BTreeMap<&String, &PropertyRequest> =
         properties.into_iter().flatten().collect();
     for (property_name, property) in properties {
-        if property
-            .definition
-            .as_ref()
-            .is_some_and(|definition| definition.data_type.is_none())
-        {
+        let Some(definition) = property.definition.as_ref() else {
+            continue;
+        };
+        if workspace.component_property_definition_needs_data_type(
+            component_type_id,
+            property_name,
+            definition,
+        ) {
             return Err(validation(format!(
                 "{member_path}.properties.{property_name}.definition.dataType is required"
             )));

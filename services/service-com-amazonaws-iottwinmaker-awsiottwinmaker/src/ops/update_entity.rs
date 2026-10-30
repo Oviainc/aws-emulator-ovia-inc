@@ -53,7 +53,10 @@
 //! which both act on a property that has to be there), a `componentPath` that
 //! does not resolve, a component of an ABSTRACT component type
 //! ([`crate::state::abstract_component_type_violation`]), a property
-//! definition carrying no `dataType`, and a `parentEntityId` that names no
+//! definition left with no `dataType` — neither its own nor one inherited from
+//! the component type its holder instantiates
+//! ([`crate::state::Workspace::component_property_definition_needs_data_type`])
+//! — and a `parentEntityId` that names no
 //! entity of the workspace, names the entity being updated, or names an entity
 //! BELOW it (which would make the stored parent graph cyclic). The patch is
 //! built on a COPY and committed last, so a refused request leaves the stored
@@ -470,7 +473,17 @@ fn apply_component_update(
     if let Some(description) = update.description {
         component.description = Some(description);
     }
-    apply_property_updates(&mut component.properties, &member, update.property_updates)?;
+    // The component type the component instantiates AFTER this patch is what
+    // the definitions it carries inherit from, so the `componentTypeId` the
+    // entry just wrote is the one the property rule below resolves against.
+    let component_type_id = component.component_type_id.clone();
+    apply_property_updates(
+        workspace,
+        component_type_id.as_deref(),
+        &mut component.properties,
+        &member,
+        update.property_updates,
+    )?;
     apply_property_group_updates(
         &mut component.property_groups,
         &member,
@@ -580,7 +593,17 @@ fn apply_composite_component_update(
     if let Some(description) = update.description {
         composite.description = Some(description);
     }
-    apply_property_updates(&mut composite.properties, &member, update.property_updates)?;
+    // A composite component instantiates the component type the declaration
+    // its path resolved to names, so that is what the definitions it carries
+    // inherit from.
+    let component_type_id = composite.component_type_id.clone();
+    apply_property_updates(
+        workspace,
+        Some(component_type_id.as_str()),
+        &mut composite.properties,
+        &member,
+        update.property_updates,
+    )?;
     apply_property_group_updates(
         &mut composite.property_groups,
         &member,
@@ -594,7 +617,12 @@ fn apply_composite_component_update(
 /// Shared by both for the reason `CreateEntity` shares its conversions: a
 /// component and a composite component carry the same modelled `PropertyRequests`
 /// map, so one shape has one rule.
+///
+/// `component_type_id` is the component type the holder instantiates, which is
+/// what a definition carrying no `dataType` of its own inherits one from.
 fn apply_property_updates(
+    workspace: &crate::state::Workspace,
+    component_type_id: Option<&str>,
     properties: &mut ::std::collections::BTreeMap<String, crate::state::PropertyRecord>,
     member_path: &str,
     updates: Option<::std::collections::HashMap<String, PropertyRequest>>,
@@ -636,13 +664,18 @@ fn apply_property_updates(
                 // A definition the request carries REPLACES the property's
                 // definition, so it must be one a read can report: every
                 // reported `PropertyDefinitionResponse` requires a `dataType`,
-                // which is the rule `CreateEntity` applies to the definitions
-                // it stores.
-                if update
-                    .definition
-                    .as_ref()
-                    .is_some_and(|definition| definition.data_type.is_none())
-                {
+                // which the definition carries itself or INHERITS from the
+                // component type its holder instantiates — the rule
+                // `crate::state::Workspace::component_property_definition_needs_data_type`
+                // every writer of a component's definition shares with
+                // `CreateEntity`.
+                if update.definition.as_ref().is_some_and(|definition| {
+                    workspace.component_property_definition_needs_data_type(
+                        component_type_id,
+                        &property_name,
+                        definition,
+                    )
+                }) {
                     return Err(validation(format!("{member}.definition.dataType is required")));
                 }
                 let property = properties.entry(property_name).or_default();

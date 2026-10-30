@@ -17,6 +17,9 @@ mod abstract_component_type_listing;
 #[path = "all/abstract_component_types.rs"]
 mod abstract_component_types;
 
+#[path = "all/component_definition_refinement.rs"]
+mod component_definition_refinement;
+
 #[path = "all/component_inherited_schema.rs"]
 mod component_inherited_schema;
 

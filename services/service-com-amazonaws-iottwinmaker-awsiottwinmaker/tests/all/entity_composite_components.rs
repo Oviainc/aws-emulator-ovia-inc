@@ -397,9 +397,9 @@ async fn an_unresolvable_composite_component_path_is_refused() {
             json!({"Sensor/inner/leaf": {}}),
         ),
         (
-            // A property a create declares is a new property, so its definition
-            // must carry a dataType — in a composite component as in a
-            // component.
+            // A definition that inherits no `dataType` either — the component
+            // type the path resolves to (`com.example.inner`) declares only
+            // "Pressure" — so no read could report it.
             "compositePropertyWithoutDataType",
             json!({"Sensor": sensor_component()}),
             json!({"Sensor/inner": {"properties": {"p": {"definition": {"isTimeSeries": true}}}}}),

@@ -1215,7 +1215,7 @@ async fn deleting_a_composite_component_removes_the_ones_below_it() {
 /// The rows differ along WHICH rule refuses the call — the two labels, each
 /// update type applied to contents that cannot take it, an unmodelled update
 /// type at each of the three levels that carries one, an unresolvable component
-/// path, an abstract component type and a definition that no read could report.
+/// path, an abstract component type and a definition no `dataType` reaches.
 #[tokio::test]
 async fn a_refused_update_is_the_rules_own_refusal_and_persists_nothing() {
     let emulator = seeded().await;
@@ -1306,10 +1306,15 @@ async fn a_refused_update_is_the_rules_own_refusal_and_persists_nothing() {
             "ValidationException",
         ),
         (
-            "aDefinitionWithNoDataType",
+            // A property NOTHING declares a `dataType` for: `SENSOR_TYPE`
+            // declares only `Serial`, so this definition inherits none and no
+            // read could report it. A definition that refines one the component
+            // type DOES declare is accepted — see
+            // `component_definition_refinement.rs`.
+            "aDefinitionNoDataTypeReaches",
             WORKSPACE,
             ENTITY,
-            json!({"componentUpdates": {"Sensor": {"propertyUpdates": {"Serial": {
+            json!({"componentUpdates": {"Sensor": {"propertyUpdates": {"Spare": {
                 "definition": {"isRequiredInEntity": true},
             }}}}}),
             400,

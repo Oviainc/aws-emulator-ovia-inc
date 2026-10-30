@@ -1582,6 +1582,42 @@ impl Workspace {
         ))
     }
 
+    /// Whether storing `definition` for `property_name` on a component that
+    /// instantiates `component_type_id` would leave the component holding a
+    /// definition no read can report.
+    ///
+    /// `dataType` is optional on `PropertyDefinitionRequest` but REQUIRED on the
+    /// `PropertyDefinitionResponse` a read reports (see
+    /// [`property_definition_response`]), so a declaration may omit it only
+    /// where it REFINES one that reaches the property anyway — for a component,
+    /// a declaration of the component type it instantiates or of a type that
+    /// type extends, which is exactly what
+    /// [`effective_property_definition`](Self::effective_property_definition)
+    /// folds in with no declaration of the component's own to fold over. A
+    /// property nothing on that chain declares with a `dataType` — a component
+    /// naming no component type, naming one this workspace does not hold, or
+    /// declaring a property its chain never mentions — inherits none, so a
+    /// writer refuses the request rather than storing a definition a reader
+    /// would have to drop.
+    ///
+    /// The component-level counterpart of
+    /// [`property_definition_needs_data_type`], which asks the same question of
+    /// a component TYPE's own definitions; shared by every writer of a
+    /// component's definition so a create and an update hold one definition to
+    /// one rule.
+    pub fn component_property_definition_needs_data_type(
+        &self,
+        component_type_id: Option<&str>,
+        property_name: &str,
+        definition: &crate::ops::types::PropertyDefinitionRequest,
+    ) -> bool {
+        definition.data_type.is_none()
+            && self
+                .effective_property_definition(component_type_id, &BTreeMap::new(), property_name)
+                .and_then(|inherited| inherited.data_type)
+                .is_none()
+    }
+
     /// The component types one component type INHERITS from: the `extendsFrom`
     /// chain behind it, nearest first, without the component type itself.
     ///
@@ -2554,8 +2590,11 @@ pub fn component_property_groups_response(
 /// refines one it inherits. A component type that extends nothing inherits
 /// nothing, so each of its own definitions must carry one, and a writer refuses
 /// the request rather than storing a definition a reader would have to drop.
-/// Shared by every writer of a definition so a create and an update hold one
-/// definition to one rule.
+/// Shared by every writer of a COMPONENT TYPE's definitions so a create and an
+/// update hold one definition to one rule; the same question about a
+/// COMPONENT's definition, whose inheritance runs through the component type it
+/// instantiates rather than through `extendsFrom`, is
+/// [`Workspace::component_property_definition_needs_data_type`].
 pub fn property_definition_needs_data_type(
     extends_from: &[String],
     definition: &crate::ops::types::PropertyDefinitionRequest,
