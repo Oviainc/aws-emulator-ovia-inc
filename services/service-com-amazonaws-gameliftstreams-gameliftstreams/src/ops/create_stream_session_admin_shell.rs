@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStreamSessionAdminShell
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStreamSessionAdminShell`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Resolves the stream group and the stream session the two path labels name and
+//! answers from the STORED session: an identifier that can name no resource of the
+//! type its label addresses is a `ValidationException`, an identifier that names
+//! nothing stored is a `ResourceNotFoundException`, and a session whose status is
+//! not one this operation documents as eligible is a `ValidationException` too.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStreamSessionAdminShell::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Two different texts are involved in that last one, and they must not be mixed
+//! up. The operation's DOCUMENTATION (quoted further down, from the model) states
+//! the requirement as "The stream session must be in one of the following statuses:
+//! ACTIVE, CONNECTED, PENDING_CLIENT_RECONNECTION, or RECONNECTING"; the MESSAGE
+//! the service answers that refusal with is the one [`CreateStreamSessionAdminShell::handle`]
+//! builds, `Stream session '<stream session ARN>' is not in ACTIVE, CONNECTED,
+//! PENDING_CLIENT_RECONNECTION or RECONNECTING status for session access`, over the
+//! stored session's own ARN. The documentation sentence is NOT the wire text:
+//! the message is pinned by `tests/all/stream_session_admin_shell.rs`.
+//!
+//! An eligible session is answered with the modelled
+//! `StreamSessionAccessNotReadyException`, worded by that shape's own documentation,
+//! which is what is true here: the returned
+//! `SessionId`, `StreamUrl` and `TokenValue` are the credentials of a Systems
+//! Manager terminal INTO the live runtime environment of a stream session, and this
+//! emulator runs no such runtime environment — a session never reaches an eligible
+//! status (`StreamSession::advance` takes `ACTIVATING` to `ERROR`, for the same
+//! reason `CreateStreamSessionConnection` can never answer a WebRTC offer), so no
+//! terminal connection to one exists to hand out. Credentials for a websocket
+//! nothing serves would be a fabricated data plane rather than a computed response.
+//! Nothing here mints, stores or hands back a credential, so every call is answered
+//! from state alone.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +201,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStreamSessionAdminShell` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStreamSessionAdminShellErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Both path labels have to resolve to the ARN of the resource they name,
+        // which is checked BEFORE the store is read: a value that resolves to no
+        // such ARN is a bad value for the label, not a resource that is missing.
+        if let Some(refusal) = crate::state::invalid_resource_arn(
+            crate::state::IDENTIFIER_MEMBER,
+            &input.identifier,
+            crate::state::STREAM_GROUP_RESOURCE,
+        ) {
+            return Err(
+                CreateStreamSessionAdminShellErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+        if let Some(refusal) = crate::state::invalid_resource_arn(
+            crate::state::STREAM_SESSION_IDENTIFIER_MEMBER,
+            &input.stream_session_identifier,
+            crate::state::STREAM_SESSION_RESOURCE,
+        ) {
+            return Err(
+                CreateStreamSessionAdminShellErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+        let region = crate::state::region_of(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateStreamSessionAdminShellErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::with_internal_id(
+                            "the gameliftstreams emulator holds no state on this engine",
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Materialise the transitions the clock had already made due at `now` — they
+        // were owed whether or not anybody called — so the status this request is
+        // judged against is the one the session actually holds.
+        state.materialize(now);
+
+        // Session-scoped: the resource this call addresses is the stream session its
+        // two path labels name, so an unresolvable session identifier, an absent
+        // group and an absent session are the SAME miss, reported against the
+        // composite stream session ARN — the rule `GetStreamSession` and
+        // `TerminateStreamSession` already answer by.
+        let session = crate::state::identifier_id(
+            &input.stream_session_identifier,
+            crate::state::STREAM_SESSION_RESOURCE,
+        )
+        .and_then(|session_id| {
+            state
+                .stream_group(&input.identifier)
+                .and_then(|group| group.sessions.get(&session_id))
+        });
+        let Some(session) = session else {
+            return Err(
+                CreateStreamSessionAdminShellErrorModeled::ResourceNotFoundException(
+                    crate::state::stream_session_not_found(
+                        &crate::state::resolved_stream_session_arn(
+                            &region,
+                            &input.identifier,
+                            &input.stream_session_identifier,
+                        ),
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        // "The stream session must be in one of the following statuses: ACTIVE,
+        // CONNECTED, PENDING_CLIENT_RECONNECTION, or RECONNECTING." A session in any
+        // other status cannot carry a terminal session, and that is a value this
+        // operation refuses rather than a resource that is missing, so it is the
+        // modelled `ValidationException`. The status judged is the STORED one, and
+        // the refusal names the stored session's own ARN and the eligible statuses
+        // (the model's own `StreamSessionStatus` values), which is how the service
+        // words this refusal.
+        if !matches!(
+            session.status.as_str(),
+            crate::state::SESSION_ACTIVE
+                | crate::state::SESSION_CONNECTED
+                | crate::state::SESSION_PENDING_CLIENT_RECONNECTION
+                | crate::state::SESSION_RECONNECTING
+        ) {
+            return Err(
+                CreateStreamSessionAdminShellErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::with_internal_id(format!(
+                            "Stream session '{}' is not in {}, {}, {} or {} status for \
+                             session access",
+                            session.arn,
+                            crate::state::SESSION_ACTIVE,
+                            crate::state::SESSION_CONNECTED,
+                            crate::state::SESSION_PENDING_CLIENT_RECONNECTION,
+                            crate::state::SESSION_RECONNECTING,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An eligible session, which this emulator never holds: the credentials this
+        // operation hands back open a terminal INTO the session's live runtime
+        // environment, and no runtime environment runs here, so the terminal
+        // connection to it is exactly what is unavailable — the condition this
+        // operation models (HTTP 409, retryable). Minting a session id, a websocket
+        // URL and a token for a channel nothing serves would report access that does
+        // not exist.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStreamSessionAdminShell"))
+        // The text is the one the model gives for this error shape, verbatim
+        // (`smithy_query(query="shape", shape="StreamSessionAccessNotReadyException")`),
+        // so nothing is added to it: the shape carries no member to name a session
+        // with, and nothing here knows a better reason than the one it states.
+        Err(
+            CreateStreamSessionAdminShellErrorModeled::StreamSessionAccessNotReadyException(
+                StreamSessionAccessNotReadyException {
+                    message: crate::state::with_internal_id(
+                        "The terminal connection to the stream session is not yet available. \
+                         Wait before retrying the request.",
+                    ),
+                },
+            )
+            .into(),
+        )
     }
 }

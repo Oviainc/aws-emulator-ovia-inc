@@ -144,7 +144,9 @@ pub const LOCATION_REMOVING: &str = "REMOVING";
 pub const LOCATION_ERROR: &str = "ERROR";
 pub const SESSION_ACTIVATING: &str = "ACTIVATING";
 pub const SESSION_ACTIVE: &str = "ACTIVE";
+pub const SESSION_CONNECTED: &str = "CONNECTED";
 pub const SESSION_PENDING_CLIENT_RECONNECTION: &str = "PENDING_CLIENT_RECONNECTION";
+pub const SESSION_RECONNECTING: &str = "RECONNECTING";
 pub const SESSION_ERROR: &str = "ERROR";
 pub const SESSION_TERMINATING: &str = "TERMINATING";
 pub const SESSION_TERMINATED: &str = "TERMINATED";
@@ -1423,9 +1425,9 @@ pub fn resource_not_found(arn: &str) -> ResourceNotFoundException {
 }
 
 /// The service's `ResourceNotFoundException` for the session-scoped operations
-/// (`GetStreamSession`, `TerminateStreamSession`, `CreateStreamSessionConnection`),
-/// which name the stream session — the resource the caller addressed — even when it
-/// is the enclosing stream group that is absent.
+/// (`GetStreamSession`, `TerminateStreamSession`, `CreateStreamSessionConnection`,
+/// `CreateStreamSessionAdminShell`), which name the stream session — the resource
+/// the caller addressed — even when it is the enclosing stream group that is absent.
 pub fn stream_session_not_found(arn: &str) -> ResourceNotFoundException {
     not_found("Stream session", arn)
 }

@@ -23,6 +23,8 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/stream_group_locations.rs"]
 mod stream_group_locations;
+#[path = "all/stream_session_admin_shell.rs"]
+mod stream_session_admin_shell;
 #[path = "all/stream_workflow.rs"]
 mod stream_workflow;
 #[path = "all/tags.rs"]
