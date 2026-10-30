@@ -15,6 +15,8 @@
 mod agent_space_lifecycle;
 #[path = "all/application_lifecycle.rs"]
 mod application_lifecycle;
+#[path = "all/error_message_wording.rs"]
+mod error_message_wording;
 #[path = "all/private_connection_lifecycle.rs"]
 mod private_connection_lifecycle;
 #[path = "all/recorded_wire_form.rs"]

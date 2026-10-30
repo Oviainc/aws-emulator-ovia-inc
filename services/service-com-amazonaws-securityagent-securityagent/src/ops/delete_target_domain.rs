@@ -183,10 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.target_domains.remove(&input.target_domain_id).is_none() {
             return Err(DeleteTargetDomainErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "No target domain found with id {}",
-                        input.target_domain_id
-                    ),
+                    // The service's own sentence for a target domain it cannot resolve
+                    // (`crate::state::TARGET_DOMAIN_NOT_FOUND`): fixed text, carrying
+                    // nothing the request sent.
+                    message: crate::state::TARGET_DOMAIN_NOT_FOUND.to_string(),
                 },
             )
             .into());

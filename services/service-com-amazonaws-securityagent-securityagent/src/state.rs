@@ -73,6 +73,15 @@ pub const MAX_APPLICATIONS: usize = 1_000;
 /// bounded.
 pub const MAX_TARGET_DOMAINS: usize = 1_000;
 
+/// The sentence a refusal of a target domain the account does not hold states.
+///
+/// RECORDED, not modelled: the recorded 404 for an unknown `targetDomainId` carries this
+/// sentence, which is wholly FIXED — it names the resource CLASS and carries no value from
+/// the request, so a refusal cannot echo a caller's own identifier back — and it is stated
+/// here once, so every operation that fails to resolve a target domain answers the same
+/// sentence rather than the documentation of the error class.
+pub const TARGET_DOMAIN_NOT_FOUND: &str = "The specified target domain does not exist.";
+
 /// The longest a `targetDomainName` may be.
 ///
 /// NOT chosen: `targetDomainName` carries no `@length` in the model, but the operation
@@ -546,6 +555,18 @@ pub const DEFAULT_DNS_RESOLUTION: &str = "PUBLIC";
 /// It is set far above any plausible client's connection count, so normal use never
 /// meets it, while the store a caller can grow stays bounded.
 pub const MAX_PRIVATE_CONNECTIONS: usize = 100;
+
+/// The sentence a refusal of a private connection the account does not hold states.
+///
+/// RECORDED, not modelled: `ResourceNotFoundException` declares only a `message`, and the
+/// shape's documentation ("The specified resource was not found. …") is the doc of the
+/// error CLASS, not the sentence the service answers. The recorded 404 for a private
+/// connection carries this sentence instead, whole: the trailing `null` is how the service
+/// renders the INTERNAL record identifier it names the resource by, which a lookup that
+/// resolved no record has none of. Nothing from the request reaches it — a refusal echoes
+/// back no name a caller sent — so every operation that fails to resolve a private
+/// connection answers the one sentence.
+pub const PRIVATE_CONNECTION_NOT_FOUND: &str = "Private Connection not found: null";
 
 /// The ARN namespace (and SigV4 signing name) of VPC Lattice, the service that owns the
 /// resource gateways and resource configurations a private connection is built on.
@@ -1227,11 +1248,14 @@ pub fn verification_method_violation(method: &str) -> Option<String> {
 /// is why [`RESOURCE_CONFIGURATION_ID_PREFIX`] and [`LATTICE_ID_SUFFIX_LEN`] — the parts
 /// this emulator MINTS ids from — are the same two bounds spelled out here.
 ///
-/// The account segment is `[0-9]{12}`, twelve ASCII digits, which is what an AWS account
-/// id is.
+/// The account segment is `\d{12}`, twelve ASCII digits, which is what an AWS account id
+/// is. It is spelled with the `\d` shorthand because a quoted pattern is the service's
+/// own pattern SOURCE text: a client repairs its request from the expression it reads
+/// out of the refusal, so an equivalent respelling of a character class (`[0-9]{12}`
+/// here) would advertise an expression the service does not publish.
 pub const RESOURCE_CONFIGURATION_ID_PATTERN: &str = concat!(
     r"((rcfg-[0-9a-z]{17})|",
-    r"(arn:[a-z0-9\-]+:vpc-lattice:[a-zA-Z0-9\-]+:[0-9]{12}:",
+    r"(arn:[a-z0-9\-]+:vpc-lattice:[a-zA-Z0-9\-]+:\d{12}:",
     r"resourceconfiguration/rcfg-[0-9a-z]{17}))",
 );
 

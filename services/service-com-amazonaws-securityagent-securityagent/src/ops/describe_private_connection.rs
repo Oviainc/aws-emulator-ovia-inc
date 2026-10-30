@@ -184,12 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DescribePrivateConnectionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "Private connection '{}' was not found. Verify that the \
-                             resource identifier is correct and that the resource \
-                             exists in the specified agent space or account.",
-                            input.private_connection_name
-                        ),
+                        // The service's own sentence for a private connection it cannot
+                        // resolve (`crate::state::PRIVATE_CONNECTION_NOT_FOUND`), not the
+                        // documentation of the error class and not a sentence built from
+                        // the name the request carried.
+                        message: crate::state::PRIVATE_CONNECTION_NOT_FOUND.to_string(),
                     },
                 )
             })?;
