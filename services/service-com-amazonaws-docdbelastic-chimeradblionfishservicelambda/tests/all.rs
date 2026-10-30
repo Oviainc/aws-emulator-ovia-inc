@@ -19,5 +19,7 @@ mod error_resource_identity;
 mod maintenance_and_restore;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

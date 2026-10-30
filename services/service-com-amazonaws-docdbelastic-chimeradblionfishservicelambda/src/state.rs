@@ -41,6 +41,22 @@ pub struct ComAmazonawsDocdbelasticChimeradblionfishservicelambdaState {
     pub snapshot_names: BTreeMap<String, String>,
 }
 
+impl ComAmazonawsDocdbelasticChimeradblionfishservicelambdaState {
+    /// The tags persisted on the resource `arn` names, whichever kind of taggable
+    /// resource this service owns it is, or `None` when this store holds no resource
+    /// under that ARN.
+    ///
+    /// A tagging call is addressed by ARN alone, so the lookup spans every taggable
+    /// collection rather than one kind's: the ARN is each record's own key, so at most
+    /// one collection can hold it.
+    pub fn tags_of(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
+        self.clusters
+            .get(arn)
+            .map(|cluster| &cluster.tags)
+            .or_else(|| self.snapshots.get(arn).map(|snapshot| &snapshot.tags))
+    }
+}
+
 /// One persisted elastic cluster.
 ///
 /// `admin_user_password` is held because `UpdateCluster` can change it, and is NEVER
@@ -747,6 +763,38 @@ impl ResourceKind {
     /// The ARN of the resource of this kind with id `resource_id`, in `region`.
     pub fn arn(self, region: &str, resource_id: &str) -> String {
         docdb_elastic_arn(region, &format!("{}/{resource_id}", self.arn_segment()))
+    }
+}
+
+/// The resource field of an ARN — what follows the account field — with any resource
+/// id stripped, or `None` when `value` is not shaped like an ARN at all.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`, and this
+/// service spells `<resource>` as `<segment>/<id>`.
+fn arn_resource_segment(value: &str) -> Option<&str> {
+    let mut fields = value.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    // partition, service, region, account: a tagging call addresses a resource by the
+    // whole ARN, which is this store's key, so none of them is read here.
+    let resource = fields.nth(4)?;
+    Some(resource.split('/').next().unwrap_or(resource))
+}
+
+/// Which kind of resource an ARN handed to a tagging call addresses.
+///
+/// A tagging operation names no resource kind of its own, so the kind comes from the
+/// ARN's own resource segment ([`ResourceKind::arn_segment`]). An identifier spelling
+/// no segment this service owns addresses this service's primary taggable resource,
+/// the elastic cluster its tagging operations are documented over ("Lists all tags on
+/// a elastic cluster resource").
+pub fn tagged_resource_kind(arn: &str) -> ResourceKind {
+    match arn_resource_segment(arn) {
+        Some(segment) if segment == ResourceKind::ClusterSnapshot.arn_segment() => {
+            ResourceKind::ClusterSnapshot
+        }
+        _ => ResourceKind::Cluster,
     }
 }
 
