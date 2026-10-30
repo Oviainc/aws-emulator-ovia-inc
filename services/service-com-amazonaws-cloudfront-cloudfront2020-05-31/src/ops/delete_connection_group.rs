@@ -217,12 +217,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // A group that still carries `Enabled` is one "the specified CloudFront resource
-        // hasn't been disabled yet" is about: the caller turns it off with an update first,
-        // and until then the group stays readable exactly as it was.
+        // A group that still carries `Enabled` is one the caller has to disable first: it
+        // turns the group off with an update, and until then the group stays readable
+        // exactly as it was.
         if enabled {
             return Err(DeleteConnectionGroupErrorModeled::ResourceNotDisabled(
-                crate::state::resource_not_disabled(),
+                crate::state::connection_group_not_disabled(),
             )
             .into());
         }

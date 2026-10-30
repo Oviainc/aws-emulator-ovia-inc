@@ -61,6 +61,8 @@ mod continuous_deployment_policy_delete;
 mod continuous_deployment_policy_update;
 #[path = "all/create_location_header.rs"]
 mod create_location_header;
+#[path = "all/delete_conflict_refusals.rs"]
+mod delete_conflict_refusals;
 #[path = "all/distribution_config_defaults.rs"]
 mod distribution_config_defaults;
 #[path = "all/distribution_config_read.rs"]

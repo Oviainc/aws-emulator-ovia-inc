@@ -223,11 +223,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // update your distributions to remove the function association from all cache
         // behaviors, then delete the function." So a function any stored cache behaviour
         // still attaches is refused here and stays readable — the same attachment check the
-        // publish path computes a published stage's status from.
-        if store.function_is_associated(&arn) {
-            return Err(
-                DeleteFunctionErrorModeled::FunctionInUse(crate::state::function_in_use()).into(),
-            );
+        // publish path computes a published stage's status from, counted so the refusal can
+        // report how many distributions the caller has to update.
+        let holders = store.distributions_using_function(&arn);
+        if holders > 0 {
+            return Err(DeleteFunctionErrorModeled::FunctionInUse(
+                crate::state::function_in_use(&input.name, holders),
+            )
+            .into());
         }
 
         // Gone means gone: the ONE record every read of this function answered from is

@@ -214,13 +214,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An identity an Amazon S3 origin still names is in use: "To delete the origin
         // access identity from an existing distribution, update the distribution
         // configuration and include an empty OriginAccessIdentity element." So an identity
-        // a stored configuration still names stays readable, and the refusal names the
-        // distribution holding it.
-        if let Some(holder) = store.distribution_using_origin_access_identity(&input.id) {
-            let in_use = crate::state::origin_access_identity_in_use(holder);
+        // a stored configuration still names stays readable, and the refusal states that
+        // condition without naming the distribution that holds the reference.
+        if store
+            .distribution_using_origin_access_identity(&input.id)
+            .is_some()
+        {
             return Err(
                 DeleteCloudFrontOriginAccessIdentityErrorModeled::CloudFrontOriginAccessIdentityInUse(
-                    in_use,
+                    crate::state::origin_access_identity_in_use(),
                 )
                 .into(),
             );

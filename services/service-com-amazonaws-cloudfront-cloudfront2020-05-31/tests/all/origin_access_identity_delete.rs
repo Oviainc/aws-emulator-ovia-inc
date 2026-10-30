@@ -715,18 +715,17 @@ async fn an_identity_an_s3_origin_still_names_cannot_be_deleted() {
             refused.error_code(),
             refused.raw
         );
-        // The refusal states the condition the shape documents, and names the distribution
-        // holding the identity — the one piece of store-derived detail in it, and the one a
-        // caller cannot work out for itself.
+        // The refusal states the condition, and names neither the distribution holding the
+        // identity nor anything else out of the store.
         let message = refused.root().find_text("Message").unwrap_or_default();
-        assert!(
-            message.starts_with("The Origin Access Identity specified is already in use"),
+        assert_eq!(
+            message, "The CloudFront origin access identity is still being used.",
             "case {case}: expected the sentence CloudFront answers this code with, got \
              {message:?}"
         );
         assert!(
-            message.contains(&holder_id),
-            "case {case}: expected the refusal to name {holder_id}, got {message:?}"
+            !message.contains(&holder_id),
+            "case {case}: expected the refusal to name no distribution, got {message:?}"
         );
         // And it destroys nothing: the identity is still readable at the same version.
         let after = get_identity(&router, &id).await;

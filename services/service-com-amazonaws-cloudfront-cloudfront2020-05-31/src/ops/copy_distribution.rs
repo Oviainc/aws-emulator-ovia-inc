@@ -375,6 +375,17 @@ fn create_refusal(refusal: crate::state::CreateRefusal) -> CopyDistributionError
                 },
             )
         }
+        // A copy takes the configuration of a STORED distribution, and the create and the
+        // update refuse an origin that names both an origin access control and an origin
+        // access identity, so no stored configuration carries that combination and this
+        // arm cannot be reached from a copy. The model declares no mutual-exclusion error
+        // for this operation, so were it ever reached the refusal is reported as the
+        // invalid argument it is, under the same sentence and the same 400.
+        crate::state::CreateRefusal::IllegalOriginAccessConfiguration(message) => {
+            CopyDistributionErrorModeled::InvalidArgument(InvalidArgument {
+                message: Some(message),
+            })
+        }
     }
     .into()
 }

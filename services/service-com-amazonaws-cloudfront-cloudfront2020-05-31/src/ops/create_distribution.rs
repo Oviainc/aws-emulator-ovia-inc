@@ -377,6 +377,13 @@ fn create_refusal(refusal: crate::state::CreateRefusal) -> CreateDistributionErr
                 },
             )
         }
+        crate::state::CreateRefusal::IllegalOriginAccessConfiguration(message) => {
+            CreateDistributionErrorModeled::IllegalOriginAccessConfiguration(
+                IllegalOriginAccessConfiguration {
+                    message: Some(message),
+                },
+            )
+        }
         crate::state::CreateRefusal::InvalidLambdaFunctionAssociation(message) => {
             CreateDistributionErrorModeled::InvalidLambdaFunctionAssociation(
                 InvalidLambdaFunctionAssociation {

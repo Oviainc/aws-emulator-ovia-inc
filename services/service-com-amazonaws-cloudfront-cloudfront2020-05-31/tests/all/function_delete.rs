@@ -64,11 +64,12 @@ const UNHELD_VERSION_TOKEN: &str = "E1ABCDEFGHIJKL";
 /// constant in the crate cannot make this assertion pass.
 const NO_SUCH_FUNCTION_MESSAGE: &str = "The specified function does not exist.";
 
-/// The sentence CloudFront answers a delete of an attached function with, as the model
-/// documents `FunctionInUse` (`smithy_query(query="doc", shape="FunctionInUse")`), spelled
-/// out here so a wrong constant in the crate cannot make this assertion pass.
-const FUNCTION_IN_USE_MESSAGE: &str =
-    "Cannot delete the function because it's attached to one or more cache behaviors.";
+/// The sentence CloudFront answers a delete of an attached function with, for the function
+/// `name` that `distributions` distributions attach — the served template, spelled out here
+/// so a wrong template in the crate cannot make this assertion pass.
+fn function_in_use_message(name: &str, distributions: usize) -> String {
+    format!("Cannot delete function {name}, it is in use by {distributions} distributions")
+}
 
 // ---------------------------------------------------------------------------
 // Calling the delete
@@ -643,8 +644,9 @@ async fn a_function_a_cache_behaviour_attaches_cannot_be_deleted() {
         );
         let message = refused.root().find_text("Message").unwrap_or_default();
         assert_eq!(
-            message, FUNCTION_IN_USE_MESSAGE,
-            "case {case}: expected the documented FunctionInUse sentence, got {message:?}"
+            message,
+            function_in_use_message(&create.name, 1),
+            "case {case}: expected the served FunctionInUse sentence, got {message:?}"
         );
         // The refused delete removed nothing.
         let still = development_etag(&router, &create.name).await;

@@ -5180,6 +5180,16 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             return Err(CreateRefusal::InvalidLambdaFunctionAssociation(message));
         }
 
+        // An origin reaches a private bucket EITHER with the credentials of an origin
+        // access control OR as an origin access identity, never both: a configuration whose
+        // origin names both says nothing about which signs it, so it is refused before any
+        // distribution is created from it.
+        if origin_with_both_access_mechanisms(&config) {
+            return Err(CreateRefusal::IllegalOriginAccessConfiguration(
+                ILLEGAL_ORIGIN_ACCESS_CONFIGURATION_MESSAGE.to_string(),
+            ));
+        }
+
         // An origin signs its requests to the bucket with the credentials of the origin
         // access control it names, so a configuration can only be stored while every
         // control it names exists: a reference to one this account does not hold is
@@ -6376,6 +6386,10 @@ pub enum CreateRefusal {
     /// access control this account does not hold (see
     /// [`ComAmazonawsCloudfrontCloudfront20200531State::unknown_origin_access_control`]).
     InvalidOriginAccessControl(String),
+    /// `IllegalOriginAccessConfiguration` — an origin of the configuration names both an
+    /// origin access control and an origin access identity (see
+    /// [`origin_with_both_access_mechanisms`]).
+    IllegalOriginAccessConfiguration(String),
     /// `InvalidLambdaFunctionAssociation` — a cache behaviour of the configuration carries
     /// an edge association naming no published function version (see
     /// [`lambda_association_without_version`]).
@@ -8474,6 +8488,38 @@ pub fn lambda_association_without_version(config: &DistributionConfig) -> Option
         })
 }
 
+/// Whether an origin of `config` names BOTH an origin access control and an origin access
+/// identity, which is the configuration `IllegalOriginAccessConfiguration` refuses: "An
+/// origin cannot contain both an origin access control (OAC) and an origin access identity
+/// (OAI)."
+///
+/// The two are the two ways ONE origin reaches a private Amazon S3 bucket — `Origin$
+/// OriginAccessControlId` names the control whose credentials sign the origin request, and
+/// `S3OriginConfig$OriginAccessIdentity` names the identity CloudFront reaches the bucket
+/// as — so an origin naming both says nothing about which of them signs it, and the
+/// configuration is refused rather than stored. Either member is documented EMPTY for an
+/// origin that names none ("specify an empty `OriginAccessIdentity` element"), so an
+/// absent or empty value is not a reference and an origin carrying one of them is fine.
+///
+/// Checked on the way IN, on every path that stores a `DistributionConfig`, and for EVERY
+/// origin of it, so no stored origin ever carries both: the condition is a property of the
+/// submitted configuration alone, which is why it lives here beside
+/// [`alias_certificate_mismatch`] and [`lambda_association_without_version`] rather than
+/// in one handler.
+pub fn origin_with_both_access_mechanisms(config: &DistributionConfig) -> bool {
+    config.origins.items.iter().any(|origin| {
+        let control = origin
+            .origin_access_control_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty());
+        let identity = origin
+            .s3_origin_config
+            .as_ref()
+            .is_some_and(|s3| !s3.origin_access_identity.trim().is_empty());
+        control && identity
+    })
+}
+
 /// Whether `arn` names a PUBLISHED Lambda function version.
 ///
 /// A version is addressed by the function's own ARN —
@@ -9488,15 +9534,21 @@ pub fn distribution_tenant_not_found() -> EntityNotFound {
     }
 }
 
-/// `ResourceNotDisabled`'s message: the sentence the model states on the shape itself —
-/// "The specified CloudFront resource hasn't been disabled yet." — worded as this service
-/// words the same condition for a distribution ([`DISTRIBUTION_NOT_DISABLED_MESSAGE`]).
+/// The sentence CloudFront answers `ResourceNotDisabled` with for a distribution tenant,
+/// on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with for THIS resource
+/// kind, and what this emulator therefore serves. Like
+/// [`DISTRIBUTION_NOT_DISABLED_MESSAGE`] it differs from the sentence the MODEL's
+/// documentation of the error shape uses ("The specified CloudFront resource hasn't been
+/// disabled yet."): that one documents the condition for every resource kind the shape
+/// serves, this one is what a tenant's delete answers. Do not "correct" this constant to
+/// the documentation sentence.
 ///
 /// A property of the resource's own state rather than of the request, so nothing from the
 /// request belongs in it and every refusal of it reads the same.
 pub const DISTRIBUTION_TENANT_NOT_DISABLED_MESSAGE: &str =
-    "The specified distribution tenant is not disabled. You must disable the distribution \
-     tenant before you can delete it.";
+    "You must disable the distribution tenant before you can delete it.";
 
 /// The modelled `ResourceNotDisabled` (HTTP 409) for a delete of a distribution tenant that
 /// is still enabled: "To delete a distribution tenant, you must first disable the
@@ -9570,22 +9622,31 @@ pub fn connection_group_not_found() -> EntityNotFound {
     }
 }
 
-/// `ResourceNotDisabled`'s message, as the model documents the shape: "The specified
-/// CloudFront resource hasn't been disabled yet."
-pub const RESOURCE_NOT_DISABLED_MESSAGE: &str =
-    "The specified CloudFront resource hasn't been disabled yet.";
-
-/// The modelled `ResourceNotDisabled` (HTTP 409) for a delete of a resource that is still
-/// enabled.
+/// The sentence CloudFront answers `ResourceNotDisabled` with for a connection group, on
+/// the wire.
 ///
-/// FIXED service text ([`RESOURCE_NOT_DISABLED_MESSAGE`]), for the reason
+/// The WIRE text — what the recorded service answers this code with for THIS resource
+/// kind, and what this emulator therefore serves. `ResourceNotDisabled` is shared by
+/// several resource kinds and the served sentence names the kind the caller has to
+/// disable, so each kind carries its own constant
+/// ([`DISTRIBUTION_TENANT_NOT_DISABLED_MESSAGE`] is the tenant's); the sentence the
+/// MODEL's documentation of the shape uses ("The specified CloudFront resource hasn't
+/// been disabled yet.") documents the condition for all of them and is not served. Do not
+/// "correct" this constant to the documentation sentence.
+pub const CONNECTION_GROUP_NOT_DISABLED_MESSAGE: &str =
+    "You must disable the specified connection group before you can delete it.";
+
+/// The modelled `ResourceNotDisabled` (HTTP 409) for a delete of a connection group that
+/// is still enabled.
+///
+/// FIXED service text ([`CONNECTION_GROUP_NOT_DISABLED_MESSAGE`]), for the reason
 /// [`entity_in_use`]'s is fixed: what the refusal states is a property of the CONDITION —
 /// the resource has not been disabled — rather than of the request, so nothing from the
 /// request or from the store belongs in the sentence and every delete this condition
 /// refuses reads the same.
-pub fn resource_not_disabled() -> crate::ops::types::ResourceNotDisabled {
+pub fn connection_group_not_disabled() -> crate::ops::types::ResourceNotDisabled {
     crate::ops::types::ResourceNotDisabled {
-        message: Some(RESOURCE_NOT_DISABLED_MESSAGE.to_string()),
+        message: Some(CONNECTION_GROUP_NOT_DISABLED_MESSAGE.to_string()),
     }
 }
 
@@ -9749,21 +9810,32 @@ pub fn no_such_origin_access_identity() -> NoSuchCloudFrontOriginAccessIdentity 
     }
 }
 
-/// The modelled `CloudFrontOriginAccessIdentityInUse` (HTTP 409) for a delete of an
-/// identity an Amazon S3 origin of `distribution_id` still names.
+/// The sentence CloudFront answers `CloudFrontOriginAccessIdentityInUse` with, on the wire.
 ///
-/// The sentence is the one the model states on the shape itself — "The Origin Access
-/// Identity specified is already in use." — up to the distribution that names it, which it
-/// names at the end: the one piece of store-derived detail in it, and the one a caller
-/// cannot work out for itself. The same shape [`origin_access_control_in_use`] takes, for
-/// the same rule applied to the other way an origin reaches a bucket.
-pub fn origin_access_identity_in_use(
-    distribution_id: &str,
-) -> crate::ops::types::CloudFrontOriginAccessIdentityInUse {
+/// The WIRE text — what the recorded service answers this code with, and what this
+/// emulator therefore serves. Like [`DISTRIBUTION_NOT_DISABLED_MESSAGE`] it differs from
+/// the sentence the MODEL's documentation of the error shape uses for the same condition
+/// ("The Origin Access Identity specified is already in use."): that one documents the
+/// condition, this one is served. Do not "correct" this constant to the documentation
+/// sentence.
+///
+/// The sentence names the resource KIND and nothing else: the condition is that something
+/// still references the identity, which is a property of the store rather than of the
+/// request, and the referencing distribution's own id is NOT part of it — the same shape
+/// [`ORIGIN_ACCESS_CONTROL_IN_USE_MESSAGE`] takes for the other way an origin reaches a
+/// bucket.
+pub const ORIGIN_ACCESS_IDENTITY_IN_USE_MESSAGE: &str =
+    "The CloudFront origin access identity is still being used.";
+
+/// The modelled `CloudFrontOriginAccessIdentityInUse` (HTTP 409) for a delete of an
+/// identity an Amazon S3 origin still names.
+///
+/// FIXED service text ([`ORIGIN_ACCESS_IDENTITY_IN_USE_MESSAGE`]), so every refusal of this
+/// condition reads the same and none of them leaks the identifier of the resource holding
+/// the reference.
+pub fn origin_access_identity_in_use() -> crate::ops::types::CloudFrontOriginAccessIdentityInUse {
     crate::ops::types::CloudFrontOriginAccessIdentityInUse {
-        message: Some(format!(
-            "The Origin Access Identity specified is already in use: {distribution_id}"
-        )),
+        message: Some(ORIGIN_ACCESS_IDENTITY_IN_USE_MESSAGE.to_string()),
     }
 }
 
@@ -10047,6 +10119,31 @@ pub fn invalid_origin_access_control() -> crate::ops::types::InvalidOriginAccess
 pub const INVALID_ORIGIN_ACCESS_CONTROL_MESSAGE: &str =
     "The specified origin access control does not exist or is not valid.";
 
+/// The modelled `IllegalOriginAccessConfiguration` (HTTP 400) for a configuration whose
+/// origin names BOTH an origin access control and an origin access identity.
+///
+/// The sentence states the condition the configuration broke — the two mechanisms are
+/// mutually exclusive on one origin — which is a property of the configuration's shape
+/// rather than of any value in it, so no origin id, control id or identity id belongs in
+/// the text.
+pub fn illegal_origin_access_configuration() -> crate::ops::types::IllegalOriginAccessConfiguration
+{
+    crate::ops::types::IllegalOriginAccessConfiguration {
+        message: Some(ILLEGAL_ORIGIN_ACCESS_CONFIGURATION_MESSAGE.to_string()),
+    }
+}
+
+/// The message `IllegalOriginAccessConfiguration` carries, on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with, and what this
+/// emulator therefore serves. Like [`INVALID_ORIGIN_ACCESS_CONTROL_MESSAGE`] it differs
+/// from the sentence the MODEL's documentation of the error shape uses for the same rule
+/// ("An origin cannot contain both an origin access control (OAC) and an origin access
+/// identity (OAI)."): that one documents the condition, this one is served. Do not
+/// "correct" this constant to the documentation sentence.
+pub const ILLEGAL_ORIGIN_ACCESS_CONFIGURATION_MESSAGE: &str =
+    "Cannot use both Origin Access Control and Origin Access Identity on an origin";
+
 /// The message `InvalidLambdaFunctionAssociation` carries for the association whose ARN
 /// names no published function version: the fixed sentence stating the FORM the ARN has to
 /// have — the function ARN qualified with the number of a published version — and then the
@@ -10079,21 +10176,30 @@ pub fn origin_access_control_already_exists_message(existing_id: &str) -> String
     )
 }
 
-/// The modelled `OriginAccessControlInUse` (HTTP 409) for a delete of a control an origin
-/// of `distribution_id` still names.
+/// The sentence CloudFront answers `OriginAccessControlInUse` with, on the wire.
 ///
-/// The sentence is the one the model states on the shape itself — "Cannot delete the
-/// origin access control because it's in use by one or more distributions." — up to the
-/// distribution that holds it, which it names at the end: the one piece of store-derived
-/// detail in it, and the one a caller cannot work out for itself.
-pub fn origin_access_control_in_use(
-    distribution_id: &str,
-) -> crate::ops::types::OriginAccessControlInUse {
+/// The WIRE text — what the recorded service answers this code with, and what this
+/// emulator therefore serves. Like [`DISTRIBUTION_NOT_DISABLED_MESSAGE`] it differs from
+/// the sentence the MODEL's documentation of the error shape uses for the same condition
+/// ("Cannot delete the origin access control because it's in use by one or more
+/// distributions."): that one documents the condition, this one is served. Do not
+/// "correct" this constant to the documentation sentence.
+///
+/// The sentence names the resource KIND and nothing else, for the reason
+/// [`ORIGIN_ACCESS_IDENTITY_IN_USE_MESSAGE`] does: the condition is that something still
+/// references the control, and the referencing distribution's own id is no part of it.
+pub const ORIGIN_ACCESS_CONTROL_IN_USE_MESSAGE: &str =
+    "The CloudFront origin access control is still being used.";
+
+/// The modelled `OriginAccessControlInUse` (HTTP 409) for a delete of a control an origin
+/// still names.
+///
+/// FIXED service text ([`ORIGIN_ACCESS_CONTROL_IN_USE_MESSAGE`]), so every refusal of this
+/// condition reads the same and none of them leaks the identifier of the resource holding
+/// the reference.
+pub fn origin_access_control_in_use() -> crate::ops::types::OriginAccessControlInUse {
     crate::ops::types::OriginAccessControlInUse {
-        message: Some(format!(
-            "Cannot delete the origin access control because it's in use by one or more \
-             distributions: {distribution_id}"
-        )),
+        message: Some(ORIGIN_ACCESS_CONTROL_IN_USE_MESSAGE.to_string()),
     }
 }
 

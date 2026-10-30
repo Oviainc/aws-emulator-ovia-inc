@@ -625,12 +625,17 @@ async fn a_control_an_origin_still_names_cannot_be_deleted() {
             refused.error_code(),
             refused.raw
         );
-        // The refusal names the distribution holding it — the one piece of detail a
-        // caller cannot work out for itself.
+        // The refusal states the condition and names no distribution: which distribution
+        // holds the reference is no part of the sentence CloudFront serves.
         let message = refused.root().find_text("Message").unwrap_or_default();
+        assert_eq!(
+            message, "The CloudFront origin access control is still being used.",
+            "case {case}: expected the sentence CloudFront answers this code with, got \
+             {message:?}"
+        );
         assert!(
-            message.contains(&distribution_id),
-            "case {case}: expected the refusal to name {distribution_id}, got {message:?}"
+            !message.contains(&distribution_id),
+            "case {case}: expected the refusal to name no distribution, got {message:?}"
         );
         // And it destroys nothing: the control is still readable at the same version.
         let after = get_control(&router, &id).await;

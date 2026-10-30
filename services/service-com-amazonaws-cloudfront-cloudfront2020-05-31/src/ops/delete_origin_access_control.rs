@@ -211,14 +211,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You cannot delete an origin access control if it's in use. First, update all
         // distributions to remove the origin access control from all origins, then delete
         // the origin access control." So a control an origin of any stored distribution
-        // still names is refused here and stays readable.
-        if let Some(holder) = store
+        // still names is refused here and stays readable, and the refusal states that
+        // condition without naming the distribution that holds the reference.
+        if store
             .distribution_using_origin_access_control(&input.id)
-            .map(|distribution| distribution.id.clone())
+            .is_some()
         {
             return Err(
                 DeleteOriginAccessControlErrorModeled::OriginAccessControlInUse(
-                    crate::state::origin_access_control_in_use(&holder),
+                    crate::state::origin_access_control_in_use(),
                 )
                 .into(),
             );

@@ -335,9 +335,24 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// whether a published stage reports [`FUNCTION_STATUS_ASSOCIATED`] or
     /// [`FUNCTION_STATUS_UNASSOCIATED`].
     pub fn function_is_associated(&self, arn: &str) -> bool {
+        self.distributions_using_function(arn) > 0
+    }
+
+    /// How many distributions this store holds attach the function `arn`.
+    ///
+    /// The COUNT behind [`Self::function_is_associated`], over the same stored
+    /// configurations and by the same rule: a function is attached to a distribution by a
+    /// cache behaviour's `FunctionAssociation$FunctionARN`, so a distribution counts once
+    /// however many of its behaviours name the function. It is what the still-in-use
+    /// refusal reports ([`function_in_use`]), so the number a caller is told is the number
+    /// of distributions it has to update.
+    pub fn distributions_using_function(&self, arn: &str) -> usize {
         self.distributions
             .values()
-            .any(|distribution| associated_function_arns(&distribution.config).any(|it| it == arn))
+            .filter(|distribution| {
+                associated_function_arns(&distribution.config).any(|it| it == arn)
+            })
+            .count()
     }
 
     /// Copy the `DEVELOPMENT` stage of the function `name` names into its `LIVE` stage, and
@@ -450,24 +465,34 @@ pub fn function_already_exists(name: &str) -> crate::ops::types::FunctionAlready
 }
 
 /// The modelled `FunctionInUse` (HTTP 409) for a delete of a function a cache behaviour
-/// still attaches.
+/// still attaches, naming the function `name` and the number of distributions that attach
+/// it.
 ///
-/// The sentence is the one the model states on the shape itself, and it is a property of
-/// the CONDITION rather than of the request — the function is attached to a cache
-/// behaviour, and the caller is told to remove the association first — so nothing from the
-/// request or from the store belongs in it and every refusal of this condition reads the
-/// same, exactly as [`super::cache_policy_in_use`] words the same condition for the other
-/// resource a cache behaviour attaches.
-pub fn function_in_use() -> crate::ops::types::FunctionInUse {
+/// Unlike the still-in-use refusals whose served sentence is fixed
+/// ([`super::ORIGIN_ACCESS_CONTROL_IN_USE_MESSAGE`] and its neighbours), the sentence this
+/// code is served with has VARIABLE parts — the function and how many distributions hold
+/// it — so each is filled from where it is known: the name from the request that addressed
+/// the function, the count from the stored distributions
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::distributions_using_function`]).
+/// Neither names any distribution.
+pub fn function_in_use(name: &str, distributions: usize) -> crate::ops::types::FunctionInUse {
     crate::ops::types::FunctionInUse {
-        message: Some(FUNCTION_IN_USE_MESSAGE.to_string()),
+        message: Some(function_in_use_message(name, distributions)),
     }
 }
 
-/// `FunctionInUse`'s message, as the model documents the shape: "Cannot delete the
-/// function because it's attached to one or more cache behaviors."
-pub const FUNCTION_IN_USE_MESSAGE: &str =
-    "Cannot delete the function because it's attached to one or more cache behaviors.";
+/// The sentence CloudFront answers `FunctionInUse` with, on the wire, for the function
+/// `name` that `distributions` distributions attach.
+///
+/// The WIRE template — what the recorded service answers this code with, and what this
+/// emulator therefore serves. Like [`super::DISTRIBUTION_NOT_DISABLED_MESSAGE`] it differs
+/// from the sentence the MODEL's documentation of the error shape uses for the same
+/// condition ("Cannot delete the function because it's attached to one or more cache
+/// behaviors."): that one documents the condition, this one is served. Do not "correct"
+/// this template to the documentation sentence.
+pub fn function_in_use_message(name: &str, distributions: usize) -> String {
+    format!("Cannot delete function {name}, it is in use by {distributions} distributions")
+}
 
 /// The modelled `NoSuchFunctionExists` (HTTP 404) for a function stage no stored function
 /// has — either no function of that name, or a function that has never been published to

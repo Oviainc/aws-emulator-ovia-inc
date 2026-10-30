@@ -429,7 +429,7 @@ pub const NO_SUCH_REALTIME_LOG_CONFIG_MESSAGE: &str =
 /// The modelled `RealtimeLogConfigInUse` (HTTP 400) for a delete of a configuration a
 /// cache behaviour still sends records through.
 ///
-/// The sentence is the one the model states on the shape itself — a property of the
+/// FIXED service text ([`REALTIME_LOG_CONFIG_IN_USE_MESSAGE`]) — a property of the
 /// CONDITION rather than of the request, so nothing from the request or the store belongs
 /// in it and every refusal of this condition reads the same.
 pub fn realtime_log_config_in_use() -> crate::ops::types::RealtimeLogConfigInUse {
@@ -438,10 +438,16 @@ pub fn realtime_log_config_in_use() -> crate::ops::types::RealtimeLogConfigInUse
     }
 }
 
-/// `RealtimeLogConfigInUse`'s message, as the model documents the shape.
+/// The sentence CloudFront answers `RealtimeLogConfigInUse` with, on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with, and what this
+/// emulator therefore serves. Like [`super::DISTRIBUTION_NOT_DISABLED_MESSAGE`] it differs
+/// from the sentence the MODEL's documentation of the error shape uses for the same
+/// condition ("Cannot delete the real-time log configuration because it is attached to one
+/// or more cache behaviors."): that one documents the condition, this one is served. Do
+/// not "correct" this constant to the documentation sentence.
 pub const REALTIME_LOG_CONFIG_IN_USE_MESSAGE: &str =
-    "Cannot delete the real-time log configuration because it is attached to one or more \
-     cache behaviors.";
+    "The CloudFront real-time log configuration is still being used.";
 
 /// Whether `config` sends any of its cache behaviours' logs through the real-time log
 /// configuration `arn` names.

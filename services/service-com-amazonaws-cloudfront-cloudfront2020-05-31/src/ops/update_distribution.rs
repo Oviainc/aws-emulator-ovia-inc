@@ -461,6 +461,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The same rule the create path applies: an origin reaches a private bucket EITHER
+        // with the credentials of an origin access control OR as an origin access identity,
+        // so an update cannot leave an origin naming both either.
+        if crate::state::origin_with_both_access_mechanisms(&input.distribution_config) {
+            return Err(
+                UpdateDistributionErrorModeled::IllegalOriginAccessConfiguration(
+                    crate::state::illegal_origin_access_configuration(),
+                )
+                .into(),
+            );
+        }
+
         // The same rule the create path applies: an origin reaches its bucket with the
         // credentials of the origin access control it names, so an update cannot leave a
         // distribution naming a control this account does not hold either.

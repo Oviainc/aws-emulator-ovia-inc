@@ -57,12 +57,11 @@ use crate::distribution_tenant_lifecycle::{
 };
 use crate::distribution_tenant_update::{update_tenant, update_xml};
 
-/// The sentence CloudFront answers `ResourceNotDisabled` with, as the model documents the
-/// error shape (`smithy_query(query="doc",shape="ResourceNotDisabled")`) — written out as
-/// the LITERAL rather than read back off the crate's own constant, so a change to that
-/// constant fails this case.
+/// The sentence CloudFront answers `ResourceNotDisabled` with for a CONNECTION GROUP —
+/// written out as the LITERAL rather than read back off the crate's own constant, so a
+/// change to that constant fails this case.
 const MODELLED_RESOURCE_NOT_DISABLED_MESSAGE: &str =
-    "The specified CloudFront resource hasn't been disabled yet.";
+    "You must disable the specified connection group before you can delete it.";
 
 /// The sentence CloudFront answers `CannotDeleteEntityWhileInUse` with, as the model
 /// documents the error shape (`smithy_query(query="doc",shape="CannotDeleteEntityWhileInUse")`),
@@ -612,7 +611,8 @@ async fn an_enabled_group_is_refused_until_an_update_disables_it() {
         assert_eq!(
             refused.root().find_text("Message"),
             Some(MODELLED_RESOURCE_NOT_DISABLED_MESSAGE),
-            "case {case}: expected the sentence the model states for the error shape, got {}",
+            "case {case}: expected the sentence CloudFront serves for this resource kind, \
+             got {}",
             refused.raw
         );
 
