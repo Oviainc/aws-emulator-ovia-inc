@@ -464,6 +464,16 @@ pub fn flow_arn(region: &str, flow_name: &str) -> String {
     ::emulator_server::emulator_arn("appflow", region, &format!("flow/{flow_name}"))
 }
 
+/// A registered connector's ARN:
+/// `arn:aws:appflow:<region>:<account>:connector/<connectorLabel>`.
+///
+/// The label is what identifies one `ConnectorRegistration` in an account
+/// (`smithy_query(query="doc", shape="DescribeConnectorRequest", member="connectorLabel")`),
+/// so it is the resource part of the ARN, built the same way a flow's is.
+pub fn connector_arn(region: &str, connector_label: &str) -> String {
+    ::emulator_server::emulator_arn("appflow", region, &format!("connector/{connector_label}"))
+}
+
 /// One modelled shape as the JSON `Value` the service's own codec renders for it.
 ///
 /// Rendering through the codec is what makes two shapes comparable at all: several of
@@ -712,6 +722,19 @@ pub const DEFAULT_CONNECTOR_PAGE_SIZE: usize = 20;
 /// The `connectorType` of a connector a caller registered themselves, rather than one
 /// AppFlow vends (`smithy_query(query="shape", shape="ConnectorType")`).
 pub const CONNECTOR_TYPE_CUSTOM: &str = "CustomConnector";
+
+/// The connection mode a registered connector declares when a flow may READ from it.
+///
+/// `ConnectorMode` is a free-form string in the model
+/// (`smithy_query(query="shape", shape="ConnectorMode")`); the two modes a connector
+/// declares to AppFlow are the direction it supports — reading from the application and
+/// writing to it (`ConnectorDetail$connectorModes`: "The connection mode that the
+/// connector supports").
+pub const CONNECTOR_MODE_SOURCE: &str = "SOURCE";
+
+/// The connection mode a registered connector declares when a flow may WRITE to it (see
+/// [`CONNECTOR_MODE_SOURCE`]).
+pub const CONNECTOR_MODE_DESTINATION: &str = "DESTINATION";
 
 /// Every scheduling frequency a scheduled flow can run at, in the order the model
 /// declares them (`smithy_query(query="shape", shape="ScheduleFrequencyType")`).
@@ -1100,66 +1123,164 @@ fn connector_metadata(connector_type: &str) -> Option<ConnectorMetadata> {
     Some(metadata)
 }
 
-impl VendedConnector {
-    /// The wire `ConnectorConfiguration` for this connector.
-    ///
-    /// Everything beyond the catalog's own members is DERIVED here, from what a flow can
-    /// do with the connector:
-    ///
-    /// * a connector a flow can read FROM is the one that decides how the flow runs, so
-    ///   it reports the destinations a flow may send its records to, the frequencies a
-    ///   schedule may use, the trigger types that can run the flow and the operators its
-    ///   tasks may apply; a connector that can only be written to reports none of those,
-    ///   because a flow is never driven by its destination;
-    /// * a connector a flow can write TO reports the write operations it accepts.
-    pub fn to_connector_configuration(&self) -> ConnectorConfiguration {
-        let as_strings = |values: &[&str]| -> Vec<String> {
-            values.iter().map(|value| (*value).to_string()).collect()
-        };
+/// Everything a `ConnectorConfiguration` states about what a FLOW may do with a
+/// connector, DERIVED from that connector's capabilities alone.
+///
+/// Shared by the connectors AppFlow vends
+/// ([`VendedConnector::to_connector_configuration`]) and the connectors a caller
+/// registered ([`registered_connector_configuration`]), so the two can never report the
+/// same capability differently:
+///
+/// * a connector a flow can read FROM is the one that decides how the flow runs, so it
+///   reports the destinations a flow may send its records to, the frequencies a schedule
+///   may use, the trigger types that can run the flow and the operators its tasks may
+///   apply; a connector that can only be written to reports none of those, because a
+///   flow is never driven by its destination;
+/// * a connector a flow can write TO reports the write operations it accepts.
+///
+/// The members that IDENTIFY a connector (its type, its metadata, the registration it
+/// came from) are not capabilities, so each caller fills those in itself.
+fn capability_configuration(
+    can_use_as_source: bool,
+    can_use_as_destination: bool,
+    supports_event_trigger: bool,
+    is_private_link_enabled: bool,
+    data_transfer_types: Vec<String>,
+    write_operations: Vec<String>,
+) -> ConnectorConfiguration {
+    let as_strings = |values: &[&str]| -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    };
 
-        // In the order the model declares `TriggerType`.
-        let mut supported_trigger_types: Vec<String> = Vec::new();
-        if self.can_use_as_source {
-            supported_trigger_types.push(TRIGGER_TYPE_SCHEDULED.to_string());
-            if self.supports_event_trigger {
-                supported_trigger_types.push(TRIGGER_TYPE_EVENT.to_string());
-            }
-            supported_trigger_types.push(TRIGGER_TYPE_ON_DEMAND.to_string());
+    // In the order the model declares `TriggerType`.
+    let mut supported_trigger_types: Vec<String> = Vec::new();
+    if can_use_as_source {
+        supported_trigger_types.push(TRIGGER_TYPE_SCHEDULED.to_string());
+        if supports_event_trigger {
+            supported_trigger_types.push(TRIGGER_TYPE_EVENT.to_string());
         }
+        supported_trigger_types.push(TRIGGER_TYPE_ON_DEMAND.to_string());
+    }
 
+    ConnectorConfiguration {
+        can_use_as_source,
+        can_use_as_destination,
+        supported_destination_connectors: Some(if can_use_as_source {
+            destination_connector_types()
+        } else {
+            Vec::new()
+        }),
+        supported_scheduling_frequencies: Some(if can_use_as_source {
+            as_strings(&SCHEDULE_FREQUENCIES)
+        } else {
+            Vec::new()
+        }),
+        is_private_link_enabled,
+        // A connector resolves its own endpoint from the connector profile it is used
+        // through, so the caller never supplies a PrivateLink endpoint URL for one.
+        is_private_link_endpoint_url_required: false,
+        supported_trigger_types: Some(supported_trigger_types),
+        supported_operators: Some(if can_use_as_source {
+            as_strings(&OPERATORS)
+        } else {
+            Vec::new()
+        }),
+        supported_write_operations: Some(write_operations),
+        supported_data_transfer_types: Some(data_transfer_types),
+        ..ConnectorConfiguration::default()
+    }
+}
+
+/// The wire `ConnectorConfiguration` for a connector a caller REGISTERED, built from the
+/// registration the store holds.
+///
+/// A registration states which connection modes the connector supports, and those modes
+/// are what a flow may do with it: one that declares the source mode can be read from,
+/// one that declares the destination mode can be written to, and every derived member
+/// then follows the same way it does for a connector AppFlow vends
+/// ([`capability_configuration`]). A registered connector reaches its application
+/// through the Lambda it was registered with rather than from AppFlow's own network, so
+/// no PrivateLink connection and no application event belong to it; a destination it
+/// serves accepts the write operations the connector interface defines, which is what
+/// the Lambda implements.
+pub fn registered_connector_configuration(
+    detail: &crate::ops::types::ConnectorDetail,
+    region: &str,
+) -> ConnectorConfiguration {
+    let declares = |mode: &str| {
+        detail
+            .connector_modes
+            .as_ref()
+            .is_some_and(|modes| modes.iter().any(|declared| declared == mode))
+    };
+    let can_use_as_source = declares(CONNECTOR_MODE_SOURCE);
+    let can_use_as_destination = declares(CONNECTOR_MODE_DESTINATION);
+    let write_operations = if can_use_as_destination {
+        EVERY_WRITE_OPERATION
+    } else {
+        NO_WRITE_OPERATION
+    };
+
+    ConnectorConfiguration {
+        connector_type: detail.connector_type.clone(),
+        connector_label: detail.connector_label.clone(),
+        connector_name: detail.connector_name.clone(),
+        connector_description: detail.connector_description.clone(),
+        connector_owner: detail.connector_owner.clone(),
+        connector_version: detail.connector_version.clone(),
+        connector_modes: detail.connector_modes.clone(),
+        connector_provisioning_type: detail.connector_provisioning_type.clone(),
+        registered_at: detail.registered_at,
+        registered_by: detail.registered_by.clone(),
+        connector_arn: detail
+            .connector_label
+            .as_deref()
+            .map(|label| connector_arn(region, label)),
+        ..capability_configuration(
+            can_use_as_source,
+            can_use_as_destination,
+            false,
+            false,
+            detail
+                .supported_data_transfer_types
+                .clone()
+                .unwrap_or_default(),
+            write_operations
+                .iter()
+                .map(|operation| (*operation).to_string())
+                .collect(),
+        )
+    }
+}
+
+impl VendedConnector {
+    /// The wire `ConnectorConfiguration` for this connector: what a flow may do with it
+    /// ([`capability_configuration`]), plus the members that name the connector the
+    /// configuration describes.
+    ///
+    /// A vended connector is not registered by anyone, so it carries none of the
+    /// registration members (`connectorLabel`, `connectorOwner`, `connectorVersion`,
+    /// `connectorArn`, `registeredAt`, `registeredBy`, `connectorProvisioningType`,
+    /// `connectorProvisioningConfig`): those belong to a connector a caller registered
+    /// ([`registered_connector_configuration`]).
+    pub fn to_connector_configuration(&self) -> ConnectorConfiguration {
         ConnectorConfiguration {
-            can_use_as_source: self.can_use_as_source,
-            can_use_as_destination: self.can_use_as_destination,
-            supported_destination_connectors: Some(if self.can_use_as_source {
-                destination_connector_types()
-            } else {
-                Vec::new()
-            }),
-            supported_scheduling_frequencies: Some(if self.can_use_as_source {
-                as_strings(&SCHEDULE_FREQUENCIES)
-            } else {
-                Vec::new()
-            }),
-            is_private_link_enabled: self.is_private_link_enabled,
-            // A vended connector resolves its own endpoint from the connector profile,
-            // so the caller never supplies a PrivateLink endpoint URL for one.
-            is_private_link_endpoint_url_required: false,
-            supported_trigger_types: Some(supported_trigger_types),
-            connector_metadata: connector_metadata(self.connector_type),
             connector_type: Some(self.connector_type.to_string()),
-            supported_operators: Some(if self.can_use_as_source {
-                as_strings(&OPERATORS)
-            } else {
-                Vec::new()
-            }),
-            supported_write_operations: Some(as_strings(self.write_operations)),
-            supported_data_transfer_types: Some(as_strings(self.data_transfer_types)),
-            // A vended connector is not registered by anyone, so it carries none of the
-            // registration members (`connectorLabel`, `connectorOwner`,
-            // `connectorVersion`, `connectorArn`, `registeredAt`, `registeredBy`,
-            // `connectorProvisioningType`, `connectorProvisioningConfig`): those belong
-            // to a connector a caller registered.
-            ..ConnectorConfiguration::default()
+            connector_metadata: connector_metadata(self.connector_type),
+            ..capability_configuration(
+                self.can_use_as_source,
+                self.can_use_as_destination,
+                self.supports_event_trigger,
+                self.is_private_link_enabled,
+                self.data_transfer_types
+                    .iter()
+                    .map(|kind| (*kind).to_string())
+                    .collect(),
+                self.write_operations
+                    .iter()
+                    .map(|operation| (*operation).to_string())
+                    .collect(),
+            )
         }
     }
 }
