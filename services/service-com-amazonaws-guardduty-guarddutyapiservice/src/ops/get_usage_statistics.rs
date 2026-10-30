@@ -185,9 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // member of this service is read by: a request that was not understood is
         // never answered as if it had been processed, and an unreadable id must not
         // become a filter that silently selects nothing.
-        if let Some(message) =
-            crate::state::account_ids_rejection(input.usage_criteria.account_ids.iter().flatten())
-        {
+        if let Some(message) = crate::state::account_ids_rejection(
+            crate::state::ACCOUNT_IDS_MEMBER,
+            input.usage_criteria.account_ids.iter().flatten(),
+        ) {
             return Err(bad_request(message));
         }
         let selected_accounts = exact_values(input.usage_criteria.account_ids.as_deref());

@@ -174,9 +174,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // `DetectionRuleAccountIds` constrains the LIST length only, so an entry
         // that is not an account id at all reaches the handler: a parameter
-        // failure, refused before anything is written.
+        // failure, refused before anything is written, naming the list the request
+        // carried it in.
         if let Some(message) =
-            crate::state::account_ids_rejection(include.iter().chain(exclude.iter()))
+            crate::state::account_ids_rejection(crate::state::INCLUDE_ACCOUNT_IDS_MEMBER, &include)
+                .or_else(|| {
+                    crate::state::account_ids_rejection(
+                        crate::state::EXCLUDE_ACCOUNT_IDS_MEMBER,
+                        &exclude,
+                    )
+                })
         {
             return Err(crate::scaffolded::Scaffolded::invalid_input(message));
         }
@@ -205,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // publishes, so an id the catalogue does not carry is the modelled 404.
         if state.custom_detection_rules.rule(&input.rule_id).is_none() {
             return Err(not_found(
-                crate::state::custom_detection_rule_not_found_message(),
+                crate::state::custom_detection_rule_not_found_message(&input.rule_id),
             ));
         }
 

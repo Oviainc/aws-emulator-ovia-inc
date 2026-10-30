@@ -29,6 +29,7 @@
 //!    at any position in the batch.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_guardduty_guarddutyapiservice::state;
 
 use crate::detector_lifecycle::{
     call, enabled_detector, error_code, error_shape, new_router, Router,
@@ -250,9 +251,10 @@ async fn a_batch_outside_the_published_length_range_is_refused() {
             "case {case}: expected the modelled error shape, got {body:?}"
         );
         let message = body["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("accountDetails"),
-            "case {case}: expected the message to name accountDetails, got {message:?}"
+        assert_eq!(
+            message,
+            state::INVALID_INPUT_PARAMETERS_MESSAGE,
+            "case {case}: expected GuardDuty's fixed constraint-refusal text, got {message:?}"
         );
     }
 

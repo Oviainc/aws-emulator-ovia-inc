@@ -450,9 +450,17 @@ async fn an_association_the_account_does_not_hold_is_refused_as_not_found() {
             let (status, body) = update_association(&router, rule, id, mode).await;
             assert_modelled_error(&case, status, &body, NOT_FOUND, 404);
             let message = body["message"].as_str().unwrap_or_default();
+            // The `AssociationId` is what says WHICH association is missing, and it
+            // came from the request, so the fixed not-found text carries it; the
+            // rule the request named is not echoed beside it.
+            assert_eq!(
+                message,
+                format!("Association not found: {id}"),
+                "case {case:?}: expected the fixed not-found text carrying the association id, got {message:?}"
+            );
             assert!(
-                !message.contains(id.as_str()) && !message.contains(rule.as_str()),
-                "case {case:?}: a refusal must not echo the caller's value, got {message:?}"
+                !message.contains(rule.as_str()),
+                "case {case:?}: a refusal must not echo the rule the caller named, got {message:?}"
             );
             // Never an upsert: the refused pair is still unreadable afterwards.
             let (status, body) = get_association_in(&router, HOME_REGION, rule, id).await;

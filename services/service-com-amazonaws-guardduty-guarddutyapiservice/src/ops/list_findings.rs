@@ -193,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         crate::state::sort_findings(&mut matched, input.sort_criteria.as_ref())
-            .map_err(|rejection| refusal(&rejection, SORT_ATTRIBUTE_MEMBER))?;
+            .map_err(|rejection| refusal(&rejection, SORT_CRITERIA_MEMBER))?;
 
         let ids: Vec<String> = matched.iter().map(|f| f.id.clone()).collect();
         let (page, next_token) = crate::state::paginate(
@@ -232,7 +232,9 @@ fn refusal(rejection: &crate::state::CriterionRejection, member: &str) -> ListFi
     bad_request(rejection.message(member))
 }
 
-/// The wire paths a refusal names (`smithy_query(operation="ListFindings")`).
-const FINDING_CRITERIA_MEMBER: &str = "findingCriteria.criterion";
+/// The wire names of the members a refusal names
+/// (`smithy_query(operation="ListFindings")`). The criterion key and the sort
+/// attribute inside them are not named, because they are the caller's own values.
+const FINDING_CRITERIA_MEMBER: &str = "findingCriteria";
 /// See [`FINDING_CRITERIA_MEMBER`].
-const SORT_ATTRIBUTE_MEMBER: &str = "sortCriteria.attributeName";
+const SORT_CRITERIA_MEMBER: &str = "sortCriteria";

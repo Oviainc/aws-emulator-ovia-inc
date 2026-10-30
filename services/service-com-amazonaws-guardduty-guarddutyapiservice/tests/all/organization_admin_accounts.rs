@@ -42,6 +42,7 @@
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_guardduty_guarddutyapiservice::state;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
     ADMIN_ACCOUNT_ID_MEMBER, ADMIN_DISABLE_SPAN_MILLIS, NEXT_TOKEN_MEMBER,
 };
@@ -581,9 +582,10 @@ async fn the_read_is_paginated_over_a_list_of_at_most_one_entry() {
             "case {case:?}: expected the modelled error shape, got {body:?}"
         );
         let message = body["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("maxResults"),
-            "case {case:?}: the refusal must name maxResults, got {message:?}"
+        assert_eq!(
+            message,
+            state::INVALID_INPUT_PARAMETERS_MESSAGE,
+            "case {case:?}: expected GuardDuty's fixed constraint-refusal text, got {message:?}"
         );
     }
 

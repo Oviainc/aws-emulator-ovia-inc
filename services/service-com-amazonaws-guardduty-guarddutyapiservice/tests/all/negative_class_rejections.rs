@@ -937,16 +937,12 @@ async fn associating_an_unpublished_rule_is_refused_with_the_modelled_404() {
                 .await;
             assert_modelled_error(&case, status, &body, NOT_FOUND, 404);
             let message = body["message"].as_str().unwrap_or_default();
-            assert!(
-                message.contains("ruleId"),
-                "case {case}: expected a message naming the member, got {message:?}"
-            );
-            // The "does not echo the caller's value" check needs a value that is
-            // not a single letter of ordinary prose, so it is asserted for the rows
-            // long enough to be distinguishable.
-            assert!(
-                rule_id.len() < 3 || !message.contains(rule_id),
-                "case {case}: a rejection must not echo the caller's value, got {message:?}"
+            // The rule id is what says WHICH rule the catalogue does not carry, and
+            // it came from the request, so the fixed text carries it.
+            assert_eq!(
+                message,
+                format!("Rule not found: {rule_id}"),
+                "case {case}: expected the fixed not-found text carrying the rule id, got {message:?}"
             );
         }
     }

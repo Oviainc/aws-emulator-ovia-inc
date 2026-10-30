@@ -105,6 +105,23 @@ fn invalid_parameter(member: &str) -> String {
     format!("The request is rejected because the parameter {member} has an invalid value.")
 }
 
+/// The message a LIST of account ids carrying a value that cannot be an account id
+/// at all is refused with, naming the list `member` the request sent.
+fn account_ids_format(member: &str) -> String {
+    format!(
+        "The request failed because parameter {member} has accountId values that are formatted incorrectly."
+    )
+}
+
+/// The same format rejection where the account id sits in a STRUCTURE member of its
+/// own — `AccountDetail.AccountId`, which is what `CreateMembers` carries.
+pub(crate) const ACCOUNT_ID_FORMAT: &str =
+    "The request failed because the 'accountId' was formatted incorrectly.";
+
+/// The wire name of the `AccountIds` list the batch members operations carry
+/// (`smithy_query(operation="DisassociateMembers")`).
+pub(crate) const ACCOUNT_IDS_MEMBER: &str = "accountIds";
+
 /// The message an `AccountDetail.Email` that breaks one of the documented email
 /// rules is refused with: GuardDuty's own wording for that rule, read from the
 /// handler so the test and the service cannot drift apart.
@@ -572,7 +589,10 @@ async fn only_the_accounts_that_are_not_members_are_reported() {
 async fn a_value_that_cannot_be_an_account_id_is_refused() {
     let router = new_router();
     let detector_id = detector_with_members(&router).await;
-    let expected = invalid_parameter("accountId");
+    // GuardDuty words the format rejection in terms of the parameter that carried
+    // the malformed value: the `accountIds` LIST for the batch operations, and the
+    // `accountId` member itself where the id sits inside an `AccountDetail`.
+    let batch_expected = account_ids_format(ACCOUNT_IDS_MEMBER);
 
     for (account_id, why) in MALFORMED_ACCOUNT_IDS {
         // Every operation that takes an account id classifies it the same way.
@@ -580,17 +600,20 @@ async fn a_value_that_cannot_be_an_account_id_is_refused() {
             (
                 "DisassociateMembers",
                 disassociate_members(&router, &detector_id, &[account_id]).await,
+                batch_expected.as_str(),
             ),
             (
                 "GetMembers",
                 get_members(&router, &detector_id, &[account_id]).await,
+                batch_expected.as_str(),
             ),
             (
                 "CreateMembers",
                 create_members(&router, &detector_id, &[(account_id, "valid@example.com")]).await,
+                ACCOUNT_ID_FORMAT,
             ),
         ];
-        for (operation, (status, body)) in responses {
+        for (operation, (status, body), expected) in responses {
             assert_eq!(
                 status, 400,
                 "case {operation} {account_id} ({why}): expected 400, got {status} {body:?}"
@@ -607,8 +630,8 @@ async fn a_value_that_cannot_be_an_account_id_is_refused() {
             );
             assert_eq!(
                 body["message"].as_str(),
-                Some(expected.as_str()),
-                "case {operation} {account_id} ({why}): expected the parameter message, got {body:?}"
+                Some(expected),
+                "case {operation} {account_id} ({why}): expected the format-rejection message, got {body:?}"
             );
         }
     }

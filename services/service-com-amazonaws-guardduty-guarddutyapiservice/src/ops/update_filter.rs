@@ -256,7 +256,7 @@ fn bad_request(message: impl Into<String>) -> UpdateFilterError {
     crate::scaffolded::Scaffolded::invalid_input(message)
 }
 
-/// The wire path of the criterion map a refusal names: `FindingCriteria` has
-/// `jsonName` `findingCriteria` and carries the keys under `criterion`
-/// (`smithy_query(operation="UpdateFilter")`).
-const FINDING_CRITERIA_MEMBER: &str = "findingCriteria.criterion";
+/// The wire name of the member a refusal of the criteria names: `FindingCriteria`
+/// has `jsonName` `findingCriteria` (`smithy_query(operation="UpdateFilter")`). The
+/// criterion KEY inside it is not named, because it is the caller's own value.
+const FINDING_CRITERIA_MEMBER: &str = "findingCriteria";

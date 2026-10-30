@@ -201,10 +201,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         for detail in &input.account_details {
-            // The same account-id rule the operations taking an `AccountIds` list
-            // apply, read from the one place it lives — here one entry at a time,
-            // because the email rule below is checked per entry beside it.
-            if let Some(message) = crate::state::account_ids_rejection([&detail.account_id]) {
+            // The same account-id FORM rule the operations taking an `AccountIds`
+            // list apply, read from the one place it lives — but the account id
+            // here is a member of `AccountDetail` rather than an element of a list
+            // the request named, so it is refused under the sentence GuardDuty
+            // answers for that member ([`crate::state::account_id_rejection`]).
+            if let Some(message) = crate::state::account_id_rejection(&detail.account_id) {
                 return Err(crate::scaffolded::Scaffolded::invalid_input(message));
             }
             if !crate::state::is_member_email(&detail.email) {

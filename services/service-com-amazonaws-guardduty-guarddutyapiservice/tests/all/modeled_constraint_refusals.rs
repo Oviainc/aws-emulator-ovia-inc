@@ -6,10 +6,17 @@
 //!
 //! > A value outside a constraint this service's model declares is refused with HTTP
 //! > 400 under `BadRequestException` — the only client error the model binds to any
-//! > of its operations — never under a code the model declares for nothing, with a
-//! > message naming the parameter at fault and the rule it broke; the refused request
-//! > changes no stored state, and the same request with a value inside the constraint
-//! > succeeds.
+//! > of its operations — never under a code the model declares for nothing, and with
+//! > ONE FIXED SENTENCE for the class: a value the service could not read as the
+//! > member's modelled type (anything outside an enumerated value set) is refused as a
+//! > payload it could not process, and every other unacceptable value with the generic
+//! > invalid-input sentence. Neither names the member at fault, interpolates the bound
+//! > that was broken, nor echoes the caller's value. The refused request changes no
+//! > stored state, and the same request with a value inside the constraint succeeds.
+//!
+//! The bound is already published in the model the caller built its request from, so
+//! the refusal restates none of it — which is also why a client may branch on, or
+//! snapshot, the one sentence.
 //!
 //! `smithy_query(query="service_info")` reports exactly two common errors for this
 //! service — `BadRequestException` (`httpError` 400) and `InternalServerErrorException`
@@ -29,6 +36,7 @@
 //! and the handlers together.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_guardduty_guarddutyapiservice::state;
 
 use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, error_shape, new_router,
@@ -64,9 +72,10 @@ fn create_filter_body(name: &str, extra: &[(&str, Value)]) -> Value {
     body
 }
 
-/// Assert one refusal: the status, the error shape on the wire, and that the code is
-/// one the model declares rather than the framework's default.
-fn assert_modeled_refusal(case: &str, status: u16, body: &Value, expected_member: &str) {
+/// Assert one refusal: the status, the error shape on the wire, that the code is one
+/// the model declares rather than the framework's default, and the FIXED sentence the
+/// class carries — which names no member and interpolates no bound.
+fn assert_modeled_refusal(case: &str, status: u16, body: &Value, expected_message: &str) {
     assert_eq!(
         status, 400,
         "case {case}: expected HTTP 400, got {status} {body:?}"
@@ -87,9 +96,9 @@ fn assert_modeled_refusal(case: &str, status: u16, body: &Value, expected_member
         "case {case}: refused under a code this service's model declares for nothing, got {body:?}"
     );
     let message = body["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains(expected_member),
-        "case {case}: expected the message to name the parameter {expected_member:?}, got {message:?}"
+    assert_eq!(
+        message, expected_message,
+        "case {case}: expected GuardDuty's fixed text for this refusal class, got {message:?}"
     );
 }
 
@@ -98,8 +107,9 @@ fn assert_modeled_refusal(case: &str, status: u16, body: &Value, expected_member
 // ---------------------------------------------------------------------------
 
 /// Rows refused by a constraint on a member of an operation addressed under a
-/// detector. Each is `(why, method, path suffix after the detector id, body, member)`.
-fn detector_scoped_refusals() -> Vec<(String, &'static str, String, Option<Value>, &'static str)> {
+/// detector. Each is `(why, method, path suffix after the detector id, body, the
+/// fixed message the refusal carries)`.
+fn detector_scoped_refusals() -> Vec<(String, &'static str, String, Option<Value>, String)> {
     // The published bounds come from the model, not from the recorded calls:
     // `CreateFilter.Rank -> FilterRank` is `@range` 1..100, `Name -> FilterName` is
     // `@length` 3..64, `Description -> FilterDescription` is 0..512, `Action ->
@@ -107,7 +117,7 @@ fn detector_scoped_refusals() -> Vec<(String, &'static str, String, Option<Value
     // `UpdateFindingsFeedback.Feedback -> Feedback` is the enum (USEFUL | NOT_USEFUL);
     // `ListFindings.MaxResults` is `@range` 1..50
     // (`smithy_query(operation="CreateFilter,UpdateFindingsFeedback,ListFindings")`).
-    let mut rows: Vec<(String, &'static str, String, Option<Value>, &'static str)> = Vec::new();
+    let mut rows: Vec<(String, &'static str, String, Option<Value>, String)> = Vec::new();
 
     for (rank, why) in [
         (0, "rank 0: one below the published minimum of 1"),
@@ -124,7 +134,7 @@ fn detector_scoped_refusals() -> Vec<(String, &'static str, String, Option<Value
                 &format!("rank-row-{rank}"),
                 &[("rank", json!(rank))],
             )),
-            "rank",
+            state::INVALID_INPUT_PARAMETERS_MESSAGE.to_string(),
         ));
     }
 
@@ -139,7 +149,7 @@ fn detector_scoped_refusals() -> Vec<(String, &'static str, String, Option<Value
             "POST",
             "/filter".to_string(),
             Some(create_filter_body(&name_of(len), &[])),
-            "name",
+            state::INVALID_INPUT_PARAMETERS_MESSAGE.to_string(),
         ));
     }
 
@@ -152,7 +162,7 @@ fn detector_scoped_refusals() -> Vec<(String, &'static str, String, Option<Value
             "description-row",
             &[("description", json!(name_of(513)))],
         )),
-        "description",
+        state::INVALID_INPUT_PARAMETERS_MESSAGE.to_string(),
     ));
 
     for action in ["DELETE", "noop", "", "ARCHIVE_AND_NOTIFY"] {
@@ -164,7 +174,7 @@ fn detector_scoped_refusals() -> Vec<(String, &'static str, String, Option<Value
                 "action-row",
                 &[("action", json!(action))],
             )),
-            "action",
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE.to_string(),
         ));
     }
 
@@ -173,7 +183,9 @@ fn detector_scoped_refusals() -> Vec<(String, &'static str, String, Option<Value
         "POST",
         "/filter".to_string(),
         Some(json!({"name": "required-row"})),
-        "findingCriteria",
+        // An ABSENT member is not a value, so neither fixed text above states it:
+        // the service says which member it cannot act without.
+        state::missing_parameter_message("findingCriteria"),
     ));
 
     for feedback in ["MAYBE_USEFUL", "useful", "", "USEFUL "] {
@@ -182,7 +194,7 @@ fn detector_scoped_refusals() -> Vec<(String, &'static str, String, Option<Value
             "POST",
             "/findings/feedback".to_string(),
             Some(json!({"findingIds": [], "feedback": feedback})),
-            "feedback",
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE.to_string(),
         ));
     }
 
@@ -196,7 +208,7 @@ fn detector_scoped_refusals() -> Vec<(String, &'static str, String, Option<Value
             "POST",
             "/findings".to_string(),
             Some(json!({"maxResults": max_results})),
-            "maxResults",
+            state::INVALID_INPUT_PARAMETERS_MESSAGE.to_string(),
         ));
     }
 
@@ -208,7 +220,7 @@ async fn a_value_outside_a_modeled_constraint_is_refused_under_the_modeled_error
     let router = new_router();
     let detector_id = enabled_detector(&router).await;
 
-    for (why, method, suffix, body, member) in detector_scoped_refusals() {
+    for (why, method, suffix, body, expected) in detector_scoped_refusals() {
         let (status, response) = call(
             &router,
             method,
@@ -216,7 +228,7 @@ async fn a_value_outside_a_modeled_constraint_is_refused_under_the_modeled_error
             body,
         )
         .await;
-        assert_modeled_refusal(&why, status, &response, member);
+        assert_modeled_refusal(&why, status, &response, &expected);
     }
 }
 
@@ -231,13 +243,13 @@ async fn the_modeled_refusal_channel_covers_every_operation_of_the_service() {
     // `FindingPublishingFrequency` is an enum and `Enable` is `@required`;
     // `ListDetectors.MaxResults` is `@range` 1..50
     // (`smithy_query(operation="CreateDetector,ListDetectors")`).
-    let rows: Vec<(String, &str, String, Option<Value>, &str)> = vec![
+    let rows: Vec<(String, &str, String, Option<Value>, String)> = vec![
         (
             "CreateDetector with an empty tags map: the published minimum is 1 entry".to_string(),
             "POST",
             "/detector".to_string(),
             Some(json!({"enable": true, "tags": {}})),
-            "tags",
+            state::INVALID_INPUT_PARAMETERS_MESSAGE.to_string(),
         ),
         (
             "CreateDetector with a clientToken of 65 characters: one above the published maximum of 64"
@@ -245,35 +257,35 @@ async fn the_modeled_refusal_channel_covers_every_operation_of_the_service() {
             "POST",
             "/detector".to_string(),
             Some(json!({"enable": true, "clientToken": name_of(65)})),
-            "clientToken",
+            state::INVALID_INPUT_PARAMETERS_MESSAGE.to_string(),
         ),
         (
             "CreateDetector with a findingPublishingFrequency outside the enum".to_string(),
             "POST",
             "/detector".to_string(),
             Some(json!({"enable": true, "findingPublishingFrequency": "EVERY_MINUTE"})),
-            "findingPublishingFrequency",
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE.to_string(),
         ),
         (
             "ListDetectors with maxResults 0: one below the published minimum of 1".to_string(),
             "GET",
             "/detector?maxResults=0".to_string(),
             None,
-            "maxResults",
+            state::INVALID_INPUT_PARAMETERS_MESSAGE.to_string(),
         ),
         (
             "ListDetectors with maxResults 51: one above the published maximum of 50".to_string(),
             "GET",
             "/detector?maxResults=51".to_string(),
             None,
-            "maxResults",
+            state::INVALID_INPUT_PARAMETERS_MESSAGE.to_string(),
         ),
     ];
 
-    for (why, method, path, body, member) in rows {
+    for (why, method, path, body, expected) in rows {
         let router = new_router();
         let (status, response) = call(&router, method, &path, body).await;
-        assert_modeled_refusal(&why, status, &response, member);
+        assert_modeled_refusal(&why, status, &response, &expected);
     }
 }
 
@@ -443,7 +455,12 @@ async fn a_refused_create_filter_leaves_no_filter_behind() {
             Some(create_filter_body(&name, &[("rank", json!(rank))])),
         )
         .await;
-        assert_modeled_refusal(&case, status, &refused, "rank");
+        assert_modeled_refusal(
+            &case,
+            status,
+            &refused,
+            state::INVALID_INPUT_PARAMETERS_MESSAGE,
+        );
 
         // Nothing was saved under that name.
         let (status, read) = call(
@@ -562,7 +579,12 @@ async fn a_refused_findings_feedback_leaves_the_finding_unmarked() {
             Some(json!({"findingIds": [finding_id.clone()], "feedback": feedback})),
         )
         .await;
-        assert_modeled_refusal(&case, status, &refused, "feedback");
+        assert_modeled_refusal(
+            &case,
+            status,
+            &refused,
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE,
+        );
         assert_eq!(
             user_feedback(&router, &detector_id, &finding_id).await,
             None,

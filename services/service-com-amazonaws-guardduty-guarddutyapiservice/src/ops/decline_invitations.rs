@@ -155,7 +155,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an account id at all reaches this handler. It is refused whole rather than
         // reported, because `UnprocessedAccounts` reports accounts that were not
         // PROCESSED, never a request that was not understood.
-        if let Some(message) = crate::state::account_ids_rejection(&input.account_ids) {
+        if let Some(message) = crate::state::account_ids_rejection(
+            crate::state::ACCOUNT_IDS_MEMBER,
+            &input.account_ids,
+        ) {
             return Err(crate::scaffolded::Scaffolded::invalid_input(message));
         }
 

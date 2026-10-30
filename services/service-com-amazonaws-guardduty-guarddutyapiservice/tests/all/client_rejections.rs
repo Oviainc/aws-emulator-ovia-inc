@@ -120,6 +120,21 @@ pub(crate) fn invalid_parameter(member: &str) -> String {
     format!("The request is rejected because the parameter {member} has an invalid value.")
 }
 
+/// The message a LIST of account ids carrying a value that cannot be an account id
+/// at all is refused with: GuardDuty's fixed format-rejection sentence for a batch,
+/// naming the list `member` the request carried the ids in.
+pub(crate) fn account_ids_format(member: &str) -> String {
+    format!(
+        "The request failed because parameter {member} has accountId values that are formatted incorrectly."
+    )
+}
+
+/// The same format rejection where the request carried the account id in a STRUCTURE
+/// member of its own rather than in a list: GuardDuty single-quotes the member name
+/// and states the class.
+pub(crate) const ACCOUNT_ID_FORMAT: &str =
+    "The request failed because the 'accountId' was formatted incorrectly.";
+
 /// The message a well-formed id this account does not own is refused with.
 pub(crate) fn not_owned(member: &str) -> String {
     format!(

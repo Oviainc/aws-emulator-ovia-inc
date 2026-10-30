@@ -174,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // store — and never a hollow success for a resource the account does not
             // hold, which the modelled `ResourceNotFoundException` is there to
             // report.
-            return Err(not_found());
+            return Err(not_found(&input.association_id));
         };
 
         // Dropping the one entry that key names is the whole delete: an association
@@ -198,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 false,
                 "an association resolved by id must be held under its own (region, rule, mode) key"
             );
-            return Err(not_found());
+            return Err(not_found(&input.association_id));
         }
 
         // `DeleteCustomDetectionRuleAssociationResponse` declares no members
@@ -220,10 +220,12 @@ const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 /// with the modelled 404, carrying the message a read of the same absence answers
 /// with: the two name the same missing resource, so they cannot describe it
 /// differently.
-fn not_found() -> DeleteCustomDetectionRuleAssociationError {
+fn not_found(association_id: &str) -> DeleteCustomDetectionRuleAssociationError {
     DeleteCustomDetectionRuleAssociationErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: Some(crate::state::detection_rule_association_not_found_message()),
+            message: Some(crate::state::detection_rule_association_not_found_message(
+                association_id,
+            )),
             // "The error type" (`smithy_query(shape="ResourceNotFoundException")`):
             // the class, the same value the body's `__type` carries.
             r#type: Some(RESOURCE_NOT_FOUND_EXCEPTION.to_string()),

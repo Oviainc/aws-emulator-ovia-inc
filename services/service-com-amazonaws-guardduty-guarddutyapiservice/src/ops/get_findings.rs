@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         crate::state::sort_findings(&mut found, input.sort_criteria.as_ref())
-            .map_err(|rejection| bad_request(rejection.message(SORT_ATTRIBUTE_MEMBER)))?;
+            .map_err(|rejection| bad_request(rejection.message(SORT_CRITERIA_MEMBER)))?;
 
         Ok(GetFindingsOutput {
             findings: found.iter().map(|record| finding(record)).collect(),
@@ -188,9 +188,11 @@ fn bad_request(message: impl Into<String>) -> GetFindingsError {
     crate::scaffolded::Scaffolded::invalid_input(message)
 }
 
-/// The wire path of the member a sort attribute arrives under
-/// (`smithy_query(operation="GetFindings")`), as a refusal names it.
-const SORT_ATTRIBUTE_MEMBER: &str = "sortCriteria.attributeName";
+/// The wire name of the member a sort attribute arrives under
+/// (`SortCriteria` has `jsonName` `sortCriteria` —
+/// `smithy_query(operation="GetFindings")`), as a refusal names it. The attribute
+/// name inside it is not named, because it is the caller's own value.
+const SORT_CRITERIA_MEMBER: &str = "sortCriteria";
 
 /// The wire `Finding` for a stored record.
 ///

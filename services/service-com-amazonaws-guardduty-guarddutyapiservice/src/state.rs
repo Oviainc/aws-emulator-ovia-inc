@@ -1611,6 +1611,12 @@ pub const SCAN_RESOURCE_CRITERIA_MEMBER: &str = "scanResourceCriteria";
 /// renders as `accountId` (`smithy_query(shape="AccountDetail")`).
 pub const ACCOUNT_ID_MEMBER: &str = "accountId";
 
+/// The wire name of the `AccountIds` list every batch members operation carries the
+/// account ids in (`smithy_query(operation="DisassociateMembers")` renders it
+/// `accountIds`), including the one `GetUsageStatistics` nests inside its criteria
+/// (`smithy_query(query="shape",shape="UsageCriteria")`).
+pub const ACCOUNT_IDS_MEMBER: &str = "accountIds";
+
 /// The wire name of `AccountDetail`'s email member
 /// (`smithy_query(shape="AccountDetail")` renders `Email` as `email`).
 pub const EMAIL_MEMBER: &str = "email";
@@ -1643,6 +1649,16 @@ pub fn is_detector_id(id: &str) -> bool {
 /// The message for a member whose VALUE cannot be a value of that member at all.
 pub fn invalid_parameter_message(member: &str) -> String {
     format!("The request is rejected because the parameter {member} has an invalid value.")
+}
+
+/// The message GuardDuty refuses a STRUCTURED member it will not accept with: the
+/// member the request carried named, and nothing from inside the structure echoed.
+///
+/// A criteria structure is unacceptable as a WHOLE — the service does not report
+/// which key inside it was at fault, nor repeat the key the caller sent — so the
+/// refusal names the member the request carried and stops there.
+pub fn invalid_parameter_value_message(member: &str) -> String {
+    format!("The request was rejected because the parameter {member} has an invalid value.")
 }
 
 /// The message GuardDuty refuses an unusable input value with where it does NOT
@@ -1736,21 +1752,47 @@ pub fn is_account_id(id: &str) -> bool {
     id.len() == ACCOUNT_ID_LEN && id.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// The message a value that cannot be an account id at all is refused with where the
+/// request carried it in a STRUCTURE member of its own rather than in a list of ids:
+/// the member name in single quotes, the format class stated, and nothing of the
+/// caller's value echoed.
+///
+/// A malformed id is a FORMAT failure, which GuardDuty words as its own class rather
+/// than as the generic unacceptable-value refusal
+/// ([`invalid_parameter_message`]): a caller can tell a syntactically impossible
+/// account id from one that was understood and rejected on its merits.
+pub const ACCOUNT_ID_FORMAT_MESSAGE: &str =
+    "The request failed because the 'accountId' was formatted incorrectly.";
+
+/// The same format failure where the request carried the account ids as a LIST:
+/// GuardDuty names the list `member` the caller sent and the `accountId` values
+/// inside it, so the refusal says which parameter of a batch call it objected to.
+///
+/// `member` is the list's wire name as the request spells it
+/// ([`ACCOUNT_IDS_MEMBER`] for the members operations, the include/exclude list for
+/// an organization scope), so one sentence serves every batch that carries account
+/// ids.
+pub fn account_ids_format_message(member: &str) -> String {
+    format!(
+        "The request failed because parameter {member} has accountId values that are formatted incorrectly."
+    )
+}
+
 /// Classify a LIST of account ids the caller named: `Some(message)` when an entry
 /// cannot be an account id at all, `None` when every entry is well formed.
 ///
 /// One reader for every operation that takes account ids, so the form cannot drift
-/// between them, and one message — [`invalid_parameter_message`] for
-/// [`ACCOUNT_ID_MEMBER`] — because the member at fault is the same one whichever
-/// operation carried it. The whole call is refused rather than the entry reported:
+/// between them, and one message — [`account_ids_format_message`] for the list
+/// `member` the request carried — because a batch refusal names the list it was
+/// handed. The whole call is refused rather than the entry reported:
 /// `UnprocessedAccounts` reports accounts that were not PROCESSED, never a request
 /// that was not understood.
 ///
-/// The argument is any iterator of string-like entries, so an operation whose scope
-/// is carried by TWO lists (an include list and an exclude list, which together name
-/// one scope) chains them into one call and refuses the same way whichever list the
-/// malformed entry sits in.
-pub fn account_ids_rejection<I>(account_ids: I) -> Option<String>
+/// The ids argument is any iterator of string-like entries, so an operation whose
+/// scope is carried by TWO lists (an include list and an exclude list, which together
+/// name one scope) chains them into one call; `member` then names the list the
+/// request actually sent.
+pub fn account_ids_rejection<I>(member: &str, account_ids: I) -> Option<String>
 where
     I: IntoIterator,
     I::Item: AsRef<str>,
@@ -1758,7 +1800,17 @@ where
     account_ids
         .into_iter()
         .any(|account_id| !is_account_id(account_id.as_ref()))
-        .then(|| invalid_parameter_message(ACCOUNT_ID_MEMBER))
+        .then(|| account_ids_format_message(member))
+}
+
+/// Classify a SINGLE account id a structure member carried: `Some(message)` when it
+/// cannot be an account id at all, `None` when it is well formed.
+///
+/// The same form question as [`account_ids_rejection`] under the sentence GuardDuty
+/// answers when the id is a member of its own ([`ACCOUNT_ID_FORMAT_MESSAGE`]) rather
+/// than an element of a list the request named.
+pub fn account_id_rejection(account_id: &str) -> Option<&'static str> {
+    (!is_account_id(account_id)).then_some(ACCOUNT_ID_FORMAT_MESSAGE)
 }
 
 /// Classify the top-level `ExpectedBucketOwner` a request carried: `Some(message)`
@@ -2172,10 +2224,11 @@ pub const DEFAULT_TAGGING_ACTION_STATUS: &str = DISABLED;
 /// The message a create for an already-protected resource is refused with.
 ///
 /// GuardDuty protects one S3 bucket with one plan, so the second create for the
-/// same bucket conflicts with the first. The caller's bucket name is not quoted
-/// back: the rejection states the rule, as every other rejection here does.
+/// same bucket conflicts with the first. AWS words this refusal in terms of the
+/// RESOURCE the plan protects — the S3 bucket — in one fixed sentence; the
+/// caller's bucket name is not quoted back.
 pub const MALWARE_PROTECTION_PLAN_CONFLICT_MESSAGE: &str =
-    "The request is rejected because a Malware Protection plan already exists for the specified protected resource.";
+    "The request was rejected because the provided S3 bucket is already protected.";
 
 /// How many Malware Protection plans one account may hold in one Region.
 ///
@@ -2366,6 +2419,28 @@ pub const FILTER_INITIAL_VERSION: i64 = 1;
 // Modelled-constraint refusals
 // ---------------------------------------------------------------------------
 
+/// The sentence GuardDuty refuses a value outside a constraint its model declares
+/// with: ONE fixed text for the whole class, naming no member and interpolating
+/// neither the bound that was broken nor the value that broke it.
+///
+/// The bound is already published in the model the caller built its request from, so
+/// the refusal restates nothing: it says only that some input parameter held a value
+/// the service will not take. A client that branches on this text, or snapshots it,
+/// sees the same sentence whichever member and whichever bound was at fault.
+pub const INVALID_INPUT_PARAMETERS_MESSAGE: &str =
+    "The request is rejected because the one or more input parameters have invalid values.";
+
+/// The sentence GuardDuty refuses a value its request payload could not be read as
+/// with — the answer to a payload that did not DESERIALIZE into the modelled input,
+/// which is what a value outside an enumerated type's value set is.
+///
+/// It is a different class from [`INVALID_INPUT_PARAMETERS_MESSAGE`]: the value was
+/// not understood at all rather than understood and rejected, so the allowed values
+/// are not enumerated back at the caller and a client reading this text knows to
+/// re-serialize rather than to re-think the value.
+pub const UNPROCESSABLE_PAYLOAD_MESSAGE: &str =
+    "The request is rejected because the JSON could not be processed.";
+
 /// How GuardDuty states a refusal the request boundary made: a member the model
 /// requires was absent, or a value fell outside a bound the model declares.
 ///
@@ -2373,54 +2448,41 @@ pub const FILTER_INITIAL_VERSION: i64 = 1;
 /// `BadRequestException` (`httpError` 400) and `InternalServerErrorException`
 /// (500) (`smithy_query(query="service_info")` lists them as the service's common
 /// errors) — and NO `ValidationException` shape. So a modelled-constraint
-/// violation is the same refusal as any other unacceptable input, and is worded
-/// the same way: the parameter at fault and the rule it broke, built from the
-/// REQUEST, with the caller's value never quoted back.
+/// violation is the same refusal as any other unacceptable input, under one of the
+/// two FIXED texts above, chosen by whether the value was unreadable or merely
+/// unacceptable; neither quotes the caller's value, the member at fault or the
+/// bound back.
 ///
 /// `service.rs` routes the framework's pre-handler refusal through here, so a
 /// constraint the model declares on ANY member of ANY operation in this service
 /// is refused under the modelled error rather than under a shape no GuardDuty
 /// client can catch.
 pub fn constraint_rejection(violations: &[::aws_smithy_schema_server::Violation]) -> String {
-    let clauses: Vec<String> = violations.iter().map(violation_clause).collect();
-    if clauses.is_empty() {
-        // The framework describes every refusal it hands us with at least one
-        // violation; an empty list has no member to name, so it falls back to the
-        // service's parameter wording without one.
-        return "The request is rejected because it contains an invalid parameter.".to_string();
-    }
-    clauses.join(" ")
-}
-
-/// One violation, as a GuardDuty sentence.
-fn violation_clause(violation: &::aws_smithy_schema_server::Violation) -> String {
     use ::aws_smithy_schema_server::ViolationKind;
 
-    // The path is already the member's wire spelling (lowerCamel, with
-    // `.member` steps for collections), which is how the caller named it.
-    let member = violation.path.as_str();
-    let requirement = match &violation.kind {
-        ViolationKind::MissingRequiredMember => {
-            return format!(
-                "The request is rejected because the parameter {member} is required."
-            )
-        }
-        ViolationKind::MinLength(min) => format!("it must have a length of at least {min}"),
-        ViolationKind::MaxLength(max) => format!("it must have a length of at most {max}"),
-        ViolationKind::MinValue(min) => format!("it must be greater than or equal to {min}"),
-        ViolationKind::MaxValue(max) => format!("it must be less than or equal to {max}"),
-        ViolationKind::Pattern(pattern) => {
-            format!("it must satisfy the pattern {pattern}")
-        }
-        ViolationKind::EnumValue(allowed) => format!("it must be one of {}", allowed.join(", ")),
-        ViolationKind::UniqueItems => "its values must be unique".to_string(),
-        // `ViolationKind` is `#[non_exhaustive]`: a class this service has no
-        // specific wording for still states the member at fault.
-        _ => return invalid_parameter_message(member),
-    };
-    format!(
-        "The request is rejected because the parameter {member} has an invalid value: {requirement}."
-    )
+    // A value outside an enumerated type's value set is not a value of the member's
+    // modelled type at all, so reading the payload into that input is what failed.
+    if violations
+        .iter()
+        .any(|violation| matches!(violation.kind, ViolationKind::EnumValue(_)))
+    {
+        return UNPROCESSABLE_PAYLOAD_MESSAGE.to_string();
+    }
+    // An ABSENT member is not a value at all, so neither text above describes it:
+    // the service states which member it cannot act without, as it does for a
+    // member a handler finds missing.
+    if let Some(absent) = violations
+        .iter()
+        .find(|violation| matches!(violation.kind, ViolationKind::MissingRequiredMember))
+    {
+        // The path is already the member's wire spelling (lowerCamel, with
+        // `.member` steps for collections), which is how the caller named it.
+        return missing_parameter_message(absent.path.as_str());
+    }
+    // Every remaining class — a length, a range, a pattern, uniqueness, and any
+    // class `ViolationKind` (which is `#[non_exhaustive]`) gains later — is a value
+    // the service will not take, and they all share the one sentence.
+    INVALID_INPUT_PARAMETERS_MESSAGE.to_string()
 }
 
 /// The modelled server fault a handler answers when the engine it was built over
@@ -5541,14 +5603,19 @@ pub enum CriterionRejection {
 
 impl CriterionRejection {
     /// The refusal message, naming the request `member` that carried the name.
+    ///
+    /// GuardDuty answers a criteria structure it will not accept with its fixed
+    /// invalid-value sentence for that member ([`invalid_parameter_value_message`]):
+    /// which key inside the structure was at fault, and why, is not echoed — the
+    /// offending name came from the request, and a refusal does not quote request
+    /// input back. The two variants are the same refusal to a caller and differ only
+    /// in why this service would not take the name; they are kept apart because the
+    /// readers that produce them answer different questions.
     pub fn message(&self, member: &str) -> String {
         match self {
-            Self::UnknownField(path) => format!(
-                "{member}: '{path}' is not a field of a GuardDuty finding, so no finding can be selected or ordered by it."
-            ),
-            Self::NotOrderable(path) => format!(
-                "{member}: '{path}' is not a finding field an ordering condition can compare: it has no numeric form."
-            ),
+            Self::UnknownField(_) | Self::NotOrderable(_) => {
+                invalid_parameter_value_message(member)
+            }
         }
     }
 }
@@ -7913,14 +7980,20 @@ pub const RUNTIME_PLATFORM_EC2: &str = "EC2";
 /// See [`RUNTIME_PLATFORM_EKS`].
 pub const RUNTIME_PLATFORM_ECS_FARGATE: &str = "ECS_FARGATE";
 
-/// The message a read of a rule the catalogue does not publish answers with.
+/// The message a read or an association of a rule the catalogue does not publish
+/// answers with.
 ///
-/// It names the member at fault and states the rule it broke, without quoting the
-/// caller's value back — the wording every rejection on this service follows.
-pub fn custom_detection_rule_not_found_message() -> String {
-    format!(
-        "The request is rejected because the input {RULE_ID_MEMBER} does not refer to a custom detection rule published by GuardDuty."
-    )
+/// A rule is addressed by its `RuleId`, which is the caller's own request value and
+/// the only thing that identifies which rule was missing, so GuardDuty echoes it
+/// after a fixed prefix: a caller resolving a batch of rule ids can tell WHICH one
+/// the catalogue does not carry.
+///
+/// `RuleId` carries `@pattern` `^[a-z0-9]+(-[a-z0-9]+)*$` and `@length` 1..100
+/// (`smithy_query(operation="GetCustomDetectionRule")`), both refused at the request
+/// boundary, so the value interpolated here is a short lower-case identifier and
+/// never arbitrary caller text.
+pub fn custom_detection_rule_not_found_message(rule_id: &str) -> String {
+    format!("Rule not found: {rule_id}")
 }
 
 /// The ARN of the custom detection rule `rule_id` as `region`'s endpoint reports
@@ -8004,24 +8077,34 @@ pub const MAX_DETECTION_RULE_REGIONS: usize = 50;
 pub const DETECTION_RULE_REGION_LIMIT_MESSAGE: &str =
     "The request is rejected because the maximum number of custom detection rule associations has been reached.";
 
-/// The message a read of an association the account does not hold answers with.
+/// The message a read, an update or a delete of an association the account does not
+/// hold answers with.
 ///
-/// It names the members that identify the association and states the rule they
-/// broke, without quoting the caller's values back.
-pub fn detection_rule_association_not_found_message() -> String {
-    format!(
-        "The request is rejected because the input {RULE_ID_MEMBER} and {ASSOCIATION_ID_MEMBER} do not refer to a custom detection rule association of the current account."
-    )
+/// An association is addressed by its `AssociationId`, which is the caller's own
+/// request value and the only thing that says WHICH association was missing, so
+/// GuardDuty echoes it after a fixed prefix — the same shape it answers a missing
+/// rule with ([`custom_detection_rule_not_found_message`]).
+///
+/// `AssociationId` carries `@pattern` `^[a-zA-Z0-9_-]{1,64}$` and `@length` 1..64
+/// (`smithy_query(operation="GetCustomDetectionRuleAssociation")`), both refused at
+/// the request boundary, so the value interpolated here is a short identifier and
+/// never arbitrary caller text.
+pub fn detection_rule_association_not_found_message(association_id: &str) -> String {
+    format!("Association not found: {association_id}")
 }
 
 /// The message a second association for a `(RuleId, Mode)` pair the account has
 /// already associated is refused with — the `ConflictException` the create
 /// models. Creating is not updating: `UpdateCustomDetectionRuleAssociation` is
 /// the operation that changes an existing association's mode.
-pub fn detection_rule_association_conflict_message() -> String {
-    format!(
-        "The request is rejected because the current account already has an association for the given {RULE_ID_MEMBER} and {MODE_MEMBER}."
-    )
+///
+/// The conflict is about ONE rule, named by the `RuleId` the request carried, so
+/// GuardDuty echoes that id after a fixed prefix: a caller associating a batch of
+/// rules can tell which of them was already associated. The id is bounded by the
+/// member's own pattern and length, as it is for
+/// [`custom_detection_rule_not_found_message`].
+pub fn detection_rule_association_conflict_message(rule_id: &str) -> String {
+    format!("Association already exists for rule {rule_id}")
 }
 
 /// The message a read of an organization configuration the account has not
@@ -8053,6 +8136,14 @@ pub fn detection_rule_org_configuration_rule_not_found_message() -> String {
         "The request is rejected because the input {RULE_ID_MEMBER} does not refer to a custom detection rule with an organization configuration of the current account."
     )
 }
+
+/// The wire names of the two account lists an organization configuration's scope is
+/// carried by (`jsonName` `includeAccountIds` / `excludeAccountIds` —
+/// `smithy_query(shape="DetectionRuleOrgConfiguration")`), so a refusal that names
+/// the list it was handed spells it the way the request did.
+pub const INCLUDE_ACCOUNT_IDS_MEMBER: &str = "includeAccountIds";
+/// See [`INCLUDE_ACCOUNT_IDS_MEMBER`].
+pub const EXCLUDE_ACCOUNT_IDS_MEMBER: &str = "excludeAccountIds";
 
 /// The message a request naming both `IncludeAccountIds` and `ExcludeAccountIds`
 /// is refused with: the two are "mutually exclusive"

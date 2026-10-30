@@ -42,7 +42,7 @@
 
 use serde_json::{json, Value};
 
-use crate::client_rejections::{invalid_parameter, not_owned};
+use crate::client_rejections::{account_ids_format, not_owned};
 use crate::detector_lifecycle::{
     call_in, error_code, error_shape, new_router, Router, ABSENT_DETECTOR_ID,
 };
@@ -558,7 +558,7 @@ async fn a_request_the_service_does_not_understand_is_still_refused_as_such() {
             );
             assert_eq!(
                 message(&body),
-                invalid_parameter("accountId"),
+                account_ids_format("accountIds"),
                 "case {case}: expected the malformed-account refusal, got {body:?}"
             );
         }

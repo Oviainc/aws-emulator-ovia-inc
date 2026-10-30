@@ -27,7 +27,7 @@
 
 use serde_json::{json, Value};
 
-use crate::client_rejections::{invalid_parameter, not_owned};
+use crate::client_rejections::{account_ids_format, invalid_parameter, not_owned};
 use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, error_shape, new_router, Router,
     ABSENT_DETECTOR_ID,
@@ -379,7 +379,9 @@ async fn an_invited_member_is_still_listed_as_associated_after_a_reported_stop()
 async fn a_value_that_cannot_be_an_account_id_is_refused() {
     let router = new_router();
     let detector_id = detector_with_members(&router).await;
-    let expected = invalid_parameter("accountId");
+    // The batch carries the ids in its `accountIds` list, which is the parameter
+    // GuardDuty's format rejection names.
+    let expected = account_ids_format("accountIds");
     let member_id = MEMBERS[0].0;
 
     for (account_id, why) in MALFORMED_ACCOUNT_IDS {

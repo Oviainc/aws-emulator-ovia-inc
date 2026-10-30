@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
-use super::client_rejections::invalid_parameter;
+use super::client_rejections::account_ids_format;
 use super::detector_lifecycle::{
     all_finding_ids, call, call_in, enabled_detector, error_code, error_shape, new_router, Router,
     ABSENT_DETECTOR_ID,
@@ -1011,10 +1011,10 @@ async fn a_detector_id_the_endpoint_does_not_hold_is_refused() {
 // Rule 7: a criteria account id that cannot be an account id at all.
 // ---------------------------------------------------------------------------
 
-/// The wire name a refusal over an account id names: `AccountIds`' entries target
-/// `AccountId` (`smithy_query(query="shape",shape="UsageCriteria")` for the criteria
-/// list, `smithy_query(shape="AccountId")` for the entry).
-const ACCOUNT_ID_MEMBER: &str = "accountId";
+/// The wire name a refusal over a LIST of account ids names: the `AccountIds` list
+/// the criteria carry them in (`smithy_query(query="shape",shape="UsageCriteria")`),
+/// which is the parameter GuardDuty's format rejection states.
+const ACCOUNT_IDS_MEMBER: &str = "accountIds";
 
 /// An entry of `usageCriteria.accountIds` that cannot be an account id at all refuses
 /// the WHOLE call, rather than becoming a filter that silently selects no record. The
@@ -1068,8 +1068,8 @@ async fn a_criteria_account_id_that_cannot_be_one_is_refused() {
                 );
                 assert_eq!(
                     response["message"].as_str(),
-                    Some(invalid_parameter(ACCOUNT_ID_MEMBER).as_str()),
-                    "case {case:?}: expected the refusal to name {ACCOUNT_ID_MEMBER}, got {response:?}"
+                    Some(account_ids_format(ACCOUNT_IDS_MEMBER).as_str()),
+                    "case {case:?}: expected the refusal to name {ACCOUNT_IDS_MEMBER}, got {response:?}"
                 );
                 let rendered = response.to_string();
                 assert!(

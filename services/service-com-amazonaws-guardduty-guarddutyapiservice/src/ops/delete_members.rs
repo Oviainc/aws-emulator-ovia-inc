@@ -185,7 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::invalid_parameter_message(crate::state::DETECTOR_ID_MEMBER),
             ));
         }
-        if let Some(message) = crate::state::account_ids_rejection(&input.account_ids) {
+        if let Some(message) = crate::state::account_ids_rejection(
+            crate::state::ACCOUNT_IDS_MEMBER,
+            &input.account_ids,
+        ) {
             return Err(crate::scaffolded::Scaffolded::invalid_input(message));
         }
 

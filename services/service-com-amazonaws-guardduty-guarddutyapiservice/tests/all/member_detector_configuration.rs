@@ -33,7 +33,7 @@
 
 use serde_json::{json, Value};
 
-use crate::client_rejections::{invalid_parameter, not_owned};
+use crate::client_rejections::{account_ids_format, invalid_parameter, not_owned};
 use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, error_shape, new_router, Router,
     ABSENT_DETECTOR_ID,
@@ -870,7 +870,9 @@ async fn a_features_additional_configuration_is_one_stored_entry_per_name() {
 async fn a_value_that_cannot_be_an_account_id_is_refused() {
     let router = new_router();
     let detector_id = detector_with_members(&router).await;
-    let expected = invalid_parameter("accountId");
+    // Both operations carry the ids in their `accountIds` list, which is the
+    // parameter GuardDuty's format rejection names.
+    let expected = account_ids_format("accountIds");
     let member_id = MEMBERS[0].0;
     let case_feature = "S3_DATA_EVENTS";
 

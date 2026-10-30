@@ -401,7 +401,10 @@ async fn a_changed_destination_is_verified_by_the_clock_and_not_by_being_read() 
 /// the destination keeps the properties it had.
 #[tokio::test]
 async fn an_update_the_service_cannot_accept_is_refused_and_writes_nothing() {
-    // (case, destinationProperties, the member the message must name, the class)
+    // (case, destinationProperties, what the message must say, the class) — the
+    // expectation is the MEMBER a handler refusal names and the whole fixed
+    // sentence a boundary refusal carries, because a boundary refusal names no
+    // member at all.
     let cases: [(&str, Value, &str, &str); 9] = [
         (
             "destinationArn is not an ARN at all",
@@ -454,7 +457,7 @@ async fn an_update_the_service_cannot_accept_is_refused_and_writes_nothing() {
         (
             "expectedBucketOwner is one digit short of the modelled length",
             json!({"expectedBucketOwner": "11112222333"}),
-            "expectedBucketOwner",
+            state::INVALID_INPUT_PARAMETERS_MESSAGE,
             ENVELOPE,
         ),
     ];
@@ -463,7 +466,7 @@ async fn an_update_the_service_cannot_accept_is_refused_and_writes_nothing() {
     let detector_id = enabled_detector(&router).await;
     let destination_id = base_destination(&router, &detector_id).await;
 
-    for (case, properties, member, class) in cases {
+    for (case, properties, expected, class) in cases {
         let (status, response) = update_destination(
             &router,
             &detector_id,
@@ -488,10 +491,17 @@ async fn an_update_the_service_cannot_accept_is_refused_and_writes_nothing() {
             "case {case:?}: expected the {ENVELOPE} envelope shape, got {response:?}"
         );
         let message = response["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains(member),
-            "case {case:?}: the refusal must name {member}, got {message:?}"
-        );
+        if class == ENVELOPE {
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected GuardDuty's fixed boundary-refusal text, got {message:?}"
+            );
+        } else {
+            assert!(
+                message.contains(expected),
+                "case {case:?}: the refusal must name {expected}, got {message:?}"
+            );
+        }
 
         // A refused update is not a partial one: nothing it carried was written.
         let (stored, _) = read_back(&router, &detector_id, &destination_id, case).await;

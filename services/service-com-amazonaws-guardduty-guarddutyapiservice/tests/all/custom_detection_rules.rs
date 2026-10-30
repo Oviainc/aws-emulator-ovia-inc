@@ -883,13 +883,12 @@ async fn a_rule_the_catalogue_does_not_publish_is_refused_with_the_modelled_404(
             "case {case:?}: expected the modelled ResourceNotFoundException, got {class:?} {response:?}"
         );
         let message = response["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("ruleId"),
-            "case {case:?}: the refusal must name ruleId, got {message:?}"
-        );
-        assert!(
-            !message.contains(rule_id.as_str()),
-            "case {case:?}: the refusal must not echo the caller's value, got {message:?}"
+        // The rule id is the ONLY thing that says which rule was missing, and it came
+        // from the request, so GuardDuty echoes it after its fixed prefix.
+        assert_eq!(
+            message,
+            format!("Rule not found: {rule_id}"),
+            "case {case:?}: expected the fixed not-found text carrying the rule id, got {message:?}"
         );
     }
 

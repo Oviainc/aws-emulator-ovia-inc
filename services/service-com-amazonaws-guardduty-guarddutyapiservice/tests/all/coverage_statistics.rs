@@ -32,6 +32,7 @@
 //! `core/router/tests/all/guardduty_runtime_coverage.rs`.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_guardduty_guarddutyapiservice::state;
 
 use super::detector_lifecycle::{
     call, call_in, create_detector, enabled_detector, error_shape, new_router, Router,
@@ -93,9 +94,11 @@ async fn statistics_ok(router: &Router, detector_id: &str, body: Value, case: &s
     reported
 }
 
-/// Assert one refusal: HTTP 400 under the modelled envelope, with a message naming the
-/// member at fault.
-fn assert_refusal(case: &str, status: u16, response: &Value, member: &str) {
+/// Assert one refusal: HTTP 400 under the modelled envelope, with a message stating
+/// `expected` — the member at fault where the HANDLER refuses the row, and the whole
+/// fixed sentence where the request BOUNDARY does, since a boundary refusal names no
+/// member (see `modeled_constraint_refusals.rs`).
+fn assert_refusal(case: &str, status: u16, response: &Value, expected: &str) {
     assert_eq!(
         status, 400,
         "case {case:?}: expected HTTP 400, got {status} {response:?}"
@@ -107,8 +110,8 @@ fn assert_refusal(case: &str, status: u16, response: &Value, member: &str) {
     );
     let message = response["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains(member),
-        "case {case:?}: expected the message to name {member:?}, got {message:?}"
+        message.contains(expected),
+        "case {case:?}: expected the message to state {expected:?}, got {message:?}"
     );
 }
 
@@ -331,28 +334,29 @@ async fn a_statistics_type_or_criterion_this_service_cannot_evaluate_is_refused(
 
     // Rows span WHICH member is wrong and HOW: a statistics type outside the enum, in
     // the wrong case, empty, one beside a valid one, the member left out altogether, a
-    // criterion key outside the enum or empty, and a criterion naming no key at all.
-    // Each row names the member a client must fix.
+    // criterion key outside the enum or empty, and a criterion naming no key at all. A
+    // row the HANDLER refuses names the member a client must fix; a row the request
+    // BOUNDARY refuses carries GuardDuty's fixed text for its class, which names none.
     let rows: Vec<(&str, Value, &str)> = vec![
         (
             "a statisticsType outside the enum",
             json!({"statisticsType": ["COUNT_BY_ACCOUNT"]}),
-            "statisticsType",
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE,
         ),
         (
             "a statisticsType in the wrong case",
             json!({"statisticsType": ["count_by_resource_type"]}),
-            "statisticsType",
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE,
         ),
         (
             "an empty statisticsType value",
             json!({"statisticsType": [""]}),
-            "statisticsType",
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE,
         ),
         (
             "an unknown statisticsType beside a known one",
             json!({"statisticsType": ["COUNT_BY_RESOURCE_TYPE", "COUNT_BY_NODE"]}),
-            "statisticsType",
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE,
         ),
         (
             "no statisticsType member at all, which the model requires",
@@ -364,21 +368,21 @@ async fn a_statistics_type_or_criterion_this_service_cannot_evaluate_is_refused(
             json!({"statisticsType": ["COUNT_BY_RESOURCE_TYPE"], "filterCriteria": {"filterCriterion": [
                 {"criterionKey": "NODE_NAME", "filterCondition": {"equals": ["a"]}},
             ]}}),
-            "criterionKey",
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE,
         ),
         (
             "a criterionKey in the wrong case",
             json!({"statisticsType": ["COUNT_BY_RESOURCE_TYPE"], "filterCriteria": {"filterCriterion": [
                 {"criterionKey": "account_id", "filterCondition": {"equals": ["a"]}},
             ]}}),
-            "criterionKey",
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE,
         ),
         (
             "an empty criterionKey",
             json!({"statisticsType": ["COUNT_BY_RESOURCE_TYPE"], "filterCriteria": {"filterCriterion": [
                 {"criterionKey": "", "filterCondition": {"equals": ["a"]}},
             ]}}),
-            "criterionKey",
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE,
         ),
         (
             "a criterion that names no key at all",
@@ -394,12 +398,15 @@ async fn a_statistics_type_or_criterion_this_service_cannot_evaluate_is_refused(
             json!({"statisticsType": ["COUNT_BY_RESOURCE_TYPE"], "filterCriteria": {"filterCriterion": [
                 {"criterionKey": "ISSUE", "filterCondition": {"equals": ["a"]}},
             ]}}),
-            "criterionKey",
+            // `CoverageFilterCriterionKey` is a different enum from `CoverageSortKey`
+            // (`smithy_query(shape="CoverageFilterCriterionKey")`), so a sort key is
+            // outside the criterion key's value set and the BOUNDARY refuses it.
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE,
         ),
     ];
 
-    for (case, body, member) in rows {
+    for (case, body, expected) in rows {
         let (status, response) = statistics(&router, &detector_id, body).await;
-        assert_refusal(case, status, &response, member);
+        assert_refusal(case, status, &response, expected);
     }
 }

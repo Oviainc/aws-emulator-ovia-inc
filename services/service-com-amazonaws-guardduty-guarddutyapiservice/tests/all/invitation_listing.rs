@@ -43,6 +43,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_guardduty_guarddutyapiservice::state;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::NEXT_TOKEN_MEMBER;
 
 use crate::detector_lifecycle::{call_in, error_code, error_shape, router_over, Router};
@@ -548,9 +549,10 @@ async fn an_unissued_token_or_an_out_of_range_page_size_is_refused() {
             "case {case:?}: expected the modelled error shape, got {body:?}"
         );
         let message = body["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("maxResults"),
-            "case {case:?}: the refusal must name maxResults, got {message:?}"
+        assert_eq!(
+            message,
+            state::INVALID_INPUT_PARAMETERS_MESSAGE,
+            "case {case:?}: expected GuardDuty's fixed constraint-refusal text, got {message:?}"
         );
     }
     for size in [1, 50] {

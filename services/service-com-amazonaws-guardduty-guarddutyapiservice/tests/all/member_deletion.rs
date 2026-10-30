@@ -40,7 +40,9 @@
 
 use serde_json::{json, Value};
 
-use crate::client_rejections::{invalid_parameter, not_owned, MALFORMED_DETECTOR_IDS};
+use crate::client_rejections::{
+    account_ids_format, invalid_parameter, not_owned, MALFORMED_DETECTOR_IDS,
+};
 use crate::detector_lifecycle::{
     call, call_in, error_code, error_shape, new_router, Router, ABSENT_DETECTOR_ID,
 };
@@ -735,7 +737,7 @@ async fn a_request_the_service_does_not_understand_is_refused_and_deletes_nothin
     for (account_id, why) in MALFORMED_ACCOUNT_IDS {
         let case = format!("an account id that is {why}");
         let (status, body) = delete_members(&router, &detector_id, &[account_id]).await;
-        assert_rejection(&case, status, &body, &invalid_parameter("accountId"));
+        assert_rejection(&case, status, &body, &account_ids_format("accountIds"));
         assert_every_member_retained(&router, REGION, &detector_id, &case).await;
     }
 
@@ -748,7 +750,7 @@ async fn a_request_the_service_does_not_understand_is_refused_and_deletes_nothin
         &[MEMBERS[0].0, MALFORMED_ACCOUNT_IDS[0].0],
     )
     .await;
-    assert_rejection(case, status, &body, &invalid_parameter("accountId"));
+    assert_rejection(case, status, &body, &account_ids_format("accountIds"));
     assert_every_member_retained(&router, REGION, &detector_id, case).await;
 
     // A value that cannot be a detector id at all is the same kind of failure.

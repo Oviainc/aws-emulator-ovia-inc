@@ -154,7 +154,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // modelled 404, never a hollow success.
             return Err(GetCustomDetectionRuleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::custom_detection_rule_not_found_message()),
+                    message: Some(crate::state::custom_detection_rule_not_found_message(
+                        &input.rule_id,
+                    )),
                     // "The error type"
                     // (`smithy_query(shape="ResourceNotFoundException")`): the
                     // class, the same value the body's `__type` carries.

@@ -197,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled shape and not under the `BadRequestException` envelope this
         // service's 400s use.
         if state.custom_detection_rules.rule(&input.rule_id).is_none() {
-            return Err(not_found());
+            return Err(not_found(&input.rule_id));
         }
 
         // Creating is not updating: `UpdateCustomDetectionRuleAssociation` is the
@@ -211,7 +211,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreateCustomDetectionRuleAssociationErrorModeled::ConflictException(
                     ConflictException {
                         message: Some(
-                            crate::state::detection_rule_association_conflict_message(),
+                            crate::state::detection_rule_association_conflict_message(
+                                &input.rule_id,
+                            ),
                         ),
                         // "The error type"
                         // (`smithy_query(shape="ConflictException")`): the class,
@@ -282,11 +284,12 @@ const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 /// is named by — the modelled 409.
 const CONFLICT_EXCEPTION: &str = "ConflictException";
 
-/// Refuse a `RuleId` the catalogue does not publish with the modelled 404.
-fn not_found() -> CreateCustomDetectionRuleAssociationError {
+/// Refuse a `RuleId` the catalogue does not publish with the modelled 404, naming
+/// the rule the request asked for.
+fn not_found(rule_id: &str) -> CreateCustomDetectionRuleAssociationError {
     CreateCustomDetectionRuleAssociationErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: Some(crate::state::custom_detection_rule_not_found_message()),
+            message: Some(crate::state::custom_detection_rule_not_found_message(rule_id)),
             r#type: Some(RESOURCE_NOT_FOUND_EXCEPTION.to_string()),
         },
     )

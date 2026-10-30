@@ -14,7 +14,9 @@
 //! The rule under test, asserted over a SET of inputs rather than one recorded call:
 //! an account id is 12 decimal digits, and an operation handed a value that cannot be
 //! an account id at all refuses the WHOLE call with HTTP 400 under the service's
-//! `InvalidInputException` class — naming the member at fault and echoing nothing of
+//! `InvalidInputException` class — with GuardDuty's fixed format-rejection text for
+//! the parameter that carried the value (the LIST, where the request names one, and
+//! the `accountId` member where the id sits inside a structure), echoing nothing of
 //! the caller's value — before the store is read or written, while a well-formed id
 //! the administrator holds no member record for is not a refusal at all but a
 //! per-account result. The rows differ along the malformed value's shape, along where
@@ -23,7 +25,7 @@
 
 use serde_json::{json, Value};
 
-use crate::client_rejections::invalid_parameter;
+use crate::client_rejections::{account_ids_format, ACCOUNT_ID_FORMAT};
 use crate::detector_lifecycle::{
     call, enabled_detector, error_code, error_shape, new_router, Router,
 };
@@ -41,12 +43,38 @@ const CLASS: &str = "InvalidInputException";
 /// carries it.
 const ENVELOPE: &str = "BadRequestException";
 
-/// The wire name of the member every one of these operations carries an account id in:
-/// `AccountIds`' entries target `AccountId`, and `AccountDetail.AccountId` and the
-/// organization scope lists' entries render the same way
-/// (`smithy_query(operation="StopMonitoringMembers")`,
+/// The wire name of the LIST member most of these operations carry the account ids
+/// in: `AccountIds` renders `accountIds`
+/// (`smithy_query(operation="StopMonitoringMembers")`), and `GetUsageStatistics`
+/// nests the same list under its criteria
+/// (`smithy_query(query="shape",shape="UsageCriteria")`).
+const ACCOUNT_IDS_MEMBER: &str = "accountIds";
+
+/// The two account lists an organization configuration's scope is carried by
+/// (`smithy_query(shape="DetectionRuleOrgConfiguration")`).
+const INCLUDE_ACCOUNT_IDS_MEMBER: &str = "includeAccountIds";
+/// See [`INCLUDE_ACCOUNT_IDS_MEMBER`].
+const EXCLUDE_ACCOUNT_IDS_MEMBER: &str = "excludeAccountIds";
+
+/// The message `operation` refuses a malformed account id with.
+///
+/// GuardDuty words the format rejection in terms of the parameter that carried the
+/// malformed value: the LIST, where the request names one, and the `accountId`
+/// member itself where the id sits inside a structure — which is what
+/// `CreateMembers` sends (`AccountDetail.AccountId` —
 /// `smithy_query(shape="AccountDetail")`).
-const ACCOUNT_ID_MEMBER: &str = "accountId";
+fn expected_message(operation: &str) -> String {
+    match operation {
+        "CreateMembers" => ACCOUNT_ID_FORMAT.to_string(),
+        "CreateCustomDetectionRuleOrgConfiguration" => {
+            account_ids_format(INCLUDE_ACCOUNT_IDS_MEMBER)
+        }
+        "UpdateCustomDetectionRuleOrgConfiguration" => {
+            account_ids_format(EXCLUDE_ACCOUNT_IDS_MEMBER)
+        }
+        _ => account_ids_format(ACCOUNT_IDS_MEMBER),
+    }
+}
 
 /// `ListCustomDetectionRules` is `POST /custom-detection-rule/rule`
 /// (`smithy_query(operation="ListCustomDetectionRules")`).
@@ -278,9 +306,9 @@ async fn published_rule_id(router: &Router) -> String {
 }
 
 /// Assert one refusal: the status, the class in all three places it appears, the
-/// message naming the member at fault, and that the caller's value is nowhere in the
-/// response.
-fn assert_refused(case: &str, status: u16, body: &Value, malformed: &str) {
+/// message GuardDuty words the format rejection with for the parameter that carried
+/// the value, and that the caller's value is nowhere in the response.
+fn assert_refused(case: &str, status: u16, body: &Value, malformed: &str, expected: &str) {
     assert_eq!(
         status, 400,
         "case {case:?}: expected HTTP 400, got {status} {body:?}"
@@ -307,8 +335,8 @@ fn assert_refused(case: &str, status: u16, body: &Value, malformed: &str) {
     );
     assert_eq!(
         body["message"].as_str(),
-        Some(invalid_parameter(ACCOUNT_ID_MEMBER).as_str()),
-        "case {case:?}: expected the refusal to name {ACCOUNT_ID_MEMBER}, got {body:?}"
+        Some(expected),
+        "case {case:?}: expected GuardDuty's format-rejection text, got {body:?}"
     );
     let rendered = body.to_string();
     assert!(
@@ -339,12 +367,13 @@ async fn malformed_account_id_refuses_every_operation_that_takes_one() {
     );
 
     for operation in OPERATIONS {
+        let expected = expected_message(operation);
         for (malformed, why) in MALFORMED_ACCOUNT_IDS {
             for (placement, index, len) in PLACEMENTS {
                 let ids = account_ids_with(malformed, index, len);
                 let case = format!("{operation}: {why} as {placement}");
                 let (status, body) = send(&router, operation, &detector_id, &rule_id, &ids).await;
-                assert_refused(&case, status, &body, malformed);
+                assert_refused(&case, status, &body, malformed, &expected);
 
                 // Nothing was read into existence and nothing was written: the
                 // recorded member reads back exactly as it did before the call.

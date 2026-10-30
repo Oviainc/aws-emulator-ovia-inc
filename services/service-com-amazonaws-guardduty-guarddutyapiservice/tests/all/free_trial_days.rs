@@ -586,8 +586,10 @@ async fn a_request_the_service_cannot_understand_is_refused() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some("The request is rejected because the parameter accountId has an invalid value."),
-            "case {account_id:?} ({why}): expected the parameter refusal, got {body:?}"
+            Some(
+                "The request failed because parameter accountIds has accountId values that are formatted incorrectly."
+            ),
+            "case {account_id:?} ({why}): expected the format refusal naming the list, got {body:?}"
         );
     }
 

@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `CreateCustomDetectionRuleAssociation` is the operation that makes an
             // association, so a well-formed pair this account holds none for is the
             // modelled 404 rather than a hollow success.
-            return Err(not_found());
+            return Err(not_found(&input.association_id));
         };
 
         // Asking for the mode the association is already in changes nothing, so
@@ -193,7 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(UpdateCustomDetectionRuleAssociationErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(crate::state::detection_rule_association_conflict_message()),
+                    message: Some(crate::state::detection_rule_association_conflict_message(
+                        &input.rule_id,
+                    )),
                     // "The error type"
                     // (`smithy_query(shape="ConflictException")`): the class, the
                     // same value the body's `__type` carries.
@@ -222,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 false,
                 "an association resolved by id must be held under its own (region, rule, mode) key"
             );
-            return Err(not_found());
+            return Err(not_found(&input.association_id));
         };
         record.mode = input.mode.clone();
         record.updated_at_millis = now;
@@ -255,10 +257,12 @@ const CONFLICT_EXCEPTION: &str = "ConflictException";
 /// with the modelled 404, carrying the message a read of the same absence answers
 /// with: the two name the same missing resource, so they cannot describe it
 /// differently.
-fn not_found() -> UpdateCustomDetectionRuleAssociationError {
+fn not_found(association_id: &str) -> UpdateCustomDetectionRuleAssociationError {
     UpdateCustomDetectionRuleAssociationErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: Some(crate::state::detection_rule_association_not_found_message()),
+            message: Some(crate::state::detection_rule_association_not_found_message(
+                association_id,
+            )),
             // "The error type" (`smithy_query(shape="ResourceNotFoundException")`):
             // the class, the same value the body's `__type` carries.
             r#type: Some(RESOURCE_NOT_FOUND_EXCEPTION.to_string()),

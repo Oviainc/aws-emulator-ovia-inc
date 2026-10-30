@@ -166,7 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 GetCustomDetectionRuleAssociationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(
-                            crate::state::detection_rule_association_not_found_message(),
+                            crate::state::detection_rule_association_not_found_message(
+                                &input.association_id,
+                            ),
                         ),
                         // "The error type"
                         // (`smithy_query(shape="ResourceNotFoundException")`): the

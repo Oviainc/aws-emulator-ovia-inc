@@ -31,6 +31,7 @@
 //! `core/router/tests/all/guardduty_runtime_coverage.rs`.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_guardduty_guarddutyapiservice::state;
 
 use super::detector_lifecycle::{
     call, call_in, create_detector, enabled_detector, error_shape, new_router, Router,
@@ -106,9 +107,11 @@ fn resources(response: &Value, case: &str) -> Vec<Value> {
         .clone()
 }
 
-/// Assert one refusal: HTTP 400 under the modelled envelope, with a message naming the
-/// member at fault.
-fn assert_refusal(case: &str, status: u16, response: &Value, member: &str) {
+/// Assert one refusal: HTTP 400 under the modelled envelope, with a message stating
+/// `expected` — the member at fault where the HANDLER refuses the row, and the whole
+/// fixed sentence where the request BOUNDARY does, since a boundary refusal names no
+/// member (see `modeled_constraint_refusals.rs`).
+fn assert_refusal(case: &str, status: u16, response: &Value, expected: &str) {
     assert_eq!(
         status, 400,
         "case {case:?}: expected HTTP 400, got {status} {response:?}"
@@ -120,8 +123,8 @@ fn assert_refusal(case: &str, status: u16, response: &Value, member: &str) {
     );
     let message = response["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains(member),
-        "case {case:?}: expected the message to name {member:?}, got {message:?}"
+        message.contains(expected),
+        "case {case:?}: expected the message to state {expected:?}, got {message:?}"
     );
 }
 
@@ -321,29 +324,30 @@ async fn a_criterion_sort_or_token_this_service_cannot_evaluate_is_refused() {
 
     // Rows span WHICH member is wrong and HOW: a key outside the enum, a key in the
     // wrong case, an empty key, a criterion naming no key at all, an order outside the
-    // enum, and a token this service never issued. Each row names the member a client
-    // must fix.
+    // enum, and a token this service never issued. A row the HANDLER refuses names the
+    // member a client must fix; a row the request BOUNDARY refuses carries GuardDuty's
+    // fixed text for its class, which names none.
     let rows: Vec<(&str, Value, &str)> = vec![
         (
             "a criterionKey outside the enum",
             json!({"filterCriteria": {"filterCriterion": [
                 {"criterionKey": "NODE_NAME", "filterCondition": {"equals": ["a"]}},
             ]}}),
-            "criterionKey",
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE,
         ),
         (
             "a criterionKey in the wrong case",
             json!({"filterCriteria": {"filterCriterion": [
                 {"criterionKey": "account_id", "filterCondition": {"equals": ["a"]}},
             ]}}),
-            "criterionKey",
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE,
         ),
         (
             "an empty criterionKey",
             json!({"filterCriteria": {"filterCriterion": [
                 {"criterionKey": "", "filterCondition": {"equals": ["a"]}},
             ]}}),
-            "criterionKey",
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE,
         ),
         (
             "a criterion that names no key at all",
@@ -355,17 +359,20 @@ async fn a_criterion_sort_or_token_this_service_cannot_evaluate_is_refused() {
         (
             "an attributeName outside the enum",
             json!({"sortCriteria": {"attributeName": "NODE_NAME"}}),
-            "attributeName",
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE,
         ),
         (
             "an attributeName that is a criterion key but not a sort key",
             json!({"sortCriteria": {"attributeName": "RESOURCE_TYPE"}}),
-            "attributeName",
+            // `CoverageSortKey` is a different enum from `CoverageFilterCriterionKey`
+            // (`smithy_query(shape="CoverageSortKey")`), so a criterion key is
+            // outside the sort key's value set and the BOUNDARY refuses it.
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE,
         ),
         (
             "an orderBy outside the enum",
             json!({"sortCriteria": {"attributeName": "ACCOUNT_ID", "orderBy": "ASCENDING"}}),
-            "orderBy",
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE,
         ),
         (
             "a nextToken that is not one this service issues",
@@ -380,17 +387,17 @@ async fn a_criterion_sort_or_token_this_service_cannot_evaluate_is_refused() {
         (
             "maxResults below the modelled minimum of 1",
             json!({"maxResults": 0}),
-            "maxResults",
+            state::INVALID_INPUT_PARAMETERS_MESSAGE,
         ),
         (
             "maxResults above the modelled maximum of 50",
             json!({"maxResults": 51}),
-            "maxResults",
+            state::INVALID_INPUT_PARAMETERS_MESSAGE,
         ),
     ];
 
-    for (case, body, member) in rows {
+    for (case, body, expected) in rows {
         let (status, response) = coverage(&router, &detector_id, body).await;
-        assert_refusal(case, status, &response, member);
+        assert_refusal(case, status, &response, expected);
     }
 }

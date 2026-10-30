@@ -499,7 +499,10 @@ async fn a_refused_create_leaves_no_destination_behind() {
 /// `InvalidInputException` class.
 #[tokio::test]
 async fn a_create_the_service_cannot_accept_is_refused() {
-    // (case, request body, the member the message must name, the error class)
+    // (case, request body, what the message must say, the error class) — the
+    // expectation is the MEMBER a handler refusal names and the whole fixed
+    // sentence a boundary refusal carries, because a boundary refusal names no
+    // member at all.
     let cases: [(&str, Value, &str, &str); 12] = [
         (
             "no destinationArn",
@@ -552,7 +555,7 @@ async fn a_create_the_service_cannot_accept_is_refused() {
         (
             "destinationType outside the enum",
             json!({"destinationType": "SQS", "destinationProperties": {"destinationArn": "arn:aws:sqs:us-east-1:111122223333:findings", "kmsKeyArn": KEY_ARN}}),
-            "destinationType",
+            state::UNPROCESSABLE_PAYLOAD_MESSAGE,
             ENVELOPE,
         ),
         (
@@ -564,20 +567,20 @@ async fn a_create_the_service_cannot_accept_is_refused() {
         (
             "expectedBucketOwner is one digit short of the modelled length",
             json!({"destinationType": S3, "destinationProperties": {"destinationArn": "arn:aws:s3:::bucket", "kmsKeyArn": KEY_ARN, "expectedBucketOwner": "11112222333"}}),
-            "expectedBucketOwner",
+            state::INVALID_INPUT_PARAMETERS_MESSAGE,
             ENVELOPE,
         ),
         (
             "expectedBucketOwner is one digit over the modelled length",
             json!({"destinationType": S3, "destinationProperties": {"destinationArn": "arn:aws:s3:::bucket", "kmsKeyArn": KEY_ARN, "expectedBucketOwner": "1111222233334"}}),
-            "expectedBucketOwner",
+            state::INVALID_INPUT_PARAMETERS_MESSAGE,
             ENVELOPE,
         ),
     ];
 
     let router = new_router();
     let detector_id = enabled_detector(&router).await;
-    for (case, body, member, class) in cases {
+    for (case, body, expected, class) in cases {
         let (status, response) = create_destination(&router, &detector_id, body).await;
         assert_eq!(
             status, 400,
@@ -596,10 +599,17 @@ async fn a_create_the_service_cannot_accept_is_refused() {
             "case {case:?}: expected the {ENVELOPE} envelope shape, got {response:?}"
         );
         let message = response["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains(member),
-            "case {case:?}: the refusal must name {member}, got {message:?}"
-        );
+        if class == ENVELOPE {
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected GuardDuty's fixed boundary-refusal text, got {message:?}"
+            );
+        } else {
+            assert!(
+                message.contains(expected),
+                "case {case:?}: the refusal must name {expected}, got {message:?}"
+            );
+        }
     }
 }
 
