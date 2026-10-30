@@ -19,6 +19,12 @@
 //! (`ValidationException`, HTTP 400), and an output that names another resource — a
 //! dictionary, or a fixture of the data source — is stored only when that id resolves
 //! (`crate::state::...::unresolved_output_reference`).
+//! The operation is `@idempotent` and carries no `@idempotencyToken`, so the request's
+//! own members are its key: a request stating the payload the feed already holds while
+//! the reconfiguration that stored it is still in flight is that same request once more,
+//! and several identical requests have the effect of ONE — it stores nothing and leaves
+//! the feed's return to its settled status due at the instant the first call set
+//! (`crate::state::Feed::reconfigure`).
 //!
 //! ## Shape of an operation
 //!
@@ -387,9 +393,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // PUT: the payload completely overwrites the existing one, so the new list
         // replaces the stored outputs and an omitted access role clears it.
-        feed.name = input.name;
-        feed.outputs = outputs;
-        feed.access_role_arn = input.access_role_arn;
+        //
         // Reconfiguring a live media feed's payload is work the service then carries
         // out, so the feed is IN FLIGHT for the span of it and reports the modelled
         // `UPDATING` — the value that exists for exactly this span — until the clock
@@ -404,7 +408,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // call's settle pass. A feed whose deletion has already been accepted never
         // reaches here (it is refused above), so this neither cancels nor accelerates a
         // transition the clock already owes.
-        let due = feed.begin_reconfiguration(now);
+        //
+        // The write and that span are decided by `crate::state::Feed::reconfigure`, the
+        // one writer of a feed's payload, because the operation is `@idempotent` with no
+        // `@idempotencyToken`: a request stating the payload the feed already holds while
+        // the reconfiguration that stored it is still in flight is that same request once
+        // more — what an SDK repeats when it never saw the first response — so it stores
+        // nothing and leaves the move the clock owes due at the instant the first call
+        // set, exactly as repeating `DeleteFeed` inside its own window leaves the
+        // removal due. Any other payload is a reconfiguration of its own.
+        let due = feed.reconfigure(input.name, outputs, input.access_role_arn, now);
 
         let output = UpdateFeedOutput {
             arn: feed.arn.clone(),

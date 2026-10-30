@@ -951,13 +951,60 @@ impl Feed {
     /// A reconfiguration that arrives while another is still in flight restarts the
     /// span and keeps the SETTLED status already remembered: the status to go back to is
     /// the one the feed held before any of the work started, never the transient one it
-    /// is carrying now.
+    /// is carrying now. A REPEAT of the reconfiguration already in flight is not such a
+    /// request and never reaches here — see [`Self::reconfigure`], the one writer of a
+    /// feed's payload.
     #[must_use]
     pub fn begin_reconfiguration(&mut self, now: Instant) -> Instant {
         let settled = self.settles_into.unwrap_or(self.status);
         let due = self.enter_transient(FeedStatus::Updating, now);
         self.settles_into = Some(settled);
         due
+    }
+
+    /// Store the payload a full-overwrite update of this feed states — its name, its
+    /// whole output list and its access role — and return the instant the
+    /// reconfiguration the feed now carries falls due.
+    ///
+    /// The payload REPLACES the stored one, so a feed reconfigured this way carries the
+    /// transient status for the span of the work ([`Self::begin_reconfiguration`]) and
+    /// an access role the request omits is cleared.
+    ///
+    /// EXCEPT when the request is the reconfiguration already in flight once more:
+    /// `UpdateFeed` is `@idempotent` and carries no `@idempotencyToken`, so the
+    /// request's own members are its key, exactly as a create's are
+    /// ([`ComAmazonawsElementalinferenceElementalinferenceState::feed_created_from`]). A
+    /// request stating the payload this feed already holds, while the reconfiguration
+    /// that stored it is still in flight, is that same request once more — what an SDK
+    /// repeats when it never saw the first response — and several identical requests
+    /// have the effect of ONE. Such a repeat therefore writes nothing and the move the
+    /// clock owes stays due at the instant the first call set: retrying cannot re-enter
+    /// the transient status, nor postpone the feed's return to the status that call
+    /// suspended, any more than repeating a delete inside its own window can postpone
+    /// the removal ([`Self::enter_transient`] is not reached at all). A request stating a
+    /// DIFFERENT payload is a reconfiguration of its own, whatever status the feed is in.
+    #[must_use]
+    pub fn reconfigure(
+        &mut self,
+        name: String,
+        outputs: Vec<Output>,
+        access_role_arn: Option<String>,
+        now: Instant,
+    ) -> Instant {
+        let repeats_the_work_in_flight = self.status == FeedStatus::Updating
+            && self.name == name
+            && self.outputs == outputs
+            && self.access_role_arn == access_role_arn;
+        if let Some(due) = self
+            .transition_due_at
+            .filter(|_| repeats_the_work_in_flight)
+        {
+            return due;
+        }
+        self.name = name;
+        self.outputs = outputs;
+        self.access_role_arn = access_role_arn;
+        self.begin_reconfiguration(now)
     }
 
     /// Put this feed into a SETTLED status, immediately — the counterpart of

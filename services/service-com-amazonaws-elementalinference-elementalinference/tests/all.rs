@@ -99,3 +99,5 @@ mod supplied_tag_validation;
 mod tag_listing;
 #[path = "all/tagging_region_scope.rs"]
 mod tagging_region_scope;
+#[path = "all/update_replay_is_idempotent.rs"]
+mod update_replay_is_idempotent;
