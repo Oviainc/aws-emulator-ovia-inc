@@ -24,6 +24,7 @@
 
 use serde_json::{json, Value};
 
+use crate::account_settings::{patch_account, role_arn};
 use crate::rest_api_lifecycle::{assert_failure, create_api, Answer, Gateway};
 use crate::stage_lifecycle::{create_deployment, get_stage};
 
@@ -147,6 +148,17 @@ async fn deployed_stage(gateway: &Gateway, name: &str) -> String {
 async fn either_spelling_of_a_setting_writes_the_same_method_setting() {
     let gateway = Gateway::new();
     let api = deployed_stage(&gateway, "setting-spellings").await;
+    // The catalog carries the two settings that turn a method's execution logging on,
+    // which API Gateway writes under the ACCOUNT's CloudWatch Logs role, so the account
+    // carries one before the table runs — the precondition the sibling
+    // `stage_execution_logging_account_role` suite covers.
+    patch_account(
+        &gateway,
+        "replace",
+        "/cloudwatchRoleArn",
+        Some(&role_arn("setting-spellings")),
+    )
+    .await;
 
     for (published, member, value, expected) in setting_catalog() {
         // One method path per spelling, so each row proves which setting the spelling

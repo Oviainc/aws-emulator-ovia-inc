@@ -27,6 +27,7 @@
 
 use serde_json::{json, Value};
 
+use crate::account_settings::{patch_account, role_arn};
 use crate::patch_updates::patch_ok;
 use crate::rest_api_lifecycle::{
     create_api, create_resource, page_items, string_member, without, Gateway,
@@ -85,6 +86,16 @@ async fn deployed_stage(gateway: &Gateway, case: &str) -> String {
         method.status, method.body
     );
     create_deployment(gateway, &api, case, json!({ "stageName": STAGE })).await;
+    // One row turns a method's execution logging on, which API Gateway writes under the
+    // ACCOUNT's CloudWatch Logs role, so the account carries one — the precondition the
+    // sibling `stage_execution_logging_account_role` suite covers.
+    patch_account(
+        gateway,
+        "replace",
+        "/cloudwatchRoleArn",
+        Some(&role_arn("update-stage-readers")),
+    )
+    .await;
     api
 }
 

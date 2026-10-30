@@ -14,6 +14,12 @@
 //! `cacheClusterStatus` is computed from it, so a caller reading straight after this call
 //! still observes `CREATE_IN_PROGRESS` or `DELETE_IN_PROGRESS`.
 //!
+//! Turning a method's EXECUTION logging on is gated on the account rather than on the
+//! stage: API Gateway writes those log events under the account-level CloudWatch Logs
+//! role, so a patch that sets a logging level other than off, or turns the full
+//! request/response data trace on, is refused while the account singleton carries no role
+//! — see [`ACCOUNT_CLOUDWATCH_ROLE_REQUIRED`].
+//!
 //! What an `op` means, how a `path` is read and how a single-valued member, a map
 //! member or a bounded number is edited are the service's shared patch semantics
 //! (`crate::state`'s patch section); this file only maps each supported path to the
@@ -171,9 +177,47 @@ fn invalid_copy_operation(path: &str, from: &str) -> String {
     )
 }
 
+/// The `loggingLevel` that is execution logging turned OFF: the one value of the
+/// documented set at which a method emits no execution log events at all.
+const LOGGING_LEVEL_OFF: &str = "OFF";
+
 /// The values `MethodSetting$loggingLevel` documents: "Valid values are OFF, ERROR, and
 /// INFO." The member is a plain string on the wire, so its value set is checked here.
-const LOGGING_LEVEL_VALUES: &[&str] = &["OFF", "ERROR", "INFO"];
+const LOGGING_LEVEL_VALUES: &[&str] = &[LOGGING_LEVEL_OFF, "ERROR", "INFO"];
+
+/// The `BadRequestException` message API Gateway refuses a configuration that turns a
+/// stage's execution logging on with while the account has no CloudWatch Logs role.
+///
+/// API Gateway writes a method's execution logs under the account-level role
+/// (`Account$cloudwatchRoleArn`, "the ARN of an Amazon CloudWatch role for the current
+/// Account"), so a stage cannot be configured to emit them before the account has one.
+/// Entirely fixed text for this condition: it names neither the stage, the method scope
+/// nor the setting the request carried.
+const ACCOUNT_CLOUDWATCH_ROLE_REQUIRED: &str =
+    "CloudWatch Logs role ARN must be set in account settings to enable logging";
+
+/// Whether this patch of the method setting `setting` turns a method's EXECUTION logging
+/// ON — the condition the account-level CloudWatch Logs role is a precondition of.
+///
+/// Execution logging is on for a method scope when its level is one of the documented
+/// levels other than [`LOGGING_LEVEL_OFF`], and the full request/response data trace is
+/// execution logging too, so either setting being turned on by an `add` or a `replace` is
+/// a configuration that needs the role. Turning either off, removing it, and every other
+/// method setting (metrics, throttling, caching) emit no execution logs and so are not
+/// gated. Each value is read exactly as the applier below reads it, so a value the
+/// setting would refuse anyway is left to its own refusal.
+fn enables_execution_logging(patch: &Patch, setting: &str) -> bool {
+    if !matches!(patch.op, PatchOpKind::Add | PatchOpKind::Replace) {
+        return false;
+    }
+    match setting {
+        "logging/loglevel" => patch.value.as_deref().is_some_and(|level| {
+            level != LOGGING_LEVEL_OFF && LOGGING_LEVEL_VALUES.contains(&level)
+        }),
+        "logging/dataTrace" => patch.require_bool().unwrap_or(false),
+        _ => false,
+    }
+}
 
 /// The range of `MethodSetting$cacheTtlInSeconds`: API Gateway documents a default TTL of
 /// 300 seconds and a maximum of 3600 seconds for a method cache, and 0 ("the higher the
@@ -282,11 +326,14 @@ fn require_deployment(
 /// Apply one patch to a COPY of a stored stage.
 ///
 /// `deployments` is the set of the API's stored deployment ids, so a stage can only be
-/// pointed at a deployment that exists.
+/// pointed at a deployment that exists. `logging_role_configured` is whether the ACCOUNT
+/// has a CloudWatch Logs role, which a patch turning execution logging on requires (see
+/// [`ACCOUNT_CLOUDWATCH_ROLE_REQUIRED`]).
 fn apply_patch(
     entry: &mut StageEntry,
     patch: &Patch,
     deployments: &BTreeSet<String>,
+    logging_role_configured: bool,
 ) -> Result<(), PatchFailure> {
     // A `copy` is the canary promotion, whose legal (path, from) pairs are the stage's
     // copy grammar — judged for the op as a whole rather than per member, because the
@@ -321,7 +368,7 @@ fn apply_patch(
         "accessLogSettings" => apply_access_log_patch(entry, patch),
         // Everything else is addressed as a method path rather than as a member of the
         // stage: `/{resource_path}/{http_method}/<setting>`.
-        _ => apply_method_setting_patch(entry, patch),
+        _ => apply_method_setting_patch(entry, patch, logging_role_configured),
     }
 }
 
@@ -611,10 +658,22 @@ fn method_setting_tail(patch: &Patch) -> Option<(usize, &'static str)> {
 /// everything before it the method, which is the `methodSettings` key the stage reports
 /// — spelled exactly as the request spelled it, escapes included, because that is the key
 /// the patch addressed.
-fn apply_method_setting_patch(entry: &mut StageEntry, patch: &Patch) -> Result<(), PatchFailure> {
+fn apply_method_setting_patch(
+    entry: &mut StageEntry,
+    patch: &Patch,
+    logging_role_configured: bool,
+) -> Result<(), PatchFailure> {
     let Some((depth, setting)) = method_setting_tail(patch) else {
         return Err(patch.unsupported_path());
     };
+    // The account-level logging role is a precondition of the CONFIGURATION, checked
+    // before any entry of `methodSettings` is touched: a stage cannot be set to emit
+    // execution logs the account has granted API Gateway no role to write.
+    if !logging_role_configured && enables_execution_logging(patch, setting) {
+        return Err(PatchFailure::BadRequest(
+            ACCOUNT_CLOUDWATCH_ROLE_REQUIRED.to_string(),
+        ));
+    }
     let raw: Vec<&str> = patch
         .path
         .strip_prefix('/')
@@ -777,9 +836,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?
             .clone();
         let deployments: BTreeSet<String> = api.deployments.keys().cloned().collect();
+        // The account singleton's CloudWatch Logs role, which a patch that turns this
+        // stage's execution logging on is a configuration of: a role set to no ARN at all
+        // is an account with none, exactly as `GetAccount` reports it.
+        let logging_role_configured = store
+            .account
+            .cloudwatch_role_arn
+            .as_deref()
+            .is_some_and(|arn| !arn.trim().is_empty());
 
         for patch in &patches {
-            apply_patch(&mut updated, patch, &deployments).map_err(patch_failure)?;
+            apply_patch(&mut updated, patch, &deployments, logging_role_configured)
+                .map_err(patch_failure)?;
         }
         // A successful patch is when the record last changed. An empty list changes
         // nothing, so it moves nothing.

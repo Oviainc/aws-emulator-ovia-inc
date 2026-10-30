@@ -32,6 +32,7 @@ use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
     CACHE_CLUSTER_DELETE_IN_PROGRESS, CACHE_CLUSTER_DELETE_SPAN, CACHE_CLUSTER_NOT_AVAILABLE,
 };
 
+use crate::account_settings::{patch_account, role_arn};
 use crate::rest_api_lifecycle::{assert_failure, create_api, Answer, Gateway};
 use crate::stage_lifecycle::{create_deployment, get_stage};
 
@@ -278,6 +279,16 @@ async fn a_patch_sets_the_member_its_path_names_and_the_stage_reads_back() {
     ];
 
     let gateway = Gateway::new();
+    // Rows below turn a method's execution logging on, which API Gateway writes under the
+    // ACCOUNT's CloudWatch Logs role, so the account carries one before the table runs —
+    // the precondition the sibling `stage_execution_logging_account_role` suite covers.
+    patch_account(
+        &gateway,
+        "replace",
+        "/cloudwatchRoleArn",
+        Some(&role_arn("update-stage-members")),
+    )
+    .await;
 
     for (index, (case, stage_name, operations, expected)) in cases.iter().enumerate() {
         // Each row gets its own API, so the table can be as wide as the rule needs

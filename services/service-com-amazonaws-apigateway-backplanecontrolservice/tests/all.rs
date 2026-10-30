@@ -321,3 +321,7 @@ mod refusal_sentence_targets;
 // the byte spelling of the YAML serialization.
 #[path = "all/stage_export_content_types.rs"]
 mod stage_export_content_types;
+// Appended for the reason the note above gives: the ACCOUNT-level CloudWatch Logs role a
+// stage configuration that turns execution logging on is refused without.
+#[path = "all/stage_execution_logging_account_role.rs"]
+mod stage_execution_logging_account_role;
