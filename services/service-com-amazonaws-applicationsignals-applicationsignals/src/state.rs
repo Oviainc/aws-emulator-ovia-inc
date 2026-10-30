@@ -1500,9 +1500,20 @@ pub fn encode_cursor(tag: &str, cursor: &str) -> String {
 
 /// The cursor `token` carries under `tag`, or `None` when it is not a token this service
 /// issued under that tag.
+///
+/// Only the ONE spelling [`encode_cursor`] writes for a position names that position, so the
+/// token is accepted only when it is byte-for-byte the token this service would mint for the
+/// cursor it decodes to. `hex::decode` reads more than `hex::encode` writes — it accepts
+/// `A-F` as well as the `a-f` the minter emits — so without that comparison a re-cased copy
+/// of an issued token, a string no response of this service ever carried, would resume a
+/// page. Re-encoding the decoded cursor is what compares the two, so the accepted spelling
+/// is the ENCODER's rather than a second grammar maintained beside it, exactly as the
+/// POSITION inside the tag is held to the spelling its encoder writes
+/// ([`canonical_number`]).
 pub fn decode_cursor(tag: &str, token: &str) -> Option<String> {
     let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    decoded.strip_prefix(tag).map(ToString::to_string)
+    let cursor = decoded.strip_prefix(tag)?;
+    (encode_cursor(tag, cursor) == token).then(|| cursor.to_string())
 }
 
 /// The refusal every read of this service reports for a `NextToken` it did not issue.

@@ -83,6 +83,8 @@ mod max_results_range;
 mod optional_page_bound;
 #[path = "all/page_bounds.rs"]
 mod page_bounds;
+#[path = "all/page_token_spelling.rs"]
+mod page_token_spelling;
 #[path = "all/paged_cursor_selection_binding.rs"]
 mod paged_cursor_selection_binding;
 #[path = "all/paged_cursor_subject_binding.rs"]
