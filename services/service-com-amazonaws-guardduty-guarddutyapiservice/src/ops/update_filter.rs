@@ -3,8 +3,12 @@
 //! @op UpdateFilter
 //! IMPLEMENTED: writes the members the request names onto the filter `CreateFilter`
 //! saved, leaves the ones it does not name as they were, and advances that filter's
-//! `UpdatedAt` and `Version`, so a later `GetFilter` reports exactly that. This is the
-//! ONLY file to touch for this operation.
+//! `UpdatedAt` and `Version`, so a later `GetFilter` reports exactly that. An updated
+//! filter whose action archives is APPLIED when the update lands: every finding the
+//! detector holds that the filter's criteria now select is archived, for the reason
+//! `CreateFilter`'s header gives — the member names the findings that match the
+//! filter, and nothing in the model scopes that set to findings generated later.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -242,10 +246,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what moves both, and `CreatedAt` never moves again.
         filter.version = filter.version.saturating_add(1);
         filter.updated_at_millis = now;
+        let name = filter.name.clone();
 
-        Ok(UpdateFilterOutput {
-            name: filter.name.clone(),
-        })
+        // The saved `Action` is a RULE, not a stored string: an update that leaves a
+        // filter archiving — by naming that action, or by leaving in place the one the
+        // create stored — applies it to the findings this detector holds that the
+        // filter's criteria now select, through the one archive write
+        // ([`crate::state::Detector::apply_filter_action`]). That is the same
+        // application `CreateFilter` makes, so a filter created archiving and a filter
+        // updated into archiving suppress the same set. The detector was resolved and
+        // mutated above under this lock, so the miss arm applies nothing because there
+        // is nothing to apply.
+        if let Some(detector) = state.detector_in_mut(&region, &input.detector_id) {
+            detector.apply_filter_action(&name, now);
+        }
+
+        Ok(UpdateFilterOutput { name })
     }
 }
 

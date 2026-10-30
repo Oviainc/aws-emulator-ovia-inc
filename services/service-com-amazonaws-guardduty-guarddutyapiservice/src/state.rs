@@ -2410,6 +2410,14 @@ pub const FILTER_QUOTA_EXCEEDED_MESSAGE: &str =
 /// (`smithy_query(query="doc",shape="CreateFilterRequest",member="Action")`).
 pub const FILTER_ACTION_NOOP: &str = "NOOP";
 
+/// The `FilterAction` that SUPPRESSES: "the action that is to be applied to the
+/// findings that match the filter"
+/// (`smithy_query(query="doc",shape="CreateFilterRequest",member="Action")`) is one
+/// of two values (`smithy_query(shape="FilterAction")`), and this is the one that
+/// changes a finding — it archives every finding the filter's criteria select
+/// ([`Detector::apply_filter_action`]). The other names no change at all.
+pub const FILTER_ACTION_ARCHIVE: &str = "ARCHIVE";
+
 /// The `FilterVersion` a freshly created filter carries. `FilterVersion` is
 /// `range min 1` (`smithy_query(shape="FilterVersion")`), so a filter nothing has
 /// updated is at version 1.
@@ -3117,6 +3125,68 @@ impl Detector {
             }
         }
         moved
+    }
+
+    /// Is `finding` selected by at least one of this detector's SUPPRESSION filters
+    /// — a saved filter whose action archives
+    /// ([`FilterRecord::archives_matching_findings`])?
+    ///
+    /// A filter selects findings by exactly the rule a findings read selects them by
+    /// ([`finding_matches`]), so the set a filter suppresses is the set a
+    /// `ListFindings` carrying its criteria reports and the two cannot drift apart.
+    /// A saved filter's criteria are resolved as fields of a finding before the
+    /// filter is stored, so the matcher cannot reject them here; one it still could
+    /// not evaluate selects NOTHING rather than suppressing everything.
+    pub fn finding_is_suppressed(&self, finding: &FindingRecord) -> bool {
+        self.filters.values().any(|filter| {
+            filter.archives_matching_findings()
+                && finding_matches(finding, Some(&filter.finding_criteria)).unwrap_or(false)
+        })
+    }
+
+    /// Apply ONE saved filter's action: when the named filter archives, put every
+    /// finding this detector holds that its criteria select into the archived state,
+    /// recording `now` as the `UpdatedAt` of each finding the call actually moves. A
+    /// filter whose action names no change, and a name this detector does not hold,
+    /// move nothing.
+    ///
+    /// Scoped to the filter a call just saved, so saving one filter never moves the
+    /// archive state a caller set through the explicit write for findings that filter
+    /// does not select. The write goes through [`Self::set_findings_archived`], the
+    /// ONE archive write, so a suppressed finding is archived exactly as an explicit
+    /// `ArchiveFindings` archives it and the last call to land still decides the
+    /// state: a finding a caller unarchives stays unarchived until the filter is
+    /// saved over it again or the activity is observed again.
+    ///
+    /// Answers whether this call moved any finding at all, as
+    /// [`Self::set_findings_archived`] does and for the same reason.
+    pub fn apply_filter_action(&mut self, filter_name: &str, now: i64) -> bool {
+        let Some(filter) = self.filters.get(filter_name) else {
+            return false;
+        };
+        if !filter.archives_matching_findings() {
+            return false;
+        }
+        let criteria = filter.finding_criteria.clone();
+        let selected: Vec<String> = self
+            .findings
+            .values()
+            .filter(|finding| finding_matches(finding, Some(&criteria)).unwrap_or(false))
+            .map(|finding| finding.id.clone())
+            .collect();
+        self.set_findings_archived(&selected, true, now)
+    }
+
+    /// Apply the archive action of EVERY saved suppression filter to one finding: the
+    /// path that has just generated or re-observed it archives it when any standing
+    /// filter selects it ([`Self::finding_is_suppressed`]), so generating a finding
+    /// never moves the archive state of a finding it is not about.
+    pub fn archive_if_suppressed(&mut self, finding_id: &str, now: i64) -> bool {
+        let suppressed = self
+            .findings
+            .get(finding_id)
+            .is_some_and(|finding| self.finding_is_suppressed(finding));
+        suppressed && self.set_findings_archived(&[finding_id.to_string()], true, now)
     }
 
     /// Record `feedback` (and the `comments` it came with) on every named finding
@@ -4633,6 +4703,19 @@ pub struct FilterRecord {
     pub updated_at_millis: i64,
     /// `FilterVersion`: 1 for a filter nothing has updated.
     pub version: i64,
+}
+
+impl FilterRecord {
+    /// Does this filter ARCHIVE the findings its criteria select?
+    ///
+    /// The stored action is one of the two `FilterAction` values
+    /// (`smithy_query(shape="FilterAction")`) and only
+    /// [`FILTER_ACTION_ARCHIVE`] is applied to a finding; a filter carrying the
+    /// other value, or carrying none at all (whose default is
+    /// [`FILTER_ACTION_NOOP`]), leaves every finding exactly as it is.
+    pub fn archives_matching_findings(&self) -> bool {
+        self.action.as_deref() == Some(FILTER_ACTION_ARCHIVE)
+    }
 }
 
 /// One ThreatIntelSet: a list of "known malicious IP addresses" GuardDuty generates

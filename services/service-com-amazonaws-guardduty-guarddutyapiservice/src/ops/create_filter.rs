@@ -3,7 +3,16 @@
 //! @op CreateFilter
 //! IMPLEMENTED: saves a finding filter on the detector and answers with the name it
 //! was saved under, so a later `GetFilter` reports exactly what this call stored. A
-//! filter name outside the documented alphabet, and a `FindingCriteria` criterion
+//! filter saved with the archiving `Action` is APPLIED when it lands: every finding
+//! the detector holds that its criteria select is archived. The member names the set
+//! that action applies to — "the findings that match the filter"
+//! (`smithy_query(query="doc",shape="CreateFilterRequest",member="Action")`) — and
+//! neither that text nor any other member of the request scopes it to findings
+//! generated after the save, so the action is applied to the findings matching it at
+//! each point the rule can act: here, and again when a finding is generated
+//! (`CreateSampleFindings`). An explicit `UnarchiveFindings` afterwards still decides
+//! the state, so this applies the rule rather than pinning the findings to it.
+//! A filter name outside the documented alphabet, and a `FindingCriteria` criterion
 //! keyed by anything that is not a field of a finding, are refused with the
 //! `BadRequestException` envelope and persist no filter.
 //! This is the ONLY file to touch for this operation.
@@ -316,6 +325,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let name = record.name.clone();
         detector.filters.insert(name.clone(), record);
+        // `Action` is a RULE, not a stored string: "the action that is to be applied
+        // to the findings that match the filter"
+        // (`smithy_query(query="doc",shape="CreateFilterRequest",member="Action")`).
+        // The filter this call just saved is applied here, to the findings this
+        // detector holds that its criteria select, through the one archive write both
+        // `ArchiveFindings` and `UnarchiveFindings` go through — so the two
+        // `FilterAction` values are observationally different and a suppression
+        // filter suppresses. A filter whose action names no change moves nothing, and
+        // neither does this call for a finding the saved filter does not select.
+        detector.apply_filter_action(&name, now);
         // The detector itself changed: it holds one more sub-resource than before,
         // which is the same change its other saved sub-resource creates record on it
         // (`CreateIPSet`, `CreateThreatIntelSet`, the entity sets, a publishing

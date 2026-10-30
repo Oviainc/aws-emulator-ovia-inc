@@ -57,6 +57,8 @@ mod detector_update_without_configuration;
 mod entity_set_delete_retention;
 #[path = "all/expected_bucket_owner_form.rs"]
 mod expected_bucket_owner_form;
+#[path = "all/filter_action_suppression.rs"]
+mod filter_action_suppression;
 #[path = "all/filter_delete.rs"]
 mod filter_delete;
 #[path = "all/filter_detector_timestamp.rs"]

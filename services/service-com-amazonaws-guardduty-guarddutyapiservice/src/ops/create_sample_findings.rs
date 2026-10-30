@@ -2,7 +2,8 @@
 
 //! @op CreateSampleFindings
 //! IMPLEMENTED: inserts one finding per requested finding type into the detector's
-//! finding store, so `ListFindings` and `GetFindings` read them back. An unknown
+//! finding store, so `ListFindings` and `GetFindings` read them back. A generated
+//! finding a saved archiving filter selects is archived as it is generated. An unknown
 //! detector id is refused with `BadRequestException`.
 //!
 //! A requested finding type must be a GuardDuty finding type: the service generates a
@@ -198,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `UpdatedAt` and `EventLastSeen` move — a repeat generation IS another
             // observation of the activity. A sample finding has no distinct
             // resource, so the finding type alone identifies it.
-            if let Some(existing) = state
+            let aggregated = state
                 .detector_in_mut(&region, &input.detector_id)
                 .and_then(|detector| {
                     detector
@@ -206,10 +207,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .values_mut()
                         .find(|finding| finding.r#type == finding_type)
                 })
-            {
-                existing.count = existing.count.saturating_add(1);
-                existing.updated_at_millis = now;
-                existing.event_last_seen_millis = now;
+                .map(|existing| {
+                    existing.count = existing.count.saturating_add(1);
+                    existing.updated_at_millis = now;
+                    existing.event_last_seen_millis = now;
+                    existing.id.clone()
+                });
+            if let Some(existing_id) = aggregated {
+                // Another occurrence of an activity a standing suppression filter
+                // selects is suppressed like the first one, so a filter saved
+                // between two generations still decides this finding's archive
+                // state.
+                if let Some(detector) = state.detector_in_mut(&region, &input.detector_id) {
+                    detector.archive_if_suppressed(&existing_id, now);
+                }
                 continue;
             }
 
@@ -241,6 +252,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 updated_at_millis: now,
                 // The generated finding is observed exactly once, now.
                 event_last_seen_millis: now,
+                // A generated finding starts unarchived; the detector's standing
+                // suppression filters are what archive it, applied below through the
+                // one archive write.
                 archived: false,
                 sample: true,
                 // No feedback has been submitted about a finding GuardDuty has only
@@ -250,7 +264,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 r#type: finding_type,
             };
             if let Some(detector) = state.detector_in_mut(&region, &input.detector_id) {
-                detector.findings.insert(finding_id, record);
+                detector.findings.insert(finding_id.clone(), record);
+                // A filter whose action archives applies to the findings its criteria
+                // select, so a finding generated while such a filter is saved is
+                // archived as it is generated — the same rule `CreateFilter` and
+                // `UpdateFilter` apply over the findings already stored.
+                detector.archive_if_suppressed(&finding_id, now);
                 // GuardDuty retains a finding for 90 days and then drops it. This
                 // emulator has no 90-day-long process, so it bounds the store by the
                 // same SHAPE of rule — a window over the most recent findings — and
