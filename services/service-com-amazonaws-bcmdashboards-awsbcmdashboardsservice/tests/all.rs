@@ -53,6 +53,8 @@ mod resource_policy;
 mod response_media_type;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/schedule_period_ceiling.rs"]
+mod schedule_period_ceiling;
 #[path = "all/scheduled_report_execution.rs"]
 mod scheduled_report_execution;
 #[path = "all/scheduled_report_execution_events.rs"]

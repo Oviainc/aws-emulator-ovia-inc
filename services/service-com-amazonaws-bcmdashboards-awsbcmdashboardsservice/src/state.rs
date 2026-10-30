@@ -1554,6 +1554,75 @@ pub fn updated_schedule_config(
     submitted
 }
 
+/// How far past the write request that submits it the END of a schedule period may reach,
+/// in calendar months.
+///
+/// `SchedulePeriod$endTime` is documented "The maximum allowed value is 3 years from the
+/// current time. Setting an end time beyond this limit returns a `ValidationException`"
+/// (`smithy_query(query="shape",shape="SchedulePeriod")`), and that sentence is written for
+/// both write paths — the member it is on defaults to "3 years from the time of the create
+/// or update request" — so every write that submits a period is held to it.
+pub const SCHEDULE_PERIOD_MAX_END_TIME_MONTHS: u32 = 36;
+
+/// The latest `endTime` a schedule period submitted at `now` may carry:
+/// [`SCHEDULE_PERIOD_MAX_END_TIME_MONTHS`] calendar months on from `now`.
+///
+/// Calendar arithmetic rather than a span of seconds, because the ceiling is stated in
+/// years and years differ in length — a span of 365-day years would refuse an end time the
+/// service admits whenever a leap day falls inside the window. The 29th of February maps
+/// to the 28th in a year that has no 29th, which is what `chrono`'s month arithmetic does.
+pub fn schedule_period_end_time_ceiling(now: SystemTime) -> SystemTime {
+    let now_utc = ::chrono::DateTime::<::chrono::Utc>::from(now);
+    let months = ::chrono::Months::new(SCHEDULE_PERIOD_MAX_END_TIME_MONTHS);
+    SystemTime::from(now_utc.checked_add_months(months).unwrap_or(now_utc))
+}
+
+/// Render the instant `value` as the RFC 3339 instant it spells, or as its epoch seconds
+/// for a value no calendar rendering can hold.
+///
+/// The one instant rendering of this crate: what a refusal names a submitted instant with,
+/// and what an event's `detail` carries ([`rfc3339`]).
+fn instant_text(value: &::aws_smithy_types::DateTime) -> String {
+    value
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|_| value.secs().to_string())
+}
+
+/// How this service refuses the `schedulePeriod` of the `scheduleConfig` a write submits at
+/// the member path `path`, made at `now`, or `None` when the period is one it can store.
+///
+/// One rule, the one the model states on the member: the `endTime` of a submitted period
+/// may be at most [`SCHEDULE_PERIOD_MAX_END_TIME_MONTHS`] calendar months past the request
+/// that carries it ([`schedule_period_end_time_ceiling`]), and a period reaching beyond
+/// that ceiling is refused with the modelled `ValidationException` — which is what
+/// `SchedulePeriod$endTime` documents, for the create request and the update request alike.
+/// The ceiling itself is admitted: it is the maximum ALLOWED value.
+///
+/// A period that names no `endTime` breaks no rule: the member is optional, and an absent
+/// one is the documented default rather than a value to check.
+///
+/// One helper for every write that submits a schedule, so the create path and the update
+/// path cannot drift apart on the rule. The refusal quotes the instant the request carried
+/// within the maximum `ValidationException$message` declares ([`MAX_MESSAGE_LENGTH`]).
+pub fn schedule_period_refusal(
+    path: &str,
+    config: &ScheduleConfig,
+    now: SystemTime,
+) -> Option<String> {
+    let end_time = config.schedule_period.as_ref()?.end_time.as_ref()?;
+    let ceiling = ::aws_smithy_types::DateTime::from(schedule_period_end_time_ceiling(now));
+    let submitted_at_or_before_ceiling = (end_time.secs(), end_time.subsec_nanos())
+        <= (ceiling.secs(), ceiling.subsec_nanos());
+    if submitted_at_or_before_ceiling {
+        return None;
+    }
+    Some(within_message_bound(format!(
+        "{path}.schedulePeriod.endTime: '{}' is beyond the maximum allowed value; the end \
+         time of a schedule period may be at most 3 years from the time of the request",
+        instant_text(end_time)
+    )))
+}
+
 /// The `@pattern` of `DashboardName` and `ScheduledReportName`, as the model writes it
 /// (`smithy_query(query="shape",shape="DashboardName,ScheduledReportName")`): both shapes
 /// declare this one expression.
@@ -2413,11 +2482,11 @@ fn request_region(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String
         .map_or_else(|| DEFAULT_REGION.to_string(), |scope| scope.region)
 }
 
-/// Render `at` as the RFC 3339 instant an event's `detail` carries.
+/// Render `at` as the RFC 3339 instant an event's `detail` carries, through the one
+/// instant rendering this crate has ([`instant_text`]), so an instant in an event and an
+/// instant in a refusal cannot drift apart on their format.
 fn rfc3339(at: SystemTime) -> String {
-    ::aws_smithy_types::DateTime::from(at)
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .unwrap_or_default()
+    instant_text(&::aws_smithy_types::DateTime::from(at))
 }
 
 /// The `detail` of the notification one execution delivers: the report the execution ran,

@@ -23,6 +23,14 @@
 //! cannot hold together, so it is refused with the modelled `ValidationException` (400)
 //! and changes nothing.
 //!
+//! A submitted `scheduleConfig` carries a `schedulePeriod` whose end is bounded: "The
+//! maximum allowed value is 3 years from the current time. Setting an end time beyond this
+//! limit returns a `ValidationException`"
+//! (`smithy_query(query="shape",shape="SchedulePeriod")`), a sentence the member writes for
+//! the create and the update request alike, and the ceiling is measured from the instant of
+//! THIS call ([`crate::state::schedule_period_refusal`]). Refused that way, the stored
+//! record keeps the period it had.
+//!
 //! The refusals that come before the write:
 //!
 //! * an `arn` no stored scheduled report answers to is refused with the service's
@@ -252,9 +260,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Resolve the resource this call addresses FIRST: an ARN no report is stored
-        // under is refused before any other member is looked at, and nothing is written
-        // on that path.
+        let now = ::std::time::SystemTime::now();
+
+        // The schedule this request submits is held to the ceiling the model states on the
+        // period's end — "The maximum allowed value is 3 years from the current time", a
+        // sentence written for the create request and this one alike
+        // (`crate::state::schedule_period_refusal`). Measured from the instant of THIS
+        // call, so what the ceiling admits is decided by the request that submits the
+        // period and not by the one that first created the report; refused before the ARN
+        // is resolved, like the other rules on the submitted members, so the stored record
+        // keeps the period it had.
+        if let Some(message) = input
+            .schedule_config
+            .as_ref()
+            .and_then(|config| crate::state::schedule_period_refusal("scheduleConfig", config, now))
+        {
+            crate::state::record_state_change(ctx, Self::NAME, &arn, "ValidationException");
+            return Err(UpdateScheduledReportErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
+        // The rules above are about the submitted members alone, so they are applied
+        // whether or not the ARN resolves. The resource this call addresses is resolved
+        // next, before any rule that reads the stored record or any member is written: an
+        // ARN no report is stored under is refused here, and nothing is written on that
+        // path.
         if !state.scheduled_reports.contains_key(&arn) {
             crate::state::record_state_change(
                 ctx,
@@ -319,7 +351,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let now = ::std::time::SystemTime::now();
         let Some(report) = state.scheduled_reports.get_mut(&arn) else {
             // Unreachable: the key was present a moment ago under this same lock.
             return Err(crate::scaffolded::Scaffolded::resource_not_found(

@@ -33,6 +33,10 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 # `Service::override_refusal`: the wording AWS states a boundary constraint refusal
 # with on the JSON protocols, which every service on one shares.
 service-common = { path = "../common" }
+# Calendar arithmetic for the ceiling the model states on a schedule period's `endTime`
+# ("3 years from the current time"): three years is a calendar offset, not a fixed
+# number of seconds.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -17,6 +17,13 @@
 //! * a `scheduledReport.dashboardArn` no stored dashboard answers to is refused with
 //!   `ValidationException` (400) — a report can only be scheduled on a dashboard that
 //!   exists, and this operation models no `ResourceNotFoundException`;
+//! * a `scheduleConfig.schedulePeriod` whose end reaches past the ceiling the model states
+//!   on it — "The maximum allowed value is 3 years from the current time. Setting an end
+//!   time beyond this limit returns a `ValidationException`"
+//!   (`smithy_query(query="shape",shape="SchedulePeriod")`) — is refused with that
+//!   `ValidationException` (400) and creates nothing
+//!   ([`crate::state::schedule_period_refusal`], shared with the update path the same
+//!   sentence is written for);
 //! * a `clientToken` an earlier successful create already recorded makes this call that
 //!   same request again: it REPLAYS that create's outcome — HTTP 200 with the ARN the
 //!   first call minted — and creates no second report, which is what the member's
@@ -251,6 +258,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        let now = ::std::time::SystemTime::now();
+
+        // The submitted schedule's period is held to the ceiling the model states on its
+        // end — "The maximum allowed value is 3 years from the current time", measured
+        // from this request (`crate::state::schedule_period_refusal`), the same rule the
+        // update path applies to a period it submits. A request beyond it creates NO
+        // report: no ARN is minted and its `clientToken` stays free.
+        if let Some(message) = crate::state::schedule_period_refusal(
+            "scheduledReport.scheduleConfig",
+            &requested.schedule_config,
+            now,
+        ) {
+            crate::state::record_state_change(ctx, Self::NAME, "-", "ValidationException");
+            return Err(CreateScheduledReportErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
         // The `@idempotencyToken` is what it is modelled as: "A unique, case-sensitive
         // identifier that you provide to ensure the idempotency of the request". A call
         // presenting a token an earlier create already recorded is that same request
@@ -277,7 +303,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // created nothing, so its token stays free. The lookup and the insert below both
         // happen under one lock. A request carrying no token has no idempotency to
         // resolve, so neither the rendering nor the sweep runs for it.
-        let now = ::std::time::SystemTime::now();
         let mut fingerprint = String::new();
         if input.client_token.is_some() {
             fingerprint =
