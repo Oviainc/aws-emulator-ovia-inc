@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRegistries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRegistries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRegistries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Reports the registries this endpoint holds, read from
+//! [`crate::state::ComAmazonawsGlueAwsglueState::registries`] — so what `CreateRegistry`
+//! persisted is what this lists, one `MaxResults`-sized page at a time, and a store
+//! holding none answers an EMPTY list rather than a refusal. A registry a delete is
+//! draining ([`crate::state::REGISTRY_STATUS_DELETING`]) is left out. A reporting
+//! operation: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +75,15 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The page size a request that names no `MaxResults` is served, documented by the member
+/// itself: "Maximum number of results required per page. If the value is not supplied,
+/// this will be defaulted to 25 per page" (`ListRegistriesInput$MaxResults`).
+const DEFAULT_PAGE_SIZE: i32 = 25;
+
+/// The largest page `MaxResults` accepts, from the member's own range
+/// (`MaxResultsNumber`, range 1..100).
+const MAX_PAGE_SIZE: i32 = 100;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -146,18 +155,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRegistries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRegistriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRegistries"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(ListRegistriesErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue schema registry store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+        // A registry's ARN is minted for the Region the call is served in, the way every
+        // other schema-registry read mints it.
+        let region = crate::state::request_region(ctx.parts());
+
+        // Absent, the page is the size the member documents as its default — which is
+        // SMALLER than the largest it accepts; the clamp re-states the modelled range here
+        // so the page size is never 0 even if the boundary validator ever stops enforcing
+        // it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(DEFAULT_PAGE_SIZE))
+            .unwrap_or(DEFAULT_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        // Reporting only: the stored registries are projected out and nothing is written.
+        let store = state.lock();
+        // The namespace is keyed by registry name and iterated in key order, so one page
+        // follows another deterministically. "Registries in the Deleting status will not be
+        // included in the results", so one a delete is draining is left out of the set the
+        // pages are cut from.
+        let matching: Vec<&crate::state::RegistryEntry> = store
+            .registries
+            .values()
+            .filter(|entry| entry.status != crate::state::REGISTRY_STATUS_DELETING)
+            .collect();
+
+        // "A continuation token, if this is a continuation call": it is the last name of
+        // the previous page, so this page resumes at the first stored name strictly after
+        // it — which stays correct across registries created or deleted between two calls.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => matching.partition_point(|entry| entry.name.as_str() <= cursor),
+            None => 0,
+        };
+        // Taken with `skip`/`take` rather than by slicing, so a cursor the request chose
+        // can never index outside the set.
+        let page: Vec<RegistryListItem> = matching
+            .iter()
+            .skip(start)
+            .take(page_size)
+            .map(|entry| RegistryListItem {
+                registry_name: Some(entry.name.clone()),
+                registry_arn: Some(crate::state::registry_arn(&region, &entry.name)),
+                description: entry.description.clone(),
+                status: Some(entry.status.clone()),
+                created_time: Some(crate::state::to_timestamp_string(entry.created_time)),
+                updated_time: Some(crate::state::to_timestamp_string(entry.updated_time)),
+            })
+            .collect();
+        let end = start.saturating_add(page.len());
+        // "A continuation token … returned if the current segment of the list is not the
+        // last": it names the last entry of the page, taken from the page itself so there
+        // is no index arithmetic to underflow on an empty page.
+        let next_token = if end < matching.len() {
+            page.last().and_then(|item| item.registry_name.clone())
+        } else {
+            None
+        };
+
+        // "Empty results will be returned if there are no registries available": the member
+        // is the empty LIST, not an absent member and not a refusal.
+        Ok(ListRegistriesOutput {
+            registries: Some(page),
+            next_token,
+        })
     }
 }

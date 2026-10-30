@@ -199,6 +199,8 @@ mod owed_status_materialisation;
 mod partitions;
 #[path = "all/registries.rs"]
 mod registries;
+#[path = "all/registry_listing.rs"]
+mod registry_listing;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
 #[path = "all/resource_tagging.rs"]

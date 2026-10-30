@@ -10161,6 +10161,11 @@ pub const MAX_STORED_SCHEMAS: usize = 2_000;
 /// registry that is simply present is this one.
 pub const REGISTRY_STATUS_AVAILABLE: &str = "AVAILABLE";
 
+/// `RegistryStatus` for a registry a delete is draining, the other of the two values the
+/// enum carries. A listing leaves a registry in this status out of its results, so the
+/// value is named here rather than spelled in each reader.
+pub const REGISTRY_STATUS_DELETING: &str = "DELETING";
+
 /// `SchemaStatus` for a schema set this store holds. Nothing here is provisioned
 /// asynchronously, so a schema set a create returned is readable at once rather than
 /// passing through `PENDING`.
