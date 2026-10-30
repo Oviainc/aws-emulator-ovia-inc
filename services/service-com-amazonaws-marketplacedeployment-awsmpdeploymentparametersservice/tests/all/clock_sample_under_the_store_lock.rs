@@ -90,7 +90,11 @@ fn rfc3339_at(at: SystemTime) -> String {
 /// wait for it. The instant is sampled just before the guard is dropped, so anything
 /// the waiting call does to the store happens strictly after it — which is what the
 /// assertions compare against.
-fn hold_store_lock_until(
+///
+/// `pub(crate)` because the sibling `contended_writes_stamp_under_the_store_lock`
+/// suite queues a whole BATCH of calls behind the same hold: ONE way of putting a
+/// call behind the store lock, so the two suites cannot come to contend differently.
+pub(crate) fn hold_store_lock_until(
     engine: &Arc<engine::InMemoryEngine>,
     until: SystemTime,
 ) -> JoinHandle<SystemTime> {
