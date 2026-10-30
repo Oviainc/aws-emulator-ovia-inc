@@ -67,7 +67,7 @@ pub(crate) async fn call(
 
 /// The wire error code of a failure body (`__type`), with any Smithy namespace
 /// stripped.
-fn error_code(body: &serde_json::Value) -> String {
+pub(crate) fn error_code(body: &serde_json::Value) -> String {
     body.get("__type")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")

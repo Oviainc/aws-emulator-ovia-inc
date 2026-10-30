@@ -1,10 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteStream
-//! Removes the stored stream a `StreamARN` names, after an optional optimistic
-//! `CurrentVersion` check. The record is gone when the call returns, so the next
-//! reader sees it absent: "This method marks the stream for deletion, and makes the
-//! data in the stream inaccessible immediately."
+//! Marks the stored stream a `StreamARN` names for deletion: "This method marks the
+//! stream for deletion, and makes the data in the stream inaccessible immediately."
+//!
+//! ## Behaviour
+//!
+//! * The record is NOT removed when the call returns. Its status moves to the
+//!   non-terminal `DELETING`, so `DescribeStream` keeps reporting the stream — same
+//!   identifiers, same `Version` — until the clock owes its removal
+//!   ([`crate::state::STREAM_DELETION_SPAN`]), which
+//!   [`crate::state::ComAmazonawsKinesisvideoKinesisvideo20170930State::settle_clock`]
+//!   then performs.
+//! * A stream that is present but not `ACTIVE` — one still `CREATING`, or one already
+//!   marked for deletion — cannot be deleted: that is the case
+//!   `ResourceInUseException` (400) is modeled for, while `ResourceNotFoundException`
+//!   (404) is reserved for a `StreamARN` no stored record answers to.
+//! * An optional `CurrentVersion` is the optimistic-concurrency guard, checked once
+//!   the stream's status allows the delete at all.
 //!
 //! ## Shape of an operation
 //!
@@ -171,8 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_clock();
 
+        // ONE resolution per call, straight to the record this delete marks: the gates
+        // below read it and the mark writes it through the same borrow.
         let stream = store
-            .resolve(None, Some(input.stream_arn.as_str()))
+            .resolve_mut(None, Some(input.stream_arn.as_str()))
             .map_err(|_| {
                 DeleteStreamError::from(DeleteStreamErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -180,6 +195,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 ))
             })?;
+
+        // The state gate, before the version guard: a stream that is not `ACTIVE`
+        // cannot be deleted under ANY version, and that is the condition
+        // `ResourceInUseException` names ("if the provided input StreamARN or ChannelARN
+        // is not in Active status … The DescribeStream … API to determine the status of
+        // the resource"). 404 stays reserved for the ARN that resolved to nothing.
+        if stream.status != crate::state::STATUS_ACTIVE {
+            return Err(DeleteStreamErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(crate::state::STREAM_NOT_ACTIVE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
 
         // The optimistic-concurrency check: a `CurrentVersion` that is not the stored
         // one means the caller is acting on a stale read, so the stream is left intact.
@@ -196,9 +225,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let stream_name = stream.stream_name.clone();
-        store.streams.remove(&stream_name);
-        store.stream_arn_index.remove(&input.stream_arn);
+        // "This method marks the stream for deletion": the record stays, in the
+        // non-terminal `DELETING` status, and the clock owes its removal. The `Version`
+        // is left as it was, so a caller polling `DescribeStream` reads the stream it
+        // deleted rather than a re-identified one. The activation instant is already
+        // clear — the gate above let only an `ACTIVE` stream through, and the clock
+        // clears it when it sets that status.
+        stream.status = crate::state::STATUS_DELETING.to_string();
+        stream.deletes_at =
+            Some(::std::time::Instant::now() + crate::state::STREAM_DELETION_SPAN);
 
         Ok(DeleteStreamOutput {})
     }

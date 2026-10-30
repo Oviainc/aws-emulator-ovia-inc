@@ -26,6 +26,8 @@ pub const STATUS_CREATING: &str = "CREATING";
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 /// See [`STATUS_CREATING`].
 pub const STATUS_UPDATING: &str = "UPDATING";
+/// See [`STATUS_CREATING`].
+pub const STATUS_DELETING: &str = "DELETING";
 
 /// `UpdateDataRetentionOperation` values, from
 /// `smithy_query(query="shape", shape="UpdateDataRetentionOperation")` via
@@ -96,6 +98,17 @@ pub const DEFAULT_MESSAGE_TTL_SECONDS: i32 = 60;
 /// that describes the stream immediately still observes `CREATING`.
 pub const STREAM_ACTIVATION_SPAN: Duration = Duration::from_millis(500);
 
+/// How long a stream marked for deletion stays readable, reporting `DELETING`, before
+/// the clock owes its removal from the store.
+///
+/// `DeleteStream` "marks the stream for deletion" rather than removing it, so the
+/// record moves to the non-terminal [`STATUS_DELETING`] and its disappearance is owed
+/// by the clock rather than performed by whoever reads it next. AWS publishes no
+/// duration for the deletion itself, so this span is CHOSEN — deliberately non-zero,
+/// so a caller that polls straight after the delete still observes `DELETING` and the
+/// refusals that status carries.
+pub const STREAM_DELETION_SPAN: Duration = Duration::from_secs(3);
+
 /// The most streams this emulator holds at once, per account and region.
 ///
 /// `streams` grows by one record per `CreateStream` request — each holding
@@ -149,6 +162,14 @@ pub const CHANNEL_NOT_FOUND_MESSAGE: &str = "The requested channel is not found 
 /// its HTTP 404, and the message is an example.
 pub const STREAM_NOT_FOUND_MESSAGE: &str = "The requested stream is not found or not active.";
 
+/// How this service words a `ResourceInUseException` for a stream that EXISTS but is
+/// not in `ACTIVE` status — the case the shape is documented for ("if the provided
+/// input StreamARN or ChannelARN is not in Active status … The DescribeStream or
+/// DescribeSignalingChannel API to determine the status of the resource"), as against
+/// the absent stream [`STREAM_NOT_FOUND_MESSAGE`] reports. Fixed text: the condition
+/// is the stream's status, so no request value belongs in it.
+pub const STREAM_NOT_ACTIVE_MESSAGE: &str = "The requested stream is not active.";
+
 /// How this service words the `InvalidArgumentException` for a request that named
 /// NEITHER identifier of the stream it addresses. Every stream operation accepts the
 /// `StreamName`/`StreamARN` pair ("You must specify either the StreamName or the
@@ -200,6 +221,9 @@ pub struct Stream {
     /// When the clock owes this stream the move out of `CREATING`; `None` once
     /// the status is terminal.
     pub activates_at: Option<Instant>,
+    /// When the clock owes this stream its removal from the store, set by the delete
+    /// that marked it for deletion; `None` while the stream is not being deleted.
+    pub deletes_at: Option<Instant>,
     /// The stream's notification configuration, `None` while it has none —
     /// `UpdateNotificationConfiguration` sets it, and passing no structure "will be
     /// deleted from the stream", i.e. puts it back to `None`.
@@ -426,14 +450,31 @@ pub struct ComAmazonawsKinesisvideoKinesisvideo20170930State {
 }
 
 impl ComAmazonawsKinesisvideoKinesisvideo20170930State {
-    /// Materialise every status transition the clock already owes.
+    /// Materialise every status transition, and every removal, the clock already owes.
     ///
     /// Called at the top of each stream and signaling-channel operation, including
-    /// the reporting ones: the move out of `CREATING` was due at a fixed instant
-    /// whether or not anybody called, so applying it here changes nothing a later
-    /// caller would not have seen anyway.
+    /// the reporting ones: the move out of `CREATING`, and the removal of a stream
+    /// marked for deletion, were each due at a fixed instant whether or not anybody
+    /// called, so applying them here changes nothing a later caller would not have
+    /// seen anyway.
     pub fn settle_clock(&mut self) {
         let now = Instant::now();
+
+        // A stream whose deletion has fallen due is gone: the delete that marked it
+        // `DELETING` fixed the instant, so removing it here is what a caller reading at
+        // that instant would have seen anyway. One walk, and an empty `Vec` allocates
+        // nothing, so the common path — no removal due — costs no allocation.
+        let mut due: Vec<(String, String)> = Vec::new();
+        for stream in self.streams.values() {
+            if stream.deletes_at.is_some_and(|instant| now >= instant) {
+                due.push((stream.stream_name.clone(), stream.stream_arn.clone()));
+            }
+        }
+        for (stream_name, stream_arn) in due {
+            self.streams.remove(&stream_name);
+            self.stream_arn_index.remove(&stream_arn);
+        }
+
         for stream in self.streams.values_mut() {
             if stream.activates_at.is_some_and(|due| now >= due) {
                 stream.activates_at = None;

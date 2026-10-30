@@ -114,12 +114,18 @@ async fn describe_stream(router: &MultiServiceRouter, name: &str) -> serde_json:
 
 /// Wait out [`kvs::state::STREAM_ACTIVATION_SPAN`] so the clock owes every freshly
 /// created stream its move to `ACTIVE`.
-fn wait_for_activation() {
+pub(crate) fn wait_for_activation() {
     std::thread::sleep(kvs::state::STREAM_ACTIVATION_SPAN + Duration::from_millis(150));
 }
 
+/// Wait out [`kvs::state::STREAM_DELETION_SPAN`] so the clock owes every stream
+/// marked for deletion its removal from the store.
+pub(crate) fn wait_for_deletion() {
+    std::thread::sleep(kvs::state::STREAM_DELETION_SPAN + Duration::from_millis(150));
+}
+
 /// The whole client script from the issue, over one store: create, read back, list,
-/// get a data endpoint, delete, and read back the absence.
+/// get a data endpoint, delete, watch the deletion settle, and read back the absence.
 #[tokio::test]
 async fn a_stream_is_created_read_listed_endpointed_and_deleted() {
     let router = harness();
@@ -258,27 +264,52 @@ async fn a_stream_is_created_read_listed_endpointed_and_deleted() {
     .await;
     assert_eq!(status, 200, "DeleteStream with the current version: {body:?}");
 
+    // The delete MARKED the stream for deletion: it is still describable, with every
+    // member carried over unchanged and only the status moved.
+    let deleting = describe_stream(&router, "demo-stream").await;
+    let mut expected = info.clone();
+    expected["Status"] = serde_json::json!("DELETING");
+    assert_eq!(
+        deleting, expected,
+        "a stream marked for deletion keeps its record with Status DELETING: \
+         expected {expected:?}, got {deleting:?}"
+    );
+
+    let (status, body) = call(&router, "/listStreams", serde_json::json!({})).await;
+    assert_eq!(status, 200, "ListStreams inside the deletion span: {body:?}");
+    assert_eq!(
+        body.get("StreamInfoList")
+            .and_then(serde_json::Value::as_array),
+        Some(&vec![deleting.clone()]),
+        "ListStreams reports the same record DescribeStream does: {body:?}"
+    );
+
+    wait_for_deletion();
+
     let (status, body) = call(
         &router,
         "/describeStream",
         serde_json::json!({ "StreamName": "demo-stream" }),
     )
     .await;
-    assert_eq!(status, 404, "DescribeStream after delete: {body:?}");
+    assert_eq!(
+        status, 404,
+        "DescribeStream once the deletion fell due: {body:?}"
+    );
     assert_eq!(
         error_code(&body),
         "ResourceNotFoundException",
-        "DescribeStream after delete: {body:?}"
+        "DescribeStream once the deletion fell due: {body:?}"
     );
 
     let (status, body) = call(&router, "/listStreams", serde_json::json!({})).await;
-    assert_eq!(status, 200, "ListStreams after delete: {body:?}");
+    assert_eq!(status, 200, "ListStreams after the deletion span: {body:?}");
     assert_eq!(
         body.get("StreamInfoList")
             .and_then(serde_json::Value::as_array)
             .map(Vec::len),
         Some(0),
-        "ListStreams must not report a deleted stream: {body:?}"
+        "ListStreams must not report a removed stream: {body:?}"
     );
 }
 
@@ -911,16 +942,29 @@ async fn list_streams_states_its_verdict_on_a_next_token() {
 }
 
 /// `CurrentVersion` is an optimistic-concurrency check: a version that is not the
-/// stored one refuses the delete and leaves the stream intact; the stored one (or no
-/// version at all) removes it.
+/// stored one refuses the delete and leaves the stream untouched; the stored one (or
+/// no version at all) marks it for deletion.
 #[tokio::test]
-async fn delete_stream_checks_current_version_before_removing_the_record() {
+async fn delete_stream_checks_current_version_before_marking_the_record() {
     let router = harness();
 
     // A version that is not the stored one, in several shapes: all inside
     // `Version`'s modeled `@length` 1..64 and `^[a-zA-Z0-9]+$` pattern.
-    for case in ["bogus1", "A", &"z".repeat(64)] {
-        let arn = create_stream(&router, "guarded").await;
+    let long_version = "z".repeat(64);
+    let cases = ["bogus1", "A", long_version.as_str()];
+
+    // One stream per row, so no row meets a record another row marked for deletion,
+    // and all of them are created before the single wait for the activation span: the
+    // version guard is only reached by a stream whose status allows a delete at all.
+    let mut rows: Vec<(&str, String, String)> = Vec::new();
+    for (index, case) in cases.iter().enumerate() {
+        let name = format!("guarded-{index}");
+        let arn = create_stream(&router, &name).await;
+        rows.push((case, name, arn));
+    }
+    wait_for_activation();
+
+    for (case, name, arn) in &rows {
         let (status, body) = call(
             &router,
             "/deleteStream",
@@ -937,15 +981,20 @@ async fn delete_stream_checks_current_version_before_removing_the_record() {
             "case {case:?}: got {body:?}"
         );
 
-        let info = describe_stream(&router, "guarded").await;
+        let info = describe_stream(&router, name).await;
         assert_eq!(
             info.get("StreamARN").and_then(serde_json::Value::as_str),
             Some(arn.as_str()),
             "case {case:?}: a refused delete must leave the stream intact, got {info:?}"
         );
+        assert_eq!(
+            info.get("Status").and_then(serde_json::Value::as_str),
+            Some("ACTIVE"),
+            "case {case:?}: a refused delete must not mark the stream, got {info:?}"
+        );
 
-        // The stored version does delete it. Passing it back in also proves it
-        // satisfies `Version`'s pattern: one that did not would be refused at the
+        // The stored version does mark it for deletion. Passing it back in also proves
+        // it satisfies `Version`'s pattern: one that did not would be refused at the
         // boundary.
         let stored = info
             .get("Version")
@@ -953,7 +1002,7 @@ async fn delete_stream_checks_current_version_before_removing_the_record() {
             .unwrap_or_else(|| panic!("case {case:?}: no Version in {info:?}"))
             .to_string();
         assert_ne!(
-            stored, case,
+            &stored, case,
             "case {case:?}: the row must differ from the stored version"
         );
         let (status, body) = call(
@@ -966,10 +1015,17 @@ async fn delete_stream_checks_current_version_before_removing_the_record() {
             status, 200,
             "case {case:?}: the stored version must delete, got {status} with {body:?}"
         );
+        let info = describe_stream(&router, name).await;
+        assert_eq!(
+            info.get("Status").and_then(serde_json::Value::as_str),
+            Some("DELETING"),
+            "case {case:?}: an accepted delete marks the stream DELETING, got {info:?}"
+        );
     }
 
     // No `CurrentVersion` at all: an unconditional delete.
     let arn = create_stream(&router, "unguarded").await;
+    wait_for_activation();
     let (status, body) = call(
         &router,
         "/deleteStream",
@@ -978,7 +1034,27 @@ async fn delete_stream_checks_current_version_before_removing_the_record() {
     .await;
     assert_eq!(status, 200, "an unconditional delete: got {body:?}");
 
-    // And the ARN of a stream that is gone resolves to nothing.
+    // A stream already marked for deletion is present but not ACTIVE, so a second
+    // delete is refused as in use rather than as absent.
+    let (status, body) = call(
+        &router,
+        "/deleteStream",
+        serde_json::json!({ "StreamARN": arn }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "deleting a stream that is already DELETING: got {status} with {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ResourceInUseException",
+        "deleting a stream that is already DELETING: got {body:?}"
+    );
+
+    // Once the deletion has fallen due, the same ARN resolves to nothing at all, and
+    // THAT is the missing-resource refusal.
+    wait_for_deletion();
     let (status, body) = call(
         &router,
         "/deleteStream",
@@ -1117,9 +1193,18 @@ async fn create_stream_refuses_a_create_past_the_stream_ceiling() {
         "the store must hold exactly the accepted streams, got {listed}"
     );
 
-    // Deleting one frees exactly one slot: the next create succeeds, and the one
-    // after it is refused again.
+    // Deleting one frees exactly one slot: the record is marked for deletion and the
+    // slot comes back when its removal falls due, after which the next create
+    // succeeds and the one after it is refused again. Only an `ACTIVE` stream can be
+    // deleted, so the activation span is waited out rather than assumed to have
+    // passed while the store filled.
+    wait_for_activation();
     let doomed = describe_stream(&router, "bound-000000").await;
+    assert_eq!(
+        doomed.get("Status").and_then(serde_json::Value::as_str),
+        Some("ACTIVE"),
+        "the stream to be deleted must be ACTIVE, got {doomed:?}"
+    );
     let arn = doomed
         .get("StreamARN")
         .and_then(serde_json::Value::as_str)
@@ -1132,6 +1217,7 @@ async fn create_stream_refuses_a_create_past_the_stream_ceiling() {
     )
     .await;
     assert_eq!(status, 200, "freeing a slot: got {status} with {body:?}");
+    wait_for_deletion();
 
     let (status, body) = call(
         &router,

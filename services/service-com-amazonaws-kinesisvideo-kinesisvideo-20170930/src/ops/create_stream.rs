@@ -260,6 +260,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .stream_storage_configuration
                 .map(|config| config.default_storage_tier),
             activates_at: Some(::std::time::Instant::now() + crate::state::STREAM_ACTIVATION_SPAN),
+            // A create marks nothing for deletion, so the clock owes this record no
+            // removal until a `DeleteStream` sets the instant.
+            deletes_at: None,
             // A create configures neither notifications, image generation nor an edge
             // agent, so each configuration starts absent and its own update operation
             // is what sets it.

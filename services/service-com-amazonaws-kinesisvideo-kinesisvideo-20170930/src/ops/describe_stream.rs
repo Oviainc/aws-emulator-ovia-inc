@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStream
-//! Reports the stored stream a `StreamName` or `StreamARN` names. Reporting only:
-//! the single write it performs is [`crate::state::ComAmazonawsKinesisvideoKinesisvideo20170930State::settle_clock`],
-//! which materialises the status move the clock already owed.
+//! Reports the stored stream a `StreamName` or `StreamARN` names — including one
+//! marked for deletion, which keeps reporting its record with the `DELETING` status
+//! until its removal falls due. Reporting only: the single write it performs is
+//! [`crate::state::ComAmazonawsKinesisvideoKinesisvideo20170930State::settle_clock`],
+//! which materialises the status moves, and the removals, the clock already owed.
 //!
 //! ## Shape of an operation
 //!
