@@ -51,7 +51,7 @@ fn caller_location(bucket: &str, key: &str) -> Value {
 /// Where a Realtime script uploaded from a local zip file is held: the service's own
 /// script bucket for the Region the upload was served in, under the account that owns the
 /// script and the script that holds the files.
-fn service_owned_script_location(script_id: &str) -> Value {
+pub(crate) fn service_owned_script_location(script_id: &str) -> Value {
     json!({
         "Bucket": format!("prod-gamescale-scripts-{REGION}"),
         "Key": format!("{}/{script_id}", engine::emulator_account_id()),
