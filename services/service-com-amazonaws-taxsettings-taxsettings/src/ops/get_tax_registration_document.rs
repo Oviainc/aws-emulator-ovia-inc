@@ -18,14 +18,16 @@
 //!   request that names no destination asked for no download, so there is no
 //!   destination path to report.
 //!
-//! Metadata that names no held document is refused with the modelled
+//! Metadata whose token does not resolve is refused with the modelled
 //! `ValidationException` (HTTP 400) carrying the `errorCode` the model publishes
 //! for how the token failed: `MalformedToken` for text this service never
 //! minted, `InvalidToken` for a token of its own that no longer locates a
-//! document.
+//! document, `ExpiredToken` for one presented past the validity window the model
+//! publishes for a `taxDocumentAccessToken`
+//! ([`crate::state::TAX_DOCUMENT_TOKEN_VALIDITY`]).
 //!
-//! A pure read: resolving a token materialises nothing, so a later caller is
-//! answered exactly what this one was.
+//! A pure read: resolving a token materialises nothing, so a later caller inside
+//! the token's window is answered exactly what this one was.
 //!
 //! ## Shape of an operation
 //!
@@ -167,14 +169,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         // The one resolution of a submitted document metadata: the token locates
-        // one document of one revision of one account's registration, and
-        // metadata that locates none is refused with the code the model
-        // publishes for how it failed. The state lock is held only for that
-        // lookup; the response is assembled after the guard is released.
+        // one document of one revision of one account's registration and is
+        // presented inside the window the model publishes for it, and metadata
+        // that satisfies neither is refused with the code the model publishes
+        // for how it failed. The clock is read here, as every operation of this
+        // service that judges a stored record against time reads it. The state
+        // lock is held only for that lookup; the response is assembled after the
+        // guard is released.
         let document = {
             let store = state.lock();
             store
-                .held_tax_document(&input.tax_document_metadata)
+                .held_tax_document(
+                    &input.tax_document_metadata,
+                    ::std::time::Instant::now(),
+                )
                 .map_err(GetTaxRegistrationDocumentErrorModeled::ValidationException)?
         };
         Ok(GetTaxRegistrationDocumentOutput {

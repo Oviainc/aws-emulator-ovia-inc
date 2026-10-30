@@ -37,6 +37,8 @@ mod derived_address_precedence;
 mod derived_registration_members;
 #[path = "all/document_destination_location.rs"]
 mod document_destination_location;
+#[path = "all/document_token_validity.rs"]
+mod document_token_validity;
 #[path = "all/exemption_access_record.rs"]
 mod exemption_access_record;
 #[path = "all/exemption_identity_padding.rs"]

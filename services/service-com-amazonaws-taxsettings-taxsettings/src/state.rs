@@ -401,6 +401,10 @@ pub const ERROR_CODE_FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
 pub const ERROR_CODE_MALFORMED_TOKEN: &str = "MalformedToken";
 /// See [`ERROR_CODE_MISSING_INPUT`].
 pub const ERROR_CODE_INVALID_TOKEN: &str = "InvalidToken";
+/// See [`ERROR_CODE_MISSING_INPUT`]. The code a token of this service's own is
+/// refused with once the validity window the model publishes for it has passed —
+/// see [`TAX_DOCUMENT_TOKEN_VALIDITY`].
+pub const ERROR_CODE_EXPIRED_TOKEN: &str = "ExpiredToken";
 /// See [`ERROR_CODE_MISSING_INPUT`]. The code a registration type that belongs
 /// to one country is refused with when the registration is held somewhere else
 /// — see [`TYPE_OUTSIDE_ITS_COUNTRY_CODES`].
@@ -803,35 +807,57 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     /// The tax document the submitted `TaxDocumentMetadata` names, or the
     /// `ValidationException` that metadata is refused with.
     ///
-    /// The metadata must name a document this service HOLDS: the token locates
-    /// one document of ONE revision of ONE account's registration, so a token
-    /// minted for a registration that has since been rewritten (a later
-    /// revision) or deleted names nothing — the invalidation the model documents
-    /// for `taxDocumentAccessToken`. The stored token is compared whole, so a
-    /// metadata whose `taxDocumentName` disagrees with the document its token
-    /// locates names nothing either.
+    /// The metadata must name a document this service HOLDS, and the token that
+    /// names it must still be inside the validity window the model publishes for
+    /// it — the two ways the model says a `taxDocumentAccessToken` stops being
+    /// valid:
+    ///
+    /// * it locates one document of ONE revision of ONE account's registration,
+    ///   so a token minted for a registration that has since been rewritten (a
+    ///   later revision) or deleted names nothing ([`unknown_tax_document`]).
+    ///   The stored token is compared whole, so a metadata whose
+    ///   `taxDocumentName` disagrees with the document its token locates names
+    ///   nothing either.
+    /// * it stops being valid [`TAX_DOCUMENT_TOKEN_VALIDITY`] after the write
+    ///   that minted it, whatever has happened to the registration since, so a
+    ///   token presented past that window is refused
+    ///   ([`expired_tax_document_token`]) even though the document it names is
+    ///   still held.
+    ///
+    /// The window is judged only for a token that still locates a document: a
+    /// retired token names nothing whatever its age, so it is refused as the
+    /// token of a registration that is gone rather than as a stale one.
     ///
     /// A reporting call: resolving a token reads the registration documents a
-    /// write recorded and changes nothing, so a caller that asks for the same
-    /// document twice is answered the same way twice.
+    /// write recorded, and the window is computed from `now` rather than
+    /// recorded, so a caller that asks for the same document twice inside the
+    /// window is answered the same way twice.
     pub fn held_tax_document(
         &self,
         metadata: &TaxDocumentMetadata,
+        now: Instant,
     ) -> Result<HeldTaxDocument, ValidationException> {
         let named = decode_document_access_token(&metadata.tax_document_access_token)?;
-        let held = self
+        let Some(stored) = self
             .registrations
             .get(&named.account_id)
             .filter(|stored| stored.revision == named.revision)
-            .and_then(|stored| stored.tax_document_metadatas.get(named.index))
-            .is_some_and(|document| {
-                document.tax_document_access_token == metadata.tax_document_access_token
-                    && document.tax_document_name == metadata.tax_document_name
-            });
-        if held {
+            .filter(|stored| {
+                stored
+                    .tax_document_metadatas
+                    .get(named.index)
+                    .is_some_and(|document| {
+                        document.tax_document_access_token == metadata.tax_document_access_token
+                            && document.tax_document_name == metadata.tax_document_name
+                    })
+            })
+        else {
+            return Err(unknown_tax_document());
+        };
+        if stored.document_tokens_valid_at(now) {
             Ok(named)
         } else {
-            Err(unknown_tax_document())
+            Err(expired_tax_document_token())
         }
     }
 
@@ -1290,6 +1316,17 @@ pub struct StoredTaxRegistration {
     /// from `VerificationDetails$taxRegistrationDocuments` when it was stored.
     /// Empty when the registration carried no document.
     pub tax_document_metadatas: Vec<TaxDocumentMetadata>,
+    /// When the access tokens of the documents above stop being valid: the
+    /// instant the write that minted them ran, plus the window the model
+    /// publishes for a `taxDocumentAccessToken`
+    /// ([`TAX_DOCUMENT_TOKEN_VALIDITY`]). Every token of one record is minted by
+    /// the one write, so one instant is the window of all of them.
+    ///
+    /// `None` only on a record no write produced — the derived [`Default`],
+    /// which a test uses to fill the store, cannot name an instant. Such a
+    /// record carries no document, so there is no token of its whose window
+    /// could be asked about.
+    pub document_tokens_expire_at: Option<Instant>,
 }
 
 impl StoredTaxRegistration {
@@ -1353,7 +1390,21 @@ impl StoredTaxRegistration {
             validation_due_at,
             revision,
             tax_document_metadatas: document_metadatas(entry, account_id, revision),
+            // The write is what mints this record's document access tokens, so
+            // the window the model publishes for them runs from it.
+            document_tokens_expire_at: Some(written_at + TAX_DOCUMENT_TOKEN_VALIDITY),
         }
+    }
+
+    /// Whether the access tokens this record's documents carry are still inside
+    /// the validity window the model publishes for a `taxDocumentAccessToken` at
+    /// `now` — see [`Self::document_tokens_expire_at`].
+    ///
+    /// A record whose window this store does not hold vouches for no token, so
+    /// no token of it is inside one.
+    pub fn document_tokens_valid_at(&self, now: Instant) -> bool {
+        self.document_tokens_expire_at
+            .is_some_and(|expires| now < expires)
     }
 
     /// The `TaxRegistration` shape `GetTaxRegistration` reports, carrying the
@@ -1584,8 +1635,11 @@ fn additional_info_response(request: &AdditionalInfoRequest) -> AdditionalInfoRe
 /// A document is named by its uploaded file name, or by its S3 key when it was
 /// referenced in S3. The access token locates the document within this account's
 /// registration revision, so writing the registration again mints new tokens and
-/// the previous ones no longer name anything — the invalidation the model
-/// documents for `taxDocumentAccessToken`.
+/// the previous ones no longer name anything — one of the two invalidations the
+/// model documents for `taxDocumentAccessToken`. The other is the window the
+/// minting write starts ([`TAX_DOCUMENT_TOKEN_VALIDITY`]), which
+/// [`StoredTaxRegistration::document_tokens_expire_at`] records for the tokens
+/// minted here.
 fn document_metadatas(
     entry: &TaxRegistrationEntry,
     account_id: &str,
@@ -1650,16 +1704,30 @@ pub struct HeldTaxDocument {
     pub name: String,
 }
 
-/// How this service words the refusal of a `taxDocumentAccessToken` that does
-/// not name a tax document it holds, whichever way the token failed.
+/// How this service words the refusal of a `taxDocumentAccessToken` that cannot
+/// be resolved to a tax document it holds, whichever way the token failed.
 ///
 /// AWS answers ONE sentence for the whole class — the token is "either
-/// malformed or incorrect" — so both refusals below state it and the published
-/// `errorCode` is what tells the two apart. It names no value from the request:
-/// the refusal is about the member, not about the text submitted for it.
+/// malformed or incorrect" — so every refusal of the class states it and the
+/// published `errorCode` is what tells them apart. It names no value from the
+/// request: the refusal is about the member, not about the text submitted for
+/// it.
 pub const TAX_DOCUMENT_TOKEN_REFUSED: &str = "The specified token in the request is either \
                                              malformed or incorrect. Check your request and try \
                                              again.";
+
+/// How long a `taxDocumentAccessToken` this service mints stays valid, counted
+/// from the write that minted it.
+///
+/// AWS's own duration, not a span this emulator chose: the model states it on
+/// the member that carries the token — "This token is valid for 24 hours."
+/// (`smithy_query(query="shape",shape="TaxDocumentMetadata")`, member
+/// `taxDocumentAccessToken`).
+///
+/// The window is published for THIS token only. The opaque cursor this service
+/// also mints ([`encode_page_token`]) carries no published window, so it is not
+/// aged.
+pub const TAX_DOCUMENT_TOKEN_VALIDITY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The name a refusal of a tax document access token reports in
 /// `ValidationExceptionField$name`.
@@ -1708,11 +1776,29 @@ fn decode_document_access_token(token: &str) -> Result<HeldTaxDocument, Validati
 ///
 /// `InvalidToken` rather than `MalformedToken`: the token IS one of this
 /// service's, it just no longer locates a document — the registration it was
-/// minted for has since been rewritten or deleted, which is the invalidation the
-/// model documents for `taxDocumentAccessToken`.
+/// minted for has since been rewritten or deleted, which is one of the two
+/// invalidations the model documents for `taxDocumentAccessToken` (the other
+/// being age — see [`expired_tax_document_token`]).
 pub fn unknown_tax_document() -> ValidationException {
     validation_naming(
         ERROR_CODE_INVALID_TOKEN,
+        TAX_DOCUMENT_ACCESS_TOKEN_PARAMETER,
+        TAX_DOCUMENT_TOKEN_REFUSED,
+    )
+}
+
+/// The refusal of a `taxDocumentAccessToken` presented past the validity window
+/// the model publishes for it ([`TAX_DOCUMENT_TOKEN_VALIDITY`]).
+///
+/// `ExpiredToken` rather than `InvalidToken`: the token IS one of this service's
+/// and it still locates a document, it has only outlived the window — the second
+/// invalidation the model documents for `taxDocumentAccessToken`, beside the
+/// rewrite [`unknown_tax_document`] answers. The message is the one sentence the
+/// class is refused with ([`TAX_DOCUMENT_TOKEN_REFUSED`]), so the code is what
+/// tells a caller which of the two it hit.
+pub fn expired_tax_document_token() -> ValidationException {
+    validation_naming(
+        ERROR_CODE_EXPIRED_TOKEN,
         TAX_DOCUMENT_ACCESS_TOKEN_PARAMETER,
         TAX_DOCUMENT_TOKEN_REFUSED,
     )
