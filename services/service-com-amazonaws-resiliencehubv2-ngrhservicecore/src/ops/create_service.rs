@@ -244,6 +244,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             updated_at: now,
             sequence,
+            // A brand-new service has no service functions yet, and no
+            // `CreateServiceFunction` token to replay.
+            service_functions: Default::default(),
+            service_function_idempotency: Default::default(),
         };
         if let Some(requested) = input.dependency_discovery.as_deref() {
             record.set_dependency_discovery(requested, now);

@@ -7,6 +7,11 @@
 //! service, plus the two secondary indexes those operations need (a name index for the
 //! duplicate-name `ConflictException`, and a `clientToken` index for idempotent replay).
 //!
+//! A service's child resources are stored INSIDE its record — see
+//! [`ServiceRecord::service_functions`] for the `ServiceFunction` lifecycle
+//! (`CreateServiceFunction`, `ListServiceFunctions`) — so deleting a service cascades to
+//! them and no lookup can reach a child whose parent is gone.
+//!
 //! Every response those operations return is projected from a record here —
 //! [`ServiceRecord::to_service`] for the full `Service` shape and
 //! [`ServiceRecord::to_summary`] for the `ServiceSummary` `ListServices` emits — so the
@@ -17,8 +22,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AssociatedSystem, DependencyDiscoveryConfig, DevOpsAgentConfiguration,
-    DevOpsAgentConfigurationView, PermissionModel, Service, ServiceReportConfiguration,
-    ServiceSummary, TestTemplateSummary,
+    DevOpsAgentConfigurationView, PermissionModel, Service, ServiceFunction,
+    ServiceReportConfiguration, ServiceSummary, TestTemplateSummary,
 };
 
 /// The ARN service namespace for this service's resources: the model's `sigv4Name` /
@@ -53,6 +58,23 @@ pub const MAX_RESULTS_MAX: i32 = 100;
 /// tokens that named the record it removed), so no map can outgrow this ceiling.
 pub const MAX_SERVICES: usize = 1_000;
 
+/// `ServiceFunctionSource`'s value for a function a CALLER created, as opposed to the
+/// `AI_GENERATED` one the assessment pipeline produces. One of
+/// `SERVICE_FUNCTION_SOURCE_VALUES`.
+pub const SERVICE_FUNCTION_SOURCE_USER: &str = "USER";
+
+/// The ceiling on how many service functions one service will hold, so an
+/// unauthenticated caller cannot grow the process's memory without limit by repeating
+/// `CreateServiceFunction`.
+///
+/// CHOSEN, not documented: the model publishes no per-service function quota, so this
+/// mirrors `ResourceList`'s own modelled `len 1..100` ceiling — the largest set of
+/// resources a single function may carry. `CreateServiceFunction` refuses a create that
+/// would pass it with the `ServiceQuotaExceededException` (HTTP 402) its model declares.
+/// The per-service idempotency index is bounded by the same ceiling: a replayed token
+/// returns the stored function instead of inserting a second one.
+pub const MAX_SERVICE_FUNCTIONS_PER_SERVICE: usize = 100;
+
 /// `DependencyDiscoveryInput`'s two caller-settable values.
 pub const DEPENDENCY_DISCOVERY_DISABLED: &str = "DISABLED";
 /// See [`DEPENDENCY_DISCOVERY_DISABLED`].
@@ -81,6 +103,52 @@ pub const DEPENDENCY_DISCOVERY_INITIALIZING_MESSAGE: &str =
 /// 250–750 ms band this project fixes for a transition the clock owes. It is never zero,
 /// so a caller that reads straight back still observes the transient status.
 const TRANSIENT_STATUS_SPAN: Duration = Duration::from_millis(500);
+
+/// One service function within a service, and the sole source of every `ServiceFunction`
+/// body this crate returns.
+#[derive(Debug, Clone)]
+pub struct ServiceFunctionRecord {
+    /// The minted `serviceFunctionId`; also this record's key in
+    /// [`ServiceRecord::service_functions`].
+    pub service_function_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub criticality: String,
+    pub source: String,
+    /// The resource identifiers associated with this function. `ResourceList` is a list
+    /// of identifier strings, and `resourceCount` is this list's LENGTH rather than a
+    /// number stored beside it, so the two can never disagree. Empty until
+    /// `CreateServiceFunctionResources` associates any.
+    pub resources: Vec<String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    /// Creation order, from the store's monotonic counter. `ListServiceFunctions` scans
+    /// by this and its `nextToken` names a position in it, so a page resumes the same
+    /// scan even after a function is deleted.
+    pub sequence: u64,
+}
+
+impl ServiceFunctionRecord {
+    /// This record as the `ServiceFunction` shape `CreateServiceFunction`,
+    /// `ListServiceFunctions` and `UpdateServiceFunction` return.
+    ///
+    /// `serviceArn` is the ARN of the service this function is stored under — the
+    /// function is nested in that service's record, so it is passed in rather than
+    /// duplicated in every function.
+    pub fn to_service_function(&self, service_arn: &str) -> ServiceFunction {
+        ServiceFunction {
+            service_arn: service_arn.to_string(),
+            service_function_id: self.service_function_id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            criticality: self.criticality.clone(),
+            resource_count: Some(self.resources.len() as i32),
+            source: Some(self.source.clone()),
+            created_at: Some(to_date_time(self.created_at)),
+            updated_at: Some(to_date_time(self.updated_at)),
+        }
+    }
+}
 
 /// One created service, and the sole source of every `Service` / `ServiceSummary` body
 /// this crate returns.
@@ -117,6 +185,17 @@ pub struct ServiceRecord {
     /// Creation order. `ListServices` scans by this, and its `nextToken` names a
     /// position in it, so a page resumes the same scan even after a delete.
     pub sequence: u64,
+    /// The service functions created within this service, keyed by `serviceFunctionId`.
+    ///
+    /// A service function exists only WITHIN a service (`CreateServiceFunction` is
+    /// "Creates a service function within a service"), so it is stored inside the parent
+    /// record: removing the service removes its functions with it, and no lookup can ever
+    /// reach a function whose service is gone.
+    pub service_functions: BTreeMap<String, ServiceFunctionRecord>,
+    /// `clientToken` -> `serviceFunctionId`, so a replayed `CreateServiceFunction`
+    /// `@idempotencyToken` returns the function the first call created instead of creating
+    /// a second one. Scoped to the parent service for the same reason as above.
+    pub service_function_idempotency: BTreeMap<String, String>,
 }
 
 impl ServiceRecord {
@@ -266,6 +345,25 @@ impl ServiceRecord {
         self.dev_ops_agent_due = Some(now + TRANSIENT_STATUS_SPAN);
     }
 
+    /// The function stored in this service under `name`, if any.
+    ///
+    /// A service function's name identifies it within its service, so this is what a
+    /// create consults before storing a second function under a name already taken.
+    pub fn service_function_named(&self, name: &str) -> Option<&ServiceFunctionRecord> {
+        self.service_functions
+            .values()
+            .find(|function| function.name == name)
+    }
+
+    /// This service's functions in creation order — what `ListServiceFunctions`
+    /// enumerates before it projects them.
+    pub fn service_functions_in_creation_order(&self) -> Vec<&ServiceFunctionRecord> {
+        let mut functions: Vec<&ServiceFunctionRecord> =
+            self.service_functions.values().collect();
+        functions.sort_by_key(|function| function.sequence);
+        functions
+    }
+
     /// Materialise every status change the CLOCK has already made due on this record.
     ///
     /// Each one was owed at `due` whether or not anybody called, so applying it on a read
@@ -358,6 +456,15 @@ pub fn mint_service_arn(region: &str) -> String {
         region,
         &format!("service/{}", mint_uuid(region)),
     )
+}
+
+/// Mint a fresh `serviceFunctionId`.
+///
+/// `EntityId` is constrained `len 1..255` / `^\S{1,255}$`, which a UUID from [`mint_uuid`]
+/// satisfies; none of its bits comes from the request, so two functions created under the
+/// same name in different services never collide.
+pub fn mint_service_function_id(region: &str) -> String {
+    mint_uuid(region)
 }
 
 /// How many resource ids this process has minted. Hashed into the next one, so two ids

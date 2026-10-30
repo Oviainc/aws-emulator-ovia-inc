@@ -160,7 +160,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // The name is free again, and no `clientToken` may replay into a service that no
-        // longer exists.
+        // longer exists. The service's functions went with the record: they are stored
+        // inside it, so deleting a service cascades to the child resources it holds.
         store.service_names.remove(&record.name);
         store
             .idempotency

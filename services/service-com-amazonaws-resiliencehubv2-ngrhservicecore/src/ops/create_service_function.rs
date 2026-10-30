@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateServiceFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateServiceFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateServiceFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a service function WITHIN a service and STORES it under that service's record,
+//! so every later `ListServiceFunctions` reads what this call wrote, and deleting the
+//! service drops its functions with it. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +147,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateServiceFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateServiceFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateServiceFunction"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateServiceFunctionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // `criticality` is a modelled enum, so the boundary has already refused anything
+        // outside `SERVICE_FUNCTION_CRITICALITY_VALUES` by the time this runs.
+        let service_arn = input.service_arn;
+
+        // A function exists only WITHIN a service, so the parent must exist before
+        // anything is stored: a `serviceArn` naming no service is a 404, not a function
+        // with no parent. Every refusal below reads the service, so nothing is minted or
+        // consumed until the call is known to be a create.
+        let Some(service) = store.services.get(&service_arn) else {
+            return Err(service_not_found(&service_arn).into());
+        };
+
+        // `clientToken` is an @idempotencyToken: a repeat of the same call returns the
+        // function the first one created rather than creating a second one.
+        if let Some(replayed) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| service.service_function_idempotency.get(token))
+            .cloned()
+            .and_then(|id| service.service_functions.get(&id))
+        {
+            return Ok(CreateServiceFunctionOutput {
+                service_function: replayed.to_service_function(&service_arn),
+            });
+        }
+
+        // A function's name identifies it within its service: a second function under a
+        // name already taken there is a conflict, not a second function.
+        if let Some(existing) = service.service_function_named(&input.name) {
+            return Err(CreateServiceFunctionErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "A service function named {} already exists in service \
+                         {service_arn}: {}",
+                        input.name, existing.service_function_id
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The store is BOUNDED before it is written: every create grows the parent
+        // service's record by one entry carrying caller-supplied payload, so a caller that
+        // repeats this call would otherwise grow the process's memory without limit. At
+        // the ceiling the create is refused with the quota error this operation models.
+        // The idempotency index is bounded by the same ceiling — a replayed token returns
+        // above instead of inserting.
+        if service.service_functions.len() >= crate::state::MAX_SERVICE_FUNCTIONS_PER_SERVICE {
+            return Err(
+                CreateServiceFunctionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The maximum number of service functions for service \
+                             {service_arn} has been reached: {}. Delete a service function \
+                             before creating another.",
+                            crate::state::MAX_SERVICE_FUNCTIONS_PER_SERVICE
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The call is a create: take the next creation-order position and mint the id.
+        let sequence = store.next_sequence();
+        let service_function_id = crate::state::mint_service_function_id(&region);
+        let record = crate::state::ServiceFunctionRecord {
+            service_function_id: service_function_id.clone(),
+            name: input.name,
+            description: input.description,
+            criticality: input.criticality,
+            // This call is the CALLER creating the function, not the assessment pipeline
+            // generating one.
+            source: crate::state::SERVICE_FUNCTION_SOURCE_USER.to_string(),
+            // Resources are associated by `CreateServiceFunctionResources`; a new function
+            // carries none, so its `resourceCount` is zero because the list is empty.
+            resources: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            sequence,
+        };
+        let service_function = record.to_service_function(&service_arn);
+        // Re-reached mutably now that the counter has been read: the store has been held
+        // under this one lock throughout, so the service is still there, and a store that
+        // somehow lost it answers the same 404 rather than panicking.
+        let Some(service) = store.services.get_mut(&service_arn) else {
+            return Err(service_not_found(&service_arn).into());
+        };
+        if let Some(token) = input.client_token {
+            service
+                .service_function_idempotency
+                .insert(token, service_function_id.clone());
+        }
+        service.service_functions.insert(service_function_id, record);
+
+        Ok(CreateServiceFunctionOutput { service_function })
     }
+}
+
+/// The refusal for a `serviceArn` that names no stored service: a service function is
+/// created within a service, so without that service there is nothing to create it in.
+fn service_not_found(service_arn: &str) -> CreateServiceFunctionErrorModeled {
+    CreateServiceFunctionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("No service found for {service_arn}"),
+        resource_id: Some(service_arn.to_string()),
+        resource_type: Some("Service".to_string()),
+    })
 }
