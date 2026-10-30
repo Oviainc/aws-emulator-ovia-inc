@@ -13,9 +13,10 @@
 //! because a container that enables nothing needs none of them — so what the model
 //! cannot say, and this module does, is the CROSS-MEMBER rule: a container that enables
 //! the feature has to carry all three, and the user pool it names has to be a pool that
-//! exists. A configuration failing either describes a sign-in path that can never work,
-//! so the request is refused with the operation's `ValidationException` and nothing is
-//! stored.
+//! exists AND that hosts the sign-in pages the Dashboards redirect is served by — a user
+//! pool domain, prefix or custom. A configuration failing any of those describes a
+//! sign-in path that can never work, so the request is refused with the operation's
+//! `ValidationException` and nothing is stored.
 //!
 //! The pool is resolved in the user-pool service's own store, reached through the SAME
 //! shared engine this service's handlers reach their own store through — the store
@@ -42,6 +43,11 @@ use crate::ops::types::{CognitoOptions, ValidationException};
 /// each names one of the three things the feature is served by, so the feature cannot be
 /// enabled without it.
 const REQUIRED_MEMBERS: [&str; 3] = ["UserPoolId", "IdentityPoolId", "RoleArn"];
+
+/// What the service answers a container enabling Cognito authentication against a user
+/// pool that hosts no sign-in pages: the pool's own `Domain` is the thing missing, and
+/// the sentence has no variable part — it names the member, not one request's pool.
+const USER_POOL_WITHOUT_DOMAIN_MESSAGE: &str = "Domain needs to be specified for user pool";
 
 /// Whether `options` describes Cognito authentication the service can provision, and the
 /// refusal stating what is wrong with it otherwise.
@@ -78,9 +84,21 @@ pub fn cognito_options_refusal<Eng: Send + Sync + 'static>(
     // told the same thing by whichever service it asked. The store comes from the
     // engine, not from a mounted service (see the module docs).
     let store = user_pools::service_state(engine)?;
-    if store.lock().pool(user_pool_id).is_none() {
+    let pools = store.lock();
+    let Some(pool) = pools.pool(user_pool_id) else {
         return Some(ValidationException {
             message: Some(format!("User pool {user_pool_id} does not exist.")),
+        });
+    };
+    // A pool that exists is still not a sign-in path until it HOSTS one: Dashboards
+    // sends the browser to the pool's managed login pages, which a pool serves only
+    // once a user pool domain is created on it, and a pool holds at most one prefix
+    // domain and at most one custom domain — either one hosts those pages, so either
+    // satisfies this. A pool with neither can authenticate nobody, so the
+    // configuration is refused and nothing is stored.
+    if pool.domain.is_none() && pool.custom_domain.is_none() {
+        return Some(ValidationException {
+            message: Some(USER_POOL_WITHOUT_DOMAIN_MESSAGE.to_owned()),
         });
     }
     None

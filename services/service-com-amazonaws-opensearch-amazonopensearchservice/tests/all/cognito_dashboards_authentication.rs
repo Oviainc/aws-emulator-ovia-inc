@@ -14,15 +14,19 @@
 //! The rule under test, asserted over a table rather than one call: a `CognitoOptions`
 //! container that ENABLES Cognito authentication is accepted only when it names all
 //! three resources the feature is served by — the user pool, the identity pool and the
-//! role — and when the user pool it names exists; anything else is refused with
+//! role — and when the user pool it names both exists and hosts the managed login pages
+//! the Dashboards sign-in redirects to, which a pool does only once a user pool domain
+//! (prefix or custom) is created on it; anything else is refused with
 //! `ValidationException` (HTTP 400) and neither creates nor changes a domain. A
 //! container that leaves the feature disabled configures no sign-in path, so none of
 //! that is required of it.
 //!
 //! The rows differ along what the rule generalises over: which required member is left
-//! out, whether the named pool exists (one of two created pools, one never created, one
-//! created and then deleted), and whether the container enables the feature at all —
-//! each row driven through BOTH operations that take the container.
+//! out, whether the named pool exists (one of several created pools, one never created,
+//! one created and then deleted), which kind of hosted domain the pool holds (a prefix
+//! domain, a custom domain, none at all, one created and then deleted), and whether the
+//! container enables the feature at all — each row driven through BOTH operations that
+//! take the container.
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -43,6 +47,11 @@ const UNCREATED_POOL: &str = "us-east-1_AAAAAAAAA";
 /// suffix: nothing resolves it either, and the refusal has to name the id the request
 /// carried rather than one case's value.
 const UNCREATED_POOL_ELSEWHERE: &str = "eu-west-1_z9Q8r7S6t";
+
+/// What the service answers a container that enables Cognito authentication against a
+/// user pool holding no hosted domain: the pool's own `Domain` is what is missing, so
+/// the sentence names that member and carries no pool id.
+const NO_HOSTED_DOMAIN: &str = "Domain needs to be specified for user pool";
 
 /// One row of the table: the container to send, the case it stands for, and the refusal
 /// sentence the service answers it with — `None` where the rule accepts it.
@@ -128,8 +137,58 @@ async fn deleted_user_pool(emulator: &Emulator, user_pool_id: &str) {
     );
 }
 
-/// One emulator with both services mounted, two created pools and one created-then-
-/// deleted pool — the preconditions the table below is written against.
+/// The ARN of the Certificate Manager certificate a CUSTOM user pool domain is served
+/// with (`CustomDomainConfigType$CertificateArn`), in the account every emulated
+/// resource belongs to.
+fn certificate_arn(certificate: &str) -> String {
+    format!(
+        "arn:aws:acm:{REGION}:{}:certificate/{certificate}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// Create the user pool domain `domain` on `user_pool_id` through the user-pool
+/// service's OWN `CreateUserPoolDomain` — a PREFIX domain when `certificate` is `None`
+/// and a CUSTOM one when it names the certificate the custom domain is served with, the
+/// two kinds of hosted domain a pool can hold.
+async fn created_user_pool_domain(
+    emulator: &Emulator,
+    user_pool_id: &str,
+    domain: &str,
+    certificate: Option<&str>,
+) {
+    let mut body = json!({ "UserPoolId": user_pool_id, "Domain": domain });
+    if let Some(certificate) = certificate {
+        body["CustomDomainConfig"] = json!({ "CertificateArn": certificate_arn(certificate) });
+    }
+    let answer = user_pool_call(emulator, "CreateUserPoolDomain", body).await;
+    assert_eq!(
+        answer.status, 200,
+        "case CreateUserPoolDomain({domain:?}): expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+}
+
+/// Delete the hosted domain `domain` of `user_pool_id`, so the pool still exists but
+/// hosts no managed login pages afterwards.
+async fn deleted_user_pool_domain(emulator: &Emulator, user_pool_id: &str, domain: &str) {
+    let answer = user_pool_call(
+        emulator,
+        "DeleteUserPoolDomain",
+        json!({ "UserPoolId": user_pool_id, "Domain": domain }),
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "case DeleteUserPoolDomain({domain:?}): expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+}
+
+/// One emulator with both services mounted, and the pools the table below is written
+/// against: one hosting a PREFIX domain, one hosting a CUSTOM domain, one hosting no
+/// domain at all, one whose domain was created and then deleted, and one created-then-
+/// deleted pool.
 struct Fixture {
     emulator: Emulator,
     rows: Vec<Row>,
@@ -138,21 +197,46 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let emulator = Emulator::with_user_pools();
-        let first = created_user_pool(&emulator, "dashboards-users").await;
-        let second = created_user_pool(&emulator, "dashboards-users-two").await;
+        let prefix_hosted = created_user_pool(&emulator, "dashboards-users").await;
+        created_user_pool_domain(&emulator, &prefix_hosted, "dashboards-login", None).await;
+        let custom_hosted = created_user_pool(&emulator, "dashboards-users-two").await;
+        created_user_pool_domain(
+            &emulator,
+            &custom_hosted,
+            "dashboards-login-custom",
+            Some("11111111-2222-3333-4444-555555555555"),
+        )
+        .await;
+        let unhosted = created_user_pool(&emulator, "dashboards-users-unhosted").await;
+        let domain_removed = created_user_pool(&emulator, "dashboards-users-domain-gone").await;
+        created_user_pool_domain(&emulator, &domain_removed, "dashboards-login-gone", None).await;
+        deleted_user_pool_domain(&emulator, &domain_removed, "dashboards-login-gone").await;
         let removed = created_user_pool(&emulator, "dashboards-users-gone").await;
         deleted_user_pool(&emulator, &removed).await;
-        let rows = rows(&first, &second, &removed);
+        let rows = rows(
+            &prefix_hosted,
+            &custom_hosted,
+            &unhosted,
+            &domain_removed,
+            &removed,
+        );
         Self { emulator, rows }
     }
 }
 
-/// The table: `first` and `second` are pools that exist, `removed` is an id whose pool
-/// was deleted.
-fn rows(first: &str, second: &str, removed: &str) -> Vec<Row> {
+/// The table: `first` hosts a prefix domain and `second` a custom one, `unhosted` is a
+/// pool that exists and hosts no domain, `domain_removed` one whose domain was deleted,
+/// and `removed` an id whose pool was deleted.
+fn rows(
+    first: &str,
+    second: &str,
+    unhosted: &str,
+    domain_removed: &str,
+    removed: &str,
+) -> Vec<Row> {
     vec![
         Row {
-            case: "enabled, naming an existing pool, an identity pool and a role",
+            case: "enabled, naming a pool hosting a prefix domain, an identity pool and a role",
             options: json!({
                 "Enabled": true,
                 "UserPoolId": first,
@@ -162,7 +246,8 @@ fn rows(first: &str, second: &str, removed: &str) -> Vec<Row> {
             refusal: None,
         },
         Row {
-            case: "enabled, naming the other existing pool, another identity pool and another role",
+            case: "enabled, naming a pool hosting a custom domain, another identity pool and \
+                   another role",
             options: json!({
                 "Enabled": true,
                 "UserPoolId": second,
@@ -170,6 +255,26 @@ fn rows(first: &str, second: &str, removed: &str) -> Vec<Row> {
                 "RoleArn": role_arn("dashboards-cognito-access"),
             }),
             refusal: None,
+        },
+        Row {
+            case: "enabled, naming a pool that hosts no domain",
+            options: json!({
+                "Enabled": true,
+                "UserPoolId": unhosted,
+                "IdentityPoolId": identity_pool_id("11111111-2222-3333-4444-555555555555"),
+                "RoleArn": role_arn("AmazonOpenSearchServiceCognitoAccess"),
+            }),
+            refusal: Some(NO_HOSTED_DOMAIN.to_string()),
+        },
+        Row {
+            case: "enabled, naming a pool whose hosted domain was deleted",
+            options: json!({
+                "Enabled": true,
+                "UserPoolId": domain_removed,
+                "IdentityPoolId": identity_pool_id("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+                "RoleArn": role_arn("dashboards-cognito-access"),
+            }),
+            refusal: Some(NO_HOSTED_DOMAIN.to_string()),
         },
         Row {
             case: "enabled, with no RoleArn",
@@ -241,6 +346,11 @@ fn rows(first: &str, second: &str, removed: &str) -> Vec<Row> {
         Row {
             case: "Enabled omitted, naming an uncreated pool and carrying no role",
             options: json!({ "UserPoolId": UNCREATED_POOL }),
+            refusal: None,
+        },
+        Row {
+            case: "disabled, naming a pool that exists and hosts no domain",
+            options: json!({ "Enabled": false, "UserPoolId": unhosted }),
             refusal: None,
         },
         Row {
