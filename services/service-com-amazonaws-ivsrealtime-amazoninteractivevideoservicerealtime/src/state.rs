@@ -21,14 +21,16 @@ use ::aws_smithy_schema_server::constraints::{validate, LengthTrait, PatternTrai
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    AutoParticipantRecordingConfiguration, Composition, CompositionSummary, ConflictException,
+    AutoParticipantRecordingConfiguration, Composition, CompositionRecordingHlsConfiguration,
+    CompositionSummary, CompositionThumbnailConfiguration, ConflictException,
     CreateIngestConfigurationOutput, Destination, DestinationConfiguration, DestinationDetail,
     DestinationSummary, EncoderConfiguration, EncoderConfigurationSummary, Event,
     GridConfiguration, IngestConfiguration,
     IngestConfigurationSummary, InternalServerException, LayoutConfiguration, Participant,
     ParticipantRecordingHlsConfiguration, ParticipantReplica, ParticipantSummary,
     ParticipantThumbnailConfiguration, ParticipantToken, PipConfiguration,
-    RedundantIngestCredential, ResourceNotFoundException, S3StorageConfiguration,
+    RecordingConfiguration, RedundantIngestCredential, ResourceNotFoundException,
+    S3DestinationConfiguration, S3StorageConfiguration,
     ServiceQuotaExceededException, Stage, StageEndpoints, StageSession, StageSessionSummary,
     StageSummary,
     StartParticipantReplicationOutput, StopParticipantReplicationOutput, StorageConfiguration,
@@ -102,13 +104,20 @@ pub const DEFAULT_RECORD_PARTICIPANT_REPLICAS: bool = true;
 /// Thumbnail-generation interval, when the thumbnail configuration does not set one.
 ///
 /// Documented on `ParticipantThumbnailConfiguration$targetIntervalSeconds`: "The targeted
-/// thumbnail-generation interval in seconds. … Default: 60."
+/// thumbnail-generation interval in seconds. … Default: 60." The thumbnail configuration
+/// of a composition destination states the same value for the same member —
+/// `CompositionThumbnailConfiguration$targetIntervalSeconds`: "The targeted
+/// thumbnail-generation interval in seconds. Default: 60." — so both are reported from
+/// here.
 pub const DEFAULT_THUMBNAIL_INTERVAL_SECONDS: i32 = 60;
 
 /// Thumbnail storage format, when the thumbnail configuration names none.
 ///
 /// Documented on `ParticipantThumbnailConfiguration$storage`: "Indicates the format in
-/// which thumbnails are recorded. … Default: `SEQUENTIAL`."
+/// which thumbnails are recorded. … Default: `SEQUENTIAL`." The composition-side member
+/// `CompositionThumbnailConfiguration$storage` states the same value ("You can enable
+/// both `SEQUENTIAL` and `LATEST`. Default: `SEQUENTIAL`."), so both are reported from
+/// here.
 pub const DEFAULT_THUMBNAIL_STORAGE: &str = "SEQUENTIAL";
 
 /// Thumbnail recording mode, when the thumbnail configuration names none.
@@ -857,6 +866,126 @@ pub fn effective_layout(requested: Option<LayoutConfiguration>) -> LayoutConfigu
     }
 }
 
+// ---------------------------------------------------------------------------
+// The modelled defaults of a composition destination's configuration
+//
+// A destination configuration is stored and reported the way every other configuration
+// this service stores is: each member the request left out of an object it DID supply is
+// reported with the default that member's own doc states. The constants come from the
+// member docs; none is this emulator's choice.
+// ---------------------------------------------------------------------------
+
+/// Target duration of a segment recorded by composite recording, when the recording
+/// configuration of a composition destination does not set one.
+///
+/// Documented on `CompositionRecordingHlsConfiguration$targetSegmentDurationSeconds`:
+/// "Defines the target duration for recorded segments generated when using composite
+/// recording. Default: 2." Composite recording is not the participant recording
+/// [`DEFAULT_HLS_TARGET_SEGMENT_DURATION_SECONDS`] cites, and the two members document
+/// different values, so each has its own constant.
+pub const DEFAULT_COMPOSITE_HLS_TARGET_SEGMENT_DURATION_SECONDS: i32 = 2;
+
+/// The HLS configuration a composition destination's recording reports, with the one
+/// member the request left out filled in from the model's documented default for it.
+fn effective_composite_hls_configuration(
+    requested: Option<CompositionRecordingHlsConfiguration>,
+) -> CompositionRecordingHlsConfiguration {
+    CompositionRecordingHlsConfiguration {
+        target_segment_duration_seconds: Some(
+            requested
+                .and_then(|configuration| configuration.target_segment_duration_seconds)
+                .unwrap_or(DEFAULT_COMPOSITE_HLS_TARGET_SEGMENT_DURATION_SECONDS),
+        ),
+    }
+}
+
+/// The recording configuration a composition destination reports, given the one its
+/// starting request supplied.
+///
+/// `hlsConfiguration` is reported for every recording configuration that exists: the
+/// member is there "to return information about how the recording will be configured",
+/// and the recording is configured with the documented segment duration whether the
+/// request named it or not.
+///
+/// `format` is reported as it arrived: `RecordingConfiguration$format` documents no
+/// default, so an absent one is not filled in.
+fn effective_composite_recording_configuration(
+    requested: RecordingConfiguration,
+) -> RecordingConfiguration {
+    RecordingConfiguration {
+        hls_configuration: Some(effective_composite_hls_configuration(
+            requested.hls_configuration,
+        )),
+        format: requested.format,
+    }
+}
+
+/// One thumbnail configuration of a composition destination, with each member the request
+/// left out filled in from the model's documented default for it — the composition-side
+/// counterpart of [`effective_thumbnail_configuration`], over the shape that carries no
+/// `recordingMode`.
+fn effective_composition_thumbnail_configuration(
+    requested: CompositionThumbnailConfiguration,
+) -> CompositionThumbnailConfiguration {
+    CompositionThumbnailConfiguration {
+        target_interval_seconds: Some(
+            requested
+                .target_interval_seconds
+                .unwrap_or(DEFAULT_THUMBNAIL_INTERVAL_SECONDS),
+        ),
+        storage: Some(requested.storage.unwrap_or_else(default_thumbnail_storage)),
+    }
+}
+
+/// The S3 destination a composition records to, from what the starting request asked for:
+/// every member of every configuration object the request supplied, with the model's
+/// documented default where the request left the member out.
+///
+/// The two optional objects are defaulted only where the request SUPPLIED them, which is
+/// what the model gives their absence meaning for: `recordingConfiguration` is "an
+/// optional customer specification", and `thumbnailConfigurations` is what "allows you to
+/// enable/disable the recording of thumbnails for a `Composition`" — and this thumbnail
+/// shape, unlike the stage-side one, carries no `recordingMode` member that could report
+/// thumbnails as off, so an element conjured for a request that supplied none would
+/// report a composition as generating thumbnails it never asked for. A documented default
+/// fills a member left out of an object that exists; it does not create the object.
+/// `storageConfigurationArn` and `encoderConfigurationArns` are `@required`, so neither
+/// can be absent.
+fn effective_s3_destination_configuration(
+    requested: S3DestinationConfiguration,
+) -> S3DestinationConfiguration {
+    S3DestinationConfiguration {
+        storage_configuration_arn: requested.storage_configuration_arn,
+        encoder_configuration_arns: requested.encoder_configuration_arns,
+        recording_configuration: requested
+            .recording_configuration
+            .map(effective_composite_recording_configuration),
+        thumbnail_configurations: requested.thumbnail_configurations.map(|configurations| {
+            configurations
+                .into_iter()
+                .map(effective_composition_thumbnail_configuration)
+                .collect()
+        }),
+    }
+}
+
+/// The configuration one destination of a composition runs with: the ONE place a
+/// destination configuration's documented defaults are applied, so what `StartComposition`
+/// persists already carries them and every read of the destination reports the same thing.
+///
+/// A channel destination has nothing to fill in: `ChannelDestinationConfiguration$channelArn`
+/// is `@required` and its `encoderConfigurationArn` documents no default, so it is
+/// reported as it arrived — as is `DestinationConfiguration$name`.
+pub fn effective_destination_configuration(
+    requested: DestinationConfiguration,
+) -> DestinationConfiguration {
+    DestinationConfiguration {
+        name: requested.name,
+        channel: requested.channel,
+        s3: requested.s3.map(effective_s3_destination_configuration),
+    }
+}
+
 // Each constant below marks the page token of ONE listing, so a token from elsewhere is
 // refused rather than silently read as a position. The marker a token actually carries is
 // the constant plus the SCOPE the issuing request paged within ([`scope_marker`]), so two
@@ -1289,7 +1418,9 @@ pub struct DestinationRecord {
     /// When it stopped; `None` while it is running.
     pub ended_at: Option<SystemTime>,
     /// What the starting request asked this destination to be —
-    /// `Destination$configuration`, "configuration used to create this destination".
+    /// `Destination$configuration`, "configuration used to create this destination" —
+    /// with the model's documented default for every member it left out
+    /// ([`effective_destination_configuration`]).
     pub configuration: DestinationConfiguration,
     /// Where an S3 destination's recording lands; `None` for a channel destination,
     /// which records nothing. See [`recording_prefix`].
@@ -5225,7 +5356,8 @@ pub fn at_most_one_element_per_choice_message(
 /// `@idempotencyToken` makes a retry of ONE request answer with what the first call
 /// created; it does not make one token stand for two different requests. So the token is
 /// stored beside a fingerprint of the rest of the request — the stage, the effective
-/// layout, the destination configurations in the order they were given, and the tag set —
+/// layout, the effective destination configurations in the order they were given, and the
+/// tag set —
 /// and a token offered again with a different fingerprint is refused instead of answered
 /// with the wrong composition.
 ///

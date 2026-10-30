@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/attributes_size_limit.rs"]
 mod attributes_size_limit;
+#[path = "all/composition_destination_configuration_defaults.rs"]
+mod composition_destination_configuration_defaults;
 #[path = "all/composition_destination_kinds.rs"]
 mod composition_destination_kinds;
 #[path = "all/composition_empty_stage_timeout.rs"]

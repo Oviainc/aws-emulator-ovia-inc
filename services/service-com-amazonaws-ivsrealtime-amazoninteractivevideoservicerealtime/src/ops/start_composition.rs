@@ -288,12 +288,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // model's documented default for every member it left out, applied in the one
         // place this service applies them (`crate::state::effective_layout`).
         let layout = crate::state::effective_layout(input.layout);
+        // Each destination as the composition will run it: what the request asked for,
+        // with the model's documented default for every member it left out, applied in
+        // the one place this service applies them
+        // (`crate::state::effective_destination_configuration`). Applied HERE, before
+        // anything is persisted, so the defaults are part of the stored destination and
+        // every later read reports the same configuration this answer carries.
+        let destinations: Vec<DestinationConfiguration> = input
+            .destinations
+            .into_iter()
+            .map(crate::state::effective_destination_configuration)
+            .collect();
         // What this request asks for, as one comparable value, so a token offered again
         // is only treated as a retry when the request really is the same one.
         let fingerprint = crate::state::composition_fingerprint(
             &input.stage_arn,
             &layout,
-            &input.destinations,
+            &destinations,
             &tags,
         );
 
@@ -363,7 +374,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (an S3 destination). `channelArn` is deliberately not checked — it names a
         // low-latency channel of the sibling `ivs` endpoint, which this store does not
         // hold (see `crate::service`'s `OWN_RESOURCE_TYPES`).
-        for destination in &input.destinations {
+        for destination in &destinations {
             if let Some(channel) = destination.channel.as_ref() {
                 if let Some(arn) = channel.encoder_configuration_arn.as_deref() {
                     if store.encoder_configuration_in(&region, arn).is_none() {
@@ -420,8 +431,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             |store, candidate| store.compositions.contains_key(candidate),
         );
 
-        let destinations: Vec<crate::state::DestinationRecord> = input
-            .destinations
+        let destinations: Vec<crate::state::DestinationRecord> = destinations
             .into_iter()
             .map(|configuration| {
                 let id = crate::state::mint_id(

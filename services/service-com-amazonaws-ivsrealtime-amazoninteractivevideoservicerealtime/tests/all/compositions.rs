@@ -479,6 +479,11 @@ async fn a_started_composition_is_read_back_exactly() {
         );
         let mut seen_ids: Vec<String> = Vec::new();
         for (index, (asked, answered)) in requested.iter().zip(reported.iter()).enumerate() {
+            // Every row above either supplies every member of the destination
+            // configuration that documents a default or supplies none of the objects
+            // those members live in, so the configuration is reported exactly as it
+            // arrived. What a PARTIALLY supplied configuration reports is the subject of
+            // `composition_destination_configuration_defaults`.
             assert_eq!(
                 &answered["configuration"], asked,
                 "case {case:?}: destination {index} must report the configuration it was \
